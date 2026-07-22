@@ -119,6 +119,312 @@ export class ObjectGenerator {
         this.generateGroupbyInvoke2();
         this.generateObjectGroupBy();
         this.generateClosurePropsHelpers();
+        this.generateShapeTransitions(); // [shape v2 · T0] 转移节点/转移表(惰性,无调用方)
+    }
+
+    // [shape v2 · T0] 运行时形状转移基础设施(**惰性:T0 无调用方,无行为变化**)。
+    // 设计见 docs/SHAPE_TRANSITIONS_DESIGN.md §3。shape_ptr@48 三态:0=无形状 /
+    // 数据段址=静态描述符(v1,仅 key_count 单 qword)/ 堆址=动态转移节点(v2)。
+    //
+    // 转移节点(堆块 TYPE_SHAPE=15,用户区 48B):
+    //   +0 parent_shape  +8 transitions(保留恒 0)  +16 key(boxed 驻留串)
+    //   +24 key_count(含本键)  +32 new_index  +40 flags(bit0 MEGAMORPHIC,保留)
+    // 转移表(堆块,用户区):+0 capacity(2 的幂) +8 count +16 entries…;entry 24B
+    //   {from_shape@0, key@8, to_shape@16};空槽 from==0;开放寻址线性探测;装载因子
+    //   0.7 翻倍扩容(rehash,旧表留给 GC);表根锚于数据段 _shape_transition_root。
+    // 寄存器契约:helper 存 S0–S3;_alloc 只保 S0–S3(S4 不保——跨 _alloc 活值限 S0–S3,
+    // 其余经锚槽/栈保全);V0–V7 纯 scratch。
+    generateShapeTransitions() {
+        const vm = this.vm;
+        const TYPE_SHAPE = 15;
+
+        // ---------- _shape_node_new(A0=parent_shape, A1=boxed_key, A2=new_index) -> RET=节点 ----------
+        // key_count = parent.key_count + 1:parent 为堆址(动态节点)读 @24,
+        // 数据段址(静态描述符)读 @0 单 qword——堆范围判别同 _strlen 快径习语。
+        vm.label("_shape_node_new");
+        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.mov(VReg.S0, VReg.A0); // parent
+        vm.mov(VReg.S1, VReg.A1); // key
+        vm.mov(VReg.S2, VReg.A2); // new_index
+        vm.lea(VReg.V0, "_heap_base");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.addImm(VReg.V0, VReg.V0, 16);
+        vm.cmp(VReg.S0, VReg.V0);
+        vm.jlt("_snn_static_parent");
+        vm.lea(VReg.V0, "_heap_ptr");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmp(VReg.S0, VReg.V0);
+        vm.jge("_snn_static_parent");
+        vm.load(VReg.S3, VReg.S0, 24); // 动态节点:key_count@24
+        vm.jmp("_snn_have_kc");
+        vm.label("_snn_static_parent");
+        vm.load(VReg.S3, VReg.S0, 0);  // 静态描述符:key_count 单 qword@0
+        vm.label("_snn_have_kc");
+        vm.addImm(VReg.S3, VReg.S3, 1); // S3 = key_count
+        vm.movImm(VReg.A0, 48);         // 用户区 48B(_alloc 请求不含 16B 头)
+        vm.call("_alloc");              // 保 S0–S3
+        vm.mov(VReg.V3, VReg.RET);      // V3 = 节点(此后无 call,V 寄存器安全)
+        vm.subImm(VReg.V2, VReg.V3, 16); // block
+        vm.movImm(VReg.V1, TYPE_SHAPE);
+        vm.storeByte(VReg.V2, 0, VReg.V1); // type 裸字节(同 writeStringHeader 习语;GC 用独立位图)
+        vm.store(VReg.V3, 0, VReg.S0);  // parent_shape
+        vm.movImm(VReg.V0, 0);
+        vm.store(VReg.V3, 8, VReg.V0);  // transitions = 0(保留)
+        vm.store(VReg.V3, 16, VReg.S1); // key
+        vm.store(VReg.V3, 24, VReg.S3); // key_count
+        vm.store(VReg.V3, 32, VReg.S2); // new_index
+        vm.store(VReg.V3, 40, VReg.V0); // flags = 0
+        vm.mov(VReg.RET, VReg.V3);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 16);
+
+        // ---------- _shape_transition_get(A0=from, A1=key) -> RET=to | 0 ----------
+        vm.label("_shape_transition_get");
+        vm.prologue(16, []);
+        vm.lea(VReg.V0, "_shape_transition_root");
+        vm.load(VReg.V0, VReg.V0, 0);   // table
+        vm.movImm(VReg.RET, 0);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_stg_done");            // 无表 → miss
+        vm.load(VReg.V1, VReg.V0, 0);   // cap
+        vm.addImm(VReg.V7, VReg.V0, 16); // entries base
+        // h = (from>>4) ^ (key>>4);idx = h & (cap-1)
+        vm.shrImm(VReg.V2, VReg.A0, 4);
+        vm.shrImm(VReg.V3, VReg.A1, 4);
+        vm.xor(VReg.V2, VReg.V2, VReg.V3);
+        vm.subImm(VReg.V4, VReg.V1, 1);
+        vm.and(VReg.V2, VReg.V2, VReg.V4);
+        // p = base + idx*24(*24 = <<4 + <<3);end = base + cap*24
+        vm.shlImm(VReg.V5, VReg.V2, 4);
+        vm.shlImm(VReg.V4, VReg.V2, 3);
+        vm.add(VReg.V5, VReg.V5, VReg.V4);
+        vm.add(VReg.V5, VReg.V5, VReg.V7); // p
+        vm.shlImm(VReg.V6, VReg.V1, 4);
+        vm.shlImm(VReg.V4, VReg.V1, 3);
+        vm.add(VReg.V6, VReg.V6, VReg.V4);
+        vm.add(VReg.V6, VReg.V6, VReg.V7); // end
+        vm.label("_stg_loop");
+        vm.load(VReg.V3, VReg.V5, 0);   // e.from
+        vm.cmpImm(VReg.V3, 0);
+        vm.jeq("_stg_done");            // 空槽 → miss(RET=0)
+        vm.cmp(VReg.V3, VReg.A0);
+        vm.jne("_stg_next");
+        vm.load(VReg.V3, VReg.V5, 8);   // e.key
+        vm.cmp(VReg.V3, VReg.A1);
+        vm.jne("_stg_next");
+        vm.load(VReg.RET, VReg.V5, 16); // e.to — 命中
+        vm.jmp("_stg_done");
+        vm.label("_stg_next");
+        vm.addImm(VReg.V5, VReg.V5, 24);
+        vm.cmp(VReg.V5, VReg.V6);
+        vm.jlt("_stg_loop");
+        vm.mov(VReg.V5, VReg.V7);       // 绕回 base
+        vm.jmp("_stg_loop");            // 装载因子 <0.7 → 必有空槽终止
+        vm.label("_stg_done");
+        vm.epilogue([], 16);
+
+        // ---------- _shape_transition_put(A0=from, A1=key, A2=to) ----------
+        // 插入 (from,key)→to;首调惰性建表(cap 16);装载因子 ≥0.7 翻倍 rehash。
+        vm.label("_shape_transition_put");
+        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.S2, VReg.A2);
+        vm.lea(VReg.V0, "_shape_transition_root");
+        vm.load(VReg.V1, VReg.V0, 0);   // table(可能 0)
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_stp_have_table");
+        // ---- 惰性建表:cap 16,用户区 16 + 16×24 = 400B ----
+        vm.movImm(VReg.A0, 400);
+        vm.call("_alloc");              // 保 S0–S3
+        vm.mov(VReg.S3, VReg.RET);      // S3 = table
+        vm.movImm(VReg.V1, 16);
+        vm.store(VReg.S3, 0, VReg.V1);  // capacity
+        vm.movImm(VReg.V4, 0);
+        vm.store(VReg.S3, 8, VReg.V4);  // count = 0
+        vm.addImm(VReg.V2, VReg.S3, 16); // p
+        vm.addImm(VReg.V3, VReg.S3, 400); // end
+        vm.label("_stp_zero");
+        vm.cmp(VReg.V2, VReg.V3);
+        vm.jge("_stp_zeroed");
+        vm.store(VReg.V2, 0, VReg.V4);  // 清零 entries(V4=0)
+        vm.addImm(VReg.V2, VReg.V2, 8);
+        vm.jmp("_stp_zero");
+        vm.label("_stp_zeroed");
+        vm.lea(VReg.V0, "_shape_transition_root");
+        vm.store(VReg.V0, 0, VReg.S3);  // 锚槽登记(数据段根 → 表存活)
+        vm.mov(VReg.V1, VReg.S3);
+        vm.label("_stp_have_table");
+        // ---- 探测:命中既存边 → 覆写返回;空槽 → 插入 ----
+        vm.load(VReg.V2, VReg.V1, 0);   // cap
+        vm.addImm(VReg.V3, VReg.V1, 16); // base
+        vm.shrImm(VReg.V4, VReg.S0, 4);
+        vm.shrImm(VReg.V5, VReg.S1, 4);
+        vm.xor(VReg.V4, VReg.V4, VReg.V5);
+        vm.subImm(VReg.V6, VReg.V2, 1);
+        vm.and(VReg.V4, VReg.V4, VReg.V6); // idx
+        vm.shlImm(VReg.V6, VReg.V4, 4);
+        vm.shlImm(VReg.V7, VReg.V4, 3);
+        vm.add(VReg.V6, VReg.V6, VReg.V7);
+        vm.add(VReg.V6, VReg.V6, VReg.V3); // p
+        vm.shlImm(VReg.V0, VReg.V2, 4);
+        vm.shlImm(VReg.V7, VReg.V2, 3);
+        vm.add(VReg.V0, VReg.V0, VReg.V7);
+        vm.add(VReg.V0, VReg.V0, VReg.V3); // end
+        vm.label("_stp_probe");
+        vm.load(VReg.V7, VReg.V6, 0);   // e.from
+        vm.cmpImm(VReg.V7, 0);
+        vm.jeq("_stp_insert");          // 空槽
+        vm.cmp(VReg.V7, VReg.S0);
+        vm.jne("_stp_advance");
+        vm.load(VReg.V7, VReg.V6, 8);   // e.key
+        vm.cmp(VReg.V7, VReg.S1);
+        vm.jeq("_stp_update");          // 既存边
+        vm.label("_stp_advance");
+        vm.addImm(VReg.V6, VReg.V6, 24);
+        vm.cmp(VReg.V6, VReg.V0);
+        vm.jlt("_stp_probe");
+        vm.mov(VReg.V6, VReg.V3);       // 绕回
+        vm.jmp("_stp_probe");
+        vm.label("_stp_update");
+        vm.store(VReg.V6, 16, VReg.S2);
+        vm.jmp("_stp_done");
+        vm.label("_stp_insert");
+        vm.store(VReg.V6, 0, VReg.S0);
+        vm.store(VReg.V6, 8, VReg.S1);
+        vm.store(VReg.V6, 16, VReg.S2);
+        // ---- count++;count*10 >= cap*7 → 扩容(mul 以移位加法替代) ----
+        vm.load(VReg.V4, VReg.V1, 8);
+        vm.addImm(VReg.V4, VReg.V4, 1);
+        vm.store(VReg.V1, 8, VReg.V4);
+        vm.shlImm(VReg.V5, VReg.V4, 3);
+        vm.shlImm(VReg.V6, VReg.V4, 1);
+        vm.add(VReg.V5, VReg.V5, VReg.V6); // count*10
+        vm.shlImm(VReg.V6, VReg.V2, 3);
+        vm.sub(VReg.V6, VReg.V6, VReg.V2); // cap*7
+        vm.cmp(VReg.V5, VReg.V6);
+        vm.jlt("_stp_done");
+        // ---- 扩容:newcap = cap×2,rehash 旧表 → 新表 ----
+        // S0–S2 已无需(边已插入旧表);S3 = 旧表(跨 _alloc 存活;旧表经栈上保存的
+        // S3 被保守栈扫描钉住,锚槽换指新表后仍存活至 rehash 完)。
+        vm.mov(VReg.S3, VReg.V1);       // 旧表 → S3
+        vm.load(VReg.V0, VReg.S3, 0);   // oldcap
+        vm.shlImm(VReg.V0, VReg.V0, 1); // newcap
+        vm.shlImm(VReg.A0, VReg.V0, 4);
+        vm.shlImm(VReg.V4, VReg.V0, 3);
+        vm.add(VReg.A0, VReg.A0, VReg.V4);
+        vm.addImm(VReg.A0, VReg.A0, 16); // 请求 = 16 + newcap*24
+        vm.call("_alloc");              // 保 S0–S3;V 寄存器作废
+        // 新表头:cap = newcap(重算),count = 旧 count
+        vm.load(VReg.V0, VReg.S3, 0);
+        vm.shlImm(VReg.V0, VReg.V0, 1); // V0 = newcap
+        vm.store(VReg.RET, 0, VReg.V0);
+        vm.load(VReg.V1, VReg.S3, 8);   // 旧 count
+        vm.store(VReg.RET, 8, VReg.V1);
+        // 清零新 entries [16, 16+newcap*24)
+        vm.addImm(VReg.V2, VReg.RET, 16);
+        vm.shlImm(VReg.V3, VReg.V0, 4);
+        vm.shlImm(VReg.V4, VReg.V0, 3);
+        vm.add(VReg.V3, VReg.V3, VReg.V4);
+        vm.add(VReg.V3, VReg.V3, VReg.RET);
+        vm.addImm(VReg.V3, VReg.V3, 16); // end
+        vm.movImm(VReg.V4, 0);
+        vm.label("_stp_rz_zero");
+        vm.cmp(VReg.V2, VReg.V3);
+        vm.jge("_stp_rz_zeroed");
+        vm.store(VReg.V2, 0, VReg.V4);
+        vm.addImm(VReg.V2, VReg.V2, 8);
+        vm.jmp("_stp_rz_zero");
+        vm.label("_stp_rz_zeroed");
+        // 锚槽换指新表(此后新表经常驻根;旧表靠栈上 S3 存活)
+        vm.lea(VReg.V5, "_shape_transition_root");
+        vm.store(VReg.V5, 0, VReg.RET);
+        // ---- rehash:遍历旧 entries,逐条重插新表 ----
+        // S0=旧 p,S1=旧 end,S2=新 end;V7 = 新 base(探测绕回基准)
+        vm.addImm(VReg.S0, VReg.S3, 16); // 旧 entries 起点
+        vm.load(VReg.V1, VReg.S3, 0);    // oldcap
+        vm.shlImm(VReg.V2, VReg.V1, 4);
+        vm.shlImm(VReg.V3, VReg.V1, 3);
+        vm.add(VReg.V2, VReg.V2, VReg.V3);
+        vm.add(VReg.V2, VReg.V2, VReg.S3);
+        vm.addImm(VReg.S1, VReg.V2, 16); // S1 = 旧 end
+        vm.lea(VReg.V7, "_shape_transition_root");
+        vm.load(VReg.V7, VReg.V7, 0);    // 新表
+        vm.addImm(VReg.V7, VReg.V7, 16); // V7 = 新 base
+        vm.lea(VReg.V6, "_shape_transition_root");
+        vm.load(VReg.V6, VReg.V6, 0);
+        vm.load(VReg.V6, VReg.V6, 0);    // newcap
+        vm.shlImm(VReg.V2, VReg.V6, 4);
+        vm.shlImm(VReg.V3, VReg.V6, 3);
+        vm.add(VReg.V2, VReg.V2, VReg.V3);
+        vm.lea(VReg.S2, "_shape_transition_root");
+        vm.load(VReg.S2, VReg.S2, 0);
+        vm.addImm(VReg.S2, VReg.S2, 16);
+        vm.add(VReg.S2, VReg.S2, VReg.V2); // S2 = 新 end
+        vm.label("_stp_rh_loop");
+        vm.cmp(VReg.S0, VReg.S1);
+        vm.jge("_stp_done");
+        vm.load(VReg.V0, VReg.S0, 0);   // e.from
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_stp_rh_next");         // 空槽跳过
+        vm.load(VReg.V1, VReg.S0, 8);   // e.key
+        vm.load(VReg.V2, VReg.S0, 16);  // e.to
+        // h = (from>>4)^(key>>4) & (newcap-1) → p
+        vm.shrImm(VReg.V3, VReg.V0, 4);
+        vm.shrImm(VReg.V4, VReg.V1, 4);
+        vm.xor(VReg.V3, VReg.V3, VReg.V4);
+        vm.subImm(VReg.V4, VReg.V6, 1);
+        vm.and(VReg.V3, VReg.V3, VReg.V4);
+        vm.shlImm(VReg.V4, VReg.V3, 4);
+        vm.shlImm(VReg.V5, VReg.V3, 3);
+        vm.add(VReg.V4, VReg.V4, VReg.V5);
+        vm.add(VReg.V4, VReg.V4, VReg.V7); // p
+        vm.label("_stp_rh_probe");
+        vm.load(VReg.V5, VReg.V4, 0);   // slot.from(新表无删除,rehash 无重复,空槽即落点)
+        vm.cmpImm(VReg.V5, 0);
+        vm.jeq("_stp_rh_place");
+        vm.addImm(VReg.V4, VReg.V4, 24);
+        vm.cmp(VReg.V4, VReg.S2);
+        vm.jlt("_stp_rh_probe");
+        vm.mov(VReg.V4, VReg.V7);       // 绕回新 base
+        vm.jmp("_stp_rh_probe");
+        vm.label("_stp_rh_place");
+        vm.store(VReg.V4, 0, VReg.V0);
+        vm.store(VReg.V4, 8, VReg.V1);
+        vm.store(VReg.V4, 16, VReg.V2);
+        vm.label("_stp_rh_next");
+        vm.addImm(VReg.S0, VReg.S0, 24);
+        vm.jmp("_stp_rh_loop");
+        vm.label("_stp_done");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 16);
+
+        // ---------- _shape_edge_count(A0=from) -> RET = 该形状的转移边数 ----------
+        // (T1 供 megamorphic 阈值判断;全表扫描——边数小,无删除,线性足够)
+        vm.label("_shape_edge_count");
+        vm.prologue(16, []);
+        vm.lea(VReg.V0, "_shape_transition_root");
+        vm.load(VReg.V0, VReg.V0, 0);   // table
+        vm.movImm(VReg.RET, 0);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_sec_done");
+        vm.load(VReg.V1, VReg.V0, 0);   // cap
+        vm.addImm(VReg.V2, VReg.V0, 16); // p
+        vm.shlImm(VReg.V3, VReg.V1, 4);
+        vm.shlImm(VReg.V4, VReg.V1, 3);
+        vm.add(VReg.V3, VReg.V3, VReg.V4);
+        vm.add(VReg.V3, VReg.V3, VReg.V0);
+        vm.addImm(VReg.V3, VReg.V3, 16); // end
+        vm.label("_sec_loop");
+        vm.cmp(VReg.V2, VReg.V3);
+        vm.jge("_sec_done");
+        vm.load(VReg.V4, VReg.V2, 0);   // e.from
+        vm.cmp(VReg.V4, VReg.A0);
+        vm.jne("_sec_next");
+        vm.addImm(VReg.RET, VReg.RET, 1);
+        vm.label("_sec_next");
+        vm.addImm(VReg.V2, VReg.V2, 24);
+        vm.jmp("_sec_loop");
+        vm.label("_sec_done");
+        vm.epilogue([], 16);
     }
 
     // ---- 闭包/函数自定义属性侧表(fn.x = 1)----

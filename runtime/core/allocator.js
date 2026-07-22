@@ -4388,6 +4388,11 @@ export class AllocatorGenerator {
         asm.addDataLabel("_global_this");
         asm.addDataQword(0);  // NULL - runtime sets this to the actual global object
 
+        // [shape v2 · T0] 形状转移表根(运行时首条转移边写入时惰性建表)。
+        // 数据段锚槽 → 根扫描覆盖 → 表与堆上转移节点不被回收。见 SHAPE_TRANSITIONS_DESIGN.md §3/§4。
+        asm.addDataLabel("_shape_transition_root");
+        asm.addDataQword(0);  // NULL - 首次 _shape_transition_put 建表并写入
+
         // 事件循环队列（微任务 / setImmediate / setTimeout(0)）的单链表头尾指针。
         // 节点由 _ev_* 运行时函数分配；根扫描覆盖这些槽 → 队列中的回调/句柄存活。
         asm.addDataLabel("_ev_micro_head");
