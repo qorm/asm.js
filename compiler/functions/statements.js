@@ -2743,6 +2743,19 @@ export const StatementCompiler = {
             this.vm.label(skipProtoLink);
         }
 
+        // [shape v2 · T2a] 原型赋形资格:全部实例方法键为静态名(计算键/私有方法 →
+        // 不合格 → 不赋形,安全退化 v1 行为)。访问器(get/set)不影响查找资格,仅置
+        // 描述符 ACCESSOR_FREE 标志位(预留给后续 getter 检查消除)。
+        let protoShapeEligible = instanceMethods.length > 0;
+        let classHasAccessors = false;
+        for (const m of instanceMethods) {
+            if (m.kind === "get" || m.kind === "set") classHasAccessors = true;
+            const k = m.key;
+            if (m.computed || !k || (k.type !== "Identifier" && k.type !== "Literal" && k.type !== "StringLiteral")) {
+                protoShapeEligible = false;
+            }
+        }
+
         // 添加实例方法到 prototype（访问器先按键名归组：同名 get/set 合并进
         // 同一个 24B 标记对象 {TYPE_GETTER@0, getter@8, setter@16}）
         this.emitClassMethodTable(instanceMethods, className, labelId, false, VReg.S1);
@@ -2757,6 +2770,55 @@ export const StatementCompiler = {
         this.vm.call("_tag_str_a1");
         this.vm.mov(VReg.A2, VReg.S0);
         this.vm.call("_object_define");
+
+        // [shape v2 · T2a] 原型赋形:运行时构建带键形状描述符(TYPE_SHAPE_DESC 堆块),
+        // 键表 = prototype props 键列快照(运行时序即真序,含 constructor)。描述符根经
+        // proto.shape@48 挂住(保守扫描覆盖);引擎 RX 片段无数据段写,安全。此后猴子
+        // 补丁加键/删键/改原型经既有形状失效路径置 0,IC 键自验证兜底,安全退化。
+        // 静态方法/字段初始化在此之后运行:其用户代码若改 prototype 同样走失效路径。
+        if (protoShapeEligible) {
+            const pskip = this.ctx.newLabel("proto_shape_skip");
+            this.vm.load(VReg.V0, VReg.S1, 8);   // count
+            this.vm.cmpImm(VReg.V0, 0);
+            this.vm.jeq(pskip);
+            this.vm.mov(VReg.S3, VReg.V0);       // S3 = count(跨 _alloc 存)
+            // 键数组:count×8B
+            this.vm.shlImm(VReg.A0, VReg.S3, 3);
+            this.vm.call("_alloc");              // 保 S0–S3
+            this.vm.mov(VReg.S2, VReg.RET);      // S2 = keys 基址
+            this.vm.load(VReg.V0, VReg.S1, 32);  // props_ptr(源)
+            this.vm.mov(VReg.V1, VReg.S2);       // 目的游标
+            this.vm.mov(VReg.V2, VReg.S3);       // 剩余数
+            const pscp = this.ctx.newLabel("proto_shape_cp");
+            const pscd = this.ctx.newLabel("proto_shape_cpd");
+            this.vm.label(pscp);
+            this.vm.cmpImm(VReg.V2, 0);
+            this.vm.jeq(pscd);
+            this.vm.load(VReg.V3, VReg.V0, 0);   // key qword
+            this.vm.store(VReg.V1, 0, VReg.V3);
+            this.vm.addImm(VReg.V0, VReg.V0, 16);
+            this.vm.addImm(VReg.V1, VReg.V1, 8);
+            this.vm.subImm(VReg.V2, VReg.V2, 1);
+            this.vm.jmp(pscp);
+            this.vm.label(pscd);
+            // 描述符:用户区 16B {@0 count|flags, @8 keys_ptr}
+            this.vm.movImm(VReg.A0, 16);
+            this.vm.call("_alloc");              // 保 S0–S3(S2=keys, S3=count)
+            // 注意:x64 上 V0 与 RET 同物理寄存器——此后至 store(RET,...) 之间
+            // 禁用 V0/V1 承载需保留的值(会覆盖 RET=描述符指针),用 V2/V3。
+            this.vm.subImm(VReg.V2, VReg.RET, 16); // V2 = block
+            this.vm.movImm(VReg.V3, 16);           // TYPE_SHAPE_DESC
+            this.vm.storeByte(VReg.V2, 0, VReg.V3);
+            this.vm.mov(VReg.V2, VReg.S3);         // V2 = count
+            if (!classHasAccessors) {
+                this.vm.movImm64(VReg.V3, 0x8000000000000000n); // ACCESSOR_FREE
+                this.vm.or(VReg.V2, VReg.V2, VReg.V3);
+            }
+            this.vm.store(VReg.RET, 0, VReg.V2);   // count|flags
+            this.vm.store(VReg.RET, 8, VReg.S2);   // keys_ptr
+            this.vm.store(VReg.S1, 48, VReg.RET);  // 戳入 proto.shape@48
+            this.vm.label(pskip);
+        }
 
         // 添加静态方法到类对象
         this.emitClassMethodTable(staticMethods, className, labelId, true, VReg.S0);

@@ -21,6 +21,7 @@ const TYPE_PROXY = 8; // Proxy 对象块:type@0=8, target@8, handler@16(装箱 0
                       // _object_get/_set 冷分支调 handler 陷阱;普通对象访问逐字节不变。
 const TYPE_GETTER = 60; // getter 标记对象，见 runtime/core/allocator.js
 const TYPE_SYMBOL = 61; // Symbol 标记块，见 runtime/core/allocator.js
+const TYPE_SHAPE_DESC = 16; // [shape v2 · T2a] 原型带键形状描述符(堆块):@0 = count|(accessor_free<<63), @8 = keys_ptr
 // [#61 P2] 对象头 40→48:尾部加 flags_ptr@40。所有 <40 偏移(0/8/16/24/32)零改,
 // 故现有 get/set/ic/delete/keys/for-in/原型链读取全部不动。flags_ptr 惰性平行
 // 属性 attrs 数组(capacity 字节,每属性 1 字节),flags_ptr=0 语义 = 全属性默认
@@ -314,30 +315,30 @@ export class ObjectGenerator {
         vm.add(VReg.A0, VReg.A0, VReg.V4);
         vm.addImm(VReg.A0, VReg.A0, 16); // 请求 = 16 + newcap*24
         vm.call("_alloc");              // 保 S0–S3;V 寄存器作废
-        // 新表头:cap = newcap(重算),count = 旧 count
-        vm.load(VReg.V0, VReg.S3, 0);
-        vm.shlImm(VReg.V0, VReg.V0, 1); // V0 = newcap
-        vm.store(VReg.RET, 0, VReg.V0);
-        vm.load(VReg.V1, VReg.S3, 8);   // 旧 count
-        vm.store(VReg.RET, 8, VReg.V1);
+        // x64 上 V0 与 RET 同物理寄存器:RET(新表指针)不得与 V0 运算交错。
+        // 先落锚(新表立即经常驻根),再用 V2–V5 写头与清零。
+        vm.lea(VReg.V5, "_shape_transition_root");
+        vm.store(VReg.V5, 0, VReg.RET); // 锚槽换指新表(旧表靠栈上 S3 存活至 rehash 完)
+        vm.load(VReg.V2, VReg.S3, 0);   // oldcap
+        vm.shlImm(VReg.V2, VReg.V2, 1); // V2 = newcap
+        vm.store(VReg.RET, 0, VReg.V2); // cap
+        vm.load(VReg.V3, VReg.S3, 8);   // 旧 count
+        vm.store(VReg.RET, 8, VReg.V3);
         // 清零新 entries [16, 16+newcap*24)
-        vm.addImm(VReg.V2, VReg.RET, 16);
-        vm.shlImm(VReg.V3, VReg.V0, 4);
-        vm.shlImm(VReg.V4, VReg.V0, 3);
-        vm.add(VReg.V3, VReg.V3, VReg.V4);
-        vm.add(VReg.V3, VReg.V3, VReg.RET);
-        vm.addImm(VReg.V3, VReg.V3, 16); // end
-        vm.movImm(VReg.V4, 0);
+        vm.addImm(VReg.V3, VReg.RET, 16); // p
+        vm.shlImm(VReg.V4, VReg.V2, 4);
+        vm.shlImm(VReg.V5, VReg.V2, 3);
+        vm.add(VReg.V4, VReg.V4, VReg.V5);
+        vm.add(VReg.V4, VReg.V4, VReg.RET);
+        vm.addImm(VReg.V4, VReg.V4, 16); // V4 = end
+        vm.movImm(VReg.V5, 0);
         vm.label("_stp_rz_zero");
-        vm.cmp(VReg.V2, VReg.V3);
+        vm.cmp(VReg.V3, VReg.V4);
         vm.jge("_stp_rz_zeroed");
-        vm.store(VReg.V2, 0, VReg.V4);
-        vm.addImm(VReg.V2, VReg.V2, 8);
+        vm.store(VReg.V3, 0, VReg.V5);
+        vm.addImm(VReg.V3, VReg.V3, 8);
         vm.jmp("_stp_rz_zero");
         vm.label("_stp_rz_zeroed");
-        // 锚槽换指新表(此后新表经常驻根;旧表靠栈上 S3 存活)
-        vm.lea(VReg.V5, "_shape_transition_root");
-        vm.store(VReg.V5, 0, VReg.RET);
         // ---- rehash:遍历旧 entries,逐条重插新表 ----
         // S0=旧 p,S1=旧 end,S2=新 end;V7 = 新 base(探测绕回基准)
         vm.addImm(VReg.S0, VReg.S3, 16); // 旧 entries 起点
@@ -1527,6 +1528,50 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.V3, TYPE_OBJECT);
         vm.jne("_ogic_slow_delegate");
         vm.mov(VReg.S3, VReg.V1); // S3 = proto(自有扫已毕,S3 复用)
+        // [shape v2 · T2a] proto 形状为 TYPE_SHAPE_DESC 带键描述符 → 键表单 cmp 查 index
+        // (替代 kv 指针追扫):描述符键表 ≡ proto props 键列快照,命中即真;未命中
+        // 仅防御性兜底(键列同源,理论必中)。V6 = obj 裸指针(回填 obj_shape 用)。
+        // (掩码取独立寄存器:and 的 dest==a 形态有 x64 生产实证,dest==b 无。)
+        vm.movImm64(VReg.V7, 0x0000ffffffffffffn);
+        vm.and(VReg.V6, VReg.S0, VReg.V7);
+        vm.load(VReg.V0, VReg.S3, OBJECT_SHAPE_OFFSET); // proto.shape
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_ogic_pkv");                    // 无形状 → kv 扫
+        vm.subImm(VReg.V1, VReg.V0, 16);        // 描述符块头
+        vm.loadByte(VReg.V1, VReg.V1, 0);
+        vm.cmpImm(VReg.V1, TYPE_SHAPE_DESC);
+        vm.jne("_ogic_pkv");                    // 静态描述符/转移节点 → kv 扫
+        vm.load(VReg.V1, VReg.V0, 0);           // count | flags63
+        vm.movImm64(VReg.V2, 0x7fffffffffffffffn);
+        vm.and(VReg.V1, VReg.V1, VReg.V2);      // count
+        vm.load(VReg.V2, VReg.V0, 8);           // keys_ptr
+        vm.cmpImm(VReg.V2, 0);
+        vm.jeq("_ogic_pkv");
+        vm.mov(VReg.V0, VReg.V2);               // 游标
+        vm.shlImm(VReg.V3, VReg.V1, 3);
+        vm.add(VReg.V3, VReg.V2, VReg.V3);      // 终点
+        vm.movImm(VReg.V4, 0);                  // index
+        vm.label("_ogic_pkey_scan");
+        vm.cmp(VReg.V0, VReg.V3);
+        vm.jge("_ogic_pkv");
+        vm.load(VReg.V5, VReg.V0, 0);
+        vm.cmp(VReg.V5, VReg.S1);               // boxed key 驻留指针单 cmp
+        vm.jeq("_ogic_pkey_hit");
+        vm.addImm(VReg.V0, VReg.V0, 8);
+        vm.addImm(VReg.V4, VReg.V4, 1);
+        vm.jmp("_ogic_pkey_scan");
+        vm.label("_ogic_pkey_hit");
+        // 回填站点 {obj_shape@0, holder=proto@8, index@16} + 取值
+        vm.load(VReg.V5, VReg.V6, OBJECT_SHAPE_OFFSET);
+        vm.store(VReg.S2, 0, VReg.V5);
+        vm.store(VReg.S2, 8, VReg.S3);
+        vm.store(VReg.S2, 16, VReg.V4);
+        vm.load(VReg.V5, VReg.S3, OBJECT_PROPS_PTR_OFFSET);
+        vm.shlImm(VReg.V4, VReg.V4, 4);
+        vm.add(VReg.V5, VReg.V5, VReg.V4);
+        vm.load(VReg.RET, VReg.V5, 8);
+        vm.jmp("_ogic_slow_getter");
+        vm.label("_ogic_pkv");
         vm.load(VReg.V4, VReg.S3, OBJECT_PROPS_PTR_OFFSET);
         vm.cmpImm(VReg.V4, 0);
         vm.jeq("_ogic_slow_delegate");

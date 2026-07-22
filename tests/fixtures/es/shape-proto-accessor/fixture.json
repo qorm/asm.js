@@ -1,0 +1,7 @@
+{
+  "description": "shape v2 T2a prototype shaping: accessor",
+  "expect": {
+    "stdout": "10 11 p",
+    "exitCode": 0
+  }
+}
