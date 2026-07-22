@@ -1,0 +1,7 @@
+{
+  "description": "L4 string in-place concat: alias-return",
+  "expect": {
+    "stdout": "20/40",
+    "exitCode": 0
+  }
+}

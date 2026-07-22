@@ -1636,7 +1636,15 @@ export const OperatorCompiler = {
         // 弹出右侧到 A1（栈顶），左侧到 A0 (_strconcat expects A0=left, A1=right)
         this.vm.pop(VReg.A1);
         this.vm.pop(VReg.A0);
-        this.vm.call("_strconcat");
+        // [L4.2 字符串原地拼接] 逃逸门控命中且本拼接即门控的 `s + E`(左侧为同名简单变量):
+        // 发 _str_concat_ip(旧串为堆串且容量足 → 就地追加返同指针;守卫不满足则尾委托
+        // _strconcat,逐字节等价)。名字守卫防嵌套拼接误命中(s + (a + b) 的内层 left=a)。
+        const _ipVar = this.ctx._ipConcatVar;
+        if (_ipVar && expr.left.type === "Identifier" && expr.left.name === _ipVar) {
+            this.vm.call("_str_concat_ip");
+        } else {
+            this.vm.call("_strconcat");
+        }
         // 结果按约定留在 RET；这里绝不能再 push（不配对的 push 会让
         // 栈错位 16 字节，epilogue 恢复到错误的 FP/LR 导致控制流损坏）
     },

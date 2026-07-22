@@ -128,7 +128,22 @@ export const AssignmentCompiler = {
 
             // 简单赋值
             if (op === "=") {
+                // [L4.2 字符串原地拼接] 逃逸门控:`s = s + E`(含 `s += E` 解糖形态)。
+                // 门控通过时设 _ipConcatVar,compileStringConcat 发 _str_concat_ip(旧串为
+                // 堆串且容量足 → 就地追加返同指针;不满足则运行时尾委托 _strconcat,
+                // 逐字节等价旧语义)。静态非拼接路径(右侧非串 → _js_add)不受影响。
+                // 否决前置:装箱变量(闭包捕获)、主程序被捕获变量、with 作用域活跃、
+                // 右侧静态非串(数值累加等根本不进 compileStringConcat,免扫描)。
+                const _ipCand = expr.right && expr.right.type === "BinaryExpression" &&
+                    expr.right.operator === "+" && expr.right.left &&
+                    expr.right.left.type === "Identifier" && expr.right.left.name === name &&
+                    inferType(expr.right.right, this.ctx) === Type.STRING &&
+                    !isBoxed && !globalLabel &&
+                    !(this.ctx.withScopes && this.ctx.withScopes.length > 0) &&
+                    this._canIpStringAccum(name);
+                if (_ipCand) this.ctx._ipConcatVar = name;
                 this.compileExpression(expr.right);
+                if (_ipCand) this.ctx._ipConcatVar = null;
 
                 // 二元表达式（算术运算和字符串连接）返回 raw bits 或 NaN-boxed，
                 // 不是 boxed Number，不需要 unbox
@@ -955,5 +970,117 @@ export const AssignmentCompiler = {
 
         // 5. 统一走 boxNumber，避免在各处重复手写装箱逻辑
         this.boxNumber(VReg.S0);
+    },
+
+    // [L4.2 字符串原地拼接] 逃逸门控:函数级保守语法分析(不做 SSA/活性)。
+    // 全部成立才允许把 `s = s + E` / `s += E` 发射为 _str_concat_ip(见 docs/STR_CONCAT_L4_DESIGN.md §2.3):
+    //   ① s 不是形参(含解构/默认值/rest 子树);② 模块顶层时 s 未被导出(import 侧可别名);
+    //   ③ 至少一个门控拼接形态;④ s 的每次写入均为 串字面量/模板字面量/门控拼接形态
+    //   (其他类型或来源否决;`let s;` 无初值允许——运行时守卫对非串旧值委托 _strconcat);
+    //   ⑤ 别名化引用(t=s / f(s) / return s / [s] / {x:s} / s.x / s() / typeof s …)只允许
+    //   出现在**活跃区之后**(活跃区 = 含末次门控拼接的最外层循环;无循环则到末次拼接止);
+    //   ⑥ 嵌套函数内引用 s 一律否决(捕获语义,与 boxedVars 检查双保险)。
+    // 正确性根基:④ 保证 s 持有的堆块要么来自全新拼接分配(唯一引用),要么是数据段
+    // 字面量(运行时守卫对只读数据段串恒委托 _strconcat);⑤ 保证唯一引用不被别名。
+    // 实现:扫描根(函数/模块 AST)**单次遍历建索引**(每名字收集 append/escape/写入事实
+    // + 循环区间表),按名裁决 O(该名引用数)——避免"每候选站点全函数走一遍"在模块级
+    // 大 AST 上退化成 O(规模 × 名字数)(曾使 gen0 自编译 1.55s → 3.13s)。
+    _canIpStringAccum(name) {
+        const root = this.ctx._ipScanRoot;
+        if (!root) return false;
+        if (this.ctx._ipExportedNames && this.ctx._ipExportedNames.has(name)) return false;
+        let index = this.ctx._ipIndex;
+        if (!index) index = this.ctx._ipIndex = this._buildIpIndex(root);
+        if (index.paramNames.has(name)) return false;
+        const e = index.per.get(name);
+        if (!e || e.appends.length === 0 || e.nestedRef || e.badWrite) return false;
+        // 活跃区终点:含末次拼接的最外层循环(前序入栈,外先内后 → 首个命中即最外);无循环取末次拼接
+        let lastAppend = e.appends[e.appends.length - 1];
+        let activeEnd = lastAppend;
+        for (let i = 0; i < index.loops.length; i++) {
+            const L = index.loops[i];
+            if (L[0] <= lastAppend && lastAppend <= L[1]) { activeEnd = L[1]; break; }
+        }
+        for (let i = 0; i < e.escapes.length; i++) if (e.escapes[i] <= activeEnd) return false;
+        return true;
+    },
+
+    _buildIpIndex(root) {
+        let idx = 0, fnDepth = 0;
+        const loops = []; // [入序, 出序]
+        const per = new Map(); // name -> { appends: [], escapes: [], badWrite, nestedRef }
+        const paramNames = new Set();
+        const entry = (nm) => {
+            let e = per.get(nm);
+            if (!e) { e = { appends: [], escapes: [], badWrite: false, nestedRef: false }; per.set(nm, e); }
+            return e;
+        };
+        const isStrLit = (n) => n != null && (n.type === "StringLiteral" ||
+            n.type === "TemplateLiteral" || (n.type === "Literal" && typeof n.value === "string"));
+        const isGatedFor = (n, nm) => n != null && n.type === "AssignmentExpression" &&
+            n.left && n.left.type === "Identifier" && n.left.name === nm &&
+            (n.operator === "+=" || (n.operator === "=" && n.right != null &&
+             n.right.type === "BinaryExpression" && n.right.operator === "+" &&
+             n.right.left && n.right.left.type === "Identifier" && n.right.left.name === nm));
+        // 形参子树内全部名字(覆盖解构/默认值/rest)→ 这些名字永不入原地拼接
+        const collectParams = (n) => {
+            if (!n || typeof n !== "object") return;
+            if (Array.isArray(n)) { for (let i = 0; i < n.length; i++) collectParams(n[i]); return; }
+            if (n.type === "Identifier" && n.name) paramNames.add(n.name);
+            for (const k in n) { if (k !== "type") collectParams(n[k]); }
+        };
+        collectParams(root.params || []);
+
+        const walk = (node, parent, grand) => {
+            if (!node || typeof node !== "object") return;
+            if (Array.isArray(node)) { for (let i = 0; i < node.length; i++) walk(node[i], parent, grand); return; }
+            const my = idx++;
+            const t = node.type;
+            if (typeof t === "string" && t.indexOf("Function") >= 0) {
+                fnDepth++;
+                for (const k in node) { if (k !== "type") walk(node[k], node, parent); }
+                fnDepth--;
+                return;
+            }
+            let loopRec = null;
+            if (t === "ForStatement" || t === "ForInStatement" || t === "ForOfStatement" ||
+                t === "WhileStatement" || t === "DoWhileStatement") {
+                loopRec = [my, my];
+                loops.push(loopRec);
+            }
+            if (t === "Identifier" && node.name) {
+                const nm = node.name;
+                if (fnDepth > 0) {
+                    entry(nm).nestedRef = true; // 嵌套函数内引用 → 捕获语义 → 否决
+                } else if (parent && ((parent.type === "VariableDeclarator" && parent.id === node) ||
+                    (parent.type === "FunctionDeclaration" && parent.id === node) ||
+                    (parent.type === "ClassDeclaration" && parent.id === node))) {
+                    // 绑定位置(声明 id),非引用 → 不计
+                } else if (parent && parent.type === "AssignmentExpression" && parent.left === node && isGatedFor(parent, nm)) {
+                    entry(nm).appends.push(my); // 门控拼接的赋值目标
+                } else if (grand && grand.type === "AssignmentExpression" && isGatedFor(grand, nm) &&
+                           grand.right === parent && parent && parent.type === "BinaryExpression" && parent.left === node) {
+                    // 门控拼接 `s = s + E` 的累加读(二元左侧的 s):允许,不计
+                } else {
+                    entry(nm).escapes.push(my); // 其余一切引用 = 潜在别名化
+                }
+            }
+            if (fnDepth === 0) {
+                if (t === "AssignmentExpression" && node.left && node.left.type === "Identifier" && node.left.name) {
+                    const nm = node.left.name;
+                    if (!isGatedFor(node, nm) && !(node.operator === "=" && isStrLit(node.right))) entry(nm).badWrite = true;
+                }
+                if (t === "VariableDeclarator" && node.id && node.id.type === "Identifier" && node.id.name) {
+                    if (node.init && !isStrLit(node.init)) entry(node.id.name).badWrite = true;
+                }
+                if (t === "UpdateExpression" && node.argument && node.argument.type === "Identifier" && node.argument.name) {
+                    entry(node.argument.name).badWrite = true; // s++/s-- → 非串写 → 否决
+                }
+            }
+            for (const k in node) { if (k !== "type") walk(node[k], node, parent); }
+            if (loopRec) loopRec[1] = idx;
+        };
+        walk(root.body, null, null);
+        return { per: per, loops: loops, paramNames: paramNames };
     },
 };

@@ -434,6 +434,129 @@ export class StringGenerator {
 
 
 
+    // [L4.1] 原地拼接助手(逃逸门控调用方专用)
+    // _str_concat_ip(A0 = boxed 旧串, A1 = boxed 后缀) -> RET = boxed 串
+    // 语义与 _strconcat 逐字节一致;差别仅在于:旧串为堆串(type 6)且容量
+    // (size-class 余量 / 大对象请求量)够装 len1+len2 时**就地追加返回同指针**。
+    // 安全性完全由调用方(编译器逃逸门控)保证:旧值在追加点后不再被读。
+    // 守卫(任一不满足 → 直接尾委托 _strconcat,零行为差异):
+    //   A0/A1 均为装箱串(0x7FFC);旧串 content 为堆内 type 6 块(字面量/数据段串只读,委托)。
+    // 容量:块头 flags_and_size 的 class 位(bits 6-9)<15 → _gc_c2s[class] 得用户区容量;
+    //   ==15(LARGE_CLASS)→ header.size(bits 16+)−16(头)。内容容量 = 用户区字节数。
+    // 溢出时按 2× 需求重分配(摊还后续追加),NUL 透明(按长度 memcpy + 末尾 NUL)。
+    // 寄存器:S0=content1, S1=content2, S2=len2, S3=len1/newlen, S4=boxed 旧串/grow 新串;
+    // scratch V0-V4;_alloc 保 S0-S3、_memcpy 保 S0/S1、_strlen/_getStrContent 保 S 寄存器。
+    generateStrConcatIP() {
+        const vm = this.vm;
+
+        vm.label("_str_concat_ip");
+        vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
+        vm.mov(VReg.S4, VReg.A0); // S4 = boxed 旧串(原地情形直接返回)
+        vm.mov(VReg.S1, VReg.A1); // S1 = boxed 后缀(所有 delegate 点仍有效)
+
+        // 守卫:旧串为装箱串
+        vm.shrImm(VReg.V0, VReg.S4, 48);
+        vm.cmpImm(VReg.V0, 0x7FFC);
+        vm.jne("_scip_delegate");
+        vm.mov(VReg.A0, VReg.S4);
+        vm.call("_getStrContent");
+        vm.mov(VReg.S0, VReg.RET); // S0 = content1
+        // 堆串判据(同 _strlen 快径)
+        vm.lea(VReg.V0, "_heap_base");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.addImm(VReg.V0, VReg.V0, 16);
+        vm.cmp(VReg.S0, VReg.V0);
+        vm.jlt("_scip_delegate");
+        vm.lea(VReg.V0, "_heap_ptr");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmp(VReg.S0, VReg.V0);
+        vm.jge("_scip_delegate");
+        vm.subImm(VReg.V2, VReg.S0, 16); // block
+        vm.loadByte(VReg.V1, VReg.V2, 0);
+        vm.cmpImm(VReg.V1, 6); // TYPE_STRING
+        vm.jne("_scip_delegate");
+        // 守卫:后缀为装箱串(v1 仅串后缀;非串由调用方先 _valueToStr)
+        vm.shrImm(VReg.V0, VReg.S1, 48);
+        vm.cmpImm(VReg.V0, 0x7FFC);
+        vm.jne("_scip_delegate");
+        // len1 / len2 / content2
+        vm.load(VReg.S3, VReg.V2, 8); // S3 = len1(block+8)
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_strlen");
+        vm.mov(VReg.S2, VReg.RET); // S2 = len2
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_getStrContent");
+        vm.mov(VReg.S1, VReg.RET); // S1 = content2
+
+        // 容量:flags_and_size 的 bits 16-63(分配时记录的用户请求大小 = 本块可用内容容量)。
+        // 不用 size_class(bits 6-9)查 c2s:writeStringHeader 把 type 以裸字节写入低 8 位
+        // (& 0xff…00 | 6),class 低 2 位(bits 6-7)被清零 → 按 class 回读容量恒偏小 →
+        // 每次追加都误判溢出走 grow(全拷贝,O(N²) 照旧)。size 字段在高字节不受影响,
+        // 且 _alloc 记录的请求大小 ≤ 块 class 容量,就地追加永不越块;小/大对象统一覆盖。
+        vm.subImm(VReg.V2, VReg.S0, 16);
+        vm.load(VReg.V0, VReg.V2, 0); // flags_and_size
+        vm.shrImm(VReg.V3, VReg.V0, 16); // V3 = 存留请求大小 = 内容容量
+        // need = len1 + len2 + 1(NUL)
+        vm.add(VReg.V0, VReg.S3, VReg.S2);
+        vm.addImm(VReg.V0, VReg.V0, 1);
+        vm.cmp(VReg.V0, VReg.V3);
+        vm.jgt("_scip_grow");
+
+        // ---- 原地追加 ----
+        vm.add(VReg.A0, VReg.S0, VReg.S3); // dest = content1+len1
+        vm.mov(VReg.A1, VReg.S1);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_memcpy");
+        vm.add(VReg.S3, VReg.S3, VReg.S2); // newlen
+        vm.add(VReg.V0, VReg.S0, VReg.S3);
+        vm.movImm(VReg.V1, 0);
+        vm.storeByte(VReg.V0, 0, VReg.V1); // 末尾 NUL
+        vm.subImm(VReg.V2, VReg.S0, 16);
+        vm.store(VReg.V2, 8, VReg.S3); // 更新 length@block+8
+        vm.mov(VReg.RET, VReg.S4); // 同指针
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
+
+        // ---- 溢出:2× 需求重分配(摊还) ----
+        vm.label("_scip_grow");
+        vm.add(VReg.S3, VReg.S3, VReg.S2); // newlen
+        vm.addImm(VReg.A0, VReg.S3, 17); // 16 头 + 内容 + NUL
+        vm.shlImm(VReg.A0, VReg.A0, 1); // 2× 摊还
+        vm.call("_alloc");
+        vm.mov(VReg.S4, VReg.RET); // S4 = 新内容(grow 路 boxed 旧串已弃)
+        // 拷旧串(len1 = newlen - len2)
+        vm.mov(VReg.A0, VReg.S4);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.sub(VReg.A2, VReg.S3, VReg.S2);
+        vm.call("_memcpy");
+        // 追后缀
+        vm.sub(VReg.V0, VReg.S3, VReg.S2);
+        vm.add(VReg.A0, VReg.S4, VReg.V0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_memcpy");
+        // 末尾 NUL
+        vm.add(VReg.V0, VReg.S4, VReg.S3);
+        vm.movImm(VReg.V1, 0);
+        vm.storeByte(VReg.V0, 0, VReg.V1);
+        // 写 type/len 头
+        this.writeStringHeader(VReg.S4, VReg.S3);
+        // 装箱
+        vm.mov(VReg.RET, VReg.S4);
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.RET, VReg.RET, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
+
+        // ---- 委托:语义与 _strconcat 逐字节一致 ----
+        vm.label("_scip_delegate");
+        vm.mov(VReg.A0, VReg.S4);
+        // A1 = S1(所有 delegate 点 S1 仍为 boxed 后缀)
+        vm.call("_strconcat");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
+    }
+
+
     // _cstr_to_heap_str(char*) -> 装箱 JS 字符串 (0x7FFC)
     // 把任意来源（如 OS 栈上的 argv/envp）的 C 字符串拷贝进 JS 堆，
     // 使其获得标准堆字符串头并可被 _getStrContent/_print 等安全识别。
@@ -4145,6 +4268,7 @@ export class StringGenerator {
         this.generateStrcat();
         this.generateGetStrContent();
         this.generateStrconcat();
+        this.generateStrConcatIP(); // [L4.1] 原地拼接助手(编译器逃逸门控专用;守卫不满足尾委托 _strconcat)
         this.generateCstrToHeapStr();
         this.generateCharToStr();
         this.generatePadEnd();

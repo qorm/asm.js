@@ -2031,6 +2031,31 @@ export class Compiler {
                     }
                 }
 
+                // [L4.2 字符串原地拼接] 模块顶层按可扫描"函数"处理:无形参;导出绑定
+                // 枚举出来供逃逸门控否决(import 侧可持有别名,顶层变量等价于全局)。
+                const _ipExported = new Set();
+                for (const _st of moduleAst.body) {
+                    if (_st.type !== "ExportDeclaration") continue;
+                    const _d = _st.declaration;
+                    if (_d && (_d.type === "FunctionDeclaration" || _d.type === "ClassDeclaration")) {
+                        if (_d.id && _d.id.name) _ipExported.add(_d.id.name);
+                    } else if (_d && _d.declarations) {
+                        for (const _dd of _d.declarations) {
+                            if (_dd.id && _dd.id.type === "Identifier") _ipExported.add(_dd.id.name);
+                        }
+                    } else if (_st.isDefault && _d && _d.type === "Identifier") {
+                        _ipExported.add(_d.name);
+                    }
+                    if (_st.specifiers) {
+                        for (const _sp of _st.specifiers) {
+                            if (_sp.local && _sp.local.name) _ipExported.add(_sp.local.name);
+                        }
+                    }
+                }
+                this.ctx._ipExportedNames = _ipExported;
+                this.ctx._ipScanRoot = { params: [], body: { type: "BlockStatement", body: moduleAst.body } };
+                this.ctx._ipIndex = null;
+
                 for (const stmt of moduleAst.body) {
                     if (stmt.type === "ImportDeclaration") {
                         continue;
@@ -2765,6 +2790,10 @@ export class Compiler {
         // 顶层声明无闭包,stub 传 A2=0。
         const isGenerator = _isGenFuncDecl(func) && !isAsync;
         const isAsyncGen = _isGenFuncDecl(func) && isAsync;
+        // [L4.2 字符串原地拼接] 逃逸门控的函数级扫描根。async/generator 骑协程
+        // (协程栈 + 推迟 GC 语义),本期一律不参与;普通函数以 AST 节点为扫描范围。
+        this.ctx._ipScanRoot = (isAsync || isGenerator || isAsyncGen) ? null : func;
+        this.ctx._ipIndex = null;
         this.ctx.inAsyncGenerator = isAsyncGen;
         if (isGenerator) {
             this.emitGeneratorStub(funcLabel + "_gbody", false);
