@@ -265,6 +265,8 @@ forwarding word(§6)兜底查表。
   形状对象改为**堆分配**,shape_ptr 变堆指针:它自身需要被修补(堆内自修补阶段
   处理),且 @48 不再"恒为静态值或 0"→ forwarding 判别逻辑需升级或改址。
   **结论:@48 是"借",不是"让";shape IC v2 立项时必须同步交还方案。**
+  **2026-07-22 更新:shape v2 已立项(`docs/SHAPE_TRANSITIONS_DESIGN.md`),其 §4 提出
+  仲裁案——shape 堆化先行、本方案 forwarding 改走 §6.3 位图判活通用方案(待评审)。**
 
 ### 6.3 @48 覆盖不到的类型 → 通用 forwarding 方案
 
