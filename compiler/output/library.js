@@ -5,7 +5,8 @@ import * as fs from "fs";
 import * as path from "path";
 
 // ---- 手写字符串解析助手（替代正则）----
-// 自举编译器暂不支持 RegexLiteral（gen1 里被静默丢弃），故 .jslib 解析改用字符串扫描。
+// 历史上自举编译器不支持 RegexLiteral（现已经 __RE_new shim 路线落地），
+// .jslib 解析保留手写字符串扫描（无运行时正则依赖，更快）。
 function jsIsSpace(c) {
     return c === " " || c === "\t" || c === "\n" || c === "\r";
 }

@@ -85,9 +85,10 @@ function runtimeNodeBase(pathMod, fsMod) {
 function _isGenFuncDecl(node) {
     return node && (node.isGenerator === true || node.generator === true);
 }
-// 裸模块名判定（等价 /^[a-z_][a-z0-9_]*$/）。改手写字符检查而非正则字面量，
-// 因自举编译器暂不支持 RegexLiteral codegen（gen1 里正则对象为 undefined，
-// .test() 调用即崩）。用于识别 node 内建导入（如 "fs"/"path"/"node:fs"）。
+// 裸模块名判定（等价 /^[a-z_][a-z0-9_]*$/）。手写字符检查而非正则字面量——
+// 历史上自举编译器不支持 RegexLiteral codegen（现已由 __RE_new shim 路线落地，
+// 见 expressions.js RegexLiteral 分支）；此处手写检查更快且无依赖，保留。
+// 用于识别 node 内建导入（如 "fs"/"path"/"node:fs"）。
 function isBareModuleName(s) {
     if (!s || s.length === 0) return false;
     const c0 = s.charCodeAt(0);
@@ -1665,7 +1666,8 @@ export class Compiler {
         if (this.os === "windows") {
             // PE 入口不经 CRT:RCX/RDX 是垃圾(非 argc/argv)。置 argc=0/argv=NULL,
             // 否则 _process_create_argv 对垃圾指针 strlen → 启动即 page fault。
-            // (真实命令行解析 GetCommandLineA 待做;自举编译器不读 argv。)
+            // (真实命令行经 GetCommandLineA 在运行时构建 process.argv:
+            //  runtime/core/process.js + backend/x64.js GetCommandLineA 调用点。)
             vm.movImm(VReg.A0, 0);
             vm.movImm(VReg.A1, 0);
         }

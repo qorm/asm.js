@@ -176,12 +176,11 @@ export function JS_MKFUNC(ptr) {
 //   +24: elements[1] (JSValue, 8 bytes)
 //   ...
 //
-// Object:
-//   +0: property_count (int64)
-//   +8: properties[0].key (char* 指针)
-//   +16: properties[0].value (JSValue)
-//   +24: properties[1].key (char* 指针)
-//   ...
+// Object(56B 头,见 runtime/types/object/index.js:29):
+//   +0: flags_and_size(qword:mark/type/class/size 位域,见 allocator.js:195)
+//   +8: count (int64)          +16: __proto__ (指针)
+//   +24: capacity (int64)      +32: props_ptr (外置 16B kv 数组:装箱 key + value)
+//   +40: flags_ptr             +48: shape_ptr (0=无形状;v1 静态形状 IC)
 //
 // Function/Closure:
 //   +0: code_ptr (指向代码)
