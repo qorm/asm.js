@@ -32,7 +32,7 @@ lldb 链式看点(注意:看点报告的 pc 是触发 store 后一条指令)、�
 ## 1. gen1 codegen/runtime 已知限制 —— 编译器源码必须避免的 gen1-hostile 模式
 
 1. **禁止 typed-array 多视图别名读位。** 不得用 `new Float64Array(buf)+new BigInt64Array(buf)` / `new Uint32Array(f32.buffer)` / `DataView` 在同一 ArrayBuffer 跨视图读位模式——gen1 不共享底层缓冲，读全 0 或崩。取 float 位模式一律用纯算术 BigInt（参照 `literals.js:11` / `operators.js` 的 `floatToInt64Bits`）。**残留违规已清除(2026-07-10 根因任务 #19:expressions.js 改 floatToF32Bits 纯算术,30 万 fuzz 全匹配;crypto.js 同治)。**
-2. **禁止对 float64 位模式用整数比较/排序。** 所有 number 统一为 float64 位模式；`<,<=,>,>=,min,max,sort` 必须走 `fcmp`（`compileComparison(useFloat=true)` 已正确）。两负数整数 cmp 顺序反转。违规：`builtin_math.js:55-77`(P1-3)、`operators.js:424-435` int 路径(P2-3)。等值 `===/!==` 用位相等（NaN/±0 边角可接受）。
+2. **禁止对 float64 位模式用整数比较/排序。** 所有 number 统一为 float64 位模式；`<,<=,>,>=,min,max,sort` 必须走 `fcmp`（`compileComparison(useFloat=true)` 已正确）。两负数整数 cmp 顺序反转。**P1-3 已修**(builtin_math 走 fcmp+NaN 传播,与 §0 表一致);`operators.js:424-435` int 路径(P2-3)潜伏非阻塞。等值 `===/!==` 用位相等（NaN/±0 边角可接受）。
 3. **不得依赖对象动态属性数超过静态预留槽位**（P0-3 落地前）。alloc 预算：`_object_new` 62、类实例 126、`{}`~1024、非空~512、namespace+16、类信息+4、prototype+256。大字典优先用 Map（链表增长）。
 4. **不得依赖数组索引赋值自动增长**（P0-2 落地前）。需要动态增长的数组用 `.push()`，不要越界索引赋值。
 5. **不得依赖堆分配跨 `INITIAL_HEAP_SIZE` 边界后仍正确**（P0-1 落地前）。当前靠调大初始堆掩盖。
