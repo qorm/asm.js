@@ -79,6 +79,7 @@ support/
 # === 会话杂物/本地脚本(勿入库)===
 /1
 /ptest/
+.agent-work/
 /self.sh
 /platform_test.sh
 g1

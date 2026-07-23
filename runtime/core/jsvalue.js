@@ -38,7 +38,6 @@
 // ==================== 常量定义 ====================
 
 // NaN-boxing 基础
-export const JS_NAN_BOXING_BASE = 0x7ff8000000000000n; // Quiet NaN 基础
 export const JS_TAG_MASK = 0x0007000000000000n; // Tag 位 (bits 48-50)
 export const JS_PAYLOAD_MASK = 0x0000ffffffffffffn; // Payload 位 (bits 0-47)
 
@@ -107,63 +106,6 @@ export function JS_VALUE_IS_FLOAT64(v) {
     return high16 < 0x7ff8n;
 }
 
-// 检查是否是 tagged value
-export function JS_VALUE_IS_TAGGED(v) {
-    const high16 = (v >> 48n) & 0xffffn;
-    return high16 >= 0x7ff8n && high16 <= 0x7fffn;
-}
-
-// 获取 tag (0-7)
-export function JS_VALUE_GET_TAG(v) {
-    if (!JS_VALUE_IS_TAGGED(v)) return -1; // 是 double
-    return Number((v >> 48n) & 0x7n);
-}
-
-// 获取 payload (48 位)
-export function JS_VALUE_GET_PAYLOAD(v) {
-    return v & JS_PAYLOAD_MASK;
-}
-
-// 获取指针 (符号扩展到 64 位)
-export function JS_VALUE_GET_PTR(v) {
-    let ptr = v & JS_PAYLOAD_MASK;
-    // 符号扩展 (如果第 47 位是 1)
-    if (ptr & 0x800000000000n) {
-        ptr |= 0xffff000000000000n;
-    }
-    return ptr;
-}
-
-// ==================== 值创建 ====================
-
-export function JS_MKVAL(tag, payload) {
-    return JS_NAN_BOXING_BASE | (BigInt(tag) << 48n) | (BigInt(payload) & JS_PAYLOAD_MASK);
-}
-
-export function JS_MKINT32(val) {
-    return JS_TAG_INT32_BASE | (BigInt(val) & 0xffffffffn);
-}
-
-export function JS_MKBOOL(val) {
-    return val ? JS_TRUE : JS_FALSE;
-}
-
-export function JS_MKSTR(ptr) {
-    return JS_TAG_STRING_BASE | (BigInt(ptr) & JS_PAYLOAD_MASK);
-}
-
-export function JS_MKOBJ(ptr) {
-    return JS_TAG_OBJECT_BASE | (BigInt(ptr) & JS_PAYLOAD_MASK);
-}
-
-export function JS_MKARR(ptr) {
-    return JS_TAG_ARRAY_BASE | (BigInt(ptr) & JS_PAYLOAD_MASK);
-}
-
-export function JS_MKFUNC(ptr) {
-    return JS_TAG_FUNCTION_BASE | (BigInt(ptr) & JS_PAYLOAD_MASK);
-}
-
 // ==================== 对象布局 ====================
 //
 // String: 纯 char* (null 结尾的 C 字符串)
@@ -176,12 +118,11 @@ export function JS_MKFUNC(ptr) {
 //   +24: elements[1] (JSValue, 8 bytes)
 //   ...
 //
-// Object:
-//   +0: property_count (int64)
-//   +8: properties[0].key (char* 指针)
-//   +16: properties[0].value (JSValue)
-//   +24: properties[1].key (char* 指针)
-//   ...
+// Object(56B 头,见 runtime/types/object/index.js:29):
+//   +0: flags_and_size(qword:mark/type/class/size 位域,见 allocator.js:195)
+//   +8: count (int64)          +16: __proto__ (指针)
+//   +24: capacity (int64)      +32: props_ptr (外置 16B kv 数组:装箱 key + value)
+//   +40: flags_ptr             +48: shape_ptr (0=无形状;v1 静态形状 IC)
 //
 // Function/Closure:
 //   +0: code_ptr (指向代码)

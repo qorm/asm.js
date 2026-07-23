@@ -66,38 +66,6 @@ const TypeToSubtype = {
     [Type.FLOAT64]: NumberSubtype.Float64,
 };
 
-// 获取类型的字节大小
-export function sizeOf(type) {
-    const subtype = TypeToSubtype[type];
-    if (subtype) {
-        return subtype.size;
-    }
-    // 基础类型
-    switch (type) {
-        case Type.NUMBER:
-            return 8; // 默认 64 位 (Float64)
-        case Type.BOOLEAN:
-            return 1;
-        case Type.STRING:
-        case Type.ARRAY:
-        case Type.OBJECT:
-        case Type.FUNCTION:
-        case Type.DATE:
-        case Type.MAP:
-        case Type.SET:
-        case Type.REGEXP:
-            return 8; // 指针大小
-        default:
-            return 8;
-    }
-}
-
-// 判断类型是否有符号
-export function isSigned(type) {
-    const subtype = TypeToSubtype[type];
-    return subtype ? subtype.signed : true;
-}
-
 // 判断类型是否是浮点
 export function isFloatType(type) {
     const subtype = TypeToSubtype[type];
@@ -113,39 +81,6 @@ export function isIntType(type) {
     return false;
 }
 
-// 类型检查错误收集器
-export class TypeChecker {
-    constructor() {
-        this.errors = [];
-        this.warnings = [];
-    }
-
-    error(message, node) {
-        const loc = node && node.loc ? ` at line ${node.loc.start.line}` : "";
-        this.errors.push(`TypeError${loc}: ${message}`);
-    }
-
-    warning(message, node) {
-        const loc = node && node.loc ? ` at line ${node.loc.start.line}` : "";
-        this.warnings.push(`TypeWarning${loc}: ${message}`);
-    }
-
-    hasErrors() {
-        return this.errors.length > 0;
-    }
-
-    report() {
-        for (const w of this.warnings) {
-            console.warn(w);
-        }
-        for (const e of this.errors) {
-            console.error(e);
-        }
-    }
-}
-
-// 全局类型检查器实例
-export const typeChecker = new TypeChecker();
 
 // 类型兼容性检查
 export function isCompatible(from, to) {

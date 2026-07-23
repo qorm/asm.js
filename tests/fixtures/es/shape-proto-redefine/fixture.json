@@ -1,0 +1,7 @@
+{
+  "description": "shape v2 T2a prototype shaping: redefine",
+  "expect": {
+    "stdout": "1\n2\n2",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "description": "L4 string in-place concat: tail-use",
+  "expect": {
+    "stdout": "<0,1,2,3,4,>\n20 string",
+    "exitCode": 0
+  }
+}

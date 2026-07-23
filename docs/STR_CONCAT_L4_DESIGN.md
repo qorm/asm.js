@@ -1,9 +1,35 @@
 # 字符串拼接 O(N²) 专项设计 — L4 可变累加缓冲(逃逸门控)
 
-> 日期:2026-07-20 · 状态:设计评审稿(未动手) · 上游:docs/PERF_PLAN.md L4(自封 #1 优先级后长期未落地)
+> 日期:2026-07-20 · **状态:L4.1 + L4.2 已落地(2026-07-22,arch/efficiency 分支)** · 上游:docs/PERF_PLAN.md L4(自封 #1 优先级后长期未落地)
 > 实测基线(v0.2.1+,2026-07-20):bench/str **~654×** vs Node(不可变串累加每次全拷贝,O(N²));
 > num 1.6×、prop 8.3×(形状 IC 后)。str 是当前最大单项差距。
+> **落地实测(2026-07-22)**:bench/str **12.78s → 0.006s(~2130×;= Node 的 0.21×,反超)**,
+> macos-arm64 与 macos-x64(Rosetta)输出逐字节同 Node;fixtures 362 → 372 全绿(新增 10 个
+> L4 fixture:正向 4 + 逃逸反例 4 + 边界 2);gen0 自编译墙钟 A/B 无差异;num/prop 基准无回归。
 > 铁律:fixtures 不降;macos-arm64 全链 gen1==gen2==gen3;test262 只升;内存布局变更原子提交。
+> (arch/efficiency 分支门禁为 fixtures;自举定点回并 dev 时补。)
+
+## 实现笔记(2026-07-22)
+
+- **L4.1 运行时助手** `generateStrConcatIP`(runtime/types/string/index.js):守卫/原地追加/
+  2× 摊还 grow/尾委托,按设计实现。**接线时修复 WIP 容量 bug**:原设计按 size_class(bits 6-9)
+  查 `_gc_c2s` 得容量——但 `writeStringHeader` 以**裸字节**写 type(低 8 位整体覆盖,class
+  低 2 位被清零)→ class 回读恒偏小 → 每次追加误判溢出走 grow(全拷贝,O(N²) 照旧,实测
+  12.78s 与基线无差)。改为直接读 flags_and_size 的 **bits 16-63(分配时记录的用户请求大小)**:
+  高字节不受 writeStringHeader 影响,请求大小 ≤ 块 class 容量(就地永不越块),小/大对象统一。
+- **L4.2 编译器门控**(compiler/expressions/assignments.js `_buildIpIndex`/`_canIpStringAccum`):
+  按 §2.3 落地,两处实现细化:
+  - **活跃区位置规则**:别名化引用只允许出现在末次门控拼接之后;若末次拼接在循环内,
+    活跃区延伸到**最外层**含该拼接的循环结束(循环内任何别名否决;循环前别名也否决——
+    它持有拼接前的值,会在循环内被原地改)。使 `for(...) s+=x; console.log(s)` 这类
+    主流形态可优化,同时保守性不减。
+  - **扫描索引化**:扫描根(函数/模块 AST)单次遍历建按名索引,裁决 O(该名引用数)。
+    逐站点全函数扫描曾使 gen0 自编译 +1.5s(模块级大 AST × 候选名数),索引化后 A/B 无差。
+  - 门控前置 `inferType(right) === STRING` 过滤:数值累加根本不进 compileStringConcat,免扫描。
+- **v1 边界(与设计一致)**:仅优化静态串右侧(`+=` 非串右值走 _js_add 运行时分派,不优化但
+  正确);async/generator/with/捕获/导出变量一律否决;**源码裸 NUL 字节与 `\0` 转义被 lexer
+  丢弃是既有冻结债**(plan.md S5)——NUL fixture 用 `String.fromCharCode(0)` 运行期构造。
+- L4.3(扩大形态:全局变量累加、forin 累加、_js_add 串分支 IP 化)另行评审。
 
 ---
 

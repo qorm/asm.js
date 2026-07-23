@@ -85,9 +85,10 @@ function runtimeNodeBase(pathMod, fsMod) {
 function _isGenFuncDecl(node) {
     return node && (node.isGenerator === true || node.generator === true);
 }
-// 裸模块名判定（等价 /^[a-z_][a-z0-9_]*$/）。改手写字符检查而非正则字面量，
-// 因自举编译器暂不支持 RegexLiteral codegen（gen1 里正则对象为 undefined，
-// .test() 调用即崩）。用于识别 node 内建导入（如 "fs"/"path"/"node:fs"）。
+// 裸模块名判定（等价 /^[a-z_][a-z0-9_]*$/）。手写字符检查而非正则字面量——
+// 历史上自举编译器不支持 RegexLiteral codegen（现已由 __RE_new shim 路线落地，
+// 见 expressions.js RegexLiteral 分支）；此处手写检查更快且无依赖，保留。
+// 用于识别 node 内建导入（如 "fs"/"path"/"node:fs"）。
 function isBareModuleName(s) {
     if (!s || s.length === 0) return false;
     const c0 = s.charCodeAt(0);
@@ -1665,7 +1666,8 @@ export class Compiler {
         if (this.os === "windows") {
             // PE 入口不经 CRT:RCX/RDX 是垃圾(非 argc/argv)。置 argc=0/argv=NULL,
             // 否则 _process_create_argv 对垃圾指针 strlen → 启动即 page fault。
-            // (真实命令行解析 GetCommandLineA 待做;自举编译器不读 argv。)
+            // (真实命令行经 GetCommandLineA 在运行时构建 process.argv:
+            //  runtime/core/process.js + backend/x64.js GetCommandLineA 调用点。)
             vm.movImm(VReg.A0, 0);
             vm.movImm(VReg.A1, 0);
         }
@@ -2030,6 +2032,31 @@ export class Compiler {
                         this.compileImportBindingInitialization(stmt);
                     }
                 }
+
+                // [L4.2 字符串原地拼接] 模块顶层按可扫描"函数"处理:无形参;导出绑定
+                // 枚举出来供逃逸门控否决(import 侧可持有别名,顶层变量等价于全局)。
+                const _ipExported = new Set();
+                for (const _st of moduleAst.body) {
+                    if (_st.type !== "ExportDeclaration") continue;
+                    const _d = _st.declaration;
+                    if (_d && (_d.type === "FunctionDeclaration" || _d.type === "ClassDeclaration")) {
+                        if (_d.id && _d.id.name) _ipExported.add(_d.id.name);
+                    } else if (_d && _d.declarations) {
+                        for (const _dd of _d.declarations) {
+                            if (_dd.id && _dd.id.type === "Identifier") _ipExported.add(_dd.id.name);
+                        }
+                    } else if (_st.isDefault && _d && _d.type === "Identifier") {
+                        _ipExported.add(_d.name);
+                    }
+                    if (_st.specifiers) {
+                        for (const _sp of _st.specifiers) {
+                            if (_sp.local && _sp.local.name) _ipExported.add(_sp.local.name);
+                        }
+                    }
+                }
+                this.ctx._ipExportedNames = _ipExported;
+                this.ctx._ipScanRoot = { params: [], body: { type: "BlockStatement", body: moduleAst.body } };
+                this.ctx._ipIndex = null;
 
                 for (const stmt of moduleAst.body) {
                     if (stmt.type === "ImportDeclaration") {
@@ -2765,6 +2792,10 @@ export class Compiler {
         // 顶层声明无闭包,stub 传 A2=0。
         const isGenerator = _isGenFuncDecl(func) && !isAsync;
         const isAsyncGen = _isGenFuncDecl(func) && isAsync;
+        // [L4.2 字符串原地拼接] 逃逸门控的函数级扫描根。async/generator 骑协程
+        // (协程栈 + 推迟 GC 语义),本期一律不参与;普通函数以 AST 节点为扫描范围。
+        this.ctx._ipScanRoot = (isAsync || isGenerator || isAsyncGen) ? null : func;
+        this.ctx._ipIndex = null;
         this.ctx.inAsyncGenerator = isAsyncGen;
         if (isGenerator) {
             this.emitGeneratorStub(funcLabel + "_gbody", false);
@@ -3170,21 +3201,6 @@ export function compileFile(inputFile, outputFile, target) {
     target = target || detectPlatform();
     const compiler = new Compiler(target);
     return compiler.compileFile(inputFile, outputFile);
-}
-
-export function parseSource(source) {
-    const lexer = new Lexer(source);
-    const parser = new Parser(lexer);
-    return parser.parseProgram();
-}
-
-export function parseFile(inputFile) {
-    const source = fs.readFileSync(inputFile, "utf-8");
-    return parseSource(source);
-}
-
-export function createCompiler(target, options) {
-    return new Compiler(target, options);
 }
 
 function normalizeNodeModuleName(importSource) {

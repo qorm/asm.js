@@ -55,24 +55,8 @@ export function detectPlatform() {
 }
 
 // 获取目标平台的 OS
-export function getTargetOS(target) {
-    let info = TARGETS[target];
-    if (!info) return null;
-    if (info.alias) {
-        info = TARGETS[info.alias];
-    }
-    return info.os;
-}
 
 // 获取目标平台的架构
-export function getTargetArch(target) {
-    let info = TARGETS[target];
-    if (!info) return null;
-    if (info.alias) {
-        info = TARGETS[info.alias];
-    }
-    return info.arch;
-}
 
 // 获取目标平台信息
 export function getTargetInfo(targetPlatform) {
@@ -119,68 +103,6 @@ export function listTargets() {
 }
 
 // 获取当前平台对应的系统调用号
-export function getSyscallNumbers(target) {
-    let info = getTargetInfo(target);
-    if (!info) return null;
-
-    let os = info.os;
-    let arch = info.arch;
-
-    // 系统调用号表
-    const syscalls = {
-        "linux-x64": {
-            read: 0,
-            write: 1,
-            open: 2,
-            close: 3,
-            mmap: 9,
-            munmap: 11,
-            brk: 12,
-            exit: 60,
-            exit_group: 231,
-        },
-        "linux-arm64": {
-            read: 63,
-            write: 64,
-            openat: 56,
-            close: 57,
-            mmap: 222,
-            munmap: 215,
-            brk: 214,
-            exit: 93,
-            exit_group: 94,
-        },
-        "macos-x64": {
-            read: 0x2000003,
-            write: 0x2000004,
-            open: 0x2000005,
-            close: 0x2000006,
-            mmap: 0x20000c5,
-            munmap: 0x2000049,
-            exit: 0x2000001,
-        },
-        "macos-arm64": {
-            read: 3,
-            write: 4,
-            open: 5,
-            close: 6,
-            mmap: 197,
-            munmap: 73,
-            exit: 1,
-        },
-        "windows-x64": {
-            // Windows 使用 NTDLL 而非直接系统调用
-            NtWriteFile: 0x08,
-            NtReadFile: 0x06,
-            NtAllocateVirtualMemory: 0x18,
-            NtFreeVirtualMemory: 0x1e,
-            NtTerminateProcess: 0x2c,
-        },
-    };
-
-    let key = os + "-" + arch;
-    return syscalls[key] || null;
-}
 
 // 获取 mmap 标志
 export function getMmapFlags(target) {

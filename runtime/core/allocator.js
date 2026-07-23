@@ -30,11 +30,6 @@ import { P_MC_CUR, P_MC_END, P_SIZE, P_MAX, P_SAVED_SP, P_STACK_HI } from "./par
 
 // ==================== 常量定义 ====================
 
-// GC 标记值（三色标记）
-export const GC_WHITE = 0; // 未标记（垃圾候选）
-export const GC_GRAY = 1; // 待处理（已发现但未遍历）
-export const GC_BLACK = 2; // 已处理（可达且已遍历）
-
 // 对象类型 (统一类型常量，用于 GC 遍历)
 export const TYPE_RAW = 0; // 原始数据，无引用
 export const TYPE_ARRAY = 1; // 数组，包含引用
@@ -255,28 +250,6 @@ export function getSizeClass(size) {
         }
     }
     return -1; // 大对象
-}
-
-// 构造 flags_and_size 值
-export function makeHeader(mark, type, sizeClass, size) {
-    return mark | (type << TYPE_SHIFT) | (sizeClass << CLASS_SHIFT) | (size << SIZE_SHIFT);
-}
-
-// 从 flags_and_size 提取各字段
-export function getMark(flagsAndSize) {
-    return flagsAndSize & MARK_MASK;
-}
-
-export function getType(flagsAndSize) {
-    return (flagsAndSize >> TYPE_SHIFT) & TYPE_MASK;
-}
-
-export function getSizeClassFromHeader(flagsAndSize) {
-    return (flagsAndSize >> CLASS_SHIFT) & CLASS_MASK;
-}
-
-export function getSize(flagsAndSize) {
-    return flagsAndSize >> SIZE_SHIFT;
 }
 
 export function alignUp(size) {
@@ -4387,6 +4360,11 @@ export class AllocatorGenerator {
         // 位于 _data_gc_end 之前 → 被 GC 根扫描覆盖，其挂载的属性/回调不会被回收。
         asm.addDataLabel("_global_this");
         asm.addDataQword(0);  // NULL - runtime sets this to the actual global object
+
+        // [shape v2 · T0] 形状转移表根(运行时首条转移边写入时惰性建表)。
+        // 数据段锚槽 → 根扫描覆盖 → 表与堆上转移节点不被回收。见 SHAPE_TRANSITIONS_DESIGN.md §3/§4。
+        asm.addDataLabel("_shape_transition_root");
+        asm.addDataQword(0);  // NULL - 首次 _shape_transition_put 建表并写入
 
         // 事件循环队列（微任务 / setImmediate / setTimeout(0)）的单链表头尾指针。
         // 节点由 _ev_* 运行时函数分配；根扫描覆盖这些槽 → 队列中的回调/句柄存活。

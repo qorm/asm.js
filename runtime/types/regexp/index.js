@@ -154,8 +154,9 @@ export class RegExpGenerator {
         // A0 = RegExp 对象指针
         // A1 = 输入字符串指针
         // 返回: 结果数组指针，null (0) 表示不匹配
-        // 注意：简化版本，暂时总是返回 null
-        // TODO: 实现完整的 exec() 功能，需要 _array_new 和 _strlen
+        // 注意：简化版本，总是返回 null。完整的 exec() 已由纯 JS 的
+        // __regexp_shim 路线取代（builtin_methods.js 正则方法分派），
+        // 此标号保留为回退 stub。
         vm.label("_regexp_exec");
         vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
 

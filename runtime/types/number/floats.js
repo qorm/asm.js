@@ -172,9 +172,7 @@ export class FloatsGenerator {
         this.generateUnboxFloat();
         this.generateUnboxToFloat64();
         this.generateBoxIntAsNumber();
-        // 转换函数在某些后端可能缺少必要的指令
-        // 暂时跳过，需要时再启用
-        // this.generateFloat32ToFloat64();
-        // this.generateFloat64ToFloat32();
+        // f32↔f64 转换现走编译期纯算术(floatToF32Bits,见 BOOTSTRAP_RULES §1.1
+        // P2-4 修复):运行时 generateFloat32ToFloat64/Float64ToFloat32 不再发射。
     }
 }

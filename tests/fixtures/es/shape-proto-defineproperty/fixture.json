@@ -1,0 +1,7 @@
+{
+  "description": "shape v2 T2a: defineProperty new key + accessor redefine (value-redefine excluded: pre-existing engine bug)",
+  "expect": {
+    "stdout": "1 n\nx\ngot",
+    "exitCode": 0
+  }
+}

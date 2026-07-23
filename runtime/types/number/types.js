@@ -95,33 +95,9 @@ export const NumberTypes = {
     },
 };
 
-// 类型 ID 到名称的映射
-export const TypeIdToName = {
-    [TYPE_INT8]: "int8",
-    [TYPE_INT16]: "int16",
-    [TYPE_INT32]: "int32",
-    [TYPE_INT64]: "int64",
-    [TYPE_UINT8]: "uint8",
-    [TYPE_UINT16]: "uint16",
-    [TYPE_UINT32]: "uint32",
-    [TYPE_UINT64]: "uint64",
-    [TYPE_FLOAT32]: "float32",
-    [TYPE_FLOAT64]: "float64",
-};
-
 // 判断类型是否为整数
 export function isIntegerType(typeId) {
     return typeId >= TYPE_INT8 && typeId <= TYPE_UINT64;
-}
-
-// 判断类型是否为有符号整数
-export function isSignedIntegerType(typeId) {
-    return typeId >= TYPE_INT8 && typeId <= TYPE_INT64;
-}
-
-// 判断类型是否为无符号整数
-export function isUnsignedIntegerType(typeId) {
-    return typeId >= TYPE_UINT8 && typeId <= TYPE_UINT64;
 }
 
 // 判断类型是否为浮点
@@ -129,24 +105,3 @@ export function isFloatType(typeId) {
     return typeId === TYPE_FLOAT32 || typeId === TYPE_FLOAT64;
 }
 
-// 获取类型位宽
-export function getTypeBitWidth(typeId) {
-    switch (typeId) {
-        case TYPE_INT8:
-        case TYPE_UINT8:
-            return 8;
-        case TYPE_INT16:
-        case TYPE_UINT16:
-            return 16;
-        case TYPE_INT32:
-        case TYPE_UINT32:
-        case TYPE_FLOAT32:
-            return 32;
-        case TYPE_INT64:
-        case TYPE_UINT64:
-        case TYPE_FLOAT64:
-            return 64;
-        default:
-            return 64;
-    }
-}

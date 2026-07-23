@@ -1,0 +1,7 @@
+{
+  "description": "L4 string in-place concat: nested",
+  "expect": {
+    "stdout": "***** outer",
+    "exitCode": 0
+  }
+}

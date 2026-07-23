@@ -140,32 +140,3 @@ export class RuntimeGenerator {
         this.parallelSchedGen.generateDataSection(asm); // P 数组/全局队列/计数/冒烟结果
     }
 }
-
-// 运行时配置
-let heapSize = 1048576; // 默认 1MB
-let maxHeapSize = 0; // 0 = 无限制
-let numWorkers = 0; // 0 = 单线程
-
-export function getHeapSize() {
-    return heapSize;
-}
-
-export function setHeapSize(size) {
-    heapSize = size;
-}
-
-export function getMaxHeapSize() {
-    return maxHeapSize;
-}
-
-export function setMaxHeapSize(size) {
-    maxHeapSize = size;
-}
-
-export function getNumWorkers() {
-    return numWorkers;
-}
-
-export function setNumWorkers(n) {
-    numWorkers = n;
-}

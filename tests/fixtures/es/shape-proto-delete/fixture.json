@@ -1,0 +1,7 @@
+{
+  "description": "shape v2 T2a prototype shaping: delete",
+  "expect": {
+    "stdout": "k d\nk undefined",
+    "exitCode": 0
+  }
+}
