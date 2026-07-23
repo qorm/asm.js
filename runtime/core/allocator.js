@@ -30,11 +30,6 @@ import { P_MC_CUR, P_MC_END, P_SIZE, P_MAX, P_SAVED_SP, P_STACK_HI } from "./par
 
 // ==================== 常量定义 ====================
 
-// GC 标记值（三色标记）
-export const GC_WHITE = 0; // 未标记（垃圾候选）
-export const GC_GRAY = 1; // 待处理（已发现但未遍历）
-export const GC_BLACK = 2; // 已处理（可达且已遍历）
-
 // 对象类型 (统一类型常量，用于 GC 遍历)
 export const TYPE_RAW = 0; // 原始数据，无引用
 export const TYPE_ARRAY = 1; // 数组，包含引用
@@ -255,28 +250,6 @@ export function getSizeClass(size) {
         }
     }
     return -1; // 大对象
-}
-
-// 构造 flags_and_size 值
-export function makeHeader(mark, type, sizeClass, size) {
-    return mark | (type << TYPE_SHIFT) | (sizeClass << CLASS_SHIFT) | (size << SIZE_SHIFT);
-}
-
-// 从 flags_and_size 提取各字段
-export function getMark(flagsAndSize) {
-    return flagsAndSize & MARK_MASK;
-}
-
-export function getType(flagsAndSize) {
-    return (flagsAndSize >> TYPE_SHIFT) & TYPE_MASK;
-}
-
-export function getSizeClassFromHeader(flagsAndSize) {
-    return (flagsAndSize >> CLASS_SHIFT) & CLASS_MASK;
-}
-
-export function getSize(flagsAndSize) {
-    return flagsAndSize >> SIZE_SHIFT;
 }
 
 export function alignUp(size) {

@@ -2,8 +2,6 @@
 // 所有堆分配的复合类型都使用统一的头部结构
 
 // 头部偏移量
-export const HEADER_TYPE_OFFSET = 0; // 类型标记 (8 bytes)
-export const HEADER_LENGTH_OFFSET = 8; // 长度/数量 (8 bytes) 或数值
 export const HEADER_SIZE = 16; // 头部总大小
 
 // 复合类型标记常量 (与 allocator.js 保持一致)
@@ -82,21 +80,8 @@ export const NumberTypes = {
     Float64: { code: NUM_FLOAT64, size: 8, signed: true, float: true },
 };
 
-// 从子类型代码获取元数据
-export function getNumberTypeMeta(code) {
-    for (const [name, meta] of Object.entries(NumberTypes)) {
-        if (meta.code === code) return { name, ...meta };
-    }
-    return null;
-}
-
 // 类型标记位掩码 (用于从 type 字段提取类型)
 export const TYPE_MASK = 0xffff;
-
-// 标志位 (type 字段的高位)
-export const FLAG_GC_MARK = 0x10000; // GC 标记位
-export const FLAG_IMMUTABLE = 0x20000; // 不可变标记
-export const FLAG_FROZEN = 0x40000; // Object.freeze
 
 /**
  * 统一对象头部结构:

@@ -53,12 +53,6 @@ const EXT_FROZEN = 4; // bit2: frozen(叠加拒改写已有值)
 // 写守卫。与 EXT_NONEXT/SEALED/FROZEN 正交:isFrozen/isSealed/isExtensible 只按各自
 // 专位 andImm 判别,不受 bit3 干扰。
 const EXT_HASFLAGS = 8; // bit3: 存在 per-property flags 块
-// [enum-order] bit4:对象属性存储已按 ES [[OwnPropertyKeys]] 规范序归一
-// (整数索引键升序在前、再字符串键插入序)。惰性:首次枚举(_object_keys/values/
-// entries/assign/for-in)时置位并(仅当含整数键且未 materialize flags 时)重排存储。
-// 无整数键(编译器自身对象全此类)→ 只置位不动存储,产物逐字节不变。
-const EXT_ORDERED = 16;
-
 export class ObjectGenerator {
     constructor(vm) {
         this.vm = vm;

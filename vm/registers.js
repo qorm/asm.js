@@ -43,10 +43,3 @@ export const RegType = {
     SPECIAL: "special", // 特殊用途
 };
 
-// 获取寄存器类型
-export function getRegType(vreg) {
-    if (vreg.startsWith("V")) return RegType.GENERAL;
-    if (vreg.startsWith("S")) return RegType.SAVED;
-    if (vreg.startsWith("A")) return RegType.ARGUMENT;
-    return RegType.SPECIAL;
-}

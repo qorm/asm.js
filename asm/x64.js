@@ -28,14 +28,6 @@ export let Reg = {
     R9B: 9, // R9 低 8 位
 };
 
-// 调用约定 (System V AMD64 ABI - Linux/macOS)
-export let CallConv = {
-    args: [Reg.RDI, Reg.RSI, Reg.RDX, Reg.RCX, Reg.R8, Reg.R9],
-    ret: Reg.RAX,
-    callerSaved: [Reg.RAX, Reg.RCX, Reg.RDX, Reg.RSI, Reg.RDI, Reg.R8, Reg.R9, Reg.R10, Reg.R11],
-    calleeSaved: [Reg.RBX, Reg.R12, Reg.R13, Reg.R14, Reg.R15, Reg.RBP],
-};
-
 // x86_64 代码生成器
 export class X64Assembler {
     constructor() {

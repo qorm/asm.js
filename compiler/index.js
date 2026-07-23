@@ -3203,21 +3203,6 @@ export function compileFile(inputFile, outputFile, target) {
     return compiler.compileFile(inputFile, outputFile);
 }
 
-export function parseSource(source) {
-    const lexer = new Lexer(source);
-    const parser = new Parser(lexer);
-    return parser.parseProgram();
-}
-
-export function parseFile(inputFile) {
-    const source = fs.readFileSync(inputFile, "utf-8");
-    return parseSource(source);
-}
-
-export function createCompiler(target, options) {
-    return new Compiler(target, options);
-}
-
 function normalizeNodeModuleName(importSource) {
     if (!importSource) return "";
     return importSource.startsWith("node:") ? importSource.slice(5) : importSource;

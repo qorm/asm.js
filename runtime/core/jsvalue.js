@@ -38,7 +38,6 @@
 // ==================== 常量定义 ====================
 
 // NaN-boxing 基础
-export const JS_NAN_BOXING_BASE = 0x7ff8000000000000n; // Quiet NaN 基础
 export const JS_TAG_MASK = 0x0007000000000000n; // Tag 位 (bits 48-50)
 export const JS_PAYLOAD_MASK = 0x0000ffffffffffffn; // Payload 位 (bits 0-47)
 
@@ -105,63 +104,6 @@ export function JS_VALUE_IS_FLOAT64(v) {
     // 如果高 16 位 < 0x7FF8，是普通 double
     // 如果高 16 位 > 0x7FFF，也是普通 double (负数 NaN，不应该出现)
     return high16 < 0x7ff8n;
-}
-
-// 检查是否是 tagged value
-export function JS_VALUE_IS_TAGGED(v) {
-    const high16 = (v >> 48n) & 0xffffn;
-    return high16 >= 0x7ff8n && high16 <= 0x7fffn;
-}
-
-// 获取 tag (0-7)
-export function JS_VALUE_GET_TAG(v) {
-    if (!JS_VALUE_IS_TAGGED(v)) return -1; // 是 double
-    return Number((v >> 48n) & 0x7n);
-}
-
-// 获取 payload (48 位)
-export function JS_VALUE_GET_PAYLOAD(v) {
-    return v & JS_PAYLOAD_MASK;
-}
-
-// 获取指针 (符号扩展到 64 位)
-export function JS_VALUE_GET_PTR(v) {
-    let ptr = v & JS_PAYLOAD_MASK;
-    // 符号扩展 (如果第 47 位是 1)
-    if (ptr & 0x800000000000n) {
-        ptr |= 0xffff000000000000n;
-    }
-    return ptr;
-}
-
-// ==================== 值创建 ====================
-
-export function JS_MKVAL(tag, payload) {
-    return JS_NAN_BOXING_BASE | (BigInt(tag) << 48n) | (BigInt(payload) & JS_PAYLOAD_MASK);
-}
-
-export function JS_MKINT32(val) {
-    return JS_TAG_INT32_BASE | (BigInt(val) & 0xffffffffn);
-}
-
-export function JS_MKBOOL(val) {
-    return val ? JS_TRUE : JS_FALSE;
-}
-
-export function JS_MKSTR(ptr) {
-    return JS_TAG_STRING_BASE | (BigInt(ptr) & JS_PAYLOAD_MASK);
-}
-
-export function JS_MKOBJ(ptr) {
-    return JS_TAG_OBJECT_BASE | (BigInt(ptr) & JS_PAYLOAD_MASK);
-}
-
-export function JS_MKARR(ptr) {
-    return JS_TAG_ARRAY_BASE | (BigInt(ptr) & JS_PAYLOAD_MASK);
-}
-
-export function JS_MKFUNC(ptr) {
-    return JS_TAG_FUNCTION_BASE | (BigInt(ptr) & JS_PAYLOAD_MASK);
 }
 
 // ==================== 对象布局 ====================
