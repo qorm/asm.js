@@ -72,6 +72,7 @@ export class ObjectGenerator {
         this.generateObjectGet();
         this.generateObjectGetIC();
         this.generateThrowReadNullish();
+        this.generateThrowTypeError();
         this.generateObjectSetIC();
         this.generateObjectDelete();
         this.generateMaybeGetter();
@@ -1688,6 +1689,52 @@ export class ObjectGenerator {
         vm.store(VReg.V0, 0, VReg.V1);
         vm.call("_throw_unwind"); // 不返回
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 16); // 理论不达
+    }
+
+    // _throw_type_error(A0 = boxed message 字符串):构造 TypeError {name,message,__asmjs_err,cause}
+    // 普通对象(与 _throw_read_nullish 同表示,故 e instanceof TypeError / e.name / e.message 成立),
+    // 置异常槽后 _throw_unwind 跨帧交给最近 try/catch。不返回。
+    // [test262 S1] 复用原语:_throw_not_a_function / 数组回调守卫 / Object.* 类型守卫等共用。
+    generateThrowTypeError() {
+        const vm = this.vm;
+        const boxStr = (reg) => { // 把 reg 内 cstr 地址标记成堆串(0x7FFC)
+            vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(reg, reg, VReg.V1);
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(reg, reg, VReg.V1);
+        };
+        vm.label("_throw_type_error");
+        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.mov(VReg.S0, VReg.A0); // S0 = boxed message
+        vm.call("_object_new");
+        vm.call("_box_obj_r");
+        vm.mov(VReg.S2, VReg.RET); // S2 = errObj(boxed)
+        // name = "TypeError"
+        vm.mov(VReg.A0, VReg.S2);
+        vm.lea(VReg.A1, vm.asm.addString("name")); boxStr(VReg.A1);
+        vm.lea(VReg.A2, vm.asm.addString("TypeError")); boxStr(VReg.A2);
+        vm.call("_object_set");
+        // message
+        vm.mov(VReg.A0, VReg.S2);
+        vm.lea(VReg.A1, vm.asm.addString("message")); boxStr(VReg.A1);
+        vm.mov(VReg.A2, VReg.S0);
+        vm.call("_object_set");
+        // __asmjs_err = true(instanceof Error 族品牌)
+        vm.mov(VReg.A0, VReg.S2);
+        vm.lea(VReg.A1, vm.asm.addString("__asmjs_err")); boxStr(VReg.A1);
+        vm.movImm64(VReg.A2, 0x7ff9000000000001n); // boxed true
+        vm.call("_object_set");
+        // cause = undefined(否则 e.cause 缺属性返 int 0 非 undefined)
+        vm.mov(VReg.A0, VReg.S2);
+        vm.lea(VReg.A1, vm.asm.addString("cause")); boxStr(VReg.A1);
+        vm.movImm64(VReg.A2, 0x7ffb000000000000n); // undefined
+        vm.call("_object_set");
+        // 置异常槽并 unwind
+        vm.lea(VReg.V0, "_exception_value");
+        vm.store(VReg.V0, 0, VReg.S2);
+        vm.lea(VReg.V0, "_exception_pending");
+        vm.movImm(VReg.V1, 1);
+        vm.store(VReg.V0, 0, VReg.V1);
+        vm.call("_throw_unwind"); // 不返回
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 16); // 理论不达
     }
 
     // [P2] 属性写站点缓存

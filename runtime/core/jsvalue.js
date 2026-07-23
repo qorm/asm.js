@@ -336,15 +336,14 @@ export class JSValueGenerator {
         vm.call("_throw_not_a_function");      // 不返回(_throw_unwind)
         // _throw_not_a_function:置 _exception_value="not a function"、pending=1,跨函数 unwind。
         vm.label("_throw_not_a_function");
-        vm.lea(VReg.V1, vm.asm.addString("not a function"));
-        vm.movImm64(VReg.V0, 0x7ffc000000000000n); // STRING_TAG
-        vm.or(VReg.V1, VReg.V1, VReg.V0);
-        vm.lea(VReg.V0, "_exception_value");
-        vm.store(VReg.V0, 0, VReg.V1);
-        vm.lea(VReg.V0, "_exception_pending");
-        vm.movImm(VReg.V1, 1);
-        vm.store(VReg.V0, 0, VReg.V1);
-        vm.call("_throw_unwind");
+        // [test262 S1] 抛真 TypeError 对象(原抛裸字符串 → e instanceof TypeError / e.name 失败)。
+        // 构造 boxed "not a function" 消息后委托 _throw_type_error(构造 {name,message,__asmjs_err,cause}
+        // 并 _throw_unwind)。bl 不改 SP(arm64),_throw_type_error 自管帧,frameless 调用安全。
+        vm.lea(VReg.V0, vm.asm.addString("not a function"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.V0, VReg.V0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.V0, VReg.V0, VReg.V1); // box 堆串
+        vm.mov(VReg.A0, VReg.V0);
+        vm.call("_throw_type_error"); // 不返回(_throw_unwind)
     }
 
     generateBoxRetHelpers() {
