@@ -274,10 +274,13 @@ export const ExpressionParser = {
     parsePrefixUpdateExpression() {
         let operator = this.curToken.literal;
         this.nextToken();
-        return new AST.UpdateExpression(operator, this.parseExpression(Precedence.PREFIX), true);
+        const arg = this.parseExpression(Precedence.PREFIX);
+        this.checkAssignmentTarget(arg, false);   // [test262 S1] ++/-- 左值校验(不允许模式)
+        return new AST.UpdateExpression(operator, arg, true);
     },
 
     parsePostfixUpdateExpression(left) {
+        this.checkAssignmentTarget(left, false);   // [test262 S1] ++/-- 左值校验(不允许模式)
         return new AST.UpdateExpression(this.curToken.literal, left, false);
     },
 
@@ -297,8 +300,30 @@ export const ExpressionParser = {
         return new AST.LogicalExpression(operator, left, this.parseExpression(precedence));
     },
 
+    // [test262 S1 早期错误] 校验赋值/更新左值的 AssignmentTargetType。只拒 node 同样拒绝的
+    // 非法形态(对自举源码零误拒):合法左值 = Identifier / 非可选链 MemberExpression;`=` 额外
+    // 允许数组·对象解构模式;复合赋值(+=等)与自增/自减不允许模式。其余(BinaryExpression、
+    // LogicalExpression、CallExpression、字面量、null/true、UpdateExpression、含 ?. 的成员)一律报错。
+    checkAssignmentTarget(left, allowPattern) {
+        if (!left) return;
+        const t = left.type;
+        const isPattern = t === "ArrayExpression" || t === "ObjectExpression" ||
+                          t === "ArrayPattern" || t === "ObjectPattern";
+        if (isPattern) {
+            if (!allowPattern) this.errors.push("Invalid left-hand side in assignment");
+            return;
+        }
+        if (t === "Identifier") return;
+        if (t === "MemberExpression") {
+            if (left.optional === true) this.errors.push("Invalid left-hand side in assignment");
+            return;
+        }
+        this.errors.push("Invalid left-hand side in assignment");
+    },
+
     parseAssignmentExpression(left) {
         let operator = this.curToken.literal;
+        this.checkAssignmentTarget(left, operator === "=");
         this.nextToken();
         return new AST.AssignmentExpression(operator, left, this.parseExpression(Precedence.ASSIGN - 1));
     },
@@ -553,6 +578,7 @@ export const ExpressionParser = {
             return pattern;
         }
         this.nextToken();
+        let restSeen = false;
         while (!this.curTokenIs(TokenType.RBRACKET) && !this.curTokenIs(TokenType.EOF)) {
             if (this.curTokenIs(TokenType.SPREAD)) {
                 // [#34] rest 元素 [..., ...rest];[test262 S1] rest 目标可为绑定模式 [...[x]]/[...{a}]
@@ -562,7 +588,9 @@ export const ExpressionParser = {
                 else if (this.curTokenIs(TokenType.LBRACKET)) restTarget = this.parseArrayPattern();
                 else restTarget = new AST.Identifier(this.curToken.literal);
                 pattern.elements.push(new AST.SpreadElement(restTarget));
+                restSeen = true;   // [test262 S1] rest 必须末位:此后任何元素/空位皆早期错误
             } else if (this.curTokenIs(TokenType.LBRACE) || this.curTokenIs(TokenType.LBRACKET)) {
+                if (restSeen) this.errors.push("Rest element must be last element");
                 // [#47] 嵌套解构:元素位可为 {..}/[..] 子 pattern(递归)。
                 const sub = this.curTokenIs(TokenType.LBRACE) ? this.parseObjectPattern() : this.parseArrayPattern();
                 if (this.peekTokenIs(TokenType.ASSIGN)) {
@@ -573,6 +601,7 @@ export const ExpressionParser = {
                     pattern.elements.push(sub);
                 }
             } else if (this.curTokenIs(TokenType.IDENT)) {
+                if (restSeen) this.errors.push("Rest element must be last element");
                 if (this.peekTokenIs(TokenType.ASSIGN)) {
                     // [#34] 默认值 [a = 9, ...]:ASSIGN 优先级防吞逗号(同形参)
                     const did = new AST.Identifier(this.curToken.literal);
@@ -586,6 +615,7 @@ export const ExpressionParser = {
                 // [C1] 数组空位 elision:[a,,b] —— 逗号间空元素推 null。此刻 cur 停在
                 // 代表空位「之后」的逗号(源自上轮末尾 peek-comma 分隔的二次 nextToken)。
                 // cur 本身即分隔逗号,不能再走下方 peek-comma 逻辑;越过它到下一元素后 continue。
+                if (restSeen) this.errors.push("Rest element must be last element");   // [test262 S1] [...a,,] rest 后空位
                 pattern.elements.push(null);
                 if (this.peekTokenIs(TokenType.RBRACKET)) {
                     // [test262 S1] 纯/尾 elision [,]/[a,,]:留 cur=, peek=] 给末尾 expectPeek

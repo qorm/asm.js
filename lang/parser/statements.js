@@ -15,7 +15,15 @@ export const StatementParser = {
             // for 循环头的 `;` 由 parseForStatement 单独消费,不经此路径。
             return new AST.EmptyStatement();
         } else if (this.curTokenIs(TokenType.LET) || this.curTokenIs(TokenType.CONST) || this.curTokenIs(TokenType.VAR) || this.curTokenIs(TokenType.INT_TYPE)) {
-            return this.parseVariableDeclaration();
+            const decl = this.parseVariableDeclaration();
+            // [test262 S1 早期错误] 语句级 const 必须带初值(for-of/in 的 const 无初值合法,
+            // 走 parseForStatement 直调 parseVariableDeclaration,不经此路径,无误拒)。
+            if (decl && decl.kind === "const") {
+                for (const d of decl.declarations) {
+                    if (!d.init) this.errors.push("Missing initializer in const declaration");
+                }
+            }
+            return decl;
         } else if (this.curTokenIs(TokenType.FUNCTION)) {
             return this.parseFunctionDeclaration();
         } else if (this.curTokenIs(TokenType.ASYNC) && this.peekTokenIs(TokenType.FUNCTION)) {
