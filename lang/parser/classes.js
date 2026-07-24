@@ -152,9 +152,18 @@ export const ClassParser = {
             return this.parseClassField(isStatic, false, key, computed);
         }
         this.nextToken(); // curToken = `(`
+        // [test262 S1] 类方法生成器/异步深度:覆盖形参 + 体内 var 的 yield/await 早期错误校验
+        if (isGenerator) this.fnGenDepth++;
+        if (isAsyncMethod) this.fnAsyncDepth++;
         let params = this.parseFunctionParams();
-        if (!this.expectPeek(TokenType.LBRACE)) return null;
+        if (!this.expectPeek(TokenType.LBRACE)) {
+            if (isGenerator) this.fnGenDepth--;
+            if (isAsyncMethod) this.fnAsyncDepth--;
+            return null;
+        }
         let methodBody = this.parseBlockStatement();
+        if (isGenerator) this.fnGenDepth--;
+        if (isAsyncMethod) this.fnAsyncDepth--;
         let value = new AST.FunctionExpression(null, params, methodBody, isAsyncMethod, isGenerator);
         value.generator = isGenerator;
         value.async = isAsyncMethod;

@@ -111,6 +111,7 @@ export const StatementParser = {
             } else if (this.curTokenIs(TokenType.LBRACKET)) {
                 id = this.parseArrayPattern();
             } else if (this.curTokenIsIdentifier()) {
+                this.checkYieldAwaitBinding(this.curToken.literal);   // [test262 S1] var yield/await
                 id = new AST.Identifier(this.curToken.literal);
             } else {
                 this.errors.push("expected identifier");
@@ -154,10 +155,30 @@ export const StatementParser = {
             id = new AST.Identifier(this.curToken.literal);
         }
         if (!this.expectPeek(TokenType.LPAREN)) return null;
+        // [test262 S1] 进入生成器/异步深度:覆盖形参 + 体内 var 绑定的 yield/await 早期错误校验
+        if (isGenerator) this.fnGenDepth++;
+        if (isAsync) this.fnAsyncDepth++;
         let params = this.parseFunctionParams();
-        if (!this.expectPeek(TokenType.LBRACE)) return null;
+        if (!this.expectPeek(TokenType.LBRACE)) {
+            if (isGenerator) this.fnGenDepth--;
+            if (isAsync) this.fnAsyncDepth--;
+            return null;
+        }
         let body = this.parseBlockStatement();
+        if (isGenerator) this.fnGenDepth--;
+        if (isAsync) this.fnAsyncDepth--;
         return new AST.FunctionDeclaration(id, params, body, isAsync, isGenerator);
+    },
+
+    // [test262 S1] yield/await 作绑定标识符(形参/var 名)在生成器/异步函数内是早期错误
+    // (作 yield/await 表达式合法,故只在绑定名校验)。
+    checkYieldAwaitBinding(name) {
+        if (name === "yield" && this.fnGenDepth > 0) {
+            this.errors.push("Cannot use 'yield' as a binding name inside a generator");
+        }
+        if (name === "await" && this.fnAsyncDepth > 0) {
+            this.errors.push("Cannot use 'await' as a binding name inside an async function");
+        }
     },
 
     parseFunctionParams() {
@@ -182,6 +203,7 @@ export const StatementParser = {
     parseFunctionParam() {
         if (this.curTokenIs(TokenType.SPREAD)) {
             this.nextToken();
+            this.checkYieldAwaitBinding(this.curToken.literal);   // [test262 S1] ...yield/...await
             return new AST.SpreadElement(new AST.Identifier(this.curToken.literal));
         }
         // [#47] 解构形参:function f({a,b})/f([a,b])/({a}={})。子 pattern 递归解析,
@@ -192,6 +214,7 @@ export const StatementParser = {
         } else if (this.curTokenIs(TokenType.LBRACKET)) {
             id = this.parseArrayPattern();
         } else {
+            this.checkYieldAwaitBinding(this.curToken.literal);   // [test262 S1] yield/await 形参
             id = new AST.Identifier(this.curToken.literal);
         }
         if (this.peekTokenIs(TokenType.ASSIGN)) {

@@ -20,6 +20,10 @@ export class Parser {
         this.errors = [];
         // 类体嵌套深度：#x 私有成员访问仅在类体内合法（>0），类外 obj.#x 报语法错
         this.classDepth = 0;
+        // [test262 S1] 生成器/异步函数嵌套深度:yield/await 作绑定标识符(形参/var 名)仅在相应
+        // 函数体内是早期错误(作 yield/await 表达式合法)。函数入口 +1、出口 -1。
+        this.fnGenDepth = 0;
+        this.fnAsyncDepth = 0;
 
         this.prefixParseFns = {};
         this.infixParseFns = {};

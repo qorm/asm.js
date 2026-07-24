@@ -793,45 +793,60 @@ export const ExpressionParser = {
             isGenerator = true;
             this.nextToken();
         }
+        // [test262 S1] 生成器深度:yield 作绑定名在此函数体内是早期错误(所有返回路径须配对减)
+        if (isGenerator) this.fnGenDepth++;
         // 命名函数表达式 function g(...) {}:先看名字。此前先 expectPeek(LPAREN),命名
         // 形式(peek=IDENT)会误 push "expected (" 假错误——虽随后正确解析,残留错误仍致
         // "Syntax errors" 编译失败(named function expression COMPILE_FAIL 根因)。
         if (this.peekTokenIs(TokenType.IDENT)) {
             this.nextToken();
             let id = new AST.Identifier(this.curToken.literal);
-            if (!this.expectPeek(TokenType.LPAREN)) return null;
+            if (!this.expectPeek(TokenType.LPAREN)) { if (isGenerator) this.fnGenDepth--; return null; }
             let params = this.parseFunctionParams();
-            if (!this.expectPeek(TokenType.LBRACE)) return null;
-            return new AST.FunctionExpression(id, params, this.parseBlockStatement(), isAsync, isGenerator);
+            if (!this.expectPeek(TokenType.LBRACE)) { if (isGenerator) this.fnGenDepth--; return null; }
+            let body = this.parseBlockStatement();
+            if (isGenerator) this.fnGenDepth--;
+            return new AST.FunctionExpression(id, params, body, isAsync, isGenerator);
         }
-        if (!this.expectPeek(TokenType.LPAREN)) return null;
+        if (!this.expectPeek(TokenType.LPAREN)) { if (isGenerator) this.fnGenDepth--; return null; }
         let params = this.parseFunctionParams();
-        if (!this.expectPeek(TokenType.LBRACE)) return null;
-        return new AST.FunctionExpression(null, params, this.parseBlockStatement(), isAsync, isGenerator);
+        if (!this.expectPeek(TokenType.LBRACE)) { if (isGenerator) this.fnGenDepth--; return null; }
+        let body = this.parseBlockStatement();
+        if (isGenerator) this.fnGenDepth--;
+        return new AST.FunctionExpression(null, params, body, isAsync, isGenerator);
     },
 
     parseAsyncExpression() {
         this.nextToken();
         if (this.curTokenIs(TokenType.FUNCTION)) {
+            // [test262 S1] async 深度:await 作绑定名在异步函数内是早期错误
+            this.fnAsyncDepth++;
             let func = this.parseFunctionExpression();
+            this.fnAsyncDepth--;
             if (func !== null) func.isAsync = true;
             return func;
         }
         if (this.curTokenIs(TokenType.LPAREN)) {
+            this.fnAsyncDepth++;   // [test262 S1] async (...) => 形参在异步上下文
             let arrow = this.parseGroupedOrArrow();
+            this.fnAsyncDepth--;
             if (arrow !== null && arrow.type === "ArrowFunctionExpression") {
                 arrow.isAsync = true;
             }
             return arrow;
         }
         if (this.curTokenIs(TokenType.IDENT)) {
+            this.fnAsyncDepth++;   // [test262 S1] async x => 单参在异步上下文
+            this.checkYieldAwaitBinding(this.curToken.literal);
             let param = new AST.Identifier(this.curToken.literal);
             if (this.peekTokenIs(TokenType.ARROW)) {
                 this.nextToken();
                 let arrow = this.parseArrowFunctionBody([param]);
+                this.fnAsyncDepth--;
                 arrow.isAsync = true;
                 return arrow;
             }
+            this.fnAsyncDepth--;
         }
         return null;
     },
