@@ -804,14 +804,20 @@ export const ExpressionParser = {
             if (!this.expectPeek(TokenType.LPAREN)) { if (isGenerator) this.fnGenDepth--; return null; }
             let params = this.parseFunctionParams();
             if (!this.expectPeek(TokenType.LBRACE)) { if (isGenerator) this.fnGenDepth--; return null; }
+            let isStrict = this.peekUseStrictDirective();
+            if (isStrict) { this.fnStrictDepth++; this.checkStrictParams(params); }
             let body = this.parseBlockStatement();
+            if (isStrict) this.fnStrictDepth--;
             if (isGenerator) this.fnGenDepth--;
             return new AST.FunctionExpression(id, params, body, isAsync, isGenerator);
         }
         if (!this.expectPeek(TokenType.LPAREN)) { if (isGenerator) this.fnGenDepth--; return null; }
         let params = this.parseFunctionParams();
         if (!this.expectPeek(TokenType.LBRACE)) { if (isGenerator) this.fnGenDepth--; return null; }
+        let isStrict = this.peekUseStrictDirective();
+        if (isStrict) { this.fnStrictDepth++; this.checkStrictParams(params); }
         let body = this.parseBlockStatement();
+        if (isStrict) this.fnStrictDepth--;
         if (isGenerator) this.fnGenDepth--;
         return new AST.FunctionExpression(null, params, body, isAsync, isGenerator);
     },

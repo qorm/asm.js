@@ -161,7 +161,11 @@ export const ClassParser = {
             if (isAsyncMethod) this.fnAsyncDepth--;
             return null;
         }
+        // [test262 S1] strict 探测(显式 "use strict" 指令;类体隐式 strict 待后续)
+        let isStrict = this.peekUseStrictDirective();
+        if (isStrict) { this.fnStrictDepth++; this.checkStrictParams(params); }
         let methodBody = this.parseBlockStatement();
+        if (isStrict) this.fnStrictDepth--;
         if (isGenerator) this.fnGenDepth--;
         if (isAsyncMethod) this.fnAsyncDepth--;
         let value = new AST.FunctionExpression(null, params, methodBody, isAsyncMethod, isGenerator);

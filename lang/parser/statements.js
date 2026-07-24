@@ -164,20 +164,67 @@ export const StatementParser = {
             if (isAsync) this.fnAsyncDepth--;
             return null;
         }
+        // [test262 S1] strict 探测:"use strict" 指令 → strict 深度 + 回溯形参校验
+        let isStrict = this.peekUseStrictDirective();
+        if (isStrict) { this.fnStrictDepth++; this.checkStrictParams(params); }
         let body = this.parseBlockStatement();
+        if (isStrict) this.fnStrictDepth--;
         if (isGenerator) this.fnGenDepth--;
         if (isAsync) this.fnAsyncDepth--;
         return new AST.FunctionDeclaration(id, params, body, isAsync, isGenerator);
     },
 
     // [test262 S1] yield/await 作绑定标识符(形参/var 名)在生成器/异步函数内是早期错误
-    // (作 yield/await 表达式合法,故只在绑定名校验)。
+    // (作 yield/await 表达式合法,故只在绑定名校验);strict 下 eval/arguments 不可作绑定名。
     checkYieldAwaitBinding(name) {
         if (name === "yield" && this.fnGenDepth > 0) {
             this.errors.push("Cannot use 'yield' as a binding name inside a generator");
         }
         if (name === "await" && this.fnAsyncDepth > 0) {
             this.errors.push("Cannot use 'await' as a binding name inside an async function");
+        }
+        if (this.fnStrictDepth > 0 && (name === "eval" || name === "arguments")) {
+            this.errors.push("Cannot use '" + name + "' as a binding name in strict mode");
+        }
+    },
+
+    // [test262 S1] 函数体首语句是否 "use strict" 指令(curToken 须为 `{`,窥探首 token)。
+    // 启发式:体首即字符串字面量 "use strict" 视为指令(覆盖绝大多数情形)。
+    peekUseStrictDirective() {
+        return this.peekTokenIs(TokenType.STRING) && this.peekToken.literal === "use strict";
+    },
+
+    // [test262 S1] 收集形参绑定名(展平解构),供 strict 重参/eval/arguments 回溯校验。
+    collectParamNames(param, out) {
+        if (!param) return;
+        const t = param.type;
+        if (t === "Identifier") { out.push(param.name); return; }
+        if (t === "AssignmentPattern") { this.collectParamNames(param.left, out); return; }
+        if (t === "SpreadElement") { this.collectParamNames(param.argument, out); return; }
+        if (t === "ObjectPattern") {
+            for (const p of (param.properties || [])) {
+                if (p.type === "SpreadElement") this.collectParamNames(p.argument, out);
+                else this.collectParamNames(p.value, out);
+            }
+            return;
+        }
+        if (t === "ArrayPattern") {
+            for (const e of (param.elements || [])) this.collectParamNames(e, out);
+            return;
+        }
+    },
+
+    // [test262 S1] strict 形参回溯校验:eval/arguments 不可作形参 + 形参不可重名。
+    checkStrictParams(params) {
+        const names = [];
+        for (const p of (params || [])) this.collectParamNames(p, names);
+        const seen = {};
+        for (const n of names) {
+            if (n === "eval" || n === "arguments") {
+                this.errors.push("Cannot use '" + n + "' as a parameter name in strict mode");
+            }
+            if (seen[n]) this.errors.push("Duplicate parameter name '" + n + "' not allowed in strict mode");
+            seen[n] = true;
         }
     },
 
