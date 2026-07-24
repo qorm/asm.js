@@ -2891,6 +2891,17 @@ export class ObjectGenerator {
         vm.label("_object_keys");
         vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
 
+        // [test262 S1] 类型分派(消 CRASH):非对象目标按规范处理,绝不按 plain 布局解引用
+        // count@8/props_ptr(此前 null/数值/数组/串脱壳后读 [垃圾+0] → SIGSEGV)。
+        // null/undefined → TypeError;array/string → 索引键 ["0",...];int/bool → 空数组;
+        // object(0x7FFD)/function(0x7FFF)/裸指针(classinfo)→ 原路径。
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFA); vm.jeq("_object_keys_nullish");
+        vm.cmpImm(VReg.V0, 0x7FFB); vm.jeq("_object_keys_nullish");
+        vm.cmpImm(VReg.V0, 0x7FFE); vm.jeq("_object_keys_indexed");
+        vm.cmpImm(VReg.V0, 0x7FFC); vm.jeq("_object_keys_indexed_str");
+        // (int/bool 等原语 → 空数组:复用路径会破坏后续堆状态,根因待调试,暂走原路径)
+
         vm.mov(VReg.S0, VReg.A0); // obj
 
         // 指针脱壳
@@ -3001,6 +3012,43 @@ export class ObjectGenerator {
         vm.label("_object_keys_done");
         // 装箱为 0x7FFE 数组 JSValue(_array_new_with_size 返回裸头,不装箱则
         // console.log/JSON.stringify 把裸头高16==0 当对象 → "[object Object]"/0)。
+        vm.movImm64(VReg.V1, 0x7FFE000000000000n);
+        vm.mov(VReg.RET, VReg.S2);
+        vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+
+        // ---- [test262 S1] 非对象目标分派处理(入口 high16 分派跳入)----
+        // null/undefined → TypeError(ToObject 规范)
+        vm.label("_object_keys_nullish");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot convert undefined or null to object"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error"); // 不返回
+
+        // array → 索引键 ["0",...,"len-1"]
+        vm.label("_object_keys_indexed");
+        vm.call("_array_length"); // A0=boxed array → RET=length
+        vm.mov(VReg.S1, VReg.RET);
+        vm.jmp("_object_keys_idx_build");
+        // string → 索引键(字节长;ASCII = 字符数,非 ASCII 见 UTF-8 偏差)
+        vm.label("_object_keys_indexed_str");
+        vm.call("_strlen"); // A0=boxed string → RET=byte length
+        vm.mov(VReg.S1, VReg.RET);
+        vm.label("_object_keys_idx_build");
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size"); // 裸结果数组
+        vm.mov(VReg.S2, VReg.RET);
+        vm.movImm(VReg.S3, 0); // i
+        vm.label("_object_keys_idx_loop");
+        vm.cmp(VReg.S3, VReg.S1); vm.jge("_object_keys_idx_done");
+        vm.scvtf(0, VReg.S3); vm.fmovToInt(VReg.A0, 0); // A0 = i 的 float64 位
+        vm.call("_valueToStr"); // RET = boxed 字符串键
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_array_push");
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_object_keys_idx_loop");
+        vm.label("_object_keys_idx_done");
         vm.movImm64(VReg.V1, 0x7FFE000000000000n);
         vm.mov(VReg.RET, VReg.S2);
         vm.or(VReg.RET, VReg.RET, VReg.V1);
