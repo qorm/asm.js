@@ -1118,6 +1118,21 @@ export class TypedArrayGenerator {
         vm.label("_ta_inc_nf");
         vm.movImm(VReg.RET, 0);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+        // [W-23] _ta_lastindexof(ta, val, from) -> 裸下标/-1。
+        // 此前 TypedArray 无 lastIndexOf 分派,`ta.lastIndexOf(v)` 落 _array_lastIndexOf,
+        // 后者按普通数组布局(data_ptr@24)解引用 typed 块 → SIGSEGV。
+        // 与 join/at 同法:先 _ta_to_array 转普通数组再复用既有 _array_lastIndexOf。
+        // from 的 INT_MAX 是"从末尾开始"的哨兵(同 _agen_lastIndexOf 约定)。
+        vm.label("_ta_lastindexof");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A1);          // val
+        vm.mov(VReg.S1, VReg.A2);          // from(裸 int)
+        vm.call("_ta_to_array");           // A0=ta;RET=装箱普通数组
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.mov(VReg.A2, VReg.S1);
+        vm.call("_array_lastIndexOf");
+        vm.epilogue([VReg.S0, VReg.S1], 0);
         // _ta_at(ta, idx) -> _array_at(_ta_to_array(ta), idx)
         vm.label("_ta_at");
         vm.prologue(0, [VReg.S0]);
@@ -1463,6 +1478,7 @@ export class TypedArrayGenerator {
         this.generateTaBuffer();
         this.generateTaByteOffset();
         this.generateCtorSupport();
+        this.generateProtoIntrinsic();
     }
 
     // [Design A] _ta_buffer(boxed ta) -> 底层 ArrayBuffer。
@@ -1627,6 +1643,13 @@ export class TypedArrayGenerator {
         vm.call("_typed_array_view");
         vm.jmp("_tact_done");
         // ---- boxed 对象:array-like({length, 0..n-1}) ----
+        // [W-23 已测偏差] 曾在此加 @@iterator 优先路(复用 _array_spread_into),
+        // 语义上更合规,但 test262 的 makeIterable 工厂内层是 `src[Symbol.iterator]()`
+        // ——本运行时对**动态**数组值的 @@iterator 取值/调用返 undefined
+        // (`typeof arr[Symbol.iterator] === "undefined"`,见 members/array 层),
+        // 于是真去迭代反而在用户回调里抛 "not a function",净损 15 例
+        // (它们此前靠"构造出空 TA"侥幸通过 *-not-called-on-empty 之类断言)。
+        // 故保留 array-like 路;iterable 支持须先补 @@iterator 的动态取值。
         vm.label("_tact_obj");
         vm.lea(VReg.A1, "_str_k_length");
         vm.movImm64(VReg.V1, STR_TAG);
@@ -1796,5 +1819,521 @@ export class TypedArrayGenerator {
         vm.mov(VReg.RET, VReg.S1);
         vm.label("_gcp_done");
         vm.epilogue([VReg.S0, VReg.S1], 16);
+    }
+
+    // ==================== [W-23] %TypedArray% 内在对象 ====================
+    // test262 harness/testTypedArray.js 的第一行就是
+    //     var TypedArray = Object.getPrototypeOf(Int8Array);
+    // 此前返 undefined,于是**凡 include 了该 harness 且引用 TypedArray.prototype 的
+    // 用例(本区 74 例)在第一次属性读处即抛 TypeError**,连测试主体都进不去。
+    //
+    // 这里把 %TypedArray% 物化成真函数值(懒建 + 单例):
+    //   fn   = 闭包 {magic@0=0xc105, fnptr@8=_ta_abstract_ctor}(直接调/new 均抛 TypeError,
+    //          合 ES「%TypedArray% 是抽象构造器」),侧表挂 .name / .prototype;
+    //   原型 = 真普通对象,方法值是 {magic, _aref_generic, _tam_<m>} 闭包 —— 复用既有
+    //          方法引用蹦床(接收者 A5 → A0,实参上移),不新造调用约定;
+    //   _tam_<m> 先做 ValidateTypedArray(接收者必须是 TA 裸块,否则 TypeError),
+    //          再委托既有 _ta_* / _array_*_rt / _agen_* 实现,不复制任何既有算法。
+    // 属性位按 ES 内置方法形状:writable|configurable、enumerable:false。
+    generateProtoIntrinsic() {
+        const vm = this.vm;
+        const MASK = 0x0000ffffffffffffn;
+        const STR_TAG = 0x7ffc000000000000n;
+        const UNDEF = 0x7ffb000000000000n;
+        const INT_MAX = 2147483647;
+        const ATTR_W_C = 1 | 4; // writable|configurable(enumerable=0)
+        const SAVE = [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5];
+        let uid = 0;
+        const L = (t) => `_tam_${t}_${uid++}`;
+        const boxStr = (reg) => {
+            vm.movImm64(VReg.V1, MASK); vm.and(reg, reg, VReg.V1);
+            vm.movImm64(VReg.V1, STR_TAG); vm.or(reg, reg, VReg.V1);
+        };
+        const keyOf = (reg, name) => { vm.lea(reg, vm.asm.addString(name)); boxStr(reg); };
+        const boxIntReg = (reg) => { vm.scvtf(0, reg); vm.fmovToInt(reg, 0); };
+
+        // ---- _tam_validate(A0=接收者) -> RET = 裸 TA 块;非 TA 抛 TypeError(不返回)。
+        // 合法接收者是 TA 裸堆指针(high16==0);装箱对象/数组先脱壳再验类型字节,
+        // 于是 {} / [] / ArrayBuffer / DataView / 原语 / undefined 一律 TypeError。
+        vm.label("_tam_validate");
+        vm.prologue(0, [VReg.S0]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.shrImm(VReg.V0, VReg.S0, 48);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_tam_val_ptr");
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jeq("_tam_val_ptr");
+        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jne("_tam_val_bad");
+        vm.label("_tam_val_ptr");
+        vm.movImm64(VReg.V1, MASK);
+        vm.and(VReg.S0, VReg.S0, VReg.V1);
+        vm.movImm64(VReg.V1, vm.ptrFloor);
+        vm.cmp(VReg.S0, VReg.V1);
+        vm.jlt("_tam_val_bad");
+        vm.loadByte(VReg.V0, VReg.S0, 0);
+        vm.cmpImm(VReg.V0, TYPE_INT8_ARRAY);
+        vm.jlt("_tam_val_bad");
+        vm.cmpImm(VReg.V0, TYPE_FLOAT64_ARRAY);
+        vm.jgt("_tam_val_bad");
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0], 0);
+        vm.label("_tam_val_bad");
+        vm.lea(VReg.A0, vm.asm.addString("Method %TypedArray%.prototype method called on incompatible receiver"));
+        boxStr(VReg.A0);
+        vm.call("_throw_type_error"); // 不返回
+        vm.epilogue([VReg.S0], 0);    // 理论不达
+
+        // ---- _ta_abstract_ctor:%TypedArray% 本体不可直接调用/构造。
+        vm.label("_ta_abstract_ctor");
+        vm.prologue(0, [VReg.S0]);
+        vm.lea(VReg.A0, vm.asm.addString("Abstract class TypedArray not directly constructable"));
+        boxStr(VReg.A0);
+        vm.call("_throw_type_error"); // 不返回
+        vm.epilogue([VReg.S0], 0);    // 理论不达
+
+        // ---- 方法包装器:统一 { 校验接收者 → 委托既有实现 }。
+        // 进入约定(来自 _aref_generic):A0=this, A1..A4=实参(装箱,缺参 undefined)。
+        const wrap = (label, body) => {
+            vm.label(label);
+            vm.prologue(48, SAVE);
+            vm.mov(VReg.S1, VReg.A1);
+            vm.mov(VReg.S2, VReg.A2);
+            vm.mov(VReg.S3, VReg.A3);
+            vm.call("_tam_validate"); // A0 仍是接收者
+            vm.mov(VReg.S0, VReg.RET); // S0 = 裸 TA
+            body();
+            vm.epilogue(SAVE, 48);
+        };
+        // 装箱实参 → 裸 int(缺省 d)。结果留在 RET。
+        const argInt = (src, d) => {
+            vm.mov(VReg.A0, src);
+            vm.movImm(VReg.A1, d);
+            vm.call("_aref_argint_d");
+        };
+        // 裸 0/1 → JS 布尔
+        const boolify = () => {
+            const t = L("bt"), d = L("bd");
+            vm.cmpImm(VReg.RET, 0);
+            vm.jne(t);
+            vm.lea(VReg.V0, "_js_false"); vm.load(VReg.RET, VReg.V0, 0); vm.jmp(d);
+            vm.label(t);
+            vm.lea(VReg.V0, "_js_true"); vm.load(VReg.RET, VReg.V0, 0);
+            vm.label(d);
+        };
+        // this → 装箱普通数组(留 S4),供 _array_*_rt / _agen_* 复用
+        const toArr = () => {
+            vm.mov(VReg.A0, VReg.S0);
+            vm.call("_ta_to_array");
+            vm.mov(VReg.S4, VReg.RET);
+        };
+
+        wrap("_tam_at", () => {
+            vm.mov(VReg.A0, VReg.S1); vm.call("_aref_argint");
+            vm.mov(VReg.S4, VReg.RET);
+            vm.mov(VReg.A0, VReg.S0); vm.mov(VReg.A1, VReg.S4);
+            vm.call("_ta_at");
+        });
+        wrap("_tam_join", () => {
+            const ok = L("jsep");
+            vm.mov(VReg.S4, VReg.S1);
+            vm.shrImm(VReg.V0, VReg.S1, 48);
+            vm.cmpImm(VReg.V0, 0x7FFB);
+            vm.jne(ok);
+            vm.lea(VReg.S4, "_str_comma_only");
+            vm.label(ok);
+            vm.mov(VReg.A0, VReg.S0); vm.mov(VReg.A1, VReg.S4);
+            vm.call("_ta_join");
+        });
+        const joinComma = () => {
+            vm.lea(VReg.S4, "_str_comma_only");
+            vm.mov(VReg.A0, VReg.S0); vm.mov(VReg.A1, VReg.S4);
+            vm.call("_ta_join");
+        };
+        wrap("_tam_toString", joinComma);
+        wrap("_tam_toLocaleString", joinComma);
+        wrap("_tam_indexOf", () => {
+            vm.mov(VReg.A0, VReg.S0); vm.mov(VReg.A1, VReg.S1);
+            vm.call("_ta_indexof");
+            boxIntReg(VReg.RET);
+        });
+        wrap("_tam_lastIndexOf", () => {
+            toArr();
+            vm.mov(VReg.A0, VReg.S4); vm.mov(VReg.A1, VReg.S1); vm.mov(VReg.A2, VReg.S2);
+            vm.call("_agen_lastIndexOf");
+        });
+        wrap("_tam_includes", () => {
+            vm.mov(VReg.A0, VReg.S0); vm.mov(VReg.A1, VReg.S1);
+            vm.call("_ta_includes");
+            boolify();
+        });
+        const sliceLike = () => {
+            argInt(VReg.S1, 0); vm.mov(VReg.S4, VReg.RET);
+            argInt(VReg.S2, INT_MAX); vm.mov(VReg.S5, VReg.RET);
+            vm.mov(VReg.A0, VReg.S0); vm.mov(VReg.A1, VReg.S4); vm.mov(VReg.A2, VReg.S5);
+            vm.call("_ta_slice");
+        };
+        wrap("_tam_slice", sliceLike);
+        wrap("_tam_subarray", sliceLike);
+        wrap("_tam_fill", () => {
+            argInt(VReg.S2, 0); vm.mov(VReg.S4, VReg.RET);
+            argInt(VReg.S3, INT_MAX); vm.mov(VReg.S5, VReg.RET);
+            vm.mov(VReg.A0, VReg.S0); vm.mov(VReg.A1, VReg.S1);
+            vm.mov(VReg.A2, VReg.S4); vm.mov(VReg.A3, VReg.S5);
+            vm.call("_ta_fill");
+        });
+        wrap("_tam_copyWithin", () => {
+            argInt(VReg.S1, 0); vm.mov(VReg.S4, VReg.RET);
+            argInt(VReg.S2, 0); vm.mov(VReg.S5, VReg.RET);
+            argInt(VReg.S3, INT_MAX); vm.mov(VReg.S3, VReg.RET);
+            vm.mov(VReg.A0, VReg.S0); vm.mov(VReg.A1, VReg.S4);
+            vm.mov(VReg.A2, VReg.S5); vm.mov(VReg.A3, VReg.S3);
+            vm.call("_ta_copywithin");
+        });
+        wrap("_tam_set", () => {
+            argInt(VReg.S2, 0); vm.mov(VReg.S4, VReg.RET);
+            vm.mov(VReg.A0, VReg.S0); vm.mov(VReg.A1, VReg.S1); vm.mov(VReg.A2, VReg.S4);
+            vm.call("_ta_set");
+        });
+        wrap("_tam_reverse", () => { vm.mov(VReg.A0, VReg.S0); vm.call("_ta_reverse"); });
+        wrap("_tam_sort", () => { vm.mov(VReg.A0, VReg.S0); vm.call("_ta_sort"); });
+        const copyThen = (target) => () => {
+            vm.mov(VReg.A0, VReg.S0);
+            vm.movImm(VReg.A1, 0);
+            vm.movImm64(VReg.A2, BigInt(INT_MAX));
+            vm.call("_ta_slice");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.call(target);
+        };
+        wrap("_tam_toReversed", copyThen("_ta_reverse"));
+        wrap("_tam_toSorted", copyThen("_ta_sort"));
+        wrap("_tam_with", () => {
+            vm.mov(VReg.A0, VReg.S0);
+            vm.movImm(VReg.A1, 0);
+            vm.movImm64(VReg.A2, BigInt(INT_MAX));
+            vm.call("_ta_slice");
+            vm.mov(VReg.S4, VReg.RET); // 拷贝
+            vm.mov(VReg.A0, VReg.S1); vm.call("_aref_argint");
+            vm.mov(VReg.S5, VReg.RET);
+            vm.mov(VReg.A0, VReg.S4); vm.mov(VReg.A1, VReg.S5); vm.mov(VReg.A2, VReg.S2);
+            vm.call("_typed_array_set");
+            vm.mov(VReg.RET, VReg.S4);
+        });
+        const iterKind = (kind) => () => {
+            toArr();
+            vm.mov(VReg.A0, VReg.S4);
+            vm.movImm(VReg.A1, kind);
+            vm.call("_array_iterator_new");
+        };
+        wrap("_tam_values", iterKind(0));
+        wrap("_tam_keys", iterKind(1));
+        wrap("_tam_entries", iterKind(2));
+        const cb2 = (target) => () => {
+            toArr();
+            vm.mov(VReg.A0, VReg.S4); vm.mov(VReg.A1, VReg.S1);
+            vm.call(target);
+        };
+        wrap("_tam_forEach", cb2("_array_forEach_rt"));
+        wrap("_tam_some", cb2("_array_some_rt"));
+        wrap("_tam_every", cb2("_array_every_rt"));
+        // map/filter 按 ES 返回同类型 TypedArray:普通数组结果再经 _typed_array_from 回填。
+        const cb2Ta = (target) => () => {
+            vm.loadByte(VReg.S5, VReg.S0, 0); // 元素类型
+            toArr();
+            vm.mov(VReg.A0, VReg.S4); vm.mov(VReg.A1, VReg.S1);
+            vm.call(target);
+            vm.mov(VReg.S4, VReg.RET);
+            vm.mov(VReg.A0, VReg.S5); vm.mov(VReg.A1, VReg.S4);
+            vm.call("_typed_array_from");
+        };
+        wrap("_tam_map", cb2Ta("_array_map_rt"));
+        wrap("_tam_filter", cb2Ta("_array_filter_rt"));
+        const cb3 = (target) => () => {
+            toArr();
+            vm.mov(VReg.A0, VReg.S4); vm.mov(VReg.A1, VReg.S1); vm.mov(VReg.A2, VReg.S2);
+            vm.call(target);
+        };
+        wrap("_tam_reduce", cb3("_array_reduce_rt"));
+        wrap("_tam_reduceRight", cb3("_array_reduceRight_rt"));
+
+        // ---- _tam_find_core(A0=裸 TA, A1=cb, A2=mode) -> 值/下标。
+        // mode: bit0 = 返回下标(而非值),bit1 = 反向。回调经既有 _aref_invoke_cb 调用
+        // (elem, idx, arr),真值判定用既有 _to_boolean。
+        vm.label("_tam_find_core");
+        vm.prologue(48, SAVE);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.S2, VReg.A2);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_ta_to_array");
+        vm.mov(VReg.S3, VReg.RET);         // 装箱普通数组(回调第 3 参)
+        vm.load(VReg.S4, VReg.S0, 8);      // len
+        vm.movImm(VReg.S5, 0);
+        vm.andImm(VReg.V0, VReg.S2, 2);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_tamf_loop");
+        vm.subImm(VReg.S5, VReg.S4, 1);
+        vm.label("_tamf_loop");
+        vm.cmpImm(VReg.S5, 0);
+        vm.jlt("_tamf_nf");
+        vm.cmp(VReg.S5, VReg.S4);
+        vm.jge("_tamf_nf");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S5);
+        vm.call("_typed_array_get");       // RET = 装箱元素
+        vm.store(VReg.SP, 0, VReg.RET);
+        vm.mov(VReg.A0, VReg.RET);
+        vm.scvtf(0, VReg.S5);
+        vm.fmovToInt(VReg.A1, 0);
+        vm.mov(VReg.A2, VReg.S3);
+        vm.mov(VReg.A3, VReg.S1);
+        vm.call("_aref_invoke_cb");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_boolean");            // 裸 0/1
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_tamf_hit");
+        vm.andImm(VReg.V0, VReg.S2, 2);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_tamf_dec");
+        vm.addImm(VReg.S5, VReg.S5, 1);
+        vm.jmp("_tamf_loop");
+        vm.label("_tamf_dec");
+        vm.subImm(VReg.S5, VReg.S5, 1);
+        vm.jmp("_tamf_loop");
+        vm.label("_tamf_hit");
+        vm.andImm(VReg.V0, VReg.S2, 1);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_tamf_hit_idx");
+        vm.load(VReg.RET, VReg.SP, 0);
+        vm.epilogue(SAVE, 48);
+        vm.label("_tamf_hit_idx");
+        vm.scvtf(0, VReg.S5);
+        vm.fmovToInt(VReg.RET, 0);
+        vm.epilogue(SAVE, 48);
+        vm.label("_tamf_nf");
+        vm.andImm(VReg.V0, VReg.S2, 1);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_tamf_nf_idx");
+        vm.movImm64(VReg.RET, UNDEF);
+        vm.epilogue(SAVE, 48);
+        vm.label("_tamf_nf_idx");
+        vm.movImm(VReg.V0, -1);
+        vm.scvtf(0, VReg.V0);
+        vm.fmovToInt(VReg.RET, 0);
+        vm.epilogue(SAVE, 48);
+
+        const findMode = (mode) => () => {
+            vm.mov(VReg.A0, VReg.S0);
+            vm.mov(VReg.A1, VReg.S1);
+            vm.movImm(VReg.A2, mode);
+            vm.call("_tam_find_core");
+        };
+        wrap("_tam_find", findMode(0));
+        wrap("_tam_findIndex", findMode(1));
+        wrap("_tam_findLast", findMode(2));
+        wrap("_tam_findLastIndex", findMode(3));
+
+        // ---- 访问器 getter(%TypedArray%.prototype 的 buffer/byteLength/byteOffset/length
+        // 是访问器而非数据属性;test262 用 gOPD(...).get 取出后 .call(x) 验接收者)。
+        // 同样经 _aref_generic 蹦床:_maybe_getter 以 this 在 A0/A5 调用,蹦床把 A5 落到 A0。
+        wrap("_tag_buffer", () => { vm.mov(VReg.A0, VReg.S0); vm.call("_ta_buffer"); });
+        wrap("_tag_byteLength", () => {
+            vm.mov(VReg.A0, VReg.S0); vm.call("_ta_bytelength"); boxIntReg(VReg.RET);
+        });
+        wrap("_tag_byteOffset", () => {
+            vm.mov(VReg.A0, VReg.S0); vm.call("_ta_byteoffset"); boxIntReg(VReg.RET);
+        });
+        wrap("_tag_length", () => {
+            vm.load(VReg.RET, VReg.S0, 8); boxIntReg(VReg.RET);
+        });
+        // @@toStringTag getter:ES 规定非 TA 接收者返 undefined(**不抛**),故不走 wrap。
+        vm.label("_tag_toStringTag");
+        vm.prologue(0, [VReg.S0]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.shrImm(VReg.V0, VReg.S0, 48);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_tagts_undef");
+        vm.cmpImm(VReg.S0, 0);
+        vm.jeq("_tagts_undef");
+        vm.movImm64(VReg.V1, vm.ptrFloor);
+        vm.cmp(VReg.S0, VReg.V1);
+        vm.jlt("_tagts_undef");
+        vm.loadByte(VReg.V0, VReg.S0, 0);
+        for (const [tag, nm] of [
+            [TYPE_INT8_ARRAY, "Int8Array"], [TYPE_INT16_ARRAY, "Int16Array"],
+            [TYPE_INT32_ARRAY, "Int32Array"], [TYPE_INT64_ARRAY, "BigInt64Array"],
+            [TYPE_UINT8_ARRAY, "Uint8Array"], [TYPE_UINT16_ARRAY, "Uint16Array"],
+            [TYPE_UINT32_ARRAY, "Uint32Array"], [TYPE_UINT64_ARRAY, "BigUint64Array"],
+            [TYPE_UINT8_CLAMPED_ARRAY, "Uint8ClampedArray"],
+            [TYPE_FLOAT32_ARRAY, "Float32Array"], [TYPE_FLOAT64_ARRAY, "Float64Array"],
+        ]) {
+            const nx = L("ts");
+            vm.cmpImm(VReg.V0, tag);
+            vm.jne(nx);
+            vm.lea(VReg.RET, vm.asm.addString(nm));
+            boxStr(VReg.RET);
+            vm.epilogue([VReg.S0], 0);
+            vm.label(nx);
+        }
+        vm.label("_tagts_undef");
+        vm.movImm64(VReg.RET, UNDEF);
+        vm.epilogue([VReg.S0], 0);
+
+        // ---- 方法表:[属性名, 规范 length, 包装器标签] ----
+        const METHODS = [
+            ["at", 1, "_tam_at"], ["copyWithin", 2, "_tam_copyWithin"],
+            ["entries", 0, "_tam_entries"], ["every", 1, "_tam_every"],
+            ["fill", 1, "_tam_fill"], ["filter", 1, "_tam_filter"],
+            ["find", 1, "_tam_find"], ["findIndex", 1, "_tam_findIndex"],
+            ["findLast", 1, "_tam_findLast"], ["findLastIndex", 1, "_tam_findLastIndex"],
+            ["forEach", 1, "_tam_forEach"], ["includes", 1, "_tam_includes"],
+            ["indexOf", 1, "_tam_indexOf"], ["join", 1, "_tam_join"],
+            ["keys", 0, "_tam_keys"], ["lastIndexOf", 1, "_tam_lastIndexOf"],
+            ["map", 1, "_tam_map"], ["reduce", 1, "_tam_reduce"],
+            ["reduceRight", 1, "_tam_reduceRight"], ["reverse", 0, "_tam_reverse"],
+            ["set", 1, "_tam_set"], ["slice", 2, "_tam_slice"],
+            ["some", 1, "_tam_some"], ["sort", 1, "_tam_sort"],
+            ["subarray", 2, "_tam_subarray"], ["toLocaleString", 0, "_tam_toLocaleString"],
+            ["toReversed", 0, "_tam_toReversed"], ["toSorted", 1, "_tam_toSorted"],
+            ["toString", 0, "_tam_toString"], ["values", 0, "_tam_values"],
+            ["with", 2, "_tam_with"],
+        ];
+
+        // ---- _ta_intrinsic() -> 装箱 %TypedArray% 函数值(单例)
+        vm.asm.addDataLabel("_ta_intrinsic_slot");
+        vm.asm.addDataQword(0);
+        vm.label("_ta_intrinsic");
+        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.lea(VReg.V0, "_ta_intrinsic_slot");
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_tapi_done");
+        vm.movImm(VReg.A0, 16);
+        vm.call("_alloc");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.movImm(VReg.V1, 0xc105);
+        vm.store(VReg.S0, 0, VReg.V1);
+        vm.lea(VReg.V1, "_ta_abstract_ctor");
+        vm.store(VReg.S0, 8, VReg.V1);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_js_box_function");
+        vm.mov(VReg.S0, VReg.RET);            // S0 = 装箱 %TypedArray%
+        vm.mov(VReg.A0, VReg.S0);
+        keyOf(VReg.A1, "name");
+        vm.lea(VReg.A2, vm.asm.addString("TypedArray")); boxStr(VReg.A2);
+        vm.call("_closure_prop_set");
+        vm.call("_object_new");
+        vm.call("_box_obj_r");
+        vm.mov(VReg.S1, VReg.RET);            // S1 = 装箱原型对象
+        for (const [name, arity, helper] of METHODS) {
+            vm.movImm(VReg.A0, 24);
+            vm.call("_alloc");
+            vm.mov(VReg.S2, VReg.RET);
+            vm.movImm(VReg.V1, 0xc105);
+            vm.store(VReg.S2, 0, VReg.V1);
+            vm.lea(VReg.V1, "_aref_generic");
+            vm.store(VReg.S2, 8, VReg.V1);
+            vm.lea(VReg.V1, helper);
+            vm.store(VReg.S2, 16, VReg.V1);
+            vm.mov(VReg.A0, VReg.S2);
+            vm.call("_js_box_function");
+            vm.mov(VReg.S2, VReg.RET);        // S2 = 装箱方法
+            vm.mov(VReg.A0, VReg.S2);
+            keyOf(VReg.A1, "name");
+            vm.lea(VReg.A2, vm.asm.addString(name)); boxStr(VReg.A2);
+            vm.call("_closure_prop_set");
+            vm.mov(VReg.A0, VReg.S2);
+            keyOf(VReg.A1, "length");
+            vm.movImm(VReg.A2, arity);
+            vm.scvtf(0, VReg.A2);
+            vm.fmovToInt(VReg.A2, 0);
+            vm.call("_closure_prop_set");
+            vm.movImm64(VReg.V1, MASK);
+            vm.and(VReg.A0, VReg.S1, VReg.V1); // 裸原型
+            keyOf(VReg.A1, name);
+            vm.mov(VReg.A2, VReg.S2);
+            vm.call("_object_define");
+            vm.mov(VReg.A0, VReg.S1);
+            keyOf(VReg.A1, name);
+            vm.movImm(VReg.A2, ATTR_W_C);
+            vm.call("_object_set_prop_attr");
+        }
+        // 访问器属性:值是 24B TYPE_GETTER 标记块 {60@0, getter@8, setter@16}(裸堆指针),
+        // 由既有 _maybe_getter / gOPD 消费。特性位 enumerable:false, configurable:true。
+        for (const [name, getter] of [
+            ["buffer", "_tag_buffer"], ["byteLength", "_tag_byteLength"],
+            ["byteOffset", "_tag_byteOffset"], ["length", "_tag_length"],
+            ["Symbol.toStringTag", "_tag_toStringTag"],
+        ]) {
+            vm.movImm(VReg.A0, 24);
+            vm.call("_alloc");
+            vm.mov(VReg.S2, VReg.RET);         // 裸 getter 闭包
+            vm.movImm(VReg.V1, 0xc105);
+            vm.store(VReg.S2, 0, VReg.V1);
+            vm.lea(VReg.V1, "_aref_generic");
+            vm.store(VReg.S2, 8, VReg.V1);
+            vm.lea(VReg.V1, getter);
+            vm.store(VReg.S2, 16, VReg.V1);
+            vm.movImm(VReg.A0, 24);
+            vm.call("_alloc");                 // RET = 裸标记块
+            vm.movImm(VReg.V1, 60);            // TYPE_GETTER
+            vm.store(VReg.RET, 0, VReg.V1);
+            vm.store(VReg.RET, 8, VReg.S2);    // getter
+            vm.movImm(VReg.V1, 0);
+            vm.store(VReg.RET, 16, VReg.V1);   // setter = 0
+            vm.mov(VReg.S2, VReg.RET);
+            vm.movImm64(VReg.V1, MASK);
+            vm.and(VReg.A0, VReg.S1, VReg.V1);
+            keyOf(VReg.A1, name);
+            vm.mov(VReg.A2, VReg.S2);
+            vm.call("_object_define");
+            vm.mov(VReg.A0, VReg.S1);
+            keyOf(VReg.A1, name);
+            vm.movImm(VReg.A2, 4);             // configurable only
+            vm.call("_object_set_prop_attr");
+        }
+        vm.mov(VReg.A0, VReg.S0);
+        keyOf(VReg.A1, "prototype");
+        vm.mov(VReg.A2, VReg.S1);
+        vm.call("_closure_prop_set");
+        vm.lea(VReg.V0, "_ta_intrinsic_slot");
+        vm.store(VReg.V0, 0, VReg.S0);
+        vm.mov(VReg.RET, VReg.S0);
+        vm.label("_tapi_done");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 16);
+
+        // ---- _ta_getprototypeof(A0=值) -> Object.getPrototypeOf 语义 + TA 构造器特判。
+        // 编译器把 Object.getPrototypeOf 的调用点改派到这里:接收者是 TA 族构造器闭包
+        // (fnptr==_ta_ctor_tramp 且 type@16 != ArrayBuffer 伪码)时返 %TypedArray%,
+        // 其余原样转发既有 _object_getPrototypeOf(零行为变更)。
+        vm.label("_ta_getprototypeof");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.shrImm(VReg.V0, VReg.S0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jne("_tagp_fwd");
+        vm.movImm64(VReg.V1, MASK);
+        vm.and(VReg.S1, VReg.S0, VReg.V1);
+        vm.movImm64(VReg.V1, vm.ptrFloor);
+        vm.cmp(VReg.S1, VReg.V1);
+        vm.jlt("_tagp_fwd");
+        vm.load(VReg.V0, VReg.S1, 0);
+        vm.movImm(VReg.V1, 0xc105);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jne("_tagp_fwd");
+        vm.load(VReg.V0, VReg.S1, 8);
+        vm.lea(VReg.V1, "_ta_ctor_tramp");
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jne("_tagp_fwd");
+        vm.load(VReg.V0, VReg.S1, 16);
+        vm.cmpImm(VReg.V0, 0x70);             // ArrayBuffer 伪类型不属于 %TypedArray% 族
+        vm.jeq("_tagp_fwd");
+        vm.call("_ta_intrinsic");
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_tagp_fwd");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_getPrototypeOf");
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+
     }
 }

@@ -41,6 +41,33 @@ export const FunctionCompiler = {
     ...ClosureCompiler,
     ...OperatorCompiler,
 
+    // [W-23] TypedArray 方法分派的**扩展入口**:先试本文件补齐的 TA 方法,未命中再落既有
+    // compileTypedArrayMethod(expressions.js)。所有 TA 分派点统一改调这里,避免在多处
+    // 复制判断。目前只补 lastIndexOf —— 此前 TA 没有该分派,`ta.lastIndexOf(v)` 落
+    // compileArrayMethod → _array_lastIndexOf,后者按普通数组布局(data_ptr@24)解引用
+    // typed 块 → SIGSEGV(test262 lastIndexOf/fromIndex-minus-zero.js 等)。
+    compileTaMethodExt(obj, name, args) {
+        if (name === "lastIndexOf" && args.length >= 1) {
+            const vm = this.vm;
+            this.compileExpression(obj);
+            vm.push(VReg.RET);
+            this.compileExpression(args[0]);
+            vm.push(VReg.RET);
+            if (args.length >= 2) {
+                this.compileExpressionAsInt(args[1]);
+                vm.mov(VReg.A2, VReg.RET);
+            } else {
+                vm.movImm(VReg.A2, 2147483647); // 哨兵:从末尾开始
+            }
+            vm.pop(VReg.A1);
+            vm.pop(VReg.A0);
+            vm.call("_ta_lastindexof"); // 裸下标/-1
+            this.boxIntAsNumber(VReg.RET);
+            return true;
+        }
+        return this.compileTypedArrayMethod(obj, name, args);
+    },
+
     // 推断对象类型（用于方法调用分派）
     inferObjectType(obj) {
         const type = inferType(obj, this.ctx);
@@ -3658,10 +3685,15 @@ export const FunctionCompiler = {
                 }
                 if (prop.name === "getPrototypeOf") {
                     // Object.getPrototypeOf(obj)
+                    // [W-23] 改派 _ta_getprototypeof:它对 TypedArray 族构造器闭包返
+                    // %TypedArray% 内在对象(test262 harness/testTypedArray.js 的
+                    // `var TypedArray = Object.getPrototypeOf(Int8Array)` 此前拿到
+                    // undefined,该 harness 下 74 例在首个 TypedArray.prototype 读处即抛),
+                    // 其余一律尾调既有 _object_getPrototypeOf,语义不变。
                     if (expr.arguments.length > 0) {
                         this.compileExpression(expr.arguments[0]);
                         this.vm.mov(VReg.A0, VReg.RET);
-                        this.vm.call("_object_getPrototypeOf");
+                        this.vm.call("_ta_getprototypeof");
                     } else {
                         this.vm.movImm(VReg.RET, 0);
                     }
@@ -4416,7 +4448,7 @@ export const FunctionCompiler = {
             if (objType === "TypedArray" && !callee.computed &&
                 (HOISTED_ARRAY_METHODS.includes(prop.name) ||
                  prop.name === "set" || prop.name === "subarray")) {
-                if (this.compileTypedArrayMethod(obj, prop.name, expr.arguments)) {
+                if (this.compileTaMethodExt(obj, prop.name, expr.arguments)) {
                     return;
                 }
             }
@@ -4530,7 +4562,7 @@ export const FunctionCompiler = {
                         // 落 _array_values/entries),未处理者(forEach)委托数组实现(_subscript_get
                         // 运行时按 tag 处理 typed)。
                         { typedArray: true, compile: () => {
-                            if (!this.compileTypedArrayMethod(obj, prop.name, expr.arguments)) {
+                            if (!this.compileTaMethodExt(obj, prop.name, expr.arguments)) {
                                 this.compileArrayMethod(obj, prop.name, expr.arguments);
                             }
                         } },
@@ -4667,7 +4699,7 @@ export const FunctionCompiler = {
                             // TypedArray:先试 TA 专用实现(_ta_fill/slice/join/...),
                             // 未覆盖者(map/filter/reduce 等)回退 typed-aware 数组实现。
                             { typedArray: true, compile: () => {
-                                if (!this.compileTypedArrayMethod(objOnce, prop.name, expr.arguments)) {
+                                if (!this.compileTaMethodExt(objOnce, prop.name, expr.arguments)) {
                                     this.compileArrayMethod(objOnce, prop.name, expr.arguments);
                                 }
                             } },
@@ -4728,7 +4760,7 @@ export const FunctionCompiler = {
                     this.vm.jmp(endLbl);
                     this.vm.label(taLbl);
                     this.vm.pop(VReg.V0);
-                    if (!this.compileTypedArrayMethod(objOnce, prop.name, expr.arguments)) {
+                    if (!this.compileTaMethodExt(objOnce, prop.name, expr.arguments)) {
                         this.compileArrayMethod(objOnce, prop.name, expr.arguments);
                     }
                     this.vm.jmp(endLbl);
@@ -4822,7 +4854,7 @@ export const FunctionCompiler = {
                 if ((prop.name === "subarray" || (prop.name === "set" && nArgs === 1)) && !callee.computed) {
                     const objOnce = this._evalOnceToIdent(obj); // 接收者单次求值
                     this.emitTagDispatchMethod(objOnce, prop, expr.arguments, [
-                        { typedArray: true, compile: () => this.compileTypedArrayMethod(objOnce, prop.name, expr.arguments) },
+                        { typedArray: true, compile: () => this.compileTaMethodExt(objOnce, prop.name, expr.arguments) },
                     ]);
                     return;
                 }
@@ -4834,7 +4866,7 @@ export const FunctionCompiler = {
                     this.emitTagDispatchMethod(objOnce, prop, expr.arguments, [
                         { type: 4, compile: () => this.compileMapMethod(objOnce, prop.name, expr.arguments) },
                         // TypedArray.set(src, off):TA 头字节分支(2 参形态)
-                        { typedArray: true, compile: () => this.compileTypedArrayMethod(objOnce, prop.name, expr.arguments) },
+                        { typedArray: true, compile: () => this.compileTaMethodExt(objOnce, prop.name, expr.arguments) },
                     ]);
                     return;
                 }

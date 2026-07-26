@@ -177,6 +177,9 @@ export class StringGenerator {
         vm.prologue(0, [VReg.S0, VReg.S1]);
         vm.mov(VReg.S0, VReg.A0);
         vm.mov(VReg.S1, VReg.A1);
+        // [W-25] that 实参 ToString:localeCompare(undefined) 须与 "undefined" 比较
+        // (test262 15.5.4.9_3),此前 _getStrContent(undefined) → 空串 → 恒返 1。
+        this._emitArgStrInline(VReg.S1, "_localeCompare_that");
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_getStrContent");
         vm.mov(VReg.S0, VReg.RET); // str content
@@ -272,6 +275,25 @@ export class StringGenerator {
         vm.label(doneLabel);
         vm.mov(VReg.RET, VReg.S2);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+    }
+
+    // [W-25] 在调用点内联 _str_argstr 的快路判别:reg 已是字符串形状则原地不动,
+    // 否则 call _str_argstr 归一后写回 reg。reg 必须是 callee-saved(S*),因为
+    // _valueToStr 会破坏 V/A 寄存器。tagLabel 用于生成唯一跳转标签。
+    _emitArgStrInline(reg, tagLabel) {
+        const vm = this.vm;
+        const skip = "_argstr_skip_" + tagLabel;
+        vm.shrImm(VReg.V1, reg, 48);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq(skip);
+        vm.cmpImm(VReg.V1, 0x7ffc);
+        vm.jeq(skip);
+        vm.cmpImm(VReg.V1, 0x7fff);
+        vm.jeq(skip);
+        vm.mov(VReg.A0, reg);
+        vm.call("_str_argstr");
+        vm.mov(reg, VReg.RET);
+        vm.label(skip);
     }
 
     // 获取字符串内容指针
@@ -370,6 +392,13 @@ export class StringGenerator {
 
         vm.mov(VReg.S0, VReg.A0); // S0 = s1
         vm.mov(VReg.S1, VReg.A1); // S1 = s2
+
+        // [W-25] 非字符串操作数 ToString。`+` 走 compileExpressionToString 已归一(此处
+        // 恒直通,只多 4 条判别指令);但 str.concat(x) 的 dispatch 把实参原样传进来,
+        // 此前经 _getStrContent 判非法 → 空串("lego".concat(undefined) === "lego")。
+        // 判别内联,慢路才 call —— _strconcat 是自举最热路径之一,不能无条件加调用。
+        this._emitArgStrInline(VReg.S1, "_strconcat_a1");
+        this._emitArgStrInline(VReg.S0, "_strconcat_a0");
 
         // 获取 s1 的实际内容指针
         vm.mov(VReg.A0, VReg.S0);
@@ -672,7 +701,12 @@ export class StringGenerator {
         vm.push(VReg.A2);
         vm.call("_getStrContent");
         vm.mov(VReg.S0, VReg.RET);
-        vm.pop(VReg.A0); // padStr
+        vm.pop(VReg.S1); // padStr(原样,先 ToString 再取内容)
+        // [W-25] fillString ToString:"abc".padStart(10,false) 须用 "false" 填充
+        // (test262 padStart/fill-string-non-strings);此前非串 pad 落 _getStrContent
+        // 非法路径 → 空串 → 退化成空格填充。
+        this._emitArgStrInline(VReg.S1, label);
+        vm.mov(VReg.A0, VReg.S1);
         vm.call("_getStrContent");
         vm.mov(VReg.S1, VReg.RET);
         vm.pop(VReg.A0); // targetLen
@@ -2587,6 +2621,201 @@ export class StringGenerator {
         vm.epilogue([VReg.S0, VReg.S1], 0);
     }
 
+    // [W-25] _str_ws_len(A0=content 指针, A1=剩余字节数) -> RET = 该处 WhiteSpace/
+    // LineTerminator 的 UTF-8 字节长度(1/2/3),不是空白则 0。
+    // trim/trimStart/trimEnd 共用(此前三处各自只认 ' ' \t \n \r,test262
+    // 15.5.4.20-3-3 / -4-12 / -4-24 / -4-46 / -4-50 全挂在这四个字节上)。
+    // 规范集合 = WhiteSpace ∪ LineTerminator:
+    //   1 字节: \t(09) \n(0A) \v(0B) \f(0C) \r(0D) SP(20)
+    //   2 字节: U+00A0        = C2 A0
+    //   3 字节: U+1680        = E1 9A 80
+    //           U+2000..200A  = E2 80 80..8A
+    //           U+2028/2029   = E2 80 A8 / A9
+    //           U+202F        = E2 80 AF
+    //           U+205F        = E2 81 9F
+    //           U+3000        = E3 80 80
+    //           U+FEFF        = EF BB BF
+    // 字节模型下这些恒是完整 UTF-8 序列;残缺序列(remaining 不够)一律判非空白,
+    // 不会越界读。loadByte 后必须 and 0xFF——本文件既有代码(_str_cp_bytes)证实
+    // 高位可能带脏值,不掩码则 >=0x80 的比较全错。
+    generateWsLen() {
+        const vm = this.vm;
+
+        vm.label("_str_ws_len");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0); // ptr
+        vm.mov(VReg.S1, VReg.A1); // remaining
+        vm.cmpImm(VReg.S1, 1);
+        vm.jlt("_swl_0");
+        vm.loadByte(VReg.V1, VReg.S0, 0);
+        vm.andImm(VReg.V1, VReg.V1, 0xff);
+        // ASCII 段
+        vm.cmpImm(VReg.V1, 0x20);
+        vm.jeq("_swl_1");
+        vm.cmpImm(VReg.V1, 0x09);
+        vm.jlt("_swl_0");
+        vm.cmpImm(VReg.V1, 0x0d);
+        vm.jle("_swl_1");
+        // 2 字节: C2 A0
+        vm.cmpImm(VReg.V1, 0xc2);
+        vm.jne("_swl_try3");
+        vm.cmpImm(VReg.S1, 2);
+        vm.jlt("_swl_0");
+        vm.loadByte(VReg.V3, VReg.S0, 1);
+        vm.andImm(VReg.V3, VReg.V3, 0xff);
+        vm.cmpImm(VReg.V3, 0xa0);
+        vm.jeq("_swl_2");
+        vm.jmp("_swl_0");
+        // 3 字节族
+        vm.label("_swl_try3");
+        vm.cmpImm(VReg.S1, 3);
+        vm.jlt("_swl_0");
+        vm.loadByte(VReg.V3, VReg.S0, 1);
+        vm.andImm(VReg.V3, VReg.V3, 0xff);
+        vm.loadByte(VReg.V4, VReg.S0, 2);
+        vm.andImm(VReg.V4, VReg.V4, 0xff);
+        vm.cmpImm(VReg.V1, 0xe1);
+        vm.jne("_swl_e2");
+        vm.cmpImm(VReg.V3, 0x9a);
+        vm.jne("_swl_0");
+        vm.cmpImm(VReg.V4, 0x80);
+        vm.jeq("_swl_3");
+        vm.jmp("_swl_0");
+        vm.label("_swl_e2");
+        vm.cmpImm(VReg.V1, 0xe2);
+        vm.jne("_swl_e3");
+        vm.cmpImm(VReg.V3, 0x81);
+        vm.jeq("_swl_e2_81");
+        vm.cmpImm(VReg.V3, 0x80);
+        vm.jne("_swl_0");
+        vm.cmpImm(VReg.V4, 0x80);
+        vm.jlt("_swl_0");
+        vm.cmpImm(VReg.V4, 0x8a);
+        vm.jle("_swl_3");
+        vm.cmpImm(VReg.V4, 0xa8);
+        vm.jeq("_swl_3");
+        vm.cmpImm(VReg.V4, 0xa9);
+        vm.jeq("_swl_3");
+        vm.cmpImm(VReg.V4, 0xaf);
+        vm.jeq("_swl_3");
+        vm.jmp("_swl_0");
+        vm.label("_swl_e2_81");
+        vm.cmpImm(VReg.V4, 0x9f);
+        vm.jeq("_swl_3");
+        vm.jmp("_swl_0");
+        vm.label("_swl_e3");
+        vm.cmpImm(VReg.V1, 0xe3);
+        vm.jne("_swl_ef");
+        vm.cmpImm(VReg.V3, 0x80);
+        vm.jne("_swl_0");
+        vm.cmpImm(VReg.V4, 0x80);
+        vm.jeq("_swl_3");
+        vm.jmp("_swl_0");
+        vm.label("_swl_ef");
+        vm.cmpImm(VReg.V1, 0xef);
+        vm.jne("_swl_0");
+        vm.cmpImm(VReg.V3, 0xbb);
+        vm.jne("_swl_0");
+        vm.cmpImm(VReg.V4, 0xbf);
+        vm.jeq("_swl_3");
+        vm.label("_swl_0");
+        vm.movImm(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_swl_1");
+        vm.movImm(VReg.RET, 1);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_swl_2");
+        vm.movImm(VReg.RET, 2);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_swl_3");
+        vm.movImm(VReg.RET, 3);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+    }
+
+    // [W-25] _str_ws_len_back(A0=content 指针, A1=end 下标) -> RET = 以 end-1 为末字节
+    // 的空白序列字节长度(1/2/3),非空白则 0。尾部扫描用(需要往回认多字节序列)。
+    // 先试 1 字节 ASCII(空白 ASCII 不可能是 UTF-8 后续字节,无歧义),再回退 2/3 字节
+    // 委托 _str_ws_len 判定,不重复空白表。
+    generateWsLenBack() {
+        const vm = this.vm;
+
+        vm.label("_str_ws_len_back");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0); // ptr
+        vm.mov(VReg.S1, VReg.A1); // end
+        vm.cmpImm(VReg.S1, 1);
+        vm.jlt("_swlb_0");
+        vm.subImm(VReg.V1, VReg.S1, 1);
+        vm.add(VReg.V1, VReg.S0, VReg.V1);
+        vm.loadByte(VReg.V3, VReg.V1, 0);
+        vm.andImm(VReg.V3, VReg.V3, 0xff);
+        vm.cmpImm(VReg.V3, 0x20);
+        vm.jeq("_swlb_1");
+        vm.cmpImm(VReg.V3, 0x09);
+        vm.jlt("_swlb_try2");
+        vm.cmpImm(VReg.V3, 0x0d);
+        vm.jle("_swlb_1");
+        vm.label("_swlb_try2");
+        vm.cmpImm(VReg.S1, 2);
+        vm.jlt("_swlb_0");
+        vm.subImm(VReg.V1, VReg.S1, 2);
+        vm.add(VReg.A0, VReg.S0, VReg.V1);
+        vm.movImm(VReg.A1, 2);
+        vm.call("_str_ws_len");
+        vm.cmpImm(VReg.RET, 2);
+        vm.jeq("_swlb_2");
+        vm.cmpImm(VReg.S1, 3);
+        vm.jlt("_swlb_0");
+        vm.subImm(VReg.V1, VReg.S1, 3);
+        vm.add(VReg.A0, VReg.S0, VReg.V1);
+        vm.movImm(VReg.A1, 3);
+        vm.call("_str_ws_len");
+        vm.cmpImm(VReg.RET, 3);
+        vm.jeq("_swlb_3");
+        vm.label("_swlb_0");
+        vm.movImm(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_swlb_1");
+        vm.movImm(VReg.RET, 1);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_swlb_2");
+        vm.movImm(VReg.RET, 2);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_swlb_3");
+        vm.movImm(VReg.RET, 3);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+    }
+
+    // [W-25] _str_argstr(A0=任意 JSValue) -> RET = 可直接交给 _getStrContent 的字符串值。
+    // 非字符串实参先走 ToString(_valueToStr,含用户 toString/[Symbol.toPrimitive])。
+    // 直通(不转换)的三类:
+    //   high16 == 0      裸内容指针(静态派发已 _getStrContent 过的实参,热路径)
+    //   high16 == 0x7FFC 装箱字符串(绝大多数调用)
+    //   high16 == 0x7FFF 装箱函数(replace 的函数替换器等由上游语义处理,
+    //                    转成 "[Function]" 只会把一种错换成另一种)
+    // 其余(undefined/null/boolean/number/object/array/裸 float)此前一律被
+    // _getStrContent 判非法 → 空串,这是 concat(undefined)/padStart(false)/
+    // localeCompare(undefined)/indexOf(undefined) 全族偏差的共因。
+    generateArgStr() {
+        const vm = this.vm;
+        vm.label("_str_argstr");
+        vm.prologue(0, [VReg.S0]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.shrImm(VReg.V1, VReg.S0, 48);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_sas_pass");
+        vm.cmpImm(VReg.V1, 0x7ffc);
+        vm.jeq("_sas_pass");
+        vm.cmpImm(VReg.V1, 0x7fff);
+        vm.jeq("_sas_pass");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_valueToStr");
+        vm.epilogue([VReg.S0], 0);
+        vm.label("_sas_pass");
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0], 0);
+    }
+
     // 去除首尾空白
     // _str_trim(str) -> 新字符串
     generateTrim() {
@@ -2613,23 +2842,16 @@ export class StringGenerator {
         vm.movImm(VReg.S2, 0); // S2 = start
         const skipStartLabel = "_trim_skip_start";
         const startDoneLabel = "_trim_start_done";
+        // [W-25] 空白判定统一走 _str_ws_len(完整 WhiteSpace ∪ LineTerminator,含多字节)
         vm.label(skipStartLabel);
         vm.cmp(VReg.S2, VReg.S1);
         vm.jge(startDoneLabel);
-        vm.add(VReg.V0, VReg.S0, VReg.S2);
-        vm.loadByte(VReg.V1, VReg.V0, 0);
-        // 检查是否是空白字符（空格、制表符、换行）
-        vm.cmpImm(VReg.V1, 32); // space
-        vm.jeq("_trim_skip_inc_start");
-        vm.cmpImm(VReg.V1, 9); // tab
-        vm.jeq("_trim_skip_inc_start");
-        vm.cmpImm(VReg.V1, 10); // newline
-        vm.jeq("_trim_skip_inc_start");
-        vm.cmpImm(VReg.V1, 13); // carriage return
-        vm.jeq("_trim_skip_inc_start");
-        vm.jmp(startDoneLabel);
-        vm.label("_trim_skip_inc_start");
-        vm.addImm(VReg.S2, VReg.S2, 1);
+        vm.add(VReg.A0, VReg.S0, VReg.S2);
+        vm.sub(VReg.A1, VReg.S1, VReg.S2);
+        vm.call("_str_ws_len");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq(startDoneLabel);
+        vm.add(VReg.S2, VReg.S2, VReg.RET);
         vm.jmp(skipStartLabel);
         vm.label(startDoneLabel);
 
@@ -2640,21 +2862,15 @@ export class StringGenerator {
         vm.label(skipEndLabel);
         vm.cmp(VReg.S3, VReg.S2);
         vm.jle(endDoneLabel);
-        vm.subImm(VReg.V0, VReg.S3, 1);
-        vm.add(VReg.V0, VReg.S0, VReg.V0);
-        vm.loadByte(VReg.V1, VReg.V0, 0);
-        vm.cmpImm(VReg.V1, 32);
-        vm.jeq("_trim_skip_dec_end");
-        vm.cmpImm(VReg.V1, 9);
-        vm.jeq("_trim_skip_dec_end");
-        vm.cmpImm(VReg.V1, 10);
-        vm.jeq("_trim_skip_dec_end");
-        vm.cmpImm(VReg.V1, 13);
-        vm.jeq("_trim_skip_dec_end");
-        vm.jmp(endDoneLabel);
-        vm.label("_trim_skip_dec_end");
-        vm.subImm(VReg.S3, VReg.S3, 1);
-        vm.jmp(skipEndLabel);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_str_ws_len_back");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq(endDoneLabel);
+        vm.sub(VReg.S3, VReg.S3, VReg.RET);
+        vm.cmp(VReg.S3, VReg.S2);
+        vm.jge(skipEndLabel);
+        vm.mov(VReg.S3, VReg.S2); // 空白跨过 start(全空白串):钳到 start
         vm.label(endDoneLabel);
 
         // 计算新长度，保存到 S4
@@ -2725,19 +2941,12 @@ export class StringGenerator {
         vm.label("_trimS_skip");
         vm.cmp(VReg.S2, VReg.S1);
         vm.jge("_trimS_skip_done");
-        vm.add(VReg.V0, VReg.S0, VReg.S2);
-        vm.loadByte(VReg.V1, VReg.V0, 0);
-        vm.cmpImm(VReg.V1, 32);
-        vm.jeq("_trimS_skip_inc");
-        vm.cmpImm(VReg.V1, 9);
-        vm.jeq("_trimS_skip_inc");
-        vm.cmpImm(VReg.V1, 10);
-        vm.jeq("_trimS_skip_inc");
-        vm.cmpImm(VReg.V1, 13);
-        vm.jeq("_trimS_skip_inc");
-        vm.jmp("_trimS_skip_done");
-        vm.label("_trimS_skip_inc");
-        vm.addImm(VReg.S2, VReg.S2, 1);
+        vm.add(VReg.A0, VReg.S0, VReg.S2);
+        vm.sub(VReg.A1, VReg.S1, VReg.S2);
+        vm.call("_str_ws_len"); // [W-25] 完整空白集
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_trimS_skip_done");
+        vm.add(VReg.S2, VReg.S2, VReg.RET);
         vm.jmp("_trimS_skip");
         vm.label("_trimS_skip_done");
 
@@ -2794,21 +3003,15 @@ export class StringGenerator {
         vm.label("_trimE_skip");
         vm.cmp(VReg.S3, VReg.S2);
         vm.jle("_trimE_skip_done");
-        vm.subImm(VReg.V0, VReg.S3, 1);
-        vm.add(VReg.V0, VReg.S0, VReg.V0);
-        vm.loadByte(VReg.V1, VReg.V0, 0);
-        vm.cmpImm(VReg.V1, 32);
-        vm.jeq("_trimE_skip_dec");
-        vm.cmpImm(VReg.V1, 9);
-        vm.jeq("_trimE_skip_dec");
-        vm.cmpImm(VReg.V1, 10);
-        vm.jeq("_trimE_skip_dec");
-        vm.cmpImm(VReg.V1, 13);
-        vm.jeq("_trimE_skip_dec");
-        vm.jmp("_trimE_skip_done");
-        vm.label("_trimE_skip_dec");
-        vm.subImm(VReg.S3, VReg.S3, 1);
-        vm.jmp("_trimE_skip");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_str_ws_len_back"); // [W-25] 完整空白集
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_trimE_skip_done");
+        vm.sub(VReg.S3, VReg.S3, VReg.RET);
+        vm.cmp(VReg.S3, VReg.S2);
+        vm.jge("_trimE_skip");
+        vm.mov(VReg.S3, VReg.S2);
         vm.label("_trimE_skip_done");
 
         // newLen = S3 - 0 = S3
@@ -3356,6 +3559,12 @@ export class StringGenerator {
         vm.mov(VReg.S0, VReg.A0); // str
         vm.mov(VReg.S1, VReg.A1); // search
         vm.mov(VReg.S2, VReg.A2); // repl
+        // [W-25] repl ToString(函数替换器由 _str_argstr 直通,仍交上游 _str_replace_fn):
+        // "undefined".replace("e", undefined) 须得 "undundefinedfined"。
+        this._emitArgStrInline(VReg.S2, "_replace_repl");
+        // search 也必须在此归一:下方 searchLen 走 _getStrContent,而 _str_indexOf 内部
+        // 已自带 ToString——两处不一致会算出错位的 searchLen 并切错串。
+        this._emitArgStrInline(VReg.S1, "_replace_search");
 
         // idx = indexOf(str, search)
         vm.mov(VReg.A0, VReg.S0);
@@ -3490,6 +3699,8 @@ export class StringGenerator {
         vm.mov(VReg.S0, VReg.A0); // remaining（初值 = str）
         vm.mov(VReg.S1, VReg.A1); // search
         vm.mov(VReg.S2, VReg.A2); // repl
+        this._emitArgStrInline(VReg.S2, "_replaceAll_repl");   // [W-25] repl ToString
+        this._emitArgStrInline(VReg.S1, "_replaceAll_search"); // [W-25] search 同上(与 indexOf 一致)
 
         // searchLen；==0 → 返回原串（守卫死循环）
         vm.mov(VReg.A0, VReg.S1);
@@ -3586,8 +3797,51 @@ export class StringGenerator {
         vm.call("_strconcat");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 16);
 
+        // [W-25] 空 searchValue:ES StringIndexOf 对空串在每个位置(0..len,含末尾)命中,
+        // 故结果 = repl + s[0] + repl + s[1] + ... + s[len-1] + repl
+        // ("".replaceAll("","abc") === "abc";"xy".replaceAll("","-") === "-x-y-")。
+        // 此前直接返回原串(仅为守住死循环)。
+        // 寄存器约束:_strconcat/_alloc 只保证 S0-S4,故 len/i 存栈帧(SP+0/SP+8),
+        // acc 用 S3(跨 _strconcat 存活)。此路径先于 hasDollar 计算,SP 两槽都空闲。
         vm.label("_replaceAll_wholestr");
-        vm.mov(VReg.RET, VReg.S0);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_getStrContent");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_strlen");
+        vm.store(VReg.SP, 0, VReg.RET); // len
+        vm.movImm(VReg.V1, 0);
+        vm.store(VReg.SP, 8, VReg.V1);  // i = 0
+        vm.lea(VReg.RET, "_str_empty");
+        {
+            const maskReg = vm.backend.name === "x64" ? VReg.V2 : VReg.V0;
+            vm.movImm64(maskReg, 0x0000ffffffffffffn);
+            vm.and(VReg.RET, VReg.RET, maskReg);
+        }
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.mov(VReg.S3, VReg.RET); // acc = ""
+        vm.label("_replaceAll_empty_loop");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.mov(VReg.A1, VReg.S2);
+        vm.call("_strconcat"); // acc += repl
+        vm.mov(VReg.S3, VReg.RET);
+        vm.load(VReg.V1, VReg.SP, 8); // i
+        vm.load(VReg.V3, VReg.SP, 0); // len
+        vm.cmp(VReg.V1, VReg.V3);
+        vm.jge("_replaceAll_empty_done");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.V1);
+        vm.call("_str_charAt"); // 1 字节子串(字节模型下拼回等价原串)
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S3);
+        vm.call("_strconcat"); // acc += s[i]
+        vm.mov(VReg.S3, VReg.RET);
+        vm.load(VReg.V1, VReg.SP, 8);
+        vm.addImm(VReg.V1, VReg.V1, 1);
+        vm.store(VReg.SP, 8, VReg.V1);
+        vm.jmp("_replaceAll_empty_loop");
+        vm.label("_replaceAll_empty_done");
+        vm.mov(VReg.RET, VReg.S3);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 16);
     }
 
@@ -3847,6 +4101,17 @@ export class StringGenerator {
         vm.call("_array_new_with_size");
         vm.mov(VReg.S3, VReg.RET); // 装箱数组
 
+        // [W-25] separator === undefined → 整串作单元素返回(ES 21.1.3.23 step 8)。
+        // 必须在 ToString 之前判:此前 undefined 被 _getStrContent 判非法 → 空串 →
+        // 落逐字符路径("abc".split(undefined) 得 ["a","b","c"],test262 separator-undef)。
+        // 注:无参 split() 由 dispatch 传 _str_empty(裸指针),与 split("") 不可区分,
+        // 仍走逐字符——那是 dispatch 侧的信息丢失,运行时无从恢复。
+        vm.movImm64(VReg.V1, 0x7ffb000000000000n);
+        vm.cmp(VReg.S1, VReg.V1);
+        vm.jeq("_split_undef_sep");
+        // 其余非串 separator 走 ToString(split(null) → "null"、split(1) → "1")
+        this._emitArgStrInline(VReg.S1, "_split_sep");
+
         // str content 指针(供 _str_substring_raw 切段)
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_getStrContent");
@@ -3898,6 +4163,17 @@ export class StringGenerator {
         vm.call("_array_push");
         // 装箱为 JSValue 数组（0x7FFE）——_array_new_with_size 返回裸指针，
         // 下游 .join()/typeof 等按 boxed 数组处理，未装箱会崩。
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.RET, VReg.RET, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffe000000000000n);
+        vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 96);
+
+        // [W-25] separator === undefined:[整串]
+        vm.label("_split_undef_sep");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.mov(VReg.A1, VReg.S0); // 原装箱串直接入数组
+        vm.call("_array_push");
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.RET, VReg.RET, VReg.V1);
         vm.movImm64(VReg.V1, 0x7ffe000000000000n);
@@ -3993,6 +4269,8 @@ export class StringGenerator {
         vm.mov(VReg.S1, VReg.A1);
         vm.mov(VReg.S4, VReg.A2); // S4 = fromIndex(入口即捕获,后续调用会冲 A2)
 
+        this._emitArgStrInline(VReg.S1, "_indexOf_search"); // [W-25] search 非串 → ToString
+
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_getStrContent");
         vm.mov(VReg.S0, VReg.RET);
@@ -4015,6 +4293,15 @@ export class StringGenerator {
         vm.jge("_indexOf_from_ok");
         vm.movImm(VReg.S4, 0);
         vm.label("_indexOf_from_ok");
+        // [W-25] 空 search:ES StringIndexOf 返回 min(pos, len),不是 -1
+        // ("abc".indexOf("", 100) === 3)。下方主循环的 pos>len-searchLen 判会误报 -1。
+        vm.cmpImm(VReg.S3, 0);
+        vm.jne("_indexOf_nonempty");
+        vm.cmp(VReg.S4, VReg.S2);
+        vm.jle("_indexOf_found");
+        vm.mov(VReg.S4, VReg.S2);
+        vm.jmp("_indexOf_found");
+        vm.label("_indexOf_nonempty");
         const outerLoop = "_indexOf_outer";
         const innerLoop = "_indexOf_inner";
         const found = "_indexOf_found";
@@ -4084,6 +4371,8 @@ export class StringGenerator {
         vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2]);
         vm.mov(VReg.S0, VReg.A0);
         vm.mov(VReg.S1, VReg.A1);
+        this._emitArgStrInline(VReg.S1, "_startsWith_search"); // [W-25]
+        vm.mov(VReg.A0, VReg.S0);
         vm.call("_getStrContent"); vm.mov(VReg.S0, VReg.RET);
         vm.mov(VReg.A0, VReg.S1); vm.call("_getStrContent"); vm.mov(VReg.S1, VReg.RET);
         vm.mov(VReg.A0, VReg.S1); vm.call("_strlen"); vm.mov(VReg.S2, VReg.RET);
@@ -4112,6 +4401,8 @@ export class StringGenerator {
         vm.label("_str_endsWith");
         vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
         vm.mov(VReg.S0, VReg.A0); vm.mov(VReg.S1, VReg.A1);
+        this._emitArgStrInline(VReg.S1, "_endsWith_search"); // [W-25]
+        vm.mov(VReg.A0, VReg.S0);
         vm.call("_getStrContent"); vm.mov(VReg.S0, VReg.RET);
         vm.mov(VReg.A0, VReg.S1); vm.call("_getStrContent"); vm.mov(VReg.S1, VReg.RET);
         vm.mov(VReg.A0, VReg.S0); vm.call("_strlen"); vm.mov(VReg.S2, VReg.RET);
@@ -4146,6 +4437,8 @@ export class StringGenerator {
         // getStrContent/strlen 调用的 A 寄存器踩踏(同 _date_toISOString 的 SP 相对存法)。
         vm.store(VReg.SP, 0, VReg.A2);
         vm.mov(VReg.S0, VReg.A0); vm.mov(VReg.S1, VReg.A1);
+        this._emitArgStrInline(VReg.S1, "_lastIndexOf_search"); // [W-25]
+        vm.mov(VReg.A0, VReg.S0);
         vm.call("_getStrContent"); vm.mov(VReg.S0, VReg.RET);
         vm.mov(VReg.A0, VReg.S1); vm.call("_getStrContent"); vm.mov(VReg.S1, VReg.RET);
         vm.mov(VReg.A0, VReg.S0); vm.call("_strlen"); vm.mov(VReg.S2, VReg.RET);
@@ -4189,6 +4482,14 @@ export class StringGenerator {
         vm.mov(VReg.S0, VReg.A0); vm.mov(VReg.S1, VReg.A1);
         // count 由活跃 dispatch(builtin_methods.js)以 fcvtzs 转好的裸 int32 传入 A1,
         // 不可再调 _to_int32(会把裸整数当 NaN-boxed 解析→得 0→误走 _repeat_empty→空串)。
+        // [W-25] count 越界 → RangeError(ES: count < 0 或 count 为 +∞ 时 throw)。
+        // dispatch 以 fcvtzs 转整数,故 +Infinity 到达时是 INT64_MAX、-Infinity 是
+        // INT64_MIN。此前 count<0 静默返空串、INT64_MAX 进入 mul+alloc → 挂死
+        // (test262 repeat/count-is-infinity-throws 之前是 run timeout)。
+        // 上限取 2^31:比之更大的 count 必然超出任何可分配串长,与 +∞ 同判。
+        vm.cmpImm(VReg.S1, 0); vm.jlt("_repeat_range_err");
+        vm.movImm64(VReg.V1, 0x80000000n);
+        vm.cmp(VReg.S1, VReg.V1); vm.jge("_repeat_range_err");
         vm.cmpImm(VReg.S1, 0); vm.jle("_repeat_empty");
         vm.mov(VReg.A0, VReg.S0); vm.call("_getStrContent"); vm.mov(VReg.S0, VReg.RET);
         vm.mov(VReg.A0, VReg.S0); vm.call("_strlen"); vm.mov(VReg.S2, VReg.RET);
@@ -4231,6 +4532,12 @@ export class StringGenerator {
         }
         vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.RET, VReg.RET, VReg.V1);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
+        // [W-25] RangeError:复用 typedarray 的 _ta_throw_range(同 {name,message,
+        // __asmjs_err,cause} 表示,instanceof RangeError / e.name 均成立),不重复造错误对象。
+        // 运行时各 generator 无条件发射,标签恒存在。不返回。
+        vm.label("_repeat_range_err");
+        vm.call("_ta_throw_range");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64); // 理论不达
     }
 
     // _str_at(str, index) -> str/undefined
@@ -4290,6 +4597,9 @@ export class StringGenerator {
         this.generateStrCodepointAt();
         this.generateStrIndexChar();
         this.generateCharCodeAt();
+        this.generateWsLen();      // [W-25] 空白判定(完整 WhiteSpace ∪ LineTerminator)
+        this.generateWsLenBack();  // [W-25] 同上,尾部扫描方向
+        this.generateArgStr();     // [W-25] 字符串实参 ToString 归一
         this.generateTrim();
         this.generateTrimStart();
         this.generateTrimEnd();

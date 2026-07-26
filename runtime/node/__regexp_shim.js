@@ -10,12 +10,18 @@
 //
 // 支持: 字面字符、.、\d \w \s \D \W \S \b \B、字符类 [a-z^]、
 //       量词 * + ? {n} {n,} {n,m}(贪婪 + ? 惰性)、分组 ( ) 捕获与 (?: )、
-//       交替 |、锚点 ^ $、转义(\n \r \t \f \v \0 \xNN \uNNNN 及标点)、
+//       交替 |、锚点 ^ $、转义(\n \r \t \f \v \0 \cX \xNN \uNNNN 及标点)、
 //       lookahead (?= (?!、lookbehind (?<= (?<!(定长优先,变长近似)、
-//       反向引用 \1..\9、命名组 (?<name>) + \k<name> + exec .groups、
+//       反向引用 \1..\9、命名组 (?<name>) + \k<name> + exec .groups(含 ES2025
+//       跨分支重名组)、内联修饰组 (?i-m:…)、
 //       flags g/i/m/s(dotAll)/y(sticky);matchAll、replace 函数参 fn(m,p1..pn,off,str)。
-// 不支持(编译标记 __bad,exec 返回 null / test false / replace 原样返回):
-//       unicode 属性类 \p{...}、unicode u flag(忽略未知 flag)、$10+/\10+ 两位组引用。
+// 语法错误:__RE_new 在**构造期**编译模式,非法模式/非法标志立即 throw SyntaxError
+//       (规范行为)。仅"能解析但本引擎未实现"的构造(\p{…} 属性类)才走静默
+//       __bad 路线(exec 恒 null / test 恒 false),不抛。
+// 不支持:unicode 属性类 \p{...}、v(unicodeSets)标志、$10+/\10+ 两位组引用、
+//       >9 个捕获组;lookbehind 的反向回溯顺序是近似(见 "look" 分支注释)。
+// 字符串是 UTF-8 字节串:charCodeAt 给的是字节。非 ASCII 字面字符与 \uNNNN 会被
+//       聚成 "str" 原子(整字符),但 . [] \w 之类仍按字节工作(记为已知偏差)。
 //
 // gen1-safe 铁律:本文件会被 gen1 编译器编译——不用正则、不用解构、不用默认参数、
 // 不用 getter/生成器、不用 arr.length=n 截断;仅 charCodeAt/charAt/slice/indexOf/push。
@@ -36,9 +42,18 @@ function __re_isWordCode(c) {
 }
 
 function __re_isSpaceCode(c) {
-    // space \t \n \v \f \r + NBSP(160)
+    // ES \s = WhiteSpace ∪ LineTerminator。
+    // TAB/LF/VT/FF/CR(9..13)、SP(32)、NBSP(160)、OGHAM SPACE(0x1680)、
+    // EN/EM QUAD..HAIR SPACE(0x2000..0x200A)、LS/PS(0x2028/0x2029)、
+    // NNBSP(0x202F)、MMSP(0x205F)、IDEOGRAPHIC SPACE(0x3000)、ZWNBSP/BOM(0xFEFF)。
     if (c === 32 || c === 160) return true;
-    return c >= 9 && c <= 13;
+    if (c >= 9 && c <= 13) return true;
+    if (c === 5760) return true;
+    if (c >= 8192 && c <= 8202) return true;
+    if (c === 8232 || c === 8233) return true;
+    if (c === 8239 || c === 8287) return true;
+    if (c === 12288 || c === 65279) return true;
+    return false;
 }
 
 function __re_hexVal(c) {
@@ -54,12 +69,27 @@ function __re_hexVal(c) {
 //       {k:"bol"} {k:"eol"} {k:"wb"} {k:"nwb"}
 // max === -1 表示无上界。idx === -1 表示 (?: ) 非捕获组。
 
+// 语法错误(可抛 SyntaxError)与"能解析但本引擎不支持"(只置 __bad,静默不匹配)
+// 必须分开:前者 new RegExp 立即抛,后者不能抛(否则 \p{…} 这类合法但未实现的
+// 模式会把用户程序打断)。__re_fail = 语法错;__re_unsup = 未实现。
+function __re_fail(st, msg) {
+    if (st.err === 0) {
+        st.err = 1;
+        st.emsg = msg;
+    }
+    return null;
+}
+
+function __re_unsup(st) {
+    st.unsup = 1;
+    return null;
+}
+
 // 转义解析。返回 {t:0, code} 字面码点 / {t:1, c} 类简写 / {t:2, c} 词边界;
-// 失败(不支持的转义,如反向引用)置 st.err 并返回 null。
+// 失败置 st.err(语法错)或 st.unsup(未实现)并返回 null。
 function __re_parseEscape(st, inClass) {
     if (st.i >= st.n) {
-        st.err = 1;
-        return null;
+        return __re_fail(st, "\\ at end of pattern");
     }
     var ch = st.p.charAt(st.i);
     var c = st.p.charCodeAt(st.i);
@@ -72,10 +102,8 @@ function __re_parseEscape(st, inClass) {
         return { t: 2, c: "b", code: 0 };
     }
     if (ch === "B") {
-        if (inClass) {
-            st.err = 1;
-            return null;
-        }
+        // 类内 [\B]:AnnexB IdentityEscape,字面 'B'(此前误判为语法错)
+        if (inClass) return { t: 0, c: "", code: 66 };
         return { t: 2, c: "B", code: 0 };
     }
     if (ch === "n") return { t: 0, c: "", code: 10 };
@@ -84,10 +112,23 @@ function __re_parseEscape(st, inClass) {
     if (ch === "f") return { t: 0, c: "", code: 12 };
     if (ch === "v") return { t: 0, c: "", code: 11 };
     if (ch === "0") return { t: 0, c: "", code: 0 };
+    if (ch === "c") {
+        // \cX 控制转义:X∈[A-Za-z] → 码点 X%32。其余按 AnnexB 退化为字面 'c'。
+        if (st.i < st.n) {
+            var lc = st.p.charCodeAt(st.i);
+            if ((lc >= 65 && lc <= 90) || (lc >= 97 && lc <= 122)) {
+                st.i = st.i + 1;
+                return { t: 0, c: "", code: lc % 32 };
+            }
+        }
+        if (st.uni) return __re_fail(st, "Invalid control escape");
+        return { t: 0, c: "", code: c };
+    }
     if (ch === "x" || ch === "u") {
         var want = ch === "x" ? 2 : 4;
         var val = 0;
         var got = 0;
+        var save = st.i;
         while (got < want && st.i < st.n) {
             var h = __re_hexVal(st.p.charCodeAt(st.i));
             if (h < 0) break;
@@ -96,14 +137,19 @@ function __re_parseEscape(st, inClass) {
             got = got + 1;
         }
         if (got !== want) {
-            // \x 后非法十六进制:按字面 "x"/"u" 处理(JS 语义)
+            // u 模式下 \x/\u 后必须是合法十六进制,否则语法错;非 u 模式按
+            // AnnexB IdentityEscape 退化为字面 "x"/"u"。
+            st.i = save;
+            if (st.uni) return __re_fail(st, "Invalid unicode escape");
             return { t: 0, c: "", code: c };
         }
         return { t: 0, c: "", code: val };
     }
     if (ch === "p" || ch === "P") {
-        st.err = 1; // unicode 属性类 \p{...} \P{...} 不支持
-        return null;
+        // u/v 模式:\p{…} 属性类 —— 本引擎未实现(不是语法错,不能抛)。
+        // 非 u 模式:AnnexB IdentityEscape,字面 'p'/'P'。
+        if (st.uni) return __re_unsup(st);
+        return { t: 0, c: "", code: c };
     }
     if (ch === "k") {
         if (inClass) return { t: 0, c: "", code: 107, ref: 0, name: "" }; // 类内 \k = 字面 'k'
@@ -116,14 +162,14 @@ function __re_parseEscape(st, inClass) {
                 st.i = st.i + 1;
             }
             if (st.i >= st.n) {
-                st.err = 1;
-                return null;
+                return __re_fail(st, "Invalid named reference");
             }
             st.i = st.i + 1; // 跳过 '>'
             return { t: 4, c: "", code: 0, ref: 0, name: nm };
         }
-        st.err = 1;
-        return null;
+        // 无 GroupName 的 \k:AnnexB IdentityEscape,字面 'k'(此前误判为语法错)
+        if (st.uni) return __re_fail(st, "Invalid named reference");
+        return { t: 0, c: "", code: 107 };
     }
     if (!inClass && c >= 49 && c <= 57) {
         return { t: 3, c: "", code: 0, ref: c - 48, name: "" }; // 反向引用 \1..\9
@@ -177,8 +223,7 @@ function __re_parseClass(st) {
                 st.i = st.i + 1;
             }
             if (hi < lo) {
-                st.err = 1;
-                return null;
+                return __re_fail(st, "Range out of order in character class");
             }
             items.push({ t: 0, c: "", lo: lo, hi: hi });
         } else {
@@ -186,8 +231,7 @@ function __re_parseClass(st) {
         }
     }
     if (st.i >= st.n) {
-        st.err = 1; // 未闭合的 [
-        return null;
+        return __re_fail(st, "Unterminated character class"); // 未闭合的 [
     }
     st.i = st.i + 1; // 跳过 ']'
     return { k: "cls", neg: neg, items: items };
@@ -261,23 +305,33 @@ function __re_parseAtom(st) {
             if (c2 === "i" || c2 === "m" || c2 === "s" || c2 === "-") {
                 // (?flags:…) / (?flags-flags:…) 内联修饰组(ES2024):flags∈{i,m,s};
                 // '-' 后为要关闭的标志。非捕获,仅在组内改 i/m/s 作用域。
+                // 规范约束:add/remove 两侧的标志各自不得重复、不得同时出现在两侧、
+                // '-' 之后不得为空、只能是 i/m/s。任一违反即 SyntaxError。
                 var neg = false;
                 var okm = true;
+                var addS = "";
+                var remS = "";
                 var pj = st.i + 1; // 指向 c2
                 while (pj < st.n) {
                     var fc = st.p.charAt(pj);
                     if (fc === ":") break;
-                    if (fc === "-") { if (neg) { okm = false; break; } neg = true; }
-                    else if (fc === "i") { if (neg) st.mi = false; else st.mi = true; }
-                    else if (fc === "m") { if (neg) st.mm = false; else st.mm = true; }
-                    else if (fc === "s") { if (neg) st.ms = false; else st.ms = true; }
-                    else { okm = false; break; }
+                    if (fc === "-") {
+                        if (neg) { okm = false; break; }
+                        neg = true;
+                    } else if (fc === "i" || fc === "m" || fc === "s") {
+                        if (addS.indexOf(fc) >= 0 || remS.indexOf(fc) >= 0) { okm = false; break; }
+                        if (neg) remS = remS + fc; else addS = addS + fc;
+                        if (fc === "i") st.mi = !neg;
+                        else if (fc === "m") st.mm = !neg;
+                        else st.ms = !neg;
+                    } else { okm = false; break; }
                     pj = pj + 1;
                 }
+                // 规范早期错误只禁止"两侧同时为空"((?-:a));(?m-:a)/(?-m:a) 都合法。
+                if (addS.length === 0 && remS.length === 0) okm = false;
                 if (!okm || pj >= st.n || st.p.charAt(pj) !== ":") {
                     st.mi = sMi; st.mm = sMm; st.ms = sMs;
-                    st.err = 1;
-                    return null;
+                    return __re_fail(st, "Invalid regular expression modifiers");
                 }
                 st.i = pj + 1; // 跳过 ':'
                 idx = -1;
@@ -316,10 +370,15 @@ function __re_parseAtom(st) {
                         st.i = st.i + 1;
                     }
                     if (st.i >= st.n || nm2.length === 0) {
-                        st.err = 1;
-                        return null;
+                        return __re_fail(st, "Invalid capture group name");
                     }
                     st.i = st.i + 1; // 跳过 '>'
+                    // ES2025 重名捕获组:同一"可选分支"内重名 → SyntaxError;
+                    // 不同分支之间允许重名(st.seen 只含当前分支路径上的名字)。
+                    if (__re_hasName(st.seen, nm2)) {
+                        return __re_fail(st, "Duplicate capture group name");
+                    }
+                    st.seen.push(nm2);
                     st.ncap = st.ncap + 1;
                     idx = st.ncap;
                     gname = nm2;
@@ -331,8 +390,7 @@ function __re_parseAtom(st) {
                     }
                 }
             } else {
-                st.err = 1; // (?P<...> 等其余 (? 形式不支持
-                return null;
+                return __re_fail(st, "Invalid group"); // (?P<...> 等其余 (? 形式不支持
             }
         } else {
             st.ncap = st.ncap + 1;
@@ -342,8 +400,7 @@ function __re_parseAtom(st) {
         if (isMod) { st.mi = sMi; st.mm = sMm; st.ms = sMs; } // 退出修饰组:还原作用域
         if (alts === null) return null;
         if (st.i >= st.n || st.p.charAt(st.i) !== ")") {
-            st.err = 1; // 未闭合的 (
-            return null;
+            return __re_fail(st, "Unterminated group"); // 未闭合的 (
         }
         st.i = st.i + 1;
         if (look !== 0) {
@@ -368,15 +425,54 @@ function __re_parseAtom(st) {
         if (e.t === 4) {
             return { k: "bref", idx: -1, name: e.name, fi: st.mi };
         }
+        if (e.code > 127) {
+            // \uNNNN / \xNN 指向非 ASCII 码点:展开成对应的 UTF-8 字节序列原子
+            // (asm.js 字符串按字节存,直接比码点永远不会命中)。
+            return { k: "str", cs: __re_utf8Str(e.code) };
+        }
         return { k: "char", c: e.code, fi: st.mi };
     }
     if (ch === ")" || ch === "|" || ch === "*" || ch === "+" || ch === "?") {
-        st.err = 1; // 悬空量词/括号,由上层守卫,到此即语法错
-        return null;
+        // 悬空量词/括号,由上层守卫,到此即语法错
+        return __re_fail(st, "Nothing to repeat");
     }
     var code = st.p.charCodeAt(st.i);
     st.i = st.i + 1;
+    if (code >= 192) {
+        // asm.js 字符串是 UTF-8 字节串(charCodeAt 给字节),一个非 ASCII 字符占多字节。
+        // 把"前导字节 + 后续续字节(0x80..0xBF)"聚成一个 str 原子,量词才作用在整个
+        // 字符上(否则 /é+/ 只会重复末字节)。
+        var st0 = st.i - 1;
+        while (st.i < st.n) {
+            var cb = st.p.charCodeAt(st.i);
+            if (cb < 128 || cb >= 192) break;
+            st.i = st.i + 1;
+        }
+        if (st.i - st0 > 1) return { k: "str", cs: st.p.slice(st0, st.i) };
+    }
     return { k: "char", c: code, fi: st.mi };
+}
+
+// 码点 → UTF-8 字节串(asm.js 字符串的实际存储形态;fromCharCode 按字节写入)。
+// 结果用**字符串**而非数组承载:节点对象里挂嵌套数组会给 GC 添压(实测在
+// 一轮里反复 new RegExp 会 SIGSEGV),字符串是不可变标量式对象,安全。
+// 无位运算,纯整数算术。
+function __re_utf8Str(c) {
+    if (c < 128) return String.fromCharCode(c);
+    var l0 = c % 64;
+    var m0 = (c - l0) / 64;
+    if (c < 2048) {
+        return String.fromCharCode(192 + m0) + String.fromCharCode(128 + l0);
+    }
+    var l1 = m0 % 64;
+    var m1 = (m0 - l1) / 64;
+    if (c < 65536) {
+        return String.fromCharCode(224 + m1) + String.fromCharCode(128 + l1) + String.fromCharCode(128 + l0);
+    }
+    var l2 = m1 % 64;
+    var m2 = (m1 - l2) / 64;
+    return String.fromCharCode(240 + m2) + String.fromCharCode(128 + l2)
+         + String.fromCharCode(128 + l1) + String.fromCharCode(128 + l0);
 }
 
 function __re_parseSeq(st) {
@@ -384,6 +480,7 @@ function __re_parseSeq(st) {
     while (st.i < st.n) {
         var ch = st.p.charAt(st.i);
         if (ch === "|" || ch === ")") break;
+        var capBefore = st.ncap; // 量词内含的捕获组区间 [capBefore+1, st.ncap]
         var atom = __re_parseAtom(st);
         if (atom === null) return null;
         // 后缀量词(至多一个,可带惰性 ?)
@@ -417,7 +514,20 @@ function __re_parseSeq(st) {
                     lazy = true;
                     st.i = st.i + 1;
                 }
-                atom = { k: "rep", min: min, max: max, lazy: lazy, atom: atom };
+                // gs/ge:本量词原子内部的捕获组下标闭区间(ge < gs 表示不含捕获组)。
+                // 规范 RepeatMatcher 每次重复前把这些组重置为 undefined。
+                atom = { k: "rep", min: min, max: max, lazy: lazy, atom: atom,
+                         gs: capBefore + 1, ge: st.ncap };
+                // 量词不可直接叠量词:/x{0,1}{1,}/ /a*+/ 都是语法错("Nothing to repeat")
+                if (st.i < st.n) {
+                    var q2 = st.p.charAt(st.i);
+                    if (q2 === "*" || q2 === "+" || q2 === "?") {
+                        return __re_fail(st, "Nothing to repeat");
+                    }
+                    if (q2 === "{" && __re_tryParseBrace(st) !== null) {
+                        return __re_fail(st, "Nothing to repeat");
+                    }
+                }
             }
         }
         nodes.push(atom);
@@ -425,32 +535,75 @@ function __re_parseSeq(st) {
     return nodes;
 }
 
+// 名字在数组里的存在性(不用 indexOf 于对象数组;gen1-safe 的显式循环)
+function __re_hasName(list, nm) {
+    var i = 0;
+    while (i < list.length) {
+        if (list[i] === nm) return true;
+        i = i + 1;
+    }
+    return false;
+}
+
+function __re_copyNames(list) {
+    var out = [];
+    var i = 0;
+    while (i < list.length) { out.push(list[i]); i = i + 1; }
+    return out;
+}
+
 function __re_parseAlts(st) {
+    // 命名组重名判定按"分支"隔离:每个可选分支从进入本 Disjunction 时的名字集
+    // 出发;退出时把各分支登记过的名字并起来交还上层。
+    var base = st.seen;
+    var union = __re_copyNames(base);
     var alts = [];
+    st.seen = __re_copyNames(base);
     var seq = __re_parseSeq(st);
-    if (seq === null) return null;
+    if (seq === null) { st.seen = union; return null; }
+    __re_unionNames(union, st.seen);
     alts.push(seq);
     while (st.i < st.n && st.p.charAt(st.i) === "|") {
         st.i = st.i + 1;
+        st.seen = __re_copyNames(base);
         seq = __re_parseSeq(st);
-        if (seq === null) return null;
+        if (seq === null) { st.seen = union; return null; }
+        __re_unionNames(union, st.seen);
         alts.push(seq);
     }
+    st.seen = union;
     return alts;
 }
 
-// 编译(带缓存)。不支持的语法置 __bad,之后 exec 恒 null。
+function __re_unionNames(dst, src) {
+    var i = 0;
+    while (i < src.length) {
+        if (!__re_hasName(dst, src[i])) dst.push(src[i]);
+        i = i + 1;
+    }
+}
+
+// 编译(带缓存)。
+//  - 语法错  → __bad=true 且 __err=非空信息串(__RE_new 据此抛 SyntaxError)
+//  - 未实现  → __bad=true 且 __err=""(静默:exec 恒 null、test 恒 false,不抛)
 function __re_compile(re) {
     if (re.__bad) return null;
     if (re.__prog !== null && re.__prog !== undefined) return re.__prog;
-    var src = re.source;
+    var src = re.__pat;
+    if (typeof src !== "string") src = re.source; // 兼容外部构造的类正则对象
+    if (typeof src !== "string") src = "";
     // mi/mm/ms:当前内联修饰(?i:…)作用域下 i/m/s 的覆盖(true=开、false=关、undefined=继承
     // 全局标志);解析时逐 atom 烙印,匹配时优先用 atom 的覆盖,否则用全局 mst.ic/ml/da。
-    var st = { p: src, i: 0, n: src.length, ncap: 0, err: 0, names: {}, nameList: [], mi: undefined, mm: undefined, ms: undefined };
+    var st = { p: src, i: 0, n: src.length, ncap: 0, err: 0, emsg: "", unsup: 0,
+               names: {}, nameList: [], seen: [],
+               uni: re.unicode === true || re.unicodeSets === true,
+               mi: undefined, mm: undefined, ms: undefined };
     var alts = __re_parseAlts(st);
-    if (alts === null || st.err !== 0 || st.i < st.n) {
+    if (alts === null || st.err !== 0 || st.unsup !== 0 || st.i < st.n) {
         // st.i < st.n:停在了多余的 ")" → 语法错
+        if (st.err === 0 && st.unsup === 0 && st.i < st.n) st.emsg = "Unmatched ')'";
         re.__bad = true;
+        re.__err = st.unsup !== 0 ? "" : (st.emsg === "" ? "Invalid regular expression" : st.emsg);
         return null;
     }
     var prog = { alts: alts, ncap: st.ncap, names: st.names, nameList: st.nameList };
@@ -546,11 +699,22 @@ function __re_restCaps(mst, snap) {
     }
 }
 
-// 命名反向引用的组下标解析(#32 typeof 守卫:name 命中原型链函数时退化为 -1)
+// 命名反向引用的组下标解析。ES2025 允许不同分支重名,故按 nameList 顺扫:
+// 优先取"当前已捕获"的那个同名组,都没捕获则取第一个(→ 按空串匹配)。
+// nameList 只登记 typeof === "string" 的名字,天然挡住原型链污染(#32)。
 function __re_resolveName(mst, name) {
-    var ri = mst.names[name];
-    if (typeof ri !== "number") return -1;
-    return ri;
+    var list = mst.nameList;
+    var first = -1;
+    var i = 0;
+    while (i < list.length) {
+        if (list[i].name === name) {
+            var gi = list[i].idx;
+            if (first < 0) first = gi;
+            if (mst.capS[gi] >= 0) return gi;
+        }
+        i = i + 1;
+    }
+    return first;
 }
 
 // !! 全部匹配函数保持 ≤4 参数:asm.js x64 后端的 P1 热槽晋升对"循环体内 ≥5 实参
@@ -590,6 +754,18 @@ function __re_mNode(mst, node, pos, cont) {
         var lic = node.fi !== undefined ? node.fi : mst.ic;
         if (pos < mst.n && __re_clsMatch(lic, node, mst.s.charCodeAt(pos))) return cont(pos + 1);
         return -1;
+    }
+    if (k === "str") {
+        // 定长字节序列(多字节 UTF-8 字符),整体作为一个原子匹配
+        var cs = node.cs;
+        var cn = cs.length;
+        if (pos + cn > mst.n) return -1;
+        var si = 0;
+        while (si < cn) {
+            if (mst.s.charCodeAt(pos + si) !== cs.charCodeAt(si)) return -1;
+            si = si + 1;
+        }
+        return cont(pos + cn);
     }
     if (k === "any") {
         if (pos < mst.n) {
@@ -673,6 +849,10 @@ function __re_mNode(mst, node, pos, cont) {
         if (node.behind) {
             // lookbehind:存在 j∈[0,pos] 使子模式恰好匹配 s[j..pos]。
             // 从 j=0 起(偏好最长左界),近似 JS 的右向贪婪;变长子模式记偏差。
+            // 已知偏差:规范以 direction=-1 反向匹配子模式,子模式自身的回溯顺序
+            // (分支左优先)应压过左界长度;这里"枚举左界 + 正向匹配"会让长度顺序
+            // 压过分支顺序,故 /.*(?<=(..|...|....))(.*)/ 的捕获与规范不同。要根治
+            // 需要一套反向匹配器(每种节点都要左向变体),不是本层能近似掉的。
             var matched = -1;
             var j = 0;
             while (j <= pos) {
@@ -719,12 +899,49 @@ function __re_mNode(mst, node, pos, cont) {
     return __re_mRep(mst, node, pos, cont);
 }
 
+// 规范 RepeatMatcher 步骤 1:每次重复前把量词原子内部的捕获组重置为 undefined
+// (所以 /(z)((a+)?(b+)?(c))* /.exec("zaacbbbcac") 的 $4 是 undefined 而不是上一轮
+// 残留的 "bbb")。这里 capS/capE 是可变数组,失败回溯时须还原。
+function __re_repClear(mst, node) {
+    var out = [];
+    var i = node.gs;
+    while (i <= node.ge) {
+        out.push(mst.capS[i]);
+        out.push(mst.capE[i]);
+        mst.capS[i] = -1;
+        mst.capE[i] = -1;
+        i = i + 1;
+    }
+    return out;
+}
+
+function __re_repRestore(mst, node, snap) {
+    var i = node.gs;
+    var k = 0;
+    while (i <= node.ge) {
+        mst.capS[i] = snap[k];
+        mst.capE[i] = snap[k + 1];
+        k = k + 2;
+        i = i + 1;
+    }
+}
+
+// 一次重复:清内部组 → 匹配原子 → 失败则还原。
+function __re_repAtom(mst, node, pos, cont) {
+    if (node.ge === undefined || node.ge < node.gs) {
+        return __re_mNode(mst, node.atom, pos, cont);
+    }
+    var snap = __re_repClear(mst, node);
+    var r = __re_mNode(mst, node.atom, pos, cont);
+    if (r < 0) __re_repRestore(mst, node, snap);
+    return r;
+}
+
 function __re_mRep(mst, node, ck, cont) {
     var pos = ck % __RE_PK;
     var count = (ck - pos) / __RE_PK;
-    var atom = node.atom;
     if (count < node.min) {
-        return __re_mNode(mst, atom, pos, function (e) {
+        return __re_repAtom(mst, node, pos, function (e) {
             return __re_mRep(mst, node, (count + 1) * __RE_PK + e, cont);
         });
     }
@@ -733,13 +950,13 @@ function __re_mRep(mst, node, ck, cont) {
         var r0 = cont(pos);
         if (r0 >= 0) return r0;
         if (!canMore) return -1;
-        return __re_mNode(mst, atom, pos, function (e) {
+        return __re_repAtom(mst, node, pos, function (e) {
             if (e === pos) return -1; // 零宽原子防死循环
             return __re_mRep(mst, node, (count + 1) * __RE_PK + e, cont);
         });
     }
     if (canMore) {
-        var r = __re_mNode(mst, atom, pos, function (e) {
+        var r = __re_repAtom(mst, node, pos, function (e) {
             if (e === pos) return -1; // 零宽原子防死循环
             return __re_mRep(mst, node, (count + 1) * __RE_PK + e, cont);
         });
@@ -750,23 +967,83 @@ function __re_mRep(mst, node, ck, cont) {
 
 // ---------- 对外 API ----------
 
+// 规范 EscapeRegExpPattern:.source 必须能原样放回 /…/ 里重新求值。
+// 空模式 → "(?:)";未转义的 "/" 加反斜杠;行终止符转义。原始模式另存 __pat,
+// 编译/复制一律走 __pat(否则 "" 会被当成 "(?:)" 再解析,虽等价但语义上不该绕)。
+function __re_escSource(p) {
+    if (p === "") return "(?:)";
+    var out = "";
+    var i = 0;
+    var n = p.length;
+    var esc = false;
+    while (i < n) {
+        var ch = p.charAt(i);
+        var c = p.charCodeAt(i);
+        if (esc) {
+            out = out + ch;
+            esc = false;
+        } else if (ch === "\\") {
+            out = out + ch;
+            esc = true;
+        } else if (ch === "/") {
+            out = out + "\\/";
+        } else if (c === 10) {
+            out = out + "\\n";
+        } else if (c === 13) {
+            out = out + "\\r";
+        } else if (c === 8232) {
+            out = out + "\\u2028";
+        } else if (c === 8233) {
+            out = out + "\\u2029";
+        } else {
+            out = out + ch;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// 标志合法性:只能取 d g i m s u v y,且不得重复,u 与 v 互斥。违反 → SyntaxError。
+function __re_checkFlags(f) {
+    var seen = "";
+    var i = 0;
+    while (i < f.length) {
+        var ch = f.charAt(i);
+        if ("dgimsuvy".indexOf(ch) < 0 || seen.indexOf(ch) >= 0) {
+            throw new SyntaxError("Invalid regular expression flags: " + f);
+        }
+        seen = seen + ch;
+        i = i + 1;
+    }
+    if (seen.indexOf("u") >= 0 && seen.indexOf("v") >= 0) {
+        throw new SyntaxError("Invalid regular expression flags: " + f);
+    }
+}
+
 export function __RE_new(pattern, flags) {
     var src = pattern;
     var f = flags;
     if (typeof src !== "string") {
         if (src !== null && src !== undefined && typeof src.source === "string") {
-            // new RegExp(re) / new RegExp(re, flags)
-            if (typeof f !== "string") f = src.flags;
-            src = src.source;
+            // new RegExp(re) / new RegExp(re, flags):flags 缺省才继承源正则的标志;
+            // 给了值(哪怕是 {})就走 ToString → 非法标志要抛 SyntaxError。
+            // (0 见下方 asm.js "无 return 返回 0" 的偏差说明。)
+            if (f === undefined || f === null || f === 0) f = src.flags;
+            src = typeof src.__pat === "string" ? src.__pat : src.source;
         } else if (src === null || src === undefined) {
             src = "";
         } else {
             src = "" + src;
         }
     }
-    if (typeof f !== "string") f = "";
-    return {
-        source: src,
+    if (f === null || f === undefined) f = "";
+    // asm.js 偏差:无 return 的函数调用求值为数值 0 而非 undefined
+    // (new RegExp("", (function(){})()) 会拿到 0),故把数值 0 也当"缺省标志"。
+    if (f === 0) f = "";
+    if (typeof f !== "string") f = "" + f; // ToString(flags):new RegExp("^", 1.0) → "1"
+    __re_checkFlags(f);
+    var re = {
+        source: __re_escSource(src),
         flags: f,
         global: f.indexOf("g") !== -1,
         ignoreCase: f.indexOf("i") !== -1,
@@ -774,12 +1051,49 @@ export function __RE_new(pattern, flags) {
         dotAll: f.indexOf("s") !== -1,
         sticky: f.indexOf("y") !== -1,
         unicode: f.indexOf("u") !== -1,
+        unicodeSets: f.indexOf("v") !== -1,
         hasIndices: f.indexOf("d") !== -1,
         lastIndex: 0,
         __isRegExp: true,
+        __pat: src,
         __prog: null,
         __bad: false,
+        __err: "",
     };
+    // 规范:模式在构造期编译,语法错立即抛 SyntaxError(此前是懒编译+静默不匹配)。
+    __re_compile(re);
+    if (re.__bad && re.__err !== "") {
+        throw new SyntaxError("Invalid regular expression: /" + src + "/: " + re.__err);
+    }
+    return re;
+}
+
+// lastIndex 是可写普通属性,用户可以塞进 undefined / null / NaN / 字符串。
+// 规范走 ToLength(ToInteger(lastIndex)):非数值一律先转数,NaN/负数 → 0。
+function __re_toIndex(v) {
+    if (typeof v === "number") {
+        if (v !== v) return 0;      // NaN
+        if (v < 0) return 0;
+        return v;
+    }
+    if (typeof v === "boolean") return v ? 1 : 0;
+    if (typeof v === "string") {
+        // 只认十进制非负整数串(其余 → NaN → 0),够覆盖 ToNumber 的常见形态
+        var i = 0;
+        var n = v.length;
+        while (i < n && __re_isSpaceCode(v.charCodeAt(i))) i = i + 1;
+        var d = 0;
+        var got = 0;
+        while (i < n && __re_isDigitCode(v.charCodeAt(i))) {
+            d = d * 10 + (v.charCodeAt(i) - 48);
+            i = i + 1;
+            got = got + 1;
+        }
+        while (i < n && __re_isSpaceCode(v.charCodeAt(i))) i = i + 1;
+        if (got === 0 || i < n) return 0;
+        return d;
+    }
+    return 0; // undefined / null / object
 }
 
 // exec:返回类数组对象 {0:整体, 1..n:分组(未命中 undefined), index, input, length}
@@ -800,13 +1114,14 @@ export function __RE_exec(re, str) {
     }
     var anchored = re.global || re.sticky; // lastIndex 参与匹配定位
     var start = 0;
-    if (anchored) start = re.lastIndex;
+    if (anchored) start = __re_toIndex(re.lastIndex);
     if (start < 0) start = 0;
     if (start > n) {
         re.lastIndex = 0;
         return null;
     }
-    var mst = { s: s, n: n, ic: re.ignoreCase, ml: re.multiline, da: re.dotAll, names: prog.names, capS: [], capE: [] };
+    var mst = { s: s, n: n, ic: re.ignoreCase, ml: re.multiline, da: re.dotAll,
+                names: prog.names, nameList: prog.nameList, capS: [], capE: [] };
     var i = 0;
     while (i <= prog.ncap) {
         mst.capS.push(-1);
@@ -879,12 +1194,20 @@ function __re_buildIndices(mst, p, end, prog) {
     if (prog.ncap >= 8) ind[8] = __re_indPair(mst, 8);
     if (prog.ncap >= 9) ind[9] = __re_indPair(mst, 9);
     if (prog.nameList.length > 0) {
+        // 两遍:先把所有名字落成 undefined,再用"确实捕获到"的那个覆盖。
+        // (ES2025 重名组:同名多个组只有一个会命中,后面的空组不得覆盖前面的值)
         var g = {};
         var j = 0;
         while (j < prog.nameList.length) {
             var nm = prog.nameList[j].name;
-            var gi = prog.nameList[j].idx;
-            if (typeof nm === "string") g[nm] = __re_indPair(mst, gi);
+            if (typeof nm === "string") g[nm] = undefined;
+            j = j + 1;
+        }
+        j = 0;
+        while (j < prog.nameList.length) {
+            var nm2 = prog.nameList[j].name;
+            var gi2 = prog.nameList[j].idx;
+            if (typeof nm2 === "string" && mst.capS[gi2] >= 0) g[nm2] = __re_indPair(mst, gi2);
             j = j + 1;
         }
         ind.groups = g;
@@ -900,14 +1223,15 @@ function __re_buildGroups(mst, s, prog) {
     var g = {};
     var list = prog.nameList;
     var i = 0;
-    while (i < list.length) {
+    while (i < list.length) { // 第一遍:所有名字 → undefined
+        if (typeof list[i].name === "string") g[list[i].name] = undefined;
+        i = i + 1;
+    }
+    i = 0;
+    while (i < list.length) { // 第二遍:命中的重名组覆盖(其余保持 undefined)
         var nm = list[i].name;
         var gi = list[i].idx;
-        if (typeof nm === "string") {
-            var v = undefined;
-            if (mst.capS[gi] >= 0) v = s.slice(mst.capS[gi], mst.capE[gi]);
-            g[nm] = v;
-        }
+        if (typeof nm === "string" && mst.capS[gi] >= 0) g[nm] = s.slice(mst.capS[gi], mst.capE[gi]);
         i = i + 1;
     }
     return g;
@@ -1030,7 +1354,9 @@ function __re_expand(m, repl, s) {
                 i = i + 2;
                 continue;
             }
-            if (c2 === "<") {
+            // 规范 GetSubstitution:namedCaptures 为 undefined(正则没有命名组)时,
+            // "$<" 是**字面量**,不做组替换。
+            if (c2 === "<" && m.groups !== undefined && m.groups !== null) {
                 // $<name> 命名组引用。[#32] typeof 守卫:名命中原型链函数则不展开。
                 var gt = i + 2;
                 var gnm = "";
@@ -1219,7 +1545,7 @@ export function __RE_split(str, re, limit) {
     if (lim === 0) return [];
     var flags = re.flags;
     if (flags.indexOf("g") < 0) flags = flags + "g";
-    var g = __RE_new(re.source, flags);
+    var g = __RE_new(typeof re.__pat === "string" ? re.__pat : re.source, flags);
     if (str === "") {
         // 规范:空串上正则能匹配空 → [],否则 [""]
         var me = __RE_exec(g, "");

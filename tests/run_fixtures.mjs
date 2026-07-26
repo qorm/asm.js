@@ -1,13 +1,19 @@
 // Minimal fixture runner: compiles each fixtures/**/main.js with gen0 (node cli.js),
 // runs the native binary, compares stdout/exitCode against fixture.json expectations.
 // ASMJS_FIXTURE_WASM=1:改编 wasm32-wasi 并经 scripts/wasm_host.mjs 运行(其余判定同一)。
-import { readFileSync, existsSync, readdirSync, statSync } from "fs";
+import { readFileSync, existsSync, readdirSync, statSync, unlinkSync } from "fs";
 import { execFileSync } from "child_process";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const fixturesDir = join(root, "tests", "fixtures");
+// 每次运行独占的产物前缀。历史实现用 `fx_ + hex(dir).slice(-16)`,而 16 个十六进制字符
+// 只覆盖路径**末 8 个字符**——同名 fixture 在不同 worktree 下末 8 字符相同,于是并行
+// 的多个 worktree(agent 各自跑 fixtures)会写同一个 /tmp 文件,互相覆盖对方的二进制,
+// 表现为随机的 stdout 串味/偶发 FAIL(实测:async-arrow-multiarg-2 期望 5 得 7)。
+// 加入 pid + 全路径(不截断)后各运行、各 worktree 互不相干。
+const runTag = `${process.pid}_${Date.now().toString(36)}`;
 const wasmMode = !!process.env.ASMJS_FIXTURE_WASM;
 const wasmHost = join(root, "scripts", "wasm_host.mjs");
 
@@ -35,7 +41,10 @@ for (const dir of fixtures) {
     // wasm 模式下若声明 expectWasm 则整体覆盖 expect(用于 native 上崩溃/不适用、
     // 但 wasm 语义正确的用例;native 模式恒忽略 expectWasm,既有 fixture 行为不变)。
     const exp = (wasmMode && spec.expectWasm) ? spec.expectWasm : (spec.expect || {});
-    const bin = join("/tmp", "fx_" + Buffer.from(dir).toString("hex").slice(-16) + (wasmMode ? ".wasm" : ""));
+    // dir 相对 fixturesDir 的路径在一次运行内唯一且短(避免 255 字节文件名上限);
+    // runTag 隔离并行运行与不同 worktree。
+    const relKey = dir.startsWith(fixturesDir) ? dir.slice(fixturesDir.length + 1) : dir;
+    const bin = join("/tmp", "fx_" + runTag + "_" + relKey.replace(/[^A-Za-z0-9]/g, "_") + (wasmMode ? ".wasm" : ""));
     let ok = true, reason = "";
     const compileArgs = [join(root, "cli.js"), join(dir, "main.js"), "-o", bin];
     if (wasmMode) compileArgs.push("--target", "wasm32-wasi");
@@ -66,6 +75,9 @@ for (const dir of fixtures) {
     }
     if (ok) pass++;
     else { fail++; failures.push(`${dir.replace(root + "/", "")}: ${reason}`); }
+    // 产物名现在按 runTag 唯一(见上),不再自我覆盖,故必须显式清理,否则每次运行
+    // 都会在 /tmp 留下一份完整 fixture 二进制集。
+    try { unlinkSync(bin); } catch { /* 编译失败时本就不存在 */ }
 }
 
 console.log(`\nPASS=${pass} FAIL=${fail} TOTAL=${fixtures.length}`);
