@@ -300,6 +300,11 @@ export const AsyncCompiler = {
         const vm = this.vm;
         if (!ctorFn) ctorFn = "_generator_new"; // 缺省=同步生成器(既有调用点字节不变)
         vm.prologue(0, [VReg.S3]); // 存 FP/LR + S3(用于跨 _generator_new 保住 A5=this)
+        // [FDI 提前] 解构参数守卫:规范里 FunctionDeclarationInstantiation 在**调用时**跑,
+        // 故 `function* g({}){}` 的 `g(null)` 同步抛 TypeError,而非先返回生成器对象、把抛
+        // 推迟到首次 .next()。见 emitGenStubParamGuards:只提前「可抛的那一步」,无解构参数
+        // 的生成器一条指令都不多发(既有产物字节不变)。
+        this.emitGenStubParamGuards(bodyLabel);
         vm.mov(VReg.S3, VReg.A5);  // S3 = this(A5);callee-saved,survives _generator_new
         // 先把 2-5 号实参压栈(4 个=32B,16 对齐),随后覆盖 A0/A1/A2 供 _generator_new
         vm.push(VReg.A1);
@@ -329,6 +334,200 @@ export const AsyncCompiler = {
         vm.store(VReg.V6, 136, VReg.A4);
         vm.epilogue([VReg.S3], 0); // ret：返回 genobj；恢复 S3
         vm.label(bodyLabel);
+    },
+
+    // [FDI 提前·发射] 在生成器 stub 入口(建协程/生成器对象之前)发解构参数的 null/undefined
+    // 守卫。判据与体内 emitDestructurePattern 的入口守卫**逐条一致**(同样只看 tagged
+    // JS_NULL/JS_UNDEFINED 两个值),所以本项只是把体内本就会抛的那一次抛"提前到调用时",
+    // 不会在任何体内不抛的情形下引入新异常;取属性、默认值表达式求值、迭代器展开等其余
+    // 绑定工作仍留在协程体内惰性执行 —— 生成器体的惰性语义不变(体不会被提前跑)。
+    // 带默认值的解构参数(`function* g({a} = {}){}`)只查 null:undefined 会被默认值接住
+    // (与 emitParamDestructure 的 undefined→默认值判据一致)。
+    // 寄存器:守卫只用 V6(x64=R11、arm64=X14),不与 A0-A5 别名,故 A0-A4 实参与 A5=this
+    // 完好流向下面的 _generator_new/回填。抛路径调 _throw_type_error(内部 _throw_unwind
+    // 跨帧),不返回,故不需要平衡本帧。
+    emitGenStubParamGuards(bodyLabel) {
+        const vm = this.vm;
+        const pats = this._genStubGuardParams(bodyLabel);
+        if (!pats || pats.length === 0) return; // 无解构参数:不发任何指令
+        const throwLabel = bodyLabel + "_pguard_throw";
+        const okLabel = bodyLabel + "_pguard_ok";
+        for (let i = 0; i < pats.length; i++) {
+            const argReg = vm.getArgReg(pats[i].index);
+            vm.movImm64(VReg.V6, 0x7ffa000000000000n); // JS_NULL
+            vm.cmp(argReg, VReg.V6);
+            vm.jeq(throwLabel);
+            if (!pats[i].dflt) {
+                vm.movImm64(VReg.V6, 0x7ffb000000000000n); // JS_UNDEFINED
+                vm.cmp(argReg, VReg.V6);
+                vm.jeq(throwLabel);
+            }
+        }
+        vm.jmp(okLabel);
+        vm.label(throwLabel);
+        vm.lea(VReg.A0, this.asm.addString("Cannot destructure 'null' or 'undefined'"));
+        vm.call("_js_box_string");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_throw_type_error"); // 不返回
+        vm.label(okLabel);
+    },
+
+    // 解析本 stub 对应函数的形参表,挑出需要提前守卫的解构参数位(实参寄存器上限 A0-A4)。
+    // 返回 [{index, dflt}];dflt=true 表示该解构参数带默认值(只守 null)。
+    _genStubGuardParams(bodyLabel) {
+        const params = this._genStubParams(bodyLabel);
+        if (!params) return null;
+        const out = [];
+        const n = params.length < 5 ? params.length : 5;
+        for (let i = 0; i < n; i++) {
+            const p = params[i];
+            if (!p) continue;
+            if (p.type === "ObjectPattern" || p.type === "ArrayPattern") {
+                out.push({ index: i, dflt: false });
+            } else if (p.type === "AssignmentPattern" && p.left &&
+                (p.left.type === "ObjectPattern" || p.left.type === "ArrayPattern")) {
+                out.push({ index: i, dflt: true });
+            }
+        }
+        return out;
+    },
+
+    // stub 只拿到 bodyLabel(=<函数标签>_gbody),形参表按标签反查:
+    //  1) 函数表达式/闭包(含对象字面量方法):pendingFunctions[i].label + "_gbody"
+    //  2) 顶层函数声明:"_user_" + name + "_gbody"
+    //  3) 类生成器方法:标签形如 _class_<类名>_[static_]<方法名>_<labelId>(见 compileClassMethod)
+    // 反查不到(计算键方法、未登记形态)→ null,即不发守卫,保持既有行为。
+    _genStubParams(bodyLabel) {
+        if (typeof bodyLabel !== "string") return null;
+        const suf = "_gbody";
+        if (bodyLabel.length <= suf.length) return null;
+        if (bodyLabel.slice(bodyLabel.length - suf.length) !== suf) return null;
+        const label = bodyLabel.slice(0, bodyLabel.length - suf.length);
+        const pend = this.pendingFunctions;
+        if (pend) {
+            for (let i = 0; i < pend.length; i++) {
+                if (pend[i] && pend[i].label === label && pend[i].expr) {
+                    return pend[i].expr.params || [];
+                }
+            }
+        }
+        const fns = this.ctx && this.ctx.functions;
+        if (fns) {
+            for (const nm in fns) {
+                if ("_user_" + nm === label) {
+                    const f = fns[nm];
+                    return (f && f.params) || [];
+                }
+            }
+        }
+        return this._genStubClassMethodParams(label);
+    },
+
+    // 类生成器方法:AST 里没有「标签 → 方法节点」的登记表(compileClassMethod 只把 method
+    // 留在自己的局部变量里),故按方法标签的构成反查:扫全部模块 AST 收集
+    // {前缀 "_class_<类名>_[static_]<方法名>_", 形参表},再要求余下部分是纯数字 labelId。
+    // 同名类+同名方法出现多次(嵌套/局部类)时:形参形状一致才用,不一致 → 返回 null 不发
+    // 守卫(宁可漏抛,不可错抛)。
+    _genStubClassMethodParams(label) {
+        if (label.indexOf("_class_") !== 0) return null;
+        const list = this._genStubClassIndex();
+        let found = null;
+        for (let i = 0; i < list.length; i++) {
+            const e = list[i];
+            if (label.length <= e.prefix.length) continue;
+            if (label.slice(0, e.prefix.length) !== e.prefix) continue;
+            const rest = label.slice(e.prefix.length);
+            let allDigits = true;
+            for (let c = 0; c < rest.length; c++) {
+                const ch = rest.charCodeAt(c);
+                if (ch < 48 || ch > 57) { allDigits = false; break; }
+            }
+            if (!allDigits) continue;
+            if (found === null) {
+                found = e.params;
+            } else if (!this._genStubSameParamShape(found, e.params)) {
+                return null; // 歧义:放弃守卫
+            }
+        }
+        return found;
+    },
+
+    // 两个形参表的「解构位形状」是否一致(只比较守卫用得到的信息)
+    _genStubSameParamShape(a, b) {
+        const ga = this._genStubShapeOf(a);
+        const gb = this._genStubShapeOf(b);
+        if (ga.length !== gb.length) return false;
+        for (let i = 0; i < ga.length; i++) {
+            if (ga[i] !== gb[i]) return false;
+        }
+        return true;
+    },
+
+    _genStubShapeOf(params) {
+        const out = [];
+        const n = params.length < 5 ? params.length : 5;
+        for (let i = 0; i < n; i++) {
+            const p = params[i];
+            if (!p) continue;
+            if (p.type === "ObjectPattern" || p.type === "ArrayPattern") {
+                out.push(i + ":0");
+            } else if (p.type === "AssignmentPattern" && p.left &&
+                (p.left.type === "ObjectPattern" || p.left.type === "ArrayPattern")) {
+                out.push(i + ":1");
+            }
+        }
+        return out;
+    },
+
+    // 全图收集类生成器方法的 {标签前缀, 形参表}。只在真的遇到类生成器方法 stub 时才建,
+    // 建一次缓存(模块图在 codegen 前已解析完毕)。下行只沿「数组」与「带 .type 的 AST 节点」,
+    // 避开 importInfo/moduleAst 之类旁路引用(循环依赖下会成环)。
+    _genStubClassIndex() {
+        if (this._genStubClassMeths) return this._genStubClassMeths;
+        const out = [];
+        const asts = [];
+        const order = this._moduleOrder;
+        if (order) {
+            for (let i = 0; i < order.length; i++) asts.push(order[i]);
+        }
+        const cur = this._currentModuleAst;
+        if (cur) {
+            let has = false;
+            for (let i = 0; i < asts.length; i++) {
+                if (asts[i] === cur) { has = true; break; }
+            }
+            if (!has) asts.push(cur);
+        }
+        for (let i = 0; i < asts.length; i++) this._genStubScanClasses(asts[i], out, 0);
+        this._genStubClassMeths = out;
+        return out;
+    },
+
+    _genStubScanClasses(node, out, depth) {
+        if (!node || typeof node !== "object" || depth > 512) return;
+        if (Array.isArray(node)) {
+            for (let i = 0; i < node.length; i++) this._genStubScanClasses(node[i], out, depth + 1);
+            return;
+        }
+        if (typeof node.type !== "string") return;
+        if ((node.type === "ClassDeclaration" || node.type === "ClassExpression") &&
+            node.id && node.id.name && Array.isArray(node.body)) {
+            const cn = node.id.name;
+            for (let i = 0; i < node.body.length; i++) {
+                const m = node.body[i];
+                if (!m || m.type !== "MethodDefinition" || m.computed) continue;
+                const fv = m.value;
+                if (!isGeneratorFunction(fv)) continue;
+                const mn = m.key && (m.key.name || m.key.value);
+                if (!mn) continue;
+                const pre = "_class_" + cn + "_" + (m.static ? "static_" : "") + mn + "_";
+                out.push({ prefix: pre, params: fv.params || [] });
+            }
+        }
+        for (const k in node) {
+            const v = node[k];
+            if (v && typeof v === "object") this._genStubScanClasses(v, out, depth + 1);
+        }
     },
 
     // async 方法 stub:方法标签处不执行体,建协程+Promise+入调度队列,返回 Promise。
