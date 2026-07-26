@@ -249,7 +249,11 @@ FAIL/COMPILE_FAIL 聚类(4378 重跑):
 
 ## Wave 2.1 + Wave 3 集成(2026-07-26)
 
-W-A1(subscript.js)+ W-3(members.js/functions.js)互斥,apply 到 dev,**权威门禁绿:gen1==gen2==gen3 + fixtures 380/380**。test262 stride-5 测量中,完成后回填并决定是否发 v0.2.4。
+W-A1(subscript.js)+ W-3(members.js/functions.js)互斥,apply 到 dev,**权威门禁绿:gen1==gen2==gen3 + fixtures 380/380**。**test262 stride-5:1979/6462 = 30.63%(28.51%→30.63%,+137 PASS)**,CRASH 235→236(持平)。错误构造器修复在全量的收益远超测量片 +43(assert.throws 遍布全套)。
+
+## 发版 v0.2.4(2026-07-26)
+
+cli.js 0.2.3→0.2.4;CHANGELOG 加 v0.2.4;版本 bump 后重跑门禁仍绿;提交 ff81f63;tag v0.2.4;**dev 与 main 双分支 + tag 均推送 qorm**(吸取上次 main 漏推教训,本次同步双分支)。
 
 ---
 

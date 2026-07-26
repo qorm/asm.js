@@ -42,10 +42,11 @@
 ### S1 — test262 快速杠杆(07-26 → 08-08)
 - [~] 修复 TypedArray 区坏 include(**2026-07-19 根因已修**:根因是构造器从未物化为全局值,`ArrayBuffer.prototype.resize` 读 undefined 属性致 include 加载即抛;已实现构造器闭包 + `.prototype` 单例 + 动态方法分派,TA 区 0/288 → 10/288;**剩余缺口非 include 问题**:%TypedArray% 原型链、方法值读取、描述符反射——转入 S4 同类簇合并处理)
 - [x] SIGSEGV/SIGBUS 崩溃簇聚类归因,修头部根因(**2026-07-26 完成**:多 agent 归因 + 5 批 worktree 隔离修复。头部根因:①数组具名属性写误入对象头路径 `_object_set_entry`(object/index.js,~150 崩溃,最大簇)②Promise 组合子无可迭代守卫 `_Promise_all/any/race/allSettled`(promise.js)③TypedArray 由对象构造把 tagged 指针当长度 `_typed_array_from`(typedarray/index.js)④`_subscript_set` 无 null 守卫。stride-5 CRASH 480→235,RegExp 区 48→0 全去崩溃)
-- [x] 目标: **≥28% 达成 → 28.51%**(2026-07-26,stride-5 1842/6462;基线 24.82%→过程 27.00%→本波次 28.51%,report 已更新)。分区亮点:Array PASS 121→266/CRASH 136→24;RegExp PASS 49→93/CRASH 48→0;Object CRASH 56→11;Promise PASS 15→25。全量 stride-1 亦达 27.81%(8987/32310)
+- [x] 目标: **≥28% 达成并超越 → 30.63%**(2026-07-26,stride-5 1979/6462)。轨迹 24.82%(基线)→27.00%→**28.51%(v0.2.3)**→**30.63%(v0.2.4)**。分区亮点:Array PASS 121→266/CRASH 136→24;RegExp PASS 49→93/CRASH 48→0;Object CRASH 56→11;Promise PASS 15→25;language/statements +assert.throws 解锁(错误构造器一等化)。三次发版 v0.2.3/v0.2.4 均 gen1==gen2==gen3 字节定点
 - **门禁**: fixtures 不降(380/380)+ 定点(gen1==gen2==gen3 字节一致,主 dev 树验证)+ test262 只升 —— **全部满足**
 - **附带安全红队收口**(2026-07-26,非 test262 计分但真实):闭合 TypedArray/DataView 越界写原语、GCM 认证绕过、timingSafeEqual 常量时间化、熵源/scrypt/HKDF/PBKDF2 改硬失败、zlib inflate 死循环 + 解压炸弹、`ar` 命令注入、未终止正则死循环 + 解析器递归上限。详见 docs/progress/2026-07-26-orchestration.md
-- **剩余(Wave 2.1/3)**: TypedArray 内联读边界(subscript.js,安全 H-1 + ~41 崩溃);编译器一等内建引用(propertyHelper/assert.throws 解锁,预估 +250-350);全局 `Buffer.from(string)` 原生崩溃
+- **已完成(v0.2.4)**: TypedArray 内联读边界(subscript.js,安全 H-1 闭合);错误构造器一等化(assert.throws 解锁,+137 PASS)
+- **下一杠杆(未做)**: **通用函数调用运行时 helper `_fn_call`/`_fn_apply`/`_reflect_apply`** —— 是 `Function.prototype.call/apply/bind` 与 `Object.*` 静态方法作一等值的前置条件,解锁 propertyHelper.js(~682 测试),S1 后半最大单一杠杆;剩余 ~41 TypedArray 崩溃(原型方法/harness 簇,非内联读);全局 `Buffer.from(string)` 原生崩溃
 - **变更未提交**(遵守"仅在被要求时提交"):11 文件已 apply 到 dev 工作树,定点绿,待主人指示提交
 
 ### S2 — 编译器车道清债(08-09 → 08-29)
