@@ -85,10 +85,15 @@ function _adler32(bytes) {
 // ---------------------------------------------------------------------------
 // bit reader (LSB-first within each byte)
 // ---------------------------------------------------------------------------
-function _makeReader(bytes) { return { bytes: bytes, pos: 0, bit: 0 }; }
+function _makeReader(bytes) { return { bytes: bytes, pos: 0, bit: 0, eof: false }; }
 function _readBit(r) {
-    const byte = r.pos < r.bytes.length ? r.bytes[r.pos] : 0;
-    const v = (byte >> r.bit) & 1;
+    // 读越界(空/截断输入)必须报数据错误 —— 旧实现返回 0,使 while(!last) 永远读不到
+    // BFINAL 位而死循环(CR-4)。这里以异常终止,由上层转成解压失败。
+    if (r.pos >= r.bytes.length) {
+        r.eof = true;
+        throw new Error("unexpected end of input");
+    }
+    const v = (r.bytes[r.pos] >> r.bit) & 1;
     r.bit++;
     if (r.bit === 8) { r.bit = 0; r.pos++; }
     return v;
@@ -158,18 +163,32 @@ function _fixedDistTree() {
     return _buildTree(lengths, 30);
 }
 
-function _inflateBlock(r, out, litTree, distTree) {
+// 解压炸弹防护(CR-5):输出上界。默认约 1 GiB,可被 maxOutputLength 选项覆盖。
+const _DEFAULT_MAX_OUTPUT = 0x40000000; // 1 GiB
+function _maxOut(options) {
+    if (options && typeof options.maxOutputLength === "number" && options.maxOutputLength >= 0) {
+        return options.maxOutputLength;
+    }
+    return _DEFAULT_MAX_OUTPUT;
+}
+
+function _inflateBlock(r, out, litTree, distTree, max) {
     while (true) {
         const sym = _decodeSym(r, litTree);
         if (sym === 256) break;
         if (sym < 0) break;
-        if (sym < 256) { out.push(sym); continue; }
+        if (sym < 256) {
+            out.push(sym);
+            if (out.length > max) throw new Error("Output length exceeded maxOutputLength");
+            continue;
+        }
         const s = sym - 257;
         const len = _lenBase[s] + _readBits(r, _lenExtra[s]);
         const dsym = _decodeSym(r, distTree);
         const dist = _distBase[dsym] + _readBits(r, _distExtra[dsym]);
         let start = out.length - dist;
         for (let i = 0; i < len; i++) out.push(out[start + i]);
+        if (out.length > max) throw new Error("Output length exceeded maxOutputLength");
     }
 }
 
@@ -205,8 +224,9 @@ function _readDynamic(r) {
     return { litTree: _buildTree(litLengths, hlit), distTree: _buildTree(distLengths, hdist) };
 }
 
-// raw DEFLATE decode -> byte array
-function _inflateRaw(bytes) {
+// raw DEFLATE decode -> byte array. `max` 为输出上界(默认 1 GiB),超出即报错。
+function _inflateRaw(bytes, max) {
+    if (max === undefined) max = _DEFAULT_MAX_OUTPUT;
     const r = _makeReader(bytes);
     const out = [];
     let last = 0;
@@ -216,16 +236,20 @@ function _inflateRaw(bytes) {
         if (type === 0) {
             // stored: align to byte boundary
             if (r.bit !== 0) { r.bit = 0; r.pos++; }
+            // LEN/NLEN 及 LEN 字节必须完整存在,否则为截断输入。
+            if (r.pos + 4 > r.bytes.length) throw new Error("unexpected end of input");
             const len = r.bytes[r.pos] | (r.bytes[r.pos + 1] << 8);
             r.pos += 4; // skip LEN(2) + NLEN(2)
+            if (r.pos + len > r.bytes.length) throw new Error("unexpected end of input");
             for (let i = 0; i < len; i++) { out.push(r.bytes[r.pos]); r.pos++; }
+            if (out.length > max) throw new Error("Output length exceeded maxOutputLength");
         } else if (type === 1) {
-            _inflateBlock(r, out, _fixedLitTree(), _fixedDistTree());
+            _inflateBlock(r, out, _fixedLitTree(), _fixedDistTree(), max);
         } else if (type === 2) {
             const tbl = _readDynamic(r);
-            _inflateBlock(r, out, tbl.litTree, tbl.distTree);
+            _inflateBlock(r, out, tbl.litTree, tbl.distTree, max);
         } else {
-            break;
+            throw new Error("invalid block type");
         }
     }
     return out;
@@ -356,7 +380,7 @@ function _gzipBytes(data) {
     for (let i = 0; i < 4; i++) out.push(isize[i]);
     return out;
 }
-function _gunzipBytes(bytes) {
+function _gunzipBytes(bytes, max) {
     // header: magic(2) CM(1) FLG(1) MTIME(4) XFL(1) OS(1) = 10 bytes
     if (bytes[0] !== 0x1f || bytes[1] !== 0x8b) return [];
     const flg = bytes[3];
@@ -370,7 +394,7 @@ function _gunzipBytes(bytes) {
     if (flg & 0x02) { p += 2; } // FHCRC
     const body = [];
     for (let i = p; i < bytes.length - 8; i++) body.push(bytes[i]);
-    return _inflateRaw(body);
+    return _inflateRaw(body, max);
 }
 function _zlibWrapBytes(data) {
     const out = [0x78, 0x9c]; // CMF=0x78 (32K window), FLG=0x9c (check ok, no dict)
@@ -380,29 +404,29 @@ function _zlibWrapBytes(data) {
     for (let i = 0; i < 4; i++) out.push(ad[i]);
     return out;
 }
-function _zlibUnwrapBytes(bytes) {
+function _zlibUnwrapBytes(bytes, max) {
     // 2-byte header, deflate body, 4-byte adler32 trailer
     const body = [];
     for (let i = 2; i < bytes.length - 4; i++) body.push(bytes[i]);
-    return _inflateRaw(body);
+    return _inflateRaw(body, max);
 }
 
 // ---------------------------------------------------------------------------
 // public sync API
 // ---------------------------------------------------------------------------
 function deflateRawSync(data, options) { return _bytesToBuffer(_deflateRaw(_toBytes(data))); }
-function inflateRawSync(data, options) { return _bytesToBuffer(_inflateRaw(_toBytes(data))); }
+function inflateRawSync(data, options) { return _bytesToBuffer(_inflateRaw(_toBytes(data), _maxOut(options))); }
 function deflateSync(data, options) { return _bytesToBuffer(_zlibWrapBytes(_toBytes(data))); }
-function inflateSync(data, options) { return _bytesToBuffer(_zlibUnwrapBytes(_toBytes(data))); }
+function inflateSync(data, options) { return _bytesToBuffer(_zlibUnwrapBytes(_toBytes(data), _maxOut(options))); }
 function gzipSync(data, options) { return _bytesToBuffer(_gzipBytes(_toBytes(data))); }
-function gunzipSync(data, options) { return _bytesToBuffer(_gunzipBytes(_toBytes(data))); }
+function gunzipSync(data, options) { return _bytesToBuffer(_gunzipBytes(_toBytes(data), _maxOut(options))); }
 // bytes -> bytes auto-detect (gzip magic vs zlib wrapper); shared by unzipSync
 // and the streaming createUnzip().
-function _unzipBytes(b) {
-    if (b[0] === 0x1f && b[1] === 0x8b) return _gunzipBytes(b);
-    return _zlibUnwrapBytes(b);
+function _unzipBytes(b, max) {
+    if (b[0] === 0x1f && b[1] === 0x8b) return _gunzipBytes(b, max);
+    return _zlibUnwrapBytes(b, max);
 }
-function unzipSync(data, options) { return _bytesToBuffer(_unzipBytes(_toBytes(data))); }
+function unzipSync(data, options) { return _bytesToBuffer(_unzipBytes(_toBytes(data), _maxOut(options))); }
 
 function crc32(data, value) {
     // Node 22+ exposes zlib.crc32(data[, value]); support the seed form.
@@ -512,12 +536,12 @@ export const zlib = {
     gzip: _asyncWrap(gzipSync), gunzip: _asyncWrap(gunzipSync), unzip: _asyncWrap(unzipSync),
     crc32,
     createGzip(options) { return _makeZlibStream(_gzipBytes, options); },
-    createGunzip(options) { return _makeZlibStream(_gunzipBytes, options); },
+    createGunzip(options) { const m = _maxOut(options); return _makeZlibStream(function (b) { return _gunzipBytes(b, m); }, options); },
     createDeflate(options) { return _makeZlibStream(_zlibWrapBytes, options); },
-    createInflate(options) { return _makeZlibStream(_zlibUnwrapBytes, options); },
+    createInflate(options) { const m = _maxOut(options); return _makeZlibStream(function (b) { return _zlibUnwrapBytes(b, m); }, options); },
     createDeflateRaw(options) { return _makeZlibStream(_deflateRaw, options); },
-    createInflateRaw(options) { return _makeZlibStream(_inflateRaw, options); },
-    createUnzip(options) { return _makeZlibStream(_unzipBytes, options); },
+    createInflateRaw(options) { const m = _maxOut(options); return _makeZlibStream(function (b) { return _inflateRaw(b, m); }, options); },
+    createUnzip(options) { const m = _maxOut(options); return _makeZlibStream(function (b) { return _unzipBytes(b, m); }, options); },
     Gzip: ZlibStream, Gunzip: ZlibStream, Deflate: ZlibStream,
     Inflate: ZlibStream, DeflateRaw: ZlibStream, InflateRaw: ZlibStream, Unzip: ZlibStream,
     brotliCompressSync(data) { return _bytesToBuffer(_toBytes(data)); },

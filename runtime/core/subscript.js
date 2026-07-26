@@ -364,6 +364,14 @@ export class SubscriptGenerator {
 
         vm.label("_subscript_set");
         vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2]);
+        // null/undefined 基对象下标写 `null[k]=v`/`undefined[k]=v`:抛可捕获 TypeError
+        // (镜像 _subscript_get 的 nullish 守卫 :26-30),否则下方 _js_unbox 把小 tagged 值
+        // 当裸指针解引用 → 段错误。A0 仍为原始基对象,A1=键。
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFA); // null
+        vm.jeq("_subscript_set_nullish");
+        vm.cmpImm(VReg.V0, 0x7FFB); // undefined
+        vm.jeq("_subscript_set_nullish");
         vm.call("_gc_remember"); // 分代写屏障(A0=容器,老容器记入记忆集;分代 GC 已是缺省)
 
         // 保存 value (JSValue) 到 S2
@@ -499,6 +507,39 @@ export class SubscriptGenerator {
         vm.call("_closure_prop_set");
         vm.mov(VReg.RET, VReg.S2); // 赋值表达式之值
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
+
+        // null/undefined 基对象:构造 `Cannot set properties of null|undefined (setting '<k>')`
+        // 交 _throw_type_error 构造 TypeError 普通对象并 unwind(可 try/catch,e instanceof TypeError)。
+        // A0=base(null/undefined), A1=原始键(任意值)。不返回。
+        const boxStr = (reg) => { // 把 reg 内 cstr 地址标记成堆串(0x7FFC)
+            vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(reg, reg, VReg.V1);
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(reg, reg, VReg.V1);
+        };
+        vm.label("_subscript_set_nullish");
+        vm.mov(VReg.S1, VReg.A1); // S1 = 原始键(跨 _valueToStr 保住 base 前先记键)
+        vm.mov(VReg.S0, VReg.A0); // S0 = base(null/undefined),选前缀用
+        vm.mov(VReg.A0, VReg.S1); // 键 -> 字符串(供 message)
+        vm.call("_valueToStr");
+        vm.mov(VReg.S1, VReg.RET); // S1 = 键字符串(boxed)
+        vm.shrImm(VReg.V1, VReg.S0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFA); // null
+        vm.jeq("_sss_nullish_null");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot set properties of undefined (setting '"));
+        vm.jmp("_sss_nullish_prefix_done");
+        vm.label("_sss_nullish_null");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot set properties of null (setting '"));
+        vm.label("_sss_nullish_prefix_done");
+        vm.call("_cstr_to_heap_str"); // RET = boxed 堆串
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1); // 键字符串
+        vm.call("_strconcat"); // RET = prefix + key
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, vm.asm.addString("')"));
+        boxStr(VReg.A1);
+        vm.call("_strconcat"); // RET = 完整 message
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_throw_type_error"); // 不返回
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32); // 理论不达
     }
 
     generate() {

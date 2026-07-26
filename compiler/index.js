@@ -12,7 +12,7 @@ import * as path from "path";
 import * as os from "os";
 // 显式导入 Buffer：全局 Buffer 在编译产物（gen1）里解析有问题，具名导入才拿到真实类。
 import { Buffer } from "node:buffer";
-import { execSync } from "child_process";
+import { execSync, execFileSync } from "child_process";
 
 // 语言前端
 import { Lexer, Parser } from "../lang/index.js";
@@ -2989,7 +2989,9 @@ export class Compiler {
 
         try {
             fs.writeFileSync(tempObjFile, Buffer.from(objectData));
-            execSync(`ar rcs "${outputFile}" "${tempObjFile}"`, { stdio: "pipe" });
+            // 用 execFileSync(无 shell)传参,避免把用户可控的输出路径拼进 shell 字符串
+            // 造成命令注入(如 outputFile 含 `"; rm -rf ~ #`)。
+            execFileSync("ar", ["rcs", outputFile, tempObjFile], { stdio: "pipe" });
             const stats = fs.statSync(outputFile);
             return { output: outputFile, size: stats.size };
         } finally {

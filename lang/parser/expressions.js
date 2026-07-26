@@ -10,12 +10,20 @@ export const ExpressionParser = {
     // ============ 解析表达式 ============
 
     parseExpression(precedence) {
+        // [安全] 递归深度守卫(见 parser/index.js 构造器):深层嵌套 ( / [ / { 会耗尽原生栈。
+        this.parseDepth = this.parseDepth + 1;
+        if (this.parseDepth > this.maxParseDepth) {
+            this.parseDepth = this.parseDepth - 1;
+            this.errors.push(`SyntaxError: Maximum parse depth exceeded at line ${this.curToken.line}:${this.curToken.column}`);
+            return null;
+        }
         if (process.env.DEBUG_PARSER) {
             console.log(`[DEBUG_PARSER] parseExpression(${precedence}) start curToken=${this.curToken.type}(${this.curToken.literal}) line=${this.curToken.line}:${this.curToken.column}`);
         }
         let prefix = this.prefixParseFns[this.curToken.type];
         if (!prefix) {
             this.errors.push(`no prefix parse function for ${this.curToken.type} (${this.curToken.literal}) at line ${this.curToken.line}:${this.curToken.column}`);
+            this.parseDepth = this.parseDepth - 1;
             return null;
         }
         let leftExp = prefix();
@@ -24,10 +32,11 @@ export const ExpressionParser = {
                 console.log(`[DEBUG_PARSER] parseExpression(${precedence}) while peekToken=${this.peekToken.type}(${this.peekToken.literal}) peekPrecedence=${this.peekPrecedence()}`);
             }
             let infix = this.infixParseFns[this.peekToken.type];
-            if (!infix) return leftExp;
+            if (!infix) { this.parseDepth = this.parseDepth - 1; return leftExp; }
             this.nextToken();
             leftExp = infix(leftExp);
         }
+        this.parseDepth = this.parseDepth - 1;
         return leftExp;
     },
 
@@ -262,8 +271,21 @@ export const ExpressionParser = {
 
     parsePrefixExpression() {
         let operator = this.curToken.literal;
+        const opLine = this.curToken.line;
+        const opColumn = this.curToken.column;
         this.nextToken();
-        return new AST.UnaryExpression(operator, this.parseExpression(Precedence.PREFIX), true);
+        const arg = this.parseExpression(Precedence.PREFIX);
+        // [test262 S1] strict 模式下 `delete` 裸变量引用是早期错误(Node 抛 SyntaxError)。
+        // 仅当操作数是裸标识符时触发;`delete obj.p` / `delete obj[k]`(成员/下标)仍合法。
+        if (operator === "delete" && arg && arg.type === "Identifier" && this.inStrictMode()) {
+            this.errors.push(`Delete of an unqualified identifier in strict mode at line ${opLine}:${opColumn}`);
+        }
+        return new AST.UnaryExpression(operator, arg, true);
+    },
+
+    // [test262 S1] 当前是否处于 strict 模式:顶层程序指令 或 函数体 "use strict" 指令。
+    inStrictMode() {
+        return this.programStrict || this.fnStrictDepth > 0;
     },
 
     parseAwaitExpression() {

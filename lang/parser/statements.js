@@ -10,6 +10,19 @@ export const StatementParser = {
     // ============ 解析语句 ============
 
     parseStatement() {
+        // [安全] 递归深度守卫(见 parser/index.js 构造器):深层嵌套块/if/while 会耗尽原生栈。
+        this.parseDepth = this.parseDepth + 1;
+        if (this.parseDepth > this.maxParseDepth) {
+            this.parseDepth = this.parseDepth - 1;
+            this.errors.push(`SyntaxError: Maximum parse depth exceeded at line ${this.curToken.line}:${this.curToken.column}`);
+            return null;
+        }
+        const stmt = this.parseStatementInner();
+        this.parseDepth = this.parseDepth - 1;
+        return stmt;
+    },
+
+    parseStatementInner() {
         if (this.curTokenIs(TokenType.SEMICOLON)) {
             // 空语句 `;`(#68):裸 `;`、`;;`、`class B{};`、`if(x);` 等。
             // for 循环头的 `;` 由 parseForStatement 单独消费,不经此路径。
@@ -216,6 +229,15 @@ export const StatementParser = {
 
     // [test262 S1] strict 形参回溯校验:eval/arguments 不可作形参 + 形参不可重名。
     checkStrictParams(params) {
+        // [test262 S1] 函数体带显式 "use strict" 指令时,形参不得为非简单形参(默认值/剩余/
+        // 解构)——Node 抛 SyntaxError。checkStrictParams 仅在显式 "use strict" 指令处调用
+        // (peekUseStrictDirective 命中),故隐式 strict(类方法/模块)不受此约束,不误拒。
+        for (const p of (params || [])) {
+            if (p && p.type !== "Identifier") {
+                this.errors.push("Illegal 'use strict' directive in function with non-simple parameter list");
+                break;
+            }
+        }
         const names = [];
         for (const p of (params || [])) this.collectParamNames(p, names);
         const seen = {};

@@ -27,6 +27,15 @@ export class Parser {
         // [test262 S1] strict 模式深度:函数体首语句为 "use strict" 指令时 +1。strict 下
         // eval/arguments 不可作绑定名、形参不可重名。
         this.fnStrictDepth = 0;
+        // [安全] 递归解析深度守卫:嵌套 ( / [ / { / 语句无上限时,几千层即耗尽自举原生
+        // 二进制的栈 → 不可捕获 SIGSEGV(DoS)。在核心表达式/语句解析入口 +1、出口 -1,
+        // 超过 maxParseDepth 记 SyntaxError 并停止下钻(编译期 parser.errors 非空即抛错)。
+        // 上限取远高于编译器自身源码所需(实测嵌套深度 < 100),1000 层留足余量。
+        this.parseDepth = 0;
+        this.maxParseDepth = 1000;
+        // [test262 S1] 程序级 strict:脚本首条 "use strict" 指令 → 顶层 strict(供 delete 裸变量
+        // 等早期错误判定;函数级 strict 仍由 fnStrictDepth 跟踪)。parseProgram 起始探测。
+        this.programStrict = false;
 
         this.prefixParseFns = {};
         this.infixParseFns = {};
@@ -245,6 +254,10 @@ export class Parser {
 
     parseProgram() {
         let program = new AST.Program();
+        // [test262 S1] 顶层 "use strict" 指令探测:首 token 为字符串字面量 "use strict"。
+        if (this.curTokenIs(TokenType.STRING) && this.curToken.literal === "use strict") {
+            this.programStrict = true;
+        }
         while (!this.curTokenIs(TokenType.EOF)) {
             let stmt = this.parseStatement();
             if (stmt !== null) {

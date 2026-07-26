@@ -77,6 +77,7 @@ export class PromiseGenerator {
         this.generatePromiseRejectStatic();
         this.generatePromiseWithResolvers();
         this.generateMakeSettledResult();
+        this.generateCombinatorGuard();
         this.generatePromiseAll();
         this.generatePromiseRace();
         this.generatePromiseAllSettled();
@@ -825,6 +826,55 @@ export class PromiseGenerator {
         vm.epilogue([VReg.S0, VReg.S1], 16);
     }
 
+    // [test262] Promise 组合器参数守卫。all/any/race/allSettled 直接把 A0 当数组
+    // 指针解引用(_array_length 等),非数组 tagged 值(Promise.all(false)/race(5) …)
+    // 会 SIGSEGV。规范要求:非可迭代参数使返回 promise **reject 一个 TypeError**
+    // (既不同步抛、也不崩)。本运行时仅支持数组(tag 0x7FFE)形态的可迭代;其余
+    // 一律走此拒绝路径。
+    //
+    // _combinator_reject_notiterable(A0 = boxed 结果 promise) -> RET = 同一 promise
+    // 构造 TypeError {name,message,__asmjs_err}(与 _throw_type_error 同构,故
+    // e instanceof TypeError / e.name / e.message 成立),以其 reject 结果 promise。
+    generateCombinatorGuard() {
+        const vm = this.vm;
+        const boxStr = (reg) => { // cstr 地址 → 装箱字符串(0x7FFC)
+            vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(reg, reg, VReg.V1);
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(reg, reg, VReg.V1);
+        };
+        vm.label("_combinator_reject_notiterable");
+        vm.prologue(16, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0); // boxed 结果 promise
+        vm.call("_object_new");
+        vm.call("_box_obj_r"); // RET = boxed(0x7FFD) errObj
+        vm.mov(VReg.S1, VReg.RET);
+        // name = "TypeError"
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.A1, vm.asm.addString("name")); boxStr(VReg.A1);
+        vm.lea(VReg.A2, vm.asm.addString("TypeError")); boxStr(VReg.A2);
+        vm.call("_object_set");
+        // message
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.A1, vm.asm.addString("message")); boxStr(VReg.A1);
+        vm.lea(VReg.A2, vm.asm.addString("argument is not iterable")); boxStr(VReg.A2);
+        vm.call("_object_set");
+        // __asmjs_err = true(instanceof Error 族品牌)
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.A1, vm.asm.addString("__asmjs_err")); boxStr(VReg.A1);
+        vm.movImm64(VReg.A2, 0x7ff9000000000001n); // boxed true
+        vm.call("_object_set");
+        // cause = undefined(与 _throw_type_error 同:避免 e.cause 缺属性返 int 0)
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.A1, vm.asm.addString("cause")); boxStr(VReg.A1);
+        vm.movImm64(VReg.A2, 0x7ffb000000000000n); // undefined
+        vm.call("_object_set");
+        // reject(result, errObj)
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_promise_reject");
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+    }
+
     // Promise.all(A0=array) -> boxed promise
     // 同步聚合(fixture 中输入均已 settle)：全成 -> resolve 结果数组；任一败 -> reject。
     generatePromiseAll() {
@@ -836,6 +886,11 @@ export class PromiseGenerator {
         vm.movImm(VReg.A0, 0);
         vm.call("_promise_new");
         vm.mov(VReg.S1, VReg.RET); // result promise
+
+        // [test262] 参数守卫:非数组(tag != 0x7FFE)→ reject TypeError,不解引用
+        vm.shrImm(VReg.V1, VReg.S0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFE);
+        vm.jne("_pall_notiter");
 
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_array_length");
@@ -900,6 +955,12 @@ export class PromiseGenerator {
         vm.movImm64(VReg.V1, 0x7ffe000000000000n);
         vm.or(VReg.A1, VReg.A1, VReg.V1);
         vm.call("_promise_resolve");
+        vm.mov(VReg.RET, VReg.S1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
+
+        vm.label("_pall_notiter");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_combinator_reject_notiterable");
         vm.mov(VReg.RET, VReg.S1);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
     }
@@ -1006,6 +1067,10 @@ export class PromiseGenerator {
         vm.movImm(VReg.A0, 0);
         vm.call("_promise_new");
         vm.mov(VReg.S1, VReg.RET); // result promise
+        // [test262] 参数守卫:非数组(tag != 0x7FFE)→ reject TypeError,不解引用
+        vm.shrImm(VReg.V1, VReg.S0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFE);
+        vm.jne("_pany_notiter");
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_array_length");
         vm.mov(VReg.S2, VReg.RET); // length
@@ -1092,6 +1157,12 @@ export class PromiseGenerator {
         vm.call("_promise_reject");
         vm.mov(VReg.RET, VReg.S1);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
+
+        vm.label("_pany_notiter");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_combinator_reject_notiterable");
+        vm.mov(VReg.RET, VReg.S1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
     }
 
     // [#35] p.finally(cb) —— 调用 cb()(忽略参数与返回值),透传原 promise。
@@ -1117,6 +1188,10 @@ export class PromiseGenerator {
         vm.movImm(VReg.A0, 0);
         vm.call("_promise_new");
         vm.mov(VReg.S1, VReg.RET);
+        // [test262] 参数守卫:非数组(tag != 0x7FFE)→ reject TypeError,不解引用
+        vm.shrImm(VReg.V1, VReg.S0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFE);
+        vm.jne("_prc_notiter");
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_array_length");
         vm.mov(VReg.S2, VReg.RET);
@@ -1171,6 +1246,12 @@ export class PromiseGenerator {
         vm.label("_prc_done");
         vm.mov(VReg.RET, VReg.S1);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 48);
+
+        vm.label("_prc_notiter");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_combinator_reject_notiterable");
+        vm.mov(VReg.RET, VReg.S1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 48);
     }
 
     // Promise.allSettled(A0=array) -> boxed promise (resolve 结果数组)
@@ -1182,6 +1263,10 @@ export class PromiseGenerator {
         vm.movImm(VReg.A0, 0);
         vm.call("_promise_new");
         vm.mov(VReg.S1, VReg.RET);
+        // [test262] 参数守卫:非数组(tag != 0x7FFE)→ reject TypeError,不解引用
+        vm.shrImm(VReg.V1, VReg.S0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFE);
+        vm.jne("_pas_notiter");
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_array_length");
         vm.mov(VReg.S2, VReg.RET);
@@ -1214,6 +1299,12 @@ export class PromiseGenerator {
         vm.movImm64(VReg.V1, 0x7ffe000000000000n);
         vm.or(VReg.A1, VReg.A1, VReg.V1);
         vm.call("_promise_resolve");
+        vm.mov(VReg.RET, VReg.S1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
+
+        vm.label("_pas_notiter");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_combinator_reject_notiterable");
         vm.mov(VReg.RET, VReg.S1);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
     }

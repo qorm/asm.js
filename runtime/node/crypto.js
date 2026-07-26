@@ -11,27 +11,43 @@ const _platform = (_proc && _proc.platform) || "macos";
 function _entropyBytes(size) {
     const out = [];
     if (size <= 0) return out;
-    const buf = __alloc(size + 1);
+    // 恰好分配 size 字节(旧代码多申请 1 字节且无用途)。堆由 GC 托管,函数返回后
+    // buf 不再可达即被回收——没有可调用的显式 free 原语(__free 未导出)。
+    const buf = __alloc(size);
+    // 硬失败(未知平台 / 熵源系统调用失败)一律抛错,绝不返回可预测的零字节;
+    // 失败关闭(fail closed),永不产出弱随机材料。
     if (_platform === "linux" || _platform === "wasi") {
         const sc = getSyscall("getrandom"); // wasi:号名空间 = linux-x64,宿主熵源
         let off = 0;
+        let guard = 0;
         while (off < size) {
             const chunk = size - off > 256 ? 256 : size - off;
-            __syscall(sc, buf + off, chunk, 0); // getrandom(buf, len, flags=0)
-            off += chunk;
+            // getrandom(buf, len, flags=0):成功返回写入字节数(>0),失败返回 -errno。
+            const ret = __syscall(sc, buf + off, chunk, 0);
+            if (ret < 0) {
+                // EINTR(-4) / EAGAIN(-11):重试(有限次数,避免挂死)。
+                if ((ret === -4 || ret === -11) && guard < 64) { guard++; continue; }
+                throw new Error("no secure entropy source");
+            }
+            if (ret === 0) { // 无进展:防止死循环,直接失败关闭
+                if (guard < 64) { guard++; continue; }
+                throw new Error("no secure entropy source");
+            }
+            off += ret; // 可能为部分读,按实际写入推进
         }
     } else if (_platform === "macos") {
         const sc = getSyscall("getentropy");
         let off = 0;
         while (off < size) {
             const chunk = size - off > 256 ? 256 : size - off;
-            __syscall(sc, buf + off, chunk); // getentropy(buf, len<=256)
+            // getentropy(buf, len<=256):成功返回 0 且原子性填满 chunk,失败返回非 0。
+            const ret = __syscall(sc, buf + off, chunk);
+            if (ret !== 0) throw new Error("no secure entropy source");
             off += chunk;
         }
     } else {
-        // 无熵源(如 windows):退化为 0 填充(记偏差)
-        for (let i = 0; i < size; i++) out.push(0);
-        return out;
+        // 无熵源(如 windows):失败关闭,绝不退化为 0 填充。
+        throw new Error("no secure entropy source");
     }
     for (let i = 0; i < size; i++) out.push(__getChar(buf + i));
     return out;
@@ -705,6 +721,8 @@ function _makeGcm(info, key, iv, decrypt) {
     const Nr = info.Nr;
     const H = _aesEncryptBlock(_zero16(), rk, Nr); // 哈希子密钥 H = E(0)
     const ivBytes = _toBytes(iv);
+    // GCM 拒绝零长度 nonce(Node 同样报错):空 nonce 使 J0 退化,破坏认证安全。
+    if (ivBytes.length === 0) throw new Error("Invalid initialization vector");
     let J0;
     if (ivBytes.length === 12) {
         J0 = [];
@@ -750,12 +768,22 @@ function _makeGcm(info, key, iv, decrypt) {
                 const ek = _aesEncryptBlock(state.J0, state.rk, state.Nr);
                 const fullTag = [];
                 for (let i = 0; i < 16; i++) fullTag.push((S[i] ^ ek[i]) & 0xff);
-                let ok = state.expectedTag !== null;
-                if (ok) {
-                    const tl = state.expectedTag.length;
-                    for (let i = 0; i < tl; i++) if (fullTag[i] !== state.expectedTag[i]) ok = false;
+                if (state.expectedTag === null) {
+                    throw new Error("Unsupported state or unable to authenticate data");
                 }
-                if (!ok) throw new Error("Unsupported state or unable to authenticate data");
+                const tl = state.expectedTag.length;
+                // 合法 GCM 认证标签长度(字节):{4,8,12,13,14,15,16}。
+                // 空/非法长度(如 setAuthTag(Buffer.alloc(0)))必须拒绝——否则可绕过认证。
+                if (tl !== 16 && tl !== 15 && tl !== 14 && tl !== 13 &&
+                    tl !== 12 && tl !== 8 && tl !== 4) {
+                    throw new Error("Invalid authentication tag length: " + tl);
+                }
+                // 常量时间比较:异或累加全部 tl 字节后一次性判等,不因首个不同字节提前返回。
+                let diff = 0;
+                for (let i = 0; i < tl; i++) diff |= (fullTag[i] ^ state.expectedTag[i]);
+                if (diff !== 0) {
+                    throw new Error("Unsupported state or unable to authenticate data");
+                }
                 result = _gctr(state.chunks, state.rk, state.Nr, icb);
             } else {
                 const ct = _gctr(state.chunks, state.rk, state.Nr, icb);
@@ -781,10 +809,13 @@ function _makeCipheriv(algo, key, iv, decrypt) {
     // 所有不变量放在 state 上,方法闭包只捕获 state(与 _makeHash 同型,规避
     // asm.js 里方法闭包捕获多个外层 const 的不可靠共享)。
     if (info.mode === "gcm") return _makeGcm(info, key, iv, decrypt);
+    const ivBytes = _toBytes(iv);
+    // CBC/CTR 要求 16 字节 IV(Node 同样报错)。长度不符即拒绝,避免静默截断/零填充。
+    if (ivBytes.length !== 16) throw new Error("Invalid initialization vector");
     const state = {
         chunks: [], autoPad: true, decrypt: decrypt, Nr: info.Nr, mode: info.mode,
         rk: _aesKeyExpansion(_toBytes(key), info.Nk, info.Nr),
-        iv: _toBytes(iv),
+        iv: ivBytes,
     };
     const api = {
         update(data, inputEncoding, outputEncoding) {
@@ -850,6 +881,9 @@ function _hmacRaw(algo, keyBytes, msgBytes) {
 
 // PBKDF2(RFC 2898),PRF = HMAC-<digest>。返回长度 keylen 的 Buffer。
 function _pbkdf2(password, salt, iterations, keylen, digest) {
+    // Node 校验:iterations 必须 >=1,keylen 必须 >0。非法值报 RangeError。
+    if (!(iterations >= 1)) throw new RangeError("iterations must be >= 1");
+    if (!(keylen > 0)) throw new RangeError("keylen must be > 0");
     const algo = (digest || "sha1").toLowerCase();
     const pw = _toBytes(password);
     const saltB = _toBytes(salt);
@@ -893,6 +927,10 @@ function _digestLen(algo) {
 function _hkdf(digest, ikm, salt, info, keylen) {
     const algo = (digest || "").toLowerCase();
     const hashLen = _digestLen(algo);
+    // RFC 5869 上界:keylen <= 255*hashLen(单字节计数器不得回绕),且 keylen>0。
+    // 超界会导致计数器溢出重复密钥流,Node 亦报 RangeError。
+    if (!(keylen > 0)) throw new RangeError("keylen must be > 0");
+    if (keylen > 255 * hashLen) throw new RangeError("Invalid key length");
     const ikmB = _toBytes(ikm);
     let saltB = _toBytes(salt);
     if (saltB.length === 0) { saltB = []; for (let i = 0; i < hashLen; i++) saltB.push(0); }
@@ -955,10 +993,15 @@ export const crypto = {
     pseudoRandomBytes: (size) => crypto.randomBytes(size),
     randomFillSync(buffer, offset, size) {
         const off = offset || 0;
-        const len = (size === undefined || size === null) ? (buffer.length - off) : size;
-        const data = _entropyBytes(len);
         // Buffer 存储在 .data;普通 TypedArray/数组直接下标写。
         const dst = (buffer && buffer.data && typeof buffer.data.length === "number") ? buffer.data : buffer;
+        const bufLen = dst.length;
+        const len = (size === undefined || size === null) ? (bufLen - off) : size;
+        // 越界写入会破坏相邻堆内存,Node 对此报 RangeError。
+        if (off < 0 || len < 0 || off + len > bufLen) {
+            throw new RangeError("offset + size would exceed buffer length");
+        }
+        const data = _entropyBytes(len);
         for (let i = 0; i < len; i++) dst[off + i] = data[i];
         return buffer;
     },
@@ -1000,7 +1043,17 @@ export const crypto = {
     setFips: () => {},
     fips: false,
     constants: {},
-    timingSafeEqual: (a, b) => a.equals(b),
+    timingSafeEqual(a, b) {
+        // 常量时间比较:先要求等长(不等长抛 RangeError,与 Node 一致),再对全部字节
+        // 异或累加,最后一次性判等——绝不因首个不同字节提前返回(避免计时旁路)。
+        const ab = _toBytes(a), bb = _toBytes(b);
+        if (ab.length !== bb.length) {
+            throw new RangeError("Input buffers must have the same byte length");
+        }
+        let diff = 0;
+        for (let i = 0; i < ab.length; i++) diff |= (ab[i] ^ bb[i]);
+        return diff === 0;
+    },
     randomInt(max, min, callback) {
         // 单参:randomInt(max);双参:randomInt(min, max)。用内核熵取 4 字节。
         let lo = 0, hi = max, cb = callback;
@@ -1023,7 +1076,10 @@ export const crypto = {
         }
         return s;
     },
-    scryptSync(password, salt, keylen) { return Buffer.alloc(keylen); },
+    scryptSync(password, salt, keylen) {
+        // 尚无真实 scrypt 实现。绝不返回全零弱密钥(失败关闭),改为抛错。
+        throw new Error("scrypt not implemented");
+    },
     secureHeapUsed: () => ({ total: 0, initial: 0, low: 0, high: 0 })
 };
 

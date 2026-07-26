@@ -476,7 +476,10 @@ export class Lexer {
         let result = "";
         this.readChar(); // 跳过第一个 /
 
-        while (this.ch !== "/" && this.ch !== "" && this.ch !== "\n") {
+        // EOF 哨兵是 "\0"(非 ""）——用 "" 会漏判文件尾,`/abc`（无闭合 /）时
+        // readChar 恒返 "\0" 致 while 死循环(100% CPU DoS)。与 readString/readTemplate
+        // 的 "\0" 守卫取齐:遇 EOF/换行退出,ch 非 "/" → 落到下方 ILLEGAL(未闭合正则)。
+        while (this.ch !== "/" && this.ch !== "\0" && this.ch !== "\n") {
             if (this.ch === "\\") {
                 result += this.ch;
                 this.readChar();

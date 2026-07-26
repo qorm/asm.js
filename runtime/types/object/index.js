@@ -2157,10 +2157,14 @@ export class ObjectGenerator {
         vm.jeq("_object_set_tag_ok");
         vm.cmpImm(VReg.V1, 0x7FFD); // Object
         vm.jeq("_object_set_tag_ok");
+        // 数组(0x7FFE):绝不落对象头写路径——数组头仅 32 字节(type@0/length@8/capacity@16/
+        // data_ptr@24),无 props_ptr@32,按对象头写会把 [S0+32] 当 props_ptr 解引用垃圾 → SIGSEGV
+        // (镜像 _object_get 读路径对 0x7FFE 的路由 :629-631)。_object_set_array 内再分:规范
+        // 数值索引键(Object.defineProperty(a,"1",…))→ 数组元素写;具名键(a.foo=9)→ 属性侧表。
         vm.cmpImm(VReg.V1, 0x7FFE); // Array
-        vm.jeq("_object_set_tag_ok");
+        vm.jeq("_object_set_array");
         // 函数值(0x7FFF):自定义属性写经闭包属性侧表(运行时路由,冷分支;别名/调用结果/
-        // 形参等非静态可知的函数值)。普通对象/数组路径逐字节不变。
+        // 形参等非静态可知的函数值)。普通对象路径逐字节不变。
         vm.cmpImm(VReg.V1, 0x7FFF);
         vm.jeq("_object_set_fnprops");
 
@@ -2174,6 +2178,26 @@ export class ObjectGenerator {
         vm.mov(VReg.A1, VReg.S1);
         vm.mov(VReg.A2, VReg.S2);
         vm.call("_closure_prop_set");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
+
+        // 数组具名/索引属性写分派(S0=arr[boxed 0x7FFE 或裸], S1=key, S2=value)。
+        // 规范数值索引键(CanonicalNumericIndexString, 如 "1")→ 委托 _subscript_set 做数组
+        // 元素写(含 _array_ensure_cap 增长、逻辑空档补 undefined、length 更新);_subscript_set
+        // 内部 _js_unbox 容裸/装箱数组,_syscall_arg 对小整数下标走裸路径原样返回。非索引键
+        // (a.foo)→ 属性侧表 _object_set_fnprops。_canonical_array_index 仅动 S0/S1(其 prologue
+        // 保存并复原),不碰 S2,故 value 跨调用稳定。
+        vm.label("_object_set_array");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_canonical_array_index"); // RET = idx(0..2^32-2) / -1(非索引)
+        vm.movImm64(VReg.V1, 0xFFFFFFFFFFFFFFFFn);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_object_set_fnprops"); // 非索引键 → 属性侧表
+        // 先落 A1=下标:RET 与 A0 共物理寄存器(X0),必须在 mov A0 覆盖 X0 前取走下标。
+        vm.mov(VReg.A1, VReg.RET);      // 裸整数下标
+        vm.mov(VReg.A0, VReg.S0);       // arr
+        vm.mov(VReg.A2, VReg.S2);       // value
+        vm.call("_subscript_set");
+        vm.mov(VReg.RET, VReg.S2);      // 赋值表达式之值
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
 
         vm.label("_object_set_tag_ok");
@@ -2196,6 +2220,11 @@ export class ObjectGenerator {
         // 类型字节防御(与 _object_get 同理):Map/Set/TypedArray/ArrayBuffer 不是
         // 属性对象,按对象头写会把 length 当 count、越块写毁邻居 → 静默跳过。
         vm.loadByte(VReg.V1, VReg.S0, 0);
+        // 裸指针数组(高16位=0 的裸堆指针,type@0==TYPE_ARRAY==1):同装箱数组(0x7FFE)
+        // 走 _object_set_array(索引键→元素写,具名键→侧表)。数组头无 props_ptr@32,
+        // 按对象头写解引用垃圾 → SIGSEGV。S0 已脱壳,_subscript_set/_closure_prop_set 均容裸指针。
+        vm.cmpImm(VReg.V1, 1); // TYPE_ARRAY
+        vm.jeq("_object_set_array");
         vm.cmpImm(VReg.V1, 4);
         vm.jeq("_object_set_ty_bail");
         vm.cmpImm(VReg.V1, 5);
