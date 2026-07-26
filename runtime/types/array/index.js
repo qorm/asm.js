@@ -1826,6 +1826,32 @@ export class ArrayGenerator {
         vm.label("_aref_invoke_cb");
         vm.prologue(0, [VReg.S0]); // 保存 S0(闭包会占用;调用者的 S0 须还原)
         vm.mov(VReg.V6, VReg.A3);
+        // [C1] callback 可调用守卫(镜像 _validate_callable 判据):装箱函数(0x7FFF)/
+        // 装箱对象(0x7FFD,可调用 Proxy 候选,下方 magic/TYPE_PROXY 分派)直通;
+        // 裸值(high16==0)须落 [heap_base,heap_ptr)(闭包块候选);其余(null/undefined/
+        // 数字/字符串/布尔)→ _throw_not_a_function(真 TypeError)。此前 null 的
+        // payload 0 直接 load [0] SIGSEGV(filter.call(obj,null) 崩根因)。
+        // 寄存器纪律:必须在 emitMaskLoad(V1) 前判 tag(x64 V1==RCX==A3,mask 装载
+        // 会冲掉装箱 callback);scratch 只用 V0(入口无活 RET)与 V5(两后端均不
+        // 别名 A0-A5),不碰已装好的回调实参 A0-A2。
+        vm.shrImm(VReg.V0, VReg.V6, 48);
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jeq("_aref_icb_callable");
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jeq("_aref_icb_callable");
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_aref_icb_notfn");
+        vm.lea(VReg.V5, "_heap_base");
+        vm.load(VReg.V5, VReg.V5, 0);
+        vm.cmp(VReg.V6, VReg.V5);
+        vm.jlt("_aref_icb_notfn");
+        vm.lea(VReg.V5, "_heap_ptr");
+        vm.load(VReg.V5, VReg.V5, 0);
+        vm.cmp(VReg.V6, VReg.V5);
+        vm.jlt("_aref_icb_callable");
+        vm.label("_aref_icb_notfn");
+        vm.call("_throw_not_a_function"); // 不返回(_throw_unwind)
+        vm.label("_aref_icb_callable");
         // 无条件掩码脱壳:装箱函数(0x7FFF)/装箱 Proxy(0x7FFD)去 tag;裸指针高16=0 恒等。
         // 此前仅 0x7FFF 脱壳 → 装箱 proxy 带 tag 解引用 [V6+0] 直接段错([1].map(proxy) 崩)。
         vm.emitMaskLoad(VReg.V1);
@@ -2075,6 +2101,26 @@ export class ArrayGenerator {
         vm.label("_aref_invoke_cb4");
         vm.prologue(0, [VReg.S0]);
         vm.mov(VReg.V6, VReg.A4);
+        // [C1] callback 可调用守卫,同 _aref_invoke_cb(x64 纪律:V1==A3 是回调实参 arr,
+        // 绝不可作 scratch;tag 判在 mask 装载前,scratch 只用 V0/V5)。
+        vm.shrImm(VReg.V0, VReg.V6, 48);
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jeq("_aref_icb4_callable");
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jeq("_aref_icb4_callable");
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_aref_icb4_notfn");
+        vm.lea(VReg.V5, "_heap_base");
+        vm.load(VReg.V5, VReg.V5, 0);
+        vm.cmp(VReg.V6, VReg.V5);
+        vm.jlt("_aref_icb4_notfn");
+        vm.lea(VReg.V5, "_heap_ptr");
+        vm.load(VReg.V5, VReg.V5, 0);
+        vm.cmp(VReg.V6, VReg.V5);
+        vm.jlt("_aref_icb4_callable");
+        vm.label("_aref_icb4_notfn");
+        vm.call("_throw_not_a_function"); // 不返回(_throw_unwind)
+        vm.label("_aref_icb4_callable");
         // 无条件掩码脱壳(同 _aref_invoke_cb:装箱 proxy 0x7FFD 需去 tag)
         vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
         vm.and(VReg.V6, VReg.V6, VReg.V1);
