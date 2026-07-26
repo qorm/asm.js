@@ -720,6 +720,215 @@ export const FunctionCompiler = {
         return { type: "Identifier", name };
     },
 
+    // ── [W-13] Object.defineProperty/defineProperties/create 的**运行时描述符**回退 ──
+    // 既有下降路径把描述符对象**在编译期**拆成 get/set/value + attrs 立即数，只对写成
+    // 对象字面量的描述符成立；`var d={...}; Object.defineProperty(o,k,d)` 之类动态描述符
+    // 以前静默退化成 value=undefined、attrs=0（无报错、结果错）。下面三个判定 + 三个
+    // 动态发射器只在**非字面量**（或字面量里含展开/计算键/访问器简写/非布尔字面量 attr）
+    // 时接管；字面量仍走原路径，逐字节不变。
+    //
+    // 描述符实参是否编译期静态可析：对象字面量、无 SpreadElement/计算键/`get x(){}`
+    // 访问器简写，且 writable/enumerable/configurable（若出现）是布尔字面量
+    // （`{writable:1}` 之类真值字面量原路径会误判成 false → 交动态路按 ToBoolean 处理）。
+    isStaticDescriptorLiteral(desc) {
+        if (!desc || desc.type !== "ObjectExpression") return false;
+        const props = desc.properties || [];
+        for (let i = 0; i < props.length; i++) {
+            const p = props[i];
+            if (!p || !p.key) return false;                 // SpreadElement 等
+            if (p.computed) return false;                   // 计算键
+            if (p.kind && p.kind !== "init") return false;  // {get x(){}} / {set x(v){}}
+            const kn = p.key.name != null ? p.key.name : p.key.value;
+            if (kn === "writable" || kn === "enumerable" || kn === "configurable") {
+                if (!p.value || p.value.type !== "Literal") return false;
+                if (p.value.value !== true && p.value.value !== false) return false;
+            }
+        }
+        return true;
+    },
+
+    // 描述符**表**（defineProperties 第二参 / create 第二参）是否静态可析：对象字面量、
+    // 每个键非计算非展开且 kind=="init"，且每个值本身是静态可析描述符。
+    isStaticDescriptorMapLiteral(map) {
+        if (!map || map.type !== "ObjectExpression") return false;
+        const props = map.properties || [];
+        for (let i = 0; i < props.length; i++) {
+            const p = props[i];
+            if (!p || !p.key) return false;
+            if (p.computed) return false;
+            if (p.kind && p.kind !== "init") return false;
+            if (!this.isStaticDescriptorLiteral(p.value)) return false;
+        }
+        return true;
+    },
+
+    // 合成 AST 小工具（供下面三个发射器共用）
+    _dpIdent(name) { return { type: "Identifier", name }; },
+    _dpMember(objNode, propName) {
+        return { type: "MemberExpression", object: objNode, property: { type: "Identifier", name: propName }, computed: false };
+    },
+    _dpObjectCall(methodName, args) {
+        return {
+            type: "CallExpression",
+            callee: {
+                type: "MemberExpression",
+                object: { type: "Identifier", name: "Object" },
+                property: { type: "Identifier", name: methodName },
+                computed: false,
+            },
+            arguments: args,
+        };
+    },
+
+    // Object.defineProperty(obj, key, <运行时描述符>) 动态回退。
+    // obj/key/desc 各求值一次落 FP 槽（保守栈扫描保活）；随后：
+    //   • 目标运行时是 Proxy(type==8) → **整份**描述符交 _object_defineProperty_proxy 陷阱
+    //     （与字面量路径同语义）；
+    //   • 否则运行时二选一（get/set 任一非 undefined ⇒ accessor），脱糖回**字面量形态**的
+    //     Object.defineProperty(o,k,{get:d.get,set:d.set}) / (o,k,{value:d.value})，
+    //     从而复用既有字面量下降 codegen（标记块构造、_object_define）而不复制它；
+    //   • 最后用 _to_boolean 逐位算 attrs（w|e<<1|c<<2）再调一次 _object_set_prop_attr 覆写
+    //     字面量路径落下的 0。缺省字段读出 undefined → ToBoolean 0，与规范默认值一致。
+    // 未装箱访问器槽的“缺省”由装箱掩码保证：undefined(0x7ffb…) & 0x0000ffffffffffff == 0，
+    // 恰是标记块里“无 getter/setter”的哨兵值，故 {get:d.get} 里 d.set 为 undefined 也正确。
+    emitDefinePropertyDynamic(expr, desc) {
+        const id = this.nextLabelId();
+        const oOff = this.ctx.allocLocal(`__dpd_obj_${id}`);
+        const kOff = this.ctx.allocLocal(`__dpd_key_${id}`);
+        const dOff = this.ctx.allocLocal(`__dpd_desc_${id}`);
+        const aOff = this.ctx.allocLocal(`__dpd_attr_${id}`);
+        const objRef = this._dpIdent(`__dpd_obj_${id}`);
+        const keyRef = this._dpIdent(`__dpd_key_${id}`);
+        const descRef = this._dpIdent(`__dpd_desc_${id}`);
+
+        // 求值顺序 obj → key → descriptor，各一次
+        if (expr.arguments.length > 0) this.compileExpression(expr.arguments[0]);
+        else this.vm.movImm(VReg.RET, 0);
+        this.vm.store(VReg.FP, oOff, VReg.RET);
+        if (expr.arguments.length > 1) this.compileExpression(expr.arguments[1]);
+        else this.vm.movImm(VReg.RET, 0);
+        this.vm.store(VReg.FP, kOff, VReg.RET);
+        this.compileExpression(desc);
+        this.vm.store(VReg.FP, dOff, VReg.RET);
+
+        const normalLabel = this.ctx.newLabel("dpd_normal");
+        const doneLabel = this.ctx.newLabel("dpd_done");
+        this.vm.load(VReg.RET, VReg.FP, oOff);
+        this.vm.emitMaskLoad(VReg.V1);
+        this.vm.andMaskReg(VReg.V0, VReg.RET, VReg.V1); // 裸指针
+        this.vm.cmpImm(VReg.V0, 0);
+        this.vm.jeq(normalLabel);
+        this.vm.loadByte(VReg.V1, VReg.V0, 0);
+        this.vm.cmpImm(VReg.V1, 8); // TYPE_PROXY
+        this.vm.jne(normalLabel);
+        this.vm.load(VReg.A0, VReg.FP, oOff);
+        this.vm.load(VReg.A1, VReg.FP, kOff);
+        this.vm.load(VReg.A2, VReg.FP, dOff);
+        this.vm.call("_object_defineProperty_proxy");
+        this.vm.jmp(doneLabel);
+        this.vm.label(normalLabel);
+
+        const undefRef = this._dpIdent("undefined");
+        const isAccessor = {
+            type: "LogicalExpression",
+            operator: "||",
+            left: { type: "BinaryExpression", operator: "!==", left: this._dpMember(descRef, "get"), right: undefRef },
+            right: { type: "BinaryExpression", operator: "!==", left: this._dpMember(descRef, "set"), right: undefRef },
+        };
+        const prop = (k, v) => ({ type: "Property", kind: "init", computed: false, shorthand: false, key: { type: "Identifier", name: k }, value: v });
+        this.compileExpression({
+            type: "ConditionalExpression",
+            test: isAccessor,
+            consequent: this._dpObjectCall("defineProperty", [objRef, keyRef, {
+                type: "ObjectExpression",
+                properties: [prop("get", this._dpMember(descRef, "get")), prop("set", this._dpMember(descRef, "set"))],
+            }]),
+            alternate: this._dpObjectCall("defineProperty", [objRef, keyRef, {
+                type: "ObjectExpression",
+                properties: [prop("value", this._dpMember(descRef, "value"))],
+            }]),
+        });
+
+        // attrs = ToBoolean(d.writable) | ToBoolean(d.enumerable)<<1 | ToBoolean(d.configurable)<<2
+        this.vm.movImm(VReg.V1, 0);
+        this.vm.store(VReg.FP, aOff, VReg.V1);
+        const attrNames = ["writable", "enumerable", "configurable"];
+        for (let i = 0; i < attrNames.length; i++) {
+            this.compileExpression(this._dpMember(descRef, attrNames[i]));
+            this.vm.mov(VReg.A0, VReg.RET);
+            this.vm.call("_to_boolean");            // RET = 裸 0/1
+            if (i === 0) this.vm.mov(VReg.V1, VReg.RET);
+            else this.vm.shlImm(VReg.V1, VReg.RET, i);
+            this.vm.load(VReg.V2, VReg.FP, aOff);
+            this.vm.or(VReg.V1, VReg.V1, VReg.V2);
+            this.vm.store(VReg.FP, aOff, VReg.V1);
+        }
+        this.vm.load(VReg.A0, VReg.FP, oOff);
+        this.vm.load(VReg.A1, VReg.FP, kOff);
+        this.vm.load(VReg.A2, VReg.FP, aOff);
+        this.vm.call("_object_set_prop_attr");
+        this.vm.label(doneLabel);
+        this.vm.load(VReg.RET, VReg.FP, oOff);      // defineProperty 返回原对象
+    },
+
+    // Object.defineProperties(obj, <运行时描述符表>) 动态回退：
+    //   Object.keys(map).forEach(k => Object.defineProperty(obj, k, map[k])), obj
+    // 内层 defineProperty 的描述符实参非字面量 → 递归走 emitDefinePropertyDynamic。
+    // obj/map 各求值一次落合成局部，箭头闭包捕获之（与 getOwnPropertyDescriptors 脱糖同法）。
+    emitDefinePropertiesDynamic(expr) {
+        const id = this.nextLabelId();
+        const oName = `__dpsd_obj_${id}`;
+        const mName = `__dpsd_map_${id}`;
+        const oOff = this.ctx.allocLocal(oName);
+        const mOff = this.ctx.allocLocal(mName);
+        this.compileExpression(expr.arguments[0]);
+        this.vm.store(VReg.FP, oOff, VReg.RET);
+        this.compileExpression(expr.arguments[1]);
+        this.vm.store(VReg.FP, mOff, VReg.RET);
+        const objRef = this._dpIdent(oName);
+        const mapRef = this._dpIdent(mName);
+        const kRef = this._dpIdent("k");
+        const body = this._dpObjectCall("defineProperty", [objRef, kRef,
+            { type: "MemberExpression", object: mapRef, property: kRef, computed: true }]);
+        this.compileExpression({
+            type: "SequenceExpression",
+            expressions: [
+                {
+                    type: "CallExpression",
+                    callee: this._dpMember(this._dpObjectCall("keys", [mapRef]), "forEach"),
+                    arguments: [{ type: "ArrowFunctionExpression", params: [kRef], expression: true, body }],
+                },
+                objRef,
+            ],
+        });
+    },
+
+    // Object.create(proto, <运行时描述符表>) 动态回退：proto/props 先各求值一次（规范
+    // 实参求值序），再建对象；props===undefined 时按规范不做属性定义（不得抛）。
+    emitObjectCreateDynamic(expr) {
+        const id = this.nextLabelId();
+        const pOff = this.ctx.allocLocal(`__ocd_proto_${id}`);
+        const mName = `__ocd_props_${id}`;
+        const cName = `__ocd_obj_${id}`;
+        const mOff = this.ctx.allocLocal(mName);
+        const cOff = this.ctx.allocLocal(cName);
+        this.compileExpression(expr.arguments[0]);
+        this.vm.store(VReg.FP, pOff, VReg.RET);
+        this.compileExpression(expr.arguments[1]);
+        this.vm.store(VReg.FP, mOff, VReg.RET);
+        this.vm.load(VReg.A0, VReg.FP, pOff);
+        this.vm.call("_object_create");
+        this.vm.store(VReg.FP, cOff, VReg.RET);
+        const mapRef = this._dpIdent(mName);
+        const objRef = this._dpIdent(cName);
+        this.compileExpression({
+            type: "ConditionalExpression",
+            test: { type: "BinaryExpression", operator: "===", left: mapRef, right: this._dpIdent("undefined") },
+            consequent: objRef,
+            alternate: this._dpObjectCall("defineProperties", [objRef, mapRef]),
+        });
+    },
+
     // 运行时按对象头类型字节分派内建 vs 用户方法。
     // 同名同 arity 的集合内建（Map.get/set/has/delete、Set.add）无法与同名用户方法静态区分，
     // 运行时判 obj 头 [0]&0xff==typeByte：命中走 compileBuiltin()，否则走通用用户方法调用。
@@ -3404,6 +3613,13 @@ export const FunctionCompiler = {
                 }
                 if (prop.name === "create") {
                     // Object.create(proto[, descriptors])
+                    // [W-13] 第二参非静态描述符表(变量/计算对象/函数返回值/含展开或计算键的
+                    // 字面量)→ 动态回退;静态字面量仍走下面原路径,逐字节不变。
+                    if (expr.arguments.length >= 2 && expr.arguments[1] &&
+                        !this.isStaticDescriptorMapLiteral(expr.arguments[1])) {
+                        this.emitObjectCreateDynamic(expr);
+                        return;
+                    }
                     if (expr.arguments.length > 0) {
                         this.compileExpression(expr.arguments[0]);
                         this.vm.mov(VReg.A0, VReg.RET);
@@ -3472,6 +3688,13 @@ export const FunctionCompiler = {
                 //   仅支持 descriptor 为对象字面量(静态可析);动态描述符记偏差。
                 if (prop.name === "defineProperty") {
                     const desc = expr.arguments[2];
+                    // [W-13] 描述符非编译期静态可析(变量/成员/调用结果/含展开或计算键或
+                    // 访问器简写或非布尔字面量 attr 的字面量)→ 运行时回退。desc 缺省
+                    // (实参不足)仍走原路径。静态字面量逐字节不变。
+                    if (desc && !this.isStaticDescriptorLiteral(desc)) {
+                        this.emitDefinePropertyDynamic(expr, desc);
+                        return;
+                    }
                     // 求 obj、key 到 FP 槽(闭包/值编译途中可能 GC,保守栈扫描保活)
                     const dpObj = this.ctx.allocLocal(`__dp_obj_${this.nextLabelId()}`);
                     const dpKey = this.ctx.allocLocal(`__dp_key_${this.nextLabelId()}`);
@@ -3581,6 +3804,12 @@ export const FunctionCompiler = {
                 // 仅支持描述符集合为对象字面量、键静态可析(与 defineProperty 同约束);
                 // obj 在每次 defineProperty 里重求值(与用户手写多条 defineProperty 同语义,
                 // 对标识符/成员目标正确;副作用型目标会重复求值,记偏差)。
+                // [W-13] 描述符表非静态可析 → 运行时回退(Object.keys(map).forEach 脱糖)。
+                if (prop.name === "defineProperties" && expr.arguments.length >= 2 &&
+                    expr.arguments[1] && !this.isStaticDescriptorMapLiteral(expr.arguments[1])) {
+                    this.emitDefinePropertiesDynamic(expr);
+                    return;
+                }
                 if (prop.name === "defineProperties" && expr.arguments.length >= 2 &&
                     expr.arguments[1] && expr.arguments[1].type === "ObjectExpression") {
                     const descs = expr.arguments[1];
@@ -3669,8 +3898,10 @@ export const FunctionCompiler = {
                     }
                     return;
                 }
-                // Object.getOwnPropertyDescriptors(obj):脱糖为
-                // Object.fromEntries(Object.keys(obj).map(k => [k, Object.getOwnPropertyDescriptor(obj, k)]))。
+                // Object.getOwnPropertyDescriptors(obj):脱糖为 Object.fromEntries(
+                //   Object.getOwnPropertyNames(obj).map(k => [k, Object.getOwnPropertyDescriptor(obj, k)]))。
+                // [W-13] 键源用 gOPN 而非 keys:gOPDs 须含**不可枚举**自有键
+                // (defineProperty(o,k,{enumerable:false}) 的键),keys 会漏掉它们。
                 // obj 只求值一次落临时局部,map 箭头以合成标识符引用(闭包捕获)。
                 if (prop.name === "getOwnPropertyDescriptors" && expr.arguments.length >= 1) {
                     const oName = `__gopds_${this.nextLabelId()}`;
@@ -3687,7 +3918,7 @@ export const FunctionCompiler = {
                     // getOwnPropertyDescriptor 陷阱返 undefined 时不得进结果,es-compat t717)。
                     // 普通对象自有键描述符恒非 undefined → filter 无操作、逐字节不影响。
                     this.compileExpression(call(mem(OBJ, "fromEntries"), [
-                        call(mem(call(mem(call(mem(OBJ, "keys"), [objRef]), "map"), [{
+                        call(mem(call(mem(call(mem(OBJ, "getOwnPropertyNames"), [objRef]), "map"), [{
                             type: "ArrowFunctionExpression", params: [kRef], expression: true,
                             body: { type: "ArrayExpression", elements: [kRef, call(mem(OBJ, "getOwnPropertyDescriptor"), [objRef, kRef])] },
                         }]), "filter"), [{

@@ -634,7 +634,7 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.V1, 0x7FFF);
         vm.jeq("_object_get_fnprops");
         vm.cmpImm(VReg.V1, 0x7FFE);
-        vm.jeq("_object_get_fnprops");
+        vm.jeq("_object_get_array");
 
         // 非法/非对象类型（数组/字符串/数字…），安全返回 undefined(装箱,非裸 0)
         vm.lea(VReg.RET, "_js_undefined");
@@ -647,6 +647,19 @@ export class ObjectGenerator {
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S1);
         vm.call("_closure_prop_get");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
+
+        // 数组属性读:委托 _subscript_get(裸数组指针 + 原键)——其内按 ES 语义分派:
+        // 规范数值索引键(a["0"]、{0:x} 解构的 "0" 键)→ 元素读;"length" → 长度;
+        // 其余具名键 → 属性侧表(.raw 等,同 _closure_prop_get,miss → undefined)。
+        // 与 _object_set 的 _object_set_array 写侧路由对称(同一 _canonical_array_index 裁决)。
+        // 传**脱壳**指针:即便块类型字节被损坏落到 _subscript_get_object,那里回调
+        // _object_get 也是高16=0 的裸指针路径,不会再回到本分支(无递归环)。
+        vm.label("_object_get_array");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.A0, VReg.S0, VReg.V1);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_subscript_get");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
 
         vm.label("_object_get_tag_ok");

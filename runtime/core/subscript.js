@@ -34,7 +34,7 @@ export class SubscriptGenerator {
         vm.jne("_subscript_get_not_str");
         vm.mov(VReg.S0, VReg.A0); // 保留装箱字符串
         vm.mov(VReg.A0, VReg.S1);
-        vm.call("_syscall_arg");
+        vm.call("_subscript_key_int"); // 字符串键按规范索引串判定(s["1"] ≡ s[1])
         vm.mov(VReg.A1, VReg.RET);
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_str_index_char"); // str[i]:越界返 undefined(非 charAt 的 "")
@@ -75,6 +75,13 @@ export class SubscriptGenerator {
 
         // 数组/TypedArray：把键归一化为整数下标
         // （float64 位 -> fcvtzs；tagged -> payload；裸整数直通）
+        // 字符串键(0x7FFC)改走冷分支 _subscript_get_strkey:ES 里数组索引**本就是字符串
+        // 属性键**(a[0] ≡ a["0"]),而 _syscall_arg 对字符串取的是**内容指针**(天文数字)
+        // → 恒判越界 → `a[k]`(k="1")/`{0:x}=arr` 一律 undefined。判别用 V1 暂存:V0 存着
+        // 类型低字节,arm64 快路靠它跨 _syscall_arg 存活,不可动。
+        vm.shrImm(VReg.V1, VReg.S1, 48);
+        vm.cmpImm(VReg.V1, 0x7FFC);
+        vm.jeq("_subscript_get_strkey");
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_syscall_arg");
         vm.mov(VReg.S1, VReg.RET);
@@ -85,6 +92,8 @@ export class SubscriptGenerator {
             vm.andImm(VReg.V0, VReg.S3, 0xff);
         }
 
+        // 下标已是裸整数(S1)、类型低字节在 V0:字符串键冷分支归一后跳回此处汇合。
+        vm.label("_subscript_get_idx_ok");
         // 检查是否是 TypedArray (类型 0x40-0x70)
         vm.cmpImm(VReg.V0, 0x40);
         vm.jlt("_subscript_get_array"); // 小于 0x40，是普通 Array
@@ -316,7 +325,7 @@ export class SubscriptGenerator {
         vm.label("_subscript_get_string");
         // str[i]：键归一化为整数下标，调 _str_charAt（S0 是裸堆字符串指针）
         vm.mov(VReg.A0, VReg.S1);
-        vm.call("_syscall_arg");
+        vm.call("_subscript_key_int"); // 字符串键按规范索引串判定(非索引返 -1 → 界外)
         vm.mov(VReg.A1, VReg.RET);
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_str_charAt");
@@ -340,6 +349,55 @@ export class SubscriptGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
         vm.label("_subscript_get_arr_oob");
         vm.movImm64(VReg.RET, 0x7ffb000000000000n); // JS_UNDEFINED
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
+
+        // ===== 数组/TypedArray 的字符串键(冷分支) =====
+        // S0=裸接收者, S1=装箱字符串键, S3=完整类型。规范数组索引串(ES
+        // CanonicalNumericIndexString:"0"/"1"/"42" 是;"01"/"1.0"/" 1"/"-0"/"1e2" 不是)
+        // → 当整数下标走元素路径;其余 → 具名属性路径。判据复用 _canonical_array_index
+        // (与 _object_set 的数组具名写同一裁决,读写两侧口径一致)。
+        vm.label("_subscript_get_strkey");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_canonical_array_index"); // RET = idx(0..2^32-2) / -1(非索引)
+        vm.movImm64(VReg.V1, 0xFFFFFFFFFFFFFFFFn);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_subscript_get_named");
+        vm.mov(VReg.S1, VReg.RET); // 裸整数下标(须先取走:x64 上 V0≡RET)
+        vm.andImm(VReg.V0, VReg.S3, 0xff); // 复原类型低字节(被调用方冲了 V0,两后端皆然)
+        vm.jmp("_subscript_get_idx_ok");
+
+        // 非规范索引串:仅数组(type=1)/TypedArray(0x40..0x70)受理,其余(Map/Set/…)undefined。
+        // "length" → _js_length 装箱成 canonical number;数组其余具名键 → 属性侧表
+        // (_closure_prop_get,与 _object_set 的数组具名写 _closure_prop_set 同表,故
+        // `a.foo=9; a[k]`(k="foo") 取得到 9);TypedArray 无侧表 → undefined。
+        vm.label("_subscript_get_named");
+        vm.andImm(VReg.V0, VReg.S3, 0xff);
+        vm.cmpImm(VReg.V0, 1); // TYPE_ARRAY
+        vm.jeq("_subscript_get_named_ok");
+        vm.cmpImm(VReg.V0, 0x40);
+        vm.jlt("_subscript_get_arr_oob");
+        vm.cmpImm(VReg.V0, 0x70);
+        vm.jgt("_subscript_get_arr_oob");
+        vm.label("_subscript_get_named_ok");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.V0, "_str_length_prop");
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.V0, VReg.V1); // 装箱字符串键 "length"
+        vm.call("_object_key_eq"); // 内容比较(动态拼出的 "length" 也认)
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_subscript_get_named_len");
+        vm.andImm(VReg.V0, VReg.S3, 0xff);
+        vm.cmpImm(VReg.V0, 1); // 仅普通数组有属性侧表
+        vm.jne("_subscript_get_arr_oob");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_closure_prop_get"); // miss → undefined
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
+        vm.label("_subscript_get_named_len");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_js_length"); // 裸整数长度
+        vm.scvtf(0, VReg.RET);
+        vm.fmovToInt(VReg.RET, 0); // canonical number(float64 位)
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
 
         // [fn props] 闭包属性侧表读:f[sym]/f[k]。键经 _js_prop_key 规范化(symbol/数值
@@ -417,6 +475,12 @@ export class SubscriptGenerator {
         vm.jeq("_subscript_set_object");
 
         // 数组/TypedArray：把键归一化为整数下标
+        // 字符串键(0x7FFC)走冷分支 _subscript_set_strkey(与 _subscript_get 同一裁决:
+        // 规范索引串当下标,否则具名属性)。此前 _syscall_arg 把字符串的内容指针当下标 →
+        // 恒 >2^28 上限被丢弃 → `a[k]="v"`(k="1") 静默不写。
+        vm.shrImm(VReg.V1, VReg.S1, 48);
+        vm.cmpImm(VReg.V1, 0x7FFC);
+        vm.jeq("_subscript_set_strkey");
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_syscall_arg");
         vm.mov(VReg.S1, VReg.RET);
@@ -428,6 +492,8 @@ export class SubscriptGenerator {
             vm.andImm(VReg.V0, VReg.V0, 0xff);
         }
 
+        // 下标已是裸整数(S1)、类型低字节在 V0:字符串键冷分支归一后跳回此处汇合。
+        vm.label("_subscript_set_idx_ok");
         // 检查是否是 TypedArray (类型 0x40-0x70)
         vm.cmpImm(VReg.V0, 0x40);
         vm.jlt("_subscript_set_array"); // 小于 0x40，是普通 Array
@@ -505,6 +571,49 @@ export class SubscriptGenerator {
         vm.label("_subscript_set_done");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
 
+        // ===== 数组/TypedArray 的字符串键(冷分支,镜像 _subscript_get_strkey) =====
+        // S0=裸接收者, S1=装箱字符串键, S2=值。
+        vm.label("_subscript_set_strkey");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_canonical_array_index"); // RET = idx / -1(非规范索引串)
+        vm.movImm64(VReg.V1, 0xFFFFFFFFFFFFFFFFn);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_subscript_set_named");
+        vm.mov(VReg.S1, VReg.RET); // 裸整数下标(须先取走:x64 上 V0≡RET)
+        vm.load(VReg.V0, VReg.S0, 0); // 复原类型低字节(被调用方冲了 V0)
+        vm.andImm(VReg.V0, VReg.V0, 0xff);
+        vm.jmp("_subscript_set_idx_ok");
+
+        // 非规范索引串:仅普通数组(type=1)受理——"length" → _js_set_length(截断/补 undefined
+        // 扩展),其余具名键 → 属性侧表(与 _object_set 的数组具名写同表)。TypedArray/其余静默
+        // 丢弃(同旧行为;spec 上 TypedArray 的 length 不可写、非规范索引串写也不落元素)。
+        vm.label("_subscript_set_named");
+        vm.load(VReg.V0, VReg.S0, 0);
+        vm.andImm(VReg.V0, VReg.V0, 0xff);
+        vm.cmpImm(VReg.V0, 1); // TYPE_ARRAY
+        vm.jne("_subscript_set_done");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.V0, "_str_length_prop");
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.V0, VReg.V1); // 装箱字符串键 "length"
+        vm.call("_object_key_eq");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_subscript_set_named_len");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_closure_prop_set");
+        vm.mov(VReg.RET, VReg.S2); // 赋值表达式之值
+        vm.jmp("_subscript_set_done");
+        vm.label("_subscript_set_named_len");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_syscall_arg"); // 值 -> 裸整数长度
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_js_set_length");
+        vm.mov(VReg.RET, VReg.S2);
+        vm.jmp("_subscript_set_done");
+
         // [fn props] 闭包属性侧表写:f[sym]=v / f[k]=v。键经 _js_prop_key 规范化,
         // 值写入 _closure_prop_set(登记/复用 props 容器)。S0=裸闭包,S1=键,S2=值。
         vm.label("_subscript_set_closure");
@@ -555,8 +664,29 @@ export class SubscriptGenerator {
     generate() {
         this.generateGet();
         this.generateSet();
+        this.generateKeyInt();
         this.generateJsLength();
         this.generateJsSetLength();
+    }
+
+    // _subscript_key_int(key) -> 裸整数下标 | -1
+    // 元素下标归一化:字符串键按 ES 的 CanonicalNumericIndexString 判定
+    // (复用 _canonical_array_index:"0"/"1"/"42" 是索引;"01"/"1.0"/" 1"/"-0"/"1e2"/""
+    //  不是 → -1),非字符串键沿用 _syscall_arg(float64 位 -> fcvtzs / tagged -> payload /
+    // 裸整数直通)。字符串接收者(s[k])用它;数组路径另在 _subscript_get/_set 内联判别,
+    // 因为那里还需把「非索引」分流到具名属性路径。
+    generateKeyInt() {
+        const vm = this.vm;
+        vm.label("_subscript_key_int");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.shrImm(VReg.V1, VReg.A0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFC);
+        vm.jne("_ski_not_str");
+        vm.call("_canonical_array_index"); // RET = idx / -1
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_ski_not_str");
+        vm.call("_syscall_arg");
+        vm.epilogue([VReg.S0, VReg.S1], 0);
     }
 
     // _js_set_length(value, n_int) -> undefined
