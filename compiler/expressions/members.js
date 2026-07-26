@@ -96,7 +96,7 @@ const NamespaceStaticRef = {
         keys: "_object_keys",
         values: "_object_values",
         entries: "_object_entries",
-        getOwnPropertyNames: "_object_keys", // 简化模型等价 keys(同调用位近似)
+        getOwnPropertyNames: "_object_gopn", // 对象路径委托 _object_keys;array/string 额外含 "length"
     },
     Date: {
         now: "_date_now", // 0 参 → canonical number

@@ -3146,12 +3146,13 @@ export const FunctionCompiler = {
                     return;
                 }
                 if (prop.name === "keys" || prop.name === "getOwnPropertyNames") {
-                    // Object.keys(obj) -> array。getOwnPropertyNames 在本简化模型里(所有自有键
-                    // 皆可枚举、无 symbol 键)等价 keys;此前未实现 → 调 miss 崩。近似复用 _object_keys。
+                    // Object.keys(obj) -> array。getOwnPropertyNames 对象路径在本简化模型里
+                    // (所有自有键皆可枚举、无 symbol 键)委托 _object_keys;array/string 目标
+                    // 额外含 "length"(_object_gopn 入口分派,test262 S1)。
                     if (expr.arguments.length > 0) {
                         this.compileExpression(expr.arguments[0]);
                         this.vm.mov(VReg.A0, VReg.RET);
-                        this.vm.call("_object_keys");
+                        this.vm.call(prop.name === "keys" ? "_object_keys" : "_object_gopn");
                     } else {
                         this.vm.movImm(VReg.RET, 0);
                     }

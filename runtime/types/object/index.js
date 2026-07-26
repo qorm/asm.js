@@ -82,6 +82,7 @@ export class ObjectGenerator {
         this.generateObjectHas();
         this.generatePropIn();
         this.generateObjectKeys();
+        this.generateObjectGetOwnPropertyNames();
         this.generateObjectGetOwnPropertySymbols();
         this.generateObjectProtoToString();
         this.generateObjectValues();
@@ -2900,7 +2901,19 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.V0, 0x7FFB); vm.jeq("_object_keys_nullish");
         vm.cmpImm(VReg.V0, 0x7FFE); vm.jeq("_object_keys_indexed");
         vm.cmpImm(VReg.V0, 0x7FFC); vm.jeq("_object_keys_indexed_str");
-        // (int/bool 等原语 → 空数组:复用路径会破坏后续堆状态,根因待调试,暂走原路径)
+        // number/bool → 空数组。注意 number 大多是**裸 float 位**(5.0 → high16=0x4014),
+        // 不是 0x7FF8 装箱 int——旧"复用空数组路径破坏堆"实为 float 未被分派、掉进 legacy
+        // 解引用踩内存(空数组路径本身无辜,bool 实测干净)。判别:0x7FF8(装箱 int/NaN 别名)
+        // /0x7FF9(bool)→ 空;0x7FFD(对象)/0x7FFF(函数)→ 原路径;其余 high16≠0 → 裸
+        // float → 空;high16==0 且全零 → float +0.0 → 空;high16==0 且非零 → 裸堆指针
+        // (Map/Set/classinfo/Symbol)→ 原路径。
+        vm.cmpImm(VReg.V0, 0x7FF8); vm.jeq("_object_keys_empty");
+        vm.cmpImm(VReg.V0, 0x7FF9); vm.jeq("_object_keys_empty");
+        vm.cmpImm(VReg.V0, 0x7FFD); vm.jeq("_object_keys_legacy");
+        vm.cmpImm(VReg.V0, 0x7FFF); vm.jeq("_object_keys_legacy");
+        vm.cmpImm(VReg.V0, 0); vm.jne("_object_keys_empty"); // 其余非零 high16 = 裸 float
+        vm.cmpImm(VReg.A0, 0); vm.jeq("_object_keys_empty"); // 全零 = +0.0
+        vm.label("_object_keys_legacy");
 
         vm.mov(VReg.S0, VReg.A0); // obj
 
@@ -3025,6 +3038,11 @@ export class ObjectGenerator {
         vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
         vm.call("_throw_type_error"); // 不返回
 
+        // number/bool → 空数组(S1=0 走通用索引键构建,即空结果)
+        vm.label("_object_keys_empty");
+        vm.movImm(VReg.S1, 0);
+        vm.jmp("_object_keys_idx_build");
+
         // array → 索引键 ["0",...,"len-1"]
         vm.label("_object_keys_indexed");
         vm.call("_array_length"); // A0=boxed array → RET=length
@@ -3053,6 +3071,70 @@ export class ObjectGenerator {
         vm.mov(VReg.RET, VReg.S2);
         vm.or(VReg.RET, VReg.RET, VReg.V1);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+    }
+
+    // Object.getOwnPropertyNames(obj) -> array
+    // _object_gopn(obj) -> array
+    // [test262 S1] 与 _object_keys 的差异仅在 array/string:索引键之外还含 "length"
+    // (node: gOPN([a,b]) = ['0','1','length'],gOPN('ab') = ['0','1','length'])。
+    // null/undefined → TypeError;对象/函数/裸指针/原语 → 委托 _object_keys
+    // (简化模型:所有自有键皆可枚举,gOPN ≡ keys,保持既有近似)。
+    generateObjectGetOwnPropertyNames() {
+        const vm = this.vm;
+
+        vm.label("_object_gopn");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFA); vm.jeq("_object_gopn_nullish");
+        vm.cmpImm(VReg.V0, 0x7FFB); vm.jeq("_object_gopn_nullish");
+        vm.cmpImm(VReg.V0, 0x7FFE); vm.jeq("_object_gopn_arr");
+        vm.cmpImm(VReg.V0, 0x7FFC); vm.jeq("_object_gopn_str");
+        vm.call("_object_keys");        // 其余形态:委托(A0 未动)
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+
+        // null/undefined → TypeError(ToObject 规范)
+        vm.label("_object_gopn_nullish");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot convert undefined or null to object"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error"); // 不返回
+
+        vm.label("_object_gopn_arr");
+        vm.call("_array_length");       // A0=boxed array → RET=length
+        vm.mov(VReg.S1, VReg.RET);
+        vm.jmp("_object_gopn_build");
+        vm.label("_object_gopn_str");
+        vm.call("_strlen");             // A0=boxed string → RET=byte length
+        vm.mov(VReg.S1, VReg.RET);
+        vm.label("_object_gopn_build");
+        // 索引键 ["0",...,"len-1"](同 _object_keys_idx_build)+ 末尾 "length"
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.mov(VReg.S2, VReg.RET);      // 裸结果数组
+        vm.movImm(VReg.S3, 0);          // i
+        vm.label("_object_gopn_idx_loop");
+        vm.cmp(VReg.S3, VReg.S1); vm.jge("_object_gopn_idx_done");
+        vm.scvtf(0, VReg.S3); vm.fmovToInt(VReg.A0, 0); // A0 = i 的 float64 位
+        vm.call("_valueToStr");         // RET = boxed 字符串键
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_array_push");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_object_gopn_idx_loop");
+        vm.label("_object_gopn_idx_done");
+        // + "length"(数据段字面量拷进堆并装箱)
+        vm.lea(VReg.A0, vm.asm.addString("length"));
+        vm.call("_cstr_to_heap_str");   // RET = boxed 堆串
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_array_push");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.movImm64(VReg.V1, 0x7FFE000000000000n);
+        vm.mov(VReg.RET, VReg.S2);
+        vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
     }
 
     // Object.prototype.toString.call(x) -> "[object Tag]"(品牌串)。tag 依 x 类型;
@@ -3304,6 +3386,22 @@ export class ObjectGenerator {
         vm.label("_object_values");
         vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
 
+        // [test262 S1] 类型分派(消 CRASH,判别逻辑详注见 _object_keys):null/undefined
+        // → TypeError;array → 元素值副本;string → 单字符串数组;number(裸 float/装箱
+        // int)/bool → 空数组;对象/函数/裸堆指针 → 原路径。
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFA); vm.jeq("_object_values_nullish");
+        vm.cmpImm(VReg.V0, 0x7FFB); vm.jeq("_object_values_nullish");
+        vm.cmpImm(VReg.V0, 0x7FFE); vm.jeq("_object_values_indexed");
+        vm.cmpImm(VReg.V0, 0x7FFC); vm.jeq("_object_values_indexed_str");
+        vm.cmpImm(VReg.V0, 0x7FF8); vm.jeq("_object_values_empty");
+        vm.cmpImm(VReg.V0, 0x7FF9); vm.jeq("_object_values_empty");
+        vm.cmpImm(VReg.V0, 0x7FFD); vm.jeq("_object_values_legacy");
+        vm.cmpImm(VReg.V0, 0x7FFF); vm.jeq("_object_values_legacy");
+        vm.cmpImm(VReg.V0, 0); vm.jne("_object_values_empty");
+        vm.cmpImm(VReg.A0, 0); vm.jeq("_object_values_empty");
+        vm.label("_object_values_legacy");
+
         vm.mov(VReg.S0, VReg.A0); // obj
 
         // 指针脱壳
@@ -3381,6 +3479,70 @@ export class ObjectGenerator {
         vm.mov(VReg.RET, VReg.S2);
         vm.or(VReg.RET, VReg.RET, VReg.V1);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+
+        // ---- [test262 S1] 非对象目标分派处理(入口 high16 分派跳入)----
+        // null/undefined → TypeError(ToObject 规范)
+        vm.label("_object_values_nullish");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot convert undefined or null to object"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error"); // 不返回
+
+        // array → [a[0],...,a[len-1]] 浅拷贝(独立循环,活值只占 S0-S3,避 S4/S5 跨 _alloc)
+        vm.label("_object_values_indexed");
+        vm.mov(VReg.S0, VReg.A0);       // boxed array
+        vm.call("_array_length");       // RET = length
+        vm.mov(VReg.S1, VReg.RET);
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.mov(VReg.S2, VReg.RET);      // 裸结果数组
+        vm.movImm(VReg.S3, 0);          // i
+        vm.label("_object_values_arr_loop");
+        vm.cmp(VReg.S3, VReg.S1); vm.jge("_object_values_idx_done");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_array_get");          // RET = boxed 元素(越界返 undefined,界内不触发)
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_array_push");
+        vm.mov(VReg.S2, VReg.RET);      // A0 裸头 → 返回仍裸头
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_object_values_arr_loop");
+
+        // string → ['c0','c1',...](字节长;ASCII = 字符数,非 ASCII 见 UTF-8 偏差)
+        vm.label("_object_values_indexed_str");
+        vm.mov(VReg.S0, VReg.A0);       // boxed string
+        vm.call("_strlen");             // RET = byte length
+        vm.mov(VReg.S1, VReg.RET);
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.movImm(VReg.S3, 0);
+        vm.label("_object_values_str_loop");
+        vm.cmp(VReg.S3, VReg.S1); vm.jge("_object_values_idx_done");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_str_charAt");         // RET = boxed 单字符串
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_array_push");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_object_values_str_loop");
+
+        vm.label("_object_values_idx_done");
+        vm.movImm64(VReg.V1, 0x7FFE000000000000n);
+        vm.mov(VReg.RET, VReg.S2);
+        vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+
+        // number/bool → 空数组(装箱)
+        vm.label("_object_values_empty");
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.movImm64(VReg.V1, 0x7FFE000000000000n);
+        vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
     }
 
     // Object.entries(obj) -> 返回 [[key, value], ...] 数组
@@ -3390,6 +3552,22 @@ export class ObjectGenerator {
 
         vm.label("_object_entries");
         vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+
+        // [test262 S1] 类型分派(消 CRASH,判别逻辑详注见 _object_keys):null/undefined
+        // → TypeError;array → [['0',v0],...];string → [['0','c0'],...];number/bool →
+        // 空数组;对象/函数/裸堆指针 → 原路径。
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFA); vm.jeq("_object_entries_nullish");
+        vm.cmpImm(VReg.V0, 0x7FFB); vm.jeq("_object_entries_nullish");
+        vm.cmpImm(VReg.V0, 0x7FFE); vm.jeq("_object_entries_indexed");
+        vm.cmpImm(VReg.V0, 0x7FFC); vm.jeq("_object_entries_indexed_str");
+        vm.cmpImm(VReg.V0, 0x7FF8); vm.jeq("_object_entries_empty");
+        vm.cmpImm(VReg.V0, 0x7FF9); vm.jeq("_object_entries_empty");
+        vm.cmpImm(VReg.V0, 0x7FFD); vm.jeq("_object_entries_legacy");
+        vm.cmpImm(VReg.V0, 0x7FFF); vm.jeq("_object_entries_legacy");
+        vm.cmpImm(VReg.V0, 0); vm.jne("_object_entries_empty");
+        vm.cmpImm(VReg.A0, 0); vm.jeq("_object_entries_empty");
+        vm.label("_object_entries_legacy");
 
         vm.mov(VReg.S0, VReg.A0); // obj
 
@@ -3495,6 +3673,105 @@ export class ObjectGenerator {
         vm.mov(VReg.RET, VReg.S2);
         vm.or(VReg.RET, VReg.RET, VReg.V1);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 16);
+
+        // ---- [test262 S1] 非对象目标分派处理(入口 high16 分派跳入)----
+        // null/undefined → TypeError(ToObject 规范)
+        vm.label("_object_entries_nullish");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot convert undefined or null to object"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error"); // 不返回
+
+        // array → [['0',a[0]],...]。活值只占 S0-S3 + 栈槽(SP+0=pair 裸头),避 S4/S5 跨
+        // _alloc(_alloc 只保 S0-S3);pair 先建再逐槽填,键/值均即取即存不跨分配调用。
+        vm.label("_object_entries_indexed");
+        vm.mov(VReg.S0, VReg.A0);       // boxed array
+        vm.call("_array_length");       // RET = length
+        vm.mov(VReg.S1, VReg.RET);
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.mov(VReg.S2, VReg.RET);      // 裸结果数组
+        vm.movImm(VReg.S3, 0);          // i
+        vm.label("_object_entries_arr_loop");
+        vm.cmp(VReg.S3, VReg.S1); vm.jge("_object_entries_idx_done");
+        // pair = new Array(2)(先建:后续键/值即取即存,无值跨分配)
+        vm.movImm(VReg.A0, 2);
+        vm.call("_array_new_with_size");
+        vm.store(VReg.SP, 0, VReg.RET);
+        // pair[0] = String(i)(i=0 的 float 位 0x0 在 _valueToStr 走 raw-number 路 → "0",同 _object_keys)
+        vm.scvtf(0, VReg.S3); vm.fmovToInt(VReg.A0, 0);
+        vm.call("_valueToStr");
+        vm.mov(VReg.A2, VReg.RET);
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.movImm(VReg.A1, 0);
+        vm.call("_array_set");
+        // pair[1] = a[i]
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_array_get");
+        vm.mov(VReg.A2, VReg.RET);
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.movImm(VReg.A1, 1);
+        vm.call("_array_set");
+        // result.push(box(pair))(内层同样装箱 0x7FFE,同对象路径)
+        vm.mov(VReg.A0, VReg.S2);
+        vm.load(VReg.A1, VReg.SP, 0);
+        vm.movImm64(VReg.V1, 0x7FFE000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_array_push");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_object_entries_arr_loop");
+
+        // string → [['0','c0'],...](字节长;ASCII = 字符数,非 ASCII 见 UTF-8 偏差)
+        vm.label("_object_entries_indexed_str");
+        vm.mov(VReg.S0, VReg.A0);       // boxed string
+        vm.call("_strlen");             // RET = byte length
+        vm.mov(VReg.S1, VReg.RET);
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.movImm(VReg.S3, 0);
+        vm.label("_object_entries_str_loop");
+        vm.cmp(VReg.S3, VReg.S1); vm.jge("_object_entries_idx_done");
+        vm.movImm(VReg.A0, 2);
+        vm.call("_array_new_with_size");
+        vm.store(VReg.SP, 0, VReg.RET);
+        vm.scvtf(0, VReg.S3); vm.fmovToInt(VReg.A0, 0);
+        vm.call("_valueToStr");
+        vm.mov(VReg.A2, VReg.RET);
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.movImm(VReg.A1, 0);
+        vm.call("_array_set");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_str_charAt");
+        vm.mov(VReg.A2, VReg.RET);
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.movImm(VReg.A1, 1);
+        vm.call("_array_set");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.load(VReg.A1, VReg.SP, 0);
+        vm.movImm64(VReg.V1, 0x7FFE000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_array_push");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_object_entries_str_loop");
+
+        vm.label("_object_entries_idx_done");
+        vm.movImm64(VReg.V1, 0x7FFE000000000000n);
+        vm.mov(VReg.RET, VReg.S2);
+        vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 16);
+
+        // number/bool → 空数组(装箱)
+        vm.label("_object_entries_empty");
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.movImm64(VReg.V1, 0x7FFE000000000000n);
+        vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 16);
     }
 
     // Object.assign(target, ...sources) -> target
@@ -3504,6 +3781,35 @@ export class ObjectGenerator {
 
         vm.label("_object_assign");
         vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+
+        // [test262 S1] 入口类型守卫(对齐 node,判别逻辑详注见 _object_keys):
+        // target null/undefined → TypeError;target number/bool → 原样返回(无包装对象,
+        // 偏差:node 返 Number/Boolean 包装);source null/undefined/number/bool → 跳过
+        // (返回 target);source string/array → 按索引键拷贝到 target;其余走原路径。
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFA); vm.jeq("_object_assign_nullish_tgt");
+        vm.cmpImm(VReg.V0, 0x7FFB); vm.jeq("_object_assign_nullish_tgt");
+        vm.cmpImm(VReg.V0, 0x7FFD); vm.jeq("_object_assign_tgt_ok");
+        vm.cmpImm(VReg.V0, 0x7FFE); vm.jeq("_object_assign_tgt_ok");
+        vm.cmpImm(VReg.V0, 0x7FFF); vm.jeq("_object_assign_tgt_ok");
+        vm.cmpImm(VReg.V0, 0x7FFC); vm.jeq("_object_assign_ret_tgt"); // string target:无包装,原样返
+        vm.cmpImm(VReg.V0, 0); vm.jne("_object_assign_ret_tgt"); // 裸 float number
+        vm.cmpImm(VReg.A0, 0); vm.jeq("_object_assign_ret_tgt"); // +0.0
+        // high16==0 且非零 → 裸堆指针 target → 原路径
+        vm.label("_object_assign_tgt_ok");
+        vm.shrImm(VReg.V0, VReg.A1, 48);
+        vm.cmpImm(VReg.V0, 0x7FFA); vm.jeq("_object_assign_ret_tgt");
+        vm.cmpImm(VReg.V0, 0x7FFB); vm.jeq("_object_assign_ret_tgt");
+        vm.cmpImm(VReg.V0, 0x7FF8); vm.jeq("_object_assign_ret_tgt");
+        vm.cmpImm(VReg.V0, 0x7FF9); vm.jeq("_object_assign_ret_tgt");
+        vm.cmpImm(VReg.V0, 0x7FFC); vm.jeq("_object_assign_src_str");
+        vm.cmpImm(VReg.V0, 0x7FFE); vm.jeq("_object_assign_src_arr");
+        vm.cmpImm(VReg.V0, 0x7FFD); vm.jeq("_object_assign_legacy");
+        vm.cmpImm(VReg.V0, 0x7FFF); vm.jeq("_object_assign_legacy");
+        vm.cmpImm(VReg.V0, 0); vm.jne("_object_assign_ret_tgt"); // 裸 float source
+        vm.cmpImm(VReg.A1, 0); vm.jeq("_object_assign_ret_tgt"); // +0.0
+        // 裸堆指针 source → 原路径
+        vm.label("_object_assign_legacy");
 
         vm.mov(VReg.S0, VReg.A0); // target
         vm.mov(VReg.S1, VReg.A1); // source
@@ -3559,6 +3865,70 @@ export class ObjectGenerator {
         // (~758KB 系统性欠生成)。
         vm.movImm64(VReg.V1, 0x7ffd000000000000n);
         vm.or(VReg.RET, VReg.S0, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
+
+        // ---- [test262 S1] 非对象 target/source 分派处理(入口守卫跳入)----
+        // target null/undefined → TypeError(ToObject 规范)
+        vm.label("_object_assign_nullish_tgt");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot convert undefined or null to object"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error"); // 不返回
+
+        // 不可拷贝形态 → 原样返回 target(原 boxed 值,tag 不改写)
+        vm.label("_object_assign_ret_tgt");
+        vm.mov(VReg.RET, VReg.A0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
+
+        // source string → target[i] = 单字符(node: assign({},'xy') → {0:'x',1:'y'})
+        // 活值:S0=boxed target、S1=boxed source、S2=len、S3=i、SP+0=当前键。
+        vm.label("_object_assign_src_str");
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_strlen");             // RET = byte length
+        vm.mov(VReg.S2, VReg.RET);
+        vm.movImm(VReg.S3, 0);
+        vm.label("_object_assign_str_loop");
+        vm.cmp(VReg.S3, VReg.S2); vm.jge("_object_assign_idx_ret");
+        vm.scvtf(0, VReg.S3); vm.fmovToInt(VReg.A0, 0);
+        vm.call("_valueToStr");         // 键 "i"
+        vm.store(VReg.SP, 0, VReg.RET);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_str_charAt");         // 值 'ci'
+        vm.mov(VReg.A2, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.load(VReg.A1, VReg.SP, 0);
+        vm.call("_object_set");
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_object_assign_str_loop");
+
+        // source array → target[i] = a[i](node: assign({},[7,8]) → {0:7,1:8})
+        vm.label("_object_assign_src_arr");
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_array_length");       // RET = length
+        vm.mov(VReg.S2, VReg.RET);
+        vm.movImm(VReg.S3, 0);
+        vm.label("_object_assign_arr_loop");
+        vm.cmp(VReg.S3, VReg.S2); vm.jge("_object_assign_idx_ret");
+        vm.scvtf(0, VReg.S3); vm.fmovToInt(VReg.A0, 0);
+        vm.call("_valueToStr");
+        vm.store(VReg.SP, 0, VReg.RET);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_array_get");
+        vm.mov(VReg.A2, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.load(VReg.A1, VReg.SP, 0);
+        vm.call("_object_set");
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_object_assign_arr_loop");
+
+        vm.label("_object_assign_idx_ret");
+        vm.mov(VReg.RET, VReg.S0);      // 原 boxed target
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
     }
 
