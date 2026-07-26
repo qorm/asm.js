@@ -312,6 +312,17 @@ W-5 范围内只有簇 D 可修,已修 3 项(`_ta_set` 规范守卫 tag 分派 n
 **主控集成 W-5+W-4+W-8**:**gen1==gen2==gen3 + fixtures 380/380 通过**。
 - 注:首次全量测量因中途 apply W-8(每个用例现编译,源码变动会污染结果)已主动中止,重跑一次干净测量。
 
+## Wave 8 派发(2026-07-26,基线 v0.2.8 / df204ed)
+
+阶段转折:CRASH 已从 480 降至 175、COMPILE_FAIL 从 108 降至 40,**主战场从"崩溃/解析"转为"语义 FAIL"**。按分区 FAIL 池大小选靶,四批互斥:
+
+| Agent | 拥有文件 | 靶区(当前通过率) | FP 风险 |
+|---|---|---|---|
+| **W-23** | runtime/types/typedarray/index.js, compiler/functions/functions.js | **TypedArray 20/288 = 6.9%**(264 FAIL,仅 4 CRASH)——**最差分区**,崩溃已基本清除故测试真正跑起来只是语义错,池子最肥。**要求先产出 FAIL 根因聚类图**(与修复同等价值) | FP-sensitive(含编译器文件) |
+| **W-24** | compiler/index.js, compiler/functions/closures.js | 函数元数据:表加 arity 槽(现为 `{code_ptr,kind,name_ptr}` 24B 无 arity)+ 扩大 `registerFuncMeta` 覆盖(类方法/箭头/对象方法)。解锁**跨所有目录**的 `*/name.js`+`*/length.js` 簇。**布局变更须原子**(治理铁律 §4:必须一次提交同步全部遍历站点) | FP-sensitive(布局变更,门禁即真考) |
+| **W-25** | runtime/types/string/index.js | **String 60/244 = 24.6%**(183 FAIL)。要求先聚类;明令 UTF-16 码元表示若需架构级改动**不许动**,只报告其门控测试数 | FP-safe(但在自举热路径,fixtures 异动即停) |
+| **W-26** | runtime/types/regexp/index.js, runtime/node/__regexp_shim.js | **RegExp 99/374 = 26.5%**(270 FAIL,0 CRASH——引擎能跑,纯语义缺口)。要求先聚类;明令**不碰** `\p{…}` unicode property escapes(表驱动大特性,~133 测试),只报告为已知门 | FP-safe |
+
 ## Wave 7 派发(2026-07-26,基线 v0.2.7 / 6e35933)
 
 四批并行,文件互斥,全部承接前几波 agent 自己定位并主动留下的杠杆:

@@ -1,5 +1,5 @@
 {
-  "generated": "2026-07-26T17:18:20.112Z",
+  "generated": "2026-07-26T18:38:13.629Z",
   "config": {
     "corpus": "/Users/nouo/github/asm.js/.test262-corpus",
     "target": "macos-arm64",
@@ -44,12 +44,12 @@
   "eligible": 32310,
   "run": 6462,
   "totals": {
-    "PASS": 2329,
-    "FAIL": 3918,
+    "PASS": 2390,
+    "FAIL": 3857,
     "COMPILE_FAIL": 40,
     "CRASH": 175
   },
-  "passRatePct": 36.04,
+  "passRatePct": 36.99,
   "byArea": {
     "built-ins/Array": {
       "PASS": 282,
@@ -88,8 +88,8 @@
       "CRASH": 1
     },
     "built-ins/Object": {
-      "PASS": 302,
-      "FAIL": 371,
+      "PASS": 304,
+      "FAIL": 369,
       "COMPILE_FAIL": 0,
       "CRASH": 9
     },
@@ -100,8 +100,8 @@
       "CRASH": 8
     },
     "built-ins/RegExp": {
-      "PASS": 99,
-      "FAIL": 270,
+      "PASS": 115,
+      "FAIL": 254,
       "COMPILE_FAIL": 5,
       "CRASH": 0
     },
@@ -112,8 +112,8 @@
       "CRASH": 10
     },
     "built-ins/String": {
-      "PASS": 60,
-      "FAIL": 183,
+      "PASS": 70,
+      "FAIL": 173,
       "COMPILE_FAIL": 0,
       "CRASH": 1
     },
@@ -124,16 +124,16 @@
       "CRASH": 0
     },
     "built-ins/TypedArray": {
-      "PASS": 20,
-      "FAIL": 264,
+      "PASS": 53,
+      "FAIL": 232,
       "COMPILE_FAIL": 0,
-      "CRASH": 4
+      "CRASH": 3
     },
     "language/expressions": {
       "PASS": 789,
-      "FAIL": 1129,
+      "FAIL": 1128,
       "COMPILE_FAIL": 23,
-      "CRASH": 64
+      "CRASH": 65
     },
     "language/statements": {
       "PASS": 616,
@@ -145,11 +145,11 @@
   "topFailPatterns": [
     {
       "pattern": "FAIL: assertion mismatch (Test262Error / wrong value)",
-      "count": 2090
+      "count": 2063
     },
     {
       "pattern": "FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)",
-      "count": 584
+      "count": 579
     },
     {
       "pattern": "FAIL: async ($DONE not signalled / promise rejected)",
@@ -161,7 +161,7 @@
     },
     {
       "pattern": "FAIL: TypedArray/ArrayBuffer semantics",
-      "count": 174
+      "count": 147
     },
     {
       "pattern": "CRASH: run signal SIGSEGV",
@@ -169,7 +169,7 @@
     },
     {
       "pattern": "FAIL: array contents mismatch (compareArray)",
-      "count": 119
+      "count": 117
     },
     {
       "pattern": "FAIL: constructor-ness reflection (isConstructor / not-a-constructor)",
