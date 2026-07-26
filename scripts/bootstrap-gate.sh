@@ -14,7 +14,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-BASELINE_FIXTURES=362
+BASELINE_FIXTURES=380
 LOCK=".git/bootstrap-gate.lock"
 
 while ! mkdir "$LOCK" 2>/dev/null; do

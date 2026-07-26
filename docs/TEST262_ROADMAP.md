@@ -1,6 +1,7 @@
 # test262 完整支持路线图 — 从 22.25% 到完整一致
 
-> 日期:2026-07-23 · 状态:**规划稿** · 当前:**22.25%**(1438/6462,stride-5 子集)
+> 日期:2026-07-23(制定) · 状态:**执行中** · **当前:33.63%**(2173/6462,stride-5 子集;CRASH 180、COMPILE_FAIL 43,更新于 2026-07-26 / v0.2.6)
+> 轨迹:20.55%(v0.2.1)→ 22.25%(v0.2.2)→ 28.51%(v0.2.3)→ 30.63%(v0.2.4)→ 31.96%(v0.2.5)→ **33.63%(v0.2.6)**
 > 参考:[Yuku](https://github.com/yuku-toolchain/yuku)(zig 规范一致 parser/工具链)、[Kiesel](https://codeberg.org/kiesel-js/kiesel)(zig 引擎,[20→25% devlog](https://linus.dev/posts/kiesel-devlog-1/))、[LibJS test262 仪表盘](https://serenityos.github.io/libjs-website/test262/)、[test262.fyi](https://test262.fyi/)
 > 关联:plan.md S1/S4、docs/SHAPE_IC_DESIGN.md、记忆 test262-s1-progress
 
@@ -86,12 +87,13 @@ test262 高通过率的真正瓶颈不是特性,是**底层语义机制**。以�
 
 > 产量为**估算**(基于缺口归类,实测校准);工作量为人/会话量级。每阶段过 bootstrap-gate(gen1==gen2==gen3 + fixtures + test262 只升)。
 
-### S1 — parser 完整性 + 易修 CRASH(22.25% → 28%,**进行中**)
-- **参考 Yuku**:parser 规范一致。剩余 COMPILE_FAIL(104→~0):计算属性/ASI/转义边界。
-- **负向解析测试**(517 的一部分):parser 对非法语法**正确抛 SyntaxError**(早期错误相位)。当前 parser 过于宽松(接受非法),负向测试判负。
-- **首批 CRASH**:数组方法泛型第一刀(转 this→真数组前置,只读方法)。
-- 已落地:Unicode 标识符/for-of 左值/rest 模式/elision/解构 getter(+110)。
-- **产量**:+~370。**工作量**:中。
+### S1 — parser 完整性 + 易修 CRASH(22.25% → 28%,**已达成并超额:33.63%**)
+- **参考 Yuku**:parser 规范一致。COMPILE_FAIL **104 → 43**(v0.2.6):19 处 `AssignmentExpression` 优先级槽误传 `Precedence.ASSIGN`(Pratt 循环 `precedence < peekPrecedence()` 致永不消费赋值符)已修;对象模式支持字符串/数字/保留字键。
+- **负向解析测试**:已落地 strict `delete` 裸变量、生成器 `yield` 绑定、`"use strict"` + 非简单参数、未终止正则(死循环)、解析器递归上限。仍偏宽松,余量见下 S1 续项。
+- **CRASH 480 → 180**。头部根因(均已修):数组具名属性写误入对象头路径(~150,含全部 RegExp `.index` expando)、`typeof <未声明>` 返 "number" 致 harness 推入垃圾构造器(35)、Promise 组合子无可迭代守卫(32)、DataView 缺类型字节守卫(37,离线目录)、类 生成器方法无协程(体内 `yield` 跑主栈)。
+- **一等内建值**:通用函数调用 helper(`_fp_call_tramp`/`_fp_apply_tramp` → `_fn_invoke_tail`)使 `Function.prototype.call/apply` 可作值读取,**test262 `propertyHelper.js` harness 首次加载成功**;错误构造器 memoized 闭包带 `.name` + `thrown.constructor`,解锁 `assert.throws`。
+- **产量**:实测 +845 PASS(1328 → 2173)。**工作量**:中(多 agent 编排 6 波)。
+- **S1 续项(下一批,已定位)**:`Object.defineProperty` 仅接受编译期对象字面量描述符(动态描述符静默退化为 `value=undefined, attrs=0`,~260 个 Object FAIL)、内建命名空间非运行时对象(`typeof Math` → "number",~150)、`(a, b)` 括号序列表达式不解析、`arr["0"]` 字符串键索引返 undefined。
 
 ### S2 — 对象模型 + 强转 + 错误地基(28% → 40%)
 - **属性描述符 + [[DefineOwnProperty]]**:Object.defineProperty/getOwnPropertyDescriptor/freeze/seal/preventExtensions/isExtensible;描述符反射(528 property-descriptor 失败)。

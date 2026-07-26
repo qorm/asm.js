@@ -50,7 +50,7 @@ gen2==gen3，探针字节不变不构成安全证据。** 疑似 P0-1/P0-3（堆
 ## 2. 验证协议（强制，缺一不可）
 
 对任何「修复」：
-- **(a) fixtures 不降**：`node tests/run_fixtures.mjs` 不低于当前基线（基线随版本上移,v1.5.39 时点 281/283,见 CHANGELOG 最新条目;本文件写作时曾为 31/114）。任何下降=回归，不合入。
+- **(a) fixtures 不降**：`node tests/run_fixtures.mjs` 不低于当前基线。**基线以 `scripts/bootstrap-gate.sh` 的 `BASELINE_FIXTURES` 为准**(v0.2.6 时点 380,FAIL 必须为 0),该常量随版本上移;历史值仅供参考(v1.5.39 时点 281/283,本文件写作时曾为 31/114)。任何下降=回归，不合入。
 - **(b) gen0 最小复现正确**：为该 bug 写 repro，`node cli.js repro.js -o r.bin && ./r.bin` 输出/exit 与 `node repro.js` 一致。
 - **(c) 反汇编佐证**（dispatch/编码类）：确认发出预期指令（如 P1-1 须见 `bl _str_lastIndexOf`）。
 - **(d) 内存布局变更**（P0-2/P0-3）额外:全量自举重建 `node cli.js cli.js -o gen1 --target <T>` → `./gen1 cli.js -o gen2` 过原崩点(很慢,仅最终验收跑)。

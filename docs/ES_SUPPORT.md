@@ -1,8 +1,8 @@
 # asm.js ES 标准支持列表
 
-> 状态基线: **v0.2.1**(2026-07-20;编译器全确定性 `gen1==gen2==gen3`,fixtures 362/362)。
+> 状态基线: **v0.2.6**(2026-07-26;编译器全确定性 `gen1==gen2==gen3`,fixtures 380/380)。
 > 本文件是**当前支持面清单**,不含修复过程——历史修复日志与旧版逐条注记已归档至 [archive/ES_SUPPORT_HISTORY.md](./archive/ES_SUPPORT_HISTORY.md),版本级变更以 [CHANGELOG.md](../CHANGELOG.md) 为准。
-> 核对方法: `node tests/run_fixtures.mjs` 全量 + 逐特性最小程序与 `node` 输出逐字节对照 + es-compat 差分计分卡(`tests/es-compat/`,诚实覆盖率 ~42%) + test262 差分(`tests/test262/run.mjs`,当前基线 1,328/6,462 = 20.55%,stride-5 子集)。
+> 核对方法: `node tests/run_fixtures.mjs` 全量 + 逐特性最小程序与 `node` 输出逐字节对照 + es-compat 差分计分卡(`tests/es-compat/`,诚实覆盖率 ~42%) + test262 差分(`tests/test262/run.mjs`,当前基线 2,173/6,462 = 33.63%,stride-5 子集;CRASH 180、COMPILE_FAIL 43)。
 > 图例: ✅ 支持(与 node 对拍一致)/ ⚠️ 部分支持(注明偏差)/ ❌ 未支持 / 🔷 引擎库(L2)形态专属,AOT 非目标
 
 ## 1. ES5 及更早

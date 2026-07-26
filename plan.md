@@ -42,11 +42,12 @@
 ### S1 — test262 快速杠杆(07-26 → 08-08)
 - [~] 修复 TypedArray 区坏 include(**2026-07-19 根因已修**:根因是构造器从未物化为全局值,`ArrayBuffer.prototype.resize` 读 undefined 属性致 include 加载即抛;已实现构造器闭包 + `.prototype` 单例 + 动态方法分派,TA 区 0/288 → 10/288;**剩余缺口非 include 问题**:%TypedArray% 原型链、方法值读取、描述符反射——转入 S4 同类簇合并处理)
 - [x] SIGSEGV/SIGBUS 崩溃簇聚类归因,修头部根因(**2026-07-26 完成**:多 agent 归因 + 5 批 worktree 隔离修复。头部根因:①数组具名属性写误入对象头路径 `_object_set_entry`(object/index.js,~150 崩溃,最大簇)②Promise 组合子无可迭代守卫 `_Promise_all/any/race/allSettled`(promise.js)③TypedArray 由对象构造把 tagged 指针当长度 `_typed_array_from`(typedarray/index.js)④`_subscript_set` 无 null 守卫。stride-5 CRASH 480→235,RegExp 区 48→0 全去崩溃)
-- [x] 目标: **≥28% 达成并超越 → 30.63%**(2026-07-26,stride-5 1979/6462)。轨迹 24.82%(基线)→27.00%→**28.51%(v0.2.3)**→**30.63%(v0.2.4)**。分区亮点:Array PASS 121→266/CRASH 136→24;RegExp PASS 49→93/CRASH 48→0;Object CRASH 56→11;Promise PASS 15→25;language/statements +assert.throws 解锁(错误构造器一等化)。三次发版 v0.2.3/v0.2.4 均 gen1==gen2==gen3 字节定点
+- [x] 目标: **≥28% 达成并大幅超越 → 33.63%**(2026-07-26,stride-5 2173/6462)。轨迹 24.82%(基线)→27.00%→**28.51%(v0.2.3)**→**30.63%(v0.2.4)**→**31.96%(v0.2.5)**→**33.63%(v0.2.6)**;**CRASH 480→180,COMPILE_FAIL 108→43**。分区亮点:Array PASS 121→280/CRASH 136→24;RegExp PASS 49→99/CRASH 48→0;Object PASS 143→212;TypedArray CRASH 56→5;Promise CRASH 32→9;DataView CRASH 37→0(离线目录);language/statements PASS 484→585。四次发版 v0.2.3–v0.2.6 **每次均 gen1==gen2==gen3 字节定点 + fixtures 380/380**
 - **门禁**: fixtures 不降(380/380)+ 定点(gen1==gen2==gen3 字节一致,主 dev 树验证)+ test262 只升 —— **全部满足**
 - **附带安全红队收口**(2026-07-26,非 test262 计分但真实):闭合 TypedArray/DataView 越界写原语、GCM 认证绕过、timingSafeEqual 常量时间化、熵源/scrypt/HKDF/PBKDF2 改硬失败、zlib inflate 死循环 + 解压炸弹、`ar` 命令注入、未终止正则死循环 + 解析器递归上限。详见 docs/progress/2026-07-26-orchestration.md
-- **已完成(v0.2.4)**: TypedArray 内联读边界(subscript.js,安全 H-1 闭合);错误构造器一等化(assert.throws 解锁,+137 PASS)
-- **下一杠杆(未做)**: **通用函数调用运行时 helper `_fn_call`/`_fn_apply`/`_reflect_apply`** —— 是 `Function.prototype.call/apply/bind` 与 `Object.*` 静态方法作一等值的前置条件,解锁 propertyHelper.js(~682 测试),S1 后半最大单一杠杆;剩余 ~41 TypedArray 崩溃(原型方法/harness 簇,非内联读);全局 `Buffer.from(string)` 原生崩溃
+- **已完成(v0.2.4–v0.2.6)**: TypedArray 内联读边界(安全 H-1 闭合);错误构造器一等化(assert.throws 解锁);**通用函数调用 helper `_fp_call_tramp`/`_fp_apply_tramp` → `_fn_invoke_tail`,`Function.prototype.call/apply` 一等值化,propertyHelper.js harness 首次加载成功**;全局 `Buffer` 物化(`IMPLICIT_GLOBALS` 遗漏);未捕获异常 stderr 诊断(此前零输出静默 exit 1);DataView 类型字节守卫(CRASH 37→0);类 生成器/异步生成器方法建真协程(此前体内 `yield` 跑主栈即段错误,PASS +82);`typeof <未声明>` → "undefined"(此前 "number",占 35/41 TypedArray 崩溃);19 处解析器优先级槽;描述符反射四项
+- **下一杠杆(进行中/未做)**: **`Object.defineProperty` 仅接受编译期对象字面量描述符**(functions.js,动态描述符静默退化为 `value=undefined, attrs=0`,~260 个 Object FAIL,当前最大单一池);内建命名空间非运行时对象(`typeof Math` → "number",~150);`(a, b)` 括号序列表达式**根本不解析**;`arr["0"]` 字符串键索引返 undefined(亦致 `var {0:a}=[...]` 解构失败);生成器 stub 参数急切绑定缺口(22 例 dstr 用例)
+- **安全红队收口(v0.2.3–v0.2.5)**: 越界写原语、越界读泄露、GCM 认证绕过、timingSafeEqual 时序、熵源/scrypt/HKDF/PBKDF2 失败开放、zlib inflate 死循环 + 解压炸弹、`ar` 命令注入、未终止正则死循环、解析器递归 DoS —— 全部闭合
 - **变更未提交**(遵守"仅在被要求时提交"):11 文件已 apply 到 dev 工作树,定点绿,待主人指示提交
 
 ### S2 — 编译器车道清债(08-09 → 08-29)
