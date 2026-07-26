@@ -302,6 +302,12 @@ export class Compiler {
         this._moduleMetaByPath = new Map();
         this._functionOwners = {};
         this.moduleRegistrySize = 32;
+        // [W-35] 本次编译读到的任一模块源码里出现过「\ + p/P」序列(→ 可能用 Unicode
+        // 属性转义,须保留 __regexp_shim 的属性表)。**单调**递增、故意不在
+        // resetModuleCompilationState 里清:入口文件在 resetModuleCompilationState
+        // 之前就被 readModuleSource 读过(compileFile → compile → compileProgram),
+        // 清掉会丢掉入口的扫描结果;而残留的 true 只会多留表(保守、安全)。
+        this._reUniPropSeen = false;
 
         // 兼容旧 API
         this.externalLibs = this.libManager.externalLibs;
@@ -1406,6 +1412,13 @@ export class Compiler {
         // (asm/*.js),故源码字面量 UTF-8 字节原样进产物,node/g1 一致且正确、gen1==gen2==gen3。
         // ASCII 不受影响(字节==码点);编译器自身源 ASCII 干净(A 的 0da5ba69)。
         let src = fs.readFileSync(filePath, "latin1");
+        // [W-35 Unicode 属性表按需发射] 每读一个模块就扫一遍「\ + p/P」;有则本次编译
+        // 保留 __regexp_shim 的 Unicode 属性表(否则 compileProgram 里把表串置空)。
+        // shim 自身除外:它的注释里就写着 \p{…}/\P{…},否则永远命中、优化恒不生效。
+        // (表体只出现在 shim 里,用户模块的 \p 才是「程序可能用到属性转义」的证据。)
+        if (filePath.indexOf("__regexp_shim.js") === -1 && sourceHasPropEscapeText(src)) {
+            this._reUniPropSeen = true;
+        }
         // CJS 检测在原始源码上(shim 注入会加 import 行、干扰判定)
         const isCjs = looksLikeCjsSource(src);
         // [CJS cyclic require] 记录每个文件是否本地 CJS,供 markCjsRequireCycles
@@ -1472,6 +1485,9 @@ export class Compiler {
             (src.indexOf(evalCallText) !== -1 || src.indexOf(newFnText) !== -1)) {
             const inj = 'import { __eval, __makeFunction, __eval_direct } from "__eval_shim";\n';
             src = injectShimImport(src, inj);
+            // [W-35] eval/new Function 的源码在编译期不可见,里面可以有 \p{…};
+            // 用 eval 的程序一律保留 Unicode 属性表(保守)。
+            this._reUniPropSeen = true;
             if (process.env.ASMJS_SHIM_DEBUG) {
                 console.error("[shim] eval shim injected: " + filePath);
             }
@@ -1924,6 +1940,46 @@ export class Compiler {
         }
     }
 
+    // [W-35 Unicode 属性表按需发射] 程序里没有任何「\ + p/P」文本(见
+    // sourceHasPropEscapeText)时,把 __regexp_shim 里那五个属性表的字符串字面量置空
+    // ——只删数据,不删代码:表体约 84KB(区间串 __RE_UT 64KB + 四张名字表 20KB),
+    // 而任何用正则的程序此前都得整份带上。
+    // **失败是响的**:名字表被清空后 __re_uniName 恒返回 -1 → __re_uniResolve 返回 -1
+    // → __re_parseProp 走 __re_fail("Invalid property name") → new RegExp/字面量构造
+    // 立即抛 SyntaxError,而不是静默匹配失败。(唯一例外见下面的漏网说明。)
+    // 漏网(只可能来自编译期不可见的动态模式,如 new RegExp("\\" + "p{L}", "u")):
+    //   u 模式 / 无标志 → 构造时抛 SyntaxError: Invalid property name(响);
+    //   v 模式          → shim 对未知属性走 __re_unsup(静默不匹配),这是 shim 既有
+    //                     行为(v 模式的字符串属性本就未实现),此处不加剧、也无法在
+    //                     编译器侧改(shim 归他人所有)。
+    // eval/new Function 的动态源码由 readModuleSource 里的 _reUniPropSeen = true 兜住。
+    _stripUnicodeTablesIfUnused() {
+        if (this._reUniPropSeen) return;
+        for (const moduleAst of this._moduleOrder) {
+            const fname = moduleAst.filename || "";
+            if (fname.indexOf("__regexp_shim.js") === -1) continue;
+            const body = moduleAst.body || [];
+            for (let i = 0; i < body.length; i++) {
+                const stmt = body[i];
+                if (!stmt || stmt.type !== "VariableDeclaration") continue;
+                const decls = stmt.declarations || [];
+                for (let j = 0; j < decls.length; j++) {
+                    const d = decls[j];
+                    if (!d || !d.id || d.id.type !== "Identifier") continue;
+                    if (!isUniTableVarName(d.id.name)) continue;
+                    const init = d.init;
+                    if (!init || init.type !== "Literal") continue;
+                    if (typeof init.value !== "string") continue;
+                    init.value = "";
+                    init.raw = '""';
+                    if (process.env.ASMJS_SHIM_DEBUG) {
+                        console.error("[shim] unicode table dropped: " + d.id.name);
+                    }
+                }
+            }
+        }
+    }
+
     compileProgram(ast) {
         const vm = this.vm;
 
@@ -1932,6 +1988,10 @@ export class Compiler {
         this.compiledFiles.add(ast.filename);
         this._injectImplicitGlobalImports(ast);
         this.resolveImports(ast, this._moduleOrder);
+        // [W-35] 全部模块都读完(_reUniPropSeen 已定型)后才决定 Unicode 属性表的去留。
+        // 必须放在 resolveImports 之后:shim 的 import 是前置注入的,shim 模块常常比
+        // 用户的其他模块**先**被读到,在 readModuleSource 里就地删表会漏掉后读模块的 \p。
+        this._stripUnicodeTablesIfUnused();
         this.moduleRegistrySize = Math.max(1, this._moduleOrder.length);
 
         this._moduleExportsList = [];
@@ -3345,6 +3405,35 @@ function injectShimImport(src, inj) {
         return src.slice(0, nl + 1) + inj + src.slice(nl + 1);
     }
     return inj + src;
+}
+
+// [W-35 Unicode 属性表按需发射] 判断源码里是否出现「反斜杠 + p/P」这两个字符的
+// 相邻序列(不区分它出现在正则字面量、字符串字面量还是注释里)。__regexp_shim 的
+// Unicode 属性表(__RE_UT 及四张名字表)约 84KB,只有真正用到属性转义的程序才需要;
+// 本函数是「是否可能用到」的**保守**判定:宁可误报(白留表,纯体积)也不可漏报。
+// 故意不跳字符串/注释、也不做转义配对:
+//   /\p{L}/u                → 源码有 \ p             命中
+//   new RegExp("\\p{L}","u") → 源码有 \ \ p(后一对) 命中
+//   注释里写 \p             → 命中(误报,无害)
+// 唯一漏得掉的是把 "\" 与 "p" 分开再拼起来的动态模式(见 readModuleSource 注释)。
+// 手写扫描,不用正则(本代码在 gen1 运行,§1.6 禁正则)。
+function sourceHasPropEscapeText(src) {
+    const n = src.length;
+    let i = 0;
+    while (i + 1 < n) {
+        if (src.charCodeAt(i) === 92) { // '\'
+            const c = src.charCodeAt(i + 1);
+            if (c === 112 || c === 80) return true; // 'p' / 'P'
+        }
+        i++;
+    }
+    return false;
+}
+
+// [W-35] __regexp_shim 里那几张 Unicode 属性表的变量名(值被整串置空即省掉表体)。
+function isUniTableVarName(name) {
+    return name === "__RE_UT" || name === "__RE_UN_GC" || name === "__RE_UN_BIN" ||
+           name === "__RE_UN_SC" || name === "__RE_UN_SCX";
 }
 
 // [批次D] 判断源码是否含正则字面量 token。手写字符扫描(不跑 Lexer 全量、

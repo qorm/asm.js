@@ -3083,7 +3083,17 @@ export const StatementCompiler = {
             // 私有方法/访问器：label 保留原名（label 只是内部 Map 键，# 反而保证
             // 不与合法标识符方法名相撞）；prototype/类对象上的属性键按私有改写
             // "#ClassName#m"，与访问端 manglePrivateName 一致。
-            const defineKey = method.key.type === "PrivateIdentifier"
+            // [W-34] 私有**生成器**方法 `*#m(){}` / `async *#m(){}` / `static *#m(){}`:
+            // 解析器的 `*` 分支(parseClassMember)先吃掉 `*` 再取键,产出的是普通
+            // Identifier{name:"#m"} 而非 PrivateIdentifier(见 lang/parser/classes.js:138)。
+            // 只认 PrivateIdentifier 时这些方法以**未改写**键 "#m" 落 prototype/类对象,
+            // 而访问端 getMemberPropertyName 对 "#" 起头的 Identifier 一律
+            // manglePrivateName → "#ClassName#m" → 查不到 → "not a function"。
+            // 判据与访问端一致:名以 "#" 起头即私有(# 非法标识符字符,公有方法撞不上)。
+            const isPrivateKey = method.key.type === "PrivateIdentifier" ||
+                (!method.computed && method.key.type === "Identifier" &&
+                 typeof methodName === "string" && methodName[0] === "#");
+            const defineKey = isPrivateKey
                 ? "#" + className + methodName
                 : methodName;
 

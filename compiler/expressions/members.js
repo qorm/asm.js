@@ -3,6 +3,13 @@
 
 import { VReg } from "../../vm/index.js";
 
+// [!! 本文件注释铁律 !!] 本文件自身用到正则字面量(见 import.meta.url 分支的
+// `.replace(...)`),自举时**依赖** compiler/index.js 把 RegExp shim 注入本文件。
+// 那段注入代码的两个否决条件是:文件名含 shim 文件名、或源码里出现 shim 的**模块名
+// 字面量**。因此本文件的注释/字符串**绝不能**写出那个模块名(写了就等于宣称"我已自己
+// import 了",注入被跳过 → 本文件的 __RE_replace 调用无定义 → gen1 编译 cli.js 直接
+// SIGSEGV)。同理也别写出 RegExp 构造的探测串。历史事故一次,勿再犯。
+
 // [Stage A 内置方法引用] 方法名 → 运行时 helper 标签。作**值读取**(非调用)时把
 // `arr.<m>`/`str.<m>` 解析为经 _aref_generic 蹦床调该 helper 的函数值。首批仅收 helper
 // 型且**忽略多余实参**的方法(蹦床把接收者插到 A0、用户实参上移一位,不处理可选参默认;
@@ -112,6 +119,73 @@ const NamespaceStaticRef = {
         isArray: "_isarray_ref", // wrapper:A1=1(Array 标识)后尾跳 _instanceof
     },
 };
+
+// ── [W-28] RegExp 对象模型物化(反射用真函数对象 + 原型)────────────────────────
+// 此前 `RegExp` 也只是**编译期构造**:RegExp 构造(带 new 与不带 new)静态改派
+// __RE_new、`re.exec(s)`/`re.test(s)` 静态改派 __RE_exec/__RE_test,而**裸 RegExp**
+// 与 `RegExp.prototype` / `re.exec`(作**值**)全落兜底 → `typeof RegExp==="number"`、
+// `RegExp.prototype===undefined`、`typeof re.exec==="undefined"`。
+//
+// 修法(与 W-18 Math 同形):只在**裸 RegExp 标识符** / `RegExp.prototype` / 接收者
+// 静态为 REGEXP 的**方法值读取**这三个反射位物化。三条既有快路(正则字面量、
+// new RegExp / RegExp(...) 构造、re.exec(s)·str.replace(re,..) 调用)都**先于**本
+// 路径命中(expressions.js 的字面量/NewExpression、functions.js 的调用派发),
+// 故字节不变。
+//
+// 方法值不新增运行时代码:直接复用既有 _aref_generic 蹦床(闭包 24B
+// {magic@0, _aref_generic@8, helper@16}),它把接收者(A5)插到 A0、用户实参上移
+// 一位后尾调 helper —— 这正是 RegExp shim 模块 导出的签名形状:
+//   __RE_exec(re, str) / __RE_test(re, str) / __RE_toString(re)
+// 于是 `RegExp.prototype.exec.call(/y/,"zy")` 与 `const f=re.test; f.call(re,s)`
+// 都天然成立,且方法值**不绑定**接收者(与 ES 一致)。
+//
+// 全局门:仅当本编译单元注入了 RegExp shim 模块(this.ctx.hasFunction("__RE_new"))
+// 才发射。编译器自身源码刻意无正则字面量、无 RegExp 构造文本(见 compiler/index.js
+// 的注入探测串;本文件的注释也必须避开那两个探测串,否则自举时反把 shim 注进编译器)
+// → 自举不注入
+// shim → 本路径在自举产物里一个字节都不发射 → 定点不受影响。
+//
+// 未落地(需新增运行时入口,本波不做,记偏差):
+//   - source/flags/global/… 的**访问器描述符**(现为 __RE_new 落在实例上的数据属性,
+//     值语义正确,但 gOPD(RegExp.prototype,"source") 仍 undefined);
+//   - Symbol.match/replace/split/search/matchAll 协议分派(__RE_match(str,re) 等
+//     首参是字符串、与 _aref_generic 的 helper(this,args…) 次序相反,需交换蹦床)。
+const REGEXP_PROTO_METHODS = [
+    // [名, RegExp shim 模块 导出名, 规范 length]
+    ["exec", "__RE_exec", 1],
+    ["test", "__RE_test", 1],
+    ["toString", "__RE_toString", 0],
+];
+// 名 → shim 导出名(值读取分派用;#32 铁律:查表后一律 typeof==="string" 判命中)。
+const REGEXP_PROTO_HELPER = {
+    exec: "__RE_exec",
+    test: "__RE_test",
+    toString: "__RE_toString",
+};
+// RegExp.prototype 的**访问器**属性(规范 22.2.6:get 访问器,set 为 undefined,
+// {enumerable:false, configurable:true})。[名, this 上无该属性时的默认值]:
+// 规范里 `get RegExp.prototype.source` / `flags` 以 %RegExpPrototype% 为 this 时
+// 分别返回 "(?:)" / "";布尔族返回 undefined(默认值 null 表示"不兜底")。
+// 实例侧不受影响:__RE_new 已把 source/flags/global/… 作为**自有数据属性**放在正则
+// 对象上,`re.source` 仍直接读自有属性、根本不经原型(本仓正则对象无原型链)。
+// 故本组纯粹服务反射(gOPD(RegExp.prototype,"global").get 等)。
+const REGEXP_PROTO_ACCESSORS = [
+    ["source", "(?:)"],
+    ["flags", ""],
+    ["global", null],
+    ["ignoreCase", null],
+    ["multiline", null],
+    ["dotAll", null],
+    ["sticky", null],
+    ["unicode", null],
+    ["unicodeSets", null],
+    ["hasIndices", null],
+];
+// 访问器属性特性位:configurable(4),writable/enumerable 关闭。
+const ACCESSOR_PROP_ATTR = 4;
+// getter 标记对象类型(与 runtime/core/allocator.js TYPE_GETTER 一致)
+const TYPE_GETTER = 60;
+const PTR_MASK_BITS = 0x0000ffffffffffffn;
 
 // ── [W-18] Math 命名空间物化(反射用真对象)────────────────────────────────────
 // 此前 `Math` 只是**编译期构造**:调用位 compileMathMethod 静态派发、`Math.floor` 值读
@@ -438,6 +512,274 @@ export const MemberCompiler = {
         vm.label(doneL);
     },
 
+    // [W-28] 本编译单元是否注入了 RegExp shim 模块(且三个方法 helper 都有真标签)。
+    // 门未开时所有 W-28 分支一律不发射,退回既有兜底 → 无 shim 的程序字节不变。
+    regexpShimReady() {
+        if (!this.ctx || !this.ctx.hasFunction) return false;
+        if (!this.getFunctionLabel) return false;
+        if (!this.getFunctionLabel("__RE_new")) return false;
+        for (let i = 0; i < REGEXP_PROTO_METHODS.length; i = i + 1) {
+            if (!this.getFunctionLabel(REGEXP_PROTO_METHODS[i][1])) return false;
+        }
+        return true;
+    },
+
+    // [W-28] `RegExp` 标识符/`RegExp.prototype` 被遮蔽?(局部变量 / 函数·类声明 /
+    // 主程序捕获全局 —— 与 Math 分支同一组守卫)
+    regexpNameShadowed() {
+        return !!((this.ctx.getLocal && this.ctx.getLocal("RegExp")) ||
+            (this.ctx.getFunction && this.ctx.getFunction("RegExp")) ||
+            (this.ctx.getMainCapturedVar && this.ctx.getMainCapturedVar("RegExp")));
+    },
+
+    // [W-28] `re.<exec|test|toString>` 值读取的判定 + 发射(命中返 true)。
+    // [#32 守卫] 查表后 typeof==="string" 判命中(防原型链上的 toString 等)。
+    _tryEmitRegExpMethodRef(expr, propName) {
+        const shimName = REGEXP_PROTO_HELPER[propName];
+        if (typeof shimName !== "string") return false;
+        if (!this.regexpShimReady()) return false;
+        if (!this.inferObjectType) return false;
+        if (this.inferObjectType(expr.object) !== "RegExp") return false;
+        // 接收者有副作用时仍需求值(结果丢弃:方法值不绑定接收者)
+        if (!(this.isPureExpr && this.isPureExpr(expr.object))) {
+            this.compileExpression(expr.object);
+        }
+        this.emitRegExpMethodClosure(propName, shimName, propName === "toString" ? 0 : 1);
+        return true;
+    },
+
+    // [W-28] 24B 方法值闭包 {magic@0, _aref_generic@8, helper@16},helper = 编译后的
+    // RegExp shim 模块 导出函数标签。RET = 装箱闭包。挂 .name/.length(规范值)。
+    emitRegExpMethodClosure(methodName, shimName, arity) {
+        const vm = this.vm;
+        this.emitBuiltinMethodRefClosure(this.getFunctionLabel(shimName)); // RET = 装箱
+        vm.mov(VReg.S0, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        this.emitBoxedStringKey("name", VReg.A1);
+        vm.lea(VReg.A2, this.asm.addString(methodName));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A2, VReg.A2, VReg.V1);
+        vm.call("_closure_prop_set");
+        vm.mov(VReg.A0, VReg.S0);
+        this.emitBoxedStringKey("length", VReg.A1);
+        vm.movImm(VReg.A2, arity);
+        vm.scvtf(0, VReg.A2);
+        vm.fmovToInt(VReg.A2, 0);
+        vm.call("_closure_prop_set");
+        vm.mov(VReg.RET, VReg.S0);
+    },
+
+    // [W-28] 合成 `function () { return this.<flag>; }`(或带默认值的
+    // `function () { return this.<flag> === undefined ? <def> : this.<flag>; }`)的 AST。
+    // 不新增运行时代码:交给既有 compileFunctionExpression 编译(普通函数表达式 →
+    // this 取**动态**接收者 A5,正是 _maybe_getter 的 getter 调用约定)。
+    _reThisPropAst(flagName) {
+        return {
+            type: "MemberExpression",
+            object: { type: "ThisExpression" },
+            property: { type: "Identifier", name: flagName },
+            computed: false,
+            optional: false,
+        };
+    },
+
+    _regexpGetterAst(flagName, defaultLit) {
+        let arg = this._reThisPropAst(flagName);
+        if (defaultLit !== null) {
+            arg = {
+                type: "ConditionalExpression",
+                test: {
+                    type: "BinaryExpression",
+                    operator: "===",
+                    left: this._reThisPropAst(flagName),
+                    right: { type: "Identifier", name: "undefined" },
+                },
+                consequent: { type: "Literal", value: defaultLit },
+                alternate: this._reThisPropAst(flagName),
+            };
+        }
+        return {
+            type: "FunctionExpression",
+            id: null,
+            params: [],
+            body: {
+                type: "BlockStatement",
+                body: [{ type: "ReturnStatement", argument: arg }],
+            },
+        };
+    },
+
+    // [W-28] 把一个访问器属性落到 RegExp.prototype:建 getter 闭包(合成 AST)、挂
+    // .name="get <flag>"/.length=0,再包 24B TYPE_GETTER 标记块 {60@0, getter@8, setter@16}
+    // (裸堆指针,由既有 _maybe_getter / gOPD 消费,形态与 %TypedArray% 原型访问器一致),
+    // 经 _object_define 落到原型、_object_set_prop_attr 落 {enumerable:false, configurable:true}。
+    emitRegExpFlagAccessor(protoSlot, tmpSlot, flagName, defaultLit) {
+        const vm = this.vm;
+        this.compileFunctionExpression(this._regexpGetterAst(flagName, defaultLit)); // RET = 装箱闭包
+        // 跨 call 一律经 scratch 槽转手(不占 callee-saved:闭包建造/内建 helper 会毁 S0)
+        vm.lea(VReg.V0, tmpSlot);
+        vm.store(VReg.V0, 0, VReg.RET);
+        vm.lea(VReg.V0, tmpSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("name", VReg.A1);
+        vm.lea(VReg.A2, this.asm.addString("get " + flagName));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A2, VReg.A2, VReg.V1);
+        vm.call("_closure_prop_set");
+        vm.lea(VReg.V0, tmpSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("length", VReg.A1);
+        vm.movImm(VReg.A2, 0);
+        vm.scvtf(0, VReg.A2);
+        vm.fmovToInt(VReg.A2, 0);
+        vm.call("_closure_prop_set");
+        // 24B 标记块(S0 暂存:此后到 _object_define 之间无 call 破坏它的语义需求)
+        vm.movImm(VReg.A0, 24);
+        vm.call("_alloc");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.movImm(VReg.V1, TYPE_GETTER);
+        vm.store(VReg.S0, 0, VReg.V1);
+        vm.lea(VReg.V0, tmpSlot);
+        vm.load(VReg.V2, VReg.V0, 0);            // 装箱 getter 闭包
+        vm.movImm64(VReg.V1, PTR_MASK_BITS);
+        vm.and(VReg.V2, VReg.V2, VReg.V1);       // 裸闭包指针(_maybe_getter 认堆内 magic)
+        vm.store(VReg.S0, 8, VReg.V2);
+        vm.movImm(VReg.V1, 0);
+        vm.store(VReg.S0, 16, VReg.V1);          // setter = 0(只读访问器)
+        // 落原型:_object_define(裸对象, key, 标记块)——绕开 _object_set 的访问器慢路
+        this.emitBoxedStringKey(flagName, VReg.A1); // 只毁 V1/LR
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.V2, VReg.V0, 0);
+        vm.movImm64(VReg.V1, PTR_MASK_BITS);
+        vm.and(VReg.A0, VReg.V2, VReg.V1);
+        vm.mov(VReg.A2, VReg.S0);
+        vm.call("_object_define");
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.A0, VReg.V0, 0);            // 装箱对象(attr 侧接受装箱)
+        this.emitBoxedStringKey(flagName, VReg.A1);
+        vm.movImm(VReg.A2, ACCESSOR_PROP_ATTR);
+        vm.call("_object_set_prop_attr");
+    },
+
+    // [W-28] 确保数据段槽(qword,GC 保守扫描即根)只登记一次。
+    _reEnsureSlot(slotLabel) {
+        if (!this._addedNsObjLabels) this._addedNsObjLabels = new Set();
+        if (this._addedNsObjLabels.has(slotLabel)) return;
+        this.asm.addDataLabel(slotLabel);
+        this.asm.addDataQword(0);
+        this._addedNsObjLabels.add(slotLabel);
+    },
+
+    // [W-28] 把 RET 里的值作为数据属性落到原型槽指向的对象上,再落 attrs。
+    // (顺序不可反:_object_set_prop_attr 会 materialize flags 并置 EXT_HASFLAGS。)
+    _reSetProtoProp(protoSlot, name, attr) {
+        const vm = this.vm;
+        vm.mov(VReg.A2, VReg.RET);
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey(name, VReg.A1);
+        vm.call("_object_set");
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey(name, VReg.A1);
+        vm.movImm(VReg.A2, attr);
+        vm.call("_object_set_prop_attr");
+    },
+
+    // [W-28] 惰性物化 RegExp 构造器函数对象 + RegExp.prototype(两个全局槽,GC 保守
+    // 扫数据段即根)。**一次填两槽**、且原型侧只从槽读构造器(不回调本函数)→ 无编译期
+    // 递归。RET = 装箱构造器函数值(稳定身份 → `RegExp===RegExp`)。
+    emitRegExpCtorObject() {
+        const vm = this.vm;
+        const ctorSlot = "_nsobj_regexp";
+        const protoSlot = "_nsobj_regexp_proto";
+        const tmpSlot = "_nsobj_regexp_tmp"; // 物化期 scratch(单次执行、不重入);兼作 GC 根
+        this._reEnsureSlot(ctorSlot);
+        this._reEnsureSlot(protoSlot);
+        this._reEnsureSlot(tmpSlot);
+        const doneL = this.ctx.newLabel("nsre_done");
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne(doneL);
+        // 构造器闭包 16B {magic, __RE_new}:`RegExp("x","g")` / `new RegExp` 经**值**
+        // 路径调用时命中 __RE_new(pattern, flags),与静态改派同一函数。
+        vm.movImm(VReg.A0, 16);
+        vm.call("_alloc");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.movImm(VReg.V1, 0xc105); // CLOSURE_MAGIC
+        vm.store(VReg.S0, 0, VReg.V1);
+        vm.lea(VReg.V1, this.getFunctionLabel("__RE_new"));
+        vm.store(VReg.S0, 8, VReg.V1);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_js_box_function");
+        vm.lea(VReg.V0, ctorSlot);
+        vm.store(VReg.V0, 0, VReg.RET); // **先**存槽:后续每步都从槽重载(跨 call 安全)
+        // RegExp.name / RegExp.length(闭包属性侧表)
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("name", VReg.A1);
+        vm.lea(VReg.A2, this.asm.addString("RegExp"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A2, VReg.A2, VReg.V1);
+        vm.call("_closure_prop_set");
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("length", VReg.A1);
+        vm.movImm(VReg.A2, 2);
+        vm.scvtf(0, VReg.A2);
+        vm.fmovToInt(VReg.A2, 0);
+        vm.call("_closure_prop_set");
+        // 原型对象
+        vm.call("_object_new");
+        vm.call("_box_obj_r");
+        vm.lea(VReg.V0, protoSlot);
+        vm.store(VReg.V0, 0, VReg.RET);
+        // 原型属性落位:先 _object_set 落值,再 _object_set_prop_attr 落 attrs
+        // (顺序不可反,同 emitMathNamespaceObject 注)。值先落 RET,再调 _reSetProtoProp。
+        for (let i = 0; i < REGEXP_PROTO_METHODS.length; i = i + 1) {
+            const m = REGEXP_PROTO_METHODS[i];
+            this.emitRegExpMethodClosure(m[0], m[1], m[2]); // RET = 方法值
+            this._reSetProtoProp(protoSlot, m[0], BUILTIN_PROP_ATTR);
+        }
+        // 访问器族(source/flags/global/…):合成 getter 闭包 + TYPE_GETTER 标记块
+        for (let i = 0; i < REGEXP_PROTO_ACCESSORS.length; i = i + 1) {
+            const a = REGEXP_PROTO_ACCESSORS[i];
+            this.emitRegExpFlagAccessor(protoSlot, tmpSlot, a[0], a[1]);
+        }
+        // prototype.constructor = RegExp(从槽读,已就绪 → 不回调 emitRegExpCtorObject)
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        this._reSetProtoProp(protoSlot, "constructor", BUILTIN_PROP_ATTR);
+        // RegExp.prototype = 原型对象(闭包属性侧表;规范 attrs 全 false,侧表无 attrs 概念)
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("prototype", VReg.A1);
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.A2, VReg.V0, 0);
+        vm.call("_closure_prop_set");
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.label(doneL);
+    },
+
+    // [W-28] `RegExp.prototype` 值读:原型槽已填则直接用,否则整体物化(构造器路径
+    // 一次填两槽)。RET = 装箱原型对象。
+    emitRegExpProtoObject() {
+        const vm = this.vm;
+        const protoSlot = "_nsobj_regexp_proto";
+        this._reEnsureSlot(protoSlot);
+        const doneL = this.ctx.newLabel("nsreproto_done");
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne(doneL);
+        this.emitRegExpCtorObject(); // 填两槽(RET = 构造器,下面重载原型)
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.label(doneL);
+    },
+
     // [Error 构造器一等值] memoized 错误构造器闭包 _errctorref_<name>(GC 根)。首次建
     // {magic, 工厂 fnptr} 闭包、存槽、并在闭包属性侧表挂 .name=<name>;后续复用同一装箱值
     // → 稳定身份(TypeError===TypeError)。RET 恒为该 memoized 装箱闭包。
@@ -713,6 +1055,14 @@ export const MemberCompiler = {
             !(this.ctx.getFunction && this.ctx.getFunction("Math")) &&
             !(this.ctx.getMainCapturedVar && this.ctx.getMainCapturedVar("Math"))) {
             this.emitMathNamespaceObject();
+            return;
+        }
+        // [W-28] 裸 `RegExp`(反射位):惰性物化真函数对象(带 .prototype/.name/.length)
+        // → typeof "function"、`RegExp.prototype` 可达。RegExp 构造(带/不带 new)
+        // 的静态改派(expressions.js / functions.js)都在到达这里之前命中 → 快路字节不变。
+        // 门:本编译单元注入了 RegExp shim 模块 且名字未被遮蔽。
+        if (name === "RegExp" && !this.regexpNameShadowed() && this.regexpShimReady()) {
+            this.emitRegExpCtorObject();
             return;
         }
         // [构造器全局值] TypedArray 族/ArrayBuffer → 24B 闭包(memoized),`new TA(...)`
@@ -1384,6 +1734,16 @@ export const MemberCompiler = {
                 return;
             }
 
+            // [W-28] `RegExp.prototype` → 惰性物化的单例原型对象(exec/test/toString +
+            // constructor)。放在通用 .name/.length/闭包侧表分支**之前**,但 propName
+            // 严格限定 "prototype" 且接收者必须是未遮蔽的裸 `RegExp` → 其它接收者字节不变。
+            if (propName === "prototype" && expr.object.type === "Identifier" &&
+                expr.object.name === "RegExp" && !this.regexpNameShadowed() &&
+                this.regexpShimReady()) {
+                this.emitRegExpProtoObject();
+                return;
+            }
+
             // [构造器 .prototype] X.prototype(X∈TA 族/ArrayBuffer)→ _get_ctor_proto 单例对象。
             // ArrayBuffer.prototype 为空对象:test262 TA include 的 resize/transferToImmutable
             // 特性探测安全返 undefined(此前 undefined.resize 抛异常 → TA 区 288 项全灭)。
@@ -1577,6 +1937,15 @@ export const MemberCompiler = {
                 // [#32 守卫] 用 typeof==="string" 判命中——`ArefMethodRef.array[propName]` 对
                 // propName="toString"/"constructor"/"hasOwnProperty" 等会经原型链返回
                 // Object.prototype 方法(函数),裸真值判会误当 helper → lea(函数)崩。
+                // [W-28] 接收者静态类型为 RegExp 的 `re.exec` / `re.test` / `re.toString`
+                // 作**值读取**(非调用)→ _aref_generic 方法值闭包(不绑定接收者)。
+                // **调用**位 `re.exec(s)` 在 compileCallExpression 里已静态改派
+                // __RE_exec(re,s)、根本不到这里 → 快路字节不变。
+                // 判定+发射全部下沉到 _tryEmitRegExpMethodRef:compileMemberExpression 是
+                // **深递归**热函数,自举时它的栈帧就是编译器自己的栈帧——在这里多加一个
+                // 局部槽就会把自举编译 cli.js 的递归推爆(实测 SIGSEGV),故此处零新局部。
+                if (this._tryEmitRegExpMethodRef(expr, propName)) return;
+
                 const _ah = ArefMethodRef.array[propName];
                 const _sh = ArefMethodRef.string[propName];
                 const arefHelper = typeof _ah === "string" ? _ah : null;
