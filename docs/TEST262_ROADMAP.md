@@ -1,7 +1,7 @@
 # test262 完整支持路线图 — 从 22.25% 到完整一致
 
-> 日期:2026-07-23(制定) · 状态:**执行中** · **当前:35.52%**(2295/6462,stride-5 子集;CRASH 177、COMPILE_FAIL 43,更新于 2026-07-26 / v0.2.7)
-> 轨迹:20.55%(v0.2.1)→ 22.25%(v0.2.2)→ 28.51%(v0.2.3)→ 30.63%(v0.2.4)→ 31.96%(v0.2.5)→ 33.63%(v0.2.6)→ **35.52%(v0.2.7)**
+> 日期:2026-07-23(制定) · 状态:**执行中** · **当前:36.04%**(2329/6462,stride-5 子集;CRASH 175、COMPILE_FAIL 40,更新于 2026-07-26 / v0.2.8)
+> 轨迹:20.55%(v0.2.1)→ 22.25%(v0.2.2)→ 28.51%(v0.2.3)→ 30.63%(v0.2.4)→ 31.96%(v0.2.5)→ 33.63%(v0.2.6)→ 35.52%(v0.2.7)→ **36.04%(v0.2.8)**
 > 参考:[Yuku](https://github.com/yuku-toolchain/yuku)(zig 规范一致 parser/工具链)、[Kiesel](https://codeberg.org/kiesel-js/kiesel)(zig 引擎,[20→25% devlog](https://linus.dev/posts/kiesel-devlog-1/))、[LibJS test262 仪表盘](https://serenityos.github.io/libjs-website/test262/)、[test262.fyi](https://test262.fyi/)
 > 关联:plan.md S1/S4、docs/SHAPE_IC_DESIGN.md、记忆 test262-s1-progress
 
@@ -87,14 +87,15 @@ test262 高通过率的真正瓶颈不是特性,是**底层语义机制**。以�
 
 > 产量为**估算**(基于缺口归类,实测校准);工作量为人/会话量级。每阶段过 bootstrap-gate(gen1==gen2==gen3 + fixtures + test262 只升)。
 
-### S1 — parser 完整性 + 易修 CRASH(22.25% → 28%,**已达成并超额:35.52%**)
+### S1 — parser 完整性 + 易修 CRASH(22.25% → 28%,**已达成并超额:36.04%**)
 - **参考 Yuku**:parser 规范一致。COMPILE_FAIL **104 → 43**(v0.2.6):19 处 `AssignmentExpression` 优先级槽误传 `Precedence.ASSIGN`(Pratt 循环 `precedence < peekPrecedence()` 致永不消费赋值符)已修;对象模式支持字符串/数字/保留字键。
 - **负向解析测试**:已落地 strict `delete` 裸变量、生成器 `yield` 绑定、`"use strict"` + 非简单参数、未终止正则(死循环)、解析器递归上限。仍偏宽松,余量见下 S1 续项。
 - **CRASH 480 → 180**。头部根因(均已修):数组具名属性写误入对象头路径(~150,含全部 RegExp `.index` expando)、`typeof <未声明>` 返 "number" 致 harness 推入垃圾构造器(35)、Promise 组合子无可迭代守卫(32)、DataView 缺类型字节守卫(37,离线目录)、类 生成器方法无协程(体内 `yield` 跑主栈)。
 - **一等内建值**:通用函数调用 helper(`_fp_call_tramp`/`_fp_apply_tramp` → `_fn_invoke_tail`)使 `Function.prototype.call/apply` 可作值读取,**test262 `propertyHelper.js` harness 首次加载成功**;错误构造器 memoized 闭包带 `.name` + `thrown.constructor`,解锁 `assert.throws`。
-- **产量**:实测 **+967 PASS(1328 → 2295)**。**工作量**:中(多 agent 编排 7 波)。
+- **产量**:实测 **+1001 PASS(1328 → 2329)**。**工作量**:中(多 agent 编排 8 波)。
 - **v0.2.7 续批(已完成)**:`Object.defineProperty` 动态描述符(此前静默退化为 `value=undefined, attrs=0`,Object PASS 193→278)、`arr["0"]` 字符串键索引(键经 `_syscall_arg` 得内容指针致恒越界,连带 `var {0:f}=a` 解构)、`Object.keys(fn)` 段错误(四个枚举器把函数值送进普通对象路径)、`for-in` 数组键返数字非字符串、`(a, b)` 括号序列表达式(根因是箭头参数启发式不回溯)。附带修出**潜伏全局缺陷**:shim import 注入把 `"use strict"` 挤离首 token,致真实编译中**顶层严格早错从未触发过**。
-- **S1 剩余(已定位,未做)**:内建命名空间非运行时对象(`typeof Math` → "number",~150 个 Object FAIL);生成器 stub 参数急切绑定缺口(22 例 dstr);参数位 rest 模式目标需 parser+codegen 联合改(仅解析会静默错编,已留 NOTE);`_object_get` 缺 `0x7FFC` 字符串接收者路由(`f(x){return x["1"]}` 等)。
+- **v0.2.8 续批(已完成)**:`Math` 物化为真反射对象(**仅在裸标识符位惰性物化**,三条快路径均在此之前解析,hello-world 二进制与 HEAD 逐字节一致;Math 20→27、Object 280→295);生成器参数急切绑定(仅上提可抛步骤,判据与函数体自身守卫**完全一致**故不会凭空造抛,函数体仍惰性);参数位 rest 模式目标 parser+codegen **联合**落地(含箭头形式,不支持形式改为**干净编译错误**而非静默错编);字符串接收者属性路由(`_object_get` + `_subscript_get` 双路);`gOPD` 函数值支持(附带修出 `fn.x=1` 会永久杀死 `fn.name` 的潜伏 bug)。
+- **S1 剩余(已定位,未做)**:函数 `length`(arity)运行时不可得——func-meta 表为 `{code_ptr, kind, name_ptr}` 无 arity 槽,需 `compiler/index.js` 加第 4 槽;内建/类/箭头的 `name` 阻塞在元数据源(`registerFuncMeta` 根本不登记它们),故 `verifyProperty(Math.abs,"name")` 簇仍失败;`Object.prototype` 不在运行时原型链(**已论证不可用白名单绕过**:`Object.create(null)` 与普通字面量的 `__proto__` 均为 0,运行时不可区分,白名单会让 `"toString" in Object.create(null)` 错误为真,破坏原型污染防护所依赖的 null 原型字典);字符串方法值(`s["toUpperCase"]`)需 this-in-A0 蹦床 + 名→label 表。
 
 ### S2 — 对象模型 + 强转 + 错误地基(28% → 40%)
 - **属性描述符 + [[DefineOwnProperty]]**:Object.defineProperty/getOwnPropertyDescriptor/freeze/seal/preventExtensions/isExtensible;描述符反射(528 property-descriptor 失败)。

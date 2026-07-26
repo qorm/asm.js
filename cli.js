@@ -13,7 +13,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 // 版本号：公开仓库重新初始化后自 0.1 起算（能力基线 = 原 v1.5.52,非功能回退）
-const VERSION = "0.2.7";
+const VERSION = "0.2.8";
 
 function printUsage() {
     console.log(`

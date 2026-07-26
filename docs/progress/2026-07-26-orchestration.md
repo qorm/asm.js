@@ -312,6 +312,17 @@ W-5 范围内只有簇 D 可修,已修 3 项(`_ta_set` 规范守卫 tag 分派 n
 **主控集成 W-5+W-4+W-8**:**gen1==gen2==gen3 + fixtures 380/380 通过**。
 - 注:首次全量测量因中途 apply W-8(每个用例现编译,源码变动会污染结果)已主动中止,重跑一次干净测量。
 
+## Wave 7 派发(2026-07-26,基线 v0.2.7 / 6e35933)
+
+四批并行,文件互斥,全部承接前几波 agent 自己定位并主动留下的杠杆:
+
+| Agent | 拥有文件 | 任务 | FP 风险 |
+|---|---|---|---|
+| **W-18** | compiler/functions/functions.js, compiler/expressions/members.js | 内建命名空间物化为真运行时对象(~150 个 Object FAIL)。`typeof Math` 现为 "number"、`gOPN(Math).length` 为 0。以 **Math 为试点**(纯静态无构造器语义),**必须保持 `Math.abs(x)` 调用快路径不变**(改成动态属性加载即性能回退且可能破定点);可选延伸 JSON;明令不碰 Object/Array(带构造器语义,风险高) | FP-sensitive |
+| **W-19** | compiler/async/async.js | 生成器 stub **参数急切绑定**:规范要求 FunctionDeclarationInstantiation 在**调用时**执行,`function* g({}){}; g(null)` 应立即抛 TypeError。v0.2.6 的 22 例 dstr 回退即此根因(前 agent 已精确定位在 `emitGeneratorStub` 的 `_generator_new` 之前,并主动不做)。**必须保持函数体惰性**(急切跑体是更严重的回退) | FP-sensitive |
+| **W-20** | runtime/types/object/index.js | `_object_get` 缺 `0x7FFC` 字符串接收者路由(`f(x){return x["1"]}` 传字符串得 undefined);次要:`Object.prototype` 不在运行时原型链(`"toString" in o` 为 false)——明令只做窄版或报告,禁止强推原型链大改 | FP-safe |
+| **W-21** | lang/parser/statements.js, compiler/functions/statements.js | 参数位 rest 模式目标(~32),**parser+codegen 联合修**。前 agent 已实现 parser 半边但**主动回滚**(codegen 只认 `SpreadElement(Identifier)`,`function f(...[a,b]){}` 编译通过却什么都不绑),NOTE 留在 statements.js:272。**明令禁止只落 parser 半边**,验收看**绑定值**而非能否解析 | FP-sensitive |
+
 ## Wave 5 收口(2026-07-26,四批全部集成,门禁绿)
 
 **W-11 完成**(API 中断后续跑恢复):**最有价值的贡献是"先复现再动手"**——任务书列的 5 个缺口中 **3 个在 v0.2.5 已修**(`gOPD(fn,"name"/"length")` 正确、writable/configurable 强制正确、原型访问器正确),我的任务书基于过期分析,它核实后未去"修"正常代码。

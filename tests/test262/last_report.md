@@ -1,10 +1,10 @@
 # asm.js test262 conformance report
 
-_Generated 2026-07-26T15:54:40.403Z — target macos-arm64_
+_Generated 2026-07-26T17:18:20.109Z — target macos-arm64_
 
 ## Headline
 
-**asm.js passes 2295 / 6462 = 35.52% of the run test262 subset**
+**asm.js passes 2329 / 6462 = 36.04% of the run test262 subset**
 (selected `language/` + core `built-ins/`), one variant per test.
 
 Of 33776 discovered test files in the selected dirs, 1466 were excluded up front (module=83, unsupported-feature=1383, intl/staging-dir=0); 32310 were eligible; 6462 were actually run (deterministic stride=5).
@@ -13,31 +13,31 @@ Of 33776 discovered test files in the selected dirs, 1466 were excluded up front
 
 | class | count | % of run |
 |-------|------:|---------:|
-| PASS         | 2295 | 35.52 |
-| FAIL         | 3947 | 61.08 |
-| COMPILE_FAIL | 43 | 0.67 |
-| CRASH        | 177 | 2.74 |
+| PASS         | 2329 | 36.04 |
+| FAIL         | 3918 | 60.63 |
+| COMPILE_FAIL | 40 | 0.62 |
+| CRASH        | 175 | 2.71 |
 | **run**      | **6462** | 100 |
 
 ## By area
 
 | area | run | PASS | FAIL | COMPILE_FAIL | CRASH | pass% |
 |------|----:|-----:|-----:|-------------:|------:|------:|
-| built-ins/Array | 594 | 281 | 290 | 0 | 23 | 47.3 |
+| built-ins/Array | 594 | 282 | 291 | 0 | 21 | 47.5 |
 | built-ins/Boolean | 10 | 3 | 6 | 0 | 1 | 30.0 |
 | built-ins/JSON | 33 | 8 | 25 | 0 | 0 | 24.2 |
 | built-ins/Map | 41 | 15 | 24 | 0 | 2 | 36.6 |
-| built-ins/Math | 65 | 21 | 44 | 0 | 0 | 32.3 |
+| built-ins/Math | 65 | 32 | 33 | 0 | 0 | 49.2 |
 | built-ins/Number | 68 | 26 | 41 | 0 | 1 | 38.2 |
-| built-ins/Object | 682 | 289 | 384 | 0 | 9 | 42.4 |
+| built-ins/Object | 682 | 302 | 371 | 0 | 9 | 44.3 |
 | built-ins/Promise | 145 | 33 | 102 | 2 | 8 | 22.8 |
 | built-ins/RegExp | 374 | 99 | 270 | 5 | 0 | 26.5 |
 | built-ins/Set | 76 | 40 | 26 | 0 | 10 | 52.6 |
 | built-ins/String | 244 | 60 | 183 | 0 | 1 | 24.6 |
 | built-ins/Symbol | 15 | 4 | 11 | 0 | 0 | 26.7 |
 | built-ins/TypedArray | 288 | 20 | 264 | 0 | 4 | 6.9 |
-| language/expressions | 2005 | 785 | 1131 | 25 | 64 | 39.2 |
-| language/statements | 1822 | 611 | 1146 | 11 | 54 | 33.5 |
+| language/expressions | 2005 | 789 | 1129 | 23 | 64 | 39.4 |
+| language/statements | 1822 | 616 | 1142 | 10 | 54 | 33.8 |
 
 ## Excluded categories (counted, not scored)
 
@@ -59,25 +59,25 @@ Excluded-by-feature detail:
 
 ## Top failing patterns (FAIL / COMPILE_FAIL / CRASH detail strings)
 
-- **2108×** FAIL: assertion mismatch (Test262Error / wrong value)
-- **595×** FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)
+- **2090×** FAIL: assertion mismatch (Test262Error / wrong value)
+- **584×** FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)
 - **564×** FAIL: async ($DONE not signalled / promise rejected)
 - **335×** FAIL: negative test wrong outcome (phase=parse)
 - **174×** FAIL: TypedArray/ArrayBuffer semantics
-- **128×** CRASH: run signal SIGSEGV
+- **127×** CRASH: run signal SIGSEGV
 - **119×** FAIL: array contents mismatch (compareArray)
 - **50×** FAIL: constructor-ness reflection (isConstructor / not-a-constructor)
-- **43×** COMPILE_FAIL: asm.js could not compile (unsupported syntax / parser gap)
+- **40×** COMPILE_FAIL: asm.js could not compile (unsupported syntax / parser gap)
 - **32×** CRASH: run timeout
-- **17×** CRASH: run signal SIGBUS
+- **16×** CRASH: run signal SIGBUS
 - **2×** FAIL: negative test wrong outcome (phase=runtime)
 
 ## Failures correlated with features (top tags among failing tests)
 
-- `destructuring-binding`: 782
+- `destructuring-binding`: 779
 - `class`: 722
-- `async-iteration`: 671
-- `generators`: 539
+- `async-iteration`: 665
+- `generators`: 536
 - `class-fields-public`: 354
 - `Symbol.iterator`: 306
 - `default-parameters`: 261
@@ -123,4 +123,4 @@ mkdir -p .test262-corpus && tar xzf /tmp/t262.tgz -C .test262-corpus --strip-com
 node tests/test262/run.mjs --stride 5 --jobs 8 --target macos-arm64
 ```
 
-_Run wall-clock: 351.3s._
+_Run wall-clock: 358.0s._
