@@ -635,6 +635,14 @@ export class ObjectGenerator {
         vm.jeq("_object_get_fnprops");
         vm.cmpImm(VReg.V1, 0x7FFE);
         vm.jeq("_object_get_array");
+        // 字符串(0x7FFC):ES 里字符串**是**属性容器(索引 + length),此前落下方
+        // "非对象 → undefined",故凡是接收者未被编译期静态推断为 String 的读全错:
+        // `function f(x){return x["1"]}; f("abc")` / `String("xy")["1"]` / 装箱串的
+        // `.length` 一律 undefined。走冷分支 _object_get_string 按 ES 语义路由。
+        // (编译器对**静态可知**的字符串接收者已直编 _str_index_char/_js_length,
+        //  不经此处;本分支只服务动态/未知接收者,不动既有快路字节。)
+        vm.cmpImm(VReg.V1, 0x7FFC);
+        vm.jeq("_object_get_string");
 
         // 非法/非对象类型（数组/字符串/数字…），安全返回 undefined(装箱,非裸 0)
         vm.lea(VReg.RET, "_js_undefined");
@@ -660,6 +668,47 @@ export class ObjectGenerator {
         vm.andMaskReg(VReg.A0, VReg.S0, VReg.V1);
         vm.mov(VReg.A1, VReg.S1);
         vm.call("_subscript_get");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
+
+        // 冷分支:接收者是装箱字符串(S0 保持**装箱**形态——本分支在 _object_get_tag_ok
+        // 的脱壳之前分流)。按 ES 的 String exotic object 语义路由:
+        //   1) 规范数值索引键 → 单字符;越界 → undefined(_str_index_char 的 str[i] 语义)。
+        //      键判定复用 _subscript_key_int(内部即 _canonical_array_index):"0"/"1"/"42"
+        //      是索引,"01"/"1.0"/" 1"/"-0"/"1e2"/"" 不是 → -1 → 落具名路径 → undefined。
+        //      非字符串键(裸整数/float64 位)由 _subscript_key_int 的 _syscall_arg 支路归一。
+        //   2) "length" → _js_length(其 0x7FFC 支路走 _str_length)→ 装箱为 JS number
+        //      (float64 位模式,同 _object_get_dv_num)。
+        //   3) 其余具名键(方法名等)→ undefined。字符串方法在本运行时是裸 label 函数
+        //      (ABI:this 作 A0 首参),没有可返回的一等函数值表示,故 s["toUpperCase"]
+        //      仍是 undefined——需编译器侧支撑,不在本分支能力内。
+        vm.label("_object_get_string");
+        vm.mov(VReg.A0, VReg.S1); // key
+        vm.call("_subscript_key_int"); // RET = 规范索引(>=0) / -1
+        vm.mov(VReg.S2, VReg.RET);
+        vm.cmpImm(VReg.S2, 0);
+        vm.jlt("_object_get_str_named");
+        vm.mov(VReg.A0, VReg.S0); // 装箱字符串接收者
+        vm.mov(VReg.A1, VReg.S2);
+        vm.call("_str_index_char"); // 越界 → 装箱 undefined
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
+
+        vm.label("_object_get_str_named");
+        // 具名键必须真是字符串才谈 "length";非字符串键(已在上面归一失败)一律 undefined。
+        vm.shrImm(VReg.V1, VReg.S1, 48);
+        vm.cmpImm(VReg.V1, 0x7FFC);
+        vm.jne("_object_get_notfound");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_getStrContent");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, this.vm.asm.addString("length"));
+        vm.call("_strcmp");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_object_get_notfound");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_js_length"); // RET = 裸整数长度
+        vm.mov(VReg.V0, VReg.RET);
+        vm.scvtf(0, VReg.V0);
+        vm.fmovToInt(VReg.RET, 0); // 裸 int → canonical float64 位模式
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
 
         vm.label("_object_get_tag_ok");

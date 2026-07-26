@@ -35,9 +35,38 @@ export class SubscriptGenerator {
         vm.mov(VReg.S0, VReg.A0); // 保留装箱字符串
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_subscript_key_int"); // 字符串键按规范索引串判定(s["1"] ≡ s[1])
-        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.S2, VReg.RET);
+        vm.cmpImm(VReg.S2, 0);
+        vm.jlt("_subscript_get_str_named"); // 非索引键(-1)→ 具名路径("length" 等)
+        vm.mov(VReg.A1, VReg.S2);
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_str_index_char"); // str[i]:越界返 undefined(非 charAt 的 "")
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
+
+        // 动态键的具名路径:与 _object_get_str_named(object/index.js)同一约定——
+        // 键须真为 0x7FFC 字符串,仅认 "length",其余(方法名等)→ undefined。
+        // 若无此分支,`var k="length"; s[k]` 会因 _subscript_key_int 返 -1 而落
+        // _str_index_char(-1) → undefined,与 node 的 3 不符。
+        vm.label("_subscript_get_str_named");
+        vm.shrImm(VReg.V1, VReg.S1, 48);
+        vm.cmpImm(VReg.V1, 0x7FFC);
+        vm.jne("_subscript_get_str_undef");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_getStrContent");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, this.vm.asm.addString("length"));
+        vm.call("_strcmp");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_subscript_get_str_undef");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_js_length"); // RET = 裸整数长度
+        vm.mov(VReg.V0, VReg.RET);
+        vm.scvtf(0, VReg.V0);
+        vm.fmovToInt(VReg.RET, 0); // 裸 int → canonical float64 位模式
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
+
+        vm.label("_subscript_get_str_undef");
+        vm.movImm64(VReg.RET, 0x7FFB000000000000n); // undefined
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
 
         vm.label("_subscript_get_not_str");
