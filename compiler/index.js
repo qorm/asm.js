@@ -85,6 +85,19 @@ function runtimeNodeBase(pathMod, fsMod) {
 function _isGenFuncDecl(node) {
     return node && (node.isGenerator === true || node.generator === true);
 }
+// [W-24] 函数 arity(规范 length):首个默认值形参/剩余形参**之前**的形参个数。
+// 与 compiler/expressions/members.js 的 _fnNameLength 逐字同源——编译期静态解析点与
+// 运行期元数据表必须给出同一个数,否则同一函数经不同访问路径读到不同 length。
+function _fnArity(expr) {
+    const params = (expr && expr.params) || [];
+    let n = 0;
+    for (let i = 0; i < params.length; i = i + 1) {
+        const t = params[i] ? params[i].type : null;
+        if (t === "AssignmentPattern" || t === "SpreadElement" || t === "RestElement") break;
+        n = n + 1;
+    }
+    return n;
+}
 // 裸模块名判定（等价 /^[a-z_][a-z0-9_]*$/）。手写字符检查而非正则字面量——
 // 历史上自举编译器不支持 RegexLiteral codegen（现已由 __RE_new shim 路线落地，
 // 见 expressions.js RegexLiteral 分支）；此处手写检查更快且无依赖，保留。
@@ -1916,6 +1929,11 @@ export class Compiler {
             this.createModuleMeta(this._moduleOrder[moduleIdx], moduleIdx);
         }
 
+        // [W-24] 函数名推断预扫:须在任何函数体发射(→ registerFuncMeta)之前跑完全部模块。
+        for (const moduleAst of this._moduleOrder) {
+            this._collectFnNameHints(moduleAst);
+        }
+
         for (const moduleAst of this._moduleOrder) {
             this.collectFunctions(moduleAst, this.getModuleMeta(moduleAst));
         }
@@ -2663,6 +2681,7 @@ export class Compiler {
     }
 
     compileProgramForLibrary(ast) {
+        this._collectFnNameHints(ast); // [W-24] 同 compileProgram:发射前预扫函数名
         this.collectFunctions(ast);
         this.compileUserFunctions();
         this.generatePendingFunctions();
@@ -3005,12 +3024,16 @@ export class Compiler {
     // 编译器在定义处已知函数是否 async/generator,但运行期闭包只带 magic(0xc105)与
     // func_ptr,无种类信息。闭包头是紧凑布局(magic@0/func_ptr@8/captured@16+),扩头会
     // 撞热路径全字比较与大量 offset-16 捕获读,故改用 code_ptr→kind 侧表:
-    //   entry = { code_ptr(=func_ptr,运行期 lea 填), kind }  (16B/条)
+    //   entry = { code_ptr(=func_ptr,运行期 lea 填)@0, kind@8, name_ptr@16, arity@24 }  (32B/条)
     // 仅 async/generator 函数建条(普通函数缺省品牌 = Function),表随此类函数数增长
     // (自举产物内此类极少)。查表 O(N) 但只在 Object.prototype.toString 冷路径调用。
     // kind: 1=Generator, 2=Async, 3=AsyncGenerator。
     // name: 供运行期函数值 .name 反射(静态访问点已由 _fnNameLength 解析,此表覆盖参数/
     // 成员链等运行时函数值);匿名函数 name="" 不占 name_ptr(其 .name 回落 undefined)。
+    // [W-24] arity@24:首个默认/剩余形参**之前**的形参个数(规范 length 语义,与
+    // members.js _fnNameLength 的编译期算法逐字同源)。供运行期函数值 .length 反射
+    // (读取器 _func_meta_arity)。**布局变更须原子**:改条目宽度必须同时改
+    // _func_meta_init / _func_meta_entry 的步长与数据段每条 qword 数(见下方三处)。
     registerFuncMeta(label, expr, nameHint) {
         if (!expr) return;
         const isAsync = isAsyncFunction(expr);
@@ -3022,17 +3045,94 @@ export class Compiler {
         let name = "";
         if (expr.id && expr.id.name) name = expr.id.name;
         else if (typeof nameHint === "string") name = nameHint;
+        else if (this._fnNameHints) {
+            // [W-24] 匿名函数/箭头:取推断名(ES NamedEvaluation 的廉价子集,见 _collectFnNameHints)
+            const h = this._fnNameHints.get(expr);
+            if (typeof h === "string") name = h;
+        }
         if (kind === 0 && name === "") return; // 匿名普通函数不入表
         if (!this._funcMeta) this._funcMeta = [];
-        this._funcMeta.push({ label: label, kind: kind, name: name });
+        this._funcMeta.push({ label: label, kind: kind, name: name, arity: _fnArity(expr) });
+    }
+
+    // [W-24 函数元数据·名字推断] ES NamedEvaluation 的**廉价确定子集**:把匿名函数/箭头
+    // 表达式节点与其绑定名/属性名关联,存入 this._fnNameHints(AST 节点 → 名字),由
+    // registerFuncMeta 在无显式 nameHint 时取用。此前 registerFuncMeta 只在顶层函数声明
+    // (带 id)与命名函数表达式处拿得到名字,`var f = () => {}` / `{ m(){} }` 一律以
+    // name="" 被丢弃 → 运行期 fn.name 反射不到。
+    // 覆盖(名字唯一且规范明确):
+    //   var/let/const f = <anon fn|arrow>      → "f"
+    //   f = <anon fn|arrow>(赋值给标识符)      → "f"
+    //   对象字面量 { m(){} } / { m: <anon fn> } → "m"(非计算键、非 get/set)
+    //   类 MethodDefinition(非计算键)          → 方法名(登记点尚未接入,提前备好)
+    // 不覆盖(名字有歧义或形态特殊,宁缺勿错):计算键 [k](){}、getter/setter(规范名是
+    // "get x"/"set x")、export default(名 "default")、解构默认值 ({a = () => {}})。
+    _collectFnNameHints(ast) {
+        if (!this._fnNameHints) this._fnNameHints = new Map();
+        const hints = this._fnNameHints;
+        const seen = new Set();
+        const isAnonFn = (n) => !!n && typeof n === "object" && !n.id &&
+            (n.type === "FunctionExpression" || n.type === "ArrowFunctionExpression");
+        const keyName = (k, computed) => {
+            if (computed || !k || typeof k !== "object") return null;
+            if (k.type === "Identifier") return k.name;
+            if (k.type === "Literal" && (typeof k.value === "string" || typeof k.value === "number")) {
+                return String(k.value);
+            }
+            return null;
+        };
+        const visit = (node) => {
+            if (!node || typeof node !== "object") return;
+            if (seen.has(node)) return;
+            seen.add(node);
+            if (Array.isArray(node)) {
+                for (let i = 0; i < node.length; i++) visit(node[i]);
+                return;
+            }
+            const t = node.type;
+            if (t === "VariableDeclarator") {
+                if (node.id && node.id.type === "Identifier" && isAnonFn(node.init)) {
+                    hints.set(node.init, node.id.name);
+                }
+            } else if (t === "AssignmentExpression") {
+                if (node.operator === "=" && node.left && node.left.type === "Identifier" &&
+                    isAnonFn(node.right)) {
+                    hints.set(node.right, node.left.name);
+                }
+            } else if (t === "Property") {
+                if ((!node.kind || node.kind === "init") && isAnonFn(node.value)) {
+                    const kn = keyName(node.key, node.computed);
+                    if (kn !== null) hints.set(node.value, kn);
+                }
+            } else if (t === "MethodDefinition") {
+                if ((!node.kind || node.kind === "method") && isAnonFn(node.value)) {
+                    const kn = keyName(node.key, node.computed);
+                    if (kn !== null) hints.set(node.value, kn);
+                }
+            }
+            for (const k in node) {
+                if (k === "type" || k === "loc" || k === "start" || k === "end" || k === "filename") continue;
+                const v = node[k];
+                if (v && typeof v === "object") visit(v);
+            }
+        };
+        visit(ast);
     }
 
     emitFuncMetaTable() {
         const vm = this.vm;
         const entries = this._funcMeta || [];
 
+        // [W-24 条目布局] 32B/条:code_ptr@0(运行期 lea 填)、kind@8(静态)、name_ptr@16
+        // (运行期 lea 填,匿名留 0)、arity@24(静态)。本函数是**唯一**知道该布局的地方——
+        // 遍历步长共 2 处(_func_meta_init / _func_meta_entry)、字段读 3 处
+        // (_func_meta_find/@8、_func_meta_name/@16、_func_meta_arity/@24)、数据发射 1 处
+        // (下方每条 4 个 qword + 空表占位)。改宽度必须六处同改(治理规则 §4:布局变更原子)。
+        // 表外无读者:runtime 侧只经 _func_meta_find / _func_meta_name / _func_meta_arity
+        // 三个访问器进表,不直接寻址条目。
+        //
         // _func_meta_init: 运行期把各函数标签地址填入 code_ptr 槽、名字串地址填入 name_ptr 槽
-        // (二者 vaddr 运行期才定,故 lea);kind 已静态写入数据。匿名(name="")的 name_ptr 留 0。
+        // (二者 vaddr 运行期才定,故 lea);kind/arity 已静态写入数据。匿名(name="")的 name_ptr 留 0。
         vm.label("_func_meta_init");
         vm.prologue(0, [VReg.S0]);
         vm.lea(VReg.S0, "_func_meta_table");
@@ -3043,7 +3143,7 @@ export class Compiler {
                 vm.lea(VReg.V1, this.asm.addString(entries[i].name));
                 vm.store(VReg.S0, 16, VReg.V1); // entry.name_ptr = &name_str
             }
-            vm.addImm(VReg.S0, VReg.S0, 24);    // 走指针,避免大 offset(§1.7)
+            vm.addImm(VReg.S0, VReg.S0, 32);    // 步长=条目宽度;走指针避免大 offset(§1.7)
         }
         vm.epilogue([VReg.S0], 0);
 
@@ -3061,7 +3161,7 @@ export class Compiler {
         vm.load(VReg.V1, VReg.S1, 0);                   // entry.code_ptr
         vm.cmp(VReg.V1, VReg.S3);
         vm.jeq("_fme_found");
-        vm.addImm(VReg.S1, VReg.S1, 24);
+        vm.addImm(VReg.S1, VReg.S1, 32);                // 步长=条目宽度(见上方布局注释)
         vm.addImm(VReg.S2, VReg.S2, 1);
         vm.jmp("_fme_loop");
         vm.label("_fme_found");
@@ -3095,19 +3195,36 @@ export class Compiler {
         vm.movImm(VReg.RET, 0);
         vm.epilogue([], 0);
 
+        // [W-24] _func_meta_arity(A0=code_ptr) -> RET=arity(裸整数,>=0);未登记 → -1。
+        // 规范 length 语义(首个默认/剩余形参之前的形参数),由 registerFuncMeta 静态算出。
+        // 未登记用 -1 而非 0:0 是合法 arity(`function(){}`),调用方必须能区分「无此函数
+        // 的元数据」与「arity 就是 0」——前者应给出 undefined,不得编造 0。
+        vm.label("_func_meta_arity");
+        vm.prologue(0, []);
+        vm.call("_func_meta_entry");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_fmarity_nf");
+        vm.load(VReg.RET, VReg.RET, 24);                // arity@24
+        vm.epilogue([], 0);
+        vm.label("_fmarity_nf");
+        vm.movImm(VReg.RET, -1);
+        vm.epilogue([], 0);
+
         // 数据表(须在 _data_gc_end 之后声明,不入 GC 根扫描:只存 code/data 常量地址,非堆指针)。
         this.asm.addDataLabel("_func_meta_count");
         this.asm.addDataQword(entries.length);
         this.asm.addDataLabel("_func_meta_table");
         if (entries.length === 0) {
-            this.asm.addDataQword(0); // 占位使标签取得偏移
+            this.asm.addDataQword(0); // 占位使标签取得偏移(空表也须占满一条 = 4 qword)
+            this.asm.addDataQword(0);
             this.asm.addDataQword(0);
             this.asm.addDataQword(0);
         } else {
             for (let i = 0; i < entries.length; i++) {
-                this.asm.addDataQword(0);               // code_ptr 占位(运行期填)
-                this.asm.addDataQword(entries[i].kind); // kind 静态
-                this.asm.addDataQword(0);               // name_ptr 占位(运行期填,匿名留 0)
+                this.asm.addDataQword(0);                // code_ptr 占位(运行期填)
+                this.asm.addDataQword(entries[i].kind);  // kind 静态
+                this.asm.addDataQword(0);                // name_ptr 占位(运行期填,匿名留 0)
+                this.asm.addDataQword(entries[i].arity); // arity 静态
             }
         }
     }
