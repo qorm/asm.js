@@ -266,6 +266,23 @@ export const ExpressionCompiler = {
                 }
                 break;
 
+            case "String":
+                // [test262 S1] new String(x) → 原始字符串(镜像 new Number 的原始值建模;
+                // 此前落 default 用户类路径得空对象 → .length undefined、数组方法泛型
+                // .call(new String(...)) 取不到元素)。偏差:typeof 得 "string" 非 "object"、
+                // 无对象身份;但 length/索引/字符串方法全部可用,远近于正确语义。
+                // 编译器源不含 `new String(`,自举字节不变。
+                if (args.length > 0) {
+                    this.compileExpression(args[0]);
+                    this.vm.mov(VReg.A0, VReg.RET);
+                    this.vm.call("_valueToStr"); // 任意值 → 字符串(字符串入参恒等)
+                } else {
+                    this.vm.lea(VReg.RET, this.asm.addString(""));
+                    this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+                    this.vm.or(VReg.RET, VReg.RET, VReg.V1);
+                }
+                break;
+
             // Number 子类型 - 整数
             case "Int8":
             case "Int16":
