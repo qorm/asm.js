@@ -5,6 +5,10 @@ import { TokenType } from "../lexer/token.js";
 import * as AST from "./ast.js";
 import { Precedence } from "./precedence.js";
 
+// rest 形参绑定模式(`function f(...[a,b])`)的临时 rest 局部名序号。仅在该语法出现时
+// 自增,故不影响任何既有产物(编译器自身源码不用该语法,自举逐字节不变)。
+let restPatSeq = 0;
+
 // 语句解析混入
 export const StatementParser = {
     // ============ 解析语句 ============
@@ -257,27 +261,59 @@ export const StatementParser = {
             return params;
         }
         this.nextToken();
-        params.push(this.parseFunctionParam());
+        this.pushFunctionParam(params, this.parseFunctionParam(true));
         while (this.peekTokenIs(TokenType.COMMA)) {
             this.nextToken(); // curToken = ,
             // 尾逗号 function f(a, b,) {}:逗号后紧跟 ) → 停止,别把 ) 当形参解析。
             if (this.peekTokenIs(TokenType.RPAREN)) break;
             this.nextToken();
-            params.push(this.parseFunctionParam());
+            this.pushFunctionParam(params, this.parseFunctionParam(true));
         }
         if (!this.expectPeek(TokenType.RPAREN)) return null;
         return params;
     },
 
-    parseFunctionParam() {
+    // rest 形参的绑定模式 `function f(...[a, b])`:parseFunctionParam 返回
+    // `SpreadElement(Identifier(__restpat_N))` 并把模式挂在 .restPattern 上,这里把模式
+    // 展成紧随其后的**影子形参**。codegen 侧无须改动四处形参循环:SpreadElement 分支照旧
+    // 在正确时机(实参寄存器未被踩)把 rest 收进局部 __restpat_N,影子形参走既有解构形参
+    // 分支延后解构,由 emitParamDestructure 按 .restSource 取回该局部(见
+    // compiler/functions/statements.js)。展开后清掉 .restPattern,免得同一节点在 AST 里
+    // 被两处引用(遍历器重复下钻)。
+    pushFunctionParam(params, param) {
+        params.push(param);
+        if (!param || !param.restPattern) return;
+        const pat = param.restPattern;
+        param.restPattern = null;
+        // rest 落在第 6 个形参位起(实参寄存器只有 A0..A4)时,影子形参会越过 codegen 的
+        // 形参循环上界而静默不解构 —— 宁可明确报错。
+        if (params.length > 5) {
+            this.errors.push("Unsupported rest parameter binding pattern beyond the 5th parameter");
+            return;
+        }
+        params.push(pat);
+    },
+
+    // allowRestPattern:仅 parseFunctionParams 传 true。箭头形参(parser/expressions.js)
+    // 逐个 push parseFunctionParam 的返回值,无法接住影子形参,故那条路径继续拒绝
+    // `(...[a, b]) => …`(明确报错,不静默少绑定)。
+    parseFunctionParam(allowRestPattern) {
         if (this.curTokenIs(TokenType.SPREAD)) {
-            // NOTE rest 形参目标按 ES 是 BindingElement,可为绑定模式
-            // (`function f(...[a, b])` / `(...{length: n}) => …`),这里刻意**只**接受裸标识符:
-            // 解析放开很容易(照搬 parseArrayPattern 的 rest 分支即可),但形参 codegen 只认
-            // SpreadElement(Identifier) —— 放开后 `f(...[a,b])` 能编译通过却一个形参都不绑定,
-            // a/b 静默读作 0。静默算错比明确的编译期报错更糟,故维持拒绝,
-            // 待 codegen 支持模式化 rest 形参后再与之一并放开。
+            // rest 形参目标按 ES 是 BindingElement,可为绑定模式(`function f(...[a, b])`)。
             this.nextToken();
+            if (this.curTokenIs(TokenType.LBRACE) || this.curTokenIs(TokenType.LBRACKET)) {
+                const pat = this.curTokenIs(TokenType.LBRACE) ? this.parseObjectPattern() : this.parseArrayPattern();
+                if (!allowRestPattern) {
+                    this.errors.push("Unsupported rest parameter binding pattern in arrow function parameters");
+                    return pat;
+                }
+                restPatSeq = restPatSeq + 1;
+                const restName = "__restpat_" + restPatSeq;
+                const sp = new AST.SpreadElement(new AST.Identifier(restName));
+                pat.restSource = restName;   // codegen 据此取回收集好的 rest 数组
+                sp.restPattern = pat;        // 由 pushFunctionParam 展成影子形参
+                return sp;
+            }
             this.checkYieldAwaitBinding(this.curToken.literal);   // [test262 S1] ...yield/...await
             return new AST.SpreadElement(new AST.Identifier(this.curToken.literal));
         }

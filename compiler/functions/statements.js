@@ -748,6 +748,23 @@ export const StatementCompiler = {
     // 调用点须先把所有实参寄存器落栈(解构中 _object_get/_subscript_get 会踩 A 寄存器),
     // 再逐个调用本方法。默认值 {a,b=5} / f({a}={}) 先按 undefined 兜底再解构。
     emitParamDestructure(pattern, slot, defaultExpr) {
+        // rest 形参的绑定模式 `function f(...[a, b])` / `f(x, ...{length: n})`:
+        // parser 把它拆成 `SpreadElement(Identifier(__restpat_N))` + 承载模式的影子形参
+        // (见 lang/parser/statements.js pushFunctionParam)。rest 数组已由 SpreadElement
+        // 分支的 emitRestParam 在形参循环内(实参寄存器尚未被踩)收进局部 __restpat_N,
+        // 这里只把它搬进本形参的临时槽,随后复用与 `var [a, b] = arr` **完全相同**的
+        // 声明式解构(emitDestructurePattern "decl"),绑定语义因此与声明处一致。
+        // 找不到该局部 = 所在形参路径没有 rest 收集(如类构造器):明确报错,不静默不绑定。
+        if (pattern && pattern.restSource) {
+            const restOff = this.ctx.getLocal(pattern.restSource);
+            if (!restOff) {
+                throw new Error("Unsupported rest parameter binding pattern in this function form");
+            }
+            this.vm.load(VReg.V0, VReg.FP, restOff);
+            this.vm.store(VReg.FP, slot, VReg.V0);
+            this.emitDestructurePattern(pattern, slot, "decl");
+            return;
+        }
         if (defaultExpr) {
             // x64: V1/V2 别名 A3/A2;实参已落栈,仍用 V5/V6 避免平台路径分叉。
             const chkReg = this.vm.backend.name === "x64" ? VReg.V5 : VReg.V1;

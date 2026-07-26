@@ -455,7 +455,10 @@ export const ExpressionParser = {
                 // [#34] 统一走 parseFunctionParam:获得默认值(AssignmentPattern)
                 // 与 rest 支持,与 function 声明形参同构。单参默认 `(y=5)=>` 因
                 // 与分组赋值二义仍不支持(须多参或裸参形态)。
-                params.push(this.parseFunctionParam());
+                // 经 pushFunctionParam 而非直接 push:rest 模式目标(`(...[a,b]) => …`)
+                // 需要展开出影子参数(见 parser/statements.js 的 pushFunctionParam),
+                // 否则 gather 与 destructure 两步接不上。
+                this.pushFunctionParam(params, this.parseFunctionParam(true));
                 this.nextToken();
                 if (this.curTokenIs(TokenType.COMMA)) {
                     this.nextToken();

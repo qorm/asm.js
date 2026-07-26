@@ -511,6 +511,13 @@ export class ObjectGenerator {
         vm.mov(VReg.A0, VReg.RET);
         vm.mov(VReg.A1, VReg.S0);
         vm.call("_object_get");
+        // [W-22] 侧表**存在**但该键 miss(_object_get → undefined)时也须落回元数据反射:
+        // 否则函数一旦挂过任意自定义属性(fn.x = 1),其 fn.name 就永久变 undefined
+        // (侧表对象里根本没有 "name" 键)。此前只有「无侧表」才走 _cpg_miss。
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_cpg_miss");
         vm.epilogue([VReg.S0, VReg.S1], 0);
         // 键 miss:若 key==="name" 反射元数据名(否则 undefined)。
         vm.label("_cpg_miss");
@@ -5439,6 +5446,11 @@ export class ObjectGenerator {
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_js_prop_key");
         vm.mov(VReg.S1, VReg.RET);
+        // [W-22] 函数值(0x7FFF)在脱壳解引用**之前**分流:函数不是对象块,下方按对象头读
+        // 类型字节必然不等 TYPE_OBJECT → 恒 undefined(见 _ogopd_fn)。
+        vm.shrImm(VReg.V1, VReg.S0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFF);
+        vm.jeq("_ogopd_fn");
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.S2, VReg.S0, VReg.V1); // raw obj
         vm.cmpImm(VReg.S2, 0);
@@ -5591,6 +5603,93 @@ export class ObjectGenerator {
         vm.load(VReg.A0, VReg.S2, 8);
         vm.mov(VReg.A1, VReg.S1);
         vm.call("_object_getOwnPropertyDescriptor");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
+
+        // ===== [W-22] 函数值(0x7FFF)的自有属性描述符(S0=fn 值, S1=已归一键)=====
+        // 函数无对象头(闭包 {magic@0, code_ptr@8, 捕获槽...} 或裸代码指针,既无 props_ptr@32
+        // 也无 flags_ptr@40),自有具名属性挂在 _closure_props_* 侧表——与 _object_get 的
+        // 0x7FFF 分支、_object_keys_fn / _object_gopn_fn 同一张表。此前任何函数值都落到上方
+        // 「脱壳 → 类型字节 != TYPE_OBJECT」→ undefined,故 gOPD(fn, 任意键) 恒 undefined;
+        // 看着能用的只有 gOPD(<字面量函数>, "name"|"length"),那是编译期拦截(functions.js
+        // 的 _fnNameLength 合成),函数一经变量/形参传递即失效——test262 propertyHelper.js
+        // 的 verifyProperty(Math.abs, "name", …) 正是这种传递形态。
+        // 两类键:
+        //   name/length → node 形状 {value, writable:false, enumerable:false, configurable:true};
+        //   其余键      → 递归描述侧表 props(普通对象 TYPE_OBJECT,不会再落本分支,无环),
+        //                 属性特性位由该对象真实持有(gOPN(fn) 报出的侧表键都能被描述)。
+        // **偏差**:length 的**值**运行期不可得——函数元数据侧表 _func_meta_table 每条只有
+        // {code_ptr, kind, name_ptr}(compiler/index.js emitFuncMetaTable),无 arity 字段,
+        // 闭包头也不带形参数。故除非用户显式写过 fn.length(落侧表),gOPD(fn,"length") 返
+        // undefined——不编造 0,与 _closure_prop_get / _object_gopn_fn 注释中的 length 语义一致。
+        vm.label("_ogopd_fn");
+        // 非字符串键(symbol 等)不进 _strcmp(避免拿 tag 位当地址),直接查侧表
+        vm.shrImm(VReg.V0, VReg.S1, 48);
+        vm.cmpImm(VReg.V0, 0x7FFC);
+        vm.jne("_ogopd_fn_side");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_getStrContent"); // 装箱串 → 内容指针
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, vm.asm.addString("name"));
+        vm.call("_strcmp");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_ogopd_fn_name");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_getStrContent");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, vm.asm.addString("length"));
+        vm.call("_strcmp");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_ogopd_fn_len");
+
+        // 普通自有属性:侧表 props 对象上的真实描述符(无侧表/键 miss → undefined)
+        vm.label("_ogopd_fn_side");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_closure_props_find"); // RET = props(装箱 0x7FFD)/undefined
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_ogopd_undef");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_getOwnPropertyDescriptor");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
+
+        // name/length:取值仍走 _closure_prop_get(侧表优先——一等 Error 构造器把 .name 挂在
+        // 侧表;miss 且键是 "name" 时它回落 _func_meta_name 反射元数据名)。键必须换成**数据段
+        // 字面量**键再传:_closure_prop_get 的 name 回落用的是键 payload 与 addString("name")
+        // 的**地址**比较,用户传来的堆串(即便内容相同)不会命中。
+        vm.label("_ogopd_fn_name");
+        vm.lea(VReg.A1, vm.asm.addString("name"));
+        vm.jmp("_ogopd_fn_meta");
+        vm.label("_ogopd_fn_len");
+        vm.lea(VReg.A1, vm.asm.addString("length"));
+        vm.label("_ogopd_fn_meta");
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_closure_prop_get");
+        vm.mov(VReg.S5, VReg.RET); // 命中值
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.S5, VReg.V1);
+        vm.jeq("_ogopd_undef"); // 匿名/未登记函数的 name、无 arity 的 length → 无此属性
+        vm.call("_object_new");
+        vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+        vm.or(VReg.V0, VReg.RET, VReg.V1);
+        vm.store(VReg.SP, 0, VReg.V0); // desc boxed
+        this._emitDescSetReg(0, "value", VReg.S5);
+        // 特性位不来自 attr 字节(侧表是普通对象,位全默认),按 node 对函数 name/length 的
+        // 规范形状直写:writable:false / enumerable:false / configurable:true。
+        vm.lea(VReg.V0, "_js_false");
+        vm.load(VReg.V0, VReg.V0, 0);
+        this._emitDescSetReg(0, "writable", VReg.V0);
+        vm.lea(VReg.V0, "_js_false");
+        vm.load(VReg.V0, VReg.V0, 0);
+        this._emitDescSetReg(0, "enumerable", VReg.V0);
+        vm.lea(VReg.V0, "_js_true");
+        vm.load(VReg.V0, VReg.V0, 0);
+        this._emitDescSetReg(0, "configurable", VReg.V0);
+        vm.load(VReg.RET, VReg.SP, 0);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
     }
 
