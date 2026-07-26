@@ -154,6 +154,7 @@ export class JSValueGenerator {
         this.generateGetTypeName();
         this.generateTypeofWrapper();
         this.generateInstanceofStub();
+        this.generateFnProtoInvoke();
     }
 
     // _js_is_float64(v) -> 1 if double, 0 if boxed
@@ -878,5 +879,163 @@ export class JSValueGenerator {
         vm.cmpImm(VReg.V2, 0);
         vm.jeq("_iof_false"); // 无 prototype(尚无实例)→ false
         vm.jmp("_iof_proto_walk");
+    }
+
+    // [test262 propertyHelper] `Function.prototype.call` / `.apply` 作**一等值**的运行时
+    // 蹦床(通用函数调用器)。此前 `f.call(...)` 只有编译期静态形态(functions.js
+    // compileMethodCall 的 cab* 分支);`var c = Function.prototype.call` /
+    // `Function.prototype.call.bind(f)` 这类**取值**形态无运行时对应物,故 test262 的
+    // propertyHelper.js 在首几行就抛异常、其下游(stride-5 子集里数百项)全部失效。
+    //
+    // 二者都被物化成普通闭包 {CLOSURE_MAGIC@0, tramp@8}(members.js emitMemoizedBuiltinRef),
+    // 按既有闭包调用约定进入:S0=闭包裸指针、A5=this(= 被调函数)、A0-A4=实参、
+    // _call_argc=实参个数。蹦床把 this 挪成被调者、A0 挪成新 this、其余实参下移一位
+    // (apply 则从数组铺开),再经共享尾段 _fn_invoke_tail 真正发起调用。
+    //
+    // 尾段是唯一的分派点(governance:参数化而非复制 codegen)。两个蹦床帧布局完全一致
+    // (prologue(64,[S0..S4]),SP+0..SP+32 = 5 个实参槽),故以 jmp 交接、由尾段 epilogue
+    // 统一归还帧。可调用性校验复用 _validate_callable(裸函数/闭包/可调用 Proxy 全覆盖,
+    // 非可调用抛真 TypeError),magic 分派与 _bound_tramp/_aref_invoke_cb 同构。
+    //
+    // [ABI 上限] 实参窗口只有 A0-A4 五个寄存器:`.call` 最多转发 4 个实参(A0 被 thisArg
+    // 占用)、`.apply` 最多 5 个;超出者丢弃(与既有 _bound_tramp 的 5 参截断同款偏差)。
+    generateFnProtoInvoke() {
+        const vm = this.vm;
+        const UNDEF = 0x7ffb000000000000n;
+        const SAVED = [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4];
+        const FRAME = 64; // SP+0..SP+32 = 实参槽 0..4(16 对齐余量)
+
+        // ---- Function.prototype.call 蹦床 ----
+        // 入口:A5=被调函数, A0=thisArg, A1-A4=实参, _call_argc=n
+        vm.label("_fp_call_tramp");
+        vm.prologue(FRAME, SAVED);
+        // 实参下移一位落槽(A0 是 thisArg,不进实参窗口);槽 4 无来源 → undefined
+        vm.store(VReg.SP, 0, VReg.A1);
+        vm.store(VReg.SP, 8, VReg.A2);
+        vm.store(VReg.SP, 16, VReg.A3);
+        vm.store(VReg.SP, 24, VReg.A4);
+        vm.movImm64(VReg.V5, UNDEF); // V5=R10,x64 上不与 A0-A5 别名
+        vm.store(VReg.SP, 32, VReg.V5);
+        vm.mov(VReg.S2, VReg.A0); // 新 this
+        vm.mov(VReg.S4, VReg.A5); // 被调函数(未校验)
+        // argc' = clamp(argc-1, 0, 4)
+        vm.lea(VReg.V0, "_call_argc");
+        vm.load(VReg.S3, VReg.V0, 0);
+        vm.subImm(VReg.S3, VReg.S3, 1);
+        vm.cmpImm(VReg.S3, 0);
+        vm.jge("_fpc_lo");
+        vm.movImm(VReg.S3, 0);
+        vm.label("_fpc_lo");
+        vm.cmpImm(VReg.S3, 4);
+        vm.jle("_fpc_hi");
+        vm.movImm(VReg.S3, 4);
+        vm.label("_fpc_hi");
+        // argc' 以外的槽填真 undefined(调用点残留的 A1-A4 是上一次调用的垃圾值)
+        for (let j = 0; j < 4; j++) {
+            const skip = "_fpc_f" + j;
+            vm.cmpImm(VReg.S3, j + 1);
+            vm.jge(skip);
+            vm.movImm64(VReg.V5, UNDEF);
+            vm.store(VReg.SP, j * 8, VReg.V5);
+            vm.label(skip);
+        }
+        vm.jmp("_fn_invoke_tail");
+
+        // ---- Function.prototype.apply 蹦床 ----
+        // 入口:A5=被调函数, A0=thisArg, A1=实参数组(装箱 0x7FFE;非数组按 0 参处理)
+        vm.label("_fp_apply_tramp");
+        vm.prologue(FRAME, SAVED);
+        vm.mov(VReg.S2, VReg.A0); // 新 this
+        vm.mov(VReg.S1, VReg.A1); // 实参数组(装箱)
+        vm.mov(VReg.S4, VReg.A5); // 被调函数(未校验)
+        vm.movImm(VReg.S3, 0);    // argc
+        vm.shrImm(VReg.V5, VReg.S1, 48);
+        vm.cmpImm(VReg.V5, 0x7ffe);
+        vm.jne("_fpa_fill");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_array_length"); // RET = 裸 int 长度
+        vm.mov(VReg.S3, VReg.RET);
+        vm.cmpImm(VReg.S3, 5);
+        vm.jle("_fpa_fill");
+        vm.movImm(VReg.S3, 5); // 寄存器窗口上限
+        vm.label("_fpa_fill");
+        for (let i = 0; i < 5; i++) {
+            const undefL = "_fpa_u" + i;
+            const nextL = "_fpa_n" + i;
+            vm.cmpImm(VReg.S3, i + 1);
+            vm.jlt(undefL);
+            vm.mov(VReg.A0, VReg.S1);
+            vm.movImm(VReg.A1, i);
+            vm.call("_array_get"); // RET = 装箱元素
+            vm.store(VReg.SP, i * 8, VReg.RET);
+            vm.jmp(nextL);
+            vm.label(undefL);
+            vm.movImm64(VReg.V5, UNDEF);
+            vm.store(VReg.SP, i * 8, VReg.V5);
+            vm.label(nextL);
+        }
+        vm.jmp("_fn_invoke_tail");
+
+        // ---- 共享尾段:真正发起调用 ----
+        // 前置:帧 = prologue(64,[S0..S4]);SP+0..SP+32 = 实参槽 0..4(已 undefined 补齐);
+        //       S2 = this(装箱)、S3 = argc(裸)、S4 = 被调值(未校验)。
+        vm.label("_fn_invoke_tail");
+        // [接收者卫生] 裸小整数接收者 → undefined。编译器把裸标识符 Array/Object/Function
+        // 物化成**裸**哨兵 1/2/3(members.js compileIdentifier,供 instanceof 用),其
+        // high16 与裸堆指针同为 0 → 下游对象 helper 会当指针解引用地址 1/2/3 而 SIGSEGV。
+        // 取值调用形态(`Function.prototype.call.bind(Object.prototype.hasOwnProperty)`
+        // 之类,test262 propertyHelper 的 verifyProperty(Object, …) 恰是此形)此前根本
+        // 到不了这里,现在到得了,故在本(全新)路径上就地拦掉。落在 [heap_base, …) 之下的
+        // 裸值不可能是合法对象接收者,归一成 undefined 后各 helper 走既有 nullish 分支。
+        vm.shrImm(VReg.V5, VReg.S2, 48);
+        vm.cmpImm(VReg.V5, 0);
+        vm.jne("_fnit_thisok");
+        vm.lea(VReg.V6, "_heap_base");
+        vm.load(VReg.V6, VReg.V6, 0);
+        vm.cmp(VReg.S2, VReg.V6);
+        vm.jge("_fnit_thisok");
+        vm.movImm64(VReg.S2, UNDEF);
+        vm.label("_fnit_thisok");
+        vm.mov(VReg.S0, VReg.S4);
+        vm.call("_validate_callable"); // S0 = 裸可调用指针;非可调用 → 抛 TypeError(不返回)
+        vm.mov(VReg.S4, VReg.S0);
+        vm.lea(VReg.V0, "_call_argc"); // [argc ABI] 目标入口读取
+        vm.store(VReg.V0, 0, VReg.S3);
+        vm.load(VReg.V0, VReg.S4, 0); // magic / 首指令字
+        vm.cmpImm(VReg.V0, 0xc105);   // CLOSURE_MAGIC
+        vm.jeq("_fnit_clos");
+        vm.cmpImm(VReg.V0, 0xa51c);   // ASYNC_CLOSURE_MAGIC
+        vm.jeq("_fnit_clos");
+        vm.mov(VReg.V6, VReg.S4);     // 裸函数:指针即入口
+        vm.movImm(VReg.S0, 0);        // 无闭包
+        vm.jmp("_fnit_go");
+        vm.label("_fnit_clos");
+        vm.mov(VReg.S0, VReg.S4);     // S0 = 闭包
+        vm.load(VReg.V6, VReg.S4, 8); // 真函数指针
+        vm.label("_fnit_go");
+        // A 寄存器最后装载(x64 上 A1/A2/A3/A4/A5 与 V7/V2/V1/V3/V4 别名,此后只用 V6/V0)
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.load(VReg.A1, VReg.SP, 8);
+        vm.load(VReg.A2, VReg.SP, 16);
+        vm.load(VReg.A3, VReg.SP, 24);
+        vm.load(VReg.A4, VReg.SP, 32);
+        vm.mov(VReg.A5, VReg.S2); // this
+        vm.callIndirect(VReg.V6);
+        vm.epilogue(SAVED, FRAME);
+
+        // [Array.prototype.push 取值] 守卫版 push。_array_push 假定接收者是真数组,
+        // 对普通对象/类数组直接按数组头解引用 → SIGSEGV。`Array.prototype.push` 作值
+        // (propertyHelper.js 的 __push,以及 `obj.push = Array.prototype.push` 这类泛型
+        // 用法)必须先验接收者。非数组(tag ≠ 0x7FFE)→ undefined(记偏差:ES 要求按
+        // 类数组语义写 length;无 _agen_push,不在此复制数组语义);真数组 → 尾跳既有
+        // _array_push(借调用者返回地址,语义/返回值与 `arr.push` 取值形态完全一致)。
+        vm.label("_fpg_arr_push");
+        vm.shrImm(VReg.V5, VReg.A0, 48);
+        vm.cmpImm(VReg.V5, 0x7ffe);
+        vm.jne("_fpg_arr_push_no");
+        vm.jmp("_array_push");
+        vm.label("_fpg_arr_push_no");
+        vm.movImm64(VReg.RET, UNDEF);
+        vm.ret();
     }
 }

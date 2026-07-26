@@ -97,6 +97,13 @@ const NamespaceStaticRef = {
         values: "_object_values",
         entries: "_object_entries",
         getOwnPropertyNames: "_object_gopn", // 对象路径委托 _object_keys;array/string 额外含 "length"
+        // [test262 propertyHelper] 反射三件套(同约定:A0=首参装箱值 → RET=装箱结果)。
+        // propertyHelper.js 头部把它们捕获成局部变量后全程经变量调用,故必须可作值读取。
+        // defineProperty 不收:无通用运行时 helper(编译期把描述符对象字面量静态分解,
+        // 运行时描述符只有 _object_defineProperty_proxy 走陷阱路径)——记偏差。
+        getOwnPropertyDescriptor: "_object_getOwnPropertyDescriptor", // (obj, key) → 描述符/undefined
+        create: "_object_create",   // (proto) → 新对象(第二参描述符仅静态调用位支持)
+        freeze: "_object_freeze",   // (obj) → obj
     },
     Date: {
         now: "_date_now", // 0 参 → canonical number
@@ -1006,10 +1013,42 @@ export const MemberCompiler = {
                     join: "_agen_join",
                     slice: "_agen_slice",
                     at: "_agen_at",
+                    // [test262 propertyHelper] `Function.prototype.call.bind(Array.prototype.push)`。
+                    // 无 _agen_push;走守卫版 _fpg_arr_push(真数组尾跳 _array_push,非数组
+                    // 返 undefined 而非按数组头解引用 SIGSEGV —— `Array.prototype.push` 的
+                    // 泛型用法就是拿非数组当接收者)。偏差同 `arr.push` 取值形态:返回数组
+                    // 而非新长度。未加此项时 Array.prototype.push 落通用 _object_get(裸
+                    // 标识 1)→ 崩,propertyHelper.js 恰死在这一行。
+                    push: "_fpg_arr_push",
                 };
                 const _aph = _apHelpers[propName];
                 if (typeof _aph === "string") {
                     this.emitBuiltinMethodRefClosure(_aph);
+                    return;
+                }
+            }
+
+            // [test262 propertyHelper] Function.prototype.call/apply 作**值读取**:发
+            // memoized 闭包({0xc105, _fp_call_tramp/_fp_apply_tramp}),使
+            // `Function.prototype.call.bind(f)` / `var c = Function.prototype.call` 这类
+            // 取值形态可调可传(typeof 得 "function"、`===` 稳定)。propertyHelper.js 头四行
+            // 全是该形态,此前在 harness 加载期即抛异常 → 其下游全部失效。
+            // 调用形态 `f.call(...)`/`f.apply(...)` 仍走 functions.js 的编译期静态派发
+            // (cab* 分支),不经此路径 → 既有字节不变。`.bind` 取值不收(见蹦床注释:
+            // 需运行时合成绑定闭包,本批不做;`f.bind(...)` 调用形态不受影响)。
+            // 仅静态链 Function.prototype 且 Function 未被局部/函数遮蔽时触发;编译器源
+            // 不含此模式 → 自举字节不变。[#32 守卫] typeof==="string" 判命中防原型链污染。
+            if (expr.object && expr.object.type === "MemberExpression" && !expr.object.computed &&
+                expr.object.object && expr.object.object.type === "Identifier" &&
+                expr.object.object.name === "Function" &&
+                expr.object.property && expr.object.property.name === "prototype" &&
+                !(this.ctx.getLocal && this.ctx.getLocal("Function")) &&
+                !(this.ctx.getFunction && this.ctx.getFunction("Function"))) {
+                let _fph = null;
+                if (propName === "call") _fph = "_fp_call_tramp";
+                else if (propName === "apply") _fph = "_fp_apply_tramp";
+                if (typeof _fph === "string") {
+                    this.emitMemoizedBuiltinRef("fnproto_" + propName, _fph);
                     return;
                 }
             }

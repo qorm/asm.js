@@ -1820,7 +1820,7 @@ export class Compiler {
     // modules involved are not imported by the compiler itself → self-host safe.
     _injectImplicitGlobalImports(ast) {
         if (!ast || !Array.isArray(ast.body)) return;
-        const IMPLICIT_GLOBALS = { URL: "url", URLSearchParams: "url", btoa: "util", atob: "util" };
+        const IMPLICIT_GLOBALS = { URL: "url", URLSearchParams: "url", btoa: "util", atob: "util", Buffer: "buffer" };
 
         // Top-level bindings that would shadow an implicit global.
         const bound = new Set();

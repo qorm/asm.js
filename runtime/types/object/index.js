@@ -19,6 +19,13 @@ const TYPE_OBJECT = 2;
 const TYPE_PROXY = 8; // Proxy 对象块:type@0=8, target@8, handler@16(装箱 0x7FFD)。
                       // 独立 type 字节使属性访问快路(cmp==TYPE_OBJECT)自动漏判 → 落
                       // _object_get/_set 冷分支调 handler 陷阱;普通对象访问逐字节不变。
+// 非属性容器堆块类型字节(布局与 [count@8, props_ptr@32] 不兼容,通用属性遍历必须绕开):
+const TYPE_MAP = 4; // Map:哈希/链表布局
+const TYPE_SET = 5; // Set:哈希/链表布局
+const TYPE_ARRAY_BUFFER = 12; // ArrayBuffer:[type@0, byteLength@8, data_ptr@16, owner@24]
+const TYPE_DATA_VIEW = 14; // DataView:[type@0, data_ptr@8, byteOffset@16, byteLength@24](32B,无 props_ptr)
+const TYPE_TA_LO = 0x40; // TypedArray 类型字节区间 [0x40, 0x7f]:[type@0, length@8, 内联元素@16]
+const TYPE_TA_HI = 0x7f;
 const TYPE_GETTER = 60; // getter 标记对象，见 runtime/core/allocator.js
 const TYPE_SYMBOL = 61; // Symbol 标记块，见 runtime/core/allocator.js
 const TYPE_SHAPE_DESC = 16; // [shape v2 · T2a] 原型带键形状描述符(堆块):@0 = count|(accessor_free<<63), @8 = keys_ptr
@@ -670,6 +677,14 @@ export class ObjectGenerator {
         // GC 复用后邻居非零 → 确定性崩,任务 #19)。
         vm.cmpImm(VReg.V1, 12);
         vm.jeq("_object_get_notfound");
+        // DataView(14):32B 块 [type@0, data_ptr@8, byteOffset@16, byteLength@24],**块尾即 32**,
+        // 根本没有 props_ptr@32。按对象头遍历会把 data_ptr 当 count(天文数字)、把块外邻居
+        // [dv+32] 当 props_ptr 读 → 阶段A 指针扫立即解引用野指针崩(crash PC
+        // _object_get_ptrscan+0xc;test262 built-ins/DataView 的主崩因,dv.byteLength /
+        // dv.nonexistent 全中)。走冷分支 _object_get_dataview:byteLength/byteOffset 读内建槽,
+        // 其余键 undefined(getInt8 等方法由编译器另行分派,不经此路径)。
+        vm.cmpImm(VReg.V1, TYPE_DATA_VIEW);
+        vm.jeq("_object_get_dataview");
         // Symbol 标记块(61):不是属性对象(desc 串指针在 +8,按对象头遍历会拿
         // 垃圾 count 越块扫崩)。只支持 .description,其余键 undefined——见
         // _object_get_symbol 冷分支。(类型检查失败分支扩一项,不动命中快路)
@@ -806,6 +821,36 @@ export class ObjectGenerator {
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
         vm.or(VReg.RET, VReg.RET, VReg.V1);
         vm.label("_object_get_symbol_ret");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
+
+        // 冷分支:接收者是 DataView 块(S0=裸指针)。只有 byteLength@24 / byteOffset@16 两个
+        // 内建槽有意义,其余键一律 undefined(与 node 一致:dv.nonexistent === undefined)。
+        // 注:dv.buffer 无法在此还原——DataView 块只存 data_ptr,不持有源 ArrayBuffer 对象,
+        // 故落 undefined(记偏差)。方法(getInt8/setFloat64…)由编译器 tag 分派,不到此。
+        vm.label("_object_get_dataview");
+        vm.mov(VReg.A0, VReg.S1); // 装箱键 → 内容指针
+        vm.call("_getStrContent");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.lea(VReg.A1, this.vm.asm.addString("byteLength"));
+        vm.call("_strcmp");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_object_get_dv_bytelength");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.lea(VReg.A1, this.vm.asm.addString("byteOffset"));
+        vm.call("_strcmp");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_object_get_dv_byteoffset");
+        vm.jmp(notFoundLabel);
+        vm.label("_object_get_dv_bytelength");
+        vm.load(VReg.V0, VReg.S0, 24);
+        vm.jmp("_object_get_dv_num");
+        vm.label("_object_get_dv_byteoffset");
+        vm.load(VReg.V0, VReg.S0, 16);
+        vm.label("_object_get_dv_num");
+        // 裸 int → canonical float64 位模式(与 _ta_bytelength 访问点同一表示)
+        vm.scvtf(0, VReg.V0);
+        vm.fmovToInt(VReg.RET, 0);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
 
         // ===== Proxy get 陷阱(冷分支;S0=裸 proxy 指针, S1=装箱键)=====
@@ -2721,7 +2766,33 @@ export class ObjectGenerator {
         vm.loadByte(VReg.V0, VReg.S0, 0);
         vm.andImm(VReg.V0, VReg.V0, 0xff);
         vm.cmpImm(VReg.V0, 1); // TYPE_ARRAY
-        vm.jne("_object_has_obj");
+        vm.jeq("_object_has_idx");
+        // TypedArray(0x40-0x7f):[type@0, length@8, 内联元素数据@16],无 props_ptr@32。
+        // 按对象头遍历会把 length@8 当 count、把内联元素数据当 props_ptr 读,再把元素
+        // **值**当键指针解引用 → 崩(crash PC _object_has_loop+0x18;实证故障地址
+        // 0x4044800000000000 就是 float64 41.0 被当地址)。length@8 与数组同语义,故数值键
+        // 复用同一 atoi 界内判定:`ta.hasOwnProperty("0")` → true、`("9")`/`("foo")` → false。
+        vm.cmpImm(VReg.V0, TYPE_TA_LO);
+        vm.jlt("_object_has_notta");
+        vm.cmpImm(VReg.V0, TYPE_TA_HI);
+        vm.jle("_object_has_idx");
+        vm.label("_object_has_notta");
+        // 其余非属性容器块(Map/Set/ArrayBuffer/DataView/Symbol):布局与 [count@8, props_ptr@32]
+        // 不兼容,按对象头遍历同样解引用垃圾。规范语义是"无此自有属性" → false,不抛。
+        // (黑名单与 _object_get 的类型字节守卫逐项取齐,使 has 与 get 语义一致。)
+        vm.cmpImm(VReg.V0, TYPE_MAP);
+        vm.jeq("_object_has_false");
+        vm.cmpImm(VReg.V0, TYPE_SET);
+        vm.jeq("_object_has_false");
+        vm.cmpImm(VReg.V0, TYPE_ARRAY_BUFFER);
+        vm.jeq("_object_has_false");
+        vm.cmpImm(VReg.V0, TYPE_DATA_VIEW);
+        vm.jeq("_object_has_false");
+        vm.cmpImm(VReg.V0, TYPE_SYMBOL);
+        vm.jeq("_object_has_false");
+        vm.jmp("_object_has_obj");
+
+        vm.label("_object_has_idx");
         vm.mov(VReg.A0, VReg.S1); // 规范化键(装箱串)→ 内容指针 atoi
         vm.call("_getStrContent");
         vm.mov(VReg.V2, VReg.RET); // 游标
@@ -2810,7 +2881,29 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.V0, TYPE_PROXY); // Proxy:冷分支调 handler.has
         vm.jeq("_prop_in_proxy");
         vm.cmpImm(VReg.V0, 1); // TYPE_ARRAY
-        vm.jne("_prop_in_obj");
+        vm.jeq("_prop_in_idx");
+        // TypedArray(0x40-0x7f):同数组按 length@8 界内判定(`"0" in ta` → true)。走对象路径会把
+        // 内联元素数据当 props 读、把元素值当键指针解引用 → 崩。与 _object_has 同源守卫。
+        vm.cmpImm(VReg.V0, TYPE_TA_LO);
+        vm.jlt("_prop_in_notta");
+        vm.cmpImm(VReg.V0, TYPE_TA_HI);
+        vm.jle("_prop_in_idx");
+        vm.label("_prop_in_notta");
+        // 其余非属性容器块(Map/Set/ArrayBuffer/DataView/Symbol)→ false(不抛),
+        // 黑名单与 _object_get / _object_has 逐项取齐。
+        vm.cmpImm(VReg.V0, TYPE_MAP);
+        vm.jeq("_prop_in_false");
+        vm.cmpImm(VReg.V0, TYPE_SET);
+        vm.jeq("_prop_in_false");
+        vm.cmpImm(VReg.V0, TYPE_ARRAY_BUFFER);
+        vm.jeq("_prop_in_false");
+        vm.cmpImm(VReg.V0, TYPE_DATA_VIEW);
+        vm.jeq("_prop_in_false");
+        vm.cmpImm(VReg.V0, TYPE_SYMBOL);
+        vm.jeq("_prop_in_false");
+        vm.jmp("_prop_in_obj");
+
+        vm.label("_prop_in_idx");
         // atoi(key content ptr = S1):全数字键 → idx;否则(含 "length")→ false(记偏差)。
         vm.mov(VReg.V2, VReg.S1); // 游标
         vm.movImm(VReg.V3, 0);    // idx 累加

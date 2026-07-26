@@ -16,6 +16,7 @@ export class ProcessGenerator {
         this.generateProcessEnvInit();
         this.generateProcessHelpers();
         this.generateThrowUnwind();
+        this.generateUncaughtReport();
         this.generateArgvInit();
         if (this.os === "windows") this.generateWinBuildArgv();
         this.generatePrintCstr(); // 辅助调试函数
@@ -595,7 +596,8 @@ export class ProcessGenerator {
         vm.jeq("_throw_unwind_exit");
         vm.jmp("_coroutine_return");
         vm.label("_throw_unwind_exit");
-        // 未捕获:exit(1)
+        // 未捕获:先向 stderr 报告诊断(node 首行同形),再 exit(1)
+        vm.call("_uncaught_report");
         vm.movImm(VReg.A0, 1);
         if (this.os === "wasi") {
             vm.syscall(60); // wasi 号名空间 = linux-x64
@@ -619,6 +621,68 @@ export class ProcessGenerator {
         vm.mov(VReg.SP, VReg.V2);
         vm.load(VReg.V2, VReg.V1, 8);
         vm.jmpIndirect(VReg.V2);
+    }
+
+    // _uncaught_report(): 未捕获异常的诊断行,写 stderr。首行与 node 同形:
+    //   Uncaught TypeError: boom   (Error 族 → "name: message")
+    //   Uncaught 42 / Uncaught str / Uncaught { a: 1 }   (其余值)
+    // 无栈回溯(调用栈此刻已被 _throw_unwind 的链空判定放弃)。
+    //
+    // 渲染完全复用 _print_value_no_nl:Error 族分支(_is_asmjs_err → _error_to_str)
+    // 已经产出 "name: message",非 Error 值走既有 inspect 形态,故此处不再自造格式化器。
+    // 但整条打印链(print.js/number/date/... 各自的 write 序列)fd 恒为 1,无参数化入口;
+    // 因此先 dup2(2,1) 把 fd1 重定向到 stderr——诊断随之落 stderr,stdout 一字不染
+    // (fixtures/test262 逐字比对 stdout,污染即回归)。进程紧接着 exit(1),fd1 无需恢复。
+    // 无 dup2/dup3 的目标(wasi/windows)维持既有静默:宁可不报,不可写进 stdout。
+    //
+    // _uncaught_reported 重入位:诊断自身再抛(属性 getter、堆损坏等)会重进
+    // _throw_unwind → 本函数,此时直接返回,绝不递归回抛出路径。
+    // _exception_value 为 0(未写/损坏)时退化成 "Uncaught exception"。
+    generateUncaughtReport() {
+        const vm = this.vm;
+        const retLabel = "_uncaught_report_ret";
+
+        vm.label("_uncaught_report");
+        vm.prologue(16, [VReg.S0]);
+
+        vm.lea(VReg.V0, "_uncaught_reported");
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne(retLabel);
+        vm.movImm(VReg.V1, 1);
+        vm.store(VReg.V0, 0, VReg.V1);
+
+        if (this.os === "macos" || this.os === "linux") {
+            // fd1 → fd2(linux-arm64 无 dup2,用 dup3(oldfd,newfd,0);
+            // macOS 号需 Unix 类前缀 0x2000000,与既有 exit/write 同一约定)
+            vm.movImm(VReg.A0, 2);
+            vm.movImm(VReg.A1, 1);
+            vm.movImm(VReg.A2, 0);
+            if (this.os === "linux") {
+                vm.syscall(this.arch === "arm64" ? 24 : 33);
+            } else {
+                vm.syscall(this.arch === "arm64" ? 90 : 0x200005a);
+            }
+
+            vm.lea(VReg.V0, "_exception_value");
+            vm.load(VReg.S0, VReg.V0, 0);
+            vm.cmpImm(VReg.S0, 0);
+            vm.jeq("_uncaught_report_bare");
+
+            vm.lea(VReg.A0, this.vm.asm.addString("Uncaught "));
+            vm.call("_print_str_no_nl");
+            vm.mov(VReg.A0, VReg.S0);
+            vm.call("_print_value_no_nl");
+            vm.call("_print_nl");
+            vm.jmp(retLabel);
+
+            vm.label("_uncaught_report_bare");
+            vm.lea(VReg.A0, this.vm.asm.addString("Uncaught exception"));
+            vm.call("_print_str"); // 带换行
+        }
+
+        vm.label(retLabel);
+        vm.epilogue([VReg.S0], 16);
     }
 
     // 辅助：把裸对象（存于 SP+spOff）的 key 属性设为装箱字符串 value。
@@ -1039,6 +1103,11 @@ export class ProcessGenerator {
         // throw 无本地 label 时 _throw_unwind 按链头恢复寄存器跳 catchPC。
         // 帧住在栈上 → 无深度上限,递归 try 天然安全。
         asm.addDataLabel("_exc_ctx_top");
+        asm.addDataQword(0);
+
+        // 未捕获诊断的重入位(见 _uncaught_report)。0 = 未报告,1 = 已报告:
+        // 报告过程本身再抛时直接退出,不递归回 _throw_unwind。
+        asm.addDataLabel("_uncaught_reported");
         asm.addDataQword(0);
 
         // Default platform/arch strings for __get_process() fallback

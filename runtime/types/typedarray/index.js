@@ -18,7 +18,7 @@
 // +16: 原始数据缓冲区
 
 import { VReg } from "../../../vm/registers.js";
-import { TYPE_ARRAY_BUFFER, TYPE_DATA_VIEW, TYPE_INT8_ARRAY, TYPE_INT16_ARRAY, TYPE_INT32_ARRAY, TYPE_INT64_ARRAY, TYPE_UINT8_ARRAY, TYPE_UINT16_ARRAY, TYPE_UINT32_ARRAY, TYPE_UINT64_ARRAY, TYPE_UINT8_CLAMPED_ARRAY, TYPE_FLOAT32_ARRAY, TYPE_FLOAT64_ARRAY } from "../../core/types.js";
+import { TYPE_ARRAY, TYPE_ARRAY_BUFFER, TYPE_DATA_VIEW, TYPE_INT8_ARRAY, TYPE_INT16_ARRAY, TYPE_INT32_ARRAY, TYPE_INT64_ARRAY, TYPE_UINT8_ARRAY, TYPE_UINT16_ARRAY, TYPE_UINT32_ARRAY, TYPE_UINT64_ARRAY, TYPE_UINT8_CLAMPED_ARRAY, TYPE_FLOAT32_ARRAY, TYPE_FLOAT64_ARRAY } from "../../core/types.js";
 
 // 重新导出类型常量
 export { TYPE_INT8_ARRAY, TYPE_INT16_ARRAY, TYPE_INT32_ARRAY, TYPE_INT64_ARRAY, TYPE_UINT8_ARRAY, TYPE_UINT16_ARRAY, TYPE_UINT32_ARRAY, TYPE_UINT64_ARRAY, TYPE_UINT8_CLAMPED_ARRAY, TYPE_FLOAT32_ARRAY, TYPE_FLOAT64_ARRAY };
@@ -121,10 +121,32 @@ export class ArrayBufferGenerator {
     }
 
     // _arraybuffer_bytelength(buf) -> byteLength
+    // [guard] 仅当实参确实是 ArrayBuffer 块时读 byteLength@8;否则返 0。
+    // 原实现无条件 `load [A0+8]`:`new DataView(5)` 的缺省 byteLength 计算把 NaN-boxed
+    // 双精度(高16=0x4014)当地址解引用 → SIGSEGV(test262 TA/DataView 崩溃簇)。
+    // 判据:tag ∈ {0(裸指针), 0x7FFD(装箱对象)} 且脱壳后 >4095(挡小整数/空页)
+    // 且头字节 == TYPE_ARRAY_BUFFER。
     generateByteLength() {
         const vm = this.vm;
+        const MASK = 0x0000ffffffffffffn;
         vm.label("_arraybuffer_bytelength");
-        vm.load(VReg.RET, VReg.A0, 8);
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_abl_ptr");
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jne("_abl_zero");
+        vm.label("_abl_ptr");
+        vm.movImm64(VReg.V1, MASK);
+        vm.and(VReg.V0, VReg.A0, VReg.V1);
+        vm.cmpImm(VReg.V0, 4095);
+        vm.jle("_abl_zero");
+        vm.loadByte(VReg.V1, VReg.V0, 0);
+        vm.cmpImm(VReg.V1, TYPE_ARRAY_BUFFER);
+        vm.jne("_abl_zero");
+        vm.load(VReg.RET, VReg.V0, 8);
+        vm.ret();
+        vm.label("_abl_zero");
+        vm.movImm(VReg.RET, 0);
         vm.ret();
     }
 
@@ -195,9 +217,23 @@ export class ArrayBufferGenerator {
         vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
         vm.mov(VReg.S1, VReg.A1); // byteOffset
         vm.mov(VReg.S2, VReg.A2); // byteLength
-        // buf.data_ptr@16(buf 高 16=0 裸指针,mask 保险)
+        // [guard] spec 25.3.2.1 步骤 2/3:第一实参不是 ArrayBuffer 就抛 TypeError。
+        // 原实现直接 `load [buf&MASK+16]` 当 data_ptr:`new DataView({})` / `new DataView(5)` /
+        // `new DataView(ta)` 读到垃圾地址,随后 get/set 越界写 → SIGSEGV。
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_dvn_ptr");
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jne("_dvn_type");
+        vm.label("_dvn_ptr");
         vm.movImm64(VReg.V1, MASK);
         vm.and(VReg.V0, VReg.A0, VReg.V1);
+        vm.cmpImm(VReg.V0, 4095);
+        vm.jle("_dvn_type");
+        vm.loadByte(VReg.V1, VReg.V0, 0);
+        vm.cmpImm(VReg.V1, TYPE_ARRAY_BUFFER);
+        vm.jne("_dvn_type");
+        // buf.data_ptr@16
         vm.load(VReg.S3, VReg.V0, 16);
         vm.movImm(VReg.A0, 32);
         vm.call("_alloc");
@@ -207,6 +243,12 @@ export class ArrayBufferGenerator {
         vm.store(VReg.RET, 16, VReg.S1); // byteOffset
         vm.store(VReg.RET, 24, VReg.S2); // byteLength
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
+        vm.label("_dvn_type");
+        vm.lea(VReg.A0, vm.asm.addString("First argument to DataView constructor must be an ArrayBuffer"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error"); // 不返回
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32); // 理论不达
     }
 
     // _dataview_get(dv, byteOffset, size, flags, le) -> canonical number。
@@ -1207,8 +1249,19 @@ export class TypedArrayGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
     }
 
-    // _ta_set(ta, src, offset) -> undefined。src(装箱普通/typed 数组)逐元素写入 ta[offset+i]
-    // (经 _subscript_get 取 src[i]、_typed_array_set 按类型强转存)。
+    // _ta_set(ta, src, offset) -> undefined。src(装箱普通/typed 数组/array-like)逐元素写入
+    // ta[offset+i](经 _subscript_get 取 src[i]、_typed_array_set 按类型强转存)。
+    //
+    // [spec 23.2.3.26 守卫] 原实现无条件把 src 脱壳后当块读 srcLen@8:
+    //   `ta.set(undefined)` / `ta.set(null)` → 脱壳得 0 → load [0+8] → SIGSEGV
+    //   (test262 built-ins/TypedArray/prototype/set/array-arg-return-abrupt-from-toobject-offset.js
+    //    的崩溃根因);`ta.set(3)` 把 NaN-boxed 双精度当地址解引用同样崩。
+    // 现按规范:
+    //   步骤 3   offset < 0                       → RangeError
+    //   步骤 15  ToObject(undefined|null)         → TypeError
+    //   srcLen:数组/TypedArray → 头 length@8;装箱对象 → ToLength(obj.length);
+    //           其余原始值(number/bool/string/symbol)→ 0(ToObject 成功但无 length,no-op)
+    //   步骤 17  srcLen + offset > ta.length      → RangeError
     generateSetMethod() {
         const vm = this.vm;
         const MASK = 0x0000ffffffffffffn;
@@ -1218,9 +1271,61 @@ export class TypedArrayGenerator {
         vm.and(VReg.S0, VReg.A0, VReg.V1); // 裸 ta
         vm.mov(VReg.S1, VReg.A1);          // src(装箱)
         vm.mov(VReg.S2, VReg.A2);          // offset
-        // srcLen = [src&MASK + 8]
+        // [步骤 3] offset < 0 → RangeError
+        vm.cmpImm(VReg.S2, 0); vm.jlt("_tas_range");
+        // ---- srcLen 判别(按 NaN-boxing tag) ----
+        vm.shrImm(VReg.V0, VReg.S1, 48);
+        vm.cmpImm(VReg.V0, 0x7FFB); vm.jeq("_tas_type");   // undefined → TypeError
+        vm.cmpImm(VReg.V0, 0x7FFA); vm.jeq("_tas_type");   // null → TypeError
+        vm.cmpImm(VReg.V0, 0x7FFE); vm.jeq("_tas_len8");   // 普通数组 → length@8
+        vm.cmpImm(VReg.V0, 0x7FFD); vm.jeq("_tas_obj");    // 装箱对象 → obj.length
+        vm.cmpImm(VReg.V0, 0); vm.jeq("_tas_raw");         // 裸指针 → 验头
+        vm.movImm(VReg.S3, 0); vm.jmp("_tas_lenok");       // 其余原始值 → 空源(no-op)
+        // 裸指针:0 视作 null;仅 TYPE_ARRAY / TypedArray 族头才有 length@8
+        vm.label("_tas_raw");
+        vm.cmpImm(VReg.S1, 4095); vm.jle("_tas_type");     // 空页/小整数误当指针 → TypeError
+        vm.loadByte(VReg.V1, VReg.S1, 0);
+        vm.cmpImm(VReg.V1, TYPE_ARRAY); vm.jeq("_tas_len8");
+        vm.cmpImm(VReg.V1, TYPE_INT8_ARRAY); vm.jlt("_tas_len0");
+        vm.cmpImm(VReg.V1, TYPE_FLOAT64_ARRAY); vm.jgt("_tas_len0");
+        vm.jmp("_tas_len8");
+        vm.label("_tas_len0");
+        vm.movImm(VReg.S3, 0); vm.jmp("_tas_lenok");
+        vm.label("_tas_len8");
         vm.movImm64(VReg.V1, MASK); vm.and(VReg.V0, VReg.S1, VReg.V1);
         vm.load(VReg.S3, VReg.V0, 8);      // srcLen
+        vm.jmp("_tas_lenok");
+        // 装箱对象:array-like → ToLength(obj.length)(缺失/负 → 0)
+        vm.label("_tas_obj");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.A1, vm.asm.addString("length"));
+        vm.movImm64(VReg.V1, MASK); vm.and(VReg.A1, VReg.A1, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_syscall_arg");           // RET = 裸 int
+        vm.mov(VReg.S3, VReg.RET);
+        vm.cmpImm(VReg.S3, 0); vm.jge("_tas_lenok");
+        vm.movImm(VReg.S3, 0);
+        // [步骤 17 · 记偏差] 规范此处对 srcLen + offset > ta.length 抛 RangeError;这里改为把
+        // srcLen 夹到 (ta.length - offset)。原因:今天 `ta.buffer` 在**动态构造**的 TypedArray
+        // 上返回 undefined(compiler/expressions/members.js 的 .buffer 派发要求静态
+        // inferObjectType==="TypedArray",闭包参数上推不出 → 落 _object_get → undefined),
+        // 于是 `new TA(ta2.buffer)` 得到长度 0 的空数组;真抛 RangeError 会把这类**本应通过**的
+        // 用例(test262 set/BigInt/typedarray-arg-target-byteoffset-internal.js)误判为抛错。
+        // 夹取同时保证循环上界 <= ta.length —— 否则 array-like 的 length 返回巨大值时会跑成
+        // 超时(set/array-arg-return-abrupt-from-src-length.js 等)。越界写本身另有
+        // _typed_array_set 的 bounds 守卫静默丢弃(内存安全)。
+        // 待 .buffer 动态派发修好后应改回抛 RangeError。
+        vm.label("_tas_lenok");
+        vm.load(VReg.V0, VReg.S0, 8);      // ta.length
+        vm.sub(VReg.V0, VReg.V0, VReg.S2); // avail = length - offset
+        vm.cmp(VReg.S3, VReg.V0); vm.jle("_tas_clamped");
+        vm.mov(VReg.S3, VReg.V0);
+        vm.label("_tas_clamped");
+        vm.cmpImm(VReg.S3, 0); vm.jge("_tas_lenok2");
+        vm.movImm(VReg.S3, 0);
+        vm.label("_tas_lenok2");
         vm.movImm(VReg.S4, 0);             // i
         vm.label("_tas_loop");             // 注意:避开 _typed_array_set 的 _ta_set_* 标签(碰撞会毁控制流)
         vm.cmp(VReg.S4, VReg.S3); vm.jge("_tas_done");
@@ -1232,6 +1337,15 @@ export class TypedArrayGenerator {
         vm.label("_tas_done");
         vm.lea(VReg.RET, "_js_undefined"); vm.load(VReg.RET, VReg.RET, 0);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+        vm.label("_tas_type");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot convert undefined or null to object"));
+        vm.movImm64(VReg.V1, MASK); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error"); // 不返回
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0); // 理论不达
+        vm.label("_tas_range");
+        vm.call("_ta_throw_range");   // RangeError,不返回
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0); // 理论不达
     }
 
     // _ta_elem_size(ta) -> 元素字节数(裸 int)。按 type 字节:1字节(0x40/0x50/0x54)、

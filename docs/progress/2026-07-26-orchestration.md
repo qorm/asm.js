@@ -251,6 +251,67 @@ FAIL/COMPILE_FAIL 聚类(4378 重跑):
 
 W-A1(subscript.js)+ W-3(members.js/functions.js)互斥,apply 到 dev,**权威门禁绿:gen1==gen2==gen3 + fixtures 380/380**。**test262 stride-5:1979/6462 = 30.63%(28.51%→30.63%,+137 PASS)**,CRASH 235→236(持平)。错误构造器修复在全量的收益远超测量片 +43(assert.throws 遍布全套)。
 
+## Wave 4 派发(2026-07-26,承接"继续推进",基线 bcd97f2 / v0.2.4)
+
+三批并行,文件互斥,均禁用 `git stash`:
+
+| Agent | 拥有文件 | 任务 | FP 风险 |
+|---|---|---|---|
+| **W-4** | runtime/core/jsvalue.js, compiler/expressions/members.js, compiler/functions/functions.js | **本阶段最大杠杆**:通用函数调用运行时 helper `_fn_apply`(复用 jsvalue.js:679 既有 magic 分派 invoker + `_bound_tramp` 绑定闭包布局)+ `Function.prototype.call/apply` 一等值化 → 解锁 propertyHelper.js(~682 测试);若前两步定点绿再扩 NamespaceStaticRef 的 `Object.*` | FP-sensitive(须 in-worktree 过定点链) |
+| **W-5** | runtime/types/typedarray/index.js | TypedArray 剩余 41 崩溃(原型方法/harness 簇:copyWithin/every/filter/findIndex 经 testWithTypedArrayConstructors)聚类归因 + 修头部根因 | FP-safe |
+| **W-6** | runtime/node/buffer.js | 全局 `Buffer.from(string)` 原生崩溃(import 形式正常)根因定位 + 修;根因若在范围外(编译器全局标识符解析/模块 shim 接线)则只出精确诊断不越界改 | FP-safe |
+| **W-7** | runtime/core/process.js, runtime/core/print.js | 未捕获异常零诊断(`_throw_unwind_exit` 裸 exit(1))→ 输出 `Uncaught <Name>: <message>` 到 **fd 2**(不污染 stdout,fixtures 比对 stdout) | FP-safe |
+
+**W-6 完成**(2026-07-26,**诊断型交付,拒绝越界改**):根因**不在** runtime/node/buffer.js,而在编译器:
+- `compiler/index.js:1823` `_injectImplicitGlobalImports` 的 `IMPLICIT_GLOBALS` 表**遗漏 `Buffer`**(仅有 URL/URLSearchParams/btoa/atob),故不注入合成 import,buffer.js 根本不进模块图。
+- `compiler/expressions/members.js:607` `compileIdentifier` 兜底把无法解析的名字编成 `movImm(RET, 0)`,于是全局 `Buffer` === 裸整数 0,与未声明标识符不可区分(实测 `typeof Buffer` → "number",与 `typeof Zork` 同)。
+- 症状非 SIGSEGV,而是 `TypeError: not a function` 被运行时**静默吞掉**(见下 W-7)。仓库自身 `compiler/index.js:13` 早有绕行注释"全局 Buffer 在编译产物里解析有问题,具名导入才拿到真实类"——本次定位了该注释背后的真因。
+- 七种全局形式(from(str)/alloc/from([..])/concat/isBuffer/hex/new Buffer)同一根因全坏;`new Buffer(n)` 最险:不抛错,静默产出空对象 → 数据静默错误。
+- **主控已采纳其一行修复并自行 apply + 门禁**:`IMPLICIT_GLOBALS` 加 `Buffer: "buffer"`。实测七种形式与 Node 逐字一致,遮蔽保护仍在(用户自定义 `class Buffer` 仍优先),**gen1==gen2==gen3 + fixtures 380/380 通过**。
+
+**W-7 完成**(2026-07-26):未捕获异常现输出 `Uncaught <Name>: <message>` 到 stderr 后再 exit 1。实现要点(process.js,print.js 未改):`_throw_unwind_exit` 前 call 新 `_uncaught_report`(:625-681);**复用既有整条打印链**(`_print_value_no_nl` 已把 `__asmjs_err` 品牌对象经 `_error_to_str` 渲染为 "name: message"),因该链硬编码 fd 1 且无可参数化入口,故用 `dup2(2,1)` 把 fd 1 重定向到 stderr(进程随即退出,无需还原)——**未新写也未复制格式化器**(遵守去重铁律);`_uncaught_reported` 重入位保证报告自身若再抛不递归回抛出路径;`_exception_value==0` 降级为 `Uncaught exception`;wasi/windows 无 dup2 保持静默(宁可无诊断也不污染 stdout)。
+- 实测覆盖:Error/TypeError/RangeError/子类/裸值(42/"str"/{}/数组/undefined)/generator throw/穿 finally/message getter 抛错(不挂不递归)/`({}).f()` 分诊原案 → `Uncaught TypeError: not a function`。
+- **流分离已由主控独立复验**:`2>/dev/null` 只剩 `x`,`1>/dev/null` 只剩 `Uncaught RangeError: r`,两者 exit 1。fixtures 380/0(无 stdout 比对 fixture 受影响)。
+- 遗留(范围外,预存):spawned coroutine 逃逸异常走 `runtime/async/coroutine.js:1093`,打印 `panic: ...` 到 **stdout**,同样污染问题,待后续单独处理。
+
+**主控集成**(Buffer 全局修复 + W-7):**gen1==gen2==gen3 + fixtures 380/380 通过**。
+
+**W-5 完成**(2026-07-26,取证型交付):把 41 个 TypedArray SIGSEGV 的崩溃 PC 逐一符号化(编译器 `asm.labels` + Mach-O `__text` vmaddr 建映射)后全部归因:
+
+| 簇 | 根因 | 数量 | faulting symbol |
+|---|---|--:|---|
+| **A** | **`typeof <未声明全局>` 返回 "number" 而非 "undefined"** → harness `testTypedArray.js` 的 `if (typeof Float16Array !== "undefined")` 探测把垃圾值 push 进构造器表,随后 `new Float16Array(...)` 在 `compileDynamicNew` 解引用 NULL | **35** | `_dnew_notcl+0x8` |
+| B | `%TypedArray%.prototype.lastIndexOf` 不在编译器 TA 方法表 → 落到 `_array_lastIndexOf` 按普通数组 `data_ptr@24` 走 typed 布局 | 2 | `_array_lastIndexOf_loop+0x18` |
+| C | `_object_has`(hasOwnProperty/`in`)无 TypedArray 守卫:把 TA `length@8` 当 count、TA 内联数据当 `props_ptr@32`,**把元素值当指针解引用**(fault addr `0x4044800000000000` 即 float64 的 41.0) | 2 | `_object_has_loop+0x18` |
+| D | `%TypedArray%.prototype.set(nullish/primitive)` — `_ta_set` 无条件读 `srcLen` | 1 | `_ta_set+0x44` |
+| E | `Object.getPrototypeOf([][Symbol.iterator]())` | 1 | `_object_getPrototypeOf_tag_ok+0x40` |
+
+**关键收敛**:簇 A(35/41)与 W-6 的 Buffer 根因**同源**——均为 `compileIdentifier` 对无法解析名字兜底 `movImm(RET,0)`;A4 的 FAIL 分析亦列 `typeof 未声明→"number"` 为跨切廉价 bug。三路独立分析指向同一处编译器缺陷。
+
+W-5 范围内只有簇 D 可修,已修 3 项(`_ta_set` 规范守卫 tag 分派 nullish→TypeError/offset<0→RangeError;`_dataview_new` 接收者守卫;`_arraybuffer_bytelength` 守卫)。fixtures 380/0;TypedArray CRASH 42→41(仅 −1,**因簇 A 掩盖全部信用**)。W-5 用**受控 what-if 实验**证明其修复真实:文本移除 harness 的 Float16Array push(模拟正确 typeof)后,HEAD 为 10 PASS/11 CRASH,带其补丁为 **11 PASS/10 CRASH**——`set/array-arg-return-abrupt-from-toobject-offset.js` 成为真 PASS。
+- 自觉规范偏差(已注释):`_ta_set` 对 srcLen **clamp** 而非溢出抛 RangeError,因 `ta.buffer` 在动态构造 TA 上返回 undefined(编译器 `.buffer` 分派需静态 `inferObjectType`),真抛会使一测试 PASS→FAIL;完全不设界则两测试 FAIL→CRASH(array-like length getter 返巨值致无界循环)。clamp 是唯一零回退变体,且越界写已被 `_typed_array_set` 边界守卫丢弃,内存安全不受损。
+
+**W-8 派发**(承接 W-5 的"最大剩余杠杆"):runtime/types/object/index.js 的 `_object_get_ptrscan` / `_object_has_loop` 加非属性容器(TypedArray/DataView/ArrayBuffer)类型字节守卫。W-5 抽样 8/37 个 DataView 崩溃全部是同一 `_object_get_ptrscan+0xc`,预计覆盖 ~37 DataView + 2 TypedArray 崩溃。
+
+**待 W-4 返回后处理**(需 members.js,当前 W-4 持有):`typeof 未声明标识符` → "undefined"(**35 崩溃 + 全套特性探测解毒**,最高优先)、`compileDynamicNew` 非构造器守卫(expressions.js:1782)。
+
+**W-4 完成**(2026-07-26,**本阶段最大杠杆,已过定点链**):**propertyHelper.js 现完整加载**。
+- 通用函数调用 helper(jsvalue.js:882-1039,新 `generateFnProtoInvoke`):`_fp_call_tramp`(参数下移一格 + argc 重算 + 尾槽填 undefined,避免调用点残留垃圾)、`_fp_apply_tramp`(从装箱数组读入 5 槽)、二者 `jmp` 汇入**单一共享分派点** `_fn_invoke_tail`(复用 `_validate_callable` 守卫,按 magic 分派同 `_bound_tramp`/`_aref_invoke_cb`)——**未复制任何大 codegen 方法**(遵守铁律)。ABI 参数窗 A0-A4,故 `.call` 最多转发 4 参、`.apply` 最多 5 参(与既有 `_bound_tramp` 同类截断)。
+- `Function.prototype.call/apply` 一等值化(members.js:1030-1054,memoized 槽 + 静态原型链守卫 + 遮蔽检查);`NamespaceStaticRef` 扩 `Object.getOwnPropertyDescriptor/create/freeze` + `Array.prototype.push`(propertyHelper 在步骤 2 后正好死在这行)。
+- 两处崩溃守卫(修其自测出的 8 例 FAIL→SIGSEGV 新回退,收回 7 例):`_fn_invoke_tail` 接收者卫生(裸标识符 `Object`/`Array`/`Function` 编译成裸哨兵 1/2/3,与堆指针不可区分,下游解引用地址 2 段错;仅在此新路径归一为 undefined)、`_fpg_arr_push` tag 检查。
+- 保守放弃:`Object.defineProperty` 作值(无通用运行时 helper,编译期从描述符字面量分解,唯一运行时入口是 proxy trap 路径;写一个超出许可文件范围)、`Function.prototype.bind` 作值(需运行时合成绑定闭包,propertyHelper 不需要;`f.bind(...)` 调用形式不受影响且已验证)。
+- 数字:`built-ins/Object,Math,Array --stride 5` **452→504(+52,33.68%→37.56%)**,其中 Object 149→201;广扫 `--stride 20`(含 language/)**490→517(+27),0 PASS 回退,0 新崩溃**。fixtures 380/0,**FIXED_POINT OK(gen1==gen2==gen3)**。
+- 残留:`defineProperty/15.2.3.6-4-581.js` FAIL→CRASH,已独立复现为 `obj[name]`(变量键)读装箱原始值接收者段错,属 subscript.js 范畴、超范围;此前被 propertyHelper 加载即死所掩盖。
+
+**W-8 完成**(2026-07-26,命中预测):**DataView CRASH 37→0**,`built-ins/Object` 逐位相同(零回退)。
+- 根因三处同源:`_object_get` 的类型字节黑名单**独缺 `TYPE_DATA_VIEW`(14)**(DataView 块 32B `[type@0,data_ptr@8,byteOffset@16,byteLength@24]`,块尾恰为 32,故 `props_ptr@32` 读到**相邻块**、`count@8` 读到 data_ptr 天文值,Phase-A 指针扫描解引用野指针);`_object_has` 只守 `TYPE_ARRAY`(TypedArray 上把 `length@8` 当 count、内联元素数据当 `props_ptr`,把元素**值**当指针传给 `_object_key_eq`);`_prop_in` 同一个洞。
+- 改法:模块头补齐具名常量 `TYPE_MAP/SET/ARRAY_BUFFER/DATA_VIEW/TA_LO/TA_HI`(**呼应 A1 的 R1 布局常量单一事实源建议**);`_object_get` 加 DataView 冷分支(`byteLength`/`byteOffset` 读 @24/@16,其余键落 notfound → undefined);`_object_has`/`_prop_in` 拆出共享索引路径并把 TypedArray 纳入,Map/Set/ArrayBuffer/DataView/Symbol 一律返 false。**无新增抛出,普通对象与 Proxy 路径逐字节不变**。
+- 数字:DataView PASS 8→13/CRASH **37→0**;Object 143→143 CRASH 8→8(逐位相同);TypedArray 13/42 不变。fixtures 380/0。
+- 诚实报告:TypedArray CRASH 未降(该 stride 下 42 例全是 prototype 方法故障,属 W-5 领域;分诊预估的"~2 例 hasOwnProperty 故障"在此样本未出现,但其 TA 半边已由 repro 证明)。`dv.buffer` 仍 undefined(DataView 块不存源 ArrayBuffer 引用,需加第 5 槽的布局变更,超出"加守卫不重构"授权)。`"toString" in o` 返 false 为预存缺陷(Object.prototype 不在运行时原型链上),与本次无关。
+
+**主控集成 W-5+W-4+W-8**:**gen1==gen2==gen3 + fixtures 380/380 通过**。
+- 注:首次全量测量因中途 apply W-8(每个用例现编译,源码变动会污染结果)已主动中止,重跑一次干净测量。
+
 ## 发版 v0.2.4(2026-07-26)
 
 cli.js 0.2.3→0.2.4;CHANGELOG 加 v0.2.4;版本 bump 后重跑门禁仍绿;提交 ff81f63;tag v0.2.4;**dev 与 main 双分支 + tag 均推送 qorm**(吸取上次 main 漏推教训,本次同步双分支)。
