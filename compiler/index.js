@@ -1429,11 +1429,22 @@ export class Compiler {
         // 已显式 import __regexp_shim 的模块不重复注入。编译器自身源码刻意无正则字面量
         // 且不含 RegExp 构造文本 → 自举不注入(ASMJS_SHIM_DEBUG=1 可验证)。
         // (检测串拆开拼接,免得本文件自己命中。)
+        // 调用形式 `RegExp(p, f)`(无 new,ES 规范等价于 new RegExp)由 functions.js
+        // 改派成 __RE_new,但此前无注入触发词 → shim 未链入,构造既不校验也不抛错
+        // (RegExp("(", "u") 静默不抛、.exec 全 undefined)。故追加调用形式触发。
+        // 不用裸 indexOf("RegExp("):那会命中注释/字符串里的 "RegExp(" 文本(编译器
+        // 自身 types.js / functions.js 的注释里就有)以及 myRegExp( 这类标识符后缀,
+        // 让完全不用正则的程序白链入整个 regexp shim(纯体积损失)。改为
+        // sourceHasRegExpCall:手写扫描(§1.6 禁正则),跳过字符串/模板文本/注释,
+        // 只在代码位置按**整词**匹配 RegExp + 空白* + "("。放在 || 末位,故仅当前面
+        // 三个廉价触发词都不命中时才扫描(此时源码必无正则字面量,"/" 一律按除法/
+        // 注释处理是安全的)。
         const reCtorText = "new Reg" + "Exp(";
         const reEscText = "RegExp" + ".escape";
         if (filePath.indexOf("__regexp_shim.js") === -1 &&
             src.indexOf("__regexp_shim") === -1 &&
-            (src.indexOf(reCtorText) !== -1 || src.indexOf(reEscText) !== -1 || sourceHasRegexLiteral(src))) {
+            (src.indexOf(reCtorText) !== -1 || src.indexOf(reEscText) !== -1 ||
+             sourceHasRegexLiteral(src) || sourceHasRegExpCall(src))) {
             const inj = 'import { __RE_new, __RE_test, __RE_exec, __RE_match, __RE_matchAll, __RE_replace, __RE_split, __RE_escape, __RE_search, __RE_toString } from "__regexp_shim";\n';
             src = injectShimImport(src, inj);
             if (process.env.ASMJS_SHIM_DEBUG) {
@@ -3436,6 +3447,113 @@ function scanRegexLiteralBody(src, i) {
         else if (c === 47 && !inClass) return any; // 闭合(体非空;// 已被注释分支排除)
         any = true;
         j++;
+    }
+    return false;
+}
+
+// 源码是否含**调用形式**的 RegExp(...)(无 new)。手写扫描,不用正则(§1.6);
+// 只在「代码位置」按整词匹配,故:
+//   - myRegExp( / xRegExp( 不命中(标识符整词读出后比较,天然带词边界);
+//   - 注释与字符串/模板文本里的 "RegExp(" 不命中(编译器自身 types.js、
+//     functions.js 的中文注释里就有这串,裸 indexOf 会让自举白注入 shim);
+//   - 模板替换 ${...} 内部按代码扫(`${RegExp("a")}` 仍命中,漏报比误报更糟)。
+// `new RegExp(` 也会命中,但那条路径已被 reCtorText 覆盖,重复无害。
+// 调用点仅在源码无正则字面量时才到达(见 readModuleSource 的 || 顺序),故
+// "/" 一律按行注释/块注释/除法处理,不必再做正则字面量启发式。
+function sourceHasRegExpCall(src) {
+    const target = "Reg" + "Exp"; // 拆开拼接:免得本文件自己命中
+    const n = src.length;
+    let i = 0;
+    let inTplText = false;  // 正在扫模板字面量的文本部分(非 ${} 内)
+    const tplBrace = [];    // 每层 ${ 起始时的花括号深度,用于识别配对的 }
+    let brace = 0;
+    if (src.charCodeAt(0) === 35 && src.charCodeAt(1) === 33) { // shebang 行跳过
+        while (i < n && src.charCodeAt(i) !== 10) i++;
+    }
+    while (i < n) {
+        const c = src.charCodeAt(i);
+        if (inTplText) {
+            if (c === 92) { i += 2; continue; } // 转义
+            if (c === 96) { inTplText = false; i++; continue; } // ` 收尾
+            if (c === 36 && i + 1 < n && src.charCodeAt(i + 1) === 123) { // ${
+                inTplText = false;
+                tplBrace.push(brace);
+                brace++;
+                i += 2;
+                continue;
+            }
+            i++;
+            continue;
+        }
+        if (c === 96) { inTplText = true; i++; continue; } // 模板起始
+        if (c === 39 || c === 34) { // ' "
+            const q = c;
+            i++;
+            while (i < n) {
+                const d = src.charCodeAt(i);
+                if (d === 92) { i += 2; continue; }
+                if (d === q) break;
+                if (d === 10) break; // 普通串不跨行
+                i++;
+            }
+            i++;
+            continue;
+        }
+        if (c === 47) { // '/'
+            const c2 = i + 1 < n ? src.charCodeAt(i + 1) : 0;
+            if (c2 === 47) { // 行注释
+                i += 2;
+                while (i < n && src.charCodeAt(i) !== 10) i++;
+                continue;
+            }
+            if (c2 === 42) { // 块注释
+                i += 2;
+                while (i + 1 < n && !(src.charCodeAt(i) === 42 && src.charCodeAt(i + 1) === 47)) i++;
+                i += 2;
+                continue;
+            }
+            i++; // 除法
+            continue;
+        }
+        if (c === 123) { brace++; i++; continue; }
+        if (c === 125) {
+            brace--;
+            if (tplBrace.length > 0 && tplBrace[tplBrace.length - 1] === brace) {
+                tplBrace.pop();
+                inTplText = true; // ${} 收尾,回到模板文本
+            }
+            i++;
+            continue;
+        }
+        if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95 || c === 36) {
+            const s = i;
+            while (i < n) {
+                const d = src.charCodeAt(i);
+                if ((d >= 48 && d <= 57) || (d >= 65 && d <= 90) ||
+                    (d >= 97 && d <= 122) || d === 95 || d === 36) i++;
+                else break;
+            }
+            if (i - s === target.length && src.slice(s, i) === target) {
+                let j = i;
+                while (j < n) { // 允许 RegExp ( 之间有空白
+                    const w = src.charCodeAt(j);
+                    if (w === 32 || w === 9 || w === 13 || w === 10) j++;
+                    else break;
+                }
+                if (j < n && src.charCodeAt(j) === 40) return true;
+            }
+            continue;
+        }
+        if (c >= 48 && c <= 57) { // 数字:整体跳过,免得 1e5 之类被拆出标识符
+            while (i < n) {
+                const d = src.charCodeAt(i);
+                if ((d >= 48 && d <= 57) || (d >= 65 && d <= 90) ||
+                    (d >= 97 && d <= 122) || d === 95 || d === 46) i++;
+                else break;
+            }
+            continue;
+        }
+        i++;
     }
     return false;
 }
