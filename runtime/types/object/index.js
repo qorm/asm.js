@@ -3049,7 +3049,8 @@ export class ObjectGenerator {
         // [test262 S1] 类型分派(消 CRASH):非对象目标按规范处理,绝不按 plain 布局解引用
         // count@8/props_ptr(此前 null/数值/数组/串脱壳后读 [垃圾+0] → SIGSEGV)。
         // null/undefined → TypeError;array/string → 索引键 ["0",...];int/bool → 空数组;
-        // object(0x7FFD)/function(0x7FFF)/裸指针(classinfo)→ 原路径。
+        // object(0x7FFD)/裸指针(classinfo)→ 原路径;function(0x7FFF)→ 侧表专路(见
+        // _object_keys_fn:函数无对象头,按 plain 布局解引用即崩)。
         vm.shrImm(VReg.V0, VReg.A0, 48);
         vm.cmpImm(VReg.V0, 0x7FFA); vm.jeq("_object_keys_nullish");
         vm.cmpImm(VReg.V0, 0x7FFB); vm.jeq("_object_keys_nullish");
@@ -3058,13 +3059,13 @@ export class ObjectGenerator {
         // number/bool → 空数组。注意 number 大多是**裸 float 位**(5.0 → high16=0x4014),
         // 不是 0x7FF8 装箱 int——旧"复用空数组路径破坏堆"实为 float 未被分派、掉进 legacy
         // 解引用踩内存(空数组路径本身无辜,bool 实测干净)。判别:0x7FF8(装箱 int/NaN 别名)
-        // /0x7FF9(bool)→ 空;0x7FFD(对象)/0x7FFF(函数)→ 原路径;其余 high16≠0 → 裸
+        // /0x7FF9(bool)→ 空;0x7FFD(对象)→ 原路径;0x7FFF(函数)→ 侧表专路;其余 high16≠0 → 裸
         // float → 空;high16==0 且全零 → float +0.0 → 空;high16==0 且非零 → 裸堆指针
         // (Map/Set/classinfo/Symbol)→ 原路径。
         vm.cmpImm(VReg.V0, 0x7FF8); vm.jeq("_object_keys_empty");
         vm.cmpImm(VReg.V0, 0x7FF9); vm.jeq("_object_keys_empty");
         vm.cmpImm(VReg.V0, 0x7FFD); vm.jeq("_object_keys_legacy");
-        vm.cmpImm(VReg.V0, 0x7FFF); vm.jeq("_object_keys_legacy");
+        vm.cmpImm(VReg.V0, 0x7FFF); vm.jeq("_object_keys_fn");
         vm.cmpImm(VReg.V0, 0); vm.jne("_object_keys_empty"); // 其余非零 high16 = 裸 float
         vm.cmpImm(VReg.A0, 0); vm.jeq("_object_keys_empty"); // 全零 = +0.0
         vm.label("_object_keys_legacy");
@@ -3228,29 +3229,96 @@ export class ObjectGenerator {
         vm.mov(VReg.RET, VReg.S2);
         vm.or(VReg.RET, VReg.RET, VReg.V1);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 0);
+
+        // [W-16] 函数接收者(0x7FFF)专路。函数值**不是** plain 属性容器:脱壳后指向闭包块
+        // {magic@0(0xc105/0xa51c), code_ptr@8, 捕获槽...} 或裸代码指针,既无 count@8 也无
+        // props_ptr@32。此前与 0x7FFD 共用 legacy 路径,把 code_ptr 当 count(天文数字)、把
+        // 块外邻居当 props 数组基址迭代 → 确定性 SIGSEGV(Object.keys(fn) /
+        // Object.getOwnPropertyNames(fn),后者亦是 Object.defineProperties(o, fnAsMap)
+        // desugar 的崩因)。函数的自有具名属性挂在 _closure_props_* 侧表(与 _object_get 的
+        // 0x7FFF 分支同表),故转为枚举侧表 props 普通对象(TYPE_OBJECT,不会再落本分支,
+        // 无递归环);从未写过 fn.x → 侧表 miss → 空数组。
+        vm.label("_object_keys_fn");
+        vm.call("_closure_props_find"); // A0=fn 值 → RET=props(装箱 0x7FFD)/undefined
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_object_keys_empty");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.cmpImm(VReg.S5, 0);
+        vm.jne("_object_keys_fn_own");
+        vm.call("_object_keys");
+        // node 语义:函数的 length/name/prototype 恒 enumerable:false,Object.keys/values/
+        // entries 不含之;侧表是普通对象、无属性特性位,故按名过滤(`Ctor.prototype = {...}`
+        // 的 ES5 构造器写法最常见,不滤则 Object.keys(Ctor) 误出 ['prototype'])。
+        // 全量自有键入口(S5==1,gOPN/Reflect.ownKeys)不过滤。
+        vm.mov(VReg.S0, VReg.RET);      // 源键数组(装箱)
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_length");
+        vm.mov(VReg.S1, VReg.RET);      // len
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.mov(VReg.S2, VReg.RET);      // 裸结果数组
+        vm.movImm(VReg.S3, 0);          // i
+        vm.label("_object_keys_fnf_loop");
+        vm.cmp(VReg.S3, VReg.S1); vm.jge("_object_keys_fnf_done");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_array_get");
+        vm.mov(VReg.S4, VReg.RET);      // key
+        // 非字符串形态的键直接收下,不进 _strcmp(避免拿 tag 位当地址解引用)
+        vm.shrImm(VReg.V0, VReg.S4, 48);
+        vm.cmpImm(VReg.V0, 0x7FFC);
+        vm.jne("_object_keys_fnf_push");
+        for (const nm of ["length", "name", "prototype"]) {
+            vm.mov(VReg.A0, VReg.S4);
+            vm.call("_getStrContent");  // 装箱串 → 内容指针
+            vm.mov(VReg.A0, VReg.RET);
+            vm.lea(VReg.A1, vm.asm.addString(nm));
+            vm.call("_strcmp");
+            vm.cmpImm(VReg.RET, 0);
+            vm.jeq("_object_keys_fnf_next");
+        }
+        vm.label("_object_keys_fnf_push");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_array_push");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.label("_object_keys_fnf_next");
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_object_keys_fnf_loop");
+        vm.label("_object_keys_fnf_done");
+        vm.movImm64(VReg.V1, 0x7FFE000000000000n);
+        vm.mov(VReg.RET, VReg.S2);
+        vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 0);
+        vm.label("_object_keys_fn_own");
+        vm.call("_object_own_keys");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 0);
     }
 
     // Object.getOwnPropertyNames(obj) -> array
     // _object_gopn(obj) -> array
     // [test262 S1] 与 _object_keys 的差异仅在 array/string:索引键之外还含 "length"
     // (node: gOPN([a,b]) = ['0','1','length'],gOPN('ab') = ['0','1','length'])。
-    // null/undefined → TypeError;对象/函数/裸指针/原语 → 委托 _object_keys
-    // (简化模型:所有自有键皆可枚举,gOPN ≡ keys,保持既有近似)。
+    // null/undefined → TypeError;函数 → ['length','name'] + 属性侧表键(见 _object_gopn_fn);
+    // 对象/裸指针/原语 → 委托 _object_own_keys(简化模型:自有键全量,不按 enumerable 过滤)。
     generateObjectGetOwnPropertyNames() {
         const vm = this.vm;
 
         vm.label("_object_gopn");
-        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
 
         vm.shrImm(VReg.V0, VReg.A0, 48);
         vm.cmpImm(VReg.V0, 0x7FFA); vm.jeq("_object_gopn_nullish");
         vm.cmpImm(VReg.V0, 0x7FFB); vm.jeq("_object_gopn_nullish");
         vm.cmpImm(VReg.V0, 0x7FFE); vm.jeq("_object_gopn_arr");
         vm.cmpImm(VReg.V0, 0x7FFC); vm.jeq("_object_gopn_str");
+        vm.cmpImm(VReg.V0, 0x7FFF); vm.jeq("_object_gopn_fn"); // [W-16] 函数:+ length/name
         // 其余形态:委托全量自有键入口(A0 未动)。gOPN 不按 enumerable 过滤:
         // defineProperty(o,k,{enumerable:false}) 的键仍须出现(node 语义)。
         vm.call("_object_own_keys");
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
 
         // null/undefined → TypeError(ToObject 规范)
         vm.label("_object_gopn_nullish");
@@ -3293,7 +3361,83 @@ export class ObjectGenerator {
         vm.movImm64(VReg.V1, 0x7FFE000000000000n);
         vm.mov(VReg.RET, VReg.S2);
         vm.or(VReg.RET, VReg.RET, VReg.V1);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+
+        // [W-16] 函数(0x7FFF):node 的自有键 = ['length','name'(,'prototype')] + 后挂的
+        // 具名属性。_object_own_keys 只能给出 _closure_props_* 侧表里的后挂键,故此处显式
+        // 前置 length/name 再追加侧表键;侧表若已有同名键(如一等 Error 构造器在侧表挂了
+        // .name)则去重,避免 gOPN(TypeError) 出两个 'name'。
+        // **偏差**:不含 'prototype'——运行期无法区分箭头函数(node 无 prototype)与普通
+        // 函数(node 有),宁缺勿多;length/name 只出现在键表,其**值**仍由 _closure_prop_get
+        // 决定(name 有元数据反射,length 为 undefined)。
+        vm.label("_object_gopn_fn");
+        vm.mov(VReg.S0, VReg.A0);       // fn 值
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.mov(VReg.S2, VReg.RET);      // 裸结果数组
+        vm.lea(VReg.A0, vm.asm.addString("length"));
+        vm.call("_cstr_to_heap_str");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_array_push");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.lea(VReg.A0, vm.asm.addString("name"));
+        vm.call("_cstr_to_heap_str");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_array_push");
+        vm.mov(VReg.S2, VReg.RET);
+        // 侧表自有键(无侧表 → 只有 length/name)
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_closure_props_find"); // RET = props(装箱 0x7FFD)/undefined
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_object_gopn_fn_done");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_object_own_keys");    // RET = 装箱键数组(symbol 键已被滤掉)
+        vm.mov(VReg.S0, VReg.RET);      // S0 复用为键数组
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_length");
+        vm.mov(VReg.S1, VReg.RET);      // len
+        vm.movImm(VReg.S3, 0);          // i
+        vm.label("_object_gopn_fn_loop");
+        vm.cmp(VReg.S3, VReg.S1); vm.jge("_object_gopn_fn_done");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_array_get");          // RET = 键
+        vm.mov(VReg.S4, VReg.RET);
+        // 非字符串形态的键(理论上不该出现)直接收下,不进 _strcmp(避免拿 tag 当地址)
+        vm.shrImm(VReg.V0, VReg.S4, 48);
+        vm.cmpImm(VReg.V0, 0x7FFC);
+        vm.jne("_object_gopn_fn_push");
+        vm.mov(VReg.A0, VReg.S4);
+        vm.call("_getStrContent");      // 装箱串 → 内容指针
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, vm.asm.addString("length"));
+        vm.call("_strcmp");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_object_gopn_fn_next"); // 已前置
+        vm.mov(VReg.A0, VReg.S4);
+        vm.call("_getStrContent");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, vm.asm.addString("name"));
+        vm.call("_strcmp");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_object_gopn_fn_next"); // 已前置
+        vm.label("_object_gopn_fn_push");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_array_push");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.label("_object_gopn_fn_next");
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_object_gopn_fn_loop");
+        vm.label("_object_gopn_fn_done");
+        vm.movImm64(VReg.V1, 0x7FFE000000000000n);
+        vm.mov(VReg.RET, VReg.S2);
+        vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
     }
 
     // Object.prototype.toString.call(x) -> "[object Tag]"(品牌串)。tag 依 x 类型;
@@ -3556,7 +3700,7 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.V0, 0x7FF8); vm.jeq("_object_values_empty");
         vm.cmpImm(VReg.V0, 0x7FF9); vm.jeq("_object_values_empty");
         vm.cmpImm(VReg.V0, 0x7FFD); vm.jeq("_object_values_legacy");
-        vm.cmpImm(VReg.V0, 0x7FFF); vm.jeq("_object_values_legacy");
+        vm.cmpImm(VReg.V0, 0x7FFF); vm.jeq("_object_values_fn"); // [W-16] 见 _object_keys_fn
         vm.cmpImm(VReg.V0, 0); vm.jne("_object_values_empty");
         vm.cmpImm(VReg.A0, 0); vm.jeq("_object_values_empty");
         vm.label("_object_values_legacy");
@@ -3702,6 +3846,68 @@ export class ObjectGenerator {
         vm.movImm64(VReg.V1, 0x7FFE000000000000n);
         vm.or(VReg.RET, VReg.RET, VReg.V1);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+
+        // [W-16] 函数接收者(0x7FFF):函数不是 plain 属性容器,按对象头读 count@8/props_ptr@32
+        // 会解引用垃圾 → SIGSEGV。自有属性在 _closure_props_* 侧表 → 枚举侧表 props 对象;
+        // 侧表 miss → 空数组。详注见 _object_keys_fn。走 _object_entries(props) 再取 v,
+        // 是为了能按键名滤掉 length/name/prototype(node 里它们 enumerable:false),
+        // 与 Object.keys(fn) 严格同集合(否则 keys().length !== values().length)。
+        vm.label("_object_values_fn");
+        vm.call("_closure_props_find");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_object_values_empty");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_object_entries");      // RET = 装箱 [[k,v],...]
+        vm.mov(VReg.S0, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_length");
+        vm.mov(VReg.S1, VReg.RET);       // len
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.mov(VReg.S2, VReg.RET);       // 裸结果数组
+        vm.movImm(VReg.S3, 0);           // i
+        vm.label("_object_values_fn_loop");
+        vm.cmp(VReg.S3, VReg.S1); vm.jge("_object_values_fn_done");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_array_get");
+        vm.mov(VReg.S4, VReg.RET);       // pair = [k, v]
+        vm.mov(VReg.A0, VReg.S4);
+        vm.movImm(VReg.A1, 0);
+        vm.call("_array_get");           // key
+        vm.shrImm(VReg.V0, VReg.RET, 48);
+        vm.cmpImm(VReg.V0, 0x7FFC);
+        vm.jne("_object_values_fn_take"); // 非字符串键:直接收下
+        for (const nm of ["length", "name", "prototype"]) {
+            vm.mov(VReg.A0, VReg.S4);
+            vm.movImm(VReg.A1, 0);
+            vm.call("_array_get");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.call("_getStrContent");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.lea(VReg.A1, vm.asm.addString(nm));
+            vm.call("_strcmp");
+            vm.cmpImm(VReg.RET, 0);
+            vm.jeq("_object_values_fn_next");
+        }
+        vm.label("_object_values_fn_take");
+        vm.mov(VReg.A0, VReg.S4);
+        vm.movImm(VReg.A1, 1);
+        vm.call("_array_get");           // value
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_array_push");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.label("_object_values_fn_next");
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_object_values_fn_loop");
+        vm.label("_object_values_fn_done");
+        vm.movImm64(VReg.V1, 0x7FFE000000000000n);
+        vm.mov(VReg.RET, VReg.S2);
+        vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
     }
 
     // Object.entries(obj) -> 返回 [[key, value], ...] 数组
@@ -3723,7 +3929,7 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.V0, 0x7FF8); vm.jeq("_object_entries_empty");
         vm.cmpImm(VReg.V0, 0x7FF9); vm.jeq("_object_entries_empty");
         vm.cmpImm(VReg.V0, 0x7FFD); vm.jeq("_object_entries_legacy");
-        vm.cmpImm(VReg.V0, 0x7FFF); vm.jeq("_object_entries_legacy");
+        vm.cmpImm(VReg.V0, 0x7FFF); vm.jeq("_object_entries_fn"); // [W-16] 见 _object_keys_fn
         vm.cmpImm(VReg.V0, 0); vm.jne("_object_entries_empty");
         vm.cmpImm(VReg.A0, 0); vm.jeq("_object_entries_empty");
         vm.label("_object_entries_legacy");
@@ -3929,6 +4135,64 @@ export class ObjectGenerator {
         vm.movImm(VReg.A0, 0);
         vm.call("_array_new_with_size");
         vm.movImm64(VReg.V1, 0x7FFE000000000000n);
+        vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 16);
+
+        // [W-16] 函数接收者(0x7FFF):函数不是 plain 属性容器,按对象头读 count@8/props_ptr@32
+        // 会解引用垃圾 → SIGSEGV。自有属性在 _closure_props_* 侧表 → 枚举侧表 props 对象;
+        // 侧表 miss → 空数组。详注见 _object_keys_fn。
+        vm.label("_object_entries_fn");
+        vm.call("_closure_props_find");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_object_entries_empty");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_object_entries");      // RET = 装箱 [[k,v],...]
+        // 与 Object.keys(fn) 同集合:滤掉 length/name/prototype(node 里 enumerable:false)
+        vm.mov(VReg.S0, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_length");
+        vm.mov(VReg.S1, VReg.RET);       // len
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.mov(VReg.S2, VReg.RET);       // 裸结果数组
+        vm.movImm(VReg.S3, 0);           // i
+        vm.label("_object_entries_fn_loop");
+        vm.cmp(VReg.S3, VReg.S1); vm.jge("_object_entries_fn_done");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_array_get");
+        vm.mov(VReg.S4, VReg.RET);       // pair
+        vm.mov(VReg.A0, VReg.S4);
+        vm.movImm(VReg.A1, 0);
+        vm.call("_array_get");           // key
+        vm.shrImm(VReg.V0, VReg.RET, 48);
+        vm.cmpImm(VReg.V0, 0x7FFC);
+        vm.jne("_object_entries_fn_take");
+        for (const nm of ["length", "name", "prototype"]) {
+            vm.mov(VReg.A0, VReg.S4);
+            vm.movImm(VReg.A1, 0);
+            vm.call("_array_get");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.call("_getStrContent");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.lea(VReg.A1, vm.asm.addString(nm));
+            vm.call("_strcmp");
+            vm.cmpImm(VReg.RET, 0);
+            vm.jeq("_object_entries_fn_next");
+        }
+        vm.label("_object_entries_fn_take");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_array_push");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.label("_object_entries_fn_next");
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_object_entries_fn_loop");
+        vm.label("_object_entries_fn_done");
+        vm.movImm64(VReg.V1, 0x7FFE000000000000n);
+        vm.mov(VReg.RET, VReg.S2);
         vm.or(VReg.RET, VReg.RET, VReg.V1);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 16);
     }
