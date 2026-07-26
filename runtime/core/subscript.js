@@ -819,6 +819,12 @@ export class SubscriptGenerator {
         // 装箱对象 0x7FFD：读其 "length" 属性（如 Buffer 的 this.length）
         vm.cmpImm(VReg.V0, 0x7FFD);
         vm.jeq("_js_length_object");
+        // [W-27] 装箱函数 0x7FFF:形参个数(规范 length)取自函数元数据侧表。此前落
+        // _js_length_str → _str_length 把闭包指针当串头读 → 0。静态可解析的接收者由
+        // members.js 的 _fnNameLength 编译期答;本分支管**运行期**函数值(形参/成员链/
+        // 数组元素里的函数)的 `f.length`。
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jeq("_js_length_func");
         // 裸堆指针：按头部类型分派
         vm.cmpImm(VReg.V0, 0);
         vm.jne("_js_length_str");
@@ -872,6 +878,29 @@ export class SubscriptGenerator {
 
         vm.label("_js_length_zero");
         vm.movImm(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+
+        // [W-27] 函数值:脱壳得 P;闭包(magic 0xc105/0xa51c)真 code_ptr 在 [P+8],裸函数
+        // 指针即 P。_func_meta_arity 未登记返 -1 —— 本函数契约是**裸整数**长度,无法表达
+        // undefined,故 -1 归 0(与改动前该形态得 0 一致,不回归);要区分「无元数据」与
+        // 「arity 就是 0」的调用方(gOPD)走 _closure_prop_get 而非此处。
+        vm.label("_js_length_func");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V0, VReg.S0, VReg.V1);   // V0 = P
+        vm.load(VReg.V2, VReg.V0, 0);               // [P]
+        vm.cmpImm(VReg.V2, 0xc105); vm.jeq("_js_length_func_clo");
+        vm.cmpImm(VReg.V2, 0xa51c); vm.jeq("_js_length_func_clo");
+        vm.mov(VReg.A0, VReg.V0);
+        vm.jmp("_js_length_func_lk");
+        vm.label("_js_length_func_clo");
+        vm.load(VReg.A0, VReg.V0, 8);
+        vm.label("_js_length_func_lk");
+        vm.call("_func_meta_arity");
+        vm.movImm(VReg.V1, -1);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jne("_js_length_func_done");
+        vm.movImm(VReg.RET, 0);
+        vm.label("_js_length_func_done");
         vm.epilogue([VReg.S0, VReg.S1], 16);
 
         // 对象：读 "length" 属性（S0 = 值，装箱 0x7FFD 或裸对象指针）→ 转原始整数

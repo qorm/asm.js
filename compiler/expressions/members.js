@@ -148,6 +148,31 @@ const MATH_NS_BINARY_REF = {
     pow: "_math_pow",     // (base, exp)
     atan2: "_math_atan2", // (y, x)
 };
+// [W-27 内建函数元数据] memoized 内建闭包(emitMemoizedBuiltinRef)的**规范 length**。
+// 键 = 该 memoize 槽的 slotKey(命名空间前缀 + "_" + 属性名,全局唯一);值 = 规范
+// Function.length。名字不在此表(由调用点的 propName 直接给)。
+// 用途:把内建函数登记进函数元数据侧表(code_ptr = helper 标签),使运行期反射
+// `Math.abs.name === "abs"` / `Math.abs.length === 1` /
+// `verifyProperty(Math.abs, "name", {writable:false,enumerable:false,configurable:true})`
+// 成立——test262 的 */name.js、*/length.js 簇正是这种「先取值到变量再反射」的形态。
+// **表必须与 NamespaceStaticRef / MATH_NS_BINARY_REF / Function.prototype 取值分支同步**:
+// 缺项的 slotKey 一律**不登记**(宁缺勿错:登记了名字却编造 length 会让 length.js 从
+// 「无此属性」变成「值错」,后者更难查)。Math 一元族规范 length 全 1、pow/atan2 为 2。
+const BUILTIN_REF_ARITY = {
+    math_floor: 1, math_ceil: 1, math_trunc: 1, math_round: 1, math_abs: 1,
+    math_sqrt: 1, math_cbrt: 1, math_log: 1, math_log2: 1, math_log10: 1,
+    math_log1p: 1, math_exp: 1, math_expm1: 1, math_sin: 1, math_cos: 1,
+    math_tan: 1, math_asin: 1, math_acos: 1, math_atan: 1, math_sinh: 1,
+    math_cosh: 1, math_tanh: 1, math_asinh: 1, math_acosh: 1, math_atanh: 1,
+    math_fround: 1, math_clz32: 1,
+    math_pow: 2, math_atan2: 2,
+    object_keys: 1, object_values: 1, object_entries: 1,
+    object_getOwnPropertyNames: 1, object_getOwnPropertyDescriptor: 2,
+    object_create: 2, object_freeze: 1,
+    date_now: 0,
+    array_isArray: 1,
+    fnproto_call: 1, fnproto_apply: 2,
+};
 // 内建**方法**数据属性 attrs:writable(1) | configurable(4),enumerable 关闭
 // (规范 17 节:{[[Writable]]:true, [[Enumerable]]:false, [[Configurable]]:true})。
 const BUILTIN_PROP_ATTR = 5;
@@ -320,13 +345,28 @@ export const MemberCompiler = {
     // [内建静态一等值] memoized 内建函数引用:惰性全局槽 _builtinref_<key>(GC 根,
     // _funcclosure_ 模式)缓存 emitBuiltinFnClosure 产的闭包 → `Math.floor === Math.floor`
     // 为 true 且每 builtin 仅建一次。首次执行建闭包存槽,后续直接读。
-    emitMemoizedBuiltinRef(slotKey, runtimeLabel) {
+    emitMemoizedBuiltinRef(slotKey, runtimeLabel, propName) {
         const label = "_builtinref_" + slotKey;
         if (!this._addedBuiltinRefLabels) this._addedBuiltinRefLabels = new Set();
         if (!this._addedBuiltinRefLabels.has(label)) {
             this.asm.addDataLabel(label);
             this.asm.addDataQword(0);
             this._addedBuiltinRefLabels.add(label);
+            // [W-27] 该内建入函数元数据侧表(每槽一次,与数据槽同一 once 门)。条目的
+            // code_ptr = helper 标签本身:本闭包 {magic@0, helper@8} 的 @8 恰是它,故
+            // _closure_prop_get / _js_length 的「闭包 → [P+8]」脱壳能查到。
+            // arity 用**合成形参表**交给 registerFuncMeta 的同一算法(不另写一份 arity
+            // 逻辑,也不直接构造条目——条目形状只有 registerFuncMeta 一个写者)。
+            // #32 守卫:typeof 判命中,原型链上的 toString/constructor 不是 number。
+            const _bra = BUILTIN_REF_ARITY[slotKey];
+            if (typeof propName === "string" && typeof _bra === "number") {
+                const _bps = [];
+                for (let i = 0; i < _bra; i = i + 1) {
+                    _bps.push({ type: "Identifier", name: "a" + i });
+                }
+                this.registerFuncMeta(runtimeLabel,
+                    { type: "FunctionExpression", params: _bps }, propName);
+            }
         }
         const doneL = this.ctx.newLabel("bref_done");
         this.vm.lea(VReg.V0, label);
@@ -386,12 +426,12 @@ export const MemberCompiler = {
         for (const mname of Object.keys(NamespaceStaticRef.Math)) {
             const helper = NamespaceStaticRef.Math[mname];
             emitProp(mname, BUILTIN_PROP_ATTR,
-                () => this.emitMemoizedBuiltinRef("math_" + mname, helper));
+                () => this.emitMemoizedBuiltinRef("math_" + mname, helper, mname));
         }
         for (const mname of Object.keys(MATH_NS_BINARY_REF)) {
             const helper = MATH_NS_BINARY_REF[mname];
             emitProp(mname, BUILTIN_PROP_ATTR,
-                () => this.emitMemoizedBuiltinRef("math_" + mname, helper));
+                () => this.emitMemoizedBuiltinRef("math_" + mname, helper, mname));
         }
         vm.lea(VReg.V0, slot);
         vm.load(VReg.RET, VReg.V0, 0);
@@ -1262,7 +1302,7 @@ export const MemberCompiler = {
                 if (propName === "call") _fph = "_fp_call_tramp";
                 else if (propName === "apply") _fph = "_fp_apply_tramp";
                 if (typeof _fph === "string") {
-                    this.emitMemoizedBuiltinRef("fnproto_" + propName, _fph);
+                    this.emitMemoizedBuiltinRef("fnproto_" + propName, _fph, propName);
                     return;
                 }
             }
@@ -1301,7 +1341,7 @@ export const MemberCompiler = {
                 const _nsHelper = _nsTable ? _nsTable[propName] : null;
                 if (typeof _nsHelper === "string") {
                     this.emitMemoizedBuiltinRef(
-                        expr.object.name.toLowerCase() + "_" + propName, _nsHelper);
+                        expr.object.name.toLowerCase() + "_" + propName, _nsHelper, propName);
                     return;
                 }
             }

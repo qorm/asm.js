@@ -2508,6 +2508,9 @@ export const StatementCompiler = {
         // —— 对齐 node 隐式 super(...args)（寄存器调用约定上限 5 个实参；参数先落栈
         // 再由 super 路径重装 A1-A5，位级等价于调用方直接调父构造器）。
         // 此前缺失：子类无构造器时父类字段（含私有字段）初始化全不执行。
+        // [W-27] 下面可能**合成**一个带 5 个转发形参的默认派生构造器;元数据 arity 必须按
+        // 用户**声明**的构造器算(默认构造器规范 length = 0),故先记住是否真有声明。
+        const hasDeclaredCtor = !!constructor;
         if (!constructor && superClass) {
             const fwdParams = [];
             for (let fi = 0; fi < 5; fi++) {
@@ -2552,6 +2555,12 @@ export const StatementCompiler = {
 
         // ========== 生成构造函数 ==========
         this.vm.label(constructorLabel);
+        // [W-27] 构造器入函数元数据侧表(code_ptr=构造器标签):类值经变量/形参传递后
+        // `K.name`/`K.length`/gOPD(K,"length") 只能靠运行期反射(编译期静态解析点见
+        // members.js _fnNameLength)。名 = 类名;arity = 声明的构造器形参(无声明 → 0)。
+        this.registerFuncMeta(constructorLabel,
+            hasDeclaredCtor ? constructor.value : { type: "FunctionExpression", params: [] },
+            className);
         this.vm.beginRecord(); // [P1]
         this.vm.prologue(8192, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
 
@@ -3175,6 +3184,15 @@ export const StatementCompiler = {
         const returnLabel = `${methodLabel}_return`;
 
         this.vm.label(methodLabel);
+        // [W-27] 方法入函数元数据侧表:`K.prototype.m.name` / `.length` 的接收者是运行期
+        // 取出的函数值(原型链读),编译期静态解析点覆盖不到。只收**普通具名方法**:
+        //   - 访问器(get/set)规范名是 "get x"/"set x",本表只存裸名 → 宁缺勿错,跳过;
+        //   - 计算键 `[k](){}` 与 well-known symbol 方法的规范名同样特殊(`[Symbol.iterator]`),
+        //     且 methodName 是 label 用的近似名 → 跳过。
+        if ((!method.kind || method.kind === "method") && !method.computed &&
+            method.key && (method.key.type === "Identifier" || method.key.type === "Literal")) {
+            this.registerFuncMeta(methodLabel, method.value, methodName);
+        }
         // [批次D] 生成器/async 生成器方法(`*g(){}` / `async *g(){}`)。此前类方法路径**完全
         // 不识别**生成器:方法体被当普通函数直编,体内 yield 直接 `_coroutine_yield` 在主栈上
         // 挂起 → `c.g()`/`C.prototype.g.call(c)` 一律 SIGSEGV。修法与顶层生成器声明

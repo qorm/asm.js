@@ -497,8 +497,9 @@ export class ObjectGenerator {
         vm.epilogue([VReg.S0, VReg.S1], 0);
 
         // _closure_prop_get(A0=fn, A1=key) -> value / undefined(无 props 或键 miss)。
-        // 键 miss 且 key==="name" 时,查函数元数据侧表反射函数名(使运行期函数值——参数/
-        // 成员链等——的 fn.name 生效,不止编译期静态可知的访问点)。
+        // 键 miss 且 key==="name"/"length" 时,查函数元数据侧表反射函数名/形参个数
+        // (使运行期函数值——参数/成员链等——的 fn.name / fn.length 生效,不止编译期
+        // 静态可知的访问点)。侧表**优先**:defineProperty 的覆盖值先命中。
         vm.label("_closure_prop_get");
         vm.prologue(0, [VReg.S0, VReg.S1]);
         vm.mov(VReg.S0, VReg.A1); // 保存 key
@@ -519,11 +520,26 @@ export class ObjectGenerator {
         vm.cmp(VReg.RET, VReg.V1);
         vm.jeq("_cpg_miss");
         vm.epilogue([VReg.S0, VReg.S1], 0);
-        // 键 miss:若 key==="name" 反射元数据名(否则 undefined)。
+        // 键 miss:若 key==="name" 反射元数据名、key==="length" 反射元数据 arity(否则 undefined)。
         vm.label("_cpg_miss");
-        // key 去壳 == addString("name") 地址?(emitBoxedStringKey 经 addString dedup,同址)
+        // [W-27 守卫] 元数据反射要**解引用** fn 的载荷([P] 读 magic),故先验形态:
+        // 只有装箱函数(高16=0x7FFF)与裸堆/代码指针(高16=0)可解引用。数字等非指针值
+        // 的载荷是尾数位,当地址解会 SIGSEGV——静态解析成函数、运行期却被重新赋成数字的
+        // 接收者(`var g=foo; g=42; g.name`)即此形态。此前只有 "name" 走该解引用,现在
+        // "length" 也走,曝面变大,故在此统一挡掉(非指针形态 → undefined,不解引用)。
+        vm.shrImm(VReg.V0, VReg.S1, 48);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_cpg_key_ck");
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jne("_cpg_undef");
+        vm.label("_cpg_key_ck");
+        // key 去壳 == addString("name")/addString("length") 地址?
+        // (emitBoxedStringKey 经 addString dedup,同址)
         vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
         vm.and(VReg.V0, VReg.S0, VReg.V1);          // key payload
+        vm.lea(VReg.V1, vm.asm.addString("length")); // "length" 串地址
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jeq("_cpg_len");
         vm.lea(VReg.V1, vm.asm.addString("name"));  // "name" 串地址
         vm.cmp(VReg.V0, VReg.V1);
         vm.jne("_cpg_undef");
@@ -543,6 +559,28 @@ export class ObjectGenerator {
         vm.jeq("_cpg_undef");
         vm.mov(VReg.A0, VReg.RET);
         vm.call("_js_box_string");                  // RET = 装箱字符串
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        // [W-27] key==="length":同一套闭包脱壳(与 name 路径逐字同形),查 _func_meta_arity。
+        // 未登记(匿名普通函数/内建)返 -1 → undefined(不编造 0);>=0 → canonical JS number。
+        // 脱壳代码在此复制而非与 name 路径共享:共享需一个跨分支存活的标志寄存器,而本函数
+        // 只保了 S0/S1(键与 fn),再占一个 callee-saved 会改热路径栈帧;复制 ~9 条指令更廉价。
+        vm.label("_cpg_len");
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.V0, VReg.S1, VReg.V1);          // V0 = P
+        vm.load(VReg.V2, VReg.V0, 0);               // [P]
+        vm.cmpImm(VReg.V2, 0xc105); vm.jeq("_cpg_len_clo");
+        vm.cmpImm(VReg.V2, 0xa51c); vm.jeq("_cpg_len_clo");
+        vm.mov(VReg.A0, VReg.V0);                   // 裸函数指针:code_ptr = P
+        vm.jmp("_cpg_len_lk");
+        vm.label("_cpg_len_clo");
+        vm.load(VReg.A0, VReg.V0, 8);               // 闭包:code_ptr = [P+8]
+        vm.label("_cpg_len_lk");
+        vm.call("_func_meta_arity");                // RET = arity(>=0);-1 = 未登记
+        vm.movImm(VReg.V1, -1);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_cpg_undef");
+        vm.scvtf(0, VReg.RET);
+        vm.fmovToInt(VReg.RET, 0);                  // 裸 int → canonical float64 位模式
         vm.epilogue([VReg.S0, VReg.S1], 0);
         vm.label("_cpg_undef");
         vm.lea(VReg.RET, "_js_undefined");
@@ -5617,10 +5655,10 @@ export class ObjectGenerator {
         //   name/length → node 形状 {value, writable:false, enumerable:false, configurable:true};
         //   其余键      → 递归描述侧表 props(普通对象 TYPE_OBJECT,不会再落本分支,无环),
         //                 属性特性位由该对象真实持有(gOPN(fn) 报出的侧表键都能被描述)。
-        // **偏差**:length 的**值**运行期不可得——函数元数据侧表 _func_meta_table 每条只有
-        // {code_ptr, kind, name_ptr}(compiler/index.js emitFuncMetaTable),无 arity 字段,
-        // 闭包头也不带形参数。故除非用户显式写过 fn.length(落侧表),gOPD(fn,"length") 返
-        // undefined——不编造 0,与 _closure_prop_get / _object_gopn_fn 注释中的 length 语义一致。
+        // [W-27] length 的**值**现由元数据侧表的 arity@24 供给(_func_meta_arity,经
+        // _closure_prop_get 的 _cpg_len 回落):用户函数/类方法/已登记内建都能报出真值。
+        // 未登记的函数(匿名普通函数、未收录的内建)仍返 undefined——不编造 0,与
+        // _closure_prop_get / _object_gopn_fn 注释中的 length 语义一致。
         vm.label("_ogopd_fn");
         // 非字符串键(symbol 等)不进 _strcmp(避免拿 tag 位当地址),直接查侧表
         vm.shrImm(VReg.V0, VReg.S1, 48);
