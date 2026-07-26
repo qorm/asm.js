@@ -747,6 +747,23 @@ export const MemberCompiler = {
         return { name: ownName, length: arity };
     },
 
+    // 键名是否为 ES 的 CanonicalNumericIndexString(数组/字符串元素下标串)。
+    // "0"/"1"/"42" 是;""/"01"/"1.0"/" 1"/"-1"/"1e2"/"length" 不是。
+    // 编译期判据,与运行时 _canonical_array_index 同语义(上界 2^32-2)。
+    isCanonicalIndexString(k) {
+        if (typeof k !== "string") return false;
+        const n = k.length;
+        if (n === 0 || n > 10) return false;   // 2^32-2 恰 10 位
+        if (n === 1 && k.charCodeAt(0) === 48) return true; // "0"
+        const c0 = k.charCodeAt(0);
+        if (c0 < 49 || c0 > 57) return false;  // 首位须 1-9(排除 "0…" 前导零)
+        for (let i = 1; i < n; i = i + 1) {
+            const c = k.charCodeAt(i);
+            if (c < 48 || c > 57) return false;
+        }
+        return Number(k) <= 4294967294;
+    },
+
     compileMemberExpression(expr) {
         // 可选成员访问 obj?.prop：obj 为 null/undefined 则整表达式短路 undefined
         if (expr.optional) {
@@ -786,6 +803,29 @@ export const MemberCompiler = {
                         : null);
             const computedPropName = staticKey;
             if (computedPropName !== null) {
+                // 字符串接收者 + 静态字符串键:IC/_object_get 只服务对象/数组/函数,
+                // 装箱字符串(0x7FFC)落"非对象"分支恒返 undefined。ES 里 s["1"] ≡ s[1]、
+                // s["length"] ≡ s.length,故这两类键在此按字符串语义分派;其余键
+                // (s["01"]/s["x"]/Symbol.*)保持原 IC 路径,codegen 逐字节不变。
+                if ((expr.property.type === "Literal" || expr.property.type === "StringLiteral") &&
+                    this.inferObjectType && this.inferObjectType(expr.object) === "String") {
+                    if (computedPropName === "length") {
+                        this.compileExpression(expr.object);
+                        this.vm.mov(VReg.A0, VReg.RET);
+                        this.vm.call("_js_length");
+                        this.vm.scvtf(0, VReg.RET);
+                        this.vm.fmovToInt(VReg.RET, 0);
+                        return;
+                    }
+                    // CanonicalNumericIndexString:"0"/"1"/"42" 是索引;"01"/"1.0"/"-1"/"" 不是
+                    if (this.isCanonicalIndexString(computedPropName)) {
+                        this.compileExpression(expr.object);
+                        this.vm.mov(VReg.A0, VReg.RET);
+                        this.vm.movImm(VReg.A1, Number(computedPropName));
+                        this.vm.call("_str_index_char"); // 越界返 undefined(s[i] 语义)
+                        return;
+                    }
+                }
                 this.compileExpression(expr.object);
                 this.emitObjectGetIC(computedPropName); // [P2] 站点缓存(getter 已融合)
                 return;
@@ -805,15 +845,18 @@ export const MemberCompiler = {
                     this.vm.movImm(VReg.A1, idx);
                     this.vm.call("_str_index_char");
                 } else {
-                    // 动态索引："str"[i]。索引经 _syscall_arg 归一化为裸 int——它稳健处理
-                    // 裸 float64 位 / 0x7ff8 装箱 int / 堆 Number 指针各表示。原用
-                    // numberToIntInPlace(=f2i,读 [src+8] 当堆 Number 对象指针)对裸 float
-                    // 位(如 s[p] 里 p=1.0)读越界 → 未转的 float 位当字符偏移 → 段错(崩溃修复)。
+                    // 动态索引："str"[i]。索引经 _subscript_key_int 归一化为裸 int:它对
+                    // 非字符串键沿用 _syscall_arg(稳健处理裸 float64 位 / 0x7ff8 装箱 int /
+                    // 堆 Number 指针各表示;原用 numberToIntInPlace=f2i 读 [src+8] 当堆
+                    // Number 指针,对裸 float 位如 s[p] 里 p=1.0 读越界 → 段错,已修),对
+                    // **字符串键**按 ES 的 CanonicalNumericIndexString 判定(s["1"] ≡ s[1],
+                    // s["01"]/s["x"] → -1 → undefined)。此前一律 _syscall_arg,字符串键取到
+                    // 的是**内容指针**(天文数字)→ 恒判越界 → `s[k]`(k="1")一律 undefined。
                     // [求值序] 非纯操作数按规范序(对象→键);皆纯保持原序字节不变。
                     if (this.isPureExpr(expr.object) && this.isPureExpr(expr.property)) {
                         this.compileExpression(expr.property);
                         this.vm.mov(VReg.A0, VReg.RET);
-                        this.vm.call("_syscall_arg");  // RET = 裸 int 索引
+                        this.vm.call("_subscript_key_int");  // RET = 裸 int 索引 / -1
                         this.vm.push(VReg.RET);
                         this.compileExpression(expr.object);
                         this.vm.mov(VReg.A0, VReg.RET); // A0 = 字符串
@@ -823,7 +866,7 @@ export const MemberCompiler = {
                         this.vm.push(VReg.RET);
                         this.compileExpression(expr.property);
                         this.vm.mov(VReg.A0, VReg.RET);
-                        this.vm.call("_syscall_arg");  // RET = 裸 int 索引
+                        this.vm.call("_subscript_key_int");  // RET = 裸 int 索引 / -1
                         this.vm.mov(VReg.A1, VReg.RET);
                         this.vm.pop(VReg.A0);           // A0 = 字符串
                     }

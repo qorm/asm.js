@@ -160,16 +160,30 @@ export class Parser {
 
     // 词法+语法状态快照/恢复:用于有限的试探式前瞻(如判别 `({a})=>` 解构参数箭头
     // vs 括号对象字面量)。捕获 lexer 全部游标 + 双 token + 错误水位,恢复即回到快照点。
+    // [seq] 模板插值状态也必须快照:lexer 靠 templateDepth/braceDepth/templateStack 决定
+    // `}` 是 RBRACE 还是 TEMPLATE_MIDDLE/TAIL。试探前瞻若跨过了插值收尾的 `}`,
+    // readTemplateMiddle 已经把 templateDepth 减掉、templateStack 弹掉;只回退游标而不
+    // 回退这三者,重扫时 `${(a,b)}` 的 `}` 会退化成 RBRACE(报 "unexpected token in
+    // template literal")。数组用手写循环复制(不依赖 Array.prototype.slice)。
+    _copyNums(a) {
+        let out = [];
+        for (let i = 0; i < a.length; i++) out.push(a[i]);
+        return out;
+    }
     saveState() {
         return {
             p: this.lexer.position, rp: this.lexer.readPosition, ch: this.lexer.ch,
             ln: this.lexer.line, col: this.lexer.column,
+            td: this.lexer.templateDepth, bd: this.lexer.braceDepth,
+            ts: this._copyNums(this.lexer.templateStack),
             cur: this.curToken, peek: this.peekToken, err: this.errors.length,
         };
     }
     restoreState(s) {
         this.lexer.position = s.p; this.lexer.readPosition = s.rp; this.lexer.ch = s.ch;
         this.lexer.line = s.ln; this.lexer.column = s.col;
+        this.lexer.templateDepth = s.td; this.lexer.braceDepth = s.bd;
+        this.lexer.templateStack = this._copyNums(s.ts);
         this.curToken = s.cur; this.peekToken = s.peek;
         this.errors.length = s.err;
     }
@@ -254,14 +268,21 @@ export class Parser {
 
     parseProgram() {
         let program = new AST.Program();
-        // [test262 S1] 顶层 "use strict" 指令探测:首 token 为字符串字面量 "use strict"。
-        if (this.curTokenIs(TokenType.STRING) && this.curToken.literal === "use strict") {
-            this.programStrict = true;
-        }
+        // [test262 S1] 顶层 "use strict" 指令探测。不能只看**首** token:编译器的
+        // readModuleSource 会在源码最前面注入 shim 的 import 行(JSON/RegExp shim),
+        // 把 `"use strict";` 从首 token 位置挤走 —— 于是任何引用 JSON.*/正则的 strict
+        // 源码都被当成 sloppy,strict 早期错误(如 `(arguments) = 20`)全部漏判。
+        // 改为:在「至今只见过 import 声明」期间遇到 "use strict" 字符串语句即置位。
+        // 注入行恒为 import,故注入前后判定一致;真正的首行指令仍在第一轮命中。
+        let onlyImports = true;
         while (!this.curTokenIs(TokenType.EOF)) {
+            if (onlyImports && this.curTokenIs(TokenType.STRING) && this.curToken.literal === "use strict") {
+                this.programStrict = true;
+            }
             let stmt = this.parseStatement();
             if (stmt !== null) {
                 program.body.push(stmt);
+                if (stmt.type !== "ImportDeclaration") onlyImports = false;
             }
             this.nextToken();
         }

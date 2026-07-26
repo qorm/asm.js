@@ -271,6 +271,12 @@ export const StatementParser = {
 
     parseFunctionParam() {
         if (this.curTokenIs(TokenType.SPREAD)) {
+            // NOTE rest 形参目标按 ES 是 BindingElement,可为绑定模式
+            // (`function f(...[a, b])` / `(...{length: n}) => …`),这里刻意**只**接受裸标识符:
+            // 解析放开很容易(照搬 parseArrayPattern 的 rest 分支即可),但形参 codegen 只认
+            // SpreadElement(Identifier) —— 放开后 `f(...[a,b])` 能编译通过却一个形参都不绑定,
+            // a/b 静默读作 0。静默算错比明确的编译期报错更糟,故维持拒绝,
+            // 待 codegen 支持模式化 rest 形参后再与之一并放开。
             this.nextToken();
             this.checkYieldAwaitBinding(this.curToken.literal);   // [test262 S1] ...yield/...await
             return new AST.SpreadElement(new AST.Identifier(this.curToken.literal));
@@ -380,6 +386,8 @@ export const StatementParser = {
             // for ([a,b] in obj)。左值为表达式(标识符/成员/数组-对象表达式);数组-对象表达式由
             // 编译器 reinterpretAsPattern 重解释为赋值形 pattern。修 ~90 个 "expected ;, got OF" COMPILE_FAIL。
             if (this.peekTokenIs(TokenType.OF)) {
+                // [test262 S1] 头部左值内层目标位校验(只拒逗号序列):`for ([(x, y)] of []) {}`。
+                this.checkPatternTargets(init);
                 // for-of:of 非运算符,parseExpression 在其前已停。
                 this.nextToken();
                 this.nextToken();
@@ -395,6 +403,7 @@ export const StatementParser = {
                 // 拆 left/right。区别于 `for((a in x);b;c)` 常规 for(其后随 `;` 不命中此分支)。
                 let right = init.right;
                 let left = init.left;
+                this.checkPatternTargets(left);   // [test262 S1] 同 for-of:头部左值只拒逗号序列
                 if (!this.expectPeek(TokenType.RPAREN)) return null;   // 移到 )
                 this.nextToken();   // 移到 body
                 let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();

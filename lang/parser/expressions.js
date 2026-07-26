@@ -337,14 +337,56 @@ export const ExpressionParser = {
                           t === "ArrayPattern" || t === "ObjectPattern";
         if (isPattern) {
             if (!allowPattern) this.errors.push("Invalid left-hand side in assignment");
+            else this.checkPatternTargets(left);
             return;
         }
-        if (t === "Identifier") return;
+        if (t === "Identifier") {
+            // [test262 S1] strict 下 eval/arguments 不可作赋值/自增左值(`(arguments) = 20`)。
+            // 非 strict 一律放行;自举源码无 "use strict" 指令 → 此分支对其恒不触发。
+            if (this.inStrictMode() && (left.name === "eval" || left.name === "arguments")) {
+                this.errors.push("Invalid left-hand side in assignment");
+            }
+            return;
+        }
         if (t === "MemberExpression") {
             if (left.optional === true) this.errors.push("Invalid left-hand side in assignment");
             return;
         }
         this.errors.push("Invalid left-hand side in assignment");
+    },
+
+    // [test262 S1 早期错误] 解构赋值模式内层目标位的最小校验:只拒 **SequenceExpression**
+    // (`[(x, y)] = []` / `[...[(x, y)]] = [[]]` / `({a: (x, y)} = {})`)。ES 规定
+    // DestructuringAssignmentTarget 必须是 LeftHandSideExpression,逗号序列绝无可能;
+    // 其它形态(成员表达式、嵌套模式、默认值)一律放行,保证对自举源码零误拒。
+    // 只看**目标位**:AssignmentExpression 只查 .left(`[a = (1,2)]` 的右值是合法序列),
+    // SpreadElement 查 .argument,对象属性查 .value。
+    checkPatternTargets(node) {
+        if (!node) return;
+        const t = node.type;
+        if (t === "SequenceExpression") {
+            this.errors.push("Invalid destructuring assignment target");
+            return;
+        }
+        if (t === "ArrayExpression" || t === "ArrayPattern") {
+            const els = node.elements;
+            if (!els) return;
+            for (let i = 0; i < els.length; i++) this.checkPatternTargets(els[i]);
+            return;
+        }
+        if (t === "ObjectExpression" || t === "ObjectPattern") {
+            const props = node.properties;
+            if (!props) return;
+            for (let i = 0; i < props.length; i++) {
+                const p = props[i];
+                if (!p) continue;
+                if (p.type === "SpreadElement") this.checkPatternTargets(p.argument);
+                else this.checkPatternTargets(p.value);
+            }
+            return;
+        }
+        if (t === "SpreadElement") { this.checkPatternTargets(node.argument); return; }
+        if (t === "AssignmentExpression" || t === "AssignmentPattern") { this.checkPatternTargets(node.left); return; }
     },
 
     parseAssignmentExpression(left) {
@@ -373,22 +415,17 @@ export const ExpressionParser = {
         let params = [];
         let isArrowMode = false;
 
-        // 检查是否可能是多参数箭头函数 (a, b) => ... 或 (...args) => ...
-        if (this.curTokenIs(TokenType.IDENT) || this.curTokenIs(TokenType.SPREAD)) {
-            // 如果是 (... 或者 (a, 则很有可能是箭头函数
-            if (this.curTokenIs(TokenType.SPREAD) || this.peekTokenIs(TokenType.COMMA)) {
-                isArrowMode = true;
-            } else if (this.peekTokenIs(TokenType.RPAREN)) {
-                // 如果是 (a) 需要看后面是不是 =>
-                if (this.lexer.peekChar() === "=") {
-                    isArrowMode = true;
-                }
-            }
-        } else if (this.curTokenIs(TokenType.LBRACE) || this.curTokenIs(TokenType.LBRACKET)) {
-            // 解构参数箭头 `({a})=>` / `([a])=>`:首 token 是 `{`/`[`,与括号对象/数组
-            // 字面量(`({a:1})`/`([1,2])`)同形,唯尾随 `=>` 可辨。token 级试探:快照后
-            // 平衡前扫至外层 `(` 闭合,判其后是否 `=>`,再恢复。此前 isArrowMode 只认
-            // IDENT/SPREAD → 解构参数箭头落表达式路径把 `{a}` 当对象字面量解析失败。
+        // [seq] 箭头形参 vs 括号表达式的判别统一走 **token 级平衡前扫**:快照后从 `(` 内
+        // 平衡扫到外层 `(` 的闭合 `)`,看其后是否紧跟 `=>`,再恢复。此前是启发式
+        // (`(a,` / `(...` / `(a)` 且下一字符是 `=`),对 `(a, b)`、`(a) == b` 误判成箭头,
+        // 而形参循环见不到 `=>` 时既不回退也不报错 —— curToken 卡在 `)`,落到下面的
+        // parseExpression 报 "no prefix parse function for )":括号序列表达式因此完全
+        // 无法解析。前扫是精确判别,`({a})=>` / `([a])=>` 这类解构参数箭头(与括号对象/
+        // 数组字面量同形,唯尾随 `=>` 可辨)也一并由它认出。
+        // 前置门槛:只有形参列表可能的首 token(IDENT / ... / { / [)才值得前扫,
+        // 免得给 `(1+2)`、`(x.y)` 之外的常见分组白付一次扫描。
+        if (this.curTokenIs(TokenType.IDENT) || this.curTokenIs(TokenType.SPREAD) ||
+            this.curTokenIs(TokenType.LBRACE) || this.curTokenIs(TokenType.LBRACKET)) {
             const snap = this.saveState();
             let depth = 1; // 已在外层 ( 内(parseGroupedOrArrow 起始 nextToken 消费了 ()
             let looksArrow = false;
@@ -407,6 +444,13 @@ export const ExpressionParser = {
         }
 
         if (isArrowMode) {
+            // 前扫已确认尾随 `=>`。形参循环若仍走不到 `) =>`(形参形态不受支持/非法),
+            // 保留期间产生的错误,再回退按表达式重解析:既不丢早期错误(restoreState 会把
+            // 错误截回快照水位),也保住既有的宽松恢复行为。parseDepth 单独存,
+            // 因 parseFunctionParam 会递归下钻。
+            const arrowSnap = this.saveState();
+            const arrowDepth = this.parseDepth;
+            const errMark = this.errors.length;
             while (true) {
                 // [#34] 统一走 parseFunctionParam:获得默认值(AssignmentPattern)
                 // 与 rest 支持,与 function 声明形参同构。单参默认 `(y=5)=>` 因
@@ -433,9 +477,14 @@ export const ExpressionParser = {
                     break;
                 }
             }
-            // 如果不是箭头函数，我们需要回退吗？Pratt 解析器很难回退。
-            // 但在 JS 中，(a, b) 也是合法的序列表达式。
-            // 假设 asm.js 暂时不单独处理 (a, b) 表达式，除非是箭头函数。
+            // 形参路径未成:先记下期间产生的错误,回退后原样补回,再走普通括号表达式路径
+            // (逗号由 COMMA 中缀 → SequenceExpression)。
+            const kept = [];
+            for (let i = errMark; i < this.errors.length; i++) kept.push(this.errors[i]);
+            this.restoreState(arrowSnap);
+            this.parseDepth = arrowDepth;
+            for (let i = 0; i < kept.length; i++) this.errors.push(kept[i]);
+            params = [];
         }
 
         let expr = this.parseExpression(Precedence.LOWEST);
@@ -633,6 +682,10 @@ export const ExpressionParser = {
                 else restTarget = new AST.Identifier(this.curToken.literal);
                 pattern.elements.push(new AST.SpreadElement(restTarget));
                 restSeen = true;   // [test262 S1] rest 必须末位:此后任何元素/空位皆早期错误
+                // [test262 S1] BindingRestElement 不得带初值:`[...x = 1]` / `[...[x] = []]` 皆早期错误。
+                if (this.peekTokenIs(TokenType.ASSIGN)) {
+                    this.errors.push("Rest element may not have a default initializer");
+                }
             } else if (this.curTokenIs(TokenType.LBRACE) || this.curTokenIs(TokenType.LBRACKET)) {
                 if (restSeen) this.errors.push("Rest element must be last element");
                 // [#47] 嵌套解构:元素位可为 {..}/[..] 子 pattern(递归)。
@@ -1029,11 +1082,16 @@ export const ExpressionParser = {
             delegate = true;
             this.nextToken();
         }
-        // 无值 yield:后随 ; } ) ] , 或 EOF 时不消费 argument。
+        // 无值 yield:后随 ; } ) ] , : 模板续段 或 EOF 时不消费 argument。
         // 判 peek(不前进),否则会吞掉终结 token 破坏外层解析。
+        // [test262 S1] `:` 曾缺席 → `(yield) ? yield : yield` 里三元的中段 yield 会把
+        // `: yield` 当实参吞掉,报 "no prefix parse function for :";TEMPLATE_MIDDLE/TAIL
+        // 同理(`` `${yield}` ``)。这些 token 都不能起始 AssignmentExpression。
         if (this.peekTokenIs(TokenType.SEMICOLON) || this.peekTokenIs(TokenType.RBRACE) ||
             this.peekTokenIs(TokenType.RPAREN) || this.peekTokenIs(TokenType.RBRACKET) ||
-            this.peekTokenIs(TokenType.COMMA) || this.peekTokenIs(TokenType.EOF)) {
+            this.peekTokenIs(TokenType.COMMA) || this.peekTokenIs(TokenType.COLON) ||
+            this.peekTokenIs(TokenType.TEMPLATE_MIDDLE) || this.peekTokenIs(TokenType.TEMPLATE_TAIL) ||
+            this.peekTokenIs(TokenType.EOF)) {
             return new AST.YieldExpression(null, delegate);
         }
         this.nextToken();

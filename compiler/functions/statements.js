@@ -1834,12 +1834,12 @@ export const StatementCompiler = {
         this.vm.load(VReg.V0, VReg.FP, isObjOffset);
         this.vm.cmpImm(VReg.V0, 0);
         this.vm.jne(yieldObjLabel);
-        // 数组：键为索引装箱**数字**(float64)。此前 yield **裸 int** 索引 → 1/2 按 float64 位
-        // 渲染成 "0."(裸指针族)。装箱数字修好渲染且保 `arr[k]` 数字下标可用。
-        // (ES for-in 键本应字符串,但 arr["0"] 字符串下标未支持——记偏差:typeof→"number")。
-        this.vm.load(VReg.V0, VReg.FP, idxOffset);
-        this.vm.scvtf(0, VReg.V0);
-        this.vm.fmovToInt(VReg.RET, 0);   // RET = 装箱 float64 数字
+        // 数组：键为索引的**字符串**(ES 语义:for-in 键恒为字符串,typeof k === "string",
+        // `k + 1` 是拼接不是加法)。曾因 arr["0"] 字符串下标未支持而 yield 装箱数字(记为
+        // 偏差);规范索引串下标已落地(_canonical_array_index/_subscript_key_int),故按
+        // 规范改回字符串:_intToStr(裸 int) 直接返回 0x7FFC 装箱串,`arr[k]` 仍正确取元素。
+        this.vm.load(VReg.A0, VReg.FP, idxOffset);
+        this.vm.call("_intToStr");        // RET = 装箱字符串键
         this.vm.jmp(afterYieldLabel);
 
         this.vm.label(yieldObjLabel);
