@@ -141,7 +141,7 @@ export const ClassParser = {
         // 计算属性名 [expr]
         if (this.curTokenIs(TokenType.LBRACKET)) {
             this.nextToken();
-            key = this.parseExpression(Precedence.ASSIGN);
+            key = this.parseExpression(Precedence.ASSIGN - 1);
             if (!this.expectPeek(TokenType.RBRACKET)) return null;
             computed = true;
         }
@@ -185,7 +185,7 @@ export const ClassParser = {
         if (this.peekTokenIs(TokenType.ASSIGN)) {
             this.nextToken();
             this.nextToken();
-            init = this.parseExpression(Precedence.ASSIGN);
+            init = this.parseExpression(Precedence.ASSIGN - 1);
         }
         if (this.peekTokenIs(TokenType.SEMICOLON)) this.nextToken();
         return new AST.PropertyDefinition(key, init, computed, isStatic);
@@ -215,7 +215,7 @@ export const ClassParser = {
         if (this.peekTokenIs(TokenType.ASSIGN)) {
             this.nextToken();
             this.nextToken();
-            init = this.parseExpression(Precedence.ASSIGN);
+            init = this.parseExpression(Precedence.ASSIGN - 1);
         }
         if (this.peekTokenIs(TokenType.SEMICOLON)) this.nextToken();
         return new AST.PropertyDefinition(key, init, false, isStatic);

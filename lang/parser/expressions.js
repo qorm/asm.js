@@ -235,7 +235,11 @@ export const ExpressionParser = {
 
         while (true) {
             this.nextToken();
-            let expr = this.parseExpression(Precedence.ASSIGN);
+            // 模板替换位的文法是 **Expression**(含逗号序列):`${a = 1}` / `${(a, b)}`。
+            // 此前传 ASSIGN(3) → Pratt 循环 `3 < 3` 假,`=`/`+=` 不被消费,报
+            // "unexpected token in template literal: ="。LOWEST 让赋值与逗号都并入;
+            // 终结符 TEMPLATE_MIDDLE/TEMPLATE_TAIL 无中缀优先级,循环自然停下。
+            let expr = this.parseExpression(Precedence.LOWEST);
             expressions.push(expr);
             this.nextToken();
 
@@ -352,7 +356,7 @@ export const ExpressionParser = {
 
     parseConditionalExpression(test) {
         this.nextToken();
-        let consequent = this.parseExpression(Precedence.ASSIGN);
+        let consequent = this.parseExpression(Precedence.ASSIGN - 1);
         if (!this.expectPeek(TokenType.COLON)) return null;
         this.nextToken();
         return new AST.ConditionalExpression(test, consequent, this.parseExpression(Precedence.TERNARY - 1));
@@ -502,7 +506,7 @@ export const ExpressionParser = {
                 // [C2] 计算键解构 {[expr]: target}:求值键 expr,必带 `: 目标`(无简写形)。
                 prop.computed = true;
                 this.nextToken(); // 越过 [,cur = 键表达式首 token
-                prop.key = this.parseExpression(Precedence.ASSIGN);
+                prop.key = this.parseExpression(Precedence.ASSIGN - 1);
                 if (!this.expectPeek(TokenType.RBRACKET)) return null; // cur = ]
                 if (!this.expectPeek(TokenType.COLON)) return null;    // cur = :
                 this.nextToken();                                      // cur = 目标首 token
@@ -520,7 +524,7 @@ export const ExpressionParser = {
                 if (this.peekTokenIs(TokenType.ASSIGN)) {
                     this.nextToken();
                     this.nextToken();
-                    prop.value = new AST.AssignmentPattern(target, this.parseExpression(Precedence.ASSIGN));
+                    prop.value = new AST.AssignmentPattern(target, this.parseExpression(Precedence.ASSIGN - 1));
                 } else {
                     prop.value = target;
                 }
@@ -537,10 +541,28 @@ export const ExpressionParser = {
                     break;
                 }
             }
+            // 属性名文法是 PropertyName:除标识符外还含字符串/数值字面量与保留字
+            // (`{ 0: v }` / `{ 'a-b': v }` / `{ if: v }`)。字面量/保留字键无简写形,
+            // 必须带 `: 目标`。键统一归一成 Identifier(name=属性字符串),使下游
+            // emitBoxedStringKey 走同一条静态键路径(数值按 String(值) 归一:1.0→"1")。
+            let keyNeedsColon = false;
             if (this.curTokenIs(TokenType.IDENT)) {
+                prop.key = new AST.Identifier(this.curToken.literal);
+            } else if (this.curTokenIs(TokenType.STRING)) {
+                prop.key = new AST.Identifier(this.curToken.literal);
+                keyNeedsColon = true;
+            } else if (this.curTokenIs(TokenType.INT) || this.curTokenIs(TokenType.FLOAT)) {
+                prop.key = new AST.Identifier(String(this.parseNumberLiteral().value));
+                keyNeedsColon = true;
+            } else if (this.curTokenIsIdentifier() && this.peekTokenIs(TokenType.COLON)) {
+                // 保留字/上下文关键字作键:`{ if: a }` / `{ default: a }`
                 prop.key = new AST.Identifier(this.curToken.literal);
             } else {
                 this.errors.push("expected property name in object pattern");
+                return null;
+            }
+            if (keyNeedsColon && !this.peekTokenIs(TokenType.COLON)) {
+                this.errors.push("expected : after literal property name in object pattern");
                 return null;
             }
             if (this.peekTokenIs(TokenType.COLON)) {
@@ -562,7 +584,7 @@ export const ExpressionParser = {
                 if (this.peekTokenIs(TokenType.ASSIGN)) {
                     this.nextToken();
                     this.nextToken();
-                    prop.value = new AST.AssignmentPattern(target, this.parseExpression(Precedence.ASSIGN));
+                    prop.value = new AST.AssignmentPattern(target, this.parseExpression(Precedence.ASSIGN - 1));
                 } else {
                     prop.value = target;
                 }
@@ -572,7 +594,7 @@ export const ExpressionParser = {
                 prop.shorthand = true;
                 this.nextToken();
                 this.nextToken();
-                prop.value = new AST.AssignmentPattern(new AST.Identifier(prop.key.name), this.parseExpression(Precedence.ASSIGN));
+                prop.value = new AST.AssignmentPattern(new AST.Identifier(prop.key.name), this.parseExpression(Precedence.ASSIGN - 1));
             } else {
                 prop.shorthand = true;
                 prop.value = prop.key;
@@ -618,18 +640,18 @@ export const ExpressionParser = {
                 if (this.peekTokenIs(TokenType.ASSIGN)) {
                     this.nextToken();
                     this.nextToken();
-                    pattern.elements.push(new AST.AssignmentPattern(sub, this.parseExpression(Precedence.ASSIGN)));
+                    pattern.elements.push(new AST.AssignmentPattern(sub, this.parseExpression(Precedence.ASSIGN - 1)));
                 } else {
                     pattern.elements.push(sub);
                 }
             } else if (this.curTokenIs(TokenType.IDENT)) {
                 if (restSeen) this.errors.push("Rest element must be last element");
                 if (this.peekTokenIs(TokenType.ASSIGN)) {
-                    // [#34] 默认值 [a = 9, ...]:ASSIGN 优先级防吞逗号(同形参)
+                    // [#34] 默认值 [a = 9, ...]:ASSIGN-1(=COMMA)防吞逗号(同形参)
                     const did = new AST.Identifier(this.curToken.literal);
                     this.nextToken();
                     this.nextToken();
-                    pattern.elements.push(new AST.AssignmentPattern(did, this.parseExpression(Precedence.ASSIGN)));
+                    pattern.elements.push(new AST.AssignmentPattern(did, this.parseExpression(Precedence.ASSIGN - 1)));
                 } else {
                     pattern.elements.push(new AST.Identifier(this.curToken.literal));
                 }
@@ -684,7 +706,7 @@ export const ExpressionParser = {
             }
             if (this.curTokenIs(TokenType.SPREAD)) {
                 this.nextToken();
-                elements.push(new AST.SpreadElement(this.parseExpression(Precedence.ASSIGN)));
+                elements.push(new AST.SpreadElement(this.parseExpression(Precedence.ASSIGN - 1)));
             } else {
                 // 元素是 AssignmentExpression 位:用 ASSIGN-1 使顶层赋值被吞并
                 // (`[a = 1]` / 解构赋值默认 `[a, b = 9] = arr`);逗号(COMMA<ASSIGN)仍不吞。
@@ -717,7 +739,7 @@ export const ExpressionParser = {
             let key;
             if (this.curTokenIs(TokenType.SPREAD)) {
                 this.nextToken();
-                properties.push(new AST.SpreadElement(this.parseExpression(Precedence.ASSIGN)));
+                properties.push(new AST.SpreadElement(this.parseExpression(Precedence.ASSIGN - 1)));
                 if (this.peekTokenIs(TokenType.COMMA)) {
                     this.nextToken();
                     this.nextToken();
@@ -754,7 +776,7 @@ export const ExpressionParser = {
             if (this.curTokenIs(TokenType.LBRACKET)) {
                 computed = true;
                 this.nextToken();
-                key = this.parseExpression(Precedence.ASSIGN);
+                key = this.parseExpression(Precedence.ASSIGN - 1);
                 if (!this.expectPeek(TokenType.RBRACKET)) return null;
             } else if (this.curTokenIs(TokenType.STRING)) {
                 key = new AST.Literal(this.curToken.literal, '"' + this.curToken.literal + '"');
@@ -776,7 +798,7 @@ export const ExpressionParser = {
                 // (Identifier, 默认表达式),供 reinterpretAsPattern/emitDestructurePattern 消费。
                 this.nextToken(); // cur = '='
                 this.nextToken(); // cur = 默认表达式首 token
-                const dflt = this.parseExpression(Precedence.ASSIGN);
+                const dflt = this.parseExpression(Precedence.ASSIGN - 1);
                 const val = new AST.AssignmentPattern(new AST.Identifier(key.name), dflt);
                 properties.push(new AST.Property(key, val, "init", computed, true));
             } else if (this.peekTokenIs(TokenType.LPAREN)) {
@@ -793,7 +815,7 @@ export const ExpressionParser = {
             } else {
                 if (!this.expectPeek(TokenType.COLON)) return null;
                 this.nextToken();
-                properties.push(new AST.Property(key, this.parseExpression(Precedence.ASSIGN), "init", computed, false));
+                properties.push(new AST.Property(key, this.parseExpression(Precedence.ASSIGN - 1), "init", computed, false));
             }
             if (this.peekTokenIs(TokenType.COMMA)) {
                 this.nextToken();
@@ -889,7 +911,7 @@ export const ExpressionParser = {
 
     parseSpreadExpression() {
         this.nextToken();
-        return new AST.SpreadElement(this.parseExpression(Precedence.ASSIGN));
+        return new AST.SpreadElement(this.parseExpression(Precedence.ASSIGN - 1));
     },
 
     parseNewExpression() {
@@ -930,7 +952,7 @@ export const ExpressionParser = {
         while (!this.curTokenIs(TokenType.RPAREN) && !this.curTokenIs(TokenType.EOF)) {
             if (this.curTokenIs(TokenType.SPREAD)) {
                 this.nextToken();
-                args.push(new AST.SpreadElement(this.parseExpression(Precedence.ASSIGN)));
+                args.push(new AST.SpreadElement(this.parseExpression(Precedence.ASSIGN - 1)));
             } else {
                 // 实参是 AssignmentExpression 位:用 ASSIGN-1 吞并顶层赋值/逻辑赋值
                 // (`f(x = 1)` / `console.log(o.x ||= v)`);逗号(COMMA<ASSIGN)仍作实参分隔。
@@ -1015,9 +1037,10 @@ export const ExpressionParser = {
             return new AST.YieldExpression(null, delegate);
         }
         this.nextToken();
-        // ASSIGN 级:yield a, b 时 argument 止于逗号(与赋值右侧语义一致),
-        // LOWEST 会把逗号当序列运算符吞掉后续实参
-        let argument = this.parseExpression(Precedence.ASSIGN);
+        // ASSIGN-1(=COMMA)级:yield a, b 时 argument 止于逗号(与赋值右侧语义一致),
+        // LOWEST 会把逗号当序列运算符吞掉后续实参;ASSIGN(3) 则会漏掉 `yield a = 1`
+        // 的赋值(YieldExpression 反被当成赋值左值 → "Invalid left-hand side")。
+        let argument = this.parseExpression(Precedence.ASSIGN - 1);
         return new AST.YieldExpression(argument, delegate);
     },
     parseImportExpression() {
@@ -1032,7 +1055,7 @@ export const ExpressionParser = {
         if (this.peekTokenIs(TokenType.LPAREN)) {
             this.nextToken();
             this.nextToken();
-            let source = this.parseExpression(Precedence.ASSIGN);
+            let source = this.parseExpression(Precedence.ASSIGN - 1);
             if (!this.expectPeek(TokenType.RPAREN)) return null;
             return new AST.CallExpression(meta, [source]);
         }

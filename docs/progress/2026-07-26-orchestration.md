@@ -312,6 +312,57 @@ W-5 范围内只有簇 D 可修,已修 3 项(`_ta_set` 规范守卫 tag 分派 n
 **主控集成 W-5+W-4+W-8**:**gen1==gen2==gen3 + fixtures 380/380 通过**。
 - 注:首次全量测量因中途 apply W-8(每个用例现编译,源码变动会污染结果)已主动中止,重跑一次干净测量。
 
+## Wave 5 收口(2026-07-26,四批全部集成,门禁绿)
+
+**W-11 完成**(API 中断后续跑恢复):**最有价值的贡献是"先复现再动手"**——任务书列的 5 个缺口中 **3 个在 v0.2.5 已修**(`gOPD(fn,"name"/"length")` 正确、writable/configurable 强制正确、原型访问器正确),我的任务书基于过期分析,它核实后未去"修"正常代码。
+- 落地 4 项(object/index.js):`_js_prop_key` 补 ToPropertyKey(bool/null/undefined/object/array/function → `_valueToStr`);`_object_keys` 经共享前导 + S5 过滤位复用为 `_object_own_keys`,`_object_gopn` 委托之(**加第二入口标签复用同一枚举体,未复制 codegen**);`_object_getPrototypeOf` nullish→TypeError、无原型→`_js_null`、原始值→undefined(此前返裸 0 即浮点 +0.0);`gOPD` 键经 `_js_prop_key` 归一。
+- 数字:**built-ins/Object PASS 201→212(+11),FAIL −9,CRASH −2**;Math/Array 零变动。fixtures 380/0。
+- 诚实标注:`_js_prop_key` 那一项在这三个目录**净零**,它主动说明"保留是因为对拍 Node 16 项属性操作均正确且守卫复现干净,但这是中心归一器,若要最小爆炸半径这是最该先丢的一项"。
+- **指出最大剩余杠杆(编译器侧)**:`Object.defineProperty` **只处理对象字面量描述符**(functions.js:3513-3524 从 AST 抽取 get/set/value/writable/...,动态描述符静默变成 `value=undefined, attrs=0`),独占 **~260/469 个 Object FAIL**(defineProperty 168 + defineProperties 92 + create 44);内建命名空间(Math/Object/Array)根本不是运行时对象(`typeof Math` → "number"),再占 ~150。
+
+**W-12 完成**(API 中断后续跑恢复,**已过定点链**):
+- **Fix 1 根因漂亮**:Pratt 循环是 `while (precedence < peekPrecedence())`,故 `parseExpression(Precedence.ASSIGN)` **永远吃不掉赋值运算符**(`3 < 3` 为假)。所有产生式为 `AssignmentExpression` 的语法槽都误传 `ASSIGN` 而非 `ASSIGN - 1`,共 **19 处**(三元 consequent、对象/数组模式默认值与计算键、字面量 spread、yield 参数、`import(...)`、类计算键与字段初始化器、函数参数默认值...);仓内已有 3 处写对的 `ASSIGN - 1` 正是佐证。模板替换位改 `LOWEST`(其产生式是 `Expression`)。
+- Fix 2:对象模式此前只收 `IDENT` 属性名,现支持字符串/数字字面量与保留字键(字面量键无简写形式,故要求 `: target`;数字经 `String(value)` 归一使 `1.0` → `"1"`,保持 codegen 走既有静态键路径)。
+- 数字:**COMPILE_FAIL 81→23(−58,−72%)**,PASS +3。**它主动点破**:58 例里多数转成 FAIL 而非 PASS——解析器缺口此前**掩盖**了下游运行时缺口;+3 CRASH 亦经双版本解析器比对确认全是"HEAD 解析器直接拒绝"的文件,**无一例从可用状态回退**。探针 23/24 与 Node 一致(此前 7/24)。
+- 附赠工具:**纯解析器 test262 记分板**(直接解析 20439 源文件不编译,~60s vs ~9min),测得 FALSE_REJECT 584→279。列出后续清单:`(a,b)` 括号序列表达式**根本不解析**(对自举编译器是醒目的洞)、参数位 rest 模式目标、`yield` 无 RHS 遇 `:`、`fnGenDepth` 嵌套函数未重置、`await` 作普通标识符。
+
+**W-10 完成**(**已过定点链**,本波最大增益):
+- **根因**:`compileClassMethod`(functions/statements.js:3149)**完全没有生成器处理**,只认 async 非生成器方法。`*g(){}` 的方法体被当普通函数发射,体内 `yield` 于是在**主栈上无协程**执行 `_coroutine_yield` → 首次调用即 SIGSEGV;`typeof` 报 "function" 是因为原型槽确实存着带 tag 的函数指针——**看着可调用,结构上不是生成器**。仓内两条兄弟路径(顶层 `function*`、生成器函数表达式/对象字面量方法)早已正确:发射生成器 stub + 真体挂 `<label>_gbody` 经 `_coroutine_entry` 进入。
+- 修法:复用既有 `emitGeneratorStub`/`emitAsyncGeneratorStub`,**未复制 codegen**;并设 `ctx.inCoroBody` 与 `ctx.inAsyncGenerator`。因 stub 把 `A5` 存入 `CORO_THIS`,`c.g()` 与提取后 `C.prototype.g.call(c)` 走同一 stub,`this` 绑定一致。
+- **主动申报越界一格**:缺陷在 `compiler/functions/statements.js` 而非任务书写的 `functions.js`,并说明为何不能用 mixin 影子法绕(`CompileContext.clone()` 不携带 `inCoroBody`/`inAsyncGenerator`)。该文件与其他 peer 不冲突,合并干净。
+- 数字:**expressions PASS +33 / CRASH −8;statements PASS +49 / CRASH −4;合计 PASS +82**(32.13%→34.27%,stride-5 外推全量约 +410)。逐测试:**104 新增 PASS,6 CRASH→FAIL(改善),22 回退**。
+- **22 例回退已彻底解释且属正确性提升**:全是 `class/dstr/{gen,async-gen}-meth-*-{null,undefined}`,此前**靠 bug 意外通过**(方法体当普通函数内联跑,解构 null 在调用时抛);现在正确返回生成器对象、解构延到协程体内。规范要求参数绑定在**调用**时急切执行,这个 eager-binding 缺口是**生成器 stub 机制的预存问题**(独立等价用例 `generators/dstr/obj-init-undefined.js` 在基线即 FAIL),修它要动 `emitGeneratorStub` 里 `_generator_new` 之前的参数绑定,影响全部三条生成器路径,是更大的 FP-sensitive 改动,已明确不在本批尝试。净账:22 个意外通过换 104 个真通过 + 12 个更少崩溃。
+- 它实现了 spawned coroutine 的 stderr 改动但**主动回滚**:会打破金标 fixture `js-spawn-panic`(该 fixture 把 panic 串钉在 stdout),改 fixture 超其范围。
+
+**主控补完 W-10 的遗留项**:按 `_uncaught_report` 同一约定给 `runtime/async/coroutine.js` 的 panic 路径加 `dup2(2,1)`(linux-arm64 用 dup3),并更新金标 fixture `js-spawn-panic`:stdout 只留 `main-ran`,说明串移至 stderr。实测 `2>/dev/null` 只剩 `main-ran`、`1>/dev/null` 只剩 panic 行,exit 均 1。**注意**:fixture 运行器只捕获 stdout,故 panic 文本本身不再被 fixture 断言(exit code 与前置输出仍断言)——已写入 fixture description。
+
+**主控集成 W-9+W-10+W-11+W-12+coroutine stderr**:**gen1==gen2==gen3 + fixtures 380/380 通过**。
+
+## 发版 v0.2.5(2026-07-26)
+
+cli.js 0.2.4→0.2.5;CHANGELOG 加 v0.2.5;门禁绿;提交 d62812d;tag v0.2.5;**dev + main + tag 三者均推送 qorm**。
+- 全量 stride-5:**2065/6462 = 31.96%**(30.63%→31.96%,+86 PASS)。分区:Object 148→201(+53)、Set 20→40、Array 266→280、Map 7→16、language/expressions 666→718、statements 493→545。
+- 诚实标注:① W-8 的 DataView CRASH 37→0 **不体现在此数字**(DataView 不在被跟踪目录集内),收益真实但离线;② CRASH 235→240(+5),系 propertyHelper 加载后**新可达代码路径**暴露的既有缺陷(W-4 已预告 1 例 FAIL→CRASH),非新引入的回退。
+
+## Wave 5 派发(2026-07-26,基线 d62812d / v0.2.5)
+
+| Agent | 拥有文件 | 任务 | FP 风险 |
+|---|---|---|---|
+| **W-9** | compiler/expressions/{members,expressions,operators}.js | **三路分析共同指向的编译器缺陷**:`typeof 未声明标识符` 返回 "number"(compileIdentifier 兜底 movImm 0)→ 应为 "undefined";+ `compileDynamicNew` 非构造器守卫抛 TypeError。经崩溃 PC 符号化证明覆盖 **35/41 TypedArray 崩溃** + 全套特性探测解毒 | FP-sensitive |
+| **W-10** | compiler/functions/functions.js, runtime/async/coroutine.js | 最大单一语义 FAIL 簇(~570):类 生成器/异步生成器方法非真可调用函数(`var ref=C.prototype.g; ref()` 崩/不可调用);顺带把 spawned coroutine panic 从 stdout 移到 stderr | FP-sensitive(编译器自身重度使用生成器/async,门禁即真考) |
+| **W-11** | runtime/types/object/index.js | propertyHelper 解锁后新可达的**描述符/属性反射缺口**(~600 + 182):函数 name/length 作自有属性、namespace 方法作自有属性、writable/configurable 写删强制、原型访问器描述符、Object.hasOwn。Object 现 201 PASS 不得下降 | FP-safe |
+| **W-12** | lang/parser/, lang/lexer/ | v0.2.3 批次主动推迟的两项:解构语法长尾(COMPILE_FAIL ~70:`[...{x}]`/`({x=1}={})`/`[k??=v]`)+ 负面解析早错(~110,仅实现精确可控子集;**禁止**广义保留字绑定拒绝) | FP-sensitive |
+
+**W-9 完成**(2026-07-26,**已过定点链,零回退**):
+- **推翻了任务书里的顾虑**:该架构**能**区分"名字解析不到"与"解析到恰好是 0 的值"——解析是纯编译期查找(getLocal/getMainCapturedVar/hasFunction/import 绑定/内建名表),故静态可判,已声明变量持 0 永不进新路径。
+- 实现:members.js:134-166 两张名表(`IDENT_BUILTIN_NAMES` 镜像 compileIdentifier 的特判名;`IDENT_KNOWN_GLOBAL_NAMES` 列经其他路径支持的全局;**故意不含** Float16Array/SharedArrayBuffer/Atomics/WeakRef/Intl);members.js:433-455 新 `isUnresolvableIdentifier`(逐分支镜像 compileIdentifier,仅当会落到终末 `movImm(RET,0)` 才返 true;`with` 作用域/非 Identifier/缺 ctx 方法一律返 false 保守走旧行为);operators.js:1494 一元路径直接发射字符串 "undefined"。
+- Fix 2:`compileDynamicNew` 守卫(expressions.js:1804-1830),`_dnew_notcl` 处只接受两种合法位形(裸指针 high16==0、装箱对象 0x7FFD),拒 NULL,其余抛 TypeError。Fix 2b:`compileUserClassNew`(:1029-1046)此前对完全无法解析的名字**静默伪造空对象**(`new Zork()` 悄悄成功),现抛 TypeError。
+- **自我纠偏(值得记录)**:Fix 2b 初版判据过宽,实测**净损 5 PASS**(`new Boolean(true)`/`new Number`/`new String` 依赖该静默回退做 `(false||y)===y` 同一性测试);改用同一个 `isUnresolvableIdentifier` 谓词后 5 例回退全部消除,同时保留 Zork/Float16Array 抛错。偏差已注释:规范此处要 ReferenceError,但运行时仅有 `_throw_type_error` 且 runtime/ 超范围。
+- 数字(4115 测试,基线同目录集重跑以保证逐测试可比):**TypedArray CRASH 41→5、PASS 13→26**;expressions PASS 718→720、CRASH 75→73;statements PASS 545→547。合计 PASS 1276→1293,CRASH **178→140**。逐测试 diff:**0 回退,17 增益(15 CRASH→PASS,2 FAIL→PASS)**。fixtures 380/0,**FIXED_POINT_OK(验证两次)**。
+- 主控集成 W-9:**gen1==gen2==gen3 + fixtures 380/380 通过**。
+
+**W-12 中断**(2026-07-26):API 连接错误致 agent 在"round 2"开始时终止,worktree 留有 3 个 parser 文件的**未验证**改动(无 fixtures/无定点/无 test262)。解析器改动是 FP-sensitive,未验证部分工作不可信。**已用 SendMessage 带上下文续跑**,指令:只做收敛与验证,不开新工作;拿不准的部分一律回滚;必须过 FIXED_POINT_OK 才算成功;全部回滚只交诊断亦可接受。
+
 ## 发版 v0.2.4(2026-07-26)
 
 cli.js 0.2.3→0.2.4;CHANGELOG 加 v0.2.4;版本 bump 后重跑门禁仍绿;提交 ff81f63;tag v0.2.4;**dev 与 main 双分支 + tag 均推送 qorm**(吸取上次 main 漏推教训,本次同步双分支)。

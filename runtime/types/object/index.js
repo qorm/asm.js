@@ -2615,7 +2615,16 @@ export class ObjectGenerator {
         vm.jeq("_jpk_int32"); // 装箱 int32
         vm.cmpImm(VReg.V1, 0x7FFF);
         vm.jgt("_jpk_double"); // > 0x7FFF:负 double(符号位)
-        // 0x7FF9-0x7FFB / 0x7FFD-0x7FFF:原样
+        // [ToPropertyKey] 0x7FF9(bool)/0x7FFA(null)/0x7FFB(undefined)/0x7FFD(object)/
+        // 0x7FFE(array)/0x7FFF(function):ES 7.1.19 要求 ToString —— o[undefined] ≡
+        // o["undefined"]、o[null] ≡ o["null"]、o[true] ≡ o["true"]、o[{}] ≡
+        // o["[object Object]"]、o[[1,2]] ≡ o["1,2"]。旧实现原样保留装箱值当键,导致
+        // 读/写/in/delete/hasOwnProperty/gOPD 全线错失(且 Object.keys 打印出 null)。
+        // symbol 键是**裸堆指针**(high16==0),走 _jpk_low → _jpk_asis,不受影响。
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_valueToStr"); // RET = 装箱堆字符串键
+        vm.epilogue([VReg.S0], 0);
+
         vm.label("_jpk_asis");
         vm.mov(VReg.RET, VReg.S0);
         vm.epilogue([VReg.S0], 0);
@@ -3011,8 +3020,18 @@ export class ObjectGenerator {
     generateObjectKeys() {
         const vm = this.vm;
 
+        // [gOPN] 同一遍历体两个入口,只差"是否按 enumerable 过滤"这一位(S5):
+        //   _object_keys(obj)      → S5=0,跳过 enumerable:false(Object.keys 语义)
+        //   _object_own_keys(obj)  → S5=1,收全部自有非 symbol 键(gOPN 语义)
+        // 单 prologue 共用,避免复制整段枚举代码。
+        vm.label("_object_own_keys");
+        vm.movImm(VReg.A1, 1);
+        vm.jmp("_object_keys_entry");
         vm.label("_object_keys");
-        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
+        vm.movImm(VReg.A1, 0);
+        vm.label("_object_keys_entry");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.mov(VReg.S5, VReg.A1); // 0=按 enumerable 过滤,1=全量自有键
 
         // [test262 S1] 类型分派(消 CRASH):非对象目标按规范处理,绝不按 plain 布局解引用
         // count@8/props_ptr(此前 null/数值/数组/串脱壳后读 [垃圾+0] → SIGSEGV)。
@@ -3062,11 +3081,11 @@ export class ObjectGenerator {
         vm.mov(VReg.A2, VReg.A1);
         vm.mov(VReg.A3, VReg.S1);
         vm.call("_aref_invoke_cb"); // RET = 键数组
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 0);
         vm.label("_object_keys_proxy_fwd");
         vm.load(VReg.A0, VReg.S0, 8); // target(装箱)
         vm.call("_object_keys");
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 0);
         vm.label("_object_keys_np");
 
         // [enum-order] 枚举前归一到 ES 规范序(整数键升序在前)。S0 保活(归一保 S0-S5)。
@@ -3090,7 +3109,10 @@ export class ObjectGenerator {
         vm.cmp(VReg.S3, VReg.S1);
         vm.jge("_object_keys_done");
 
-        // 可枚举判别:flags_ptr==0 → 收;否则 flags[idx]&ATTR_ENUMERABLE==0 → 跳过
+        // 可枚举判别:S5==1(gOPN 全量)→ 收;flags_ptr==0 → 收;
+        // 否则 flags[idx]&ATTR_ENUMERABLE==0 → 跳过
+        vm.cmpImm(VReg.S5, 0);
+        vm.jne("_object_keys_take");
         vm.load(VReg.V2, VReg.S0, OBJECT_FLAGS_PTR_OFFSET);
         vm.cmpImm(VReg.V2, 0);
         vm.jeq("_object_keys_take");
@@ -3150,7 +3172,7 @@ export class ObjectGenerator {
         vm.movImm64(VReg.V1, 0x7FFE000000000000n);
         vm.mov(VReg.RET, VReg.S2);
         vm.or(VReg.RET, VReg.RET, VReg.V1);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 0);
 
         // ---- [test262 S1] 非对象目标分派处理(入口 high16 分派跳入)----
         // null/undefined → TypeError(ToObject 规范)
@@ -3192,7 +3214,7 @@ export class ObjectGenerator {
         vm.movImm64(VReg.V1, 0x7FFE000000000000n);
         vm.mov(VReg.RET, VReg.S2);
         vm.or(VReg.RET, VReg.RET, VReg.V1);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 0);
     }
 
     // Object.getOwnPropertyNames(obj) -> array
@@ -3212,7 +3234,9 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.V0, 0x7FFB); vm.jeq("_object_gopn_nullish");
         vm.cmpImm(VReg.V0, 0x7FFE); vm.jeq("_object_gopn_arr");
         vm.cmpImm(VReg.V0, 0x7FFC); vm.jeq("_object_gopn_str");
-        vm.call("_object_keys");        // 其余形态:委托(A0 未动)
+        // 其余形态:委托全量自有键入口(A0 未动)。gOPN 不按 enumerable 过滤:
+        // defineProperty(o,k,{enumerable:false}) 的键仍须出现(node 语义)。
+        vm.call("_object_own_keys");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
 
         // null/undefined → TypeError(ToObject 规范)
@@ -4201,7 +4225,7 @@ export class ObjectGenerator {
         vm.prologue(32, [VReg.S0, VReg.S1]);
 
         vm.mov(VReg.S0, VReg.A0); // 保存原始输入
-        
+
         // 类型检查: 必须是 Object (0x7FFD) / Array (0x7FFE) / 裸堆指针 (高16位=0)
         vm.shrImm(VReg.S1, VReg.A0, 48);
         vm.cmpImm(VReg.S1, 0); // 裸堆指针（未装箱的对象指针，兼容旧调用点）
@@ -4210,10 +4234,22 @@ export class ObjectGenerator {
         vm.jeq("_object_getPrototypeOf_tag_ok");
         vm.cmpImm(VReg.S1, 0x7FFE); // Array
         vm.jeq("_object_getPrototypeOf_tag_ok");
+        // null/undefined → TypeError(ToObject 规范,ES 20.1.2.12 step 1)
+        vm.cmpImm(VReg.S1, 0x7FFA); vm.jeq("_object_getPrototypeOf_nullish");
+        vm.cmpImm(VReg.S1, 0x7FFB); vm.jeq("_object_getPrototypeOf_nullish");
 
-        // 非法类型，返回 undefined
-        vm.movImm(VReg.RET, 0);
+        // 其余基元(number/string/boolean/function):本运行时无包装原型对象 → undefined。
+        // 旧实现返回**裸 0**(即 float +0.0),`gPO(x) === null` 恒 false 且 console.log
+        // 打印 0;改为规范单例 undefined,使返回值始终是合法 JSValue。
+        vm.lea(VReg.RET, "_js_undefined");
+        vm.load(VReg.RET, VReg.RET, 0);
         vm.epilogue([VReg.S0, VReg.S1], 32);
+
+        vm.label("_object_getPrototypeOf_nullish");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot convert undefined or null to object"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error"); // 不返回
 
         vm.label("_object_getPrototypeOf_tag_ok");
         // 指针脱壳 (使用 S1 作为临时)
@@ -4250,8 +4286,10 @@ export class ObjectGenerator {
         // RET 已是裸 classinfo 指针,原样返回(与类值表示一致)
         vm.epilogue([VReg.S0, VReg.S1], 32);
 
+        // 原型为空 → 规范 null 单例(旧实现返裸 0,`gPO(Object.create(null)) === null` 恒假)
         vm.label("_object_getPrototypeOf_null");
-        vm.movImm(VReg.RET, 0);
+        vm.lea(VReg.RET, "_js_null");
+        vm.load(VReg.RET, VReg.RET, 0);
         vm.epilogue([VReg.S0, VReg.S1], 32);
 
         // [proxy] getPrototypeOf 陷阱(S1=裸 proxy)
@@ -5069,6 +5107,12 @@ export class ObjectGenerator {
         vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
         vm.mov(VReg.S0, VReg.A0); // obj boxed
         vm.mov(VReg.S1, VReg.A1); // key boxed
+        // [ToPropertyKey] 复用下标读写同一归一器:数值/布尔/null/undefined/对象 → 字符串键,
+        // 字符串/symbol 原样。此前 gOPD 直接拿原始装箱值比键,gOPD(o, 1)/gOPD(o, undefined)
+        // 恒返 undefined(ES 20.1.2.8 step 2 = ToPropertyKey(P))。
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_js_prop_key");
+        vm.mov(VReg.S1, VReg.RET);
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.S2, VReg.S0, VReg.V1); // raw obj
         vm.cmpImm(VReg.S2, 0);

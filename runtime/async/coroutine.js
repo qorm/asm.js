@@ -1090,6 +1090,20 @@ export class CoroutineGenerator {
         vm.load(VReg.V1, VReg.V0, 0);
         vm.cmpImm(VReg.V1, 0);
         vm.jeq("_sched_run_no_panic");
+        // 诊断写 stderr,与主路径 _uncaught_report 同一约定:整条打印链 fd 恒为 1
+        // 且无参数化入口,故先 dup2(2,1) 把 fd1 重定向到 stderr,进程随即 exit(1),
+        // fd1 无需恢复。stdout 一字不染(fixtures/test262 逐字比对 stdout)。
+        // 无 dup2/dup3 的目标(wasi/windows)维持既有行为。
+        if (this.os === "macos" || this.os === "linux") {
+            vm.movImm(VReg.A0, 2);
+            vm.movImm(VReg.A1, 1);
+            vm.movImm(VReg.A2, 0);
+            if (this.os === "linux") {
+                vm.syscall(this.arch === "arm64" ? 24 : 33);
+            } else {
+                vm.syscall(this.arch === "arm64" ? 90 : 0x200005a);
+            }
+        }
         vm.lea(VReg.A0, this.vm.asm.addString("panic: uncaught exception in spawned coroutine:"));
         vm.call("_print_str_no_nl");
         vm.lea(VReg.A0, "_exception_value");

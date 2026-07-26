@@ -131,6 +131,40 @@ const ERR_CTOR_NAMES = [
     "ReferenceError", "EvalError", "URIError",
 ];
 
+// [typeof 未解析名] compileIdentifier 的兜底把**任何**解析不到的裸名编成 movImm(RET,0)
+// ——与真实数值 0 位形完全相同,运行时 _typeof 只能判成 "number"。于是
+// `typeof Zork === "number"`,test262 harness 里
+// `if (typeof Float16Array !== "undefined") floatArrayConstructors.push(Float16Array)`
+// 这类特性探测**恒真**,把裸 0 推进数组,随后 `new TA(...)` 在 compileDynamicNew
+// 里按 classinfo 布局解 NULL → SIGSEGV(built-ins/TypedArray 崩溃的主因)。
+// 规范里 typeof 是**唯一**允许对 unresolvable reference 不抛异常、直接返回
+// "undefined" 的上下文,故在 typeof 编译位静态判定"编译器根本解析不到这个名",
+// 直接发字符串 "undefined";其它一切上下文行为不变(兜底 0 保持原样)。
+//
+// 下面两张表用于把"解析不到"与"解析得到、值恰好是 0"严格区分开:
+// IDENT_BUILTIN_NAMES —— compileIdentifier 自身按名特判的内建名(与其分支逐条对应)。
+const IDENT_BUILTIN_NAMES = [
+    "this", "undefined", "null", "NaN", "Infinity",
+    "Array", "Object", "Function", "process", "globalThis",
+    "Boolean", "Number", "String", "Symbol", "JSON", "print",
+];
+// IDENT_KNOWN_GLOBAL_NAMES —— compileIdentifier 之外(成员访问 / 调用静态派发 / 运行时
+// 内建)确实**支持**的全局名。它们兜底也是 0,但功能真实存在,报 "undefined" 会让
+// `typeof Math !== "undefined"` 之类探测由真变假 → 反向回归。故一律视为"可解析",
+// 保持既有行为(typeof 仍得 "number",与本改动前逐字节一致)。宁可漏报不可误报:
+// 表里多列一个名最多是维持现状,少列一个名才会造成回归。
+// (Float16Array / SharedArrayBuffer / Atomics / WeakRef / Intl 等编译器与运行时完全
+//  没有的名故意**不**收录 —— 它们正是本修复要还给 "undefined" 的目标。)
+const IDENT_KNOWN_GLOBAL_NAMES = [
+    "Math", "console", "Date", "RegExp", "Map", "Set", "WeakMap", "WeakSet",
+    "Promise", "Reflect", "Proxy", "BigInt", "DataView", "arguments", "eval",
+    "parseInt", "parseFloat", "isNaN", "isFinite",
+    "encodeURI", "decodeURI", "encodeURIComponent", "decodeURIComponent",
+    "Buffer", "require", "module", "exports", "__dirname", "__filename",
+    "setTimeout", "clearTimeout", "setInterval", "clearInterval",
+    "queueMicrotask", "structuredClone",
+];
+
 // 成员访问编译方法混入
 export const MemberCompiler = {
     // 私有名改写：#x -> "#ClassName#x"。# 不是合法标识符字符，用户属性键永远撞不上；
@@ -394,6 +428,31 @@ export const MemberCompiler = {
         this.compileIdentifier(expr);
         this._inWithResolve = false;
         this.vm.label(doneL);
+    },
+
+    // [typeof 未解析名] 判定 compileIdentifier 是否**只能**落到最末的兜底
+    // `movImm(RET, 0)` —— 即这个名字编译器完全解析不到。分支与 compileIdentifier
+    // 一一对应(内建特判名 / 局部槽 / 主程序捕获全局 / 函数·类声明 / 模块导入绑定)。
+    // 只有 typeof 编译位使用;返回 false 一律表示"当作可解析",即维持原行为。
+    // 保守优先:任何拿不准的情形(with 作用域、非 Identifier 节点、ctx 缺方法)都返 false。
+    isUnresolvableIdentifier(expr) {
+        if (!expr || expr.type !== "Identifier" || !expr.name) return false;
+        const name = expr.name;
+        // with(obj) 作用域内标识符要先查 with 对象属性,静态判不了 → 保守当可解析
+        if (this.ctx.withScopes && this.ctx.withScopes.length > 0) return false;
+        if (IDENT_BUILTIN_NAMES.indexOf(name) >= 0) return false;
+        if (IDENT_KNOWN_GLOBAL_NAMES.indexOf(name) >= 0) return false;
+        if (ERR_CTOR_NAMES.indexOf(name) >= 0) return false;
+        // TA_CTOR_TAGS 是编译器自建字面对象,但仍按 #32 铁律走 hasOwnProperty,
+        // 避免用户名(constructor/toString/...)经原型链误命中。
+        if (Object.prototype.hasOwnProperty.call(TA_CTOR_TAGS, name)) return false;
+        // 词法解析路径(与 compileIdentifier 同样按真值判定 offset)
+        if (this.ctx.getLocal && this.ctx.getLocal(name)) return false;
+        if (this.ctx.getMainCapturedVar && this.ctx.getMainCapturedVar(name)) return false;
+        if (this.ctx.hasFunction && this.ctx.hasFunction(name)) return false;
+        if (this.getImportBindingForLocal && this._currentModuleAst &&
+            this.getImportBindingForLocal(this._currentModuleAst, name)) return false;
+        return true;
     },
 
     compileIdentifier(expr) {

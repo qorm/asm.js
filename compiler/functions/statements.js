@@ -3158,15 +3158,28 @@ export const StatementCompiler = {
         const returnLabel = `${methodLabel}_return`;
 
         this.vm.label(methodLabel);
-        const isAsyncMethod = !!(method.value && method.value.isAsync && !method.value.isGenerator);
+        // [批次D] 生成器/async 生成器方法(`*g(){}` / `async *g(){}`)。此前类方法路径**完全
+        // 不识别**生成器:方法体被当普通函数直编,体内 yield 直接 `_coroutine_yield` 在主栈上
+        // 挂起 → `c.g()`/`C.prototype.g.call(c)` 一律 SIGSEGV。修法与顶层生成器声明
+        // (compiler/index.js)、生成器函数表达式(closures.js)同构:方法标签处落生成器 stub
+        // (建协程 + 返回 genobj),真体在 _gbody,由 _coroutine_entry 首次 resume 进入。
+        // stub 保存 A5=this 到 CORO_THIS,故方法生成器的 this 绑定与直调一致;方法以裸函数
+        // 指针存 prototype,提取出来的引用(`var r = C.prototype.g; r.call(c)`)走同一入口。
+        const isGenMethod = !!(method.value && (method.value.isGenerator === true || method.value.generator === true));
+        const isAsyncGenMethod = isGenMethod && !!(method.value && method.value.isAsync);
+        const isAsyncMethod = !!(method.value && method.value.isAsync && !isGenMethod);
         // async 方法:标签处先落 stub(建协程+Promise 返回);真体在 _abody(经 _coroutine_entry
         // 进入,用 async 返回路径 resolve coro+88 的 Promise)。方法以裸函数指针存表,调用点
         // compileMethodCall 不识别 async,故由 stub 自建协程(与 async 函数调用同构)。
         if (isAsyncMethod) {
             this.emitAsyncMethodStub(methodLabel + "_abody", false);
+        } else if (isAsyncGenMethod) {
+            this.emitAsyncGeneratorStub(methodLabel + "_gbody", false);
+        } else if (isGenMethod) {
+            this.emitGeneratorStub(methodLabel + "_gbody", false);
         }
-        // [P1] async 方法禁录(S4 跨协程共享,同 closures.js 注)
-        if (!(method.value && method.value.isAsync)) this.vm.beginRecord();
+        // [P1] async 方法禁录(S4 跨协程共享,同 closures.js 注);生成器体同跑协程栈,同理禁录
+        if (!(method.value && method.value.isAsync) && !isGenMethod) this.vm.beginRecord();
         this.vm.prologue(8192, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
 
         const savedCtx = this.ctx;
@@ -3191,6 +3204,12 @@ export const StatementCompiler = {
         this.ctx.className = className;
         this.ctx.inStaticMethod = !!isStatic; // super.m()/super.prop 在静态方法内走父类对象
         this.ctx.returnLabel = returnLabel;
+        // [批次D] 生成器方法体:跑在协程栈上(inCoroBody → 体内无 try 的 throw/finally 重抛
+        // 走 returnLabel 完成协程,不跨栈 unwind);async 生成器体内 yield 需先 resolve
+        // coro+88 的 next() Promise(inAsyncGenerator,见 emitAsyncYieldValue)。ctx 为本方法
+        // 专属 clone,方法末尾整体还原 savedCtx,无需逐字段恢复。
+        this.ctx.inCoroBody = isGenMethod;
+        this.ctx.inAsyncGenerator = isAsyncGenMethod;
         // async 方法体:未捕获异常 reject 关联 Promise(而非退出),同 async 函数。
         let asyncMethodRejectLabel = null;
         if (isAsyncMethod) {

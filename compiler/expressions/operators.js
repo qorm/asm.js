@@ -1491,6 +1491,20 @@ export const OperatorCompiler = {
             this.vm.call("_js_box_string");
             return;
         }
+        // [typeof 未解析名] 编译器完全解析不到的裸标识符 → 规范要求 typeof 返回
+        // "undefined"(unresolvable reference 唯一不抛的上下文)。不这样做的话
+        // compileIdentifier 兜底发裸 0,_typeof 把它判成 "number",
+        // `typeof Float16Array !== "undefined"` 等特性探测恒真 → 垃圾值被当构造器
+        // 使用 → SIGSEGV。判定见 members.js isUnresolvableIdentifier:已声明变量
+        // (哪怕值就是 0)、内建名、成员/调用路径支持的全局名一律不走这里。
+        if (expr.operator === "typeof" && expr.argument.type === "Identifier" &&
+            this.isUnresolvableIdentifier && this.isUnresolvableIdentifier(expr.argument)) {
+            const undefLabel = this.asm.addString("undefined");
+            this.vm.lea(VReg.A0, undefLabel);
+            this.vm.call("_js_box_string");
+            return;
+        }
+
         // !字面量 曾编译期用 `Boolean(val)` 折叠,但自举产物里该调用走本运行时 Boolean()
         // —— 对字面量恒 true → !0/!""/!null 误折叠成 false。删除折叠,统一走下方运行时
         // case "!"(_to_boolean),对变量/字面量均正确(!!var 已实测正确)。

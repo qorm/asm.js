@@ -289,10 +289,12 @@ export const StatementParser = {
         if (this.peekTokenIs(TokenType.ASSIGN)) {
             this.nextToken();
             this.nextToken();
-            // 默认值必须在 ASSIGN 优先级解析：LOWEST(1) 会让逗号(COMMA=2)被当作序列
-            // 运算符吞掉后续形参（f(a=9,b,c) 被解析成单个形参 a=(9,b,c)），导致 b/c
-            // 从不入槽、恒读 0。ASSIGN(3) > COMMA(2) 使解析在逗号处停止。
-            return new AST.AssignmentPattern(id, this.parseExpression(Precedence.ASSIGN));
+            // 默认值是 **AssignmentExpression** 位,须用 ASSIGN-1(=COMMA=2)解析:
+            // LOWEST(1) 会让逗号(COMMA=2)被当作序列运算符吞掉后续形参
+            // (f(a=9,b,c) 被解析成单个形参 a=(9,b,c)),导致 b/c 从不入槽、恒读 0;
+            // 而 ASSIGN(3) 又太高 —— Pratt 循环 `3 < 3` 假使 `f(a = q += 1)` 里的
+            // `+=` 不被消费,报 "expected ), got +="。ASSIGN-1 两者兼顾。
+            return new AST.AssignmentPattern(id, this.parseExpression(Precedence.ASSIGN - 1));
         }
         return id;
     },

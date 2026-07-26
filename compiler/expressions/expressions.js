@@ -1026,6 +1026,26 @@ export const ExpressionCompiler = {
         const offset = this.ctx.getLocal(className);
         const globalLabel = this.ctx.getMainCapturedVar(className);
 
+        // [非构造器守卫·静态名] 名字在**任何**位置都解析不到时,下面最末的兜底会静默地
+        // "构造"出一个空对象并返回 —— `new Float16Array(8)` / `new Zork()` 于是悄悄
+        // 成功,后续对该空对象的操作再以离奇方式失败。改为抛可捕获的 TypeError:
+        // 规范这里其实是 ReferenceError,但运行时只有 _throw_type_error 原语(本次改动
+        // 不碰 runtime/),抛 TypeError 至少让错误可见、可 try/catch —— 记偏差。
+        // 判别复用 typeof 的同一把尺子 isUnresolvableIdentifier(members.js):内建名
+        // (Boolean/Number/String/Symbol/Date/…)与 TA 族一律**不**算未解析 —— 它们的
+        // `new` 靠这条静默兜底得到一个空对象,test262 里 `var y = new Boolean(true);
+        // (false || y) !== y` 之类恒等比较正因此通过,收紧会反向回归(实测 -5)。
+        // 判别全在编译期完成,解析得到的名一条指令都不多发。
+        if (this.isUnresolvableIdentifier &&
+            this.isUnresolvableIdentifier({ type: "Identifier", name: className }) &&
+            !this.getFunctionLabel(className)) {
+            this.vm.lea(VReg.A0, this.asm.addString("value is not a constructor"));
+            this.vm.call("_js_box_string");
+            this.vm.mov(VReg.A0, VReg.RET);
+            this.vm.call("_throw_type_error"); // 不返回
+            return;
+        }
+
         // 1. 分配实例对象（新布局：属性区独立分配、可自动增长，头字段已初始化）
         this.vm.call("_object_new");
         this.vm.mov(VReg.S0, VReg.RET); // S0 = 新对象（裸指针）
@@ -1780,6 +1800,34 @@ export const ExpressionCompiler = {
             this.vm.call("_fn_construct_call");
             this.vm.jmp(dynNewProxyEndL);
             this.vm.label(notClosureL);
+        }
+
+        // [非构造器守卫] 走到这里的值只可能按**类信息对象**布局解释(下面直接
+        // `ldr [S1,#32]` 取 props_ptr)。此前对 NULL / 数字 / 字符串 / undefined 等
+        // 非法构造器一律照读 → 解引用野地址 SIGSEGV(test262 里 `new <garbage>()`
+        // 的崩溃点 _dnew_notcl)。类信息值只有两种合法位形:裸指针(高16位为 0,
+        // 如 _classinfo_X 槽)与装箱对象 0x7FFD;闭包/Proxy 已在上面各自分流。
+        // 其余一律抛可捕获的 TypeError(与 _throw_read_nullish 同表示 →
+        // `e instanceof TypeError` / `e.constructor.name === "TypeError"` 成立)。
+        // 消息用固定串(asm.addString 驻留)——按调用位拼接 callee 源文本会给字符串池
+        // 增加几十条,可能推动自举产物越过 16KB 页界触发既有布局非确定性。
+        {
+            const ctorOkL = this.ctx.newLabel("dnew_ctorok");
+            const ctorBadL = this.ctx.newLabel("dnew_ctorbad");
+            this.vm.cmpImm(VReg.S1, 0);
+            this.vm.jeq(ctorBadL);
+            this.vm.load(VReg.V1, VReg.FP, dnFnValSlot); // 原始(带 tag)值
+            this.vm.shrImm(VReg.V1, VReg.V1, 48);
+            this.vm.cmpImm(VReg.V1, 0); // 裸指针
+            this.vm.jeq(ctorOkL);
+            this.vm.cmpImm(VReg.V1, 0x7ffd); // 装箱对象
+            this.vm.jeq(ctorOkL);
+            this.vm.label(ctorBadL);
+            this.vm.lea(VReg.A0, this.asm.addString("value is not a constructor"));
+            this.vm.call("_js_box_string");
+            this.vm.mov(VReg.A0, VReg.RET);
+            this.vm.call("_throw_type_error"); // 不返回
+            this.vm.label(ctorOkL);
         }
 
         // 1. 分配新对象（新布局：属性区独立分配、可自动增长）
