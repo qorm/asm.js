@@ -233,3 +233,24 @@ FAIL/COMPILE_FAIL 聚类(4378 重跑):
 - 回写:plan.md S1 段已标达成;两条运维教训入记忆(共享 stash、worktree 门禁)。
 
 **变更未提交**,待主人指示。剩余 Wave 2.1(TypedArray 读边界)与 Wave 3(编译器一等内建引用,预估 +250-350)已登记。
+
+## 发版 v0.2.3(2026-07-26)
+
+主人指示"推个版本"。cli.js VERSION 0.2.2→0.2.3;CHANGELOG 加 v0.2.3 条目;版本 bump 后重跑定点门禁仍绿(gen1==gen2==gen3,fixtures 380/380);提交 48ad72c(遵循本仓约定,不带 Co-Authored-By 尾注——接管时已从全历史剥离);annotated tag v0.2.3;推送 qorm/dev + tag 成功。
+
+## Wave 2.1 + Wave 3 派发(2026-07-26,承接"继续")
+
+基线现为已提交 HEAD 48ad72c(含全部 Wave 2 改动),worktree agent 从此分叉无 base 错位。两批并行(文件互斥),均禁用 `git stash`(改用 `git checkout -- <file>` 或复制到 scratchpad 做 before/after,规避共享 refs/stash 竞态):
+- **Wave 2.1**(FP-safe,worktree):subscript.js TypedArray 内联**读**路径加边界检查(越界返 undefined),闭合安全 H-1 内存泄露 + 清 ~41 TypedArray 崩溃。
+- **Wave 3**(FP-sensitive,worktree,须 in-worktree 过定点门禁):编译器一等内建值引用(A4 item 2)——`Function.prototype.call/apply/bind` 值读、错误构造器作 memoized 闭包带 `.name` + `thrown.constructor`、扩 NamespaceStaticRef;解锁 propertyHelper.js/assert.throws,预估 +250-350。保守优先,破定点即回退。
+
+**W-3 完成**(2026-07-26,Wave 3,**已过全链定点门禁**):落地子修复 #1(错误构造器一等 memoized 闭包)——assert.throws 最大单一解锁。`Error/TypeError/RangeError/SyntaxError/ReferenceError/EvalError/URIError` 现读作稳定 memoized 闭包带 `.name` 侧表属性,`thrown.constructor` 在 `__asmjs_err` 品牌错误对象上派发回同一闭包。改动:members.js `emitErrorCtorRef`(~253)+ compileIdentifier(~449)+ compileMemberExpression 的 constructor 分派(~892);functions.js `emitLoadClassInfo` 守卫(~242,内建错误超类无 classinfo 槽时 destReg=0,修 `class X extends Error` SIGSEGV);operators.js 未改。**gen1==gen2==gen3 字节一致(18595856 B),fixtures 380/0**。test262 测量片(Object,Math,language/statements)PASS **662→705(+43)**,statements +42(assert.throws 密集),无新 CRASH/COMPILE_FAIL。
+- **保守放弃 #2/#3**(理由充分):#2 `Function.prototype.call/apply/bind` 需通用函数调用运行时 helper(`_fn_call`/`_fn_apply`/`_reflect_apply` 不存在),超范围;load-only stub 不能让 `verifyProperty` 工作,只增风险。#3 `Object.*` 值读被 #2 门控(propertyHelper.js 仍在 `Function.prototype.call.bind(...)` 行加载即抛)。故 **propertyHelper.js 的 682 测试尚未解锁**,需后续运行时 `_fn_apply` 工作(登记为下一杠杆)。
+
+## Wave 2.1 + Wave 3 集成(2026-07-26)
+
+W-A1(subscript.js)+ W-3(members.js/functions.js)互斥,apply 到 dev,**权威门禁绿:gen1==gen2==gen3 + fixtures 380/380**。test262 stride-5 测量中,完成后回填并决定是否发 v0.2.4。
+
+---
+
+**W-A1 完成**(2026-07-26,Wave 2.1):subscript.js `_subscript_get` TypedArray 内联读路径加边界检查(越界跳 `_subscript_get_arr_oob` 返 undefined,10 行,复用 length@8 偏移无新魔数)。9 种元素类型 repro 全对拍 Node,**安全 H-1 越界读/内存泄露闭合**,fixtures 380/0,patch 干净可 apply。**但 TypedArray stride-5 CRASH 41→41 未变**——经查这 41 项是原型方法/harness 路径(copyWithin/every/filter 等经 `testWithTypedArrayConstructors`),非直接 `ta[i]` 内联读(那些已走 bounds-safe `_typed_array_get`)。即:安全价值真实,但崩溃数收益未兑现(原假设有误)。仍纳入集成(正确的安全修复,无回退)。剩余 TypedArray 崩溃根因转入后续(原型方法/harness 簇,非本批)。

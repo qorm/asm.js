@@ -239,6 +239,18 @@ export const FunctionCompiler = {
             this.vm.load(destReg, destReg, 0);
             return;
         }
+        // 内建 Error 族父类无 classinfo 槽:置 destReg=0(调用方据此跳过原型链链接;
+        // super() 由 ERR_TYPES 内联落 name/message/__asmjs_err,不需父 classinfo)。
+        // 裸错误标识符现物化为 Error 构造器闭包(members.js emitErrorCtorRef),若落下方
+        // 标识符兜底会把该闭包当 raw classinfo 解引用 → `class X extends Error` 段错误;
+        // 此守卫保持与旧路径(标识符编得 0)等价的"父 classinfo 为空"语义。
+        const ERR_SUPER_NAMES = ["Error", "TypeError", "RangeError", "SyntaxError",
+            "ReferenceError", "EvalError", "URIError"];
+        if (ERR_SUPER_NAMES.indexOf(className) >= 0 && !hasInfoSlot && !localOff &&
+            !(declNode && declNode.type === "ClassDeclaration")) {
+            this.vm.movImm(destReg, 0);
+            return;
+        }
         // 否则当作标识符/导入绑定编译，得到装箱类信息对象，去 tag 成 raw
         this.compileExpression({ type: "Identifier", name: className });
         this.vm.movImm64(VReg.V1, 0x0000ffffffffffffn);

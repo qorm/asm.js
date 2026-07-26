@@ -106,6 +106,24 @@ const NamespaceStaticRef = {
     },
 };
 
+// [Error 构造器一等值] 裸错误构造器标识符(TypeError 等)作**值读取**时物化为 memoized
+// 闭包(_errctorref_<name>,GC 根),并在侧表挂 .name=<构造器名>。使
+// `typeof TypeError==="function"`、`TypeError.name==="TypeError"`、`TypeError===TypeError`
+// 成立;`thrown.constructor`(__asmjs_err 品牌对象)按 name 分派回同一 memoized 闭包 →
+// `thrown.constructor===TypeError` 与 `.constructor.name`(test262 assert.throws 命门)。
+// 收录 7 类(AggregateError 略,其 new 走 expressions.js 内联)。fnptr 用占位 _object_new
+// (0 参、恒返空对象、必链接):assert.throws 只**读** .name/身份、从不**调用**构造器值,
+// 故 fnptr 实际不被触发;直接 `new TypeError(...)` 仍走 compileNewExpression 内联产
+// __asmjs_err 普通对象(正确)。仅经**别名**的 `var C=TypeError;new C()`/`C()` 落占位
+// (罕见),得空对象而非错误对象——记偏差。编译器源仅 `class TypeError extends Error`
+// (名遮蔽 → hasFunction 分支)与 `instanceof Error`(operators.js 内联短路,不编 RHS 标识符)
+// 引用错误名 → 本路径不被自举触发,数据段/字节不变。
+const ERR_CTOR_PLACEHOLDER_FN = "_object_new";
+const ERR_CTOR_NAMES = [
+    "Error", "TypeError", "RangeError", "SyntaxError",
+    "ReferenceError", "EvalError", "URIError",
+];
+
 // 成员访问编译方法混入
 export const MemberCompiler = {
     // 私有名改写：#x -> "#ClassName#x"。# 不是合法标识符字符，用户属性键永远撞不上；
@@ -235,6 +253,38 @@ export const MemberCompiler = {
         this.emitBuiltinFnClosure(runtimeLabel); // RET = 装箱闭包
         this.vm.lea(VReg.V0, label);
         this.vm.store(VReg.V0, 0, VReg.RET);
+        this.vm.label(doneL);
+    },
+
+    // [Error 构造器一等值] memoized 错误构造器闭包 _errctorref_<name>(GC 根)。首次建
+    // {magic, 工厂 fnptr} 闭包、存槽、并在闭包属性侧表挂 .name=<name>;后续复用同一装箱值
+    // → 稳定身份(TypeError===TypeError)。RET 恒为该 memoized 装箱闭包。
+    emitErrorCtorRef(name) {
+        const factory = ERR_CTOR_PLACEHOLDER_FN;
+        const label = "_errctorref_" + name;
+        if (!this._addedErrCtorRefLabels) this._addedErrCtorRefLabels = new Set();
+        if (!this._addedErrCtorRefLabels.has(label)) {
+            this.asm.addDataLabel(label);
+            this.asm.addDataQword(0);
+            this._addedErrCtorRefLabels.add(label);
+        }
+        const doneL = this.ctx.newLabel("errctor_done");
+        this.vm.lea(VReg.V0, label);
+        this.vm.load(VReg.RET, VReg.V0, 0);
+        this.vm.cmpImm(VReg.RET, 0);
+        this.vm.jne(doneL);
+        this.emitBuiltinFnClosure(factory); // RET = 装箱闭包(0x7FFF)
+        this.vm.lea(VReg.V0, label);
+        this.vm.store(VReg.V0, 0, VReg.RET); // memoize
+        // 侧表挂 .name = <name>(_closure_prop_set: A0=fn, A1=key, A2=boxed 串)
+        this.vm.mov(VReg.A0, VReg.RET);
+        this.emitBoxedStringKey("name", VReg.A1);
+        this.vm.lea(VReg.A2, this.asm.addString(name));
+        this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        this.vm.or(VReg.A2, VReg.A2, VReg.V1);
+        this.vm.call("_closure_prop_set"); // 毁 RET,下方重载
+        this.vm.lea(VReg.V0, label);
+        this.vm.load(VReg.RET, VReg.V0, 0);
         this.vm.label(doneL);
     },
 
@@ -434,6 +484,14 @@ export const MemberCompiler = {
         if (name === "String") { this.emitBuiltinFnClosure("_builtin_string"); return; }
         // Symbol 一等值(批次D):typeof Symbol === "function"、可传递后调用
         if (name === "Symbol") { this.emitBuiltinFnClosure("_symbol_new"); return; }
+        // [Error 构造器一等值] 裸 TypeError/RangeError/... 作值 → memoized 闭包(.name 就绪、
+        // 可传递、`===` 稳定、typeof "function")。用户局部/函数遮蔽同名时退回词法解析。
+        if (ERR_CTOR_NAMES.indexOf(name) >= 0 &&
+            !(this.ctx.getLocal && this.ctx.getLocal(name)) &&
+            !(this.ctx.getFunction && this.ctx.getFunction(name))) {
+            this.emitErrorCtorRef(name);
+            return;
+        }
         if (name === "JSON") {
             this.vm.call("_object_new");
             this.vm.call("_box_obj_r"); // box->helper
@@ -806,6 +864,53 @@ export const MemberCompiler = {
             }
         } else {
             const propName = this.getMemberPropertyName(expr.property);
+
+            // [Error 构造器一等值] `thrown.constructor`:__asmjs_err 品牌对象(tag 0x7FFD +
+            // __asmjs_err 属性)按其 .name 分派回 memoized 错误构造器闭包 → `thrown.constructor
+            // ===TypeError` 与 `.constructor.name`(test262 assert.throws 命门)。非错误对象
+            // (无品牌/非对象)退回通用 .constructor 读(emitObjectGetIC,与原语义逐字节等价)。
+            // 编译器/运行时源无 `.constructor` 成员读(仅注释)→ 本路径不被自举触发,字节不变。
+            if (propName === "constructor" && expr.object &&
+                expr.object.type !== "SuperExpression") {
+                const cid = this.nextLabelId();
+                const ctorEnd = this.ctx.newLabel("ctor_end");
+                const ctorFb = this.ctx.newLabel("ctor_fb");
+                const ctorRecv = this.ctx.allocLocal(`__ctor_recv_${cid}`);
+                this.compileExpression(expr.object);
+                this.vm.store(VReg.FP, ctorRecv, VReg.RET);
+                this.vm.shrImm(VReg.V1, VReg.RET, 48);
+                this.vm.cmpImm(VReg.V1, 0x7FFD); // 对象?
+                this.vm.jne(ctorFb);
+                this.vm.load(VReg.A0, VReg.FP, ctorRecv);
+                this.emitBoxedStringKey("__asmjs_err", VReg.A1);
+                this.vm.call("_object_has"); // 裸 0/1
+                this.vm.cmpImm(VReg.RET, 0);
+                this.vm.jeq(ctorFb);
+                const ctorName = this.ctx.allocLocal(`__ctor_name_${cid}`);
+                this.vm.load(VReg.A0, VReg.FP, ctorRecv);
+                this.emitBoxedStringKey("name", VReg.A1);
+                this.vm.call("_object_get"); // RET = name 串
+                this.vm.store(VReg.FP, ctorName, VReg.RET);
+                for (let ei = 0; ei < ERR_CTOR_NAMES.length; ei++) {
+                    const en = ERR_CTOR_NAMES[ei];
+                    const ctorNx = this.ctx.newLabel("ctor_nx");
+                    this.vm.load(VReg.A0, VReg.FP, ctorName);
+                    this.emitBoxedStringKey(en, VReg.A1);
+                    this.vm.call("_strict_eq");
+                    this.vm.movImm64(VReg.V1, 0x7ff9000000000001n); // JS_TRUE
+                    this.vm.cmp(VReg.RET, VReg.V1);
+                    this.vm.jne(ctorNx);
+                    this.emitErrorCtorRef(en); // RET = memoized 闭包
+                    this.vm.jmp(ctorEnd);
+                    this.vm.label(ctorNx);
+                }
+                // 品牌在但 name 不识别 → 退回通用读
+                this.vm.label(ctorFb);
+                this.vm.load(VReg.RET, VReg.FP, ctorRecv);
+                this.emitObjectGetIC("constructor");
+                this.vm.label(ctorEnd);
+                return;
+            }
 
             // [#66 Phase2] super.prop 读:从父类 prototype 沿链取属性/访问器,再以
             // 当前实例(this)解 getter。ctx.superClass 记父类名;父 prototype =

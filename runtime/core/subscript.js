@@ -90,6 +90,16 @@ export class SubscriptGenerator {
         vm.jlt("_subscript_get_array"); // 小于 0x40，是普通 Array
 
         // ========== TypedArray 路径 ==========
+        // [H-1] 越界读返回 undefined(spec:OOB TypedArray 元素读 → undefined,不抛)。
+        // 内联读此前不查界,`new Float64Array(1)[1e6]` 越界读数 MB → 信息泄露/段错误
+        // (内联 OOB 读是剩余 TypedArray 段错误主因)。镜像 _typed_array_get 的 bounds
+        // 检查:length 在头 @8(读原始数组头 S0,须在下方 S0 被改写为 data_ptr-16 之前)。
+        // 复用 _subscript_get_arr_oob(置 RET=JS_UNDEFINED 并 epilogue)。
+        vm.load(VReg.V1, VReg.S0, 8); // length
+        vm.cmpImm(VReg.S1, 0);
+        vm.jlt("_subscript_get_arr_oob");
+        vm.cmp(VReg.S1, VReg.V1);
+        vm.jge("_subscript_get_arr_oob");
         // [Design A] 元素基址改用 data_ptr(内联/buffer 视图统一)。既有寻址用 base+16,
         // 故置 S0 = data_ptr - 16,令后续 base+16 恰读 data_ptr。S2 随后被各分支覆写。
         vm.load(VReg.S2, VReg.S0, 16);

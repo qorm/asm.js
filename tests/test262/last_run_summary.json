@@ -1,5 +1,5 @@
 {
-  "generated": "2026-07-26T10:35:21.941Z",
+  "generated": "2026-07-26T11:56:55.576Z",
   "config": {
     "corpus": "/Users/nouo/github/asm.js/.test262-corpus",
     "target": "macos-arm64",
@@ -44,22 +44,22 @@
   "eligible": 32310,
   "run": 6462,
   "totals": {
-    "PASS": 1842,
-    "FAIL": 4277,
+    "PASS": 1979,
+    "FAIL": 4139,
     "COMPILE_FAIL": 108,
-    "CRASH": 235
+    "CRASH": 236
   },
-  "passRatePct": 28.51,
+  "passRatePct": 30.63,
   "byArea": {
     "built-ins/Array": {
-      "PASS": 266,
-      "FAIL": 304,
+      "PASS": 280,
+      "FAIL": 290,
       "COMPILE_FAIL": 0,
       "CRASH": 24
     },
     "built-ins/Boolean": {
-      "PASS": 1,
-      "FAIL": 8,
+      "PASS": 3,
+      "FAIL": 6,
       "COMPILE_FAIL": 0,
       "CRASH": 1
     },
@@ -70,8 +70,8 @@
       "CRASH": 0
     },
     "built-ins/Map": {
-      "PASS": 7,
-      "FAIL": 32,
+      "PASS": 16,
+      "FAIL": 23,
       "COMPILE_FAIL": 0,
       "CRASH": 2
     },
@@ -88,56 +88,56 @@
       "CRASH": 1
     },
     "built-ins/Object": {
-      "PASS": 148,
-      "FAIL": 523,
+      "PASS": 149,
+      "FAIL": 522,
       "COMPILE_FAIL": 0,
       "CRASH": 11
     },
     "built-ins/Promise": {
-      "PASS": 25,
-      "FAIL": 109,
+      "PASS": 31,
+      "FAIL": 103,
       "COMPILE_FAIL": 2,
       "CRASH": 9
     },
     "built-ins/RegExp": {
-      "PASS": 93,
-      "FAIL": 277,
+      "PASS": 97,
+      "FAIL": 273,
       "COMPILE_FAIL": 4,
       "CRASH": 0
     },
     "built-ins/Set": {
-      "PASS": 20,
-      "FAIL": 46,
+      "PASS": 40,
+      "FAIL": 26,
       "COMPILE_FAIL": 0,
       "CRASH": 10
     },
     "built-ins/String": {
-      "PASS": 55,
-      "FAIL": 188,
+      "PASS": 60,
+      "FAIL": 183,
       "COMPILE_FAIL": 0,
       "CRASH": 1
     },
     "built-ins/Symbol": {
-      "PASS": 3,
-      "FAIL": 12,
+      "PASS": 4,
+      "FAIL": 11,
       "COMPILE_FAIL": 0,
       "CRASH": 0
     },
     "built-ins/TypedArray": {
-      "PASS": 10,
-      "FAIL": 237,
+      "PASS": 13,
+      "FAIL": 233,
       "COMPILE_FAIL": 0,
-      "CRASH": 41
+      "CRASH": 42
     },
     "language/expressions": {
-      "PASS": 666,
-      "FAIL": 1214,
+      "PASS": 700,
+      "FAIL": 1180,
       "COMPILE_FAIL": 51,
       "CRASH": 74
     },
     "language/statements": {
-      "PASS": 493,
-      "FAIL": 1217,
+      "PASS": 531,
+      "FAIL": 1179,
       "COMPILE_FAIL": 51,
       "CRASH": 61
     }
@@ -145,7 +145,7 @@
   "topFailPatterns": [
     {
       "pattern": "FAIL: assertion mismatch (Test262Error / wrong value)",
-      "count": 2327
+      "count": 2193
     },
     {
       "pattern": "FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)",
@@ -161,11 +161,11 @@
     },
     {
       "pattern": "CRASH: run signal SIGSEGV",
-      "count": 173
+      "count": 174
     },
     {
       "pattern": "FAIL: TypedArray/ArrayBuffer semantics",
-      "count": 158
+      "count": 154
     },
     {
       "pattern": "FAIL: array contents mismatch (compareArray)",
