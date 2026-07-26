@@ -328,27 +328,13 @@ export class ArrayGenerator {
         vm.movImm(VReg.S2, 0);
         vm.label("_array_indexOf_from_ok");
 
-        // 预先检查 value 是否是 Number 对象
-        // S4 = value 的数值（如果是 Number），否则为 0
+        // [已删 Number 对象探针] 旧探针把搜索值脱壳当堆指针 load 类型字——但主循环自
+        // _strict_eq 化后 S4 已无读者(见下方注释),探针成纯死代码;且对装箱 tagged 值
+        // (true=0x7FF9..01 → 脱壳 payload=1)与负 float(0xBFF8.. → 脱壳非法地址)的
+        // load 直接 SIGSEGV:`[false,true].indexOf(true)` 恒崩(泛型数组方法把 test262
+        // 用例推进到此路径后显形)。删除探针 = 只消灭崩溃解引用,可工作输入的结果不变
+        // (字符串/对象/数组搜索值原本也只是探针失败落回主循环)。
         vm.movImm(VReg.S4, 0);
-        vm.cmpImm(VReg.S1, 0);
-        vm.jeq("_array_indexOf_loop"); // null，跳过
-        // 检查是否是原始 float64（非 NaN-boxing）
-        vm.shrImm(VReg.V0, VReg.S1, 48); // V0 = 高 16 位
-        vm.cmpImm(VReg.V0, 0x7FF8);
-        vm.jlt("_array_indexOf_loop"); // 原始 float，使用直接比较
-        // 否则尝试作为 Number 对象处理：必须先脱壳成堆指针再读类型！
-        // 原直接 load[S1,0]，但 S1 是装箱值(如字符串 0x7ffc|ptr) → 读 [0x7ffc..] 越界崩
-        // （自举里 arr.indexOf("str") 类调用，字符串搜索值 → 崩根因）。
-        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
-        vm.and(VReg.V1, VReg.S1, VReg.V1); // V1 = 脱壳堆指针
-        vm.load(VReg.V0, VReg.V1, 0); // 加载 value 的类型（字符串对象 type=6 < TYPE_INT8）
-        vm.cmpImm(VReg.V0, TYPE_INT8);
-        vm.jlt("_array_indexOf_loop"); // 不是 Number
-        vm.cmpImm(VReg.V0, TYPE_FLOAT64);
-        vm.jgt("_array_indexOf_loop"); // 不是 Number
-        // 是 Number，加载其数值
-        vm.load(VReg.S4, VReg.V1, 8);
 
         vm.label("_array_indexOf_loop");
         vm.cmp(VReg.S2, VReg.S3);
@@ -417,21 +403,9 @@ export class ArrayGenerator {
         vm.mov(VReg.S2, VReg.V0);           // 钳到 len-1
         vm.label("_array_lastIndexOf_start");
 
-        // value 是否 Number 对象 → S4 = 数值,否则 0（同 indexOf）
+        // [已删 Number 对象探针,同 _array_indexOf] 主循环 _strict_eq 化后 S4 无读者,
+        // 探针对装箱 tagged/负 float 搜索值的脱壳解引用恒 SIGSEGV,纯删。
         vm.movImm(VReg.S4, 0);
-        vm.cmpImm(VReg.S1, 0);
-        vm.jeq("_array_lastIndexOf_loop");
-        vm.shrImm(VReg.V0, VReg.S1, 48);
-        vm.cmpImm(VReg.V0, 0x7FF8);
-        vm.jlt("_array_lastIndexOf_loop");
-        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
-        vm.and(VReg.V1, VReg.S1, VReg.V1);
-        vm.load(VReg.V0, VReg.V1, 0);
-        vm.cmpImm(VReg.V0, TYPE_INT8);
-        vm.jlt("_array_lastIndexOf_loop");
-        vm.cmpImm(VReg.V0, TYPE_FLOAT64);
-        vm.jgt("_array_lastIndexOf_loop");
-        vm.load(VReg.S4, VReg.V1, 8);
 
         vm.label("_array_lastIndexOf_loop");
         vm.cmpImm(VReg.S2, 0);
