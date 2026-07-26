@@ -786,6 +786,21 @@ export class TypedArrayGenerator {
         vm.andImm(VReg.V2, VReg.V1, 0x7ff8);
         vm.cmpImm(VReg.V2, 0x7ff8);
         vm.jne("_ta_set_have_bits"); // 非 NaN-tag → S2 是规范浮点位模式(含负数)
+        // [W-32] 正向 NaN-box tag 0x7FF8..0x7FFF = **装箱的非 double 值**
+        // (0x7FF8 int32 / 0x7FF9 bool / 0x7FFA null / 0x7FFB undefined / 0x7FFC string /
+        //  0x7FFD object / 0x7FFE array / 0x7FFF function)。ES 要求元素写先 ToNumber;
+        // 此前把位模式**原样存下**:Float64Array 存进 0x7FFB…(读回竟 `=== undefined`)、
+        // 存进串/对象指针;整型数组则存指针低 32 位(实测 f64[i]="3.5" → 3.5 变
+        // 70777452)。真 NaN 在本运行时是 0x7FF0000000000001(high16=0x7FF0),不在此
+        // 区间,故不受影响;负向镜像 0xFFF8..0xFFFF 是负 double/-NaN,保持原路径。
+        vm.cmpImm(VReg.V1, 0x7FF8);
+        vm.jlt("_ta_set_check_heap");
+        vm.cmpImm(VReg.V1, 0x7FFF);
+        vm.jgt("_ta_set_check_heap");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_number_coerce");   // ToNumber:undefined→NaN、null→+0、bool→0/1、
+        vm.mov(VReg.S2, VReg.RET);   // 串→_str_to_num、对象→NaN
+        vm.jmp("_ta_set_have_bits");
 
         vm.label("_ta_set_check_heap");
         // 检查 value 是否是 boxed Number（需要 unbox）
@@ -794,6 +809,20 @@ export class TypedArrayGenerator {
 
         vm.cmp(VReg.S2, VReg.S3);
         vm.jlt("_ta_set_raw"); // 小于 heap_base，当作 raw
+
+        // [W-32/K1] Symbol → TypeError(ES: ToNumber(symbol) 抛;此前静默存指针低字节)。
+        // Symbol 是**裸堆指针 + 用户区标记块**([ptr]==TYPE_SYMBOL(61)),故判据放在
+        // heap_base 之后。**必须早于**下方那段硬编码上界(0x100200000)检查:native 上
+        // heap_base 实测高于该常量,那条 jge 恒成立 → 放后面则分支永不可达。
+        vm.lea(VReg.V0, "_heap_ptr");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmp(VReg.S2, VReg.V0);
+        vm.jge("_ta_set_notsym");
+        vm.load(VReg.V0, VReg.S2, 0);
+        vm.andImm(VReg.V0, VReg.V0, 0xff);
+        vm.cmpImm(VReg.V0, 61); // TYPE_SYMBOL
+        vm.jeq("_ta_set_symbol");
+        vm.label("_ta_set_notsym");
 
         // 额外检查：上界之外不是堆对象
         if (vm.platform === "wasi") {
@@ -923,6 +952,14 @@ export class TypedArrayGenerator {
 
         vm.label("_ta_set_done");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
+
+        // [W-32/K1] Symbol 元素写 → TypeError(不返回)。
+        vm.label("_ta_set_symbol");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot convert a Symbol value to a number"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error"); // 不返回
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64); // 理论不达
     }
 
     // 获取 TypedArray 长度
@@ -1427,16 +1464,64 @@ export class TypedArrayGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 0);
     }
 
-    // _ta_sort(ta) -> ta(原地数值升序插入排序;默认数值序,与数组 sort 的字典序不同——
-    // TypedArray.sort 默认按数值)。比较函数暂不支持(记偏差,follow-up)。
+    // [W-32/K7] _ta_sort_cmp(ta, comparefn) -> ta(原地插入排序)。
+    //   comparefn === undefined → 数值升序(TypedArray 默认数值序,与数组 sort 的字典序不同);
+    //   否则 comparefn 必须可调用(不可调用 → TypeError,ES 22.2.3.26 步骤 1),
+    //   次序由 comparefn(a, b) 的 ToNumber 结果决定(>0 交换;NaN 视作 +0 → 保持稳定)。
+    // _ta_sort(ta) 是**兼容入口**:编译期静态 TypedArray 路径(compiler/expressions/expressions.js
+    // 的 compileTypedArrayMethod)只传 A0、且根本不求值比较器实参,故这里显式置
+    // comparefn=undefined 后落入同一实现——绝不嗅探 A1(那是未初始化的残留值)。
     generateSortMethod() {
         const vm = this.vm;
         const MASK = 0x0000ffffffffffffn;
+        const UNDEF = 0x7ffb000000000000n;
         vm.label("_ta_sort");
-        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.movImm64(VReg.A1, UNDEF);           // 静态路径:无比较器
+        // fallthrough → _ta_sort_cmp
+        vm.label("_ta_sort_cmp");
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
         vm.movImm64(VReg.V1, MASK);
         vm.and(VReg.S0, VReg.A0, VReg.V1);
+        vm.store(VReg.SP, 0, VReg.A1);         // comparefn(装箱)落栈槽:跨回调存活且 GC 可见
         vm.load(VReg.S1, VReg.S0, 8);          // len
+        vm.shrImm(VReg.V0, VReg.A1, 48);
+        vm.cmpImm(VReg.V0, 0x7ffb);            // undefined → 数值序
+        vm.jeq("_ta_sort_numeric");
+        vm.mov(VReg.A0, VReg.A1);
+        vm.call("_ta_need_fn");                // 非可调用 → TypeError(不返回)
+        vm.movImm(VReg.S2, 1);                 // i
+        vm.label("_ta_sortc_outer");
+        vm.cmp(VReg.S2, VReg.S1); vm.jge("_ta_sortc_done");
+        vm.mov(VReg.A0, VReg.S0); vm.mov(VReg.A1, VReg.S2); vm.call("_typed_array_get"); vm.mov(VReg.S4, VReg.RET); // key
+        vm.mov(VReg.S3, VReg.S2);              // j = i
+        vm.label("_ta_sortc_inner");
+        vm.cmpImm(VReg.S3, 0); vm.jle("_ta_sortc_place");
+        vm.subImm(VReg.A1, VReg.S3, 1);
+        vm.mov(VReg.A0, VReg.S0); vm.call("_typed_array_get"); vm.mov(VReg.S5, VReg.RET); // prev = ta[j-1]
+        // comparefn(prev, key):元素本身就是 canonical f64(= 装箱数字),直接当实参。
+        vm.mov(VReg.A0, VReg.S5);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.movImm64(VReg.A2, UNDEF);
+        vm.load(VReg.A3, VReg.SP, 0);
+        vm.call("_aref_invoke_cb");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_number_coerce");             // ToNumber(结果)→ canonical f64
+        vm.fmovToFloat(0, VReg.RET);
+        vm.movImm(VReg.V1, 0); vm.scvtf(1, VReg.V1); // d1 = 0.0
+        vm.fcmp(0, 1);
+        vm.jfgt("_ta_sortc_shift");            // >0 → prev 应排在 key 之后;NaN 落 place(视作 0)
+        vm.jmp("_ta_sortc_place");
+        vm.label("_ta_sortc_shift");
+        vm.mov(VReg.A0, VReg.S0); vm.mov(VReg.A1, VReg.S3); vm.mov(VReg.A2, VReg.S5); vm.call("_typed_array_set");
+        vm.subImm(VReg.S3, VReg.S3, 1); vm.jmp("_ta_sortc_inner");
+        vm.label("_ta_sortc_place");
+        vm.mov(VReg.A0, VReg.S0); vm.mov(VReg.A1, VReg.S3); vm.mov(VReg.A2, VReg.S4); vm.call("_typed_array_set");
+        vm.addImm(VReg.S2, VReg.S2, 1); vm.jmp("_ta_sortc_outer");
+        vm.label("_ta_sortc_done");
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
+
+        vm.label("_ta_sort_numeric");
         vm.movImm(VReg.S2, 1);                 // i
         vm.label("_ta_sort_outer");
         vm.cmp(VReg.S2, VReg.S1); vm.jge("_ta_sort_done");
@@ -1455,6 +1540,90 @@ export class TypedArrayGenerator {
         vm.addImm(VReg.S2, VReg.S2, 1); vm.jmp("_ta_sort_outer");
         vm.label("_ta_sort_done");
         vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
+    }
+
+    // [W-32/K1] _ta_need_fn(A0=装箱候选) —— 回调/比较器的可调用性守卫。
+    // 判据比 _aref_invoke_cb 的守卫**更严**:后者放行任意装箱对象(0x7FFD),非 Proxy
+    // 时落 "裸函数" 分支直接 callIndirect 到对象首地址 → `ta.find({})` SIGBUS。
+    // 这里只接受:装箱函数(0x7FFF) / 堆内闭包块(magic@0==0xc105) / 可调用 Proxy(type@0==8)。
+    // 其余(数字、字符串、null、undefined、普通对象、数组)一律 TypeError。
+    generateNeedFn() {
+        const vm = this.vm;
+        const MASK = 0x0000ffffffffffffn;
+        vm.label("_ta_need_fn");
+        vm.prologue(0, [VReg.S0]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.shrImm(VReg.V0, VReg.S0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jeq("_tanf_ok");                    // 装箱函数(裸函数指针/闭包)
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_tanf_raw");
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jne("_tanf_bad");
+        vm.label("_tanf_raw");
+        vm.movImm64(VReg.V1, MASK);
+        vm.and(VReg.S0, VReg.S0, VReg.V1);
+        vm.lea(VReg.V0, "_heap_base");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmp(VReg.S0, VReg.V0);
+        vm.jlt("_tanf_bad");
+        vm.lea(VReg.V0, "_heap_ptr");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmp(VReg.S0, VReg.V0);
+        vm.jge("_tanf_bad");
+        vm.load(VReg.V0, VReg.S0, 0);
+        vm.movImm(VReg.V1, 0xc105);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jeq("_tanf_ok");                    // 闭包块
+        vm.andImm(VReg.V0, VReg.V0, 0xff);
+        vm.cmpImm(VReg.V0, 8);                 // TYPE_PROXY(可调用 Proxy 候选)
+        vm.jeq("_tanf_ok");
+        vm.label("_tanf_bad");
+        vm.call("_throw_not_a_function");      // 不返回
+        vm.label("_tanf_ok");
+        vm.epilogue([VReg.S0], 0);
+    }
+
+    // [W-32/K7] _ta_subarray(ta, begin, end) -> **共享同一 buffer 的视图**(不拷贝)。
+    // ES 22.2.3.27:subarray 返回 view,写回互见、`sub.buffer === src.buffer`。
+    // 原实现走 _ta_slice(整段拷贝),别名写不回传——真实程序里静默丢数据。
+    // 实现:_ta_buffer 取(或惰性建)底层 ArrayBuffer,再 _typed_array_view 造视图,
+    // byteOffset = 源 byteOffset + begin*elemSize。begin/end 归一同 slice(夹到 [0,len],
+    // 负数加 len,2147483647 = 到末尾哨兵),count<0 归 0 —— 故不会触发 view 的 RangeError。
+    generateSubarray() {
+        const vm = this.vm;
+        const MASK = 0x0000ffffffffffffn;
+        vm.label("_ta_subarray");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.movImm64(VReg.V1, MASK);
+        vm.and(VReg.S0, VReg.A0, VReg.V1);  // 裸 ta
+        vm.mov(VReg.S1, VReg.A1);           // begin
+        vm.mov(VReg.S2, VReg.A2);           // end
+        vm.load(VReg.S3, VReg.S0, 8);       // len
+        // 归一 begin
+        vm.cmpImm(VReg.S1, 0); vm.jge("_ta_sub_s1"); vm.add(VReg.S1, VReg.S1, VReg.S3); vm.label("_ta_sub_s1");
+        vm.cmpImm(VReg.S1, 0); vm.jge("_ta_sub_s2"); vm.movImm(VReg.S1, 0); vm.label("_ta_sub_s2");
+        vm.cmp(VReg.S1, VReg.S3); vm.jle("_ta_sub_s3"); vm.mov(VReg.S1, VReg.S3); vm.label("_ta_sub_s3");
+        // 归一 end
+        vm.movImm64(VReg.V0, 2147483647n); vm.cmp(VReg.S2, VReg.V0); vm.jne("_ta_sub_e0"); vm.mov(VReg.S2, VReg.S3); vm.jmp("_ta_sub_edone"); vm.label("_ta_sub_e0");
+        vm.cmpImm(VReg.S2, 0); vm.jge("_ta_sub_e1"); vm.add(VReg.S2, VReg.S2, VReg.S3); vm.label("_ta_sub_e1");
+        vm.cmpImm(VReg.S2, 0); vm.jge("_ta_sub_e2"); vm.movImm(VReg.S2, 0); vm.label("_ta_sub_e2");
+        vm.cmp(VReg.S2, VReg.S3); vm.jle("_ta_sub_e3"); vm.mov(VReg.S2, VReg.S3); vm.label("_ta_sub_e3");
+        vm.label("_ta_sub_edone");
+        // count = end - begin(<0 → 0),复用 S3
+        vm.sub(VReg.S3, VReg.S2, VReg.S1);
+        vm.cmpImm(VReg.S3, 0); vm.jge("_ta_sub_c0"); vm.movImm(VReg.S3, 0); vm.label("_ta_sub_c0");
+        vm.mov(VReg.A0, VReg.S0); vm.call("_ta_elem_size"); vm.mov(VReg.S4, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0); vm.call("_ta_buffer");    vm.mov(VReg.S2, VReg.RET); // 底层 buffer
+        vm.mov(VReg.A0, VReg.S0); vm.call("_ta_byteoffset"); vm.mov(VReg.S5, VReg.RET); // 源 byteOffset
+        vm.mul(VReg.V0, VReg.S1, VReg.S4);  // begin*elemSize(x64 上 mul 可能动 A2,故先算)
+        vm.add(VReg.V0, VReg.V0, VReg.S5);
+        vm.mov(VReg.A2, VReg.V0);           // byteOffset
+        vm.mov(VReg.A3, VReg.S3);           // length(元素数)
+        vm.mov(VReg.A1, VReg.S2);           // buffer
+        vm.load(VReg.A0, VReg.S0, 0); vm.andImm(VReg.A0, VReg.A0, 0xff); // type
+        vm.call("_typed_array_view");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 0);
     }
 
@@ -1475,8 +1644,10 @@ export class TypedArrayGenerator {
         this.generateByteLengthMethod();
         this.generateReverse();
         this.generateSortMethod();
+        this.generateNeedFn();
         this.generateTaBuffer();
         this.generateTaByteOffset();
+        this.generateSubarray();
         this.generateCtorSupport();
         this.generateProtoIntrinsic();
     }
@@ -1974,7 +2145,13 @@ export class TypedArrayGenerator {
             vm.call("_ta_slice");
         };
         wrap("_tam_slice", sliceLike);
-        wrap("_tam_subarray", sliceLike);
+        // [W-32/K7] subarray 是**视图**(共享 buffer),不是拷贝 —— 走 _ta_subarray。
+        wrap("_tam_subarray", () => {
+            argInt(VReg.S1, 0); vm.mov(VReg.S4, VReg.RET);
+            argInt(VReg.S2, INT_MAX); vm.mov(VReg.S5, VReg.RET);
+            vm.mov(VReg.A0, VReg.S0); vm.mov(VReg.A1, VReg.S4); vm.mov(VReg.A2, VReg.S5);
+            vm.call("_ta_subarray");
+        });
         wrap("_tam_fill", () => {
             argInt(VReg.S2, 0); vm.mov(VReg.S4, VReg.RET);
             argInt(VReg.S3, INT_MAX); vm.mov(VReg.S5, VReg.RET);
@@ -1996,7 +2173,12 @@ export class TypedArrayGenerator {
             vm.call("_ta_set");
         });
         wrap("_tam_reverse", () => { vm.mov(VReg.A0, VReg.S0); vm.call("_ta_reverse"); });
-        wrap("_tam_sort", () => { vm.mov(VReg.A0, VReg.S0); vm.call("_ta_sort"); });
+        // [W-32/K7] sort/toSorted 传递比较器(S1);undefined → 数值序,非可调用 → TypeError。
+        const sortWith = () => {
+            vm.mov(VReg.A0, VReg.S0); vm.mov(VReg.A1, VReg.S1);
+            vm.call("_ta_sort_cmp");
+        };
+        wrap("_tam_sort", sortWith);
         const copyThen = (target) => () => {
             vm.mov(VReg.A0, VReg.S0);
             vm.movImm(VReg.A1, 0);
@@ -2006,7 +2188,15 @@ export class TypedArrayGenerator {
             vm.call(target);
         };
         wrap("_tam_toReversed", copyThen("_ta_reverse"));
-        wrap("_tam_toSorted", copyThen("_ta_sort"));
+        wrap("_tam_toSorted", () => {
+            vm.mov(VReg.A0, VReg.S0);
+            vm.movImm(VReg.A1, 0);
+            vm.movImm64(VReg.A2, BigInt(INT_MAX));
+            vm.call("_ta_slice");           // RET = 副本(原数组不变)
+            vm.mov(VReg.A0, VReg.RET);
+            vm.mov(VReg.A1, VReg.S1);
+            vm.call("_ta_sort_cmp");
+        });
         wrap("_tam_with", () => {
             vm.mov(VReg.A0, VReg.S0);
             vm.movImm(VReg.A1, 0);
@@ -2028,7 +2218,12 @@ export class TypedArrayGenerator {
         wrap("_tam_values", iterKind(0));
         wrap("_tam_keys", iterKind(1));
         wrap("_tam_entries", iterKind(2));
+        // [W-32/K1] 回调型方法:ES 规定 ValidateTypedArray 之后立刻 IsCallable(callbackfn),
+        // 不可调用即 TypeError —— 且**先于**任何元素访问。既有 _aref_invoke_cb 的守卫放行
+        // 装箱普通对象并 callIndirect 其首地址(ta.find({}) 段错),故这里前置严格校验。
+        const needFn = () => { vm.mov(VReg.A0, VReg.S1); vm.call("_ta_need_fn"); };
         const cb2 = (target) => () => {
+            needFn();
             toArr();
             vm.mov(VReg.A0, VReg.S4); vm.mov(VReg.A1, VReg.S1);
             vm.call(target);
@@ -2038,6 +2233,7 @@ export class TypedArrayGenerator {
         wrap("_tam_every", cb2("_array_every_rt"));
         // map/filter 按 ES 返回同类型 TypedArray:普通数组结果再经 _typed_array_from 回填。
         const cb2Ta = (target) => () => {
+            needFn();
             vm.loadByte(VReg.S5, VReg.S0, 0); // 元素类型
             toArr();
             vm.mov(VReg.A0, VReg.S4); vm.mov(VReg.A1, VReg.S1);
@@ -2049,6 +2245,7 @@ export class TypedArrayGenerator {
         wrap("_tam_map", cb2Ta("_array_map_rt"));
         wrap("_tam_filter", cb2Ta("_array_filter_rt"));
         const cb3 = (target) => () => {
+            needFn();
             toArr();
             vm.mov(VReg.A0, VReg.S4); vm.mov(VReg.A1, VReg.S1); vm.mov(VReg.A2, VReg.S2);
             vm.call(target);
@@ -2123,6 +2320,7 @@ export class TypedArrayGenerator {
         vm.epilogue(SAVE, 48);
 
         const findMode = (mode) => () => {
+            needFn();
             vm.mov(VReg.A0, VReg.S0);
             vm.mov(VReg.A1, VReg.S1);
             vm.movImm(VReg.A2, mode);

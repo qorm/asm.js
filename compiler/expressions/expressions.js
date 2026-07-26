@@ -1616,8 +1616,9 @@ export const ExpressionCompiler = {
             return true;
         }
         if (name === "slice" || name === "subarray") {
-            // subarray 规范上是共享 buffer 的视图;此处按 slice(拷贝)近似——数值语义一致,
-            // 别名写回不生效(记偏差,follow-up)。
+            // slice 拷贝;subarray 是**共享 buffer 的视图**(_ta_subarray 经 _ta_buffer +
+            // _typed_array_view 建真视图,byteOffset = src.byteOffset + begin*elemSize)。
+            // 此前二者都走 _ta_slice,别名写回静默失效——`u.subarray(1,3)[0]=99` 不改 u。
             this.compileExpression(obj);
             vm.push(VReg.RET);
             if (args.length >= 1) { this.compileExpressionAsInt(args[0]); vm.mov(VReg.A1, VReg.RET); }
@@ -1625,7 +1626,7 @@ export const ExpressionCompiler = {
             if (args.length >= 2) { vm.push(VReg.A1); this.compileExpressionAsInt(args[1]); vm.mov(VReg.A2, VReg.RET); vm.pop(VReg.A1); }
             else vm.movImm(VReg.A2, 2147483647);
             vm.pop(VReg.A0);
-            vm.call("_ta_slice");
+            vm.call(name === "subarray" ? "_ta_subarray" : "_ta_slice");
             return true;
         }
         if (name === "fill") {
@@ -1670,11 +1671,20 @@ export const ExpressionCompiler = {
             return true;
         }
         if (name === "reverse" || name === "sort") {
-            // reverse:原地反转。sort:原地**数值**升序(TypedArray 默认数值序;比较函数暂不支持,
-            // 传入亦忽略——记偏差)。二者返回原 typed array。
+            // reverse:原地反转。sort:原地升序——**比较函数现已支持**(_ta_sort_cmp:undefined
+            // 走既有数值插入排序,否则 validate-callable 后按 ToNumber(cmp(a,b)) 定序)。
+            // 此前从不编译 args[0],传入的比较函数被静默忽略。
             this.compileExpression(obj);
+            if (name === "sort") {
+                vm.push(VReg.RET);
+                if (args.length >= 1) { this.compileExpression(args[0]); vm.mov(VReg.A1, VReg.RET); }
+                else vm.movImm64(VReg.A1, 0x7FFB000000000000n); // undefined → 数值序
+                vm.pop(VReg.A0);
+                vm.call("_ta_sort_cmp");
+                return true;
+            }
             vm.mov(VReg.A0, VReg.RET);
-            vm.call(name === "reverse" ? "_ta_reverse" : "_ta_sort");
+            vm.call("_ta_reverse");
             return true;
         }
         if (name === "toReversed" || name === "toSorted") {

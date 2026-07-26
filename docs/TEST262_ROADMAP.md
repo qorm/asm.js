@@ -99,6 +99,33 @@ test262 高通过率的真正瓶颈不是特性,是**底层语义机制**。以�
 - **顺带修复测试基础设施真缺陷**:`tests/run_fixtures.mjs` 用 `/tmp/fx_<dir 末 16 个十六进制字符>` 命名产物,而 16 个十六进制字符只编码路径**末 8 个字符**,故同名 fixture 在不同 worktree 下命中同一 `/tmp` 文件;并行 agent 各自跑 fixtures 时互相覆盖二进制,产生随机 stdout 串味(实测一次 `async-arrow-multiarg-2` 期望 5 得 7,一度被误判为编译器 miscompile,经二分排除)。已改为 pid+时间戳+相对路径并显式清理;两次故意并发运行均 380/380 且零残留。
 - **S1 剩余(已定位,未做)**:**`String.prototype` 不作为对象存在——门控 465 个 String 测试(该目录 38%),是目前发现的全仓最大单一杠杆**;`RegExp.prototype` 同样缺失(70);`\p{…}` 属性转义(123);`v` 标志/unicodeSets(21);`Array.prototype.constructor` 缺失(69,全在 `split`);UTF-8 字节串 vs UTF-16 码元(String+RegExp 共 ~27);函数 `length`(arity)与内建 `name` 的元数据消费端(见 v0.2.9 后续批);`Object.prototype` 不在运行时原型链(**已论证不可用白名单绕过**:`Object.create(null)` 与普通字面量的 `__proto__` 均为 0,运行时不可区分,白名单会让 `"toString" in Object.create(null)` 错误为真,破坏原型污染防护所依赖的 null 原型字典)。
 
+### S1.5 — `language/` 根因图(2026-07-26 实测,3828 项 stride-5)
+
+> 首次对最大池做根因聚类。方法:每个失败**按序首匹配只归入一个簇**(无重复计数),492 项(20%)留作长尾。计数 ±2%(超时敏感)。
+
+| # | 根因 | 计数 | 侧 | 可解性 | 已复现 |
+|---|---|--:|---|---|---|
+| 1 | **早期错误未抛**(重复 `constructor`、重复绑定、非法赋值目标) | 306 | parser | 中(规则多但各自机械) | 是 |
+| 5 | **async 异常不转 rejection**——async 函数体内 `throw` **直接终止进程**(`panic: uncaught exception in spawned coroutine`)而非 reject;`yield*` 无迭代器协议校验 | 266 | runtime | **架构级**(协程边界需 abrupt-completion 契约) | 是 |
+| 2 | **数组解构急切抽干可迭代对象**——`emitDestructurePattern` 用 `_array_spread_into` 物化后再按下标读:无逐元素交错、无 `IteratorClose`、无限迭代器**挂死** | 241(含 24 超时崩溃) | 编译器+运行时 | **架构级**(需真 IteratorRecord,**不可打补丁**) | 是 |
+| 4 | **类元素属性特性错**:4a 原型方法/访问器被定义为 `enumerable:true`(规范为不可枚举)164;4b **静态方法根本没物化为构造器自有属性**(`gOPD(C,'m')===undefined` 而 `typeof C.m==="function"`)64 | 228 | 编译器+运行时 | **机械**(描述符管线已存在) | 是 |
+| 3 | **私有 生成器/异步生成器方法不可调用**(`*#m(){}`)——公有/静态生成器方法均正常,是私有名路径没接到协程接线 | 207 | 编译器 | 中 | 是 |
+| 6 | **无法解析的标识符读出数值 `0` 而非抛 ReferenceError**(`compileIdentifier` 兜底 `movImm(RET,0)`);`assert.throws(ReferenceError,…)` **0 PASS / 261 run** | 149 | 编译器 | **机械→中**(判定谓词已存在于旁边的 `typeof` 路径) | 是 |
+| 7 | 缺失的规范 TypeError(不可迭代解构源、私有 brand 检查、无访问器的 `[[Get]]/[[Set]]`) | 118 | 混合 | 中 | 是 |
+| 8 | **NamedEvaluation 缺失**(解构默认值/逻辑赋值 RHS/类表达式绑定的匿名函数无 `.name`) | 111 | 编译器 | **机械**(扩展已覆盖两种形式的推断) | 是 |
+| 9 | **普通函数没有 `.prototype` 对象 → `obj.constructor` 为 undefined** | 105 | 编译器+运行时 | 中 | 是 |
+| 10 | 私有名以普通字符串键建模(`"#__classexpr1#f"`),经 `Object.keys`/`gOPN`/`hasOwnProperty` **泄露** | 51 | 编译器 | 中(需独立私有名空间) | 是 |
+| 11 | `class X extends <内建>` 编译/运行崩溃 | 23(全 CRASH) | 编译器 | 中 | 是 |
+| 12 | `eval` 内含 `super`(类字段/派生构造器)→ SIGSEGV | ~32 | 编译器/engine | 中 | 否 |
+
+**判定为重复、不另计**:`Object.prototype` 不在原型链(是簇 4/7/9 与长尾的**贡献因子**,非独立簇);函数 `.name/.length` 反射门(簇 9 的子情形);**`Symbol.species` 在这两个目录里出现次数为 0**(根本不是 `language/` 议题);UTF-8 vs UTF-16(在 String/RegExp,不在此);一般求值顺序**已正确**(仅迭代器那处即簇 2)。
+
+**CRASH 108 项判定:不适合作为下一目标**。与早期 built-ins 各波不同,`language/` 的崩溃**多是簇 2/5/12 的症状**而非独立缺陷——仅约 29 项廉价且孤立,其余 ~55 项会随那三簇一并消失。
+
+**最高杠杆项 = 簇 9(函数 `.prototype`/`.constructor`),理由是认识论而非计数**:`assert.throws(Test262Error,…)` 是 **0 PASS / 199 run**、源码含 `.constructor` 的是 **0/93**——这是硬零而非低百分比,意味着**全语料范围内**凡用自定义错误构造器的测试,其正确与否当前对 harness **完全不可见**(实测确认:`T.prototype` 为 undefined、`e.constructor` 为 undefined)。其中约 85 项**行为其实已正确**,只因 harness 读 `thrown.constructor.name` 而判负。先修它,再重测,下面所有优先级才可信。
+
+**建议工序**:A(测量解封)簇 9 → 簇 6;B(性价比)簇 4 → 簇 8 → 簇 3;C(架构,按依赖排序)簇 2 → 簇 5 → 簇 1(计数最大但**故意排最后**:各规则独立可并行,且过早做会在不改善引擎语义的情况下抬高通过率,并有过度拒绝而**破坏自举**的最高风险)。
+
 ### S2 — 对象模型 + 强转 + 错误地基(28% → 40%)
 - **属性描述符 + [[DefineOwnProperty]]**:Object.defineProperty/getOwnPropertyDescriptor/freeze/seal/preventExtensions/isExtensible;描述符反射(528 property-descriptor 失败)。
 - **泛型数组方法(完整)**:所有数组方法对类数组 this 工作(消灭 ~136 Array CRASH + 相关)。
