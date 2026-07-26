@@ -1,5 +1,5 @@
 {
-  "generated": "2026-07-26T18:38:13.629Z",
+  "generated": "2026-07-26T20:04:58.003Z",
   "config": {
     "corpus": "/Users/nouo/github/asm.js/.test262-corpus",
     "target": "macos-arm64",
@@ -44,12 +44,12 @@
   "eligible": 32310,
   "run": 6462,
   "totals": {
-    "PASS": 2390,
-    "FAIL": 3857,
+    "PASS": 2568,
+    "FAIL": 3673,
     "COMPILE_FAIL": 40,
-    "CRASH": 175
+    "CRASH": 181
   },
-  "passRatePct": 36.99,
+  "passRatePct": 39.74,
   "byArea": {
     "built-ins/Array": {
       "PASS": 282,
@@ -88,20 +88,20 @@
       "CRASH": 1
     },
     "built-ins/Object": {
-      "PASS": 304,
-      "FAIL": 369,
+      "PASS": 305,
+      "FAIL": 367,
       "COMPILE_FAIL": 0,
-      "CRASH": 9
+      "CRASH": 10
     },
     "built-ins/Promise": {
-      "PASS": 33,
-      "FAIL": 102,
+      "PASS": 51,
+      "FAIL": 84,
       "COMPILE_FAIL": 2,
       "CRASH": 8
     },
     "built-ins/RegExp": {
-      "PASS": 115,
-      "FAIL": 254,
+      "PASS": 133,
+      "FAIL": 236,
       "COMPILE_FAIL": 5,
       "CRASH": 0
     },
@@ -130,30 +130,30 @@
       "CRASH": 3
     },
     "language/expressions": {
-      "PASS": 789,
-      "FAIL": 1128,
+      "PASS": 863,
+      "FAIL": 1051,
       "COMPILE_FAIL": 23,
-      "CRASH": 65
+      "CRASH": 68
     },
     "language/statements": {
-      "PASS": 616,
-      "FAIL": 1142,
+      "PASS": 683,
+      "FAIL": 1073,
       "COMPILE_FAIL": 10,
-      "CRASH": 54
+      "CRASH": 56
     }
   },
   "topFailPatterns": [
     {
       "pattern": "FAIL: assertion mismatch (Test262Error / wrong value)",
-      "count": 2063
+      "count": 1987
     },
     {
       "pattern": "FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)",
-      "count": 579
+      "count": 574
     },
     {
       "pattern": "FAIL: async ($DONE not signalled / promise rejected)",
-      "count": 564
+      "count": 467
     },
     {
       "pattern": "FAIL: negative test wrong outcome (phase=parse)",
@@ -169,7 +169,7 @@
     },
     {
       "pattern": "FAIL: array contents mismatch (compareArray)",
-      "count": 117
+      "count": 111
     },
     {
       "pattern": "FAIL: constructor-ness reflection (isConstructor / not-a-constructor)",
@@ -181,11 +181,11 @@
     },
     {
       "pattern": "CRASH: run timeout",
-      "count": 32
+      "count": 35
     },
     {
       "pattern": "CRASH: run signal SIGBUS",
-      "count": 16
+      "count": 19
     },
     {
       "pattern": "FAIL: negative test wrong outcome (phase=runtime)",
