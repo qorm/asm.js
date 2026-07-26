@@ -874,6 +874,41 @@ export const MemberCompiler = {
                 }
             }
 
+            // [test262 S1 泛型数组方法] Array.prototype.<m> 作值读取:发接收者无绑定的
+            // 内置方法引用闭包({0xc105, _aref_generic, _agen_<m>})。使
+            // `Array.prototype.map.call(arrayLike, fn)`/`.apply`/提取存变量等泛型调用
+            // 形态可用(ES 要求数组方法泛型)。_agen_* 是纯新增运行时分派层:真数组
+            // 恒等直通既有 _array_*_rt/_aref_arr_* 路径,字符串/类数组对象快照成真数组
+            // 后同路委托(runtime/types/array/index.js:generateAgenGeneric)。
+            // 仅静态链 Array.prototype 且 Array 未被局部遮蔽时触发;编译器源不含此
+            // 模式,自举字节不变。[#32 守卫] typeof==="string" 判命中防原型链污染。
+            if (expr.object && expr.object.type === "MemberExpression" && !expr.object.computed &&
+                expr.object.object && expr.object.object.type === "Identifier" &&
+                expr.object.object.name === "Array" &&
+                expr.object.property && expr.object.property.name === "prototype" &&
+                !(this.ctx.getLocal && this.ctx.getLocal("Array"))) {
+                const _apHelpers = {
+                    forEach: "_agen_forEach",
+                    map: "_agen_map",
+                    filter: "_agen_filter",
+                    some: "_agen_some",
+                    every: "_agen_every",
+                    reduce: "_agen_reduce",
+                    reduceRight: "_agen_reduceRight",
+                    indexOf: "_agen_indexOf",
+                    lastIndexOf: "_agen_lastIndexOf",
+                    includes: "_agen_includes",
+                    join: "_agen_join",
+                    slice: "_agen_slice",
+                    at: "_agen_at",
+                };
+                const _aph = _apHelpers[propName];
+                if (typeof _aph === "string") {
+                    this.emitBuiltinMethodRefClosure(_aph);
+                    return;
+                }
+            }
+
             // [#58] Math 常量(E/PI):编译期折成 raw f64 位常量直入 RET。
             // 原先 Math.X 非方法访问落通用 _object_get → Math 无此对象 → 得 0。
             // 显式 === 链(非 {} 查表:用户标识符做字典键有原型链污染风险,#32)。

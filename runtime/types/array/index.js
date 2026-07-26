@@ -2224,10 +2224,231 @@ export class ArrayGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
     }
 
+    // [test262 S1 泛型数组方法] `Array.prototype.<m>.call(recv, ...)` 的运行时分派层。
+    // ES 要求数组方法泛型(对任何 length+索引元素对象工作);jsbin 既有实现假设真数组
+    // (0x7FFE)直读缓冲,非数组 this 即 SIGSEGV。守卫分派:真数组恒等直通既有
+    // _array_*_rt/_aref_arr_* 快路(一字节不改);字符串/类数组对象先经 _agen_norm
+    // 快照成真数组再同路委托。全部为**新增** helper,不触碰任何编译器依赖的共享热路径。
+    // 已知偏差:回调第三参收到快照数组而非原对象;回调期间对原对象的变异不被观察;
+    // length 走 int32 截断(超 2^31 类数组不支持)。
+    generateAgenGeneric() {
+        const vm = this.vm;
+        const UNDEF = 0x7ffb000000000000n;
+        const boxStr = (reg) => { // cstr 地址 → 装箱字符串(0x7FFC)
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+            vm.or(reg, reg, VReg.V1);
+        };
+
+        // _agen_norm(A0=recv boxed) -> boxed 真数组。
+        // 真数组:恒等返回(快路,3 条指令)。null/undefined:抛 TypeError。
+        // 字符串:len=_strlen;对象(0x7FFD):len=ToLength(this.length)。
+        // 其余(数字/布尔/裸指针):len=0 → 空数组。
+        // 元素逐索引经 _subscript_get(recv, boxed_i) 读取(对象键规范化/字符串 charAt
+        // /typed 布局均由其内部处理),push 进新真数组。
+        vm.label("_agen_norm");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jne("_agen_norm_slow");
+        vm.mov(VReg.RET, VReg.A0); // 真数组:恒等
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+        vm.label("_agen_norm_slow");
+        vm.cmpImm(VReg.V0, 0x7FFA); // null
+        vm.jeq("_agen_norm_nullish");
+        vm.cmpImm(VReg.V0, 0x7FFB); // undefined
+        vm.jeq("_agen_norm_nullish");
+        vm.mov(VReg.S0, VReg.A0); // recv
+        vm.cmpImm(VReg.V0, 0x7FFC); // 字符串
+        vm.jne("_agen_norm_objlen");
+        vm.call("_strlen"); // A0=recv → RET=裸 len(_strlen 内部 _getStrContent 兼容装箱)
+        vm.mov(VReg.S1, VReg.RET);
+        vm.jmp("_agen_norm_lenok");
+        vm.label("_agen_norm_objlen");
+        vm.cmpImm(VReg.V0, 0x7FFD); // 仅对象走 length 属性读;其余 len=0
+        vm.jne("_agen_norm_len0");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.lea(VReg.A1, vm.asm.addString("length"));
+        boxStr(VReg.A1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.call("_maybe_getter"); // RET = boxed length 值
+        // x64 陷阱:V0==RET==RAX,tag 检查必须用 V2(否则冲掉 boxed length)
+        vm.shrImm(VReg.V2, VReg.RET, 48);
+        vm.cmpImm(VReg.V2, 0x7FFB); // undefined → 0
+        vm.jeq("_agen_norm_len0");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_int32"); // boxed → 裸 int32(ToLength 近似)
+        vm.mov(VReg.S1, VReg.RET);
+        vm.cmpImm(VReg.S1, 0);
+        vm.jge("_agen_norm_lenok"); // 负 → 0
+        vm.label("_agen_norm_len0");
+        vm.movImm(VReg.S1, 0);
+        vm.label("_agen_norm_lenok");
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.mov(VReg.S2, VReg.RET); // result(callee-saved,落栈 GC 可见)
+        vm.movImm(VReg.S3, 0); // i
+        vm.label("_agen_norm_loop");
+        vm.cmp(VReg.S3, VReg.S1);
+        vm.jge("_agen_norm_done");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.scvtf(0, VReg.S3);
+        vm.fmovToInt(VReg.A1, 0); // boxed 数字下标
+        vm.call("_subscript_get"); // RET = 元素(boxed;miss → undefined)
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_array_push"); // 可能扩容重分配 → 回写 S2
+        vm.mov(VReg.S2, VReg.RET);
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_agen_norm_loop");
+        vm.label("_agen_norm_done");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.RET, VReg.S2, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffe000000000000n);
+        vm.or(VReg.RET, VReg.RET, VReg.V1); // 归一化装箱
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+        vm.label("_agen_norm_nullish");
+        vm.lea(VReg.A0, vm.asm.addString("Array.prototype method called on null or undefined"));
+        boxStr(VReg.A0);
+        vm.call("_throw_type_error"); // 不返回
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0); // 理论不达
+
+        // 回调型两参:_agen_<m>(A0=recv, A1=cb) → norm 后委托 _array_<m>_rt
+        const cb2 = [
+            ["_agen_forEach", "_array_forEach_rt"],
+            ["_agen_map", "_array_map_rt"],
+            ["_agen_filter", "_array_filter_rt"],
+            ["_agen_some", "_array_some_rt"],
+            ["_agen_every", "_array_every_rt"],
+        ];
+        for (const [label, target] of cb2) {
+            vm.label(label);
+            vm.prologue(0, [VReg.S0]);
+            vm.mov(VReg.S0, VReg.A1); // cb
+            vm.call("_agen_norm");    // A0=recv 已就位 → RET=真数组
+            vm.mov(VReg.A0, VReg.RET);
+            vm.mov(VReg.A1, VReg.S0);
+            vm.call(target);
+            vm.epilogue([VReg.S0], 0);
+        }
+
+        // 回调+seed 三参:reduce/reduceRight(A0=recv, A1=cb, A2=seed 或 undefined)
+        const cb3 = [
+            ["_agen_reduce", "_array_reduce_rt"],
+            ["_agen_reduceRight", "_array_reduceRight_rt"],
+        ];
+        for (const [label, target] of cb3) {
+            vm.label(label);
+            vm.prologue(0, [VReg.S0, VReg.S1]);
+            vm.mov(VReg.S0, VReg.A1); // cb
+            vm.mov(VReg.S1, VReg.A2); // seed(缺参为 undefined,_rt 内部判)
+            vm.call("_agen_norm");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.mov(VReg.A1, VReg.S0);
+            vm.mov(VReg.A2, VReg.S1);
+            vm.call(target);
+            vm.epilogue([VReg.S0, VReg.S1], 0);
+        }
+
+        // _agen_indexOf(A0=recv, A1=value, A2=boxed from) → boxed 数字。
+        // 委托 _aref_arr_indexOf(自处理装箱 from 缺省 0 + 结果装箱)。
+        vm.label("_agen_indexOf");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A1);
+        vm.mov(VReg.S1, VReg.A2);
+        vm.call("_agen_norm");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.mov(VReg.A2, VReg.S1);
+        vm.call("_aref_arr_indexOf");
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+
+        // _agen_lastIndexOf(A0=recv, A1=value, A2=boxed from) → boxed 数字。
+        // from 缺省 INT_MAX 哨兵(_array_lastIndexOf 钳到 len-1);结果裸 int → 装箱。
+        vm.label("_agen_lastIndexOf");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.mov(VReg.S0, VReg.A1); // value
+        vm.mov(VReg.S1, VReg.A2); // boxed from
+        vm.call("_agen_norm");
+        vm.mov(VReg.S2, VReg.RET); // 真数组
+        vm.mov(VReg.A0, VReg.S1);
+        vm.movImm(VReg.A1, 2147483647);
+        vm.call("_aref_argint_d"); // boxed from → 裸(缺省 INT_MAX)
+        vm.mov(VReg.A2, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_array_lastIndexOf"); // 裸 int 下标/-1
+        vm.scvtf(0, VReg.RET);
+        vm.fmovToInt(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+
+        // _agen_includes(A0=recv, A1=value, A2=boxed from) → JS bool。
+        vm.label("_agen_includes");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.mov(VReg.S0, VReg.A1);
+        vm.mov(VReg.S1, VReg.A2);
+        vm.call("_agen_norm");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_aref_argint"); // boxed from → 裸(缺省 0)
+        vm.mov(VReg.A2, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_array_includes"); // 裸 0/1
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_agen_includes_true");
+        vm.lea(VReg.V0, "_js_false");
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+        vm.label("_agen_includes_true");
+        vm.lea(VReg.V0, "_js_true");
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+
+        // _agen_join(A0=recv, A1=sep) → 字符串。sep 缺省(undefined) → ","(镜像静态派发)。
+        vm.label("_agen_join");
+        vm.prologue(0, [VReg.S0]);
+        vm.mov(VReg.S0, VReg.A1);
+        vm.call("_agen_norm");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.shrImm(VReg.V0, VReg.S0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFB); // sep undefined?
+        vm.jne("_agen_join_sep_ok");
+        vm.lea(VReg.S0, "_str_comma_only");
+        vm.label("_agen_join_sep_ok");
+        vm.mov(VReg.A1, VReg.S0);
+        vm.call("_array_join");
+        vm.epilogue([VReg.S0], 0);
+
+        // _agen_slice(A0=recv, A1=boxed start, A2=boxed end) → 新数组。
+        vm.label("_agen_slice");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A1);
+        vm.mov(VReg.S1, VReg.A2);
+        vm.call("_agen_norm");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.mov(VReg.A2, VReg.S1);
+        vm.call("_aref_arr_slice");
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+
+        // _agen_at(A0=recv, A1=boxed idx) → 元素。
+        vm.label("_agen_at");
+        vm.prologue(0, [VReg.S0]);
+        vm.mov(VReg.S0, VReg.A1);
+        vm.call("_agen_norm");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.call("_aref_arr_at");
+        vm.epilogue([VReg.S0], 0);
+    }
+
     generate() {
         this.generateArefGeneric();
         this.generateArefIntWrappers();
         this.generateArefCallbackMethods();
+        this.generateAgenGeneric();
         this.generateSpreadCall0();
         this.generateArraySpreadInto();
         this.generateArrayEnsureCap();
