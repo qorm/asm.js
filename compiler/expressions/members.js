@@ -113,6 +113,48 @@ const NamespaceStaticRef = {
     },
 };
 
+// ── [W-18] Math 命名空间物化(反射用真对象)────────────────────────────────────
+// 此前 `Math` 只是**编译期构造**:调用位 compileMathMethod 静态派发、`Math.floor` 值读
+// 走 NamespaceStaticRef、`Math.PI` 折常量,而**裸 `Math`**(非成员、非调用位)落
+// compileIdentifier 兜底 movImm(RET,0) → `typeof Math==="number"`、
+// `Object.getOwnPropertyNames(Math)` 空、`gOPD(Math,"abs")` undefined。
+//
+// 修法:只在**裸 Math 标识符**求值处(即"反射性使用")惰性物化一个真对象到全局槽
+// `_nsobj_math`(数据段,GC 保守扫描即根),属性 = 下面两张表。三条既有快路
+// (调用 / 静态值读 / E·PI 折叠)在 compileCallExpression、下方 MemberExpression
+// 分支里都**先于**本路径命中,故 `Math.abs(x)` 仍是直连 helper 调用、字节不变。
+// 编译器自身源码只以**调用位**使用 Math(全仓 grep:无裸 Math、无非调用 Math.x 读),
+// 故自举产物不发射本路径一个字节 → 定点不受影响。
+//
+// 方法值复用 emitMemoizedBuiltinRef(与 `Math.abs` 静态值读同槽 `math_abs`)→
+// `Math.abs === Object.getOwnPropertyDescriptor(Math,"abs").value` 且每 helper 仅建一次。
+// attrs 落 writable|configurable(=5,enumerable:false),即规范 17 节内建数据属性约定。
+//
+// 未收录的静态(max/min/hypot/imul/random/sign/f16round/sumPrecise/Symbol.toStringTag):
+// 编译器把它们**内联展开**(builtin_math.js),无单一 helper 标签可包成闭包 → 作值读取
+// 无正确实现可给,宁缺勿滥(留作后续批次)。对应 own property 仍缺失,记偏差。
+const MATH_NS_CONST_BITS = {
+    E: 0x4005bf0a8b145769n,
+    LN10: 0x40026bb1bbb55516n,
+    LN2: 0x3fe62e42fefa39efn,
+    LOG10E: 0x3fdbcb7b1526e50en,
+    LOG2E: 0x3ff71547652b82fen,
+    PI: 0x400921fb54442d18n,
+    SQRT1_2: 0x3fe6a09e667f3bcdn,
+    SQRT2: 0x3ff6a09e667f3bcdn,
+};
+// 二元 helper(A0/A1 均取 canonical float64 位、返位):闭包直连即可正确接受两实参。
+const MATH_NS_BINARY_REF = {
+    pow: "_math_pow",     // (base, exp)
+    atan2: "_math_atan2", // (y, x)
+};
+// 内建**方法**数据属性 attrs:writable(1) | configurable(4),enumerable 关闭
+// (规范 17 节:{[[Writable]]:true, [[Enumerable]]:false, [[Configurable]]:true})。
+const BUILTIN_PROP_ATTR = 5;
+// Math 的**数值常量**(E/PI/LN2/…)是 {writable:false, enumerable:false,
+// configurable:false} → attrs 全 0(见 sec-math.pi 等)。
+const BUILTIN_CONST_ATTR = 0;
+
 // [Error 构造器一等值] 裸错误构造器标识符(TypeError 等)作**值读取**时物化为 memoized
 // 闭包(_errctorref_<name>,GC 根),并在侧表挂 .name=<构造器名>。使
 // `typeof TypeError==="function"`、`TypeError.name==="TypeError"`、`TypeError===TypeError`
@@ -295,6 +337,65 @@ export const MemberCompiler = {
         this.vm.lea(VReg.V0, label);
         this.vm.store(VReg.V0, 0, VReg.RET);
         this.vm.label(doneL);
+    },
+
+    // [W-18] 裸 `Math` 求值:惰性物化命名空间对象到全局槽 _nsobj_math(数据段 qword,
+    // GC 保守扫数据段即根)。RET = 装箱对象(稳定身份 → `Math===Math`)。
+    // 站点形态:槽非 0 → 直接用;否则建对象、逐属性 _object_set + _object_set_prop_attr。
+    // 只在**裸标识符**位发射(反射用),调用位/静态成员读先于此命中 → 快路零改。
+    emitMathNamespaceObject() {
+        const slot = "_nsobj_math";
+        if (!this._addedNsObjLabels) this._addedNsObjLabels = new Set();
+        if (!this._addedNsObjLabels.has(slot)) {
+            this.asm.addDataLabel(slot);
+            this.asm.addDataQword(0);
+            this._addedNsObjLabels.add(slot);
+        }
+        const vm = this.vm;
+        const doneL = this.ctx.newLabel("nsmath_done");
+        vm.lea(VReg.V0, slot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne(doneL);
+        // 建空对象并**先**存槽:后续每个属性写都从槽重载装箱对象(跨 call 无需占用
+        // callee-saved 寄存器,且 emitBuiltinFnClosure 会毁 S0),同时保证重入安全。
+        vm.call("_object_new");
+        vm.call("_box_obj_r");
+        vm.lea(VReg.V0, slot);
+        vm.store(VReg.V0, 0, VReg.RET);
+        // 属性落位顺序:常量 → 一元方法 → 二元方法(与规范无关,仅决定 gOPN 顺序)。
+        // 先 _object_set 落值,再 _object_set_prop_attr 落 attrs(顺序不可反:后者
+        // materialize flags 并置 EXT_HASFLAGS,attr=0 的常量若先落 attrs 则写值被拒)。
+        const emitProp = (name, attr, emitValue) => {
+            emitValue();                                  // RET = 值
+            vm.mov(VReg.A2, VReg.RET);
+            vm.lea(VReg.V0, slot);
+            vm.load(VReg.A0, VReg.V0, 0);
+            this.emitBoxedStringKey(name, VReg.A1);       // _tag_key_a1 只毁 V1/LR
+            vm.call("_object_set");
+            vm.lea(VReg.V0, slot);
+            vm.load(VReg.A0, VReg.V0, 0);
+            this.emitBoxedStringKey(name, VReg.A1);
+            vm.movImm(VReg.A2, attr);
+            vm.call("_object_set_prop_attr");
+        };
+        for (const cname of Object.keys(MATH_NS_CONST_BITS)) {
+            const bits = MATH_NS_CONST_BITS[cname];
+            emitProp(cname, BUILTIN_CONST_ATTR, () => vm.movImm64(VReg.RET, bits));
+        }
+        for (const mname of Object.keys(NamespaceStaticRef.Math)) {
+            const helper = NamespaceStaticRef.Math[mname];
+            emitProp(mname, BUILTIN_PROP_ATTR,
+                () => this.emitMemoizedBuiltinRef("math_" + mname, helper));
+        }
+        for (const mname of Object.keys(MATH_NS_BINARY_REF)) {
+            const helper = MATH_NS_BINARY_REF[mname];
+            emitProp(mname, BUILTIN_PROP_ATTR,
+                () => this.emitMemoizedBuiltinRef("math_" + mname, helper));
+        }
+        vm.lea(VReg.V0, slot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.label(doneL);
     },
 
     // [Error 构造器一等值] memoized 错误构造器闭包 _errctorref_<name>(GC 根)。首次建
@@ -561,6 +662,17 @@ export const MemberCompiler = {
         if (name === "JSON") {
             this.vm.call("_object_new");
             this.vm.call("_box_obj_r"); // box->helper
+            return;
+        }
+        // [W-18] 裸 `Math`(反射位):惰性物化真命名空间对象 → typeof "object"、
+        // gOPN/gOPD 可见。调用位(compileCallExpression → compileMathMethod)与静态成员
+        // 值读/常量折叠都在到达这里之前命中,故快路字节不变。用户遮蔽(局部 Math /
+        // 同名函数声明)时退回词法解析。
+        if (name === "Math" &&
+            !(this.ctx.getLocal && this.ctx.getLocal("Math")) &&
+            !(this.ctx.getFunction && this.ctx.getFunction("Math")) &&
+            !(this.ctx.getMainCapturedVar && this.ctx.getMainCapturedVar("Math"))) {
+            this.emitMathNamespaceObject();
             return;
         }
         // [构造器全局值] TypedArray 族/ArrayBuffer → 24B 闭包(memoized),`new TA(...)`
