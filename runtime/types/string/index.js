@@ -45,6 +45,29 @@ export class StringGenerator {
         vm.store(VReg.V0, 8, lenReg);
     }
 
+    // [W-39] this-check: 校验 this 是否为字符串(装箱 0x7FFC)或裸指针(高16位=0)。
+    // 编译器静态分派 trim/slice 等会先 _getStrContent 再传裸指针;动态分派(.call(5))
+    // 传装箱值。二者 high16 分别是 0 和 0x7FFC,均合法;其余(non-string)→ TypeError。
+    // 放在 prologue 之后、方法体之前——prologue 已保存 S 寄存器,V0/V1 为 scratch 安全。
+    // _throw_type_error 不返回,无需恢复寄存器。
+    _emitThisStringCheck(methodName) {
+        const vm = this.vm;
+        const okLabel = "_thischeck_ok_" + methodName;
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFC);  // 装箱字符串(动态分派)
+        vm.jeq(okLabel);
+        vm.cmpImm(VReg.V0, 0);       // 裸指针(编译器静态分派已 _getStrContent 预校验)
+        vm.jeq(okLabel);
+        // 非字符串——throw TypeError
+        vm.lea(VReg.A0, vm.asm.addString("String.prototype method called on non-string value"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+        vm.label(okLabel);
+    }
+
     // 生成字符串长度函数
     // _strlen(str) -> length
     generateStrlen() {
@@ -175,6 +198,7 @@ export class StringGenerator {
         const vm = this.vm;
         vm.label("_str_localeCompare");
         vm.prologue(0, [VReg.S0, VReg.S1]);
+        this._emitThisStringCheck("localeCompare");
         vm.mov(VReg.S0, VReg.A0);
         vm.mov(VReg.S1, VReg.A1);
         // [W-25] that 实参 ToString:localeCompare(undefined) 须与 "undefined" 比较
@@ -695,6 +719,7 @@ export class StringGenerator {
 
         vm.label(label);
         vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        this._emitThisStringCheck(label);
 
         // S0 = 原串内容, S1 = pad 内容, S3 = targetLen
         vm.push(VReg.A1);
@@ -2205,6 +2230,7 @@ export class StringGenerator {
 
         vm.label("_str_toUpperCase");
         vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        this._emitThisStringCheck("toUpperCase");
 
         vm.mov(VReg.S0, VReg.A0); // S0 = 源字符串（可能是 NaN-boxed）
 
@@ -2296,6 +2322,7 @@ export class StringGenerator {
 
         vm.label("_str_toLowerCase");
         vm.prologue(128, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        this._emitThisStringCheck("toLowerCase");
 
         vm.mov(VReg.S0, VReg.A0); // S0 = 源字符串（可能是 NaN-boxed）
 
@@ -2384,6 +2411,7 @@ export class StringGenerator {
 
         vm.label("_str_charAt");
         vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2]);
+        this._emitThisStringCheck("charAt");
 
         vm.mov(VReg.S0, VReg.A0); // S0 = 原始字符串指针
         vm.mov(VReg.S1, VReg.A1); // S1 = index
@@ -2570,6 +2598,7 @@ export class StringGenerator {
 
         vm.label("_str_charCodeAt");
         vm.prologue(0, [VReg.S0, VReg.S1]);
+        this._emitThisStringCheck("charCodeAt");
 
         // 索引可能是 raw float64 位模式，先归一化为整数
         vm.push(VReg.A0);
@@ -2825,6 +2854,7 @@ export class StringGenerator {
         vm.label("_str_trim");
         // 使用 6 个保存寄存器: S0=str, S1=len, S2=start, S3=end/newLen后为result, S4=newLen, S5=index
         vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        this._emitThisStringCheck("trim");
 
         vm.mov(VReg.S0, VReg.A0); // S0 = 源字符串
 
@@ -2927,6 +2957,7 @@ export class StringGenerator {
 
         vm.label("_str_trimStart");
         vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        this._emitThisStringCheck("trimStart");
 
         vm.mov(VReg.S0, VReg.A0);
         vm.mov(VReg.A0, VReg.S0);
@@ -2987,6 +3018,7 @@ export class StringGenerator {
 
         vm.label("_str_trimEnd");
         vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        this._emitThisStringCheck("trimEnd");
 
         vm.mov(VReg.S0, VReg.A0);
         vm.mov(VReg.A0, VReg.S0);
@@ -3054,6 +3086,7 @@ export class StringGenerator {
         vm.label("_str_slice");
         // S0=str, S1=start, S2=end/result, S3=len, S4=newLen, S5=index
         vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        this._emitThisStringCheck("slice");
 
         vm.mov(VReg.S0, VReg.A0); // S0 = str (Original JSValue)
         vm.mov(VReg.S1, VReg.A1); // S1 = start (JSValue)
@@ -3195,6 +3228,7 @@ export class StringGenerator {
 
         vm.label("_str_substring");
         vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        this._emitThisStringCheck("substring");
 
         vm.mov(VReg.S0, VReg.A0); // str
 
@@ -3320,6 +3354,7 @@ export class StringGenerator {
 
         vm.label("_str_substr");
         vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        this._emitThisStringCheck("substr");
 
         vm.mov(VReg.S0, VReg.A0); // str (装箱)
         vm.mov(VReg.S1, VReg.A1); // start (boxed)
@@ -4088,6 +4123,7 @@ export class StringGenerator {
 
         vm.label("_str_split");
         vm.prologue(96, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        this._emitThisStringCheck("split");
 
         // S0 = 装箱 str, S1 = 装箱 sep, S2 = str content 指针, S3 = 结果数组(装箱),
         // S4 = 段起点 i(绝对下标), S5 = sep 长度。
@@ -4265,6 +4301,7 @@ export class StringGenerator {
         // (str, search, fromIndex_raw) -> index or -1。A2=裸 int 起始下标,
         // 所有调用点必须显式置 A2(缺省 0)——否则读到上文残留垃圾。
         vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        this._emitThisStringCheck("indexOf");
         vm.mov(VReg.S0, VReg.A0);
         vm.mov(VReg.S1, VReg.A1);
         vm.mov(VReg.S4, VReg.A2); // S4 = fromIndex(入口即捕获,后续调用会冲 A2)
@@ -4347,6 +4384,7 @@ export class StringGenerator {
         const vm = this.vm;
         vm.label("_str_includes");
         vm.prologue(16, [VReg.S0, VReg.S1]);
+        this._emitThisStringCheck("includes");
         vm.mov(VReg.S0, VReg.A0);
         vm.mov(VReg.S1, VReg.A1);
         vm.movImm(VReg.A2, 0); // fromIndex=0(_str_indexOf 新增第三参,必须显式置)
@@ -4369,6 +4407,7 @@ export class StringGenerator {
         const vm = this.vm;
         vm.label("_str_startsWith");
         vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2]);
+        this._emitThisStringCheck("startsWith");
         vm.mov(VReg.S0, VReg.A0);
         vm.mov(VReg.S1, VReg.A1);
         this._emitArgStrInline(VReg.S1, "_startsWith_search"); // [W-25]
@@ -4400,6 +4439,7 @@ export class StringGenerator {
         const vm = this.vm;
         vm.label("_str_endsWith");
         vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        this._emitThisStringCheck("endsWith");
         vm.mov(VReg.S0, VReg.A0); vm.mov(VReg.S1, VReg.A1);
         this._emitArgStrInline(VReg.S1, "_endsWith_search"); // [W-25]
         vm.mov(VReg.A0, VReg.S0);
@@ -4479,6 +4519,7 @@ export class StringGenerator {
         const vm = this.vm;
         vm.label("_str_repeat");
         vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
+        this._emitThisStringCheck("repeat");
         vm.mov(VReg.S0, VReg.A0); vm.mov(VReg.S1, VReg.A1);
         // count 由活跃 dispatch(builtin_methods.js)以 fcvtzs 转好的裸 int32 传入 A1,
         // 不可再调 _to_int32(会把裸整数当 NaN-boxed 解析→得 0→误走 _repeat_empty→空串)。
@@ -4545,6 +4586,7 @@ export class StringGenerator {
         const vm = this.vm;
         vm.label("_str_at");
         vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2]);
+        this._emitThisStringCheck("at");
         vm.mov(VReg.S0, VReg.A0); vm.mov(VReg.S1, VReg.A1);
         vm.mov(VReg.A0, VReg.S1); vm.call("_to_int32"); vm.mov(VReg.S1, VReg.RET);
         vm.mov(VReg.A0, VReg.S0); vm.call("_strlen"); vm.mov(VReg.S2, VReg.RET);
@@ -4562,6 +4604,19 @@ export class StringGenerator {
     generateConcat() {
         const vm = this.vm;
         vm.label("_str_concat");
+        // this-check: A0 must be装箱字符串(0x7FFC)或裸指针(高16位=0)
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFC);
+        vm.jeq("_concat_this_ok");
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_concat_this_ok");
+        vm.lea(VReg.A0, vm.asm.addString("String.prototype method called on non-string value"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+        vm.label("_concat_this_ok");
         vm.jmp("_strconcat");
     }
 
