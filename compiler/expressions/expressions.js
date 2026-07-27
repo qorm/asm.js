@@ -266,22 +266,53 @@ export const ExpressionCompiler = {
                 }
                 break;
 
-            case "String":
-                // [test262 S1] new String(x) → 原始字符串(镜像 new Number 的原始值建模;
-                // 此前落 default 用户类路径得空对象 → .length undefined、数组方法泛型
-                // .call(new String(...)) 取不到元素)。偏差:typeof 得 "string" 非 "object"、
-                // 无对象身份;但 length/索引/字符串方法全部可用,远近于正确语义。
-                // 编译器源不含 `new String(`,自举字节不变。
+            case "String": {
+                // new String(x) -> wrapper object with __value and length properties
+                // typeof returns "object", identity: new String("x") !== "x"
                 if (args.length > 0) {
                     this.compileExpression(args[0]);
                     this.vm.mov(VReg.A0, VReg.RET);
-                    this.vm.call("_valueToStr"); // 任意值 → 字符串(字符串入参恒等)
+                    this.vm.call("_valueToStr"); // any value -> boxed string (0x7FFC-tagged)
                 } else {
                     this.vm.lea(VReg.RET, this.asm.addString(""));
                     this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
                     this.vm.or(VReg.RET, VReg.RET, VReg.V1);
                 }
+                // RET = boxed string -> save to FP-relative local
+                const strValOff = this.ctx.allocLocal(`__str_new_val_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, strValOff, VReg.RET);
+                // Create empty wrapper object
+                this.vm.call("_object_new"); // RET = raw obj pointer
+                const objPtrOff = this.ctx.allocLocal(`__str_new_obj_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, objPtrOff, VReg.RET);
+                // Set prototype: load String.prototype singleton
+                this.emitStringProtoObject(); // RET = boxed String.prototype (0x7FFD-tagged)
+                this.vm.load(VReg.V0, VReg.FP, objPtrOff);
+                this.vm.store(VReg.V0, 16, VReg.RET); // obj.__proto__ = String.prototype
+                // Store __value property
+                this.vm.load(VReg.A0, VReg.FP, objPtrOff);
+                this.vm.load(VReg.A2, VReg.FP, strValOff);
+                this.vm.lea(VReg.A1, this.asm.addString("__value"));
+                this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+                this.vm.or(VReg.A1, VReg.A1, VReg.V1);
+                this.vm.call("_object_set");
+                // Store "length" property
+                this.vm.load(VReg.A0, VReg.FP, objPtrOff);
+                this.vm.lea(VReg.A1, this.asm.addString("length"));
+                this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+                this.vm.or(VReg.A1, VReg.A1, VReg.V1);
+                this.vm.load(VReg.A0, VReg.FP, strValOff);
+                this.vm.call("_strlen"); // RET = raw int length
+                this.vm.scvtf(0, VReg.RET);
+                this.vm.fmovToInt(VReg.RET, 0);
+                this.vm.mov(VReg.A2, VReg.RET); // A2 = boxed number
+                this.vm.load(VReg.A0, VReg.FP, objPtrOff);
+                this.vm.call("_object_set");
+                // Box the object
+                this.vm.load(VReg.RET, VReg.FP, objPtrOff);
+                this.vm.call("_box_obj_r"); // RET = 0x7FFD-tagged wrapper object
                 break;
+            }
 
             // Number 子类型 - 整数
             case "Int8":

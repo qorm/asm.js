@@ -204,6 +204,8 @@ const STRING_PROTO_METHODS = [
     ["split", "_str_split", 1],
     ["localeCompare", "_str_localeCompare", 1],
     ["indexOf", "_aref_str_indexOf", 1], // aref wrapper:boxed fromIndex→raw int
+    ["toString", "_str_toString_wrapper", 0], // returns this.__value (primitive string)
+    ["valueOf", "_str_valueOf", 0],           // returns this.__value (primitive string)
     ["constructor", null, 1],             // 最后落位:从构造器槽读
 ];
 // RegExp.prototype 的**访问器**属性(规范 22.2.6:get 访问器,set 为 undefined,

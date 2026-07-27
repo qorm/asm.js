@@ -45,26 +45,40 @@ export class StringGenerator {
         vm.store(VReg.V0, 8, lenReg);
     }
 
-    // [W-39] this-check: 校验 this 是否为字符串(装箱 0x7FFC)或裸指针(高16位=0)。
-    // 编译器静态分派 trim/slice 等会先 _getStrContent 再传裸指针;动态分派(.call(5))
-    // 传装箱值。二者 high16 分别是 0 和 0x7FFC,均合法;其余(non-string)→ TypeError。
-    // 放在 prologue 之后、方法体之前——prologue 已保存 S 寄存器,V0/V1 为 scratch 安全。
+    // [W-39] this-check: validates A0 is a string value.
+    // Accepts: 0x7FFC (boxed string, from dynamic dispatch), 0x7FFD (boxed wrapper object,
+    //   from new String(...) -- extract __value before dispatching), raw pointer (high16=0,
+    //   from compiler static dispatch with _getStrContent pre-validation).
+    // Rejects: anything else (numbers, booleans, undefined, etc.) -> TypeError.
+    //放在 prologue 之后、方法体之前——prologue 已保存 S 寄存器,V0/V1 为 scratch 安全。
     // _throw_type_error 不返回,无需恢复寄存器。
     _emitThisStringCheck(methodName) {
         const vm = this.vm;
         const okLabel = "_thischeck_ok_" + methodName;
+        const extractLabel = "_thischeck_extract_" + methodName;
         vm.shrImm(VReg.V0, VReg.A0, 48);
-        vm.cmpImm(VReg.V0, 0x7FFC);  // 装箱字符串(动态分派)
+        vm.cmpImm(VReg.V0, 0x7FFC);  // boxed string (dynamic dispatch)
         vm.jeq(okLabel);
-        vm.cmpImm(VReg.V0, 0);       // 裸指针(编译器静态分派已 _getStrContent 预校验)
+        vm.cmpImm(VReg.V0, 0x7FFD);  // boxed wrapper object (new String(...))
+        vm.jeq(extractLabel);
+        vm.cmpImm(VReg.V0, 0);       // raw pointer (compiler static dispatch)
         vm.jeq(okLabel);
-        // 非字符串——throw TypeError
+        // non-string -- throw TypeError
         vm.lea(VReg.A0, vm.asm.addString("String.prototype method called on non-string value"));
         vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
         vm.and(VReg.A0, VReg.A0, VReg.V1);
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
         vm.or(VReg.A0, VReg.A0, VReg.V1);
         vm.call("_throw_type_error");
+        // 0x7FFD extraction: call _object_get(A0=boxed obj, A1=boxed "__value" key)
+        // _object_get preserves S0-S5 (its own prologue/epilogue), only clobbers V0-V4.
+        vm.label(extractLabel);
+        vm.mov(VReg.V0, VReg.A0);         // V0 = boxed obj (used as first arg below)
+        vm.mov(VReg.A0, VReg.V0);         // A0 = boxed obj
+        vm.lea(VReg.A1, vm.asm.addString("__value"));
+        vm.call("_tag_key_a1");            // A1 = boxed "__value" key
+        vm.call("_object_get");            // RET = primitive string (0x7FFC)
+        vm.mov(VReg.A0, VReg.RET);        // A0 = extracted string for method body
         vm.label(okLabel);
     }
 
@@ -4620,6 +4634,70 @@ export class StringGenerator {
         vm.jmp("_strconcat");
     }
 
+    // _str_toString_wrapper(this) -> string value
+    // For String.prototype.toString() / String.prototype.valueOf():
+    //   - boxed string (0x7FFC): return as-is (primitive string)
+    //   - boxed wrapper object (0x7FFD): extract __value property
+    //   - raw pointer (high16=0): return as-is
+    //   - anything else: TypeError
+    generateToStringWrapper() {
+        const vm = this.vm;
+        vm.label("_str_toString_wrapper");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFC);
+        vm.jeq("_tsw_ret_primitive");
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jeq("_tsw_extract");
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_tsw_ret_primitive");
+        // TypeError for non-string/non-wrapper values (e.g., String.prototype.toString.call(5))
+        vm.lea(VReg.A0, vm.asm.addString("String.prototype method called on non-string value"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+        // 0x7FFD: extract __value property from wrapper object
+        vm.label("_tsw_extract");
+        vm.mov(VReg.V0, VReg.A0);         // V0 = boxed wrapper object
+        vm.mov(VReg.A0, VReg.V0);         // A0 = boxed obj (first arg to _object_get)
+        vm.lea(VReg.A1, vm.asm.addString("__value"));
+        vm.call("_tag_key_a1");            // A1 = boxed "__value" key
+        vm.call("_object_get");            // RET = primitive string (0x7FFC)
+        vm.label("_tsw_ret_primitive");
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+    }
+
+    // _str_valueOf(this) -> same semantics as _str_toString_wrapper
+    // For String.prototype.valueOf(): returns the primitive string value
+    generateValueOf() {
+        const vm = this.vm;
+        vm.label("_str_valueOf");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFC);
+        vm.jeq("_vo_ret_primitive");
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jeq("_vo_extract");
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_vo_ret_primitive");
+        vm.lea(VReg.A0, vm.asm.addString("String.prototype method called on non-string value"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+        vm.label("_vo_extract");
+        vm.mov(VReg.V0, VReg.A0);
+        vm.mov(VReg.A0, VReg.V0);
+        vm.lea(VReg.A1, vm.asm.addString("__value"));
+        vm.call("_tag_key_a1");            // A1 = boxed "__value" key
+        vm.call("_object_get");
+        vm.label("_vo_ret_primitive");
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+    }
+
     // 生成所有字符串函数
     generate() {
         this.generateStrlen();
@@ -4677,6 +4755,9 @@ export class StringGenerator {
         this.generateConcat();
         this.generateSplit();
         this.generateSubstringRaw();
+        // String.prototype wrapper methods (toString/valueOf for new String() objects)
+        this.generateToStringWrapper();
+        this.generateValueOf();
         // 基础操作 (Moved from base.js)
         this.generateRawStrlen();
         this.generateStrLength();
