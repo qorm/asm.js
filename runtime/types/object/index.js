@@ -5143,7 +5143,10 @@ export class ObjectGenerator {
         vm.jlt("_ospa_done");
         vm.loadByte(VReg.V1, VReg.S0, 0);
         vm.cmpImm(VReg.V1, TYPE_OBJECT);
+        vm.jeq("_ospa_type_ok");
+        vm.cmpImm(VReg.V1, 3); // TYPE_FUNCTION (classinfo) — same layout as TYPE_OBJECT
         vm.jne("_ospa_done");
+        vm.label("_ospa_type_ok");
         vm.load(VReg.S3, VReg.S0, 8); // count
         vm.movImm(VReg.S4, 0);
         vm.label("_ospa_loop");
@@ -5499,6 +5502,8 @@ export class ObjectGenerator {
         vm.loadByte(VReg.V1, VReg.S2, 0);
         vm.cmpImm(VReg.V1, TYPE_OBJECT);
         vm.jeq("_ogopd_obj");
+        vm.cmpImm(VReg.V1, 3); // TYPE_FUNCTION (classinfo) — same layout as TYPE_OBJECT
+        vm.jeq("_ogopd_obj");
         vm.cmpImm(VReg.V1, TYPE_PROXY);
         vm.jeq("_ogopd_proxy");
         vm.jmp("_ogopd_undef");
@@ -5575,6 +5580,16 @@ export class ObjectGenerator {
         vm.load(VReg.V0, VReg.V0, 0);
         vm.label("_ogopd_setv");
         this._emitDescSetReg(0, "set", VReg.V0);
+        // [classinfo] Static accessors on classinfo (type=3) are non-enumerable per ES spec.
+        vm.loadByte(VReg.V1, VReg.S2, 0);
+        vm.cmpImm(VReg.V1, 3);
+        vm.jne("_ogopd_acc_en");
+        vm.load(VReg.V1, VReg.SP, 32);
+        vm.mov(VReg.V0, VReg.V1);
+        vm.movImm(VReg.V1, ATTR_ENUMERABLE);
+        vm.sub(VReg.V0, VReg.V0, VReg.V1);
+        vm.store(VReg.SP, 32, VReg.V0);
+        vm.label("_ogopd_acc_en");
         this._emitDescSetBool(0, "enumerable", 32, ATTR_ENUMERABLE);
         this._emitDescSetBool(0, "configurable", 32, ATTR_CONFIGURABLE);
         vm.load(VReg.RET, VReg.SP, 0);
@@ -5584,6 +5599,17 @@ export class ObjectGenerator {
         vm.label("_ogopd_data");
         this._emitDescSetReg(0, "value", VReg.S5);
         this._emitDescSetBool(0, "writable", 32, ATTR_WRITABLE);
+        // [classinfo] Static methods on classinfo (type=3) are non-enumerable per ES spec.
+        // classinfo has no per-property flags, so force enumerable:false here.
+        vm.loadByte(VReg.V1, VReg.S2, 0);
+        vm.cmpImm(VReg.V1, 3);
+        vm.jne("_ogopd_data_en");
+        vm.load(VReg.V1, VReg.SP, 32);
+        vm.mov(VReg.V0, VReg.V1);
+        vm.movImm(VReg.V1, ATTR_ENUMERABLE);
+        vm.sub(VReg.V0, VReg.V0, VReg.V1);
+        vm.store(VReg.SP, 32, VReg.V0);
+        vm.label("_ogopd_data_en");
         this._emitDescSetBool(0, "enumerable", 32, ATTR_ENUMERABLE);
         this._emitDescSetBool(0, "configurable", 32, ATTR_CONFIGURABLE);
         vm.load(VReg.RET, VReg.SP, 0);

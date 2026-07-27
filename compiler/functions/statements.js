@@ -2819,6 +2819,12 @@ export const StatementCompiler = {
         this.vm.call("_tag_str_a1");
         this.vm.mov(VReg.A2, VReg.S0);
         this.vm.call("_object_define");
+        // constructor on prototype must be non-enumerable per ES spec (19.1.2.21).
+        this.vm.mov(VReg.A0, VReg.S1);
+        this.vm.lea(VReg.A1, this.addStringConstant("constructor"));
+        this.vm.call("_tag_str_a1");
+        this.vm.movImm(VReg.A2, 5); // writable+configurable, not enumerable
+        this.vm.call("_object_set_prop_attr");
 
         // [shape v2 · T2a] 原型赋形:运行时构建带键形状描述符(TYPE_SHAPE_DESC 堆块),
         // 键表 = prototype props 键列快照(运行时序即真序,含 constructor)。描述符根经
@@ -3078,6 +3084,15 @@ export const StatementCompiler = {
                 this.vm.movImm64(VReg.V0, 0x7fff000000000000n);
                 this.vm.or(VReg.A2, VReg.A2, VReg.V0);
                 this.vm.call("_object_define");
+                // Prototype methods must be non-enumerable per ES spec (8.1.1.1).
+                // Skip for static methods — classinfo (type=3) flags materialization
+                // corrupts the object (GC/metadata side-effects).
+                if (!isStatic) {
+                    this.vm.mov(VReg.A0, targetReg);
+                    this.vm.load(VReg.A1, VReg.FP, wkt);
+                    this.vm.movImm(VReg.A2, 5); // writable+configurable, not enumerable
+                    this.vm.call("_object_set_prop_attr");
+                }
                 continue;
             }
             // 私有方法/访问器：label 保留原名（label 只是内部 Map 键，# 反而保证
@@ -3144,6 +3159,18 @@ export const StatementCompiler = {
                 }
                 this.vm.mov(VReg.A2, VReg.V2);
                 this.vm.call("_object_define");
+                // Accessor on prototype must be non-enumerable per ES spec (8.1.1.1).
+                if (!isStatic) {
+                    this.vm.mov(VReg.A0, targetReg);
+                    if (isComputedAccessor) {
+                        this.vm.load(VReg.A1, VReg.FP, ckSlot);
+                    } else {
+                        this.vm.lea(VReg.A1, this.addStringConstant(defineKey));
+                        this.vm.call("_tag_str_a1");
+                    }
+                    this.vm.movImm(VReg.A2, 5); // writable+configurable, not enumerable
+                    this.vm.call("_object_set_prop_attr");
+                }
                 continue;
             }
 
@@ -3167,6 +3194,13 @@ export const StatementCompiler = {
                 this.vm.movImm64(VReg.V0, 0x7fff000000000000n);
                 this.vm.or(VReg.A2, VReg.A2, VReg.V0);
                 this.vm.call("_object_define");
+                // Prototype methods must be non-enumerable per ES spec (8.1.1.1).
+                if (!isStatic) {
+                    this.vm.mov(VReg.A0, targetReg);
+                    this.vm.load(VReg.A1, VReg.FP, kt);
+                    this.vm.movImm(VReg.A2, 5); // writable+configurable, not enumerable
+                    this.vm.call("_object_set_prop_attr");
+                }
                 continue;
             }
             this.vm.mov(VReg.A0, targetReg);
@@ -3178,6 +3212,14 @@ export const StatementCompiler = {
             this.vm.movImm64(VReg.V0, 0x7fff000000000000n);
             this.vm.or(VReg.A2, VReg.A2, VReg.V0);
             this.vm.call("_object_define");
+            // Prototype methods must be non-enumerable per ES spec (8.1.1.1).
+            if (!isStatic) {
+                this.vm.mov(VReg.A0, targetReg);
+                this.vm.lea(VReg.A1, this.addStringConstant(defineKey));
+                this.vm.call("_tag_str_a1");
+                this.vm.movImm(VReg.A2, 5); // writable+configurable, not enumerable
+                this.vm.call("_object_set_prop_attr");
+            }
         }
     },
 
