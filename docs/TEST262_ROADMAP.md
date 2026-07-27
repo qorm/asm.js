@@ -1,7 +1,7 @@
 # test262 完整支持路线图 — 从 22.25% 到完整一致
 
-> 日期:2026-07-23(制定) · 状态:**执行中** · **当前:41.64%**(2691/6462,stride-5 子集;CRASH 180、COMPILE_FAIL 40,更新于 2026-07-27 / v0.3.1)
-> 轨迹:20.55%(v0.2.1)→ 22.25%(v0.2.2)→ 28.51%(v0.2.3)→ 30.63%(v0.2.4)→ 31.96%(v0.2.5)→ 33.63%(v0.2.6)→ 35.52%(v0.2.7)→ 36.04%(v0.2.8)→ 36.99%(v0.2.9)→ 39.74%(v0.3.0)→ **41.64%(v0.3.1)**
+> 日期:2026-07-23(制定) · 状态:**执行中** · **当前:43.67%**(2822/6462,stride-5 子集;CRASH 177、COMPILE_FAIL 40,更新于 2026-07-27 / v0.3.3)
+> 轨迹:20.55%(v0.2.1)→ 22.25%(v0.2.2)→ 28.51%(v0.2.3)→ 30.63%(v0.2.4)→ 31.96%(v0.2.5)→ 33.63%(v0.2.6)→ 35.52%(v0.2.7)→ 36.04%(v0.2.8)→ 36.99%(v0.2.9)→ 39.74%(v0.3.0)→ 41.64%(v0.3.1)→ 43.49%(v0.3.2)→ **43.67%(v0.3.3)**
 > 参考:[Yuku](https://github.com/yuku-toolchain/yuku)(zig 规范一致 parser/工具链)、[Kiesel](https://codeberg.org/kiesel-js/kiesel)(zig 引擎,[20→25% devlog](https://linus.dev/posts/kiesel-devlog-1/))、[LibJS test262 仪表盘](https://serenityos.github.io/libjs-website/test262/)、[test262.fyi](https://test262.fyi/)
 > 关联:plan.md S1/S4、docs/SHAPE_IC_DESIGN.md、记忆 test262-s1-progress
 
@@ -97,7 +97,8 @@ test262 高通过率的真正瓶颈不是特性,是**底层语义机制**。以�
 - **v0.2.8 续批(已完成)**:`Math` 物化为真反射对象(**仅在裸标识符位惰性物化**,三条快路径均在此之前解析,hello-world 二进制与 HEAD 逐字节一致;Math 20→27、Object 280→295);生成器参数急切绑定(仅上提可抛步骤,判据与函数体自身守卫**完全一致**故不会凭空造抛,函数体仍惰性);参数位 rest 模式目标 parser+codegen **联合**落地(含箭头形式,不支持形式改为**干净编译错误**而非静默错编);字符串接收者属性路由(`_object_get` + `_subscript_get` 双路);`gOPD` 函数值支持(附带修出 `fn.x=1` 会永久杀死 `fn.name` 的潜伏 bug)。
 - **v0.2.9 续批(已完成)**:`%TypedArray%` 内建物化(**最大单簇 74 例**——`harness/testTypedArray.js` 第 1 行 `Object.getPrototypeOf(Int8Array)` 返 undefined,整个 harness 在读第一个属性时即死,测试体从未执行;TypedArray 20→53,6.9%→18.4%);String 全 ES 空白集 trim + 参数 `ToString` 强转(用户 `toString`/`Symbol.toPrimitive` 现在真的会跑**且其抛出会传播**)+ `repeat(Infinity)` 由**挂死**改为 RangeError(String 全目录 297→346);RegExp 构造期急切编译并抛 SyntaxError(须把解析器单一错误通道拆成**真语法错**与**合法但未实现**(`\p{}`)两类,否则新抛会误伤)+ 标志校验 + RepeatMatcher 捕获重置 + ES2025 重复具名组(RegExp 96→120)。
 - **顺带修复测试基础设施真缺陷**:`tests/run_fixtures.mjs` 用 `/tmp/fx_<dir 末 16 个十六进制字符>` 命名产物,而 16 个十六进制字符只编码路径**末 8 个字符**,故同名 fixture 在不同 worktree 下命中同一 `/tmp` 文件;并行 agent 各自跑 fixtures 时互相覆盖二进制,产生随机 stdout 串味(实测一次 `async-arrow-multiarg-2` 期望 5 得 7,一度被误判为编译器 miscompile,经二分排除)。已改为 pid+时间戳+相对路径并显式清理;两次故意并发运行均 380/380 且零残留。
-- **S1 剩余(已定位,未做)**:**`String.prototype` 不作为对象存在——门控 465 个 String 测试(该目录 38%),是目前发现的全仓最大单一杠杆**;`RegExp.prototype` 同样缺失(70);`\p{…}` 属性转义(123);`v` 标志/unicodeSets(21);`Array.prototype.constructor` 缺失(69,全在 `split`);UTF-8 字节串 vs UTF-16 码元(String+RegExp 共 ~27);函数 `length`(arity)与内建 `name` 的元数据消费端(见 v0.2.9 后续批);`Object.prototype` 不在运行时原型链(**已论证不可用白名单绕过**:`Object.create(null)` 与普通字面量的 `__proto__` 均为 0,运行时不可区分,白名单会让 `"toString" in Object.create(null)` 错误为真,破坏原型污染防护所依赖的 null 原型字典)。
+- **v0.3.0-v0.3.3 续批(已完成)**:`String.prototype` 物化为真对象,22 方法惰性加载(String 75→79,+30 stride-1);`String.prototype` 方法 this 参数校验(双约定:raw pointer 用于编译器静态分派,boxed string 用于动态 .call/.apply,首次尝试因仅检测 boxed 形式致编译器自身路径解析失效——gen1 找不到 cli.js,已回退并用双约定重做);`Function.prototype` 惰性 `.prototype` 对象(lazy 创建于首次 `_closure_prop_get("prototype")`);NamedEvaluation 扩展至解构默认/逻辑赋值/类表达式绑定;
+- **S1 剩余(已定位,未做)**: `new String()` wrapper 对象(~40 测试,W-44b 进行中);`Object.prototype` 不在运行时原型链(**已论证不可用白名单绕过**:需窄域方案);迭代器协议(簇 2,架构级);async abrupt completions(簇 5,架构级);早期错误(簇 1,306 测试,机械但故意最后做);私有名空间(簇 10,51 测试);`class X extends <内建>`(簇 11,23 全 CRASH);`eval` 含 super(簇 12,~32);`ReferenceError` on unresolvable identifier(簇 6,149,已尝试但谓词无法区分未声明与闭包捕获变量,需架构设计);缺规范 TypeError(簇 7,118)。
 
 ### S1.5 — `language/` 根因图(2026-07-26 实测,3828 项 stride-5)
 

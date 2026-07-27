@@ -4160,6 +4160,7 @@ export const FunctionCompiler = {
             // (记偏差:用户对象覆写的 valueOf 经显式 .valueOf() 调用不触发,返回对象本身。)
             if (prop.name === "valueOf" && !callee.computed && expr.arguments.length === 0) {
                 const voIdLbl = this.ctx.newLabel("valof_id");
+                const voIdLbl2 = this.ctx.newLabel("valof_id2");
                 const voEndLbl = this.ctx.newLabel("valof_end");
                 this.compileExpression(obj); // RET = 接收者
                 // 仅装箱对象(0x7FFD)可能是 Date;其余一律恒等。
@@ -4176,7 +4177,27 @@ export const FunctionCompiler = {
                 this.vm.call("_date_getTime"); // Date → 时间戳
                 this.vm.jmp(voEndLbl);
                 this.vm.label(voIdLbl);
-                this.vm.pop(VReg.RET); // 其余对象 → 恒等
+                // non-Date 0x7FFD object (e.g., new String()) → generic method call
+                // to invoke the actual valueOf method on the prototype chain
+                {
+                    const voLbl = this.asm.addString("valueOf");
+                    this.vm.load(VReg.A0, VReg.SP, 0);
+                    this.vm.lea(VReg.A1, voLbl);
+                    this.vm.call("_tag_str_a1"); // key box
+                    this.vm.call("_object_get");
+                    this.vm.mov(VReg.A0, VReg.RET);
+                    this.vm.load(VReg.A1, VReg.SP, 0);
+                    this.vm.call("_maybe_getter");
+                    this.vm.mov(VReg.V6, VReg.RET);
+                    this.vm.shrImm(VReg.V0, VReg.V6, 48);
+                    this.vm.cmpImm(VReg.V0, 0x7FFF);
+                    this.vm.jne(voIdLbl2); // not a function → identity fallback
+                    this.vm.pop(VReg.V5);
+                    this.compileMethodCall(VReg.V6, VReg.V5, expr.arguments);
+                    this.vm.jmp(voEndLbl);
+                    this.vm.label(voIdLbl2);
+                    this.vm.pop(VReg.RET); // identity fallback
+                }
                 this.vm.label(voEndLbl);
                 return;
             }
