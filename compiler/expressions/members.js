@@ -162,6 +162,50 @@ const REGEXP_PROTO_HELPER = {
     test: "__RE_test",
     toString: "__RE_toString",
 };
+
+// ── [W-29] String.prototype 物化(反射用真对象)───────────────────────────────────
+// 此前 `String` 只是编译期构造:调用位 compileCallExpression 静态改派 _valueToStr / _builtin_string,
+// `String.prototype` 全落兜底 → typeof String === "function" 但 String.prototype === undefined。
+//
+// 修法(与 W-18 Math / W-28 RegExp 同形):只在**裸 String 标识符**处惰性物化一个真函数对象
+// (带 .prototype/.name/.length)到全局槽;String.prototype 访问处惰性物化原型对象。
+// 调用位(`String(x)`/`new String(x)`)在 compileCallExpression 已静态改派,先于本路径命中,
+// 故快路字节不变。方法值复用 emitBuiltinMethodRefClosure(与 Array.prototype 方法同闭包形态
+// {magic@0, _aref_generic@8, helper@16}),蹦床把 this 插 A0、实参上移一位后尾调 helper。
+//
+// 包含方法(全部接受 NaN-boxed 实参,直连 _aref_generic 或已有 aref wrapper):
+//   trim/trimStart/trimEnd/toUpperCase/toLowerCase/slice/substring/substr/
+//   at/charCodeAt/includes/startsWith/endsWith/repeat/concat/padStart/padEnd/
+//   split/localeCompare/indexOf/constructor
+// 未包含(需裸 int 参数且无 aref wrapper/函数替换/多参归约/迭代器协议):
+//   lastIndexOf/codePointAt/codePointBefore/replace/replaceAll/match/matchAll/search/
+//   normalize/toString/valueOf/entries/keys/values/@@iterator
+//
+// 属性描述符:writable:true, enumerable:false, configurable:true (规范 21.1.3 方法)
+const STRING_PROTO_METHODS = [
+    // [方法名, 运行时 helper 标签, 规范 length]
+    ["toUpperCase", "_str_toUpperCase", 0],
+    ["toLowerCase", "_str_toLowerCase", 0],
+    ["trim", "_str_trim", 0],
+    ["trimStart", "_str_trimStart", 0],
+    ["trimEnd", "_str_trimEnd", 0],
+    ["slice", "_str_slice", 2],
+    ["substring", "_str_substring", 2],
+    ["substr", "_str_substr", 2],
+    ["at", "_str_at", 1],
+    ["charCodeAt", "_str_charCodeAt", 1],
+    ["includes", "_str_includes", 1],
+    ["startsWith", "_str_startsWith", 1],
+    ["endsWith", "_str_endsWith", 1],
+    ["repeat", "_str_repeat", 1],
+    ["concat", "_strconcat", 1],
+    ["padStart", "_str_padStart", 2],
+    ["padEnd", "_str_padEnd", 2],
+    ["split", "_str_split", 1],
+    ["localeCompare", "_str_localeCompare", 1],
+    ["indexOf", "_aref_str_indexOf", 1], // aref wrapper:boxed fromIndex→raw int
+    ["constructor", null, 1],             // 最后落位:从构造器槽读
+];
 // RegExp.prototype 的**访问器**属性(规范 22.2.6:get 访问器,set 为 undefined,
 // {enumerable:false, configurable:true})。[名, this 上无该属性时的默认值]:
 // 规范里 `get RegExp.prototype.source` / `flags` 以 %RegExpPrototype% 为 this 时
@@ -532,6 +576,13 @@ export const MemberCompiler = {
             (this.ctx.getMainCapturedVar && this.ctx.getMainCapturedVar("RegExp")));
     },
 
+    // [W-29] `String` 标识符被遮蔽?同 regexpNameShadowed 守卫组。
+    stringNameShadowed() {
+        return !!((this.ctx.getLocal && this.ctx.getLocal("String")) ||
+            (this.ctx.getFunction && this.ctx.getFunction("String")) ||
+            (this.ctx.getMainCapturedVar && this.ctx.getMainCapturedVar("String")));
+    },
+
     // [W-28] `re.<exec|test|toString>` 值读取的判定 + 发射(命中返 true)。
     // [#32 守卫] 查表后 typeof==="string" 判命中(防原型链上的 toString 等)。
     _tryEmitRegExpMethodRef(expr, propName) {
@@ -775,6 +826,112 @@ export const MemberCompiler = {
         vm.cmpImm(VReg.RET, 0);
         vm.jne(doneL);
         this.emitRegExpCtorObject(); // 填两槽(RET = 构造器,下面重载原型)
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.label(doneL);
+    },
+
+    // [W-29] 惰性物化 String 构造器函数对象 + String.prototype(两个全局槽,GC 保守
+    // 扫数据段即根)。**一次填两槽**、且原型侧只从槽读构造器(不回调本函数)→ 无编译期
+    // 递归。RET = 装箱构造器函数值(稳定身份 → `String===String`)。
+    emitStringCtorObject() {
+        const vm = this.vm;
+        const ctorSlot = "_nsobj_string";
+        const protoSlot = "_nsobj_string_proto";
+        this._reEnsureSlot(ctorSlot);
+        this._reEnsureSlot(protoSlot);
+        const doneL = this.ctx.newLabel("nsstr_done");
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne(doneL);
+        // 构造器闭包 16B {magic, _builtin_string}:`String(x)` 经 compileCallExpression
+        // 的静态改派,但作为**值**传递时用此闭包(与 Boolean/Number 同形)。
+        vm.movImm(VReg.A0, 16);
+        vm.call("_alloc");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.movImm(VReg.V1, 0xc105); // CLOSURE_MAGIC
+        vm.store(VReg.S0, 0, VReg.V1);
+        vm.lea(VReg.V1, "_builtin_string");
+        vm.store(VReg.S0, 8, VReg.V1);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_js_box_function");
+        vm.lea(VReg.V0, ctorSlot);
+        vm.store(VReg.V0, 0, VReg.RET); // **先**存槽
+        // String.name / String.length(闭包属性侧表)
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("name", VReg.A1);
+        vm.lea(VReg.A2, this.asm.addString("String"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A2, VReg.A2, VReg.V1);
+        vm.call("_closure_prop_set");
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("length", VReg.A1);
+        vm.movImm(VReg.A2, 1);
+        vm.scvtf(0, VReg.A2);
+        vm.fmovToInt(VReg.A2, 0);
+        vm.call("_closure_prop_set");
+        // 原型对象
+        vm.call("_object_new");
+        vm.call("_box_obj_r");
+        vm.lea(VReg.V0, protoSlot);
+        vm.store(VReg.V0, 0, VReg.RET);
+        // 原型属性落位:方法闭包 + _object_set_prop_attr(BUILTIN_PROP_ATTR=5)
+        for (let i = 0; i < STRING_PROTO_METHODS.length; i = i + 1) {
+            const m = STRING_PROTO_METHODS[i];
+            if (m[1] === null) continue; // constructor 最后单独落
+            // m[1] 是运行时标签(非用户函数),直接传给 emitBuiltinMethodRefClosure;
+            // vm.lea 在链接期解析为运行时函数地址。
+            this.emitBuiltinMethodRefClosure(m[1]); // RET = 闭包
+            // 挂 .name/.length(与 emitRegExpMethodClosure 同);RET 会被毁,先存 S0
+            vm.mov(VReg.S0, VReg.RET);
+            vm.mov(VReg.A0, VReg.S0);
+            this.emitBoxedStringKey("name", VReg.A1);
+            vm.lea(VReg.A2, this.asm.addString(m[0]));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+            vm.or(VReg.A2, VReg.A2, VReg.V1);
+            vm.call("_closure_prop_set");
+            vm.mov(VReg.A0, VReg.S0);
+            this.emitBoxedStringKey("length", VReg.A1);
+            vm.movImm(VReg.A2, m[2]);
+            vm.scvtf(0, VReg.A2);
+            vm.fmovToInt(VReg.A2, 0);
+            vm.call("_closure_prop_set");
+            // _reSetProtoProp 从 RET 读值,恢复闭包到 RET
+            vm.mov(VReg.RET, VReg.S0);
+            this._reSetProtoProp(protoSlot, m[0], BUILTIN_PROP_ATTR);
+        }
+        // prototype.constructor = String(从槽读)
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        this._reSetProtoProp(protoSlot, "constructor", BUILTIN_PROP_ATTR);
+        // String.prototype = 原型对象(闭包属性侧表)
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("prototype", VReg.A1);
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.A2, VReg.V0, 0);
+        vm.call("_closure_prop_set");
+        // RET = 装箱构造器(稳定身份)
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.label(doneL);
+    },
+
+    // [W-29] `String.prototype` 值读:原型槽已填则直接用,否则整体物化(构造器路径
+    // 一次填两槽)。RET = 装箱原型对象。
+    emitStringProtoObject() {
+        const vm = this.vm;
+        const protoSlot = "_nsobj_string_proto";
+        this._reEnsureSlot(protoSlot);
+        const doneL = this.ctx.newLabel("nsstrproto_done");
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne(doneL);
+        this.emitStringCtorObject(); // 填两槽(RET = 构造器,下面重载原型)
         vm.lea(VReg.V0, protoSlot);
         vm.load(VReg.RET, VReg.V0, 0);
         vm.label(doneL);
@@ -1030,7 +1187,13 @@ export const MemberCompiler = {
         }
         if (name === "Boolean") { this.emitBuiltinFnClosure("_builtin_boolean"); return; }
         if (name === "Number") { this.emitBuiltinFnClosure("_builtin_number"); return; }
-        if (name === "String") { this.emitBuiltinFnClosure("_builtin_string"); return; }
+        // [W-29] 裸 `String`(反射位):惰性物化真函数对象(带 .prototype/.name/.length)
+        // → typeof "function"、`String.prototype` 可达。String(x) 的静态改派在
+        // compileCallExpression 先于本路径命中 → 快路字节不变。遮蔽守卫同 Math/RegExp。
+        if (name === "String" && !this.stringNameShadowed()) {
+            this.emitStringCtorObject();
+            return;
+        }
         // Symbol 一等值(批次D):typeof Symbol === "function"、可传递后调用
         if (name === "Symbol") { this.emitBuiltinFnClosure("_symbol_new"); return; }
         // [Error 构造器一等值] 裸 TypeError/RangeError/... 作值 → memoized 闭包(.name 就绪、
@@ -1741,6 +1904,15 @@ export const MemberCompiler = {
                 expr.object.name === "RegExp" && !this.regexpNameShadowed() &&
                 this.regexpShimReady()) {
                 this.emitRegExpProtoObject();
+                return;
+            }
+
+            // [W-29] `String.prototype` → 惰性物化的单例原型对象(方法闭包 + constructor)。
+            // 放在通用 .name/.length 分支之前;propName 严格限定 "prototype" 且接收者是
+            // 未遮蔽的裸 `String` → 其它接收者字节不变。
+            if (propName === "prototype" && expr.object.type === "Identifier" &&
+                expr.object.name === "String" && !this.stringNameShadowed()) {
+                this.emitStringProtoObject();
                 return;
             }
 
