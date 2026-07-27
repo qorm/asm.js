@@ -1,5 +1,5 @@
 {
-  "generated": "2026-07-27T21:34:53.253Z",
+  "generated": "2026-07-27T22:03:14.996Z",
   "config": {
     "corpus": "/Users/nouo/github/asm.js/.test262-corpus",
     "target": "macos-arm64",
@@ -44,12 +44,12 @@
   "eligible": 32310,
   "run": 6462,
   "totals": {
-    "PASS": 2816,
-    "FAIL": 3427,
+    "PASS": 2822,
+    "FAIL": 3423,
     "COMPILE_FAIL": 40,
-    "CRASH": 179
+    "CRASH": 177
   },
-  "passRatePct": 43.58,
+  "passRatePct": 43.67,
   "byArea": {
     "built-ins/Array": {
       "PASS": 284,
@@ -112,10 +112,10 @@
       "CRASH": 10
     },
     "built-ins/String": {
-      "PASS": 73,
-      "FAIL": 168,
+      "PASS": 79,
+      "FAIL": 164,
       "COMPILE_FAIL": 0,
-      "CRASH": 3
+      "CRASH": 1
     },
     "built-ins/Symbol": {
       "PASS": 4,
@@ -145,7 +145,7 @@
   "topFailPatterns": [
     {
       "pattern": "FAIL: assertion mismatch (Test262Error / wrong value)",
-      "count": 1897
+      "count": 1893
     },
     {
       "pattern": "FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)",
@@ -165,7 +165,7 @@
     },
     {
       "pattern": "CRASH: run signal SIGSEGV",
-      "count": 128
+      "count": 126
     },
     {
       "pattern": "FAIL: array contents mismatch (compareArray)",
