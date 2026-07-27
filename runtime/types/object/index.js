@@ -521,6 +521,7 @@ export class ObjectGenerator {
         vm.jeq("_cpg_miss");
         vm.epilogue([VReg.S0, VReg.S1], 0);
         // 键 miss:若 key==="name" 反射元数据名、key==="length" 反射元数据 arity(否则 undefined)。
+        // [W-41] key==="prototype":惰性创建 F.prototype + constructor 回链(仅闭包 magic 0xc105)。
         vm.label("_cpg_miss");
         // [W-27 守卫] 元数据反射要**解引用** fn 的载荷([P] 读 magic),故先验形态:
         // 只有装箱函数(高16=0x7FFF)与裸堆/代码指针(高16=0)可解引用。数字等非指针值
@@ -532,6 +533,44 @@ export class ObjectGenerator {
         vm.jeq("_cpg_key_ck");
         vm.cmpImm(VReg.V0, 0x7FFF);
         vm.jne("_cpg_undef");
+        // [W-41] 普通闭包(magic 0xc105):若 key==="prototype" 惰性创建。
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.V0, VReg.S1, VReg.V1);          // V0 = raw fn ptr
+        vm.load(VReg.V2, VReg.V0, 0);               // V2 = magic
+        vm.cmpImm(VReg.V2, 0xc105);
+        vm.jne("_cpg_key_ck");                       // 非普通闭包 → 跳过 prototype
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.V0, VReg.S0, VReg.V1);          // V0 = key payload
+        vm.lea(VReg.V1, vm.asm.addString("prototype"));
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jne("_cpg_key_ck");                       // 不是 "prototype" → name/length
+        // --- lazy F.prototype creation ---
+        // 1. create prototype object (raw)
+        vm.call("_object_new");                      // RET = raw prototype
+        // 2. box raw prototype -> 0x7FFD
+        vm.mov(VReg.V2, VReg.RET);
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V2, VReg.V2, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+        vm.or(VReg.RET, VReg.V2, VReg.V1);         // RET = boxed prototype
+        vm.mov(VReg.S0, VReg.RET);                  // S0 = boxed proto (callee-saved, safe across calls)
+        // 3. prototype.constructor = fn
+        vm.mov(VReg.A0, VReg.RET);                  // A0 = boxed proto
+        vm.lea(VReg.A1, vm.asm.addString("constructor"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);           // A1 = boxed "constructor"
+        vm.mov(VReg.A2, VReg.S1);                   // A2 = boxed fn
+        vm.call("_object_set");
+        // 4. fn.prototype = boxed prototype (via _closure_prop_set)
+        vm.mov(VReg.A0, VReg.S1);                   // A0 = boxed fn
+        vm.lea(VReg.A1, vm.asm.addString("prototype"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);           // A1 = boxed "prototype"
+        vm.mov(VReg.A2, VReg.S0);                   // A2 = boxed prototype
+        vm.call("_closure_prop_set");
+        // 5. return boxed prototype
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
         vm.label("_cpg_key_ck");
         // key 去壳 == addString("name")/addString("length") 地址?
         // (emitBoxedStringKey 经 addString dedup,同址)
