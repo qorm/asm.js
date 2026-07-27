@@ -1,10 +1,10 @@
 # asm.js test262 conformance report
 
-_Generated 2026-07-27T19:20:31.490Z — target macos-arm64_
+_Generated 2026-07-27T21:34:53.251Z — target macos-arm64_
 
 ## Headline
 
-**asm.js passes 2691 / 6462 = 41.64% of the run test262 subset**
+**asm.js passes 2816 / 6462 = 43.58% of the run test262 subset**
 (selected `language/` + core `built-ins/`), one variant per test.
 
 Of 33776 discovered test files in the selected dirs, 1466 were excluded up front (module=83, unsupported-feature=1383, intl/staging-dir=0); 32310 were eligible; 6462 were actually run (deterministic stride=5).
@@ -13,8 +13,8 @@ Of 33776 discovered test files in the selected dirs, 1466 were excluded up front
 
 | class | count | % of run |
 |-------|------:|---------:|
-| PASS         | 2691 | 41.64 |
-| FAIL         | 3552 | 54.97 |
+| PASS         | 2816 | 43.58 |
+| FAIL         | 3427 | 53.03 |
 | COMPILE_FAIL | 40 | 0.62 |
 | CRASH        | 179 | 2.77 |
 | **run**      | **6462** | 100 |
@@ -24,20 +24,20 @@ Of 33776 discovered test files in the selected dirs, 1466 were excluded up front
 | area | run | PASS | FAIL | COMPILE_FAIL | CRASH | pass% |
 |------|----:|-----:|-----:|-------------:|------:|------:|
 | built-ins/Array | 594 | 284 | 289 | 0 | 21 | 47.8 |
-| built-ins/Boolean | 10 | 3 | 6 | 0 | 1 | 30.0 |
+| built-ins/Boolean | 10 | 1 | 9 | 0 | 0 | 10.0 |
 | built-ins/JSON | 33 | 8 | 25 | 0 | 0 | 24.2 |
 | built-ins/Map | 41 | 15 | 24 | 0 | 2 | 36.6 |
 | built-ins/Math | 65 | 32 | 33 | 0 | 0 | 49.2 |
-| built-ins/Number | 68 | 26 | 41 | 0 | 1 | 38.2 |
-| built-ins/Object | 682 | 311 | 362 | 0 | 9 | 45.6 |
+| built-ins/Number | 68 | 25 | 42 | 0 | 1 | 36.8 |
+| built-ins/Object | 682 | 310 | 363 | 0 | 9 | 45.5 |
 | built-ins/Promise | 145 | 51 | 84 | 2 | 8 | 35.2 |
 | built-ins/RegExp | 374 | 133 | 235 | 5 | 1 | 35.6 |
 | built-ins/Set | 76 | 40 | 26 | 0 | 10 | 52.6 |
-| built-ins/String | 244 | 75 | 167 | 0 | 2 | 30.7 |
+| built-ins/String | 244 | 73 | 168 | 0 | 3 | 29.9 |
 | built-ins/Symbol | 15 | 4 | 11 | 0 | 0 | 26.7 |
 | built-ins/TypedArray | 288 | 53 | 232 | 0 | 3 | 18.4 |
-| language/expressions | 2005 | 915 | 1001 | 23 | 66 | 45.6 |
-| language/statements | 1822 | 741 | 1016 | 10 | 55 | 40.7 |
+| language/expressions | 2005 | 986 | 930 | 23 | 66 | 49.2 |
+| language/statements | 1822 | 801 | 956 | 10 | 55 | 44.0 |
 
 ## Excluded categories (counted, not scored)
 
@@ -59,36 +59,36 @@ Excluded-by-feature detail:
 
 ## Top failing patterns (FAIL / COMPILE_FAIL / CRASH detail strings)
 
-- **1977×** FAIL: assertion mismatch (Test262Error / wrong value)
-- **467×** FAIL: async ($DONE not signalled / promise rejected)
+- **1897×** FAIL: assertion mismatch (Test262Error / wrong value)
 - **463×** FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)
+- **422×** FAIL: async ($DONE not signalled / promise rejected)
 - **335×** FAIL: negative test wrong outcome (phase=parse)
 - **147×** FAIL: TypedArray/ArrayBuffer semantics
-- **129×** CRASH: run signal SIGSEGV
+- **128×** CRASH: run signal SIGSEGV
 - **111×** FAIL: array contents mismatch (compareArray)
 - **50×** FAIL: constructor-ness reflection (isConstructor / not-a-constructor)
 - **40×** COMPILE_FAIL: asm.js could not compile (unsupported syntax / parser gap)
 - **35×** CRASH: run timeout
-- **15×** CRASH: run signal SIGBUS
+- **16×** CRASH: run signal SIGBUS
 - **2×** FAIL: negative test wrong outcome (phase=runtime)
 
 ## Failures correlated with features (top tags among failing tests)
 
-- `destructuring-binding`: 730
-- `async-iteration`: 601
-- `class`: 503
-- `generators`: 432
+- `destructuring-binding`: 644
+- `async-iteration`: 555
+- `class`: 464
+- `generators`: 372
 - `Symbol.iterator`: 299
 - `class-fields-public`: 243
-- `default-parameters`: 238
 - `TypedArray`: 219
-- `class-methods-private`: 179
+- `default-parameters`: 200
+- `class-methods-private`: 160
 - `class-fields-private`: 141
-- `class-static-methods-private`: 137
 - `regexp-unicode-property-escapes`: 132
 - `BigInt`: 120
+- `class-static-methods-private`: 117
 - `Symbol.asyncIterator`: 112
-- `Symbol`: 90
+- `Symbol`: 89
 - `async-functions`: 70
 - `arrow-function`: 67
 - `resizable-arraybuffer`: 57
@@ -123,4 +123,4 @@ mkdir -p .test262-corpus && tar xzf /tmp/t262.tgz -C .test262-corpus --strip-com
 node tests/test262/run.mjs --stride 5 --jobs 8 --target macos-arm64
 ```
 
-_Run wall-clock: 391.6s._
+_Run wall-clock: 394.1s._

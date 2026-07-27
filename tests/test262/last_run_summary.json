@@ -1,5 +1,5 @@
 {
-  "generated": "2026-07-27T19:20:31.492Z",
+  "generated": "2026-07-27T21:34:53.253Z",
   "config": {
     "corpus": "/Users/nouo/github/asm.js/.test262-corpus",
     "target": "macos-arm64",
@@ -44,12 +44,12 @@
   "eligible": 32310,
   "run": 6462,
   "totals": {
-    "PASS": 2691,
-    "FAIL": 3552,
+    "PASS": 2816,
+    "FAIL": 3427,
     "COMPILE_FAIL": 40,
     "CRASH": 179
   },
-  "passRatePct": 41.64,
+  "passRatePct": 43.58,
   "byArea": {
     "built-ins/Array": {
       "PASS": 284,
@@ -58,10 +58,10 @@
       "CRASH": 21
     },
     "built-ins/Boolean": {
-      "PASS": 3,
-      "FAIL": 6,
+      "PASS": 1,
+      "FAIL": 9,
       "COMPILE_FAIL": 0,
-      "CRASH": 1
+      "CRASH": 0
     },
     "built-ins/JSON": {
       "PASS": 8,
@@ -82,14 +82,14 @@
       "CRASH": 0
     },
     "built-ins/Number": {
-      "PASS": 26,
-      "FAIL": 41,
+      "PASS": 25,
+      "FAIL": 42,
       "COMPILE_FAIL": 0,
       "CRASH": 1
     },
     "built-ins/Object": {
-      "PASS": 311,
-      "FAIL": 362,
+      "PASS": 310,
+      "FAIL": 363,
       "COMPILE_FAIL": 0,
       "CRASH": 9
     },
@@ -112,10 +112,10 @@
       "CRASH": 10
     },
     "built-ins/String": {
-      "PASS": 75,
-      "FAIL": 167,
+      "PASS": 73,
+      "FAIL": 168,
       "COMPILE_FAIL": 0,
-      "CRASH": 2
+      "CRASH": 3
     },
     "built-ins/Symbol": {
       "PASS": 4,
@@ -130,14 +130,14 @@
       "CRASH": 3
     },
     "language/expressions": {
-      "PASS": 915,
-      "FAIL": 1001,
+      "PASS": 986,
+      "FAIL": 930,
       "COMPILE_FAIL": 23,
       "CRASH": 66
     },
     "language/statements": {
-      "PASS": 741,
-      "FAIL": 1016,
+      "PASS": 801,
+      "FAIL": 956,
       "COMPILE_FAIL": 10,
       "CRASH": 55
     }
@@ -145,15 +145,15 @@
   "topFailPatterns": [
     {
       "pattern": "FAIL: assertion mismatch (Test262Error / wrong value)",
-      "count": 1977
-    },
-    {
-      "pattern": "FAIL: async ($DONE not signalled / promise rejected)",
-      "count": 467
+      "count": 1897
     },
     {
       "pattern": "FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)",
       "count": 463
+    },
+    {
+      "pattern": "FAIL: async ($DONE not signalled / promise rejected)",
+      "count": 422
     },
     {
       "pattern": "FAIL: negative test wrong outcome (phase=parse)",
@@ -165,7 +165,7 @@
     },
     {
       "pattern": "CRASH: run signal SIGSEGV",
-      "count": 129
+      "count": 128
     },
     {
       "pattern": "FAIL: array contents mismatch (compareArray)",
@@ -185,7 +185,7 @@
     },
     {
       "pattern": "CRASH: run signal SIGBUS",
-      "count": 15
+      "count": 16
     },
     {
       "pattern": "FAIL: negative test wrong outcome (phase=runtime)",
