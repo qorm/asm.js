@@ -5121,4 +5121,72 @@ export const FunctionCompiler = {
             this.compileClosureCall(VReg.V6, expr.arguments);
         }
     },
+
+    // [W-24+ext] 重写 _collectFnNameHints:覆盖 index.js 类定义版,在原有基础上扩展两类
+    // NamedEvaluation 缺口。Object.assign(Compiler.prototype, FunctionCompiler) 在
+    // index.js 末尾运行,本方法覆盖类定义版。
+    // 扩展项:
+    //   1. AssignmentPattern:解构默认值 {arrow = ()=>{}} → name "arrow"
+    //   2. Logical-assignment(??=/&&=/||=):f ??= ()=>{} → name "f"
+    // (ClassExpression 绑定名由 members.js _resolveFnNode/_fnNameLength 静态解析覆盖。)
+    _collectFnNameHints(ast) {
+        if (!this._fnNameHints) this._fnNameHints = new Map();
+        const hints = this._fnNameHints;
+        const seen = new Set();
+        const isAnonFn = (n) => !!n && typeof n === "object" && !n.id &&
+            (n.type === "FunctionExpression" || n.type === "ArrowFunctionExpression");
+        const keyName = (k, computed) => {
+            if (computed || !k || typeof k !== "object") return null;
+            if (k.type === "Identifier") return k.name;
+            if (k.type === "Literal" && (typeof k.value === "string" || typeof k.value === "number")) {
+                return String(k.value);
+            }
+            return null;
+        };
+        const visit = (node) => {
+            if (!node || typeof node !== "object") return;
+            if (seen.has(node)) return;
+            seen.add(node);
+            if (Array.isArray(node)) {
+                for (let i = 0; i < node.length; i = i + 1) visit(node[i]);
+                return;
+            }
+            const t = node.type;
+            if (t === "VariableDeclarator") {
+                if (node.id && node.id.type === "Identifier" && isAnonFn(node.init)) {
+                    hints.set(node.init, node.id.name);
+                }
+            } else if (t === "AssignmentExpression") {
+                // [ext] 扩展至逻辑赋值运算符(??=/&&=/||=)
+                const isLogicalAssign = node.operator === "??=" ||
+                    node.operator === "&&=" || node.operator === "||=";
+                if ((node.operator === "=" || isLogicalAssign) &&
+                    node.left && node.left.type === "Identifier" && isAnonFn(node.right)) {
+                    hints.set(node.right, node.left.name);
+                }
+            } else if (t === "AssignmentPattern") {
+                // [ext] 解构默认值: {arrow = ()=>{}} 中 AssignmentPattern
+                // left 是绑定标识符,right 是函数/箭头 → name = 绑定标识符名
+                if (node.left && node.left.type === "Identifier" && isAnonFn(node.right)) {
+                    hints.set(node.right, node.left.name);
+                }
+            } else if (t === "Property") {
+                if ((!node.kind || node.kind === "init") && isAnonFn(node.value)) {
+                    const kn = keyName(node.key, node.computed);
+                    if (kn !== null) hints.set(node.value, kn);
+                }
+            } else if (t === "MethodDefinition") {
+                if ((!node.kind || node.kind === "method") && isAnonFn(node.value)) {
+                    const kn = keyName(node.key, node.computed);
+                    if (kn !== null) hints.set(node.value, kn);
+                }
+            }
+            for (const k in node) {
+                if (k === "type" || k === "loc" || k === "start" || k === "end" || k === "filename") continue;
+                const v = node[k];
+                if (v && typeof v === "object") visit(v);
+            }
+        };
+        visit(ast);
+    },
 };

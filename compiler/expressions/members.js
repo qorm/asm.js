@@ -1363,7 +1363,11 @@ export const MemberCompiler = {
             }
             const init = (this.ctx.varInitExprs && this.ctx.varInitExprs[nm]) || null;
             if (init && (init.type === "ArrowFunctionExpression" ||
-                init.type === "FunctionExpression" || init.type === "ClassExpression")) {
+                init.type === "FunctionExpression" || init.type === "ClassExpression" ||
+                // [ext] parser 对匿名 class 表达式产出 ClassDeclaration 节点(含合成名)
+                // var C = class {} → init.type === "ClassDeclaration"
+                (init.type === "ClassDeclaration" && init.id && init.id.name &&
+                 init.id.name.indexOf("__classexpr") === 0))) {
                 return { node: init, fallbackName: nm };
             }
             return null;
@@ -1397,7 +1401,12 @@ export const MemberCompiler = {
         let ownName;
         let params;
         if (node.type === "ClassDeclaration" || node.type === "ClassExpression") {
-            ownName = (node.id && node.id.name) ? node.id.name : r.fallbackName;
+            // [ext] parser 对匿名 class 表达式赋合成名(__classexprN),应使用变量绑定名
+            if (node.id && node.id.name && node.id.name.indexOf("__classexpr") === 0) {
+                ownName = r.fallbackName;
+            } else {
+                ownName = (node.id && node.id.name) ? node.id.name : r.fallbackName;
+            }
             params = this._classCtorParams(node);
         } else {
             ownName = (node.id && node.id.name) ? node.id.name : r.fallbackName;
