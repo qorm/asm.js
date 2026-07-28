@@ -3303,6 +3303,19 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.RET, 0);
         vm.jne("_object_keys_next");
 
+        // [W-47] private-name 过滤:键以 '#' 开头 → 私有字段名,不出现在 Object.keys/gOPN。
+        // S4 是 NaN-boxed string(0x7FFC);先判 tag 再取内容首字节。非字符串键(数字)
+        // tag≠0x7FFC 直通。_getStrContent 仅用 S0-S1/V0-V2,S2-S5 存活。
+        vm.shrImm(VReg.V0, VReg.S4, 48);
+        vm.cmpImm(VReg.V0, 0x7FFC);
+        vm.jne("_object_keys_push");
+        vm.mov(VReg.A0, VReg.S4);
+        vm.call("_getStrContent");
+        vm.loadByte(VReg.V0, VReg.RET, 0);
+        vm.cmpImm(VReg.V0, 0x23); // '#'
+        vm.jeq("_object_keys_next");
+
+        vm.label("_object_keys_push");
         // push 到结果数组
         vm.mov(VReg.A0, VReg.S2);
         vm.mov(VReg.A1, VReg.S4);
@@ -3900,6 +3913,21 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.RET, 0);
         vm.jne("_object_values_next");
 
+        // [W-47] private-name 过滤(同 _object_keys_loop)
+        // V0 被 _is_symbol clobber,需重算 propAddr
+        vm.load(VReg.V2, VReg.S0, OBJECT_PROPS_PTR_OFFSET);
+        vm.shl(VReg.V0, VReg.S3, 4);
+        vm.add(VReg.V0, VReg.V2, VReg.V0);
+        vm.load(VReg.A0, VReg.V0, 0);
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFC);
+        vm.jne("_object_values_push");
+        vm.call("_getStrContent");
+        vm.loadByte(VReg.V0, VReg.RET, 0);
+        vm.cmpImm(VReg.V0, 0x23);
+        vm.jeq("_object_values_next");
+
+        vm.label("_object_values_push");
         vm.mov(VReg.A0, VReg.S2);
         vm.mov(VReg.A1, VReg.S4);
         vm.call("_array_push");
@@ -4135,6 +4163,17 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.RET, 0);
         vm.jne("_object_entries_next");
 
+        // [W-47] private-name 过滤(同 _object_keys_loop)
+        vm.shrImm(VReg.V0, VReg.S4, 48);
+        vm.cmpImm(VReg.V0, 0x7FFC);
+        vm.jne("_object_entries_push");
+        vm.mov(VReg.A0, VReg.S4);
+        vm.call("_getStrContent");
+        vm.loadByte(VReg.V0, VReg.RET, 0);
+        vm.cmpImm(VReg.V0, 0x23);
+        vm.jeq("_object_entries_next");
+
+        vm.label("_object_entries_push");
         // pair = new Array(2)
         vm.movImm(VReg.A0, 2);
         vm.call("_array_new_with_size");

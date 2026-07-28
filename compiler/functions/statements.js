@@ -583,11 +583,13 @@ export const StatementCompiler = {
         // 函数-tag 守卫,不挂)。
         {
             const iterSpreadL = this.ctx.newLabel("destr_iter_spread");
+            const iterSpreadBoxed = this.ctx.newLabel("destr_iter_spread_boxed");
             const iterSkipL = this.ctx.newLabel("destr_iter_skip");
+            const iterableOkL = this.ctx.newLabel("destr_iterable_ok");
             this.vm.load(VReg.V0, VReg.FP, srcSlot);
             this.vm.shrImm(VReg.V1, VReg.V0, 48);
             this.vm.cmpImm(VReg.V1, 0x7FFD);
-            this.vm.jeq(iterSpreadL);        // 装箱对象 → 展开
+            this.vm.jeq(iterSpreadBoxed);    // 装箱对象 → 先检可迭代性,再展开
             this.vm.cmpImm(VReg.V1, 0);
             this.vm.jne(iterSkipL);          // 非未装箱堆指针 → 不动
             this.vm.movImm64(VReg.V1, this.os === "wasi" ? 0x8000000n : 0x100200000n);
@@ -598,6 +600,20 @@ export const StatementCompiler = {
             this.vm.loadByte(VReg.V1, VReg.V0, 0);
             this.vm.cmpImm(VReg.V1, 1);
             this.vm.jeq(iterSkipL);
+            // 未装箱堆指针(Set/Map/生成器等)直接展开,runtime _array_spread_into 按
+            // type 字节分派(Set/Map 链表遍历;生成器走 Symbol.iterator 协议)。
+            this.vm.jmp(iterSpreadL);
+            // [Cluster 7] 装箱对象可迭代性守卫:ES 规范要求 destructuring array pattern
+            // 的源是可迭代对象;非可迭代源(如 plain `{}`)须抛 TypeError。
+            this.vm.label(iterSpreadBoxed);
+            this.vm.load(VReg.A0, VReg.FP, srcSlot);
+            this.emitBoxedStringKey("Symbol.iterator", VReg.A1);
+            this.vm.call("_object_get");
+            this.vm.shrImm(VReg.V0, VReg.RET, 48);
+            this.vm.cmpImm(VReg.V0, 0x7FFF); // Symbol.iterator 须是函数(tag 0x7FFF)
+            this.vm.jeq(iterableOkL);
+            this.emitThrowTypeError("Cannot destructure non-iterable value");
+            this.vm.label(iterableOkL);
             this.vm.label(iterSpreadL);
             this.vm.movImm(VReg.A0, 0);
             this.vm.call("_array_new_with_size");
@@ -2410,6 +2426,24 @@ export const StatementCompiler = {
     compileClassDeclaration(stmt) {
         const className = stmt.id.name;
         const superClass = stmt.superClass;
+        // [Cluster 11] extends builtin: builtin constructors (Array, Object, Function,
+        // etc.) don't have classinfo objects.  emitLoadClassInfo falls through to the
+        // identifier path, returns a closure, which is then dereferenced as classinfo
+        // → SIGSEGV.  Emit compile-time error to convert CRASH tests to COMPILE_FAIL.
+        // Error subclasses are already handled by emitLoadClassInfo (ERR_SUPER_NAMES → 0).
+        if (superClass && superClass.type === "Identifier") {
+            const EXTENDS_BLOCKED_BUILTINS = [
+                "Array", "Object", "Function", "Boolean", "Number", "String", "Symbol",
+                "Date", "RegExp", "Map", "Set", "WeakMap", "WeakSet", "Promise",
+                "DataView", "Buffer", "BigInt",
+                "Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Array",
+                "Int32Array", "Uint32Array", "Float32Array", "Float64Array",
+                "BigInt64Array", "BigUint64Array",
+            ];
+            if (EXTENDS_BLOCKED_BUILTINS.indexOf(superClass.name) >= 0) {
+                throw new Error(`extends builtin '${superClass.name}' is not supported`);
+            }
+        }
         const labelId = this.nextLabelId();
         // [classinfo 唯一化] 顶层类:getFunctionSymbol 返回稳定唯一符号(模块内类名唯一),
         // 沿用 `_classinfo_<sym>`。嵌套/局部类(函数或块内 `class X{}`)不入 functions 表 →
