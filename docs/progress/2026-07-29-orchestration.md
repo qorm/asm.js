@@ -199,7 +199,7 @@
 
 ## 11. 后续演进待办（按优先级）
 
-0. **~~Object.defineProperty 杠杆~~（已于 v0.3.6 落地，见 §13）**：按 §12 字段存在位掩码重做成功——built-ins/Object 46.3% → 53.7%、整体 43.89% → 44.55%（+43），三处 P0 误拒已规避、门禁绿。**剩余缺口**列入后续：①动态路径非对象描述符未拒；②动态 data+accessor 混用未拒（动态路径在 helper 前仍先脱糖）；③non-configurable + non-writable 属性改值未强制（需按内容比较的字符串 SameValue）；④gOPD 对数组 length/下标、全局对象、内建构造器的覆盖未做（~25 FAIL + 内建反射）。
+0. **~~Object.defineProperty 杠杆~~（v0.3.6 落地强制 + v0.3.7 补全缺口，见 §13/§14）**：built-ins/Object 46.3% → 53.7%（v0.3.6）→ **55.0%**（v0.3.7）；整体 43.89% → 44.55% → **44.69%**。**Object 杠杆仍剩**：①gOPD 对数组 length/下标、全局对象、内建构造器的覆盖（~25 FAIL + 内建反射）；②**【新首要】`Object.keys` 对奇异对象（RegExp/`new String()` 等）过度枚举内部槽**——既有 bug，v0.3.7 收紧“描述符须对象”校验后暴露为 3 个 test262 损失（create/15.2.3.5-4-35、defineProperties/15.2.3.7-5-b-241/-246）；修复应收回这 3 个并改善其它依赖 keys 的用例。
 1. **looksLikeCjsSource 运行期 CJS 误判（P2，既有，Wave 4 暴露）**：复用朴素 `cjsHasEsmSyntax`，注释/字符串/模板/正则里含 “export ”/“import ” 文字的 CJS 被判为非 CJS、不做 CJS 包装，`import` 之运行期崩 `FATAL: _object_set called with NULL object`（Node 正常执行）。HEAD 逐字相同、与 Wave 4 无关；Wave 4 仅解除编译期误杀使其显形。彻底修复需把 CJS 检测改 AST/词法感知（与 Wave 4 的 `astHasRealTopLevelEsm` 同源思路）。
 2. **resolvePackageSpecifier 损坏 package.json 静默丢弃（P2，既有）**：`compiler/index.js:3837-3838` 对损坏 JSON `catch return ""`，经包说明符的导入被静默丢弃、编译成功（Node 抛 ERR_INVALID_PACKAGE_CONFIG）。与 `nearestPackageJsonExplicitCommonjs` 的抛错路径不一致。
 3. **--static 端到端 codegen 缺陷（P2，既有）**：含导出函数的程序 `--static` 在 `asm/arm64.js:1603` 报 “Unknown label: _js_add”（在 writeStaticLibrary 之前）。C_INTEROP_DESIGN.md B4 已登记。修复须过完整门禁。
@@ -236,7 +236,9 @@ P1/P2 残留：enumerable 变更与 accessor get/set 恒等未强制（漏拒）
 `git checkout HEAD -- compiler/functions/functions.js runtime/types/object/index.js`（仅这两文件受 Wave 5 触及）。回退后 node --check 通过、P0 行为消失、19 个 Wave 2/3/4 文件完好、gate 复跑 `PASS=385` 全绿 + `gen1==gen2==gen3` 定点、test262 刷新回 43.89%（2836/6462，runnerSha=a678f85、corpusPin=9e61c128）。
 - 2026-07-30：**发布 v0.3.5 并推送**（commit 39d7e79，tag v0.3.5，branch dev → qorm/asm.js）：Wave 2/3/4 全部改动 + 文档；fixture 套件首次全绿（385/0）、test262 43.89%（2836/6462，经固定 corpus + runnerSha/corpusPin 可复现）。
 - 2026-07-30：Wave 6 按 §12 字段存在位掩码设计**重做** Object.defineProperty 杠杆（编译器把 `(mask<<8)|attr` 经 A5 传入新增运行时 helper `_object_define_property`；HAS_VALUE/WRITABLE/ENUMERABLE/CONFIGURABLE/GET/SET）。主控独立差分复验：三处曾误拒用例（缺字段 `{}`、frozen `{}`、accessor `{}`、缺省 writable 保留、字符串内容 SameValue）全部与 Node 一致（P0 已规避）；基础强制（重定义 non-configurable、非扩展新键、data↔accessor 切换、非 callable get/set、data+accessor 混用静态）正确抛 TypeError。
-- 2026-07-30：Wave 6 门禁绿（`gen1==gen2==gen3` 逐字节 + fixtures `385/0/0/0`）；test262 升至 **44.55%（2879/6462，+43）**、built-ins/Object **53.7%（366/682，+50）**。残留 4 处宽松欠强制（动态非对象描述符未拒、动态 data+accessor 混用未拒——动态路径仍先脱糖、non-config+non-writable 改值未强制——需内容 SameValue）严格优于旧“一律接受”、列入后续。**发布 v0.3.6 并推送**。注：本周期子代理 API 多次 SSL 证书主机名不匹配（4+ 个 agent 终止/卡死），Wave 6 的验证以主控差分电池 + 门禁为主。
+- 2026-07-30：Wave 6 门禁绿（`gen1==gen2==gen3` 逐字节 + fixtures `385/0/0/0`）；test262 升至 **44.55%（2879/6462，+43）**、built-ins/Object **53.7%（366/682，+50）**。残留 4 处宽松欠强制（动态非对象描述符未拒、动态 data+accessor 混用未拒——动态路径仍先脱糖、non-config+non-writable 改值未强制——需内容 SameValue）严格优于旧“一律接受”、列入后续。**发布 v0.3.6 并推送**。注：本周期子代理 API 多次 SSL 证书主机名不匹配（4+ 个 agent 终止/卡死），Wave 6/7 的验证以主控差分电池 + 门禁为主。
+- 2026-07-30：Wave 7 补全 v0.3.6 遗留四处 defineProperty 缺口：①non-configurable + non-writable 改值强制（内容 SameValue：字符串按 `_getStrContent`+`_strcmp` 比内容，否则全 64 位位模式，0/-0 抛、NaN==NaN；顺带修键相等快路屏蔽小 double 高位的旧假相等）；②动态路径非对象描述符拒绝；③动态 data+accessor 混用拒绝（动态路计算完整掩码经 `_object_define_property`，不再先脱糖）。实现途中修两处自引入回归（动态字段存在读取器数组 SIGSEGV → 改 `_object_get`；`_maybe_getter` 按 [[Get]] 调访问器值字段）。
+- 2026-07-30：Wave 7 主控独立差分 25 例与 Node 全一致（四处缺口 + P0 误拒守卫 + SameValue 边角），fixtures `385/0/0/0`；门禁绿（`gen1==gen2==gen3` + 385）。test262 44.55% → **44.69%（2888，+9）**、built-ins/Object 53.7% → **55.0%（375，+9）**。净 +9 = +12 − 3：3 个损失（create/15.2.3.5-4-35、defineProperties/15.2.3.7-5-b-241/-246）由**既有** `Object.keys` 对奇异对象（RegExp/`new String()` 内部槽）过度枚举 bug 被本次正确收紧的“描述符须对象”校验暴露（基线仅因旧宽松路静默忽略侥幸通过），列为下一目标。**发布 v0.3.7 并推送**。
 
 ### 12.4 重做设计（字段存在位掩码）
 
@@ -267,3 +269,20 @@ P1/P2 残留：enumerable 变更与 accessor get/set 恒等未强制（漏拒）
 2. 动态 data+accessor 混用未拒（`emitDefinePropertyDynamic` 仍先脱糖为 accessor 或 data，混用到不了 helper 的 `_dp_nomix`）。
 3. non-configurable + non-writable 属性改值未强制（helper `_dp_old_data` 分支缺值比较；需按内容比较字符串的 SameValue）。
 4. gOPD 对数组 length/下标、全局对象、内建构造器返回 undefined（~25 FAIL + 内建反射）。
+
+## 14. Wave 7 结果（defineProperty 缺口补全，v0.3.7）
+
+补全 §13 所列四处缺口中的三处（①②③），仅余 gOPD 覆盖（④，见 §11）。
+
+| 项 | 状态 | 证据 |
+|---|---|---|
+| ① non-configurable + non-writable 改值强制（内容 SameValue） | 达成 | e3/e6 与 Node 一致抛；字符串按内容比、0/-0 抛、NaN==NaN、同值/同引用不抛 |
+| ② 动态路径非对象描述符拒绝 | 达成 | v5（42 / undefined）与 Node 一致抛 TypeError |
+| ③ 动态 data+accessor 混用拒绝 | 达成 | v7 与 Node 一致抛（动态路计完整掩码经 `_object_define_property`，不再先脱糖） |
+| 完整 bootstrap gate | 达成 | `gen1==gen2==gen3` 逐字节 + fixtures `385/0/0/0`，退出 0 |
+| test262 | 达成 | 整体 44.55% → **44.69%**（2888，+9）；built-ins/Object 53.7% → **55.0%**（375，+9） |
+| 发布 | 达成 | v0.3.7 已推送（branch dev + tag） |
+
+净 +9 = +12 增益 − 3 损失。3 个损失（create/15.2.3.5-4-35、defineProperties/15.2.3.7-5-b-241/-246）根因为**既有** `Object.keys` 对奇异对象（RegExp/`new String()`）过度枚举内部槽：用奇异对象作属性表时 `Object.keys` 返回 source/flags 等内部槽名，defineProperties 取其值（字符串/原语）作描述符 → v0.3.7 正确的“描述符须对象”校验抛错；基线因旧宽松路静默忽略非对象描述符侥幸通过。修复 `Object.keys` 奇异对象枚举即可收回（列 §11 新首要）。
+
+实现途中修掉两处自引入回归：动态字段存在读取器 `_prop_in` 对数组只判数值索引、装箱键经数组路径 `loadByte` → SIGSEGV（改 `_object_get` 读一次 + `!== undefined` 判 presence）；`_object_get` 对访问器属性只返 getter 标记块，须继以 `_maybe_getter`（this=desc）调其 getter 取真值（对齐 [[Get]]），否则描述符上由访问器提供的字段被当标记块误判（回收 18 个 Object 用例）。

@@ -811,22 +811,18 @@ export const FunctionCompiler = {
     // obj/key/desc 各求值一次落 FP 槽（保守栈扫描保活）；随后：
     //   • 目标运行时是 Proxy(type==8) → **整份**描述符交 _object_defineProperty_proxy 陷阱
     //     （与字面量路径同语义）；
-    //   • 否则运行时二选一（get/set 任一非 undefined ⇒ accessor），脱糖回**字面量形态**的
-    //     Object.defineProperty(o,k,{get:d.get,set:d.set}) / (o,k,{value:d.value})，
-    //     从而复用既有字面量下降 codegen（标记块构造、_object_define）而不复制它；
-    //   • 最后用 _to_boolean 逐位算 attrs（w|e<<1|c<<2）再调一次 _object_set_prop_attr 覆写
-    //     字面量路径落下的 0。缺省字段读出 undefined → ToBoolean 0，与规范默认值一致。
-    // 未装箱访问器槽的“缺省”由装箱掩码保证：undefined(0x7ffb…) & 0x0000ffffffffffff == 0，
-    // 恰是标记块里“无 getter/setter”的哨兵值，故 {get:d.get} 里 d.set 为 undefined 也正确。
+    //   • 否则交 _object_define_property_dyn(obj,key,desc)：运行时逐字段读一次（presence
+    //     经 _object_has、值经 _object_get）算出**完整字段存在掩码** + attr，打包后尾调
+    //     _object_define_property——与字面量静态路径同走一份 ValidateAndApplyPropertyDescriptor。
+    //     由此动态描述符也受全部强制：非对象描述符先经 _dp_require_object 抛 TypeError
+    //     （v5：defineProperty({},k,42)/undefined）；data+accessor 字段混用触发 _dp_nomix
+    //     （v7：{value:1,get:fn}）。旧实现先脱糖成 {get,set} 或 {value} 再递归，丢掉了
+    //     “哪些字段真出现”的信息，混用与非对象皆漏检。
     emitDefinePropertyDynamic(expr, desc) {
         const id = this.nextLabelId();
         const oOff = this.ctx.allocLocal(`__dpd_obj_${id}`);
         const kOff = this.ctx.allocLocal(`__dpd_key_${id}`);
         const dOff = this.ctx.allocLocal(`__dpd_desc_${id}`);
-        const aOff = this.ctx.allocLocal(`__dpd_attr_${id}`);
-        const objRef = this._dpIdent(`__dpd_obj_${id}`);
-        const keyRef = this._dpIdent(`__dpd_key_${id}`);
-        const descRef = this._dpIdent(`__dpd_desc_${id}`);
 
         // 求值顺序 obj → key → descriptor，各一次
         if (expr.arguments.length > 0) this.compileExpression(expr.arguments[0]);
@@ -855,45 +851,11 @@ export const FunctionCompiler = {
         this.vm.jmp(doneLabel);
         this.vm.label(normalLabel);
 
-        const undefRef = this._dpIdent("undefined");
-        const isAccessor = {
-            type: "LogicalExpression",
-            operator: "||",
-            left: { type: "BinaryExpression", operator: "!==", left: this._dpMember(descRef, "get"), right: undefRef },
-            right: { type: "BinaryExpression", operator: "!==", left: this._dpMember(descRef, "set"), right: undefRef },
-        };
-        const prop = (k, v) => ({ type: "Property", kind: "init", computed: false, shorthand: false, key: { type: "Identifier", name: k }, value: v });
-        this.compileExpression({
-            type: "ConditionalExpression",
-            test: isAccessor,
-            consequent: this._dpObjectCall("defineProperty", [objRef, keyRef, {
-                type: "ObjectExpression",
-                properties: [prop("get", this._dpMember(descRef, "get")), prop("set", this._dpMember(descRef, "set"))],
-            }]),
-            alternate: this._dpObjectCall("defineProperty", [objRef, keyRef, {
-                type: "ObjectExpression",
-                properties: [prop("value", this._dpMember(descRef, "value"))],
-            }]),
-        });
-
-        // attrs = ToBoolean(d.writable) | ToBoolean(d.enumerable)<<1 | ToBoolean(d.configurable)<<2
-        this.vm.movImm(VReg.V1, 0);
-        this.vm.store(VReg.FP, aOff, VReg.V1);
-        const attrNames = ["writable", "enumerable", "configurable"];
-        for (let i = 0; i < attrNames.length; i++) {
-            this.compileExpression(this._dpMember(descRef, attrNames[i]));
-            this.vm.mov(VReg.A0, VReg.RET);
-            this.vm.call("_to_boolean");            // RET = 裸 0/1
-            if (i === 0) this.vm.mov(VReg.V1, VReg.RET);
-            else this.vm.shlImm(VReg.V1, VReg.RET, i);
-            this.vm.load(VReg.V2, VReg.FP, aOff);
-            this.vm.or(VReg.V1, VReg.V1, VReg.V2);
-            this.vm.store(VReg.FP, aOff, VReg.V1);
-        }
+        // 常规对象:整份描述符交运行时动态助手(全字段掩码 + require_object + 混用强制)
         this.vm.load(VReg.A0, VReg.FP, oOff);
         this.vm.load(VReg.A1, VReg.FP, kOff);
-        this.vm.load(VReg.A2, VReg.FP, aOff);
-        this.vm.call("_object_set_prop_attr");
+        this.vm.load(VReg.A2, VReg.FP, dOff);
+        this.vm.call("_object_define_property_dyn");
         this.vm.label(doneLabel);
         this.vm.load(VReg.RET, VReg.FP, oOff);      // defineProperty 返回原对象
     },

@@ -5540,10 +5540,26 @@ export class ObjectGenerator {
         vm.label("_dp_data_val");
         vm.andImm(VReg.V1, VReg.V2, DP_HAS_VALUE);
         vm.cmpImm(VReg.V1, 0); vm.jeq("_dp_apply");
-        vm.load(VReg.A0, VReg.SP, 72);                 // 新值
-        vm.load(VReg.A1, VReg.SP, 24);                 // oldval
-        vm.call("_object_key_eq");                     // SameValue:串按内容、余按位、NaN==NaN、0≠-0
-        vm.cmpImm(VReg.RET, 0); vm.jeq("_dp_throw_redef");
+        // SameValue(新值, oldval)。双方皆字符串 → 按**内容**(_getStrContent+_strcmp,
+        // 免比较箱子指针:"ab" 与 "a"+"b" 内容等而箱子异);否则按**完整 64 位位模式**
+        // (数字/布尔/对象同一引用——NaN 已规范化故 NaN==NaN;0 与 -0 位异故不等)。
+        // 不可复用 _object_key_eq:其快速路以 JS_PAYLOAD_MASK 取低 48 位,小数双精度
+        // (1.0/2.0/0/-0…)的高 16 位(指数/符号)被剥成同值 → 假相等,漏抛 e3/e6/0≠-0。
+        vm.load(VReg.S2, VReg.SP, 72);                 // S2 = 新值(boxed,跨调用保活)
+        vm.load(VReg.S3, VReg.SP, 24);                 // S3 = oldval(boxed)
+        vm.shrImm(VReg.V1, VReg.S2, 48);
+        vm.cmpImm(VReg.V1, 0x7ffc); vm.jne("_dp_sv_bits");   // 新值非串 → 位模式
+        vm.shrImm(VReg.V1, VReg.S3, 48);
+        vm.cmpImm(VReg.V1, 0x7ffc); vm.jne("_dp_sv_bits");   // 旧值非串 → 位模式
+        // 双方字符串:逐字节内容比较
+        vm.mov(VReg.A0, VReg.S2); vm.call("_getStrContent"); vm.mov(VReg.S4, VReg.RET);
+        vm.mov(VReg.A0, VReg.S3); vm.call("_getStrContent"); vm.mov(VReg.S5, VReg.RET);
+        vm.mov(VReg.A0, VReg.S4); vm.mov(VReg.A1, VReg.S5); vm.call("_strcmp");
+        vm.cmpImm(VReg.RET, 0); vm.jne("_dp_throw_redef");   // 内容异 → 抛
+        vm.jmp("_dp_apply");
+        // 位模式比较(完整 64 位:tag/指数/符号/指针全含)
+        vm.label("_dp_sv_bits");
+        vm.cmp(VReg.S2, VReg.S3); vm.jne("_dp_throw_redef");
         vm.jmp("_dp_apply");
 
         vm.label("_dp_throw_redef");
@@ -5662,8 +5678,9 @@ export class ObjectGenerator {
     }
 
     // [#dp-mask] _object_define_property_dyn(obj_boxed, key, desc_boxed):动态描述符回退。
-    //   逐字段读一次(presence 经 _object_has,值经 _object_get —— 访问器 getter 只求值一次),
-    //   运行时算 mask/attr,打包后尾调 _object_define_property。描述符非对象先抛。
+    //   逐字段经 _object_get 读一次(走原型链,数组/对象皆宜,访问器 getter 只求值一次),
+    //   presence 取“值 !== undefined”(sanctioned 近似 [[HasProperty]]),运行时算 mask/attr,
+    //   打包后尾调 _object_define_property。描述符非对象先抛。
     generateObjectDefinePropertyDyn() {
         const vm = this.vm;
         const boxStr = (reg) => {
@@ -5689,20 +5706,27 @@ export class ObjectGenerator {
         let uid = 0;
         const field = (name, presBit, isBool, slot, attrShift) => {
             const s = uid++;
-            const presL = `_dpd_pres_${s}`;
             const skipL = `_dpd_skip_${s}`;
+            // 字段值经 _object_get 读一次(装箱键;对象/数组/原型链皆宜,访问器 getter 仅触发
+            // 一次)。presence ≈ 值 !== undefined——规范用 [[HasProperty]],此处取其 sanctioned
+            // 近似(显式 undefined 字段记偏差)。不用 _prop_in:其对数组只判数值索引、且约定
+            // A1=裸内容指针,装箱键经数组路径 loadByte → SIGSEGV;亦不用 _object_has(仅自有
+            // 属性,漏继承字段)。_object_get 走原型链,故 Object.create({value:5}) 继承字段亦生效。
             vm.mov(VReg.A0, VReg.S2);
             vm.lea(VReg.A1, vm.asm.addString(name)); boxStr(VReg.A1);
-            vm.call("_object_has");                // RET 0/1
-            vm.cmpImm(VReg.RET, 0); vm.jne(presL);
-            vm.jmp(skipL);
-            vm.label(presL);
+            vm.call("_object_get");                // RET = 值或 getter 标记块
+            // 字段可能由访问器提供(描述符/原型上的 get/set 等):_object_get 仅返 getter
+            // 标记块,须 _maybe_getter 以 this=desc 调其 getter 取真值(对齐 [[Get]])。
+            // 漏此步则标记块被当值:truthy 非函数 → “Getter must be a function”、attr 误 true。
+            vm.mov(VReg.A0, VReg.RET);
+            vm.mov(VReg.A1, VReg.S2);              // this = 描述符
+            vm.call("_maybe_getter");              // RET = 解析后的值(数据属性原样)
+            vm.movImm64(VReg.V1, 0x7ffb000000000000n); // undefined
+            vm.cmp(VReg.RET, VReg.V1);
+            vm.jeq(skipL);                          // undefined → 视为缺省
             vm.load(VReg.V0, VReg.SP, 24);
             vm.orImm(VReg.V0, VReg.V0, presBit);
             vm.store(VReg.SP, 24, VReg.V0);        // mask |= presBit
-            vm.mov(VReg.A0, VReg.S2);
-            vm.lea(VReg.A1, vm.asm.addString(name)); boxStr(VReg.A1);
-            vm.call("_object_get");                // RET boxed
             if (isBool) {
                 vm.mov(VReg.A0, VReg.RET);
                 vm.call("_to_boolean");            // RET 0/1

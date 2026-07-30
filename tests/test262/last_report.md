@@ -1,10 +1,10 @@
 # asm.js test262 conformance report
 
-_Generated 2026-07-30T17:57:14.752Z — target macos-arm64_
+_Generated 2026-07-30T21:35:03.974Z — target macos-arm64_
 
 ## Headline
 
-**asm.js passes 2879 / 6462 = 44.55% of the run test262 subset**
+**asm.js passes 2888 / 6462 = 44.69% of the run test262 subset**
 (selected `language/` + core `built-ins/`), one variant per test.
 
 Of 33776 discovered test files in the selected dirs, 1466 were excluded up front (module=83, unsupported-feature=1383, intl/staging-dir=0); 32310 were eligible; 6462 were actually run (deterministic stride=5).
@@ -13,8 +13,8 @@ Of 33776 discovered test files in the selected dirs, 1466 were excluded up front
 
 | class | count | % of run |
 |-------|------:|---------:|
-| PASS         | 2879 | 44.55 |
-| FAIL         | 3347 | 51.80 |
+| PASS         | 2888 | 44.69 |
+| FAIL         | 3338 | 51.66 |
 | COMPILE_FAIL | 69 | 1.07 |
 | CRASH        | 167 | 2.58 |
 | **run**      | **6462** | 100 |
@@ -29,7 +29,7 @@ Of 33776 discovered test files in the selected dirs, 1466 were excluded up front
 | built-ins/Map | 41 | 15 | 24 | 0 | 2 | 36.6 |
 | built-ins/Math | 65 | 32 | 33 | 0 | 0 | 49.2 |
 | built-ins/Number | 68 | 25 | 42 | 0 | 1 | 36.8 |
-| built-ins/Object | 682 | 366 | 305 | 0 | 11 | 53.7 |
+| built-ins/Object | 682 | 375 | 296 | 0 | 11 | 55.0 |
 | built-ins/Promise | 145 | 50 | 76 | 6 | 13 | 34.5 |
 | built-ins/RegExp | 374 | 133 | 235 | 5 | 1 | 35.6 |
 | built-ins/Set | 76 | 40 | 26 | 2 | 8 | 52.6 |
@@ -59,8 +59,8 @@ Excluded-by-feature detail:
 
 ## Top failing patterns (FAIL / COMPILE_FAIL / CRASH detail strings)
 
-- **1849×** FAIL: assertion mismatch (Test262Error / wrong value)
-- **444×** FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)
+- **1841×** FAIL: assertion mismatch (Test262Error / wrong value)
+- **443×** FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)
 - **418×** FAIL: async ($DONE not signalled / promise rejected)
 - **327×** FAIL: negative test wrong outcome (phase=parse)
 - **147×** FAIL: TypedArray/ArrayBuffer semantics
@@ -125,4 +125,4 @@ mkdir -p .test262-corpus && tar xzf /tmp/t262.tgz -C .test262-corpus --strip-com
 node tests/test262/run.mjs --stride 5 --jobs 8 --target macos-arm64
 ```
 
-_Run wall-clock: 406.4s._
+_Run wall-clock: 396.0s._
