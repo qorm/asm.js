@@ -159,6 +159,57 @@ function looksLikeCjsSource(src) {
         src.indexOf("exports[") !== -1 ||
         cjsHasBareRequire(src);
 }
+// 从 dirname(filePath) 逐级向上找第一个存在的 package.json,当且仅当其 "type"
+// 恰为字符串 "commonjs" 时返回 true。链上无 package.json、JSON 解析失败、无
+// type 字段或 type 为别的值("module" 等)→ false。每调用走一遍目录链即可
+// (模块数有限,不缓存)。用 readModuleSource 同款模块级 fs/path 绑定。
+// 自举安全:编译器/运行时模块都在根 package.json(无 type 字段)之下,恒 false。
+function nearestPackageJsonExplicitCommonjs(filePath) {
+    let dir = path.dirname(filePath);
+    while (true) {
+        const pkgPath = path.join(dir, "package.json");
+        if (fs.existsSync(pkgPath)) {
+            let typeVal;
+            try {
+                typeVal = JSON.parse(fs.readFileSync(pkgPath, "latin1")).type;
+            } catch (e) {
+                // 损坏的 package.json 不能静默吞掉:Node 对无效配置抛
+                // ERR_INVALID_PACKAGE_CONFIG,这里对齐 Node 抛编译错误。
+                // 覆盖入口与相对导入路径;经“包说明符”解析到的损坏 package.json 由
+                // resolvePackageSpecifier 自己的 catch 先行吞掉(既有行为,该导入被
+                // 静默丢弃),到不了这里——那处与 Node 的分歧属既有待办,非本函数职责。
+                // 自举安全:根 package.json 是合法 JSON(无 type 字段),
+                // 自编译时解析恒成功、走 return typeVal === "commonjs" 得 false,
+                // 此 throw 分支不可达。
+                const err = new Error("Invalid package config: " + pkgPath);
+                err.code = "ERR_INVALID_PACKAGE_CONFIG";
+                throw err;
+            }
+            return typeVal === "commonjs";
+        }
+        const parent = path.dirname(dir);
+        if (parent === dir) return false; // 到文件系统根仍无 package.json
+        dir = parent;
+    }
+}
+// AST 级判定:program.body 顶层是否有真实 import/export 声明。解析器只发三种
+// 模块语句:ImportDeclaration、ImportLibDeclaration(.jslib)、统一的
+// ExportDeclaration(所有 export 形态);无 ExportNamedDeclaration 等分支类型。
+// "__" 前缀排除编译器注入的 shim import(__json_shim、__regexp_shim、
+// __channel_shim、__eval_shim、__number_shim、__date_shim)——这些是合成的,
+// 不算用户 ESM。与 cjsHasEsmSyntax 的文本扫描不同,本判定有词法感知:
+// 注释/字符串里出现 "export "/"import " 文字不产生声明节点,故不误杀
+// 注释里含 "export helper" 的合法 CJS 文件(Node 照常执行)。
+// 已知窄边角:用户裸名导入恰以 "__" 开头(如 import x from "__foo")会被一并
+// 当作合成 shim 排除而漏拒——极罕见,且不劣于本检查引入前(彼时一切 ESM 均被接受)。
+function astHasRealTopLevelEsm(program) {
+    for (const s of program.body) {
+        if (s.type === "ExportDeclaration") return true;
+        if ((s.type === "ImportDeclaration" || s.type === "ImportLibDeclaration") &&
+            !(s.source && s.source.value && s.source.value.indexOf("__") === 0)) return true;
+    }
+    return false;
+}
 // 从 CJS 源码静态提取 module.exports 的具名键,供 ESM 具名导入互操作
 // (Node 用 cjs-module-lexer 合成具名导出;这里覆盖 fixtures 用到的两种形态:
 //  ① module.exports = { k: v, ... } 对象字面量顶层键;② exports.k = / module.exports.k =)。
@@ -249,23 +300,13 @@ function cjsStringLiteral(s) {
 
 const UNINITIALIZED_BINDING_SENTINEL = 0x7ff70000deadbeefn;
 
-// 目标平台配置
-const Targets = {
-    "linux-arm64": { arch: "arm64", os: "linux", ext: "" },
-    "linux-x64": { arch: "x64", os: "linux", ext: "" },
-    "macos-arm64": { arch: "arm64", os: "macos", ext: "" },
-    "macos-x64": { arch: "x64", os: "macos", ext: "" },
-    "windows-x64": { arch: "x64", os: "windows", ext: ".exe" },
-    "wasm32-wasi": { arch: "wasm32", os: "wasi", ext: ".wasm" },
-};
-
 export class Compiler {
     constructor(target) {
-        this.target = target || "linux-arm64";
-        const targetInfo = Targets[this.target];
-        if (!targetInfo) {
-            throw new Error("Unknown target: " + target);
-        }
+        // 目标目录单一来源:platform.js 的 TARGETS。resolveTarget 在此把别名规范成
+        // 正式名,并对未知目标抛 "Unknown target: <name>"——构造阶段即拦截非法目标,
+        // 别名(如 darwin-arm64)也能端到端构造,不再「过校验却在构造阶段崩」。
+        this.target = resolveTarget(target || "linux-arm64");
+        const targetInfo = TARGETS[this.target];
 
         this.arch = targetInfo.arch;
         this.os = targetInfo.os;
@@ -1426,6 +1467,13 @@ export class Compiler {
         // 与 moduleAst.filename / _requirePath 对齐。
         if (!this._cjsFlags) this._cjsFlags = {};
         this._cjsFlags[filePath] = isCjs;
+        // 同时按解析后的绝对路径登记一份:resolveImports 的 type:commonjs 门控以
+        // ast.filename(绝对路径)查 _cjsFlags,而入口可能以相对路径传入 readModuleSource。
+        // 缺这份绝对键会让“相对路径编译 type:commonjs 下的 CJS 入口”漏命中门控、被合成
+        // export 误判为 ESM 而误拒。附加而非替换,markCjsRequireCycles/_requireExportKind
+        // 使用的原键不受影响。
+        const _absFilePath = path.resolve(filePath);
+        if (_absFilePath !== filePath) this._cjsFlags[_absFilePath] = isCjs;
         // structuredClone(x) 在 functions.js 里被脱糖成 JSON.parse(JSON.stringify(x)),
         // 这些 __JSON_* 调用是 codegen 合成的、源码里无 "JSON.*" 文本 → 不会触发下面的
         // 注入,shim 缺失时合成调用静默失效(返回原对象别名,非深拷贝)。故把
@@ -1557,7 +1605,7 @@ export class Compiler {
 
         if (!outputFile) {
             const baseName = path.basename(inputFile, ".js");
-            outputFile = baseName + Targets[this.target].ext;
+            outputFile = baseName + TARGETS[this.target].ext;
         }
 
         this.outputFileName = outputFile;
@@ -2452,6 +2500,23 @@ export class Compiler {
             this.compiledFiles.add(modulePath);
         }
 
+        // 显式 "type": "commonjs" 的 package.json 下,.js 不得出现真实顶层
+        // import/export 声明(Node v25 对这种文件抛 SyntaxError;此前编译器
+        // 静默按 ESM 收下)。改在 AST 层判定(astHasRealTopLevelEsm)而非
+        // readModuleSource 的文本扫描:注释/字符串里的 "export "/"import "
+        // 文字不再误杀合法 CJS 文件。仅对 .js 生效(.mjs/.cjs 不受 package
+        // type 约束),且只在最近 package.json 显式声明 "commonjs" 时抛;
+        // 无 package.json / 无 type 字段 / type 为别的值都不抛——编译器自身
+        // 模块在根 package.json(无 type)之下,自举零影响。
+        // !this._cjsFlags[modulePath] 是关键:_wrapCjsSource 会为 CJS 模块
+        // 合成真实 `export default module.exports;` 节点,而 _cjsFlags 在
+        // 包装前已按原始源码把真 CJS 标为 true,故须排除,否则一切 CJS 模块
+        // 在显式 type:commonjs 下都会误报。
+        if (modulePath.endsWith(".js") && !this._cjsFlags[modulePath] &&
+            nearestPackageJsonExplicitCommonjs(modulePath) && astHasRealTopLevelEsm(ast)) {
+            throw new Error("Cannot use ESM import/export in a .js file whose package.json sets \"type\": \"commonjs\": " + modulePath);
+        }
+
         for (const stmt of ast.body) {
             // Handle ImportDeclaration, ExportDeclaration with source (export { x } from "m"),
             // and ExportAllDeclaration (export * from "m")
@@ -3073,7 +3138,11 @@ export class Compiler {
     }
 
     writeStaticLibrary(objectData, outputFile) {
-        const tempDir = os.tmpdir();
+        // 用 mkdtempSync 建 0700 私有临时目录(POSIX 下 mkdtempSync 默认 0700)再放 .o,
+        // 取代旧实现把可预测文件名(baseName + ".o")直接落在共享 os.tmpdir() 下——同机
+        // 用户可预创建/抢注同名 symlink 劫持写入或让 ar 打包进别人控制的内容。目录名唯一,
+        // 内部用固定文件名即可;打包完整目录递归清掉。
+        const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "asmjs-ar-"));
         const baseName = path.basename(outputFile, ".a");
         const tempObjFile = path.join(tempDir, baseName + ".o");
 
@@ -3086,7 +3155,7 @@ export class Compiler {
             return { output: outputFile, size: stats.size };
         } finally {
             try {
-                fs.unlinkSync(tempObjFile);
+                fs.rmSync(tempDir, { recursive: true, force: true });
             } catch (e) {}
         }
     }
@@ -3673,9 +3742,15 @@ function resolveModulePathUncached(importSource, sourcePath, nodeShimPath, pathM
         if (fsMod.existsSync(builtinPath)) {
             return builtinPath;
         }
-        if (importSource.startsWith("node:")) {
-            return nodeShimPath;
-        }
+    }
+    // 未知 node: 内建:上面没命中 runtime/node/<name>.js shim 的一律让编译失败。
+    // 含两类:① 合法裸名但无 shim(如 "node:notreal");② 连裸名都不是的(如
+    // "node:not-real",连字符不过 isBareModuleName,此前会漏到包解析被静默忽略)。
+    // Node 自身对此抛 ERR_UNKNOWN_BUILTIN_MODULE;静默放行会让导入绑定消失、
+    // 程序带着 undefined 编译通过。已知内建全部在上面返回,此处永不触发。
+    // (抛错不进 _resolvePathMemo——memo 只缓存返回值。)
+    if (importSource.startsWith("node:")) {
+        throw new Error("Unknown node: builtin module '" + importSource + "'");
     }
 
     if (!importSource.startsWith(".") && !importSource.startsWith("/")) {

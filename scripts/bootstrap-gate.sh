@@ -6,7 +6,9 @@
 #
 #   1. full self-host chain, fresh outputs (stale-tail trap: always rm first)
 #   2. byte-identical fixed point: gen1 == gen2 == gen3
-#   3. fixtures: FAIL == 0 and PASS >= baseline
+#   3. fixtures via the authoritative runner scripts/run-fixtures.mjs:
+#      discovered manifests == baseline, FAIL == 0, XPASS == 0,
+#      and PASS + XFAIL == discovered
 #
 # Concurrency: mkdir-based lock serializes parallel agents/worktrees through
 # one gate run at a time (macOS has no flock). A probe showing byte-identical
@@ -14,7 +16,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-BASELINE_FIXTURES=380
+# Exact expected fixture manifest count under tests/fixtures (ratchet: bump
+# only when new fixtures genuinely land; never lower it).
+BASELINE_FIXTURES=385
 LOCK=".git/bootstrap-gate.lock"
 
 while ! mkdir "$LOCK" 2>/dev/null; do
@@ -47,16 +51,34 @@ if ! cmp -s gen2 gen3; then
 fi
 echo "[gate] OK: gen1 == gen2 == gen3 (byte-identical fixed point)"
 
-FIX_OUT="$(node tests/run_fixtures.mjs)"
+# Authoritative runner (discovers every fixture.json incl. custom entries,
+# honors knownFailure as XFAIL/XPASS, exits non-zero on FAIL or XPASS).
+# Its output contract we parse:
+#   Running <N> fixture(s) on <target>
+#   Summary: PASS=<n> FAIL=<n> XFAIL=<n> XPASS=<n>
+if ! FIX_OUT="$(node scripts/run-fixtures.mjs)"; then
+    echo "$FIX_OUT" | tail -n 20 >&2
+    echo "[gate] FAIL: fixture runner exited non-zero" >&2
+    exit 1
+fi
 echo "$FIX_OUT" | tail -n 5
-PASS_N="$(echo "$FIX_OUT" | sed -n 's/.*PASS=\([0-9][0-9]*\).*/\1/p')"
-FAIL_N="$(echo "$FIX_OUT" | sed -n 's/.*FAIL=\([0-9][0-9]*\).*/\1/p')"
-if [ -z "${PASS_N}" ] || [ "${FAIL_N:-1}" != "0" ]; then
-    echo "[gate] FAIL: fixtures failing (PASS=${PASS_N:-?} FAIL=${FAIL_N:-?})" >&2
+DISCOVERED_N="$(echo "$FIX_OUT" | sed -n 's/^Running \([0-9][0-9]*\) fixture(s) on .*/\1/p')"
+COUNTS="$(echo "$FIX_OUT" | sed -n 's/^Summary: PASS=\([0-9][0-9]*\) FAIL=\([0-9][0-9]*\) XFAIL=\([0-9][0-9]*\) XPASS=\([0-9][0-9]*\).*/\1 \2 \3 \4/p')"
+if [ -z "${DISCOVERED_N}" ] || [ -z "${COUNTS}" ]; then
+    echo "[gate] FAIL: could not parse fixture runner output" >&2
     exit 1
 fi
-if [ "$PASS_N" -lt "$BASELINE_FIXTURES" ]; then
-    echo "[gate] FAIL: fixtures regressed PASS=$PASS_N < baseline $BASELINE_FIXTURES" >&2
+read -r PASS_N FAIL_N XFAIL_N XPASS_N <<< "$COUNTS"
+if [ "${DISCOVERED_N}" != "${BASELINE_FIXTURES}" ]; then
+    echo "[gate] FAIL: fixture manifest count changed: discovered=$DISCOVERED_N expected=$BASELINE_FIXTURES (bump BASELINE_FIXTURES only if new fixtures genuinely landed)" >&2
     exit 1
 fi
-echo "[gate] PASS: fixed point + fixtures $PASS_N/$((PASS_N + FAIL_N)) (baseline $BASELINE_FIXTURES)"
+if [ "${FAIL_N}" != "0" ] || [ "${XPASS_N}" != "0" ]; then
+    echo "[gate] FAIL: fixtures FAIL=$FAIL_N XPASS=$XPASS_N (both must be 0; an XPASS means a knownFailure marker is now stale and should be removed)" >&2
+    exit 1
+fi
+if [ $((PASS_N + XFAIL_N)) -ne "${DISCOVERED_N}" ]; then
+    echo "[gate] FAIL: PASS+XFAIL=$((PASS_N + XFAIL_N)) != discovered $DISCOVERED_N" >&2
+    exit 1
+fi
+echo "[gate] PASS: fixed point + fixtures PASS=$PASS_N XFAIL=$XFAIL_N FAIL=$FAIL_N XPASS=$XPASS_N (discovered $DISCOVERED_N == baseline $BASELINE_FIXTURES)"

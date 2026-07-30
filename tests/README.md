@@ -48,20 +48,40 @@
 
 ## known failure 语义
 
-如果一个 fixture 写了 `knownFailure`：
+如果一个 fixture 写了 `knownFailure`（值为说明产品缺口的字符串）：
 
 - 当前不满足期望时记为 `XFAIL`
 - 未来突然满足期望时记为 `XPASS`
 
 这样我们既能把未完成能力收进回归面，也不会把当前主线工作淹没在大量已知红灯里。
 
+当前标记 `knownFailure` 的负向 fixture 有 2 个，期望都是 `compile=false`，但编译器目前仍然接受了本应拒绝的输入：
+
+- `node/builtin-node-scheme-missing`：未知 `node:` 内建说明符在解析期应报错，当前未报错。
+- `node/packages/package-json-type-commonjs-rejects-esm`：`package.json` 的 `type=commonjs` 下使用 ESM `import/export` 的 `.js` 文件应被拒绝，当前未拒绝。
+
+这两项都是真实产品缺口，等编译器补上相应拒绝逻辑后，fixture 会变成 `XPASS`；权威 runner 与门禁都会把 `XPASS` 判为非零退出，届时必须移除对应的 `knownFailure` 标记，让它转回普通 `PASS`。
+
 ## 运行方式
 
+唯一权威 runner 是 `scripts/run-fixtures.mjs`：发现 `tests/fixtures/` 下每一个 `fixture.json`（含自定义入口，不要求目录里有 `main.js`），完整执行 parse/compile/run 与 stdout/stderr/exitCode 反向断言，并诚实报告 `PASS/FAIL/XFAIL/XPASS`：
+
 ```bash
-node tests/run_fixtures.mjs
+node scripts/run-fixtures.mjs
 ```
 
-（注：仓库 `package.json` 当前未定义 npm scripts，早期文档中的 `npm run test:*` 命令已失效，请直接调用下列脚本。）
+`tests/run_fixtures.mjs` 现在只是转发到权威 runner 的薄包装：原样透传参数与退出码，不再自带任何会漏跑或伪装的独立语义（旧版因要求目录里有 `main.js` 而漏掉 5 个自定义入口 fixture，只发现 380/385，还把 2 个负向 fixture 伪装成 PASS）。旧版的 ASMJS_FIXTURE_WASM/expectWasm 支路随薄包装一并移除，wasm fixture 回归现状见 `docs/WASM_DESIGN.md`（该文档对旧包装的描述待同步）。
+
+门禁 `scripts/bootstrap-gate.sh` 消费的也是权威 runner 的输出，其 fixture 断言为：
+
+- 发现的 manifest 数 == `BASELINE_FIXTURES`（当前 385，只随版本上移）
+- `FAIL == 0`
+- `XPASS == 0`
+- `PASS + XFAIL == 发现数`
+
+任一不满足即非零退出。
+
+（注：仓库 `package.json` 已定义 npm scripts——`test:fixtures` / `gate` / `platform:contract`，可 `npm run <名>` 或直接调用对应脚本；早期文档中其它 `npm run test:*` 命令仍未定义。）
 
 正式版/完整兼容方向额外需要跑自举烟测：
 
@@ -111,9 +131,9 @@ node --no-warnings scripts/run-fixtures.mjs --verbose
 
 ## 游离资产说明：`ptest/` 与 `support/`（不入库）
 
-仓库根下的 `ptest/` 与 `support/` 是历史遗留的本地游离资产，均未接入 `node tests/run_fixtures.mjs` 回归基线：
+仓库根下的 `ptest/` 与 `support/` 是历史遗留的本地游离资产，均未接入 fixture 回归基线：
 
 - `ptest/`：大量本地试编译产物（平台后缀二进制）及配套驱动脚本，未跟踪；`.gitignore` 已按“会话杂物/本地脚本（勿入库）”忽略。
 - `support/`：仅余本地探针 `test_nodejs_init.js`，未跟踪；`.gitignore` 已按“临时 / 一次性脚本”忽略。
 
-处置决定：两者保留为本地 scratch，不入库、不计入 fixtures 基线。回归基线的唯一入口是 `tests/fixtures/`（当前 362 个用例），由 `node tests/run_fixtures.mjs` 驱动。
+处置决定：两者保留为本地 scratch，不入库、不计入 fixtures 基线。回归基线的唯一入口是 `tests/fixtures/`（当前 385 个 fixture manifest；门禁下限 `BASELINE_FIXTURES` 随版本只升不降），由唯一权威 runner `node scripts/run-fixtures.mjs` 驱动（`tests/run_fixtures.mjs` 仅透传转发）。

@@ -30,7 +30,7 @@
 //   tests/test262/last_run.json     machine-readable results (committed if small)
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, rmSync } from "fs";
-import { spawn } from "child_process";
+import { spawn, execFileSync } from "child_process";
 import { join, dirname, resolve, relative } from "path";
 import { fileURLToPath } from "url";
 import { tmpdir } from "os";
@@ -43,6 +43,17 @@ const CLI = join(REPO, "cli.js");
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
+
+// Pinned tc39/test262 commit used for reproducible corpus downloads. The URL
+// https://github.com/tc39/test262/archive/<sha>.tar.gz is immutable, unlike
+// refs/heads/main.tar.gz which tracks a moving branch head.
+//
+// NOTE: changing this pin (or vendoring on a fresh machine) requires
+// re-downloading the corpus AND re-running the suite -- the reported counts
+// depend on the exact corpus snapshot. An already-vendored local corpus
+// (default <repo>/.test262-corpus) is used as-is and is NOT re-downloaded, so
+// if it was vendored from a different commit, re-vendor before trusting numbers.
+const TEST262_PIN = "9e61c12835c5e4a3bdba93850427e6742c4f64c4"; // tc39/test262 commit (2026-07-19 main HEAD; matches the vendored .test262-corpus snapshot behind the reported counts)
 
 // Default selection: the two big language areas plus a spread of core built-ins.
 // Deterministic: every eligible test in these dirs (subject to --stride/--max).
@@ -268,6 +279,19 @@ function run(cmd, args, timeoutMs) {
   });
 }
 
+// Best-effort identity of this runner's checkout (the asm.js repo HEAD),
+// recorded in the run summary so results are attributable to a concrete
+// compiler state. Returns null when git/the repo is unavailable (e.g. an
+// exported source tree without .git).
+function gitRunnerSha() {
+  try {
+    return execFileSync("git", ["rev-parse", "HEAD"],
+      { cwd: REPO, encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"] }).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Classification
 // ---------------------------------------------------------------------------
@@ -368,7 +392,7 @@ async function main() {
   if (!existsSync(opt.corpus)) {
     console.error("Corpus not found at " + opt.corpus);
     console.error("Vendor it first, e.g.:");
-    console.error("  curl -sL -o /tmp/t262.tgz https://github.com/tc39/test262/archive/refs/heads/main.tar.gz");
+    console.error("  curl -sL -o /tmp/t262.tgz https://github.com/tc39/test262/archive/" + TEST262_PIN + ".tar.gz");
     console.error("  mkdir -p " + opt.corpus + " && tar xzf /tmp/t262.tgz -C " + opt.corpus + " --strip-components=1");
     process.exit(1);
   }
@@ -480,7 +504,12 @@ async function main() {
   writeFileSync(join(__dirname, "last_report.md"), report);
   const summary = {
     generated: new Date().toISOString(),
-    config: { corpus: opt.corpus, target: opt.target, dirs, stride: opt.stride, max: opt.max, jobs: opt.jobs },
+    // Reproducibility identity: exact runner checkout + exact corpus snapshot.
+    runnerSha: gitRunnerSha(),
+    corpusPin: TEST262_PIN,
+    // Portable corpus identifier: path relative to the repo root (default
+    // ".test262-corpus"); never a machine-specific absolute path.
+    config: { corpus: relative(REPO, opt.corpus), target: opt.target, dirs, stride: opt.stride, max: opt.max, jobs: opt.jobs },
     discovered: files.length, excluded, excludedFeatureCounts, eligible: eligible.length,
     run: runCount, totals,
     passRatePct: Number(pct(totals.PASS)),
@@ -596,7 +625,9 @@ function buildReport(d) {
   P("");
   P("## Methodology / reproducibility");
   P("");
-  P("- Corpus: official `tc39/test262` (main), vendored locally, NOT committed.");
+  P(`- Corpus: official \`tc39/test262\` pinned at commit \`${TEST262_PIN}\``);
+  P("  (TEST262_PIN in tests/test262/run.mjs), vendored locally, NOT committed. Changing the");
+  P("  pin requires re-downloading the corpus and re-running; counts depend on the snapshot.");
   P("- Each test is assembled per test262 `INTERPRETING.md`: host shims (`print`, `$262` stub) +");
   P("  `harness/assert.js` + `harness/sta.js` (+ `doneprintHandle.js` for async) + any `includes:` +");
   P("  the test body. `raw` tests run the body alone. `onlyStrict` tests get a leading `\"use strict\";`.");
@@ -617,7 +648,7 @@ function buildReport(d) {
   P("");
   P("```sh");
   P("# 1. vendor the corpus (NOT committed)");
-  P("curl -sL -o /tmp/t262.tgz https://github.com/tc39/test262/archive/refs/heads/main.tar.gz");
+  P("curl -sL -o /tmp/t262.tgz https://github.com/tc39/test262/archive/" + TEST262_PIN + ".tar.gz");
   P("mkdir -p .test262-corpus && tar xzf /tmp/t262.tgz -C .test262-corpus --strip-components=1");
   P("# 2. run the harness");
   P("node tests/test262/run.mjs" + (d.opt.stride > 1 ? " --stride " + d.opt.stride : "")

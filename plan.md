@@ -1,7 +1,9 @@
 # asm.js 接管规划 (plan.md)
 
-> 接管日期: 2026-07-19 · 基线: dev @ v1.5.52 (fixtures 362/362 全绿, gen1==gen2==gen3 字节级定点)
-> 本文档是接管后的总执行蓝图,取代 ROADMAP 中已滞后的里程碑表,作为进度跟踪的唯一事实源。
+> 接管日期: 2026-07-19 · 接管时点能力基线: dev @ v1.5.52 (fixtures 362/362 全绿, gen1==gen2==gen3 字节级定点)
+> 本文档是接管后的总执行蓝图,取代 ROADMAP 中已滞后的里程碑表,作为进度跟踪的执行蓝图(非唯一事实源,见下注)。
+
+> **2026-07-29 重定基线**:上行的 "v1.5.52" 是 2026-07-19 接管时点的**能力基线**(重新初始化前的代码状态),**不是当前版本号**。项目已于 2026-07-19 公开重新初始化并更名 asm.js,版本号自 v0.1 重新起算;当前为 **v0.3.x**(最新 tag v0.3.4,dev HEAD a678f85,cli.js VERSION=0.3.5 未提交)。fixtures 现状:manifest **385**(es 253 / modules 28 / node 104),门禁要求发现数**精确等于** `BASELINE_FIXTURES`(当前 **385**)且 FAIL==0、XPASS==0(见 §2 铁律1 与 `scripts/bootstrap-gate.sh`)。权威划分:fixture 基线的权威值是 `scripts/bootstrap-gate.sh` 的 `BASELINE_FIXTURES`;当前事实(版本号 / test262 数字 / 定点状态)的权威值是进度台账(`docs/progress/`)与 `tests/test262/last_report.md`;本文档是执行蓝图,不复述这些动态数字以免漂移。
 
 ---
 
@@ -19,11 +21,11 @@
 
 零依赖、自举的 JavaScript→原生 AOT 编译器:JS 源码 →(lang 前端)→(compiler 上帝类直接 codegen)→(vm 虚拟指令 + 寄存器提升)→(backend 物理翻译)→(asm 编码/重定位)→(binary 五格式打包);运行时由 `runtime/*Generator` 在编译期现生成机器码;值表示为 NaN-boxing;分代 GC 默认开启;G-M-P 并行调度已到 N>2(仅 linux-arm64 真体)。
 
-**当前阶段定位**: v1.5.x 修复季尾声 + G-M-P 一期收官的交汇点。ES/Node 从"补能力"转入"度量驱动收口"(test262 20.4% 是北极星数字);L2 引擎库(route B)已超前交付,L1 未启动;文档系统性滞后代码 10+ 个版本。
+**当前阶段定位**(接管时点): v1.5.x 修复季尾声 + G-M-P 一期收官的交汇点。ES/Node 从"补能力"转入"度量驱动收口"(test262 20.4% 是接管时点的北极星**历史值**,当前 43.67%);L2 引擎库(route B)已超前交付,L1 未启动;文档系统性滞后代码 10+ 个版本。
 
 ## 2. 治理铁律(每次改动必须遵守,源自 BOOTSTRAP_RULES §2/§3)
 
-1. **fixtures 不降**: `node tests/run_fixtures.mjs` 不低于当前基线(362)。
+1. **fixtures 真值**: `node scripts/run-fixtures.mjs` 发现的 manifest 数须精确等于 `scripts/bootstrap-gate.sh` 的 `BASELINE_FIXTURES`(当前 385),且 FAIL==0、XPASS==0、PASS+XFAIL==发现数;新增 fixture 时同步上调 BASELINE_FIXTURES,绝不降低。
 2. **自举定点不破**: 任何改动后 macos-arm64 全链 `gen1==gen2==gen3` 字节一致;探针字节不变不构成安全证据。
 3. **gen0 最小复现**: 每个修复配 repro,与 Node 行为对拍。
 4. **内存布局原子性**: 对象头/数组头变更必须单次提交同步所有遍历站点。
@@ -49,6 +51,7 @@
 - **下一杠杆(进行中/未做)**: **`Object.defineProperty` 仅接受编译期对象字面量描述符**(functions.js,动态描述符静默退化为 `value=undefined, attrs=0`,~260 个 Object FAIL,当前最大单一池);内建命名空间非运行时对象(`typeof Math` → "number",~150);`(a, b)` 括号序列表达式**根本不解析**;`arr["0"]` 字符串键索引返 undefined(亦致 `var {0:a}=[...]` 解构失败);生成器 stub 参数急切绑定缺口(22 例 dstr 用例)
 - **安全红队收口(v0.2.3–v0.2.5)**: 越界写原语、越界读泄露、GCM 认证绕过、timingSafeEqual 时序、熵源/scrypt/HKDF/PBKDF2 失败开放、zlib inflate 死循环 + 解压炸弹、`ar` 命令注入、未终止正则死循环、解析器递归 DoS —— 全部闭合
 - **变更未提交**(遵守"仅在被要求时提交"):11 文件已 apply 到 dev 工作树,定点绿,待主人指示提交
+- **后续版本指针**: 本段记录止于 v0.2.6(33.63%);v0.2.7–v0.3.4 的逐版沿革(test262 33.63% → 43.67%)见 [CHANGELOG.md](./CHANGELOG.md),不在此重复。
 
 ### S2 — 编译器车道清债(08-09 → 08-29)
 每修一个即解锁一批 Node shim 缺口,优先于 shim 扩面:
@@ -96,6 +99,6 @@
 
 ## 5. 进度跟踪机制
 
-- 每个阶段结束更新本文件勾选状态 + CHANGELOG 版本条目,版本号沿用 v1.5.x 递增。
+- 每个阶段结束更新本文件勾选状态 + CHANGELOG 版本条目;版本号已于 2026-07-19 重新初始化后自 v0.1 起算,按 v0.x 递增(当前 v0.3.x,见头部重定基线注)。
 - 每周日复盘: fixtures 数、test262 %、定点状态、阶段燃尽。
 - 阶段未过门禁不进入下一阶段;阻塞超 3 天升级给主人决策。

@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // asm.js 命令行编译工具
 
-import { existsSync, readFileSync, writeFileSync, statSync, mkdirSync, unlinkSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, statSync, mkdirSync, mkdtempSync, rmSync } from "fs";
 import { dirname, basename, join, resolve } from "path";
+import { tmpdir } from "os";
 import { fileURLToPath } from "url";
 import { spawnSync } from "child_process";
 
@@ -13,7 +14,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 // 版本号：公开仓库重新初始化后自 0.1 起算（能力基线 = 原 v1.5.52,非功能回退）
-const VERSION = "0.3.4";
+const VERSION = "0.3.5";
 
 function printUsage() {
     console.log(`
@@ -31,8 +32,8 @@ Options:
   --static              Build static library (.a/.lib)
   --no-jslib            Don't generate .jslib declaration file
   --export <name>       Export symbol (can be used multiple times)
-  --lib <name>          Link with library
-  --lib-path <path>     Add library search path
+  --lib <name>          Link with library (NOT supported yet - errors out)
+  --lib-path <path>     Add library search path (NOT supported yet - errors out)
   --list-targets        List all supported targets
   --debug               Enable debug output
   -v, --version         Show version number
@@ -47,7 +48,7 @@ Examples:
   asm.js hello.js --target macos-arm64         # Cross-compile to macOS ARM64
   asm.js mylib.js --shared -o libmy.dylib      # Build shared library
   asm.js mylib.js --static -o libmy.a          # Build static library
-  asm.js app.js --lib mylib --lib-path ./libs  # Link with library
+  asm.js app.js --lib mylib                    # ERROR: library linking not supported yet
   asm.js run app.js foo bar                    # Run app.js (compiles under the hood)
 `);
 }
@@ -83,8 +84,11 @@ function runSubcommand(args) {
     }
 
     const target = wasm ? "wasm32-wasi" : detectPlatform();
-    const tmpDir = process.env.TMPDIR || "/tmp";
-    const tmpOut = join(tmpDir, `asmjs-run-${basename(inputFile, ".js")}-${process.pid}${wasm ? ".wasm" : ""}`);
+    // 用 mkdtempSync 建 0700 私有临时目录(POSIX 下 mkdtempSync 默认 0700)再放产物执行,
+    // 取代旧实现把可预测文件名直接落在共享 TMPDIR//tmp 下(同机用户可预创建/抢注同名
+    // symlink 劫持写入)。目录名唯一,内部用固定文件名即可;跑完整目录递归清掉。
+    const runDir = mkdtempSync(join(tmpdir(), "asmjs-run-"));
+    const tmpOut = join(runDir, wasm ? "out.wasm" : "out");
 
     // 静默编译（无 Compiling.../Successfully 提示）
     try {
@@ -105,7 +109,7 @@ function runSubcommand(args) {
         ? spawnSync(process.execPath, [join(__dirname, "scripts", "wasm_host.mjs"), tmpOut, ...progArgs], { stdio: "inherit" })
         : spawnSync(tmpOut, progArgs, { stdio: "inherit" });
     const elapsed = (Date.now() - t0) / 1000;
-    try { unlinkSync(tmpOut); } catch (e) { /* 忽略清理失败 */ }
+    try { rmSync(runDir, { recursive: true, force: true }); } catch (e) { /* 忽略清理失败 */ }
 
     if (res.error) {
         console.error(`Failed to execute: ${res.error.message}`);
@@ -113,6 +117,16 @@ function runSubcommand(args) {
     }
     console.error(`[asm.js run] ${elapsed.toFixed(3)}s`);
     process.exit(res.status === null ? 1 : res.status);
+}
+
+// --lib/--lib-path(及短别名 -l/-L)历史上只把值 push 进 Compiler.libraries /
+// Compiler.libraryPaths 两个数组,而这两个数组在整个编译器里从无读取点——链接请求被
+// 无声丢弃,却仍打印 "Successfully compiled"。与其让产物"看似链接实则未链接",不如在
+// 参数处理阶段(产出任何产物之前)就响亮失败、非零退出。真正实现库链接前,此诊断即契约。
+function rejectLibLinking(flag) {
+    console.error(`Error: ${flag} is not supported yet.`);
+    console.error("Library linking (--lib/--lib-path) is currently unimplemented and would be silently ignored, so we fail loudly instead of emitting an unlinked artifact.");
+    process.exit(1);
 }
 
 function parseArgs(args) {
@@ -168,11 +182,9 @@ function parseArgs(args) {
             i++;
             result.exports.push(args[i]);
         } else if (arg === "--lib" || arg === "-l") {
-            i++;
-            result.libs.push(args[i]);
+            rejectLibLinking(arg);
         } else if (arg === "--lib-path" || arg === "-L") {
-            i++;
-            result.libPaths.push(args[i]);
+            rejectLibLinking(arg);
         } else if (!arg.startsWith("-")) {
             result.input = arg;
         } else {
@@ -209,7 +221,8 @@ function main() {
     if (opts.listTargets) {
         console.log("Supported targets:");
         for (const target of listTargets()) {
-            console.log(`  ${target}`);
+            const tag = target.experimental ? "  (experimental)" : "";
+            console.log(`  ${target.name.padEnd(16)} ${target.desc}${tag}`);
         }
         process.exit(0);
     }
@@ -242,9 +255,10 @@ function main() {
         target = detectPlatform();
     }
 
-    // 验证目标
+    // 验证并规范化目标:别名(如 darwin-arm64)在此统一规范成正式名,未知目标由
+    // resolveTarget 抛错在同一处拦截(后续默认输出文件名也用正式名)。
     try {
-        resolveTarget(target);
+        target = resolveTarget(target);
     } catch (e) {
         console.error(`Error: ${e.message}`);
         console.log("Use --list-targets to see supported targets");

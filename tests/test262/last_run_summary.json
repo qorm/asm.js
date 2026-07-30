@@ -1,7 +1,9 @@
 {
-  "generated": "2026-07-27T22:03:14.996Z",
+  "generated": "2026-07-30T16:19:22.506Z",
+  "runnerSha": "a678f85de9783c3dda07f4b3ac2abc83805786dd",
+  "corpusPin": "9e61c12835c5e4a3bdba93850427e6742c4f64c4",
   "config": {
-    "corpus": "/Users/nouo/github/asm.js/.test262-corpus",
+    "corpus": ".test262-corpus",
     "target": "macos-arm64",
     "dirs": [
       "language/expressions",
@@ -44,12 +46,12 @@
   "eligible": 32310,
   "run": 6462,
   "totals": {
-    "PASS": 2822,
-    "FAIL": 3423,
-    "COMPILE_FAIL": 40,
-    "CRASH": 177
+    "PASS": 2836,
+    "FAIL": 3401,
+    "COMPILE_FAIL": 69,
+    "CRASH": 156
   },
-  "passRatePct": 43.67,
+  "passRatePct": 43.89,
   "byArea": {
     "built-ins/Array": {
       "PASS": 284,
@@ -88,15 +90,15 @@
       "CRASH": 1
     },
     "built-ins/Object": {
-      "PASS": 310,
-      "FAIL": 363,
+      "PASS": 316,
+      "FAIL": 357,
       "COMPILE_FAIL": 0,
       "CRASH": 9
     },
     "built-ins/Promise": {
       "PASS": 51,
-      "FAIL": 84,
-      "COMPILE_FAIL": 2,
+      "FAIL": 80,
+      "COMPILE_FAIL": 6,
       "CRASH": 8
     },
     "built-ins/RegExp": {
@@ -108,13 +110,13 @@
     "built-ins/Set": {
       "PASS": 40,
       "FAIL": 26,
-      "COMPILE_FAIL": 0,
-      "CRASH": 10
+      "COMPILE_FAIL": 2,
+      "CRASH": 8
     },
     "built-ins/String": {
-      "PASS": 79,
+      "PASS": 78,
       "FAIL": 164,
-      "COMPILE_FAIL": 0,
+      "COMPILE_FAIL": 1,
       "CRASH": 1
     },
     "built-ins/Symbol": {
@@ -130,22 +132,22 @@
       "CRASH": 3
     },
     "language/expressions": {
-      "PASS": 986,
-      "FAIL": 930,
-      "COMPILE_FAIL": 23,
-      "CRASH": 66
+      "PASS": 990,
+      "FAIL": 926,
+      "COMPILE_FAIL": 30,
+      "CRASH": 59
     },
     "language/statements": {
-      "PASS": 801,
-      "FAIL": 956,
-      "COMPILE_FAIL": 10,
-      "CRASH": 55
+      "PASS": 806,
+      "FAIL": 948,
+      "COMPILE_FAIL": 25,
+      "CRASH": 43
     }
   },
   "topFailPatterns": [
     {
       "pattern": "FAIL: assertion mismatch (Test262Error / wrong value)",
-      "count": 1893
+      "count": 1881
     },
     {
       "pattern": "FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)",
@@ -153,31 +155,31 @@
     },
     {
       "pattern": "FAIL: async ($DONE not signalled / promise rejected)",
-      "count": 422
+      "count": 420
     },
     {
       "pattern": "FAIL: negative test wrong outcome (phase=parse)",
-      "count": 335
+      "count": 327
     },
     {
       "pattern": "FAIL: TypedArray/ArrayBuffer semantics",
       "count": 147
     },
     {
-      "pattern": "CRASH: run signal SIGSEGV",
-      "count": 126
-    },
-    {
       "pattern": "FAIL: array contents mismatch (compareArray)",
       "count": 111
     },
     {
-      "pattern": "FAIL: constructor-ness reflection (isConstructor / not-a-constructor)",
-      "count": 50
+      "pattern": "CRASH: run signal SIGSEGV",
+      "count": 105
     },
     {
       "pattern": "COMPILE_FAIL: asm.js could not compile (unsupported syntax / parser gap)",
-      "count": 40
+      "count": 69
+    },
+    {
+      "pattern": "FAIL: constructor-ness reflection (isConstructor / not-a-constructor)",
+      "count": 50
     },
     {
       "pattern": "CRASH: run timeout",

@@ -56,10 +56,12 @@ function _entropyBytes(size) {
 const _hexChars = "0123456789abcdef";
 
 // ============================================================================
-// 真实哈希实现(SHA-256 / SHA-1 / MD5)。纯 32 位整数运算(移位/异或/加法),
-// 无乘法,asm.js 编译产物可正确执行。输入按字节数组处理(字符串走 charCodeAt,
-// ASCII 与 Node utf8 一致;非 ASCII 记偏差)。sha224/384/512 尚无实现,退化为
-// 旧的确定性占位摘要(稳定但非真值)。
+// 真实哈希实现(SHA-256 / SHA-1 / MD5 / SHA-512 / SHA-384)。纯整数运算,无宽整数乘,
+// asm.js 编译产物可正确执行(32 位算法用移位/异或/加法;SHA-512/384 是 64 位算法,
+// 每个 64 位字用 [hi, lo] 两个 32 位分量表示,见 _sha512)。输入按字节数组处理
+// (字符串走 charCodeAt,ASCII 与 Node utf8 一致;非 ASCII 记偏差)。
+// sha1/sha256/sha384/sha512/md5 均为真实实现,与 Node 输出逐字节一致;sha224 及
+// sha3 系列无实现,在 createHash/createHmac 创建时即被拒绝(失败关闭,绝不产假摘要)。
 // ============================================================================
 
 function _rotr(x, n) { return ((x >>> n) | (x << (32 - n))) >>> 0; }
@@ -329,26 +331,14 @@ function _sha512(bytes, is384) {
     return out;
 }
 
-// 旧的确定性占位(仅 sha224 未实现算法时用)
-function _fallbackWidth(algo) {
+// 支持集判定(以 getHashes 为准,大小写不敏感,与 _hashBytes/_hashRaw 的小写化一致)。
+// 未列入的算法(sha224 / sha3 系列 / 拼错的名字)一律视为不支持。
+function _isSupportedHash(algo) {
     const a = (algo || "").toLowerCase();
-    if (a === "sha224") return 28;
-    if (a === "sha384") return 48;
-    if (a === "sha512") return 64;
-    return 32;
-}
-function _fallbackDigest(buf, algo) {
-    const n = _fallbackWidth(algo);
-    const bytes = [];
-    for (let k = 0; k < n; k++) {
-        let h = (5381 + k * 131) | 0;
-        for (let i = 0; i < buf.length; i++) h = (((h << 5) + h) + buf.charCodeAt(i) + k) | 0;
-        bytes.push((h >>> 0) & 0xff);
-    }
-    return bytes;
+    return a === "sha1" || a === "sha256" || a === "sha384" || a === "sha512" || a === "md5";
 }
 
-// 算法名 → 真实哈希函数;未知返回 null(走占位)
+// 算法名 → 真实哈希函数;未知返回 null(调用方失败关闭抛错,绝不产出占位假摘要)
 function _hashBytes(algo, buf) {
     const a = (algo || "").toLowerCase();
     const bytes = _strBytes(buf);
@@ -368,8 +358,9 @@ function _encodeDigest(bytes, encoding) {
 }
 
 function _computeDigest(buf, algo, encoding) {
-    let bytes = _hashBytes(algo, buf);
-    if (bytes === null) bytes = _fallbackDigest(buf, algo);
+    const bytes = _hashBytes(algo, buf);
+    // 失败关闭:未知算法绝不退化为假摘要,抛错对齐 Node(createHash 亦在创建时先拦)。
+    if (bytes === null) throw new Error("Digest method not supported");
     return _encodeDigest(bytes, encoding);
 }
 
@@ -380,8 +371,9 @@ function _computeDigest(buf, algo, encoding) {
 function _hmacDigest(key, msg, algo, encoding) {
     const keyBytes = _toBytes(key);
     const msgBytes = _strBytes(msg);
-    let bytes = _hmacRaw(algo, keyBytes, msgBytes);
-    if (bytes === null) bytes = _fallbackDigest(msg, algo);
+    const bytes = _hmacRaw(algo, keyBytes, msgBytes);
+    // 失败关闭:未知算法绝不退化为假 HMAC,抛错对齐 Node。
+    if (bytes === null) throw new Error("Digest method not supported");
     return _encodeDigest(bytes, encoding);
 }
 function _bytesToStr(bytes) {
@@ -885,6 +877,9 @@ function _pbkdf2(password, salt, iterations, keylen, digest) {
     if (!(iterations >= 1)) throw new RangeError("iterations must be >= 1");
     if (!(keylen > 0)) throw new RangeError("keylen must be > 0");
     const algo = (digest || "sha1").toLowerCase();
+    // 支持集校验:未支持摘要失败关闭(干净抛错),避免 _hmacRaw→_hashRaw 返 null 后
+    // 在 innerHash.length 触发偶发 null 解引用 TypeError。
+    if (!_isSupportedHash(algo)) throw new Error("Digest method not supported");
     const pw = _toBytes(password);
     const saltB = _toBytes(salt);
     const dk = [];
@@ -926,6 +921,8 @@ function _digestLen(algo) {
 // (Node 返回 ArrayBuffer;`Buffer.from(result)` 两端通用)。
 function _hkdf(digest, ikm, salt, info, keylen) {
     const algo = (digest || "").toLowerCase();
+    // 支持集校验:未支持摘要失败关闭(干净抛错),同 _pbkdf2。
+    if (!_isSupportedHash(algo)) throw new Error("Digest method not supported");
     const hashLen = _digestLen(algo);
     // RFC 5869 上界:keylen <= 255*hashLen(单字节计数器不得回绕),且 keylen>0。
     // 超界会导致计数器溢出重复密钥流,Node 亦报 RangeError。
@@ -954,6 +951,11 @@ function _hkdf(digest, ikm, salt, info, keylen) {
 // 用闭包对象(非 class):asm.js 里从对象方法内 `new ClassName()` 实例化会崩,
 // 闭包 api 对象规避该限制,且 update 链式返回自身。
 function _makeHash(algorithm) {
+    // 创建时即校验算法(以 getHashes 支持集为准)。未知/拼错算法立即失败关闭,
+    // 错误形状对齐 Node(普通 Error,message "Digest method not supported")。
+    if (!_isSupportedHash(algorithm)) {
+        throw new Error("Digest method not supported");
+    }
     const state = { algo: algorithm, buf: "" };
     const api = {
         update(data, inputEncoding) {
@@ -969,6 +971,14 @@ function _makeHash(algorithm) {
     return api;
 }
 function _makeHmac(algorithm, key) {
+    // createHmac 未知/拼错算法失败关闭。错误形状对齐 Node:createHmac 抛
+    // TypeError [ERR_CRYPTO_INVALID_DIGEST] "Invalid digest: <algo>"(注意 Node 本身
+    // 即与 createHash 的普通 Error "Digest method not supported" 不同,此处如实区分)。
+    if (!_isSupportedHash(algorithm)) {
+        const e = new TypeError("Invalid digest: " + algorithm);
+        e.code = "ERR_CRYPTO_INVALID_DIGEST";
+        throw e;
+    }
     const state = { algo: algorithm, key: key, buf: "" };
     const api = {
         update(data, inputEncoding) {
@@ -982,6 +992,49 @@ function _makeHmac(algorithm, key) {
         },
     };
     return api;
+}
+
+// ============================================================================
+// randomInt:范围校验 + 拒绝采样(消除模偏差),错误形状对齐 Node。
+// ============================================================================
+// 安全整数判定(不依赖 Number.isSafeInteger,该全局在本运行时未必存在)。
+// NaN / Infinity 经 `v % 1 === 0` 与上下界两重过滤排除(二者对 NaN/Inf 均不成立)。
+function _isSafeInt(v) {
+    return typeof v === "number" && v % 1 === 0 &&
+        v >= -9007199254740991 && v <= 9007199254740991;
+}
+// Node ERR_INVALID_ARG_TYPE 的 "Received ..." 文案(对齐 inspect 的常见形态)。
+function _safeIntMsg(argName, v) {
+    let received;
+    if (v === undefined) received = "Received undefined";
+    else if (typeof v === "string") received = "Received type string ('" + v + "')";
+    else if (typeof v === "number") received = "Received type number (" + v + ")";
+    else received = "Received type " + typeof v;
+    return 'The "' + argName + '" argument must be a safe integer. ' + received;
+}
+// 组装带 ERR_INVALID_ARG_TYPE code 的 TypeError(对齐 Node 错误形状)。
+function _argTypeErr(argName, v) {
+    const e = new TypeError(_safeIntMsg(argName, v));
+    e.code = "ERR_INVALID_ARG_TYPE";
+    return e;
+}
+// 返回 [0, range) 内无模偏差的整数(range >= 1)。拒绝采样:按 range-1 所需比特数取熵,
+// 掩去最高字节多余高位使候选值均匀落在 [0, 2^bits),>= range 则重取。候选值恒 < 2^53
+// (bits <= 53),float64 下精确;组装只用 <= 2^48 的乘子,无宽整数精度损失。
+function _unbiasedBelow(range) {
+    if (range <= 1) return 0;
+    let bits = 0, t = range - 1;
+    while (t >= 1) { bits = bits + 1; t = (t - (t % 2)) / 2; } // bitLength(range-1),避开 32 位 >>>
+    const nbytes = ((bits + 7) / 8) | 0;
+    const topBits = bits - 8 * (nbytes - 1); // 最高字节的有效比特数,1..8
+    const mask = (1 << topBits) - 1;
+    for (;;) {
+        const b = _entropyBytes(nbytes);
+        let value = 0, mult = 1;
+        for (let i = 0; i < nbytes - 1; i++) { value += b[i] * mult; mult *= 256; }
+        value += (b[nbytes - 1] & mask) * mult;
+        if (value < range) return value; // >= range 拒绝重取,消除模偏差
+    }
 }
 
 export const crypto = {
@@ -1037,10 +1090,23 @@ export const crypto = {
         catch (e) { err = e; }
         if (typeof callback === "function") callback(err, out);
     },
-    createECDH: () => ({ generateKeys() {}, computeSecret() {} }),
+    // ECDH 未实现:失败关闭。绝不返回会静默产出 undefined 共享密钥的空壳对象,
+    // 调用即抛清晰错误(曲线参数无意义,因为整个 ECDH 不可用)。
+    createECDH: (curveName) => {
+        throw new Error("ECDH not implemented");
+    },
     getCurves: () => [],
-    getFips: () => 0,
-    setFips: () => {},
+    getFips: () => 0, // 诚实:本运行时为非 FIPS 构建,恒返回 0。
+    setFips(flag) {
+        // 非 FIPS 构建上启用 FIPS 失败关闭:抛错。对齐 Node 非 FIPS-capable 构建契约
+        // (注:FIPS-capable 的 Node 构建 setFips(true) 不抛错,本机 Node v25 即此类)。
+        // setFips(false) / 无参为可接受的空操作(本就处于非 FIPS 态)。
+        if (flag) {
+            const e = new Error("Cannot set FIPS mode in a non-FIPS build");
+            e.code = "ERR_CRYPTO_FIPS_UNAVAILABLE";
+            throw e;
+        }
+    },
     fips: false,
     constants: {},
     timingSafeEqual(a, b) {
@@ -1054,13 +1120,30 @@ export const crypto = {
         for (let i = 0; i < ab.length; i++) diff |= (ab[i] ^ bb[i]);
         return diff === 0;
     },
-    randomInt(max, min, callback) {
-        // 单参:randomInt(max);双参:randomInt(min, max)。用内核熵取 4 字节。
-        let lo = 0, hi = max, cb = callback;
-        if (typeof min === "number") { lo = max; hi = min; } else if (typeof min === "function") { cb = min; }
-        const b = _entropyBytes(4);
-        const r = ((b[0] + b[1] * 256 + b[2] * 65536 + b[3] * 16777216) >>> 0);
-        const val = lo + (r % (hi - lo));
+    randomInt(min, max, callback) {
+        // 形态:randomInt(max) / randomInt(min, max),末尾可带 callback。
+        // 非法参数同步抛错(即便带 callback,Node 亦同步抛)。
+        let lo, hi, cb = callback;
+        if (typeof max === "function") { cb = max; max = undefined; }
+        if (max === undefined) {
+            // 单参:形参 min 实为 max。
+            hi = min; lo = 0;
+            if (!_isSafeInt(hi)) throw _argTypeErr("max", hi);
+        } else {
+            lo = min; hi = max;
+            // Node 校验顺序:先 min 后 max。
+            if (!_isSafeInt(lo)) throw _argTypeErr("min", lo);
+            if (!_isSafeInt(hi)) throw _argTypeErr("max", hi);
+        }
+        // max 必须 > min(覆盖 hi==lo / hi<lo / 单参零或负数)。
+        if (!(hi > lo)) {
+            const e = new RangeError('The value of "max" is out of range. ' +
+                'It must be greater than the value of "min" (' + lo + '). Received ' + hi);
+            e.code = "ERR_OUT_OF_RANGE";
+            throw e;
+        }
+        // 拒绝采样(无模偏差),取足够熵字节而非固定 4 字节取模。
+        const val = lo + _unbiasedBelow(hi - lo);
         if (cb) { cb(null, val); return; }
         return val;
     },

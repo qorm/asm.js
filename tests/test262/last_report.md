@@ -1,10 +1,10 @@
 # asm.js test262 conformance report
 
-_Generated 2026-07-27T22:03:14.994Z — target macos-arm64_
+_Generated 2026-07-30T16:19:22.504Z — target macos-arm64_
 
 ## Headline
 
-**asm.js passes 2822 / 6462 = 43.67% of the run test262 subset**
+**asm.js passes 2836 / 6462 = 43.89% of the run test262 subset**
 (selected `language/` + core `built-ins/`), one variant per test.
 
 Of 33776 discovered test files in the selected dirs, 1466 were excluded up front (module=83, unsupported-feature=1383, intl/staging-dir=0); 32310 were eligible; 6462 were actually run (deterministic stride=5).
@@ -13,10 +13,10 @@ Of 33776 discovered test files in the selected dirs, 1466 were excluded up front
 
 | class | count | % of run |
 |-------|------:|---------:|
-| PASS         | 2822 | 43.67 |
-| FAIL         | 3423 | 52.97 |
-| COMPILE_FAIL | 40 | 0.62 |
-| CRASH        | 177 | 2.74 |
+| PASS         | 2836 | 43.89 |
+| FAIL         | 3401 | 52.63 |
+| COMPILE_FAIL | 69 | 1.07 |
+| CRASH        | 156 | 2.41 |
 | **run**      | **6462** | 100 |
 
 ## By area
@@ -29,15 +29,15 @@ Of 33776 discovered test files in the selected dirs, 1466 were excluded up front
 | built-ins/Map | 41 | 15 | 24 | 0 | 2 | 36.6 |
 | built-ins/Math | 65 | 32 | 33 | 0 | 0 | 49.2 |
 | built-ins/Number | 68 | 25 | 42 | 0 | 1 | 36.8 |
-| built-ins/Object | 682 | 310 | 363 | 0 | 9 | 45.5 |
-| built-ins/Promise | 145 | 51 | 84 | 2 | 8 | 35.2 |
+| built-ins/Object | 682 | 316 | 357 | 0 | 9 | 46.3 |
+| built-ins/Promise | 145 | 51 | 80 | 6 | 8 | 35.2 |
 | built-ins/RegExp | 374 | 133 | 235 | 5 | 1 | 35.6 |
-| built-ins/Set | 76 | 40 | 26 | 0 | 10 | 52.6 |
-| built-ins/String | 244 | 79 | 164 | 0 | 1 | 32.4 |
+| built-ins/Set | 76 | 40 | 26 | 2 | 8 | 52.6 |
+| built-ins/String | 244 | 78 | 164 | 1 | 1 | 32.0 |
 | built-ins/Symbol | 15 | 4 | 11 | 0 | 0 | 26.7 |
 | built-ins/TypedArray | 288 | 53 | 232 | 0 | 3 | 18.4 |
-| language/expressions | 2005 | 986 | 930 | 23 | 66 | 49.2 |
-| language/statements | 1822 | 801 | 956 | 10 | 55 | 44.0 |
+| language/expressions | 2005 | 990 | 926 | 30 | 59 | 49.4 |
+| language/statements | 1822 | 806 | 948 | 25 | 43 | 44.2 |
 
 ## Excluded categories (counted, not scored)
 
@@ -59,15 +59,15 @@ Excluded-by-feature detail:
 
 ## Top failing patterns (FAIL / COMPILE_FAIL / CRASH detail strings)
 
-- **1893×** FAIL: assertion mismatch (Test262Error / wrong value)
+- **1881×** FAIL: assertion mismatch (Test262Error / wrong value)
 - **463×** FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)
-- **422×** FAIL: async ($DONE not signalled / promise rejected)
-- **335×** FAIL: negative test wrong outcome (phase=parse)
+- **420×** FAIL: async ($DONE not signalled / promise rejected)
+- **327×** FAIL: negative test wrong outcome (phase=parse)
 - **147×** FAIL: TypedArray/ArrayBuffer semantics
-- **126×** CRASH: run signal SIGSEGV
 - **111×** FAIL: array contents mismatch (compareArray)
+- **105×** CRASH: run signal SIGSEGV
+- **69×** COMPILE_FAIL: asm.js could not compile (unsupported syntax / parser gap)
 - **50×** FAIL: constructor-ness reflection (isConstructor / not-a-constructor)
-- **40×** COMPILE_FAIL: asm.js could not compile (unsupported syntax / parser gap)
 - **35×** CRASH: run timeout
 - **16×** CRASH: run signal SIGBUS
 - **2×** FAIL: negative test wrong outcome (phase=runtime)
@@ -76,20 +76,20 @@ Excluded-by-feature detail:
 
 - `destructuring-binding`: 644
 - `async-iteration`: 555
-- `class`: 464
-- `generators`: 372
+- `class`: 456
+- `generators`: 370
 - `Symbol.iterator`: 299
 - `class-fields-public`: 243
 - `TypedArray`: 219
 - `default-parameters`: 200
-- `class-methods-private`: 160
+- `class-methods-private`: 158
 - `class-fields-private`: 141
 - `regexp-unicode-property-escapes`: 132
 - `BigInt`: 120
-- `class-static-methods-private`: 117
+- `class-static-methods-private`: 115
 - `Symbol.asyncIterator`: 112
 - `Symbol`: 89
-- `async-functions`: 70
+- `async-functions`: 68
 - `arrow-function`: 67
 - `resizable-arraybuffer`: 57
 - `computed-property-names`: 55
@@ -97,7 +97,9 @@ Excluded-by-feature detail:
 
 ## Methodology / reproducibility
 
-- Corpus: official `tc39/test262` (main), vendored locally, NOT committed.
+- Corpus: official `tc39/test262` pinned at commit `9e61c12835c5e4a3bdba93850427e6742c4f64c4`
+  (TEST262_PIN in tests/test262/run.mjs), vendored locally, NOT committed. Changing the
+  pin requires re-downloading the corpus and re-running; counts depend on the snapshot.
 - Each test is assembled per test262 `INTERPRETING.md`: host shims (`print`, `$262` stub) +
   `harness/assert.js` + `harness/sta.js` (+ `doneprintHandle.js` for async) + any `includes:` +
   the test body. `raw` tests run the body alone. `onlyStrict` tests get a leading `"use strict";`.
@@ -117,10 +119,10 @@ Excluded-by-feature detail:
 
 ```sh
 # 1. vendor the corpus (NOT committed)
-curl -sL -o /tmp/t262.tgz https://github.com/tc39/test262/archive/refs/heads/main.tar.gz
+curl -sL -o /tmp/t262.tgz https://github.com/tc39/test262/archive/9e61c12835c5e4a3bdba93850427e6742c4f64c4.tar.gz
 mkdir -p .test262-corpus && tar xzf /tmp/t262.tgz -C .test262-corpus --strip-components=1
 # 2. run the harness
 node tests/test262/run.mjs --stride 5 --jobs 8 --target macos-arm64
 ```
 
-_Run wall-clock: 393.0s._
+_Run wall-clock: 458.8s._
