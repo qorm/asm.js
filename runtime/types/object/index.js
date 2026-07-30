@@ -47,6 +47,18 @@ const ATTR_ENUMERABLE = 2; // bit1
 const ATTR_CONFIGURABLE = 4; // bit2
 const ATTR_DEFAULT = 7; // 普通属性:writable+enumerable+configurable 全 1
 
+// [#dp-mask] Object.defineProperty 字段存在位掩码(field-presence mask)。
+// 编译器按描述符里**实际出现**的字段置位,运行时仅对出现的字段做验证/强制/改写;
+// 未出现的字段保留既有值/属性位(绝不以 undefined 覆盖、绝不默认 false)。这是上一版
+// 强制实现被回退的根因修复:旧版只看结果 attr 字节 + 可能 undefined 的 value,丢失了
+// "哪些字段真被指定"的信息。掩码经打包参 (mask<<8)|attr 由 A5 传入 _object_define_property。
+const DP_HAS_VALUE = 1;
+const DP_HAS_WRITABLE = 2;
+const DP_HAS_ENUMERABLE = 4;
+const DP_HAS_CONFIGURABLE = 8;
+const DP_HAS_GET = 16;
+const DP_HAS_SET = 32;
+
 // [#61 P1] 属性描述符 Phase 1 —— 对象级 extensible/sealed/frozen 三位。
 // 存 type 字的 byte1(obj+1),语义取反(0=默认可扩展)。
 // _object_new 整字写 TYPE_OBJECT(0..2),byte1 天然=0;普通赋值路径永不
@@ -115,6 +127,10 @@ export class ObjectGenerator {
         this.generateObjectGetAttr();
         this.generateObjectSetAttr();
         this.generateObjectSetPropAttr();
+        // [#dp-mask] defineProperty 验证/强制(字段存在掩码)
+        this.generateObjectDefinePropertyHelpers();
+        this.generateObjectDefineProperty();
+        this.generateObjectDefinePropertyDyn();
         this.generateCanonicalArrayIndex();
         this.generateObjectNormalizeOrder();
         this.generateObjectApplyClearAttrs();
@@ -5247,6 +5263,476 @@ export class ObjectGenerator {
         vm.call("_object_set_attr");
         vm.label("_ospa_done");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+    }
+
+    // [#dp-mask] defineProperty 验证/强制的小工具:
+    //   _is_callable(v_boxed) -> 0/1       typeof==="function" 等价判定
+    //   _dp_check_accessor(v_boxed) -> 0/1 undefined 或可调用 → 1(get/set 合法性)
+    //   _dp_require_object(d_boxed)        描述符非(非空)对象 → 抛 TypeError(不返回)
+    generateObjectDefinePropertyHelpers() {
+        const vm = this.vm;
+        const boxStr = (reg) => {
+            vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(reg, reg, VReg.V1);
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(reg, reg, VReg.V1);
+        };
+
+        // _is_callable(v) -> 0/1。装箱函数 tag 0x7FFF;或裸堆指针落 [heap_base,heap_ptr)
+        // 且 type@0 ∈ {3(classinfo/TYPE_CLOSURE), 0xc105(CLOSURE_MAGIC), 0xa51c(ASYNC)}。
+        vm.label("_is_callable");
+        vm.prologue(0, []);
+        vm.shrImm(VReg.V1, VReg.A0, 48);
+        vm.cmpImm(VReg.V1, 0x7fff); vm.jeq("_isc_yes");
+        vm.cmpImm(VReg.V1, 0); vm.jne("_isc_no");
+        vm.cmpImm(VReg.A0, 0); vm.jeq("_isc_no");
+        vm.lea(VReg.V1, "_heap_base"); vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.A0, VReg.V1); vm.jb("_isc_no");
+        vm.lea(VReg.V1, "_heap_ptr"); vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.A0, VReg.V1); vm.jae("_isc_no");
+        vm.load(VReg.V1, VReg.A0, 0);
+        vm.cmpImm(VReg.V1, 3); vm.jeq("_isc_yes");
+        vm.cmpImm(VReg.V1, 0xc105); vm.jeq("_isc_yes");
+        vm.cmpImm(VReg.V1, 0xa51c); vm.jeq("_isc_yes");
+        vm.label("_isc_no");
+        vm.movImm(VReg.RET, 0);
+        vm.epilogue([], 0);
+        vm.label("_isc_yes");
+        vm.movImm(VReg.RET, 1);
+        vm.epilogue([], 0);
+
+        // _dp_check_accessor(v) -> 0/1。undefined 合法(缺省 get/set);否则须可调用。
+        vm.label("_dp_check_accessor");
+        vm.prologue(0, []);
+        vm.movImm64(VReg.V0, 0x7ffb000000000000n); // undefined
+        vm.cmp(VReg.A0, VReg.V0); vm.jeq("_dpca_yes");
+        vm.call("_is_callable"); // A0=v 未改;RET=0/1 直接作返回
+        vm.epilogue([], 0);
+        vm.label("_dpca_yes");
+        vm.movImm(VReg.RET, 1);
+        vm.epilogue([], 0);
+
+        // _dp_require_object(d)。对象(0x7FFD)/数组(0x7FFE)/函数(0x7FFF)/裸堆指针(高16=0
+        // 且非空)放行;其余(数字/布尔/null/undefined/字符串)抛 TypeError。
+        vm.label("_dp_require_object");
+        vm.prologue(0, []);
+        vm.shrImm(VReg.V1, VReg.A0, 48);
+        vm.cmpImm(VReg.V1, 0x7ffd); vm.jeq("_dpo_ok");
+        vm.cmpImm(VReg.V1, 0x7ffe); vm.jeq("_dpo_ok");
+        vm.cmpImm(VReg.V1, 0x7fff); vm.jeq("_dpo_ok");
+        vm.cmpImm(VReg.V1, 0); vm.jne("_dpo_throw");
+        vm.cmpImm(VReg.A0, 0); vm.jeq("_dpo_throw");
+        vm.jmp("_dpo_ok");
+        vm.label("_dpo_throw");
+        vm.lea(VReg.A0, vm.asm.addString("Property description must be an object"));
+        boxStr(VReg.A0);
+        vm.call("_throw_type_error"); // 不返回
+        vm.label("_dpo_ok");
+        vm.epilogue([], 0);
+    }
+
+    // [#dp-mask] _object_define_property(obj_boxed, key, value, get, set, packed=(mask<<8)|attr)
+    //   完整实现 ValidateAndApplyPropertyDescriptor(仅对 mask 标记出现的字段生效)+ 落值 + 落 attr。
+    //   返回原对象(boxed);非法时 _throw_type_error(不返回)。
+    //
+    //   帧布局(prologue 96,S0=obj_raw / S1=key 跨调用保活;其余全落 SP 以免疫 _alloc
+    //   只保 S0-S3 的约定违例):
+    //     SP+0 boxed obj   SP+8 mask     SP+16 idx      SP+24 oldval
+    //     SP+32 oldattr(-1=键不存在哨兵) SP+40 oldIsAccessor SP+48 oldGet SP+56 oldSet
+    //     SP+64 attr       SP+72 value   SP+80 get      SP+88 set
+    generateObjectDefineProperty() {
+        const vm = this.vm;
+        const boxStr = (reg) => {
+            vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(reg, reg, VReg.V1);
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(reg, reg, VReg.V1);
+        };
+        const throwMsg = (msg) => {
+            vm.lea(VReg.A0, vm.asm.addString(msg)); boxStr(VReg.A0); vm.call("_throw_type_error");
+        };
+
+        vm.label("_object_define_property");
+        vm.prologue(96, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.store(VReg.SP, 0, VReg.A0);             // boxed obj
+        vm.store(VReg.SP, 72, VReg.A2);            // value
+        vm.store(VReg.SP, 80, VReg.A3);            // get
+        vm.store(VReg.SP, 88, VReg.A4);            // set
+        vm.andImm(VReg.V0, VReg.A5, 0xff);
+        vm.store(VReg.SP, 64, VReg.V0);            // attr
+        vm.shrImm(VReg.V0, VReg.A5, 8);
+        vm.store(VReg.SP, 8, VReg.V0);             // mask
+        vm.mov(VReg.S1, VReg.A1);                  // key(保活)
+
+        // 接收者守卫:对象/数组/函数/裸堆指针放行;原语抛 TypeError(防脱壳解引用崩)。
+        vm.shrImm(VReg.V1, VReg.A0, 48);
+        vm.cmpImm(VReg.V1, 0x7ffd); vm.jeq("_dp_recv_ok");
+        vm.cmpImm(VReg.V1, 0x7ffe); vm.jeq("_dp_recv_ok");
+        vm.cmpImm(VReg.V1, 0x7fff); vm.jeq("_dp_recv_ok");
+        vm.cmpImm(VReg.V1, 0); vm.jeq("_dp_recv_ok");
+        throwMsg("Cannot define property, target is not an object");
+        vm.label("_dp_recv_ok");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.S0, VReg.A0, VReg.V1);  // S0 = raw obj
+
+        // 类型字节守卫:仅普通对象(2)/classinfo(3)走强制路;其余(数组/Map/函数值侧表…)
+        // 落 legacy(旧 _object_define + _object_set_prop_attr,无强制)保持既有行为不回归。
+        vm.loadByte(VReg.V1, VReg.S0, 0);
+        vm.cmpImm(VReg.V1, 2); vm.jeq("_dp_obj_ok");
+        vm.cmpImm(VReg.V1, 3); vm.jeq("_dp_obj_ok");
+        vm.jmp("_dp_legacy");
+
+        // ============ ToPropertyDescriptor 验证 ============
+        vm.label("_dp_obj_ok");
+        vm.load(VReg.V0, VReg.SP, 8);                                  // mask
+        vm.andImm(VReg.V1, VReg.V0, DP_HAS_VALUE | DP_HAS_WRITABLE);   // data 位
+        vm.andImm(VReg.V2, VReg.V0, DP_HAS_GET | DP_HAS_SET);          // accessor 位
+        vm.cmpImm(VReg.V1, 0); vm.jeq("_dp_nomix");
+        vm.cmpImm(VReg.V2, 0); vm.jeq("_dp_nomix");
+        throwMsg("Invalid property descriptor: cannot both specify accessors and a value or writable attribute");
+        vm.label("_dp_nomix");
+        vm.load(VReg.V0, VReg.SP, 8);
+        vm.andImm(VReg.V0, VReg.V0, DP_HAS_GET);
+        vm.cmpImm(VReg.V0, 0); vm.jeq("_dp_noget");
+        vm.load(VReg.A0, VReg.SP, 80);
+        vm.call("_dp_check_accessor");
+        vm.cmpImm(VReg.RET, 0); vm.jeq("_dp_badget");
+        vm.jmp("_dp_noget");
+        vm.label("_dp_badget"); throwMsg("Getter must be a function");
+        vm.label("_dp_noget");
+        vm.load(VReg.V0, VReg.SP, 8);
+        vm.andImm(VReg.V0, VReg.V0, DP_HAS_SET);
+        vm.cmpImm(VReg.V0, 0); vm.jeq("_dp_noset");
+        vm.load(VReg.A0, VReg.SP, 88);
+        vm.call("_dp_check_accessor");
+        vm.cmpImm(VReg.RET, 0); vm.jeq("_dp_badset");
+        vm.jmp("_dp_noset");
+        vm.label("_dp_badset"); throwMsg("Setter must be a function");
+        vm.label("_dp_noset");
+
+        // ============ 查找既有属性 ============
+        vm.movImm(VReg.V0, 0);
+        vm.store(VReg.SP, 16, VReg.V0);            // idx = 0
+        vm.label("_dp_loop");
+        vm.load(VReg.V0, VReg.SP, 16);
+        vm.load(VReg.V3, VReg.S0, 8);              // count(跨调用重载)
+        vm.cmp(VReg.V0, VReg.V3); vm.jge("_dp_absent");
+        vm.load(VReg.V2, VReg.S0, OBJECT_PROPS_PTR_OFFSET);
+        vm.shlImm(VReg.V1, VReg.V0, 4);
+        vm.add(VReg.V5, VReg.V2, VReg.V1);         // entry
+        vm.load(VReg.A0, VReg.V5, 0);              // 既有 key
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_key_eq");
+        vm.cmpImm(VReg.RET, 0); vm.jne("_dp_found");
+        vm.load(VReg.V0, VReg.SP, 16);
+        vm.addImm(VReg.V0, VReg.V0, 1);
+        vm.store(VReg.SP, 16, VReg.V0);
+        vm.jmp("_dp_loop");
+
+        // ---- 命中:取 oldval / oldattr / oldIsAccessor / oldGet / oldSet ----
+        vm.label("_dp_found");
+        vm.load(VReg.V0, VReg.SP, 16);
+        vm.load(VReg.V2, VReg.S0, OBJECT_PROPS_PTR_OFFSET);
+        vm.shlImm(VReg.V1, VReg.V0, 4);
+        vm.add(VReg.V5, VReg.V2, VReg.V1);
+        vm.load(VReg.V0, VReg.V5, 8);
+        vm.store(VReg.SP, 24, VReg.V0);            // oldval
+        vm.mov(VReg.A0, VReg.S0);
+        vm.load(VReg.A1, VReg.SP, 16);
+        vm.call("_object_get_attr");
+        vm.store(VReg.SP, 32, VReg.RET);           // oldattr
+        vm.movImm(VReg.V1, 0);
+        vm.store(VReg.SP, 40, VReg.V1);            // oldIsAccessor = 0
+        vm.store(VReg.SP, 48, VReg.V1);            // oldGet = 0
+        vm.store(VReg.SP, 56, VReg.V1);            // oldSet = 0
+        // oldval 是 TYPE_GETTER 标记块?
+        vm.load(VReg.V0, VReg.SP, 24);
+        vm.shrImm(VReg.V1, VReg.V0, 48);
+        vm.cmpImm(VReg.V1, 0); vm.jne("_dp_old_data");
+        vm.cmpImm(VReg.V0, 0); vm.jeq("_dp_old_data");
+        vm.lea(VReg.V1, "_heap_base"); vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.V0, VReg.V1); vm.jlt("_dp_old_data");
+        vm.lea(VReg.V1, "_heap_ptr"); vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.V0, VReg.V1); vm.jge("_dp_old_data");
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.cmpImm(VReg.V1, TYPE_GETTER); vm.jne("_dp_old_data");
+        vm.movImm(VReg.V1, 1); vm.store(VReg.SP, 40, VReg.V1);
+        vm.load(VReg.V1, VReg.V0, 8);  vm.store(VReg.SP, 48, VReg.V1);  // oldGet
+        vm.load(VReg.V1, VReg.V0, 16); vm.store(VReg.SP, 56, VReg.V1);  // oldSet
+        vm.label("_dp_old_data");
+        vm.jmp("_dp_present");
+
+        // ---- 键不存在:non-extensible 抛;否则直接落(无当前描述符)----
+        vm.label("_dp_absent");
+        vm.loadByte(VReg.V0, VReg.S0, 1);
+        vm.andImm(VReg.V0, VReg.V0, EXT_NONEXT);
+        vm.cmpImm(VReg.V0, 0); vm.jeq("_dp_absent_ok");
+        throwMsg("Cannot define property, object is not extensible");
+        vm.label("_dp_absent_ok");
+        vm.movImm64(VReg.V0, 0x7ffb000000000000n);
+        vm.store(VReg.SP, 24, VReg.V0);            // oldval = undefined
+        vm.movImm(VReg.V0, 0);
+        vm.store(VReg.SP, 40, VReg.V0);            // oldIsAccessor = 0
+        vm.store(VReg.SP, 48, VReg.V0);
+        vm.store(VReg.SP, 56, VReg.V0);
+        vm.movImm64(VReg.V0, 0xFFFFFFFFFFFFFFFFn);
+        vm.store(VReg.SP, 32, VReg.V0);            // oldattr = -1(不存在哨兵)
+        vm.jmp("_dp_apply");
+
+        // ============ 强制(键已存在)============
+        vm.label("_dp_present");
+        vm.load(VReg.V0, VReg.SP, 32);             // oldattr
+        vm.andImm(VReg.V1, VReg.V0, ATTR_CONFIGURABLE);
+        vm.cmpImm(VReg.V1, 0); vm.jne("_dp_apply"); // 当前 configurable → 放行
+        vm.load(VReg.V2, VReg.SP, 8);              // mask
+        // (1) HAS_CONFIGURABLE 且置 configurable:true → 抛
+        vm.andImm(VReg.V1, VReg.V2, DP_HAS_CONFIGURABLE);
+        vm.cmpImm(VReg.V1, 0); vm.jeq("_dp_chk2");
+        vm.load(VReg.V0, VReg.SP, 64);             // attr
+        vm.andImm(VReg.V1, VReg.V0, ATTR_CONFIGURABLE);
+        vm.cmpImm(VReg.V1, 0); vm.jeq("_dp_chk2");
+        throwMsg("Cannot redefine property, property is not configurable");
+        // (2) HAS_ENUMERABLE 且 enumerable 与当前不同 → 抛
+        vm.label("_dp_chk2");
+        vm.andImm(VReg.V1, VReg.V2, DP_HAS_ENUMERABLE);
+        vm.cmpImm(VReg.V1, 0); vm.jeq("_dp_chk3");
+        vm.load(VReg.V0, VReg.SP, 64);
+        vm.andImm(VReg.V1, VReg.V0, ATTR_ENUMERABLE);   // 新 en
+        vm.load(VReg.V3, VReg.SP, 32);
+        vm.andImm(VReg.V3, VReg.V3, ATTR_ENUMERABLE);   // 旧 en
+        vm.cmp(VReg.V1, VReg.V3); vm.jne("_dp_throw_redef");
+        // (3) data <-> accessor 切换(空描述符两者皆非 → 不抛)
+        vm.label("_dp_chk3");
+        vm.load(VReg.V5, VReg.SP, 40);             // oldIsAccessor
+        vm.andImm(VReg.V3, VReg.V2, DP_HAS_VALUE | DP_HAS_WRITABLE); // descData 位
+        vm.andImm(VReg.V4, VReg.V2, DP_HAS_GET | DP_HAS_SET);        // descAcc 位
+        vm.cmpImm(VReg.V5, 0); vm.jeq("_dp_chk3_data");
+        vm.cmpImm(VReg.V3, 0); vm.jne("_dp_throw_redef"); // 旧 accessor + 新 data → 抛
+        vm.jmp("_dp_chk4");
+        vm.label("_dp_chk3_data");
+        vm.cmpImm(VReg.V4, 0); vm.jne("_dp_throw_redef"); // 旧 data + 新 accessor → 抛
+        // (4) 当前 accessor:get/set 同一性;当前 data:不可写时拒改 writable/value
+        vm.label("_dp_chk4");
+        vm.load(VReg.V5, VReg.SP, 40);
+        vm.cmpImm(VReg.V5, 0); vm.jeq("_dp_data_chk");
+        // 当前 accessor
+        vm.andImm(VReg.V1, VReg.V2, DP_HAS_GET);
+        vm.cmpImm(VReg.V1, 0); vm.jeq("_dp_acc_set");
+        vm.load(VReg.V3, VReg.SP, 80);
+        vm.emitMaskLoad(VReg.V0); vm.andMaskReg(VReg.V3, VReg.V3, VReg.V0); // 新 get 裸指针
+        vm.load(VReg.V4, VReg.SP, 48);                                       // oldGet
+        vm.cmp(VReg.V3, VReg.V4); vm.jne("_dp_throw_redef");
+        vm.label("_dp_acc_set");
+        vm.andImm(VReg.V1, VReg.V2, DP_HAS_SET);
+        vm.cmpImm(VReg.V1, 0); vm.jeq("_dp_apply");
+        vm.load(VReg.V3, VReg.SP, 88);
+        vm.emitMaskLoad(VReg.V0); vm.andMaskReg(VReg.V3, VReg.V3, VReg.V0);
+        vm.load(VReg.V4, VReg.SP, 56);                                       // oldSet
+        vm.cmp(VReg.V3, VReg.V4); vm.jne("_dp_throw_redef");
+        vm.jmp("_dp_apply");
+        // 当前 data
+        vm.label("_dp_data_chk");
+        vm.load(VReg.V0, VReg.SP, 32);
+        vm.andImm(VReg.V0, VReg.V0, ATTR_WRITABLE);    // 当前 writable
+        vm.cmpImm(VReg.V0, 0); vm.jne("_dp_apply");    // 可写 → 允许改值/收 writable
+        vm.andImm(VReg.V1, VReg.V2, DP_HAS_WRITABLE);
+        vm.cmpImm(VReg.V1, 0); vm.jeq("_dp_data_val");
+        vm.load(VReg.V0, VReg.SP, 64);
+        vm.andImm(VReg.V1, VReg.V0, ATTR_WRITABLE);
+        vm.cmpImm(VReg.V1, 0); vm.jeq("_dp_data_val");
+        vm.jmp("_dp_throw_redef");                     // 不可写 → 拒置 writable:true
+        vm.label("_dp_data_val");
+        vm.andImm(VReg.V1, VReg.V2, DP_HAS_VALUE);
+        vm.cmpImm(VReg.V1, 0); vm.jeq("_dp_apply");
+        vm.load(VReg.A0, VReg.SP, 72);                 // 新值
+        vm.load(VReg.A1, VReg.SP, 24);                 // oldval
+        vm.call("_object_key_eq");                     // SameValue:串按内容、余按位、NaN==NaN、0≠-0
+        vm.cmpImm(VReg.RET, 0); vm.jeq("_dp_throw_redef");
+        vm.jmp("_dp_apply");
+
+        vm.label("_dp_throw_redef");
+        throwMsg("Cannot redefine property");
+
+        // ============ 落值 + 落 attr ============
+        vm.label("_dp_apply");
+        vm.load(VReg.V2, VReg.SP, 8);              // mask
+        // storeValue:新 accessor → 建标记块;否则 HAS_VALUE → value;否则保留 oldval
+        vm.andImm(VReg.V1, VReg.V2, DP_HAS_GET | DP_HAS_SET);
+        vm.cmpImm(VReg.V1, 0); vm.jne("_dp_apply_acc");
+        vm.andImm(VReg.V1, VReg.V2, DP_HAS_VALUE);
+        vm.cmpImm(VReg.V1, 0); vm.jeq("_dp_apply_keep");
+        vm.load(VReg.V5, VReg.SP, 72);             // storeValue = value
+        vm.jmp("_dp_apply_store");
+        vm.label("_dp_apply_keep");
+        vm.load(VReg.V5, VReg.SP, 24);             // storeValue = oldval(保留)
+        vm.jmp("_dp_apply_store");
+        vm.label("_dp_apply_acc");
+        // 标记块:get = HAS_GET? 新 : oldGet;set = HAS_SET? 新 : oldSet
+        vm.movImm(VReg.A0, 24); vm.call("_alloc"); // _alloc 毁 V/S4/S5;故全从 SP 取
+        vm.mov(VReg.V5, VReg.RET);                 // V5 = 标记块
+        vm.movImm(VReg.V1, TYPE_GETTER); vm.store(VReg.V5, 0, VReg.V1);
+        vm.load(VReg.V2, VReg.SP, 8);              // mask(重载,_alloc 已毁)
+        vm.andImm(VReg.V1, VReg.V2, DP_HAS_GET);
+        vm.cmpImm(VReg.V1, 0); vm.jeq("_dp_acc_oldget");
+        vm.load(VReg.V3, VReg.SP, 80);
+        vm.emitMaskLoad(VReg.V0); vm.andMaskReg(VReg.V3, VReg.V3, VReg.V0);
+        vm.store(VReg.V5, 8, VReg.V3);
+        vm.jmp("_dp_acc_getdone");
+        vm.label("_dp_acc_oldget");
+        vm.load(VReg.V3, VReg.SP, 48); vm.store(VReg.V5, 8, VReg.V3);
+        vm.label("_dp_acc_getdone");
+        vm.andImm(VReg.V1, VReg.V2, DP_HAS_SET);
+        vm.cmpImm(VReg.V1, 0); vm.jeq("_dp_acc_oldset");
+        vm.load(VReg.V3, VReg.SP, 88);
+        vm.emitMaskLoad(VReg.V0); vm.andMaskReg(VReg.V3, VReg.V3, VReg.V0);
+        vm.store(VReg.V5, 16, VReg.V3);
+        vm.jmp("_dp_acc_setdone");
+        vm.label("_dp_acc_oldset");
+        vm.load(VReg.V3, VReg.SP, 56); vm.store(VReg.V5, 16, VReg.V3);
+        vm.label("_dp_acc_setdone");
+        // storeValue = V5(标记块裸指针)
+        vm.label("_dp_apply_store");
+        vm.load(VReg.A0, VReg.SP, 0);              // boxed obj
+        vm.mov(VReg.A1, VReg.S1);                  // key
+        vm.mov(VReg.A2, VReg.V5);                  // storeValue
+        vm.call("_object_define");                 // 落值(新键追加/既有覆写;冻结对象无变更则短路无害)
+        // finalAttr:不存在 → attr;存在 → oldattr 仅覆写 mask 标记位
+        vm.load(VReg.V0, VReg.SP, 32);             // oldattr
+        vm.movImm64(VReg.V1, 0xFFFFFFFFFFFFFFFFn);
+        vm.cmp(VReg.V0, VReg.V1); vm.jeq("_dp_attr_new");
+        vm.load(VReg.V2, VReg.SP, 8);              // mask
+        vm.load(VReg.V3, VReg.SP, 64);             // attr
+        vm.andImm(VReg.V1, VReg.V2, DP_HAS_WRITABLE);
+        vm.cmpImm(VReg.V1, 0); vm.jeq("_dp_at_en");
+        vm.andImm(VReg.V0, VReg.V0, 0xFE);
+        vm.andImm(VReg.V1, VReg.V3, ATTR_WRITABLE);
+        vm.or(VReg.V0, VReg.V0, VReg.V1);
+        vm.label("_dp_at_en");
+        vm.andImm(VReg.V1, VReg.V2, DP_HAS_ENUMERABLE);
+        vm.cmpImm(VReg.V1, 0); vm.jeq("_dp_at_cf");
+        vm.andImm(VReg.V0, VReg.V0, 0xFD);
+        vm.andImm(VReg.V1, VReg.V3, ATTR_ENUMERABLE);
+        vm.or(VReg.V0, VReg.V0, VReg.V1);
+        vm.label("_dp_at_cf");
+        vm.andImm(VReg.V1, VReg.V2, DP_HAS_CONFIGURABLE);
+        vm.cmpImm(VReg.V1, 0); vm.jeq("_dp_attr_store");
+        vm.andImm(VReg.V0, VReg.V0, 0xFB);
+        vm.andImm(VReg.V1, VReg.V3, ATTR_CONFIGURABLE);
+        vm.or(VReg.V0, VReg.V0, VReg.V1);
+        vm.jmp("_dp_attr_store");
+        vm.label("_dp_attr_new");
+        vm.load(VReg.V0, VReg.SP, 64);             // finalAttr = attr(缺省位全 false)
+        vm.label("_dp_attr_store");
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.mov(VReg.A2, VReg.V0);
+        vm.call("_object_set_prop_attr");
+        vm.load(VReg.RET, VReg.SP, 0);             // 返回原对象
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 96);
+
+        // ============ legacy:非普通对象(数组/Map/函数值侧表…)旧行为,无强制 ============
+        vm.label("_dp_legacy");
+        vm.load(VReg.V2, VReg.SP, 8);              // mask
+        vm.andImm(VReg.V1, VReg.V2, DP_HAS_GET | DP_HAS_SET);
+        vm.cmpImm(VReg.V1, 0); vm.jne("_dp_leg_acc");
+        vm.andImm(VReg.V1, VReg.V2, DP_HAS_VALUE);
+        vm.cmpImm(VReg.V1, 0); vm.jeq("_dp_leg_undef");
+        vm.load(VReg.V5, VReg.SP, 72);
+        vm.jmp("_dp_leg_store");
+        vm.label("_dp_leg_undef");
+        vm.movImm64(VReg.V5, 0x7ffb000000000000n);
+        vm.jmp("_dp_leg_store");
+        vm.label("_dp_leg_acc");
+        vm.movImm(VReg.A0, 24); vm.call("_alloc");
+        vm.mov(VReg.V5, VReg.RET);
+        vm.movImm(VReg.V1, TYPE_GETTER); vm.store(VReg.V5, 0, VReg.V1);
+        vm.load(VReg.V3, VReg.SP, 80);
+        vm.emitMaskLoad(VReg.V0); vm.andMaskReg(VReg.V3, VReg.V3, VReg.V0);
+        vm.store(VReg.V5, 8, VReg.V3);
+        vm.load(VReg.V3, VReg.SP, 88);
+        vm.emitMaskLoad(VReg.V0); vm.andMaskReg(VReg.V3, VReg.V3, VReg.V0);
+        vm.store(VReg.V5, 16, VReg.V3);
+        vm.label("_dp_leg_store");
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.mov(VReg.A2, VReg.V5);
+        vm.call("_object_define");
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.load(VReg.A2, VReg.SP, 64);             // attr
+        vm.call("_object_set_prop_attr");
+        vm.load(VReg.RET, VReg.SP, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 96);
+    }
+
+    // [#dp-mask] _object_define_property_dyn(obj_boxed, key, desc_boxed):动态描述符回退。
+    //   逐字段读一次(presence 经 _object_has,值经 _object_get —— 访问器 getter 只求值一次),
+    //   运行时算 mask/attr,打包后尾调 _object_define_property。描述符非对象先抛。
+    generateObjectDefinePropertyDyn() {
+        const vm = this.vm;
+        const boxStr = (reg) => {
+            vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(reg, reg, VReg.V1);
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(reg, reg, VReg.V1);
+        };
+        vm.label("_object_define_property_dyn");
+        vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.mov(VReg.S0, VReg.A0);                  // obj boxed
+        vm.mov(VReg.S1, VReg.A1);                  // key
+        vm.mov(VReg.S2, VReg.A2);                  // desc
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_dp_require_object");             // 非对象 → 抛
+        // SP+0 value  SP+8 get  SP+16 set  SP+24 mask  SP+32 attr
+        vm.movImm64(VReg.V0, 0x7ffb000000000000n);
+        vm.store(VReg.SP, 0, VReg.V0);
+        vm.store(VReg.SP, 8, VReg.V0);
+        vm.store(VReg.SP, 16, VReg.V0);
+        vm.movImm(VReg.V0, 0);
+        vm.store(VReg.SP, 24, VReg.V0);
+        vm.store(VReg.SP, 32, VReg.V0);
+
+        let uid = 0;
+        const field = (name, presBit, isBool, slot, attrShift) => {
+            const s = uid++;
+            const presL = `_dpd_pres_${s}`;
+            const skipL = `_dpd_skip_${s}`;
+            vm.mov(VReg.A0, VReg.S2);
+            vm.lea(VReg.A1, vm.asm.addString(name)); boxStr(VReg.A1);
+            vm.call("_object_has");                // RET 0/1
+            vm.cmpImm(VReg.RET, 0); vm.jne(presL);
+            vm.jmp(skipL);
+            vm.label(presL);
+            vm.load(VReg.V0, VReg.SP, 24);
+            vm.orImm(VReg.V0, VReg.V0, presBit);
+            vm.store(VReg.SP, 24, VReg.V0);        // mask |= presBit
+            vm.mov(VReg.A0, VReg.S2);
+            vm.lea(VReg.A1, vm.asm.addString(name)); boxStr(VReg.A1);
+            vm.call("_object_get");                // RET boxed
+            if (isBool) {
+                vm.mov(VReg.A0, VReg.RET);
+                vm.call("_to_boolean");            // RET 0/1
+                vm.shlImm(VReg.V1, VReg.RET, attrShift);
+                vm.load(VReg.V0, VReg.SP, 32);
+                vm.or(VReg.V0, VReg.V0, VReg.V1);
+                vm.store(VReg.SP, 32, VReg.V0);    // attr |= bit
+            } else {
+                vm.store(VReg.SP, slot, VReg.RET); // value/get/set
+            }
+            vm.label(skipL);
+        };
+        field("value", DP_HAS_VALUE, false, 0, 0);
+        field("writable", DP_HAS_WRITABLE, true, 0, 0);
+        field("enumerable", DP_HAS_ENUMERABLE, true, 0, 1);
+        field("configurable", DP_HAS_CONFIGURABLE, true, 0, 2);
+        field("get", DP_HAS_GET, false, 8, 0);
+        field("set", DP_HAS_SET, false, 16, 0);
+
+        vm.mov(VReg.A0, VReg.S0);                  // obj
+        vm.mov(VReg.A1, VReg.S1);                  // key
+        vm.load(VReg.A2, VReg.SP, 0);              // value
+        vm.load(VReg.A3, VReg.SP, 8);              // get
+        vm.load(VReg.A4, VReg.SP, 16);             // set
+        vm.load(VReg.V0, VReg.SP, 24);             // mask
+        vm.shlImm(VReg.V0, VReg.V0, 8);
+        vm.load(VReg.V1, VReg.SP, 32);             // attr
+        vm.or(VReg.A5, VReg.V0, VReg.V1);          // packed
+        vm.call("_object_define_property");        // RET = obj(或抛)
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
     }
 
     // _canonical_array_index(key_boxed) -> RET = 规范数组索引值(0..2^32-2)或 -1(非索引)。

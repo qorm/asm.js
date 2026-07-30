@@ -3762,70 +3762,66 @@ export const FunctionCompiler = {
                     this.vm.label(dpNormalLabel);
                     this._dpDoneLabel = dpDoneLabel; // 供末尾 load 前落 done 标签
 
-                    // 从对象字面量描述符提取 get/set/value 节点 + [#61 P2] attrs
-                    // (writable/enumerable/configurable);defineProperty 缺省全 false,
-                    // 从布尔字面量提取(非字面量或缺省 → false)。
+                    // 从对象字面量描述符提取 get/set/value 节点 + [#61 P2] attrs,并记**字段
+                    // 存在位**(field-presence mask)。运行时(_object_define_property)仅对出现的
+                    // 字段做验证/强制/改写;缺省字段保留既有值/属性位(绝不以 undefined 覆盖、
+                    // 绝不默认 false)—— 上一版强制被回退的根因即只看结果 attr + 可能 undefined 的
+                    // value、丢失了"哪些字段真被指定"。dpAttr 仍按出现布尔字面量的值算(缺省 → 0)。
+                    // value/get/set 表达式按**源码序**各求值一次落 FP 槽(保序 + 免疫相互覆盖/GC)。
                     let getterNode = null, setterNode = null, valueNode = null, hasValue = false;
                     let wr = false, en = false, cf = false;
+                    let hasWr = false, hasEn = false, hasCf = false;
+                    const dpVal = this.ctx.allocLocal(`__dp_val_${this.nextLabelId()}`);
+                    const dpGet = this.ctx.allocLocal(`__dp_get_${this.nextLabelId()}`);
+                    const dpSet = this.ctx.allocLocal(`__dp_set_${this.nextLabelId()}`);
+                    this.vm.movImm64(VReg.RET, 0x7ffb000000000000n);   // undefined
+                    this.vm.store(VReg.FP, dpVal, VReg.RET);
+                    this.vm.store(VReg.FP, dpGet, VReg.RET);
+                    this.vm.store(VReg.FP, dpSet, VReg.RET);
                     if (desc && desc.type === "ObjectExpression") {
                         for (const p of desc.properties) {
                             if (!p.key) continue;
                             const kn = p.key.name || p.key.value;
-                            if (kn === "get") getterNode = p.value;
-                            else if (kn === "set") setterNode = p.value;
-                            else if (kn === "value") { valueNode = p.value; hasValue = true; }
-                            else if (kn === "writable") wr = !!(p.value && p.value.type === "Literal" && p.value.value === true);
-                            else if (kn === "enumerable") en = !!(p.value && p.value.type === "Literal" && p.value.value === true);
-                            else if (kn === "configurable") cf = !!(p.value && p.value.type === "Literal" && p.value.value === true);
+                            if (kn === "get") {
+                                getterNode = p.value;
+                                this.compileExpression(p.value);
+                                this.vm.store(VReg.FP, dpGet, VReg.RET);
+                            } else if (kn === "set") {
+                                setterNode = p.value;
+                                this.compileExpression(p.value);
+                                this.vm.store(VReg.FP, dpSet, VReg.RET);
+                            } else if (kn === "value") {
+                                valueNode = p.value; hasValue = true;
+                                this.compileExpression(p.value);
+                                this.vm.store(VReg.FP, dpVal, VReg.RET);
+                            } else if (kn === "writable") {
+                                hasWr = true;
+                                wr = !!(p.value && p.value.type === "Literal" && p.value.value === true);
+                            } else if (kn === "enumerable") {
+                                hasEn = true;
+                                en = !!(p.value && p.value.type === "Literal" && p.value.value === true);
+                            } else if (kn === "configurable") {
+                                hasCf = true;
+                                cf = !!(p.value && p.value.type === "Literal" && p.value.value === true);
+                            }
                         }
                     }
+                    const hasGet = getterNode != null;
+                    const hasSet = setterNode != null;
                     const dpAttr = (wr ? 1 : 0) | (en ? 2 : 0) | (cf ? 4 : 0);
+                    // 存在位:HAS_VALUE=1 HAS_WRITABLE=2 HAS_ENUMERABLE=4 HAS_CONFIGURABLE=8
+                    // HAS_GET=16 HAS_SET=32;打包参 A5 = (mask<<8) | dpAttr。
+                    const dpMask = (hasValue ? 1 : 0) | (hasWr ? 2 : 0) | (hasEn ? 4 : 0) |
+                        (hasCf ? 8 : 0) | (hasGet ? 16 : 0) | (hasSet ? 32 : 0);
+                    const dpPacked = (dpMask << 8) | dpAttr;
 
-                    if (getterNode || setterNode) {
-                        // accessor:24B {TYPE_GETTER@0, getter@8, setter@16}
-                        const TYPE_GETTER = 60;
-                        const dpMark = this.ctx.allocLocal(`__dp_mark_${this.nextLabelId()}`);
-                        this.vm.movImm(VReg.A0, 24);
-                        this.vm.call("_alloc");
-                        this.vm.store(VReg.FP, dpMark, VReg.RET);
-                        this.vm.movImm(VReg.V1, TYPE_GETTER);
-                        this.vm.store(VReg.RET, 0, VReg.V1);
-                        this.vm.movImm(VReg.V1, 0);
-                        this.vm.store(VReg.RET, 8, VReg.V1);
-                        this.vm.store(VReg.RET, 16, VReg.V1);
-                        if (getterNode) {
-                            this.compileExpression(getterNode);       // 装箱闭包
-                            this.vm.emitMaskLoad(VReg.V1);
-                            this.vm.andMaskReg(VReg.V0, VReg.RET, VReg.V1);   // 脱壳裸指针
-                            this.vm.load(VReg.V1, VReg.FP, dpMark);
-                            this.vm.store(VReg.V1, 8, VReg.V0);
-                        }
-                        if (setterNode) {
-                            this.compileExpression(setterNode);
-                            this.vm.emitMaskLoad(VReg.V1);
-                            this.vm.andMaskReg(VReg.V0, VReg.RET, VReg.V1);
-                            this.vm.load(VReg.V1, VReg.FP, dpMark);
-                            this.vm.store(VReg.V1, 16, VReg.V0);
-                        }
-                        this.vm.load(VReg.A2, VReg.FP, dpMark);        // value = 标记裸指针
-                    } else {
-                        // data 描述符:value(缺省 undefined)
-                        if (hasValue) {
-                            this.compileExpression(valueNode);
-                        } else {
-                            this.vm.movImm64(VReg.RET, 0x7ffb000000000000n); // was lea+load _js const
-                        }
-                        this.vm.mov(VReg.A2, VReg.RET);
-                    }
                     this.vm.load(VReg.A0, VReg.FP, dpObj);
                     this.vm.load(VReg.A1, VReg.FP, dpKey);
-                    this.vm.call("_object_define");
-                    // [#61 P2] 落 per-property attrs(defineProperty 缺省全 false,与普通
-                    // 赋值的全 true 相区别)。materialize flags + 置 EXT_HASFLAGS 迫 IC 慢路。
-                    this.vm.load(VReg.A0, VReg.FP, dpObj);
-                    this.vm.load(VReg.A1, VReg.FP, dpKey);
-                    this.vm.movImm(VReg.A2, dpAttr);
-                    this.vm.call("_object_set_prop_attr");
+                    this.vm.load(VReg.A2, VReg.FP, dpVal);            // value(accessor 下运行时忽略)
+                    this.vm.load(VReg.A3, VReg.FP, dpGet);            // get
+                    this.vm.load(VReg.A4, VReg.FP, dpSet);            // set
+                    this.vm.movImm(VReg.A5, dpPacked);                // (mask<<8)|attr
+                    this.vm.call("_object_define_property");          // 验证/强制/落值/落 attr;返回原对象
                     // defineProperty 返回原对象(proxy 分支在此汇合)
                     this.vm.label(this._dpDoneLabel);
                     this.vm.load(VReg.RET, VReg.FP, dpObj);

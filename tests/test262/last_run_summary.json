@@ -1,6 +1,6 @@
 {
-  "generated": "2026-07-30T16:19:22.506Z",
-  "runnerSha": "a678f85de9783c3dda07f4b3ac2abc83805786dd",
+  "generated": "2026-07-30T17:57:14.754Z",
+  "runnerSha": "39d7e79b15fd835194225ecb0ba01109567c858d",
   "corpusPin": "9e61c12835c5e4a3bdba93850427e6742c4f64c4",
   "config": {
     "corpus": ".test262-corpus",
@@ -46,18 +46,18 @@
   "eligible": 32310,
   "run": 6462,
   "totals": {
-    "PASS": 2836,
-    "FAIL": 3401,
+    "PASS": 2879,
+    "FAIL": 3347,
     "COMPILE_FAIL": 69,
-    "CRASH": 156
+    "CRASH": 167
   },
-  "passRatePct": 43.89,
+  "passRatePct": 44.55,
   "byArea": {
     "built-ins/Array": {
-      "PASS": 284,
-      "FAIL": 289,
+      "PASS": 278,
+      "FAIL": 294,
       "COMPILE_FAIL": 0,
-      "CRASH": 21
+      "CRASH": 22
     },
     "built-ins/Boolean": {
       "PASS": 1,
@@ -90,16 +90,16 @@
       "CRASH": 1
     },
     "built-ins/Object": {
-      "PASS": 316,
-      "FAIL": 357,
+      "PASS": 366,
+      "FAIL": 305,
       "COMPILE_FAIL": 0,
-      "CRASH": 9
+      "CRASH": 11
     },
     "built-ins/Promise": {
-      "PASS": 51,
-      "FAIL": 80,
+      "PASS": 50,
+      "FAIL": 76,
       "COMPILE_FAIL": 6,
-      "CRASH": 8
+      "CRASH": 13
     },
     "built-ins/RegExp": {
       "PASS": 133,
@@ -115,9 +115,9 @@
     },
     "built-ins/String": {
       "PASS": 78,
-      "FAIL": 164,
+      "FAIL": 163,
       "COMPILE_FAIL": 1,
-      "CRASH": 1
+      "CRASH": 2
     },
     "built-ins/Symbol": {
       "PASS": 4,
@@ -133,9 +133,9 @@
     },
     "language/expressions": {
       "PASS": 990,
-      "FAIL": 926,
+      "FAIL": 924,
       "COMPILE_FAIL": 30,
-      "CRASH": 59
+      "CRASH": 61
     },
     "language/statements": {
       "PASS": 806,
@@ -147,15 +147,15 @@
   "topFailPatterns": [
     {
       "pattern": "FAIL: assertion mismatch (Test262Error / wrong value)",
-      "count": 1881
+      "count": 1849
     },
     {
       "pattern": "FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)",
-      "count": 463
+      "count": 444
     },
     {
       "pattern": "FAIL: async ($DONE not signalled / promise rejected)",
-      "count": 420
+      "count": 418
     },
     {
       "pattern": "FAIL: negative test wrong outcome (phase=parse)",
@@ -166,12 +166,12 @@
       "count": 147
     },
     {
-      "pattern": "FAIL: array contents mismatch (compareArray)",
-      "count": 111
+      "pattern": "CRASH: run signal SIGSEGV",
+      "count": 115
     },
     {
-      "pattern": "CRASH: run signal SIGSEGV",
-      "count": 105
+      "pattern": "FAIL: array contents mismatch (compareArray)",
+      "count": 110
     },
     {
       "pattern": "COMPILE_FAIL: asm.js could not compile (unsupported syntax / parser gap)",
@@ -187,7 +187,7 @@
     },
     {
       "pattern": "CRASH: run signal SIGBUS",
-      "count": 16
+      "count": 17
     },
     {
       "pattern": "FAIL: negative test wrong outcome (phase=runtime)",
