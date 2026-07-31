@@ -1,6 +1,6 @@
 {
-  "generated": "2026-07-31T04:38:44.260Z",
-  "runnerSha": "687ad708dc32cad2a47368b3719ad9eac0f1254e",
+  "generated": "2026-07-31T05:39:08.636Z",
+  "runnerSha": "d5bbfc3cb7f4c115d9cedbe51cd43a9d7cbb887f",
   "corpusPin": "9e61c12835c5e4a3bdba93850427e6742c4f64c4",
   "config": {
     "corpus": ".test262-corpus",
@@ -46,12 +46,12 @@
   "eligible": 32310,
   "run": 6462,
   "totals": {
-    "PASS": 2892,
-    "FAIL": 3335,
+    "PASS": 2893,
+    "FAIL": 3334,
     "COMPILE_FAIL": 69,
     "CRASH": 166
   },
-  "passRatePct": 44.75,
+  "passRatePct": 44.77,
   "byArea": {
     "built-ins/Array": {
       "PASS": 278,
@@ -90,8 +90,8 @@
       "CRASH": 1
     },
     "built-ins/Object": {
-      "PASS": 378,
-      "FAIL": 293,
+      "PASS": 379,
+      "FAIL": 292,
       "COMPILE_FAIL": 0,
       "CRASH": 11
     },
@@ -147,7 +147,7 @@
   "topFailPatterns": [
     {
       "pattern": "FAIL: assertion mismatch (Test262Error / wrong value)",
-      "count": 1838
+      "count": 1837
     },
     {
       "pattern": "FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)",
@@ -167,7 +167,7 @@
     },
     {
       "pattern": "CRASH: run signal SIGSEGV",
-      "count": 115
+      "count": 116
     },
     {
       "pattern": "FAIL: array contents mismatch (compareArray)",
@@ -187,7 +187,7 @@
     },
     {
       "pattern": "CRASH: run signal SIGBUS",
-      "count": 16
+      "count": 15
     },
     {
       "pattern": "FAIL: negative test wrong outcome (phase=runtime)",

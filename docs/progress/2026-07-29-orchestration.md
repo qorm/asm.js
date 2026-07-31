@@ -199,7 +199,7 @@
 
 ## 11. 后续演进待办（按优先级）
 
-0. **~~Object 杠杆~~（v0.3.6 强制 → v0.3.7 补全 → v0.3.8 枚举修复，见 §13/§14/§15）**：built-ins/Object 46.3% → 53.7% → 55.0% → **55.4%**（v0.3.8）；整体 43.89% → 44.55% → 44.69% → **44.75%**。v0.3.8 修复 Object.keys 对奇异包装对象（RegExp/new String）过度枚举，收回 v0.3.7 暴露的 3 个 wrapper-as-map 损失。**Object 杠杆仍剩**：①gOPD 对数组 length/下标、全局对象、内建构造器的覆盖（~25 FAIL + 内建反射；并可把 RegExp source/flags 等移到 prototype 以对齐 gOPN 的 `["lastIndex"]`）；②`new String` 自有可枚举索引字符（`Object.keys(new String("hi"))` 应为 `["0","1"]`）；③`JSON.stringify(new String(...))` 应序列化为原始字符串。
+0. **~~Object 杠杆~~（v0.3.6 强制 → v0.3.7 补全 → v0.3.8 枚举 → v0.3.9 gOPD 数组，见 §13–§16）**：built-ins/Object 46.3% → 53.7% → 55.0% → 55.4% → **55.6%**（v0.3.9）；整体 43.89% → 44.55% → 44.69% → 44.75% → **44.77%**。v0.3.9 gOPD 支持数组（length/索引/侧表具名/arguments）+ undefined/null 抛 TypeError。**Object 杠杆仍剩（按价值）**：①**【下一步·最高价值】内建构造器具现为运行时对象**（Date 优先 ~50 翻转，再 Object/Array/Function/Number/Boolean/Error/JSON 及其 prototype，~100+；复用 Math 具现模板）——根因是 `typeof Object` 为 "number"（members.js:1159-1173 哨兵 1/2/3），gOPD 目录 179 FAIL 的大头与 ~673 个 verifyProperty 用例系于此；②全局对象具现 + 顶层 `this`（11 直接 + 大量 ES5 `var global=this`）；③函数 "length" 经运行时 gOPD 路径返 undefined（内联快路可用）+ 函数 "prototype" 自有属性/attr；④`new String` 索引字符 + length attr + `JSON.stringify(new String)`；⑤原语字符串/TypedArray 元素描述符；⑥RegExp source/flags 移到 prototype 以对齐 gOPN 的 `["lastIndex"]`。
 1. **looksLikeCjsSource 运行期 CJS 误判（P2，既有，Wave 4 暴露）**：复用朴素 `cjsHasEsmSyntax`，注释/字符串/模板/正则里含 “export ”/“import ” 文字的 CJS 被判为非 CJS、不做 CJS 包装，`import` 之运行期崩 `FATAL: _object_set called with NULL object`（Node 正常执行）。HEAD 逐字相同、与 Wave 4 无关；Wave 4 仅解除编译期误杀使其显形。彻底修复需把 CJS 检测改 AST/词法感知（与 Wave 4 的 `astHasRealTopLevelEsm` 同源思路）。
 2. **resolvePackageSpecifier 损坏 package.json 静默丢弃（P2，既有）**：`compiler/index.js:3837-3838` 对损坏 JSON `catch return ""`，经包说明符的导入被静默丢弃、编译成功（Node 抛 ERR_INVALID_PACKAGE_CONFIG）。与 `nearestPackageJsonExplicitCommonjs` 的抛错路径不一致。
 3. **--static 端到端 codegen 缺陷（P2，既有）**：含导出函数的程序 `--static` 在 `asm/arm64.js:1603` 报 “Unknown label: _js_add”（在 writeStaticLibrary 之前）。C_INTEROP_DESIGN.md B4 已登记。修复须过完整门禁。
@@ -241,6 +241,8 @@ P1/P2 残留：enumerable 变更与 accessor get/set 恒等未强制（漏拒）
 - 2026-07-30：Wave 7 主控独立差分 25 例与 Node 全一致（四处缺口 + P0 误拒守卫 + SameValue 边角），fixtures `385/0/0/0`；门禁绿（`gen1==gen2==gen3` + 385）。test262 44.55% → **44.69%（2888，+9）**、built-ins/Object 53.7% → **55.0%（375，+9）**。净 +9 = +12 − 3：3 个损失（create/15.2.3.5-4-35、defineProperties/15.2.3.7-5-b-241/-246）由**既有** `Object.keys` 对奇异对象（RegExp/`new String()` 内部槽）过度枚举 bug 被本次正确收紧的“描述符须对象”校验暴露（基线仅因旧宽松路静默忽略侥幸通过），列为下一目标。**发布 v0.3.7 并推送**。
 - 2026-07-31：Wave 8 修复 `Object.keys` 对奇异包装对象过度枚举。根因：RegExp（`__regexp_shim` 的 `__RE_new`）与 `new String` 包装把内部槽存为默认可枚举自有属性、无 flags 表（flags_ptr==0 → 全枚举），而枚举行走器本就遵循 ATTR_ENUMERABLE。修复在构造时标内部槽不可枚举：RegExp shim 对 16 槽各 `Object.defineProperty {writable,non-enumerable,configurable}`；`new String` codegen 对 `__value`/`length` 发 `_object_set_attr`（attr=5）；`_object_assign` 补 ATTR_ENUMERABLE 过滤。
 - 2026-07-31：Wave 8 主控独立差分 27 例与 Node 全一致（枚举 + RegExp/String 功能 + create/defineProperties 机制），fixtures `385/0/0/0`，门禁绿（`gen1==gen2==gen3` + 385）。test262 44.69% → **44.75%（2892，+4）**、built-ins/Object 55.0% → **55.4%（378，+3）**——收回 v0.3.7 暴露的 3 个 wrapper-as-properties-map 用例（create/15.2.3.5-4-35、defineProperties/...-241/-246）。**发布 v0.3.8 并推送**。
+- 2026-07-31：Wave 9 gOPD 数组支持 + undefined/null 抛 TypeError。调查发现 gOPD 目录实为 **131 PASS / 179 FAIL**（远超此前 ~25 的步进采样估计），且更深根因是**内建构造器非运行时对象**（`typeof Object` 为 "number"，仅 Math 经特化具现）。本波先做最低风险的运行时增量：`runtime/types/object/index.js` 的 `_object_getOwnPropertyDescriptor` 新增 `TYPE_ARRAY` 分支（按规范合成 length / 索引元素 / 侧表具名描述符，arguments 同覆盖）+ 序言对 undefined/null 目标抛 TypeError。纯新增 +104 行、零改既有指令。
+- 2026-07-31：Wave 9 主控独立差分 24 例与 Node 全一致（数组 length/索引/越界/非规范/具名、arguments、undefined/null 抛 TypeError、num/bool 不抛 + plain-object/function/Math 回归守卫），fixtures `385/0/0/0`，门禁绿（`gen1==gen2==gen3` + 385）。test262 44.75% → **44.77%（2893，+1）**、built-ins/Object 55.4% → **55.6%（379，+1）**、gOPD 目录 stride-1 131 → 134（+3）。两处既有残留（纯新增未触、非本波引入）：`gOPD(函数变量,"length")` 经运行时路径返 undefined、`new String` length attr 偏差。**发布 v0.3.9 并推送**。下一步：内建构造器具现（Date 优先 ~50 翻转）+ 全局对象/顶层 this。
 
 ### 12.4 重做设计（字段存在位掩码）
 
@@ -303,3 +305,17 @@ P1/P2 残留：enumerable 变更与 accessor get/set 恒等未强制（漏拒）
 | 发布 | 达成 | v0.3.8 已推送（branch dev + tag） |
 
 延期项（列 §11）：①gOPD 对数组/全局/内建覆盖（并把 RegExp source/flags 移到 prototype 以对齐 gOPN 的 `["lastIndex"]`）；②`new String` 自有可枚举索引字符；③`JSON.stringify(new String(...))` 序列化为原始字符串。
+
+## 16. Wave 9 结果（gOPD 数组支持 + undefined/null TypeError，v0.3.9）
+
+调查发现 gOPD 目录实为 131 PASS / 179 FAIL（步进采样曾低估为 ~25）；更深根因是内建构造器非运行时对象（`typeof Object` 为 "number"，仅 Math 具现）。本波做最低风险的运行时增量。
+
+| 项 | 状态 | 证据 |
+|---|---|---|
+| TYPE_ARRAY gOPD 分支（length / 索引 / 侧表具名 / arguments） | 达成 | `gOPD([1,2,3],"length")`={v:3,w:true,e:false,c:false}；"0"={v:1,w,e,c}；越界/非规范键 undefined；`a.foo=9` 具名描述符；arguments "0" 受理 |
+| gOPD 序言 undefined/null 目标抛 TypeError | 达成 | `gOPD(undefined/null,"x")` 抛 TypeError；num/bool 不抛（与 Node 一致） |
+| 完整 bootstrap gate | 达成 | `gen1==gen2==gen3` 逐字节 + fixtures `385/0/0/0`（纯新增 +104 行、零改既有指令） |
+| test262 | 达成 | 整体 44.75% → **44.77%**（2893，+1）；Object 55.4% → **55.6%**（379，+1）；gOPD 目录 stride-1 131 → 134（+3） |
+| 发布 | 达成 | v0.3.9 已推送（branch dev + tag） |
+
+既有残留（纯新增未触，列 §11）：`gOPD(函数变量,"length")` 运行时路径返 undefined；`new String` length attr 偏差；原语字符串/TypedArray 元素描述符；内建构造器/全局 gOPD 覆盖（下一步最高价值）。

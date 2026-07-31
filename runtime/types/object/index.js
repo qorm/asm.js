@@ -6084,6 +6084,16 @@ export class ObjectGenerator {
         vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
         vm.mov(VReg.S0, VReg.A0); // obj boxed
         vm.mov(VReg.S1, VReg.A1); // key boxed
+        // [ToObject] 目标 null(0x7FFA)/undefined(0x7FFB)→ TypeError(ES 20.1.2.8 step 1,
+        // 先于 ToPropertyKey;node: "Cannot convert undefined or null to object")。其余原语
+        // (数值 0x7FF8/裸 float 位、布尔 0x7FF9、字符串 0x7FFC、symbol)继续下行:脱壳后 payload
+        // 为 0 或 < ptrFloor(数值/布尔)→ undefined,或类型字节不受理(字符串块)→ undefined,
+        // 皆不抛(与 node 一致:仅 null/undefined 抛)。
+        vm.shrImm(VReg.V1, VReg.S0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFA);
+        vm.jeq("_ogopd_nullish");
+        vm.cmpImm(VReg.V1, 0x7FFB);
+        vm.jeq("_ogopd_nullish");
         // [ToPropertyKey] 复用下标读写同一归一器:数值/布尔/null/undefined/对象 → 字符串键,
         // 字符串/symbol 原样。此前 gOPD 直接拿原始装箱值比键,gOPD(o, 1)/gOPD(o, undefined)
         // 恒返 undefined(ES 20.1.2.8 step 2 = ToPropertyKey(P))。
@@ -6105,6 +6115,8 @@ export class ObjectGenerator {
         vm.loadByte(VReg.V1, VReg.S2, 0);
         vm.cmpImm(VReg.V1, TYPE_OBJECT);
         vm.jeq("_ogopd_obj");
+        vm.cmpImm(VReg.V1, 1); // TYPE_ARRAY (allocator.js) — 数组头非对象布局,见 _ogopd_arr
+        vm.jeq("_ogopd_arr");
         vm.cmpImm(VReg.V1, 3); // TYPE_FUNCTION (classinfo) — same layout as TYPE_OBJECT
         vm.jeq("_ogopd_obj");
         vm.cmpImm(VReg.V1, TYPE_PROXY);
@@ -6221,6 +6233,98 @@ export class ObjectGenerator {
         vm.label("_ogopd_undef");
         vm.lea(VReg.RET, "_js_undefined");
         vm.load(VReg.RET, VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
+
+        // [ToObject] null/undefined 目标 → TypeError(不返回)。消息装箱同 _object_gopn_nullish /
+        // _object_getPrototypeOf_nullish 的既有形态(数据段字面量掩码 + 0x7FFC 串 tag)。
+        vm.label("_ogopd_nullish");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot convert undefined or null to object"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error"); // 不返回
+
+        // ===== [arr] TYPE_ARRAY 自有属性描述符(S2=裸数组头, S1=已归一装箱键, S0=原装箱值)=====
+        // 数组头 32 字节 {type@0, length@8, capacity@16, data_ptr@24},无 props_ptr@32——绝不能
+        // 落 _ogopd_obj 按对象头遍历(把 capacity 当 count、[头+32] 当 props_ptr 解引用垃圾)。
+        // ES 数组自有属性三分:
+        //   "length" → 数据描述符 {value:len, writable:true, enumerable:false, configurable:false}
+        //              (attr = ATTR_WRITABLE = 1,node 实测形状);
+        //   规范数值索引键(CanonicalNumericIndexString;判据复用 _canonical_array_index,与
+        //   _object_set_array :2396 / _subscript_get_strkey :388 读写同裁决)且 idx<length →
+        //   元素描述符 {value:elem, writable+enumerable+configurable 全真}(attr = ATTR_DEFAULT = 7);
+        //   idx>=length(越界)→ undefined;
+        //   其余键(具名 a.foo=9 / symbol / .raw)→ 闭包属性侧表(写侧 _object_set_fnprops →
+        //   _closure_prop_set 同一张表;查法与 _ogopd_fn_side :6312 相同:_closure_props_find +
+        //   递归描述 props 对象)。
+        // arguments 也是 TYPE_ARRAY,本分支同样受理(gOPD(arguments,"0"))。
+        // 描述符构建复用 _ogopd_data 尾段(S5=value, [SP+0]=desc, [SP+32]=attr);其 classinfo
+        // 判定读 [S2+0] 类型字节,数组=1≠3 恒跳过,无旁路。
+        vm.label("_ogopd_arr");
+        // 非字符串键(symbol 等)不做内容比较,直落侧表(_object_key_eq 对非串键虽不误判,
+        // 但省一次 call 且语义更直白)。
+        vm.shrImm(VReg.V0, VReg.S1, 48);
+        vm.cmpImm(VReg.V0, 0x7FFC);
+        vm.jne("_ogopd_arr_side");
+        // "length" 内容比较:复用驻留常量 _str_length_prop + _object_key_eq(动态拼出的
+        // "length" 也认),同 _subscript_get_named :411-415。
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.V0, "_str_length_prop");
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.V0, VReg.V1); // 装箱字符串键 "length"
+        vm.call("_object_key_eq"); // 内容比较;S0-S3 由其 prologue 保活
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_ogopd_arr_len");
+        // 规范数值索引键?
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_canonical_array_index"); // RET = idx(0..2^32-2) / -1(非索引);不写 S2-S5
+        vm.mov(VReg.S3, VReg.RET); // 先取走 idx(x64 上 V0≡RET,下方 movImm64 会冲)
+        vm.movImm64(VReg.V1, 0xFFFFFFFFFFFFFFFFn);
+        vm.cmp(VReg.S3, VReg.V1);
+        vm.jeq("_ogopd_arr_side"); // 非索引字符串键("foo"/"01"/"1.0"/"-0"…)→ 侧表
+        vm.load(VReg.V0, VReg.S2, 8); // length
+        vm.cmp(VReg.S3, VReg.V0);
+        vm.jge("_ogopd_undef"); // 越界 → undefined(node 语义,同 _array_get :198-200)
+        // 元素读(内联 _array_get :202-206 读式): data_ptr + idx*8
+        vm.load(VReg.V1, VReg.S2, 24); // data_ptr
+        vm.shl(VReg.V0, VReg.S3, 3);
+        vm.add(VReg.V0, VReg.V1, VReg.V0);
+        vm.load(VReg.S5, VReg.V0, 0); // 元素值
+        vm.call("_object_new"); // RET = 裸描述符对象(保 S0/S1;S2-S5 其体内不写)
+        vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+        vm.or(VReg.V0, VReg.RET, VReg.V1);
+        vm.store(VReg.SP, 0, VReg.V0); // desc boxed
+        vm.movImm(VReg.V2, ATTR_DEFAULT); // 7 = writable+enumerable+configurable
+        vm.store(VReg.SP, 32, VReg.V2); // attr
+        vm.jmp("_ogopd_data");
+
+        // "length":value = 长度装箱成 canonical number(float64 位模式,同 _object_get_str_named
+        // :808-811 与 _subscript_get_named_len :426-429);attr = ATTR_WRITABLE(仅 writable 真)。
+        vm.label("_ogopd_arr_len");
+        vm.load(VReg.V0, VReg.S2, 8); // length
+        vm.scvtf(0, VReg.V0);
+        vm.fmovToInt(VReg.RET, 0);
+        vm.mov(VReg.S5, VReg.RET); // value = JS number
+        vm.call("_object_new");
+        vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+        vm.or(VReg.V0, VReg.RET, VReg.V1);
+        vm.store(VReg.SP, 0, VReg.V0); // desc boxed
+        vm.movImm(VReg.V2, ATTR_WRITABLE); // 1 = 仅 writable
+        vm.store(VReg.SP, 32, VReg.V2); // attr
+        vm.jmp("_ogopd_data");
+
+        // 具名/symbol 自有属性:闭包属性侧表(与 _object_set 数组具名写 _closure_prop_set 同表,
+        // 键是裸数组指针,故传装箱/裸均可——_closure_props_find 内部脱壳)。无侧表/键 miss →
+        // undefined;命中 → 递归描述 props 对象(TYPE_OBJECT,不会再落本分支,无环)。
+        vm.label("_ogopd_arr_side");
+        vm.mov(VReg.A0, VReg.S0); // 原装箱数组(或裸指针)
+        vm.call("_closure_props_find"); // RET = props(装箱 0x7FFD)/undefined
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_ogopd_undef");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_getOwnPropertyDescriptor");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
 
         // ===== Proxy getOwnPropertyDescriptor 陷阱(S2=裸 proxy, S1=装箱键)=====
