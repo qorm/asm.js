@@ -199,7 +199,7 @@
 
 ## 11. 后续演进待办（按优先级）
 
-0. **~~Object/内建杠杆~~（v0.3.6 强制 → v0.3.7 补全 → v0.3.8 枚举 → v0.3.9 gOPD 数组 → v0.3.10 Date 具现，见 §13–§17）**：built-ins/Object 46.3% → 53.7% → 55.0% → 55.4% → 55.6% → **56.9%**（v0.3.10）；整体 43.89% → 44.55% → 44.69% → 44.75% → 44.77% → **44.91%**。v0.3.10 具现 Date（typeof Date=function、Date.prototype 真对象、gOPD 反射静态方法与原型方法、泛型 .call）。**仍剩（按价值）**：①**Date 加固**（修 11 个边角 SIGSEGV：`_aref_date_*` 加 this 类型检查改抛 TypeError、setter 实参 ToNumber 强转、Symbol.toPrimitive、扩展年份 toString、`class extends Date` 子类化）；②**其余内建构造器具现**（Object/Array/Function/Number/Boolean/Error/JSON + prototype，~100+，复用 Date/Math 模板；`typeof Object` 仍为 "number"）；③全局对象具现 + 顶层 `this`；④函数 length 运行时 gOPD 路径 + 函数 prototype 自有属性/attr；⑤`new String` 索引字符 + length attr + `JSON.stringify(new String)`；⑥原语字符串/TypedArray 元素描述符；⑦RegExp source/flags 移到 prototype 以对齐 gOPN。
+0. **~~Object/内建杠杆~~（v0.3.6 强制 → v0.3.7 补全 → v0.3.8 枚举 → v0.3.9 gOPD 数组 → v0.3.10 Date 具现，见 §13–§17）**：built-ins/Object 46.3% → 53.7% → 55.0% → 55.4% → 55.6% → **56.9%**（v0.3.10）；整体 43.89% → 44.55% → 44.69% → 44.75% → 44.77% → 44.91% → **45.90%**（v0.3.11 解析器早期错误 SAFE 层 +64，集中 language/）。v0.3.10 具现 Date。**距 70% 还需 ~+24pp（~1560 翻转）**。**下一步杠杆（按 翻转/难度）**：①**【最高价值】内建函数一等化**（Lever 1，~250-320：`typeof fn` → "function"、`.apply/.call/.bind` 可用；`typeof Object` 仍为 "number"，最跨目录根因，解锁 name/length 与大量 typeof 首断言）；②**内建函数 name/length 自有属性**（Lever 2，~150-200，依赖①，附加低风险）；③**补全解析器早期错误**（类别 A 对象模式绑定点 + Tier 2/3，~187+）；④**缺失内建方法 + String 迭代/Symbol 协议**（Lever 4，~150-230）；⑤**Date 加固**（修 11 个边角 SIGSEGV：`_aref_date_*` this 类型检查、setter 实参强转、Symbol.toPrimitive、扩展年份 toString、`class extends Date`）；⑥其余内建构造器具现（Object/Array/Function/Number/Boolean/Error/JSON + prototype，复用 Date/Math 模板）；⑦全局对象具现 + 顶层 `this`；⑧`new String` 索引字符 + `JSON.stringify(new String)`；⑨原语字符串/TypedArray 元素描述符；⑩RegExp source/flags 移到 prototype 以对齐 gOPN；⑪**突发完成传播 + TDZ**（Lever 5，~400-570，最高但最难/最高风险）；⑫async fn/generator/for-await-of。**说明**：top 5-6 杠杆约到 58-63%；70% 需 ~12 簇含至少一个硬语义杠杆 + async 进展。
 1. **looksLikeCjsSource 运行期 CJS 误判（P2，既有，Wave 4 暴露）**：复用朴素 `cjsHasEsmSyntax`，注释/字符串/模板/正则里含 “export ”/“import ” 文字的 CJS 被判为非 CJS、不做 CJS 包装，`import` 之运行期崩 `FATAL: _object_set called with NULL object`（Node 正常执行）。HEAD 逐字相同、与 Wave 4 无关；Wave 4 仅解除编译期误杀使其显形。彻底修复需把 CJS 检测改 AST/词法感知（与 Wave 4 的 `astHasRealTopLevelEsm` 同源思路）。
 2. **resolvePackageSpecifier 损坏 package.json 静默丢弃（P2，既有）**：`compiler/index.js:3837-3838` 对损坏 JSON `catch return ""`，经包说明符的导入被静默丢弃、编译成功（Node 抛 ERR_INVALID_PACKAGE_CONFIG）。与 `nearestPackageJsonExplicitCommonjs` 的抛错路径不一致。
 3. **--static 端到端 codegen 缺陷（P2，既有）**：含导出函数的程序 `--static` 在 `asm/arm64.js:1603` 报 “Unknown label: _js_add”（在 writeStaticLibrary 之前）。C_INTEROP_DESIGN.md B4 已登记。修复须过完整门禁。
@@ -246,6 +246,8 @@ P1/P2 残留：enumerable 变更与 accessor get/set 恒等未强制（漏拒）
 - 2026-07-31：Wave 10 具现 Date 内建为真运行时对象（闭包构造器模板，仿 String/RegExp）。新增 emitDateCtorObject/emitDateProtoObject（members.js +248）+ `_date_call` 与 `_aref_date_*` 装箱包装（runtime/types/date/index.js +120）+ 闭包属性 attr 工作（`_closure_props_ensure` + `_object_set_prop_attr`，object/index.js +17）。裸 Date 标识符与 Date.prototype 读取作晚分支接入，四条按名语法快路（静态调用/方法派发/new Date/instanceof）不受影响。
 - 2026-07-31：Wave 10 主控独立差分 25 例与 Node 全一致（typeof Date=function、typeof Date.prototype=object、identity、gOPD(Date, now/parse/prototype)、gOPD(Date.prototype, getTime)、泛型 .call、全部既有 Date 回归守卫 instanceof/Date.now/getters/setters/parse/UTC/valueOf）。fixtures `385/0/0/0`，门禁绿（`gen1==gen2==gen3`）。test262（整体 stride-5）44.77% → **44.91%（2902，+9）**、built-ins/Object 55.6% → **56.9%（388，+9）**、built-ins/Date（单独非计分）24/117 → 39/117（+15）。
 - 2026-07-31：Wave 10 已知残留（built-ins/Date 非计分子集）：经 prototype 现可达的 **11 个边角 SIGSEGV**——5× 非对象 this（`_aref_date_*` 无防护读 `[this+8]`，本应抛 TypeError：getDate/getMinutes/getUTCDate/getUTCMinutes/setSeconds/setFullYear 的 this-value-non-object）、2× setter 实参 ToNumber 强转（setHours/arg-ms、setSeconds/arg-sec）、1× Symbol.toPrimitive/called-as-function、1× toString/negative-year（扩展年份格式）、1× subclassing（class extends Date）。具现前 Date.prototype 为 undefined，这些测试在 undefined 上抛预期 TypeError 计 PASS；具现后可调用方法在边角输入上崩溃。列 Date 加固波次。**发布 v0.3.10 并推送**。注：本波实施 agent 因 token-plan 5 小时配额耗尽（429，07-31 09:00 UTC 重置）于验证途中终止，主控自行完成差分/fixtures/门禁验证与发布；配额恢复前暂停子代理波次。
+- 2026-07-31：Wave 11 解析器早期错误强制（Lever 3 SAFE 层）。主人指示“继续一直到 70% 能才停”。先做 FAIL 模式分析（top 杠杆排序 + 距 70% 缺口分析），再实现解析器早期错误安全层（附加 `this.errors.push`，按阶段计分）：D rest 尾逗号、F 类 constructor/prototype 命名、E 类私有名校验、B use-strict 非简单形参（箭头+对象方法）、C 严格重复形参（扩展继承严格）、G 杂项语法、A 严格/上下文保留字作绑定（含转义、eval/arguments）。类别 A 因实施 agent token 配额（再次 429，重置 14:01 UTC）途中截断（对象模式绑定点部分未完成）；主控补 eval/arguments 严格绑定检查并验证严格门控正确（严格拒 public/eval/arguments/重复形参，sloppy 允许 yield/f(a,a)）。
+- 2026-07-31：Wave 11 验证：完整 test262 44.91% → **45.90%（2966，+64，集中 language/：expressions 990→1024、statements 806→836）**，**零 PASS→COMPILE_FAIL 误拒**；fixtures 385/0/0/0；门禁绿（gen1==gen2==gen3）。**发布 v0.3.11 并推送**。剩余早期错误（Tier 2/3 + 类别 A 对象模式绑定点）与其余杠杆列 §11。
 
 ### 12.4 重做设计（字段存在位掩码）
 
@@ -349,3 +351,19 @@ Date 由哨兵数值（typeof "number"）具现为真闭包构造器对象（仿
 具现前 Date.prototype 为 undefined，这些测试在 undefined 上抛预期 TypeError 计 PASS；具现后可调用方法在边角输入上崩溃。修复方向：`_aref_date_*` 加 this 类型检查（非 Date 对象抛 TypeError）、setter 实参强转、Symbol.toPrimitive、扩展年份格式、子类化支持。
 
 实施注：本波实施 agent 因 token-plan 5 小时配额耗尽（429，07-31 09:00 UTC 重置）于验证途中终止；主控自行完成独立差分（25 例与 Node 全一致）、fixtures（385/0/0/0）、门禁（gen1==gen2==gen3）验证与发布。
+
+## 18. Wave 11 结果（解析器早期错误 SAFE 层，v0.3.11）
+
+解析器现拒绝本应为 SyntaxError 的程序（负向 phase=parse，按阶段计分故无需错误构造器）。实现安全层（D/F/E/B/C/G + 部分 A）。
+
+| 项 | 状态 | 证据 |
+|---|---|---|
+| D rest 参数尾逗号 / F 类 constructor·prototype 命名 / E 类私有名校验 | 达成 | `(...a,)`、`class C{'constructor';}`、`class C{#x;#x;}`/`# x` 拒绝 |
+| B use-strict 非简单形参（箭头+对象方法）/ C 严格重复形参（扩展继承严格） | 达成 | `([e])=>{"use strict";}`、`"use strict";function f(a,a){}` 拒绝；sloppy `f(a,a)` 仍合法 |
+| G 杂项语法（coalesce/`**` 混用、重复 `__proto__`、rest 带初始化器） | 达成 | 相应负向测试翻转 |
+| A 严格/上下文保留字作绑定（含转义、eval/arguments） | 部分达成 | 严格拒 public/eval/arguments、yield/await 上下文门控、关键字恒拒、排除属性名（`{ if:1 }` 仍合法）；对象模式绑定点因实施 agent token 配额截断未完成 |
+| 完整 bootstrap gate | 达成 | gen1==gen2==gen3 逐字节 + fixtures 385/0/0/0（零误拒合法程序） |
+| test262 | 达成 | 44.91% → **45.90%**（2966，+64，集中 language/：expressions 990→1024、statements 806→836），零 PASS→COMPILE_FAIL 误拒 |
+| 发布 | 达成 | v0.3.11 已推送（branch dev + tag） |
+
+残留（列 §11 ③）：类别 A 对象模式绑定点（rest/computed/colon/shorthand/shorthand-default 的保留字检查）因实施 agent token 配额（再次 429，重置 07-31 14:01 UTC）途中截断；Tier 2（类 delete 私有/标识符、字段初始化器 ContainsArguments/SuperCall、RegExp `\p{}`/v 校验）与 Tier 3（词法重声明/作用域、语句位词法声明+ASI、break/continue/return 上下文、await/async 上下文）未做。

@@ -1,6 +1,6 @@
 {
-  "generated": "2026-07-31T09:50:01.693Z",
-  "runnerSha": "8cb53a354d00c6cced56c13f3aa46f0164ef510a",
+  "generated": "2026-07-31T16:01:52.474Z",
+  "runnerSha": "10a40a06a773a5b37b3f8b8168d55635a7542849",
   "corpusPin": "9e61c12835c5e4a3bdba93850427e6742c4f64c4",
   "config": {
     "corpus": ".test262-corpus",
@@ -46,12 +46,12 @@
   "eligible": 32310,
   "run": 6462,
   "totals": {
-    "PASS": 2902,
-    "FAIL": 3324,
+    "PASS": 2966,
+    "FAIL": 3260,
     "COMPILE_FAIL": 69,
     "CRASH": 167
   },
-  "passRatePct": 44.91,
+  "passRatePct": 45.9,
   "byArea": {
     "built-ins/Array": {
       "PASS": 278,
@@ -132,14 +132,14 @@
       "CRASH": 3
     },
     "language/expressions": {
-      "PASS": 990,
-      "FAIL": 923,
+      "PASS": 1024,
+      "FAIL": 889,
       "COMPILE_FAIL": 30,
       "CRASH": 62
     },
     "language/statements": {
-      "PASS": 806,
-      "FAIL": 948,
+      "PASS": 836,
+      "FAIL": 918,
       "COMPILE_FAIL": 25,
       "CRASH": 43
     }
@@ -159,7 +159,7 @@
     },
     {
       "pattern": "FAIL: negative test wrong outcome (phase=parse)",
-      "count": 327
+      "count": 263
     },
     {
       "pattern": "FAIL: TypedArray/ArrayBuffer semantics",

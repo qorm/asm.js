@@ -33,6 +33,15 @@ export const ExpressionParser = {
             }
             let infix = this.infixParseFns[this.peekToken.type];
             if (!infix) { this.parseDepth = this.parseDepth - 1; return leftExp; }
+            // [test262 早期错误 G] 后缀 ++/-- 与左操作数之间禁有 LineTerminator(no LineTerminator
+            // here):`i\n++j` 不是 `i++` 而是 ASI 后的 `i; ++j`。curToken 是左操作数末 token,
+            // peekToken 是 ++/--;不同行即停止本表达式(交回语句层按 ASI/前缀解析),不消费 ++。
+            // 仅后缀(中缀)INCREMENT/DECREMENT 受此约束;前缀 ++ 走 prefix 路径不受影响。
+            if ((this.peekToken.type === TokenType.INCREMENT || this.peekToken.type === TokenType.DECREMENT) &&
+                this.curToken.line !== this.peekToken.line) {
+                this.parseDepth = this.parseDepth - 1;
+                return leftExp;
+            }
             this.nextToken();
             leftExp = infix(leftExp);
         }
@@ -313,6 +322,12 @@ export const ExpressionParser = {
     parseBinaryExpression(left) {
         let operator = this.curToken.literal;
         let precedence = this.curPrecedence();
+        // [test262 早期错误 G] `**` 左操作数不得是未加括号的一元表达式:-x ** 2 / !x ** 2 /
+        // typeof x ** 2 / delete o.p ** 2 皆 SyntaxError;(-x) ** 2 与 ++x ** 2(UpdateExpression
+        // 非 UnaryExpression)合法。右操作数允许一元(2 ** -3 合法),故只查 left。
+        if (operator === "**" && left && left.type === "UnaryExpression" && !left._parenthesized) {
+            this.errors.push("Unary operator may not be applied to the left-hand side of '**' without parentheses");
+        }
         this.nextToken();
         // ** 右结合:右操作数用 precedence-1,使 2**3**2 解析为 2**(3**2)=512(非 (2**3)**2=64)。
         const rightPrec = operator === "**" ? precedence - 1 : precedence;
@@ -323,7 +338,19 @@ export const ExpressionParser = {
         let operator = this.curToken.literal;
         let precedence = this.curPrecedence();
         this.nextToken();
-        return new AST.LogicalExpression(operator, left, this.parseExpression(precedence));
+        let right = this.parseExpression(precedence);
+        // [test262 早期错误 G] ?? 不得与 && / || 在无括号时混用(a ?? b && c / a && b ?? c 等)。
+        // 仅当冲突侧操作数是「未加括号」的逻辑表达式(非 parseGroupedOrArrow 产出,无
+        // _logicalGrouped 标记)时报错;(a ?? b) && c / a ?? (b && c) / a ?? b ?? c 皆合法。
+        const isCoalesce = operator === "??";
+        if (isCoalesce || operator === "&&" || operator === "||") {
+            const mixes = (n) => n && n.type === "LogicalExpression" && !n._parenthesized &&
+                (isCoalesce ? (n.operator === "&&" || n.operator === "||") : (n.operator === "??"));
+            if (mixes(left) || mixes(right)) {
+                this.errors.push("Cannot mix '??' with '&&' or '||' without parentheses");
+            }
+        }
+        return new AST.LogicalExpression(operator, left, right);
     },
 
     // [test262 S1 早期错误] 校验赋值/更新左值的 AssignmentTargetType。只拒 node 同样拒绝的
@@ -458,8 +485,14 @@ export const ExpressionParser = {
                 // 经 pushFunctionParam 而非直接 push:rest 模式目标(`(...[a,b]) => …`)
                 // 需要展开出影子参数(见 parser/statements.js 的 pushFunctionParam),
                 // 否则 gather 与 destructure 两步接不上。
-                this.pushFunctionParam(params, this.parseFunctionParam(true));
+                let arrowParam = this.parseFunctionParam(true);
+                this.pushFunctionParam(params, arrowParam);
                 this.nextToken();
+                // [test262 早期错误 D] rest 形参必须末位且不得带尾逗号:`(...a, b) => …` /
+                // `(...a,) => …`。nextToken 后 cur 是分隔符;rest(SpreadElement)后随逗号即非法。
+                if (arrowParam && arrowParam.type === "SpreadElement" && this.curTokenIs(TokenType.COMMA)) {
+                    this.errors.push("Rest parameter must be last formal parameter");
+                }
                 if (this.curTokenIs(TokenType.COMMA)) {
                     this.nextToken();
                     // 尾逗号 (x, y,) =>:逗号后紧跟 ) → 参数列表结束,别把 ) 当形参。
@@ -515,6 +548,10 @@ export const ExpressionParser = {
             }
             return this.parseArrowFunctionBody(p);
         }
+        // [test262 早期错误 G] 标记「括号包裹」的表达式:?? 与 &&/|| 混用、`**` 左操作数禁一元
+        // 等校验都需区分有无括号(括号重置结合性)。下划线前缀 + 布尔值:编译期各 `for..in`
+        // AST 遍历或按 `_` 前缀跳过(compiler/index.js 约定)或因非对象跳过,对 codegen/自举定点零影响。
+        if (expr) expr._parenthesized = true;
         return expr;
     },
 
@@ -523,8 +560,18 @@ export const ExpressionParser = {
         let body,
             isExpression = false;
         if (this.curTokenIs(TokenType.LBRACE)) {
+            // [test262 早期错误 B] 块体箭头带显式 "use strict" 指令时,形参必须是简单形参列表
+            // (默认值/剩余/解构皆非法)。cur=`{`,peek=体首 token,peekUseStrictDirective 可探测。
+            // 简写体(表达式)无指令可言,不受此约束。仅显式指令触发,隐式 strict 不受影响。
+            let isStrict = this.peekUseStrictDirective();
+            if (isStrict) { this.fnStrictDepth++; this.checkStrictParams(params); }
+            this.checkInheritedStrictParams(params, isStrict);   // [test262 早期错误 C] 继承 strict 重参
             body = this.parseBlockStatement();
+            if (isStrict) this.fnStrictDepth--;
         } else {
+            // [test262 早期错误 C] 简写体无指令,但继承 strict(程序级/外层 strict/类体)下形参
+            // 仍不可重名/eval/arguments。ownStrict 恒 false。
+            this.checkInheritedStrictParams(params, false);
             // 箭头简写体是 **AssignmentExpression**:须含赋值运算符(=,+=,*= 等,优先级
             // ASSIGN=3),但不含逗号序列(COMMA=2,`v=>a,b` 应为 `(v=>a),b`)。传 COMMA
             // 优先级:Pratt 循环 `prec < peekPrec` 对赋值 `2<3` 消费、对逗号 `2<2` 不消费。
@@ -550,6 +597,7 @@ export const ExpressionParser = {
                 // 对象 rest 目标必须是标识符(ES:ObjectRestProperty = ...BindingIdentifier,
                 // {...{a}} 非法)。数组 rest 才可为模式(见 parseArrayPattern)。
                 this.nextToken();
+                this.checkReservedBinding(this.curToken.literal);   // [test262 早期错误 A] {...rest}
                 pattern.properties.push(new AST.SpreadElement(new AST.Identifier(this.curToken.literal)));
                 break;
             }
@@ -677,6 +725,8 @@ export const ExpressionParser = {
         let restSeen = false;
         while (!this.curTokenIs(TokenType.RBRACKET) && !this.curTokenIs(TokenType.EOF)) {
             if (this.curTokenIs(TokenType.SPREAD)) {
+                // [test262 早期错误 G] rest 之前不得再出现 rest([...a, ...b]):rest 必须末位。
+                if (restSeen) this.errors.push("Rest element must be last element");
                 // [#34] rest 元素 [..., ...rest];[test262 S1] rest 目标可为绑定模式 [...[x]]/[...{a}]
                 this.nextToken();
                 let restTarget;
@@ -785,6 +835,7 @@ export const ExpressionParser = {
 
     parseObjectLiteral() {
         let properties = [];
+        let protoCount = 0;   // [test262 早期错误 G] 非计算 `__proto__: 值` 计数(>1 即早期错误)
         if (this.peekTokenIs(TokenType.RBRACE)) {
             this.nextToken();
             return new AST.ObjectExpression(properties);
@@ -847,11 +898,15 @@ export const ExpressionParser = {
                 return null;
             }
             if (this.peekTokenIs(TokenType.COMMA) || this.peekTokenIs(TokenType.RBRACE)) {
+                // [test262 早期错误 A] 简写属性 `{ x }` 的键即绑定引用,须过保留字校验;
+                // 带冒号的键 `{ if: 1 }`(PropertyName)走 COLON 分支,不校验(属性名可为保留字)。
+                if (!computed && key.type === "Identifier") this.checkReservedBinding(key.name);
                 properties.push(new AST.Property(key, key, "init", computed, true));
             } else if (this.peekTokenIs(TokenType.ASSIGN) && !computed && accessorKind === null) {
                 // CoverInitializedName `{a = 默认}`:简写属性带默认值,仅在解构目标位合法
                 // (`({a = 1} = obj)`)。产出 shorthand Property,value = AssignmentPattern
                 // (Identifier, 默认表达式),供 reinterpretAsPattern/emitDestructurePattern 消费。
+                if (key.type === "Identifier") this.checkReservedBinding(key.name);   // [test262 早期错误 A]
                 this.nextToken(); // cur = '='
                 this.nextToken(); // cur = 默认表达式首 token
                 const dflt = this.parseExpression(Precedence.ASSIGN - 1);
@@ -861,7 +916,13 @@ export const ExpressionParser = {
                 this.nextToken();
                 let params = this.parseFunctionParams();
                 if (!this.expectPeek(TokenType.LBRACE)) return null;
+                // [test262 早期错误 B] 对象字面量方法(含 get/set/async/generator 简写)带显式
+                // "use strict" 指令时,形参必须是简单形参列表。cur=`{`,peek=体首 token。
+                let isStrict = this.peekUseStrictDirective();
+                if (isStrict) { this.fnStrictDepth++; this.checkStrictParams(params); }
+                this.checkInheritedStrictParams(params, isStrict);   // [test262 早期错误 C] 继承 strict 重参
                 let body = this.parseBlockStatement();
+                if (isStrict) this.fnStrictDepth--;
                 {
                     const mfn = new AST.FunctionExpression(null, params, body, isAsyncMethod, isGenMethod);
                     mfn.async = isAsyncMethod;
@@ -871,6 +932,15 @@ export const ExpressionParser = {
             } else {
                 if (!this.expectPeek(TokenType.COLON)) return null;
                 this.nextToken();
+                // [test262 早期错误 G] 对象字面量不得含多个非计算 `__proto__: 值`(原型设置器唯一)。
+                // 简写 { __proto__ } / 方法 { __proto__(){} } / 访问器 / 计算 { ["__proto__"]: } 不计。
+                if (!computed) {
+                    let keyName = key.type === "Identifier" ? key.name : (key.type === "Literal" ? String(key.value) : null);
+                    if (keyName === "__proto__") {
+                        protoCount = protoCount + 1;
+                        if (protoCount > 1) this.errors.push("Duplicate '__proto__' property in object literal");
+                    }
+                }
                 properties.push(new AST.Property(key, this.parseExpression(Precedence.ASSIGN - 1), "init", computed, false));
             }
             if (this.peekTokenIs(TokenType.COMMA)) {
@@ -900,12 +970,14 @@ export const ExpressionParser = {
         // "Syntax errors" 编译失败(named function expression COMPILE_FAIL 根因)。
         if (this.peekTokenIs(TokenType.IDENT)) {
             this.nextToken();
+            this.checkReservedBinding(this.curToken.literal);   // [test262 早期错误 A] 函数名保留字
             let id = new AST.Identifier(this.curToken.literal);
             if (!this.expectPeek(TokenType.LPAREN)) { if (isGenerator) this.fnGenDepth--; return null; }
             let params = this.parseFunctionParams();
             if (!this.expectPeek(TokenType.LBRACE)) { if (isGenerator) this.fnGenDepth--; return null; }
             let isStrict = this.peekUseStrictDirective();
             if (isStrict) { this.fnStrictDepth++; this.checkStrictParams(params); }
+            this.checkInheritedStrictParams(params, isStrict);   // [test262 早期错误 C] 继承 strict 重参
             let body = this.parseBlockStatement();
             if (isStrict) this.fnStrictDepth--;
             if (isGenerator) this.fnGenDepth--;
@@ -916,6 +988,7 @@ export const ExpressionParser = {
         if (!this.expectPeek(TokenType.LBRACE)) { if (isGenerator) this.fnGenDepth--; return null; }
         let isStrict = this.peekUseStrictDirective();
         if (isStrict) { this.fnStrictDepth++; this.checkStrictParams(params); }
+        this.checkInheritedStrictParams(params, isStrict);   // [test262 早期错误 C] 继承 strict 重参
         let body = this.parseBlockStatement();
         if (isStrict) this.fnStrictDepth--;
         if (isGenerator) this.fnGenDepth--;

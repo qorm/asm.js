@@ -19,6 +19,7 @@ export const ClassParser = {
             id = new AST.Identifier(defaultName);
             anonymous = true;
         } else if (this.curTokenIsIdentifier()) {
+            this.checkReservedBinding(this.curToken.literal);   // [test262 早期错误 A] 类名保留字
             id = new AST.Identifier(this.curToken.literal);
         } else {
             return null;
@@ -51,6 +52,9 @@ export const ClassParser = {
     parseClassBody() {
         let body = [];
         this.classDepth = this.classDepth + 1; // #x 访问仅类体内合法
+        // [test262 早期错误 E] 私有名查重栈:嵌套类各有独立 ClassBody 作用域,进体压新表、出体弹出。
+        const prevPrivateNames = this._curPrivateNames;
+        this._curPrivateNames = [];
         this.nextToken();
         while (!this.curTokenIs(TokenType.RBRACE) && !this.curTokenIs(TokenType.EOF)) {
             // 类体内可选/杂散分号 `class C { ; method(){}; }`:跳过,不当成员解析。
@@ -64,8 +68,34 @@ export const ClassParser = {
             }
             this.nextToken();
         }
+        this._checkDuplicatePrivateNames(this._curPrivateNames);
+        this._curPrivateNames = prevPrivateNames;
         this.classDepth = this.classDepth - 1;
         return body;
+    },
+
+    // [test262 早期错误 E] 同一 ClassBody 内私有名不得重复绑定,唯一例外是同名 get+set 各一。
+    // 跳过非法/已单独报错的名("#" 空白分隔、"#constructor")。private name 恒带 '#' 前缀,
+    // 不会与 Object.prototype 继承键碰撞,可直接以对象作映射(同 checkStrictParams 模式)。
+    _checkDuplicatePrivateNames(entries) {
+        const map = {};
+        for (let i = 0; i < entries.length; i++) {
+            const e = entries[i];
+            if (!e.name || e.name === "#" || e.name === "#constructor") continue;
+            let rec = map[e.name];
+            if (!rec) { rec = { get: 0, set: 0, other: 0 }; map[e.name] = rec; }
+            if (e.category === "get") rec.get = rec.get + 1;
+            else if (e.category === "set") rec.set = rec.set + 1;
+            else rec.other = rec.other + 1;
+        }
+        const keys = Object.keys(map);
+        for (let i = 0; i < keys.length; i++) {
+            const rec = map[keys[i]];
+            const total = rec.get + rec.set + rec.other;
+            if (rec.get > 1 || rec.set > 1 || (rec.other > 0 && total > 1)) {
+                this.errors.push("Duplicate private name '" + keys[i] + "'");
+            }
+        }
     },
 
     parseClassMember() {
@@ -118,6 +148,9 @@ export const ClassParser = {
             return this.parsePrivateFieldOrMethod(isStatic, kind);
         }
 
+        // [test262 早期错误 F] 记录方法是否以访问器(get/set)声明:下面的 constructor 判定会
+        // 把 kind 覆写成 "constructor",丢失访问器信息;SpecialMethod 校验需要它。
+        const isAccessorMethod = (kind === "get" || kind === "set");
         // 检查 constructor
         if (this.curToken.literal === "constructor") {
             kind = "constructor";
@@ -161,9 +194,12 @@ export const ClassParser = {
             if (isAsyncMethod) this.fnAsyncDepth--;
             return null;
         }
-        // [test262 S1] strict 探测(显式 "use strict" 指令;类体隐式 strict 待后续)
+        // [test262 S1] strict 探测(显式 "use strict" 指令)
         let isStrict = this.peekUseStrictDirective();
         if (isStrict) { this.fnStrictDepth++; this.checkStrictParams(params); }
+        // [test262 早期错误 C] 类体隐式 strict(classDepth>0):方法形参不可重名/eval/arguments,
+        // 即使方法体无自有 "use strict" 指令。
+        this.checkInheritedStrictParams(params, isStrict);
         let methodBody = this.parseBlockStatement();
         if (isStrict) this.fnStrictDepth--;
         if (isGenerator) this.fnGenDepth--;
@@ -171,7 +207,28 @@ export const ClassParser = {
         let value = new AST.FunctionExpression(null, params, methodBody, isAsyncMethod, isGenerator);
         value.generator = isGenerator;
         value.async = isAsyncMethod;
+        // [test262 早期错误 F] SpecialMethod:非 static、名为 "constructor" 的 MethodDefinition
+        // 不得是生成器/get/set/async(static constructor 方法是普通方法,合法)。static prototype
+        // 方法亦禁。用解析后的属性名判定(生成器的 `*` 在 constructor 探测之后才消费,kind 仍是
+        // "method",故不能只看 kind)。计算键无法静态判定,跳过。
+        let methodName = this._classPropName(key, computed);
+        if (!isStatic && methodName === "constructor" && (isGenerator || isAsyncMethod || isAccessorMethod)) {
+            this.errors.push("Class constructor may not be a generator, accessor, or async method");
+        }
+        if (isStatic && methodName === "prototype") {
+            this.errors.push("Classes may not have a static property named 'prototype'");
+        }
         return new AST.MethodDefinition(key, value, kind, isStatic, computed);
+    },
+
+    // [test262 早期错误 F/E] 解析类成员属性名字符串:Identifier/PrivateIdentifier 取 name,
+    // 字符串·数值字面量键取 String(value)(PropName 按值比较,含 'constructor' 字符串键)。
+    // 计算键/其它形态返回 null(无法静态判定,调用方跳过校验)。
+    _classPropName(key, computed) {
+        if (computed || !key) return null;
+        if (key.type === "Identifier" || key.type === "PrivateIdentifier") return key.name;
+        if (key.type === "Literal") return String(key.value);
+        return null;
     },
 
     parseClassField(isStatic, isPrivate, existingKey = null, computed = false) {
@@ -179,6 +236,16 @@ export const ClassParser = {
         if (!key) {
             let name = this.curToken.literal;
             key = isPrivate ? new AST.PrivateIdentifier(name) : new AST.Identifier(name);
+        }
+
+        // [test262 早期错误 F] FieldDefinition 的 PropName 不得为 "constructor"(含字符串键);
+        // static 字段不得名为 "prototype"。ALWAYS 文法约束,与 strict 无关。
+        let fieldName = this._classPropName(key, computed);
+        if (fieldName === "constructor") {
+            this.errors.push("Classes may not have a field named 'constructor'");
+        }
+        if (isStatic && fieldName === "prototype") {
+            this.errors.push("Classes may not have a static property named 'prototype'");
         }
 
         let init = null;
@@ -192,13 +259,34 @@ export const ClassParser = {
     },
 
     parsePrivateFieldOrMethod(isStatic, kind = "method") {
-        // 获取私有名称
-        let name = this.curToken.literal;
-        if (!name.startsWith("#")) {
-            this.nextToken();
-            name = "#" + this.curToken.literal;
+        // 获取私有名称。词法上 `#x`(# 紧邻名字)合成单个 IDENT("#x");`# x`(# 与名字间有
+        // 空白/换行)则产出裸 HASH token + 独立标识符。ES 要求 # 紧邻 IdentifierName,故见到
+        // 裸 HASH 必为早期错误(此前会静默把 `# x` 当两个成员编译)。
+        let name;
+        if (this.curTokenIs(TokenType.HASH)) {
+            this.errors.push("Private name '#' must be immediately followed by an identifier (no whitespace)");
+            if (this.peekTokenIsIdentifier()) {
+                this.nextToken();
+                name = "#" + this.curToken.literal;
+            } else {
+                name = "#";
+            }
+        } else {
+            name = this.curToken.literal;   // 形如 "#x"(词法已合并)
         }
         let key = new AST.PrivateIdentifier(name);
+
+        // [test262 早期错误 F] "#constructor" 不是合法私有名(私有构造器无意义)。
+        if (name === "#constructor") {
+            this.errors.push("Classes may not have a private field or method named '#constructor'");
+        }
+
+        // [test262 早期错误 E] 记录私有名及类别(get/set/其它),供 parseClassBody 收尾查重:
+        // 字段与非 get/set 方法归 "other";同名 get+set 各一合法,其余重复皆早期错误。
+        if (this._curPrivateNames) {
+            let category = (this.peekTokenIs(TokenType.LPAREN) && (kind === "get" || kind === "set")) ? kind : "other";
+            this._curPrivateNames.push({ name: name, category: category });
+        }
 
         // 检查是否是方法 (有括号)
         if (this.peekTokenIs(TokenType.LPAREN)) {

@@ -9,6 +9,27 @@ import { Precedence } from "./precedence.js";
 // 自增,故不影响任何既有产物(编译器自身源码不用该语法,自举逐字节不变)。
 let restPatSeq = 0;
 
+// [test262 早期错误 A] 保留字表(按 StringValue 判定)。转义标识符已在词法解码成字面值并经
+// lookupIdent 重分类(lexer/index.js readIdentifier → lookupIdent),故字面字符串判定即覆盖
+// `var \u{69}f` 之类转义形态(拼成 ReservedWord 非法)。
+// 恒保留(任何模式都不可作绑定标识符):核心关键字 + enum + null/true/false。
+// 刻意不含:get/set/from/as/of/async(上下文关键字,可作标识符)、undefined/int(合法标识符)、
+// let/static/yield(严格模式保留,见 STRICT_RESERVED)、await(仅模块/async 保留,模块测试已被
+// harness 排除、async 由 checkYieldAwaitBinding 覆盖)。
+const ALWAYS_RESERVED = {
+    "break": 1, "case": 1, "catch": 1, "class": 1, "const": 1, "continue": 1, "debugger": 1,
+    "default": 1, "delete": 1, "do": 1, "else": 1, "enum": 1, "export": 1, "extends": 1,
+    "finally": 1, "for": 1, "function": 1, "if": 1, "import": 1, "in": 1, "instanceof": 1,
+    "new": 1, "return": 1, "super": 1, "switch": 1, "this": 1, "throw": 1, "try": 1,
+    "typeof": 1, "var": 1, "void": 1, "while": 1, "with": 1,
+    "null": 1, "true": 1, "false": 1,
+};
+// 严格模式保留(future-reserved + let/static/yield):仅 strict(inStrictMode)下不可作绑定标识符。
+const STRICT_RESERVED = {
+    "implements": 1, "interface": 1, "package": 1, "private": 1, "protected": 1, "public": 1,
+    "let": 1, "static": 1, "yield": 1,
+};
+
 // 语句解析混入
 export const StatementParser = {
     // ============ 解析语句 ============
@@ -129,6 +150,7 @@ export const StatementParser = {
                 id = this.parseArrayPattern();
             } else if (this.curTokenIsIdentifier()) {
                 this.checkYieldAwaitBinding(this.curToken.literal);   // [test262 S1] var yield/await
+                this.checkReservedBinding(this.curToken.literal);     // [test262 早期错误 A] 保留字
                 id = new AST.Identifier(this.curToken.literal);
             } else {
                 this.errors.push("expected identifier");
@@ -169,6 +191,7 @@ export const StatementParser = {
             id = new AST.Identifier(defaultName);
         } else {
             if (!this.expectIdentifier()) return null;
+            this.checkReservedBinding(this.curToken.literal);   // [test262 早期错误 A] 函数名保留字
             id = new AST.Identifier(this.curToken.literal);
         }
         if (!this.expectPeek(TokenType.LPAREN)) return null;
@@ -184,6 +207,7 @@ export const StatementParser = {
         // [test262 S1] strict 探测:"use strict" 指令 → strict 深度 + 回溯形参校验
         let isStrict = this.peekUseStrictDirective();
         if (isStrict) { this.fnStrictDepth++; this.checkStrictParams(params); }
+        this.checkInheritedStrictParams(params, isStrict);   // [test262 早期错误 C] 继承 strict 重参
         let body = this.parseBlockStatement();
         if (isStrict) this.fnStrictDepth--;
         if (isGenerator) this.fnGenDepth--;
@@ -202,6 +226,26 @@ export const StatementParser = {
         }
         if (this.fnStrictDepth > 0 && (name === "eval" || name === "arguments")) {
             this.errors.push("Cannot use '" + name + "' as a binding name in strict mode");
+        }
+    },
+
+    // [test262 早期错误 A] 绑定标识符的保留字校验:Identifier = IdentifierName but not ReservedWord。
+    // 仅在「绑定/形参/声明名」位调用(绝不在属性名/方法名/标签位,故 { if:1 } / o.public=1 合法)。
+    // 恒保留字任何模式报错;严格保留字仅 inStrictMode 报错(sloppy var let=1 / var public=1 仍合法)。
+    // yield 生成器内 / await 异步内由 checkYieldAwaitBinding 另管,此处不重复。
+    checkReservedBinding(name) {
+        if (typeof name !== "string" || name.length === 0) return;
+        // [test262 早期错误 A] strict 模式下 eval/arguments 不得作为绑定标识符。
+        if (this.inStrictMode() && (name === "eval" || name === "arguments")) {
+            this.errors.push("Cannot declare '" + name + "' as an identifier in strict mode");
+            return;
+        }
+        if (ALWAYS_RESERVED[name] === 1) {
+            this.errors.push("Cannot use reserved word '" + name + "' as an identifier");
+            return;
+        }
+        if (STRICT_RESERVED[name] === 1 && this.inStrictMode()) {
+            this.errors.push("Cannot use reserved word '" + name + "' as an identifier in strict mode");
         }
     },
 
@@ -231,17 +275,24 @@ export const StatementParser = {
         }
     },
 
-    // [test262 S1] strict 形参回溯校验:eval/arguments 不可作形参 + 形参不可重名。
+    // [test262 S1] strict 形参回溯校验:函数体带**显式** "use strict" 指令时,形参不得为非简单
+    // 形参(默认值/剩余/解构)——Node 抛 SyntaxError。checkStrictParams 仅在显式指令处调用
+    // (peekUseStrictDirective 命中)。注意:非简单形参禁令是「函数体内指令」专属——继承 strict
+    // (程序级指令/类体隐式)下 `"use strict"; function f(a=1){}` 仍合法,故此检查不随继承 strict 触发。
+    // 显式指令既已使函数 strict,形参名约束(重名/eval/arguments)经 checkStrictParamNames 一并校验。
     checkStrictParams(params) {
-        // [test262 S1] 函数体带显式 "use strict" 指令时,形参不得为非简单形参(默认值/剩余/
-        // 解构)——Node 抛 SyntaxError。checkStrictParams 仅在显式 "use strict" 指令处调用
-        // (peekUseStrictDirective 命中),故隐式 strict(类方法/模块)不受此约束,不误拒。
         for (const p of (params || [])) {
             if (p && p.type !== "Identifier") {
                 this.errors.push("Illegal 'use strict' directive in function with non-simple parameter list");
                 break;
             }
         }
+        this.checkStrictParamNames(params);
+    },
+
+    // [test262 早期错误 C] strict 形参**名**校验:重名 + eval/arguments 不可作形参。凡函数处于
+    // strict(显式指令 或 继承)即触发,不含非简单形参检查(那是显式指令专属)。
+    checkStrictParamNames(params) {
         const names = [];
         for (const p of (params || [])) this.collectParamNames(p, names);
         const seen = {};
@@ -254,6 +305,17 @@ export const StatementParser = {
         }
     },
 
+    // [test262 早期错误 C] 继承 strict 下的形参名补查:函数体无自有 "use strict" 指令(ownStrict
+    // 为 false)但处于 strict(程序级指令 programStrict / 外层 strict 函数 fnStrictDepth>0 / 类体
+    // 隐式 strict classDepth>0)时,补查重名/eval/arguments。自有指令站点已由 checkStrictParams 覆盖,
+    // ownStrict 为真时直接返回避免重复报错。sloppy 顶层 `function f(a,a){}` 三gate皆假 → 不触发(仍合法)。
+    checkInheritedStrictParams(params, ownStrict) {
+        if (ownStrict) return;
+        if (this.inStrictMode() || this.classDepth > 0) {
+            this.checkStrictParamNames(params);
+        }
+    },
+
     parseFunctionParams() {
         let params = [];
         if (this.peekTokenIs(TokenType.RPAREN)) {
@@ -261,13 +323,24 @@ export const StatementParser = {
             return params;
         }
         this.nextToken();
-        this.pushFunctionParam(params, this.parseFunctionParam(true));
+        let firstParam = this.parseFunctionParam(true);
+        // [test262 早期错误 D] rest 形参必须末位且不得带尾逗号:`(...a, b)` / `(...a,)` 皆
+        // SyntaxError。rest 形参产出 SpreadElement;其后紧跟逗号(COMMA)即非法(无论逗号后
+        // 是形参还是 `)`)。ALWAYS 文法约束,与 strict 无关。
+        if (firstParam && firstParam.type === "SpreadElement" && this.peekTokenIs(TokenType.COMMA)) {
+            this.errors.push("Rest parameter must be last formal parameter");
+        }
+        this.pushFunctionParam(params, firstParam);
         while (this.peekTokenIs(TokenType.COMMA)) {
             this.nextToken(); // curToken = ,
             // 尾逗号 function f(a, b,) {}:逗号后紧跟 ) → 停止,别把 ) 当形参解析。
             if (this.peekTokenIs(TokenType.RPAREN)) break;
             this.nextToken();
-            this.pushFunctionParam(params, this.parseFunctionParam(true));
+            let nextParam = this.parseFunctionParam(true);
+            if (nextParam && nextParam.type === "SpreadElement" && this.peekTokenIs(TokenType.COMMA)) {
+                this.errors.push("Rest parameter must be last formal parameter");
+            }
+            this.pushFunctionParam(params, nextParam);
         }
         if (!this.expectPeek(TokenType.RPAREN)) return null;
         return params;
@@ -315,6 +388,7 @@ export const StatementParser = {
                 return sp;
             }
             this.checkYieldAwaitBinding(this.curToken.literal);   // [test262 S1] ...yield/...await
+            this.checkReservedBinding(this.curToken.literal);     // [test262 早期错误 A] 保留字
             return new AST.SpreadElement(new AST.Identifier(this.curToken.literal));
         }
         // [#47] 解构形参:function f({a,b})/f([a,b])/({a}={})。子 pattern 递归解析,
@@ -326,6 +400,7 @@ export const StatementParser = {
             id = this.parseArrayPattern();
         } else {
             this.checkYieldAwaitBinding(this.curToken.literal);   // [test262 S1] yield/await 形参
+            this.checkReservedBinding(this.curToken.literal);     // [test262 早期错误 A] 保留字
             id = new AST.Identifier(this.curToken.literal);
         }
         if (this.peekTokenIs(TokenType.ASSIGN)) {
