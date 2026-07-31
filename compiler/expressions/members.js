@@ -208,6 +208,77 @@ const STRING_PROTO_METHODS = [
     ["valueOf", "_str_valueOf", 0],           // returns this.__value (primitive string)
     ["constructor", null, 1],             // 最后落位:从构造器槽读
 ];
+
+// ── [Date 一等值] Date.prototype 物化(反射用真对象)─────────────────────────────
+// 此前 `Date` 只是编译期构造:Date.now/parse/UTC 静态改派(functions.js)、
+// date.getTime() 等经 HOISTED_DATE_METHODS 派发(functions.js,tag 分派 TYPE_DATE=7)、
+// new Date(...) 经 expressions.js、instanceof Date 经 operators.js([ptr]&0xff==7,
+// 从不编译 RHS Date)。四条快路均按**标识符/属性名语法**先于 compileIdentifier 命中,
+// 与 Date 标识符的**值**无关 → 裸 `Date` / `Date.prototype` / `Date.prototype.getTime`
+// (作值)三个反射位物化不改动其字节。
+//
+// 方法值经 emitBuiltinMethodRefClosure(24B {magic, _aref_generic, helper})——蹦床把
+// this 插 A0、实参上移后尾调 helper。helper 必须是 _aref_generic 安全(吃装箱 this/实参、
+// 返装箱结果):getter 族经 _aref_date_gp*(覆写 A1=part、调 _date_get_part、装箱裸 int);
+// setter 族经 _aref_date_sp*(装箱值转裸 int、调 _date_set_part,返新 ms 本身即 number);
+// getTime/valueOf 直连 _date_getTime(返 timestamp 的 float 位,天然 number);
+// toString/toISOString/toJSON 直连 _date_toISOString(尾部已装箱 0x7FFC)。
+// getter/setter 绝不直连 _date_get_part/_date_set_part(调用约定不符 + 结果未装箱)。
+//
+// 属性描述符:writable:true, enumerable:false, configurable:true(attr 5,规范 21.4.4)。
+const DATE_PROTO_METHODS = [
+    // [方法名, 运行时 helper 标签(_aref_generic 安全), 规范 length]
+    ["getTime", "_date_getTime", 0],
+    ["valueOf", "_date_getTime", 0],
+    ["toString", "_date_toString", 0],
+    ["toISOString", "_date_toISOString", 0],
+    ["toJSON", "_date_toISOString", 1],
+    ["getTimezoneOffset", "_aref_date_tzoffset", 0],
+    ["getFullYear", "_aref_date_gp0", 0],
+    ["getUTCFullYear", "_aref_date_gp0", 0],
+    ["getMonth", "_aref_date_gp1", 0],
+    ["getUTCMonth", "_aref_date_gp1", 0],
+    ["getDate", "_aref_date_gp2", 0],
+    ["getUTCDate", "_aref_date_gp2", 0],
+    ["getHours", "_aref_date_gp3", 0],
+    ["getUTCHours", "_aref_date_gp3", 0],
+    ["getMinutes", "_aref_date_gp4", 0],
+    ["getUTCMinutes", "_aref_date_gp4", 0],
+    ["getSeconds", "_aref_date_gp5", 0],
+    ["getUTCSeconds", "_aref_date_gp5", 0],
+    ["getDay", "_aref_date_gp6", 0],
+    ["getUTCDay", "_aref_date_gp6", 0],
+    ["getMilliseconds", "_aref_date_gp7", 0],
+    ["getUTCMilliseconds", "_aref_date_gp7", 0],
+    ["setTime", "_aref_date_setTime", 1],
+    ["setFullYear", "_aref_date_sp0", 2],
+    ["setUTCFullYear", "_aref_date_sp0", 2],
+    ["setMonth", "_aref_date_sp1", 2],
+    ["setUTCMonth", "_aref_date_sp1", 2],
+    ["setDate", "_aref_date_sp2", 1],
+    ["setUTCDate", "_aref_date_sp2", 1],
+    ["setHours", "_aref_date_sp3", 4],
+    ["setUTCHours", "_aref_date_sp3", 4],
+    ["setMinutes", "_aref_date_sp4", 3],
+    ["setUTCMinutes", "_aref_date_sp4", 3],
+    ["setSeconds", "_aref_date_sp5", 2],
+    ["setUTCSeconds", "_aref_date_sp5", 2],
+    ["setMilliseconds", "_aref_date_sp6", 1],
+    ["setUTCMilliseconds", "_aref_date_sp6", 1],
+];
+// Date.prototype 的 locale/字符串方法:仅当本编译单元注入了 __date_shim(五个 __DATE_*
+// 导出全有真标签,dateShimReady)时用真 shim 函数;否则用占位闭包(直连 _date_toISOString,
+// 返 ISO 串)——仅为让 gOPD(Date.prototype,"toLocaleString") 等描述符测试翻转(记偏差:
+// 占位不做本地化格式)。toGMTString 复用 toUTCString 的 helper(规范同义)。
+const DATE_PROTO_SHIM_METHODS = [
+    // [方法名, __date_shim 导出名, 规范 length]
+    ["toLocaleString", "__DATE_toLocaleString", 0],
+    ["toLocaleDateString", "__DATE_toLocaleDateString", 0],
+    ["toLocaleTimeString", "__DATE_toLocaleTimeString", 0],
+    ["toUTCString", "__DATE_toUTCString", 0],
+    ["toGMTString", "__DATE_toUTCString", 0],
+    ["toDateString", "__DATE_toDateString", 0],
+];
 // RegExp.prototype 的**访问器**属性(规范 22.2.6:get 访问器,set 为 undefined,
 // {enumerable:false, configurable:true})。[名, this 上无该属性时的默认值]:
 // 规范里 `get RegExp.prototype.source` / `flags` 以 %RegExpPrototype% 为 this 时
@@ -289,7 +360,7 @@ const BUILTIN_REF_ARITY = {
     object_keys: 1, object_values: 1, object_entries: 1,
     object_getOwnPropertyNames: 1, object_getOwnPropertyDescriptor: 2,
     object_create: 2, object_freeze: 1,
-    date_now: 0,
+    date_now: 0, date_parse: 1, date_utc: 7,
     array_isArray: 1,
     fnproto_call: 1, fnproto_apply: 2,
 };
@@ -583,6 +654,25 @@ export const MemberCompiler = {
         return !!((this.ctx.getLocal && this.ctx.getLocal("String")) ||
             (this.ctx.getFunction && this.ctx.getFunction("String")) ||
             (this.ctx.getMainCapturedVar && this.ctx.getMainCapturedVar("String")));
+    },
+
+    // [Date 一等值] `Date` 标识符被遮蔽?同 stringNameShadowed 守卫组。
+    dateNameShadowed() {
+        return !!((this.ctx.getLocal && this.ctx.getLocal("Date")) ||
+            (this.ctx.getFunction && this.ctx.getFunction("Date")) ||
+            (this.ctx.getMainCapturedVar && this.ctx.getMainCapturedVar("Date")));
+    },
+
+    // [Date 一等值] 本编译单元是否注入了 __date_shim(五个 __DATE_* 导出全有真标签)。
+    // 门未开时 locale 族方法用占位闭包(见 DATE_PROTO_SHIM_METHODS 注)。
+    dateShimReady() {
+        if (!this.ctx || !this.ctx.hasFunction) return false;
+        if (!this.getFunctionLabel) return false;
+        for (let i = 0; i < DATE_PROTO_SHIM_METHODS.length; i = i + 1) {
+            const shim = DATE_PROTO_SHIM_METHODS[i][1];
+            if (!this.getFunctionLabel(shim)) return false;
+        }
+        return true;
     },
 
     // [W-28] `re.<exec|test|toString>` 值读取的判定 + 发射(命中返 true)。
@@ -939,6 +1029,146 @@ export const MemberCompiler = {
         vm.label(doneL);
     },
 
+    // [Date 一等值] 把一个 Date 原型方法落到原型槽:建 24B 方法值闭包
+    // (emitBuiltinMethodRefClosure → helper 经 _aref_generic 蹦床)、挂 .name/.length
+    // (规范值,闭包属性侧表),再 _reSetProtoProp 落原型(attr 5)。helperLabel 是运行时
+    // 标签或已解析的 shim 函数标签,vm.lea 链接期解析。
+    emitDateProtoMethodEntry(protoSlot, name, helperLabel, length) {
+        const vm = this.vm;
+        this.emitBuiltinMethodRefClosure(helperLabel); // RET = 闭包
+        vm.mov(VReg.S0, VReg.RET);                     // 跨 call 暂存(closure_prop_set 毁 RET)
+        vm.mov(VReg.A0, VReg.S0);
+        this.emitBoxedStringKey("name", VReg.A1);
+        vm.lea(VReg.A2, this.asm.addString(name));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A2, VReg.A2, VReg.V1);
+        vm.call("_closure_prop_set");
+        vm.mov(VReg.A0, VReg.S0);
+        this.emitBoxedStringKey("length", VReg.A1);
+        vm.movImm(VReg.A2, length);
+        vm.scvtf(0, VReg.A2);
+        vm.fmovToInt(VReg.A2, 0);
+        vm.call("_closure_prop_set");
+        vm.mov(VReg.RET, VReg.S0);                     // 恢复闭包供 _reSetProtoProp
+        this._reSetProtoProp(protoSlot, name, BUILTIN_PROP_ATTR);
+    },
+
+    // [Date 一等值] 惰性物化 Date 构造器函数对象 + Date.prototype(两个全局槽,GC 保守
+    // 扫数据段即根)。**一次填两槽**、原型侧只从槽读构造器(不回调本函数)→ 无编译期递归。
+    // RET = 装箱构造器函数值(稳定身份 → `Date===Date`)。
+    emitDateCtorObject() {
+        const vm = this.vm;
+        const ctorSlot = "_nsobj_date";
+        const protoSlot = "_nsobj_date_proto";
+        this._reEnsureSlot(ctorSlot);
+        this._reEnsureSlot(protoSlot);
+        const doneL = this.ctx.newLabel("nsdate_done");
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne(doneL);
+        // 构造器闭包 16B {magic, _date_call}:裸 Date 作**值**传递后不带 new 调用
+        // (`const D=Date; D()`)命中 _date_call → 当前时间 ISO 字符串。new Date(...) /
+        // Date.now() 等调用位都先于值路径静态改派,不经此。
+        vm.movImm(VReg.A0, 16);
+        vm.call("_alloc");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.movImm(VReg.V1, 0xc105); // CLOSURE_MAGIC
+        vm.store(VReg.S0, 0, VReg.V1);
+        vm.lea(VReg.V1, "_date_call");
+        vm.store(VReg.S0, 8, VReg.V1);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_js_box_function");
+        vm.lea(VReg.V0, ctorSlot);
+        vm.store(VReg.V0, 0, VReg.RET); // **先**存槽:后续每步都从槽重载(跨 call 安全)
+        // Date.name / Date.length(闭包属性侧表;name/length 的 gOPD 形状由 _ogopd_fn 的
+        // name/length 分支硬编 {w:false,e:false,c:true},无需落 attr)
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("name", VReg.A1);
+        vm.lea(VReg.A2, this.asm.addString("Date"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A2, VReg.A2, VReg.V1);
+        vm.call("_closure_prop_set");
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("length", VReg.A1);
+        vm.movImm(VReg.A2, 7); // Date.length === 7
+        vm.scvtf(0, VReg.A2);
+        vm.fmovToInt(VReg.A2, 0);
+        vm.call("_closure_prop_set");
+        // 原型对象
+        vm.call("_object_new");
+        vm.call("_box_obj_r");
+        vm.lea(VReg.V0, protoSlot);
+        vm.store(VReg.V0, 0, VReg.RET);
+        // 原型方法落位:_aref_generic 安全 helper 闭包 + attr 5(见 DATE_PROTO_METHODS 注)
+        for (let i = 0; i < DATE_PROTO_METHODS.length; i = i + 1) {
+            const m = DATE_PROTO_METHODS[i];
+            this.emitDateProtoMethodEntry(protoSlot, m[0], m[1], m[2]);
+        }
+        // locale/字符串方法族:shim 就绪用真 shim 函数,否则占位(直连 _date_toISOString)
+        const shimReady = this.dateShimReady();
+        for (let i = 0; i < DATE_PROTO_SHIM_METHODS.length; i = i + 1) {
+            const m = DATE_PROTO_SHIM_METHODS[i];
+            const helper = shimReady ? this.getFunctionLabel(m[1]) : "_date_toISOString";
+            this.emitDateProtoMethodEntry(protoSlot, m[0], helper, m[2]);
+        }
+        // prototype.constructor = Date(从槽读,已就绪 → 不回调 emitDateCtorObject)
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        this._reSetProtoProp(protoSlot, "constructor", BUILTIN_PROP_ATTR);
+        // 静态方法作构造器闭包属性:now/parse/UTC(attr 5)。值经 emitMemoizedBuiltinRef
+        // (与静态值读同槽 → Date.now === gOPD(Date,"now").value);落值后经
+        // _closure_prop_set_attr 落 attr,否则 gOPD(Date,"now") 误报 enumerable:true。
+        const setCtorProp = (name, attr, emitValue) => {
+            emitValue();                                   // RET = 值
+            vm.mov(VReg.A2, VReg.RET);
+            vm.lea(VReg.V0, ctorSlot);
+            vm.load(VReg.A0, VReg.V0, 0);
+            this.emitBoxedStringKey(name, VReg.A1);
+            vm.call("_closure_prop_set");
+            vm.lea(VReg.V0, ctorSlot);
+            vm.load(VReg.A0, VReg.V0, 0);
+            this.emitBoxedStringKey(name, VReg.A1);
+            vm.movImm(VReg.A2, attr);
+            vm.call("_closure_prop_set_attr");
+        };
+        setCtorProp("now", BUILTIN_PROP_ATTR,
+            () => this.emitMemoizedBuiltinRef("date_now", "_date_now", "now"));
+        setCtorProp("parse", BUILTIN_PROP_ATTR,
+            () => this.emitMemoizedBuiltinRef("date_parse", "_date_parse_iso", "parse"));
+        setCtorProp("UTC", BUILTIN_PROP_ATTR,
+            () => this.emitMemoizedBuiltinRef("date_utc", "_date_utc", "UTC"));
+        // Date.prototype = 原型对象(闭包属性侧表;规范 attrs 全 false → attr 0,
+        // 否则 gOPD(Date,"prototype") 误报全真)
+        setCtorProp("prototype", BUILTIN_CONST_ATTR, () => {
+            vm.lea(VReg.V0, protoSlot);
+            vm.load(VReg.RET, VReg.V0, 0);
+        });
+        // RET = 装箱构造器(稳定身份)
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.label(doneL);
+    },
+
+    // [Date 一等值] `Date.prototype` 值读:原型槽已填则直接用,否则整体物化(构造器路径
+    // 一次填两槽)。RET = 装箱原型对象。
+    emitDateProtoObject() {
+        const vm = this.vm;
+        const protoSlot = "_nsobj_date_proto";
+        this._reEnsureSlot(protoSlot);
+        const doneL = this.ctx.newLabel("nsdateproto_done");
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne(doneL);
+        this.emitDateCtorObject(); // 填两槽(RET = 构造器,下面重载原型)
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.label(doneL);
+    },
+
     // [Error 构造器一等值] memoized 错误构造器闭包 _errctorref_<name>(GC 根)。首次建
     // {magic, 工厂 fnptr} 闭包、存槽、并在闭包属性侧表挂 .name=<name>;后续复用同一装箱值
     // → 稳定身份(TypeError===TypeError)。RET 恒为该 memoized 装箱闭包。
@@ -1194,6 +1424,14 @@ export const MemberCompiler = {
         // compileCallExpression 先于本路径命中 → 快路字节不变。遮蔽守卫同 Math/RegExp。
         if (name === "String" && !this.stringNameShadowed()) {
             this.emitStringCtorObject();
+            return;
+        }
+        // [Date 一等值] 裸 `Date`(反射位):惰性物化真函数对象(带 .prototype/.name/.length
+        // 与 now/parse/UTC 静态)→ typeof "function"、`Date.prototype` 可达、gOPD(Date,…) 成立。
+        // 四条既有快路(Date.now/parse/UTC 静态调用、date.m() 方法派发、new Date、instanceof Date)
+        // 均按语法先于本路径命中 → 快路字节不变。遮蔽守卫同 String。
+        if (name === "Date" && !this.dateNameShadowed()) {
+            this.emitDateCtorObject();
             return;
         }
         // Symbol 一等值(批次D):typeof Symbol === "function"、可传递后调用
@@ -1924,6 +2162,14 @@ export const MemberCompiler = {
             if (propName === "prototype" && expr.object.type === "Identifier" &&
                 expr.object.name === "String" && !this.stringNameShadowed()) {
                 this.emitStringProtoObject();
+                return;
+            }
+
+            // [Date 一等值] `Date.prototype` → 惰性物化的单例原型对象(方法闭包 + constructor)。
+            // propName 严格限定 "prototype" 且接收者是未遮蔽的裸 `Date` → 其它接收者字节不变。
+            if (propName === "prototype" && expr.object.type === "Identifier" &&
+                expr.object.name === "Date" && !this.dateNameShadowed()) {
+                this.emitDateProtoObject();
                 return;
             }
 

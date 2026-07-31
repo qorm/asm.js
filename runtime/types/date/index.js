@@ -259,6 +259,126 @@ export class DateGenerator {
 
         // 生成 toISOString 相关辅助函数
         this.generateToISOString();
+
+        // [Date 一等值] 物化 Date/Date.prototype 所需的运行时入口(无条件发射,
+        // 与 _date_now 同,使 gen1/gen2/gen3 链接同一组标签)。
+        this.generateDateValueHelpers();
+    }
+
+    // [Date 一等值] 裸 `Date` 作值传递后调用(`const D=Date; D()`)与原型方法引用
+    // (Date.prototype.getTime.call(d) 等)所需的运行时 helper。调用位/静态成员读
+    // (functions.js 的 Date.now/parse/UTC 与 HOISTED_DATE_METHODS 派发)先于值路径
+    // 命中,不经此族 → 既有快路字节不变。
+    generateDateValueHelpers() {
+        const vm = this.vm;
+
+        // _date_call - Date() 不带 new(经值路径调用)→ 当前时间的 ISO 字符串(装箱)。
+        // ES:Date() 返回字符串。本运行时全 UTC、toString===toISOString,故取 now 建
+        // Date 再 toISOString(_date_new(0) 的 0→now 语义 + _date_toISOString 已装箱)。
+        vm.label("_date_call");
+        vm.prologue(0, []);
+        vm.movImm(VReg.A0, 0);
+        vm.call("_date_new");          // RET = 装箱 Date(now)
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_date_toISOString");  // RET = 装箱 ISO 字符串
+        vm.epilogue([], 0);
+
+        // _date_utc - Date.UTC 作**值**调用(emitMemoizedBuiltinRef 的 16B 闭包 fnptr)。
+        // 调用约定:A0-A5 = y,mo,d,h,mi,s(装箱,缺参=undefined);ms 不在寄存器入参,
+        // 缺省 0(直调 Date.UTC(…,ms) 的 7 参形态仍走 functions.js 内联快路,不受此限)。
+        // 历法复用 _date_civil_to_days(与 emitDateUTCms 同源 Hinnant),ms 重组式逐字同
+        // emitDateUTCms 尾段(msArg=0)。RET = 裸 float64 毫秒(number)。
+        vm.label("_date_utc");
+        vm.prologue(128, [VReg.S0]);
+        // 装箱入参先落栈(_aref_argint_d 会毁 A 寄存器)
+        vm.store(VReg.SP, 0, VReg.A0);
+        vm.store(VReg.SP, 8, VReg.A1);
+        vm.store(VReg.SP, 16, VReg.A2);
+        vm.store(VReg.SP, 24, VReg.A3);
+        vm.store(VReg.SP, 32, VReg.A4);
+        vm.store(VReg.SP, 40, VReg.A5);
+        // 装箱 → 裸 int(缺省:y/mo/h/mi/s=0,d=1;同 ES Date.UTC 缺省)
+        vm.load(VReg.A0, VReg.SP, 0);  vm.movImm(VReg.A1, 0); vm.call("_aref_argint_d"); vm.store(VReg.SP, 64, VReg.RET);  // y
+        vm.load(VReg.A0, VReg.SP, 8);  vm.movImm(VReg.A1, 0); vm.call("_aref_argint_d"); vm.store(VReg.SP, 72, VReg.RET);  // mo
+        vm.load(VReg.A0, VReg.SP, 16); vm.movImm(VReg.A1, 1); vm.call("_aref_argint_d"); vm.store(VReg.SP, 80, VReg.RET);  // d
+        vm.load(VReg.A0, VReg.SP, 24); vm.movImm(VReg.A1, 0); vm.call("_aref_argint_d"); vm.store(VReg.SP, 88, VReg.RET);  // h
+        vm.load(VReg.A0, VReg.SP, 32); vm.movImm(VReg.A1, 0); vm.call("_aref_argint_d"); vm.store(VReg.SP, 96, VReg.RET);  // mi
+        vm.load(VReg.A0, VReg.SP, 40); vm.movImm(VReg.A1, 0); vm.call("_aref_argint_d"); vm.store(VReg.SP, 104, VReg.RET); // s
+        // days = civil_to_days(y, mo+1, d)
+        vm.load(VReg.A0, VReg.SP, 64);
+        vm.load(VReg.A1, VReg.SP, 72);
+        vm.addImm(VReg.A1, VReg.A1, 1); // m(1 基)
+        vm.load(VReg.A2, VReg.SP, 80);
+        vm.call("_date_civil_to_days");
+        vm.mov(VReg.S0, VReg.RET);      // S0 = days
+        // ms = ((days*24 + h)*60 + mi)*60000 + s*1000
+        vm.load(VReg.V3, VReg.SP, 88);
+        vm.movImm(VReg.V4, 24);
+        vm.mul(VReg.V5, VReg.S0, VReg.V4);
+        vm.add(VReg.V5, VReg.V5, VReg.V3);
+        vm.load(VReg.V3, VReg.SP, 96);
+        vm.movImm(VReg.V4, 60);
+        vm.mul(VReg.V5, VReg.V5, VReg.V4);
+        vm.add(VReg.V5, VReg.V5, VReg.V3);
+        vm.movImm(VReg.V4, 60000);
+        vm.mul(VReg.V5, VReg.V5, VReg.V4);
+        vm.load(VReg.V3, VReg.SP, 104);
+        vm.movImm(VReg.V4, 1000);
+        vm.mul(VReg.V3, VReg.V3, VReg.V4);
+        vm.add(VReg.V5, VReg.V5, VReg.V3); // V5 = ms(整数)
+        vm.scvtf(0, VReg.V5);
+        vm.fmovToInt(VReg.RET, 0);
+        vm.epilogue([VReg.S0], 128);
+
+        // getter 族 wrapper:_aref_generic 把 this 插 A0、用户实参上移( getter 无视之)。
+        // 各 wrapper 覆写 A1 = part 码、调 _date_get_part(返裸 int)、装箱成 number。
+        // part: 0=year 1=month(0基) 2=date 3=hours 4=minutes 5=seconds 6=day-of-week 7=ms。
+        // UTC 变体与本地变体同 part(本运行时全 UTC)→ 两名共享同一 wrapper。
+        for (let part = 0; part <= 7; part = part + 1) {
+            vm.label("_aref_date_gp" + part);
+            vm.prologue(0, []);
+            vm.movImm(VReg.A1, part);
+            vm.call("_date_get_part"); // RET = 裸 int
+            vm.scvtf(0, VReg.RET);
+            vm.fmovToInt(VReg.RET, 0); // 装箱 number
+            vm.epilogue([], 0);
+        }
+
+        // setter 族 wrapper(单字段;多字段 setFullYear(y,m,d) 等经值调用仅设首字段,
+        // 记偏差——直调经 functions.js 的 _date_set_parts 原子多字段快路)。A1=装箱值
+        // → _aref_argint 转裸 int(undefined→0),A1=part,调 _date_set_part(返新 ms 的
+        // 裸 float 位,本身即 number)。part: 0=year 1=month0 2=date 3=h 4=mi 5=s 6=ms。
+        for (let part = 0; part <= 6; part = part + 1) {
+            vm.label("_aref_date_sp" + part);
+            vm.prologue(0, [VReg.S0]);
+            vm.mov(VReg.S0, VReg.A0);  // date
+            vm.mov(VReg.A0, VReg.A1);  // 装箱值
+            vm.call("_aref_argint");   // RET = 裸 int
+            vm.mov(VReg.A2, VReg.RET);
+            vm.mov(VReg.A0, VReg.S0);  // date
+            vm.movImm(VReg.A1, part);
+            vm.call("_date_set_part"); // RET = 新 ms(裸 float 位 = number)
+            vm.epilogue([VReg.S0], 0);
+        }
+
+        // setTime wrapper:直写 timestamp,返回新 ms(number)。x64 上 V1==RCX==A1,
+        // emitMaskLoad(V1) 会冲掉装箱 ms,故先存 S0。
+        vm.label("_aref_date_setTime");
+        vm.prologue(0, [VReg.S0]);
+        vm.mov(VReg.S0, VReg.A1);                  // 新 ms(number 的 float 位)
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.A0, VReg.A0, VReg.V1);  // 裸 date 指针
+        vm.store(VReg.A0, 8, VReg.S0);
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0], 0);
+
+        // getTimezoneOffset wrapper:本运行时全 UTC,恒返回装箱 0(同 compileDateMethod)。
+        vm.label("_aref_date_tzoffset");
+        vm.prologue(0, []);
+        vm.movImm(VReg.RET, 0);
+        vm.scvtf(0, VReg.RET);
+        vm.fmovToInt(VReg.RET, 0);
+        vm.epilogue([], 0);
     }
 
     // 生成 _date_toISOString 函数

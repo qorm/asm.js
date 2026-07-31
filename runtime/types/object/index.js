@@ -654,6 +654,23 @@ export class ObjectGenerator {
         vm.call("_object_set");
         vm.mov(VReg.RET, VReg.S1); // 返回被赋值
         vm.epilogue([VReg.S0, VReg.S1], 0);
+
+        // [Date 一等值] _closure_prop_set_attr(A0=fn, A1=key, A2=attr):给闭包属性侧表里
+        // 的某键落属性特性位。_closure_prop_set 只 _object_set 落值(侧表 props 是普通对象,
+        // 默认 attr=7 全真),gOPD(fn,key) 递归描述该 props 对象时会如实读出 attr 字节 →
+        // 不落 attr 则 gOPD(Date,"now") 误报 enumerable:true、gOPD(Date,"prototype") 全真。
+        // 用法:_closure_prop_set 落值**之后**调本 helper 落 attr(顺序不可反:
+        // _object_set_prop_attr 会 materialize flags 并置 EXT_HASFLAGS,值须先就位)。
+        vm.label("_closure_prop_set_attr");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A1); // key
+        vm.mov(VReg.S1, VReg.A2); // attr
+        vm.call("_closure_props_ensure"); // A0=fn → RET=props(装箱)
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.mov(VReg.A2, VReg.S1);
+        vm.call("_object_set_prop_attr");
+        vm.epilogue([VReg.S0, VReg.S1], 0);
     }
 
     // 创建新对象

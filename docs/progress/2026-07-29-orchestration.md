@@ -199,7 +199,7 @@
 
 ## 11. 后续演进待办（按优先级）
 
-0. **~~Object 杠杆~~（v0.3.6 强制 → v0.3.7 补全 → v0.3.8 枚举 → v0.3.9 gOPD 数组，见 §13–§16）**：built-ins/Object 46.3% → 53.7% → 55.0% → 55.4% → **55.6%**（v0.3.9）；整体 43.89% → 44.55% → 44.69% → 44.75% → **44.77%**。v0.3.9 gOPD 支持数组（length/索引/侧表具名/arguments）+ undefined/null 抛 TypeError。**Object 杠杆仍剩（按价值）**：①**【下一步·最高价值】内建构造器具现为运行时对象**（Date 优先 ~50 翻转，再 Object/Array/Function/Number/Boolean/Error/JSON 及其 prototype，~100+；复用 Math 具现模板）——根因是 `typeof Object` 为 "number"（members.js:1159-1173 哨兵 1/2/3），gOPD 目录 179 FAIL 的大头与 ~673 个 verifyProperty 用例系于此；②全局对象具现 + 顶层 `this`（11 直接 + 大量 ES5 `var global=this`）；③函数 "length" 经运行时 gOPD 路径返 undefined（内联快路可用）+ 函数 "prototype" 自有属性/attr；④`new String` 索引字符 + length attr + `JSON.stringify(new String)`；⑤原语字符串/TypedArray 元素描述符；⑥RegExp source/flags 移到 prototype 以对齐 gOPN 的 `["lastIndex"]`。
+0. **~~Object/内建杠杆~~（v0.3.6 强制 → v0.3.7 补全 → v0.3.8 枚举 → v0.3.9 gOPD 数组 → v0.3.10 Date 具现，见 §13–§17）**：built-ins/Object 46.3% → 53.7% → 55.0% → 55.4% → 55.6% → **56.9%**（v0.3.10）；整体 43.89% → 44.55% → 44.69% → 44.75% → 44.77% → **44.91%**。v0.3.10 具现 Date（typeof Date=function、Date.prototype 真对象、gOPD 反射静态方法与原型方法、泛型 .call）。**仍剩（按价值）**：①**Date 加固**（修 11 个边角 SIGSEGV：`_aref_date_*` 加 this 类型检查改抛 TypeError、setter 实参 ToNumber 强转、Symbol.toPrimitive、扩展年份 toString、`class extends Date` 子类化）；②**其余内建构造器具现**（Object/Array/Function/Number/Boolean/Error/JSON + prototype，~100+，复用 Date/Math 模板；`typeof Object` 仍为 "number"）；③全局对象具现 + 顶层 `this`；④函数 length 运行时 gOPD 路径 + 函数 prototype 自有属性/attr；⑤`new String` 索引字符 + length attr + `JSON.stringify(new String)`；⑥原语字符串/TypedArray 元素描述符；⑦RegExp source/flags 移到 prototype 以对齐 gOPN。
 1. **looksLikeCjsSource 运行期 CJS 误判（P2，既有，Wave 4 暴露）**：复用朴素 `cjsHasEsmSyntax`，注释/字符串/模板/正则里含 “export ”/“import ” 文字的 CJS 被判为非 CJS、不做 CJS 包装，`import` 之运行期崩 `FATAL: _object_set called with NULL object`（Node 正常执行）。HEAD 逐字相同、与 Wave 4 无关；Wave 4 仅解除编译期误杀使其显形。彻底修复需把 CJS 检测改 AST/词法感知（与 Wave 4 的 `astHasRealTopLevelEsm` 同源思路）。
 2. **resolvePackageSpecifier 损坏 package.json 静默丢弃（P2，既有）**：`compiler/index.js:3837-3838` 对损坏 JSON `catch return ""`，经包说明符的导入被静默丢弃、编译成功（Node 抛 ERR_INVALID_PACKAGE_CONFIG）。与 `nearestPackageJsonExplicitCommonjs` 的抛错路径不一致。
 3. **--static 端到端 codegen 缺陷（P2，既有）**：含导出函数的程序 `--static` 在 `asm/arm64.js:1603` 报 “Unknown label: _js_add”（在 writeStaticLibrary 之前）。C_INTEROP_DESIGN.md B4 已登记。修复须过完整门禁。
@@ -243,6 +243,9 @@ P1/P2 残留：enumerable 变更与 accessor get/set 恒等未强制（漏拒）
 - 2026-07-31：Wave 8 主控独立差分 27 例与 Node 全一致（枚举 + RegExp/String 功能 + create/defineProperties 机制），fixtures `385/0/0/0`，门禁绿（`gen1==gen2==gen3` + 385）。test262 44.69% → **44.75%（2892，+4）**、built-ins/Object 55.0% → **55.4%（378，+3）**——收回 v0.3.7 暴露的 3 个 wrapper-as-properties-map 用例（create/15.2.3.5-4-35、defineProperties/...-241/-246）。**发布 v0.3.8 并推送**。
 - 2026-07-31：Wave 9 gOPD 数组支持 + undefined/null 抛 TypeError。调查发现 gOPD 目录实为 **131 PASS / 179 FAIL**（远超此前 ~25 的步进采样估计），且更深根因是**内建构造器非运行时对象**（`typeof Object` 为 "number"，仅 Math 经特化具现）。本波先做最低风险的运行时增量：`runtime/types/object/index.js` 的 `_object_getOwnPropertyDescriptor` 新增 `TYPE_ARRAY` 分支（按规范合成 length / 索引元素 / 侧表具名描述符，arguments 同覆盖）+ 序言对 undefined/null 目标抛 TypeError。纯新增 +104 行、零改既有指令。
 - 2026-07-31：Wave 9 主控独立差分 24 例与 Node 全一致（数组 length/索引/越界/非规范/具名、arguments、undefined/null 抛 TypeError、num/bool 不抛 + plain-object/function/Math 回归守卫），fixtures `385/0/0/0`，门禁绿（`gen1==gen2==gen3` + 385）。test262 44.75% → **44.77%（2893，+1）**、built-ins/Object 55.4% → **55.6%（379，+1）**、gOPD 目录 stride-1 131 → 134（+3）。两处既有残留（纯新增未触、非本波引入）：`gOPD(函数变量,"length")` 经运行时路径返 undefined、`new String` length attr 偏差。**发布 v0.3.9 并推送**。下一步：内建构造器具现（Date 优先 ~50 翻转）+ 全局对象/顶层 this。
+- 2026-07-31：Wave 10 具现 Date 内建为真运行时对象（闭包构造器模板，仿 String/RegExp）。新增 emitDateCtorObject/emitDateProtoObject（members.js +248）+ `_date_call` 与 `_aref_date_*` 装箱包装（runtime/types/date/index.js +120）+ 闭包属性 attr 工作（`_closure_props_ensure` + `_object_set_prop_attr`，object/index.js +17）。裸 Date 标识符与 Date.prototype 读取作晚分支接入，四条按名语法快路（静态调用/方法派发/new Date/instanceof）不受影响。
+- 2026-07-31：Wave 10 主控独立差分 25 例与 Node 全一致（typeof Date=function、typeof Date.prototype=object、identity、gOPD(Date, now/parse/prototype)、gOPD(Date.prototype, getTime)、泛型 .call、全部既有 Date 回归守卫 instanceof/Date.now/getters/setters/parse/UTC/valueOf）。fixtures `385/0/0/0`，门禁绿（`gen1==gen2==gen3`）。test262（整体 stride-5）44.77% → **44.91%（2902，+9）**、built-ins/Object 55.6% → **56.9%（388，+9）**、built-ins/Date（单独非计分）24/117 → 39/117（+15）。
+- 2026-07-31：Wave 10 已知残留（built-ins/Date 非计分子集）：经 prototype 现可达的 **11 个边角 SIGSEGV**——5× 非对象 this（`_aref_date_*` 无防护读 `[this+8]`，本应抛 TypeError：getDate/getMinutes/getUTCDate/getUTCMinutes/setSeconds/setFullYear 的 this-value-non-object）、2× setter 实参 ToNumber 强转（setHours/arg-ms、setSeconds/arg-sec）、1× Symbol.toPrimitive/called-as-function、1× toString/negative-year（扩展年份格式）、1× subclassing（class extends Date）。具现前 Date.prototype 为 undefined，这些测试在 undefined 上抛预期 TypeError 计 PASS；具现后可调用方法在边角输入上崩溃。列 Date 加固波次。**发布 v0.3.10 并推送**。注：本波实施 agent 因 token-plan 5 小时配额耗尽（429，07-31 09:00 UTC 重置）于验证途中终止，主控自行完成差分/fixtures/门禁验证与发布；配额恢复前暂停子代理波次。
 
 ### 12.4 重做设计（字段存在位掩码）
 
@@ -319,3 +322,30 @@ P1/P2 残留：enumerable 变更与 accessor get/set 恒等未强制（漏拒）
 | 发布 | 达成 | v0.3.9 已推送（branch dev + tag） |
 
 既有残留（纯新增未触，列 §11）：`gOPD(函数变量,"length")` 运行时路径返 undefined；`new String` length attr 偏差；原语字符串/TypedArray 元素描述符；内建构造器/全局 gOPD 覆盖（下一步最高价值）。
+
+## 17. Wave 10 结果（Date 内建具现，v0.3.10）
+
+Date 由哨兵数值（typeof "number"）具现为真闭包构造器对象（仿 String/RegExp 模板）。
+
+| 项 | 状态 | 证据 |
+|---|---|---|
+| Date 闭包构造器（typeof "function"，name="Date"，length=7，_date_call 可调用） | 达成 | typeof Date === "function"；Date === Date 恒等 |
+| Date.prototype 真对象（全部方法自有属性 attr 5 + constructor 回指） | 达成 | typeof Date.prototype === "object"；Date.prototype === Date.prototype 恒等 |
+| 静态方法 now/parse/UTC（attr 5）+ prototype（attr 0） | 达成 | gOPD(Date,"now"/"parse")={w:true,e:false,c:true}；gOPD(Date,"prototype")={w:false,e:false,c:false} |
+| 原型方法 gOPD + 泛型 .call | 达成 | gOPD(Date.prototype,"getTime")={w:true,e:false,c:true}；Date.prototype.getTime.call(new Date(1000))===1000 |
+| 既有 Date 行为保留 | 达成 | 25 例差分全一致：instanceof/Date.now/new Date(0).getTime/getFullYear/getMonth/getDate/getDay/parse/UTC/valueOf/setTime |
+| 完整 bootstrap gate | 达成 | gen1==gen2==gen3 逐字节 + fixtures 385/0/0/0（自举期发射零字节，编译器仅调用/new/instanceof 位用 Date） |
+| test262 | 达成 | 整体 44.77% → **44.91%**（2902，+9）；Object 55.6% → **56.9%**（388，+9）；built-ins/Date（非计分）24/117 → 39/117（+15） |
+| 发布 | 达成 | v0.3.10 已推送（branch dev + tag） |
+
+已知残留（built-ins/Date 非计分子集，列 §11 ①）：经 prototype 现可达的 11 个边角 SIGSEGV——
+
+- 5× 非对象 this（this-value-non-object：getDate/getMinutes/getUTCDate/getUTCMinutes/setSeconds/setFullYear）：`_aref_date_*` 包装无防护读 `[this+8]`，本应抛 TypeError。
+- 2× setter 实参 ToNumber 强转（setHours/arg-ms-to-number、setSeconds/arg-sec-to-number）。
+- 1× Symbol.toPrimitive/called-as-function。
+- 1× toString/negative-year（扩展年份 ±YYYYYY 格式）。
+- 1× subclassing（class extends Date）。
+
+具现前 Date.prototype 为 undefined，这些测试在 undefined 上抛预期 TypeError 计 PASS；具现后可调用方法在边角输入上崩溃。修复方向：`_aref_date_*` 加 this 类型检查（非 Date 对象抛 TypeError）、setter 实参强转、Symbol.toPrimitive、扩展年份格式、子类化支持。
+
+实施注：本波实施 agent 因 token-plan 5 小时配额耗尽（429，07-31 09:00 UTC 重置）于验证途中终止；主控自行完成独立差分（25 例与 Node 全一致）、fixtures（385/0/0/0）、门禁（gen1==gen2==gen3）验证与发布。
