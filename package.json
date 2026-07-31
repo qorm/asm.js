@@ -1,6 +1,6 @@
 {
   "name": "asm.js",
-  "version": "0.3.12",
+  "version": "0.3.13",
   "scripts": {
     "test:fixtures": "node scripts/run-fixtures.mjs",
     "gate": "bash scripts/bootstrap-gate.sh",

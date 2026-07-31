@@ -38,6 +38,21 @@ const ArefMethodRef = {
         every: ["_array_every_rt", 1],
         reduce: ["_array_reduce_rt", 1],
         reduceRight: ["_array_reduceRight_rt", 1],
+        // [I3] 补齐缺失方法的一等值。一律用 _agen_* 泛型 helper(真数组恒等直通 _array_*_rt,
+        // 非数组经 _agen_norm 快照/抛 TypeError)——方法值不绑定接收者,`[].findIndex.call(o)`
+        // 的 this 可被 .call 改成任意对象,test262 return-abrupt-from-this-length-* 即此形态;
+        // 若直连 _array_*_rt 会按数组头解引用非数组 → SIGSEGV。values/keys/entries 委托
+        // _array_iterator_new;concat 变参由 _array_concat_rt 读 _call_argc(截断 4)。
+        find: ["_agen_find", 1],
+        findIndex: ["_agen_findIndex", 1],
+        flatMap: ["_agen_flatMap", 1],
+        flat: ["_agen_flat", 0],
+        fill: ["_agen_fill", 1],
+        copyWithin: ["_agen_copyWithin", 2],
+        concat: ["_agen_concat", 1],
+        values: ["_agen_values", 0],
+        keys: ["_agen_keys", 0],
+        entries: ["_agen_entries", 0],
     },
     string: {
         toUpperCase: ["_str_toUpperCase", 0],
@@ -2064,6 +2079,19 @@ export const MemberCompiler = {
                     join: ["_agen_join", 1],
                     slice: ["_agen_slice", 2],
                     at: ["_agen_at", 1],
+                    // [I3] 补齐缺失方法的泛型值读取。回调型经 cb2 表委托 _array_*_rt;
+                    // flat/fill/copyWithin 经 _agen_* norm 后委托;values/keys/entries norm
+                    // 后委托 _array_iterator_new。runtime/types/array/index.js:generateArefI3Methods。
+                    find: ["_agen_find", 1],
+                    findIndex: ["_agen_findIndex", 1],
+                    flatMap: ["_agen_flatMap", 1],
+                    flat: ["_agen_flat", 0],
+                    fill: ["_agen_fill", 1],
+                    copyWithin: ["_agen_copyWithin", 2],
+                    concat: ["_agen_concat", 1],
+                    values: ["_agen_values", 0],
+                    keys: ["_agen_keys", 0],
+                    entries: ["_agen_entries", 0],
                     // [test262 propertyHelper] `Function.prototype.call.bind(Array.prototype.push)`。
                     // 无 _agen_push;走守卫版 _fpg_arr_push(真数组尾跳 _array_push,非数组
                     // 返 undefined 而非按数组头解引用 SIGSEGV —— `Array.prototype.push` 的

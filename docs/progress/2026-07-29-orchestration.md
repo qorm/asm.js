@@ -251,6 +251,7 @@ P1/P2 残留：enumerable 变更与 accessor get/set 恒等未强制（漏拒）
 - 2026-07-31：Wave 12 内建函数一等化（Lever 1）。调查确认 `.call/.apply/.bind` 已对任意 0x7FFF 闭包可用，失败全因内建未物化为闭包值；最佳首增量 I5（已物化内建函数值登记正确 name/length，最低风险）。
 - 2026-07-31：I5 实施（members.js 五个闭包构建点补逐闭包 name/length + object/index.js `_js_length_dyn`/`_fn_has_own`/`_prop_in` 闭包分支 + 修正错 arity）。差分 ~104 例与 Node 全一致，fixtures 385/0/0/0，test262 2966 → 2972（+6，零误拒），门禁绿。仅 +6（非预估 ~55）：name/length 的 [[Set]]/[[Delete]] 语义未强制（`fn.name=x` 生效、delete 后元数据复活），~40+ verifyProperty 探针仍败——即 I6。
 - 2026-07-31：I6 实施（`_closure_prop_set` name/length 写守卫 + `_object_delete` 函数值墓碑 0x84 + 墓碑感知读路径 `_closure_prop_get`/`_js_length_dyn`/`_fn_has_own`/`_prop_in`/`_ogopd_fn` + `_object_set` 追加复位 flags）。差分 39 例与 Node 全一致，fixtures 385/0/0/0（途中修 2 回归），test262 2972 → **3036（+64，较 v0.3.10 基线 +70）**，byArea Object 57.6%/Math 69.2%/Array 48.8%/String 38.5%，零误拒。门禁绿（gen1==gen2==gen3）。**发布 v0.3.12 并推送**。残留与下一杠杆（I3/I2/I1·I4）列 §11。
+- 2026-07-31：Wave 13 实施 I3（Array.prototype 缺失方法一等值暴露：find/findIndex/fill/flat/flatMap/concat/copyWithin/keys/values/entries，runtime/types/array/index.js +495 纯插入 + members.js +28）。十方法以 方法值/.call/Array.prototype.<m>.call 三形态可用、带 name/length（I5 机制）；keys/values/entries 委托既有 `_array_iterator_new` 返回真迭代器；实例表用 `_agen_*` 泛型（非数组经 `_agen_norm` 快照/抛 TypeError，避免把非数组按数组头解引用 SIGSEGV）+ Symbol-length 守卫。差分电池与 Node 逐字一致，fixtures 385/0/0/0，test262 3036 → **3043（+7）**、built-ins/Array 48.8% → 50.0%、CRASH 172 → 169（−3）。门禁绿（gen1==gen2==gen3）。唯一 PASS→FAIL（findIndex/return-abrupt-from-this-length-as-symbol）为既有有损 Symbol 存储局限（基线 PASS 纯属方法 undefined 巧合），列残留。**发布 v0.3.13 并推送**（网络恢复，含补推 v0.3.12）。
 
 ### 12.4 重做设计（字段存在位掩码）
 
@@ -387,3 +388,16 @@ Lever 1（内建函数一等化）首两个增量。`.call/.apply/.bind` 本已�
 | 发布 | 达成 | v0.3.12 已推送（branch dev + tag） |
 
 残留（列 §11）：strict 写 name/length 不抛（无 strict 上下文，全模式忽略，满足 sloppy verifyProperty 探针）；`in` 不走 Function.prototype 链（未物化）；静态 gOPD 编译期拦截不反映 defineProperty 覆盖；类值（TYPE_FUNCTION=3）name/length 删除未处理。下一杠杆 I3（暴露缺失 Array.prototype 方法 flat/values/entries/...，~48-65）。
+
+## 20. Wave 13 结果（Array.prototype 缺失方法一等值暴露 I3，v0.3.13）
+
+| 项 | 状态 | 证据 |
+|---|---|---|
+| 十个方法一等值（find/findIndex/fill/flat/flatMap/concat/copyWithin/keys/values/entries） | 达成 | 方法值/.call/Array.prototype.<m>.call 三形态可用，带正确 name/length（I5 机制） |
+| keys/values/entries 真迭代器 | 达成 | 委托既有 `_array_iterator_new`，next()/Symbol.iterator/for-of/展开/Array.from 全通 |
+| 实例表 `_agen_*` 泛型（非数组快照/抛 TypeError，避 SIGSEGV）+ Symbol-length 守卫 | 达成 | `[].findIndex.call(o)` 不按非数组头解引用 |
+| 完整 bootstrap gate | 达成 | `gen1==gen2==gen3` 逐字节 + fixtures `385/0/0/0` |
+| test262 | 达成 | 46.98% → **47.09%**（3043，+7）；built-ins/Array 48.8% → 50.0%；CRASH 172 → 169（−3） |
+| 发布 | 达成 | v0.3.13 已推送（含补推 v0.3.12） |
+
+残留（列 §11）：findIndex/return-abrupt-from-this-length-as-symbol（既有有损 Symbol 存储，`o.length=Symbol(1)` 读回 0，基线 PASS 纯属方法 undefined 巧合）；2 个 FAIL→CRASH（concat/create-proxy、flatMap/this-value-ctor-object-species-bad-throws，既有 Symbol.species + Object.getPrototypeOf，object/core 超范围）；flat(depth<=0) 返回接收者非浅拷贝；泛型快照不保留数组空洞；species/constructor 协议未实现。下一杠杆 I2（物化 Map/Set/Promise 构造器 + prototype，~38-61）。

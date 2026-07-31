@@ -2297,7 +2297,15 @@ export class ArrayGenerator {
         vm.shrImm(VReg.V2, VReg.RET, 48);
         vm.cmpImm(VReg.V2, 0x7FFB); // undefined → 0
         vm.jeq("_agen_norm_len0");
+        // [I3] length 是 Symbol → ToNumber(Symbol) abrupt,抛 TypeError。_to_int32 不处理
+        // Symbol(裸堆指针走 _number_coerce 直接 SIGSEGV);此前 findIndex 等未暴露成值读取,
+        // 本路径不可达,暴露后 test262 return-abrupt-from-this-length-as-symbol 触雷,就地拦。
+        vm.mov(VReg.S3, VReg.RET);  // 存 boxed length(_is_symbol 毁 A0/RET)
         vm.mov(VReg.A0, VReg.RET);
+        vm.call("_is_symbol");      // RET = 0/1
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_agen_norm_len_sym");
+        vm.mov(VReg.A0, VReg.S3);   // 还原 length
         vm.call("_to_int32"); // boxed → 裸 int32(ToLength 近似)
         vm.mov(VReg.S1, VReg.RET);
         vm.cmpImm(VReg.S1, 0);
@@ -2333,6 +2341,11 @@ export class ArrayGenerator {
         boxStr(VReg.A0);
         vm.call("_throw_type_error"); // 不返回
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0); // 理论不达
+        vm.label("_agen_norm_len_sym");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot convert a Symbol value to a number"));
+        boxStr(VReg.A0);
+        vm.call("_throw_type_error"); // 不返回
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0); // 理论不达
 
         // 回调型两参:_agen_<m>(A0=recv, A1=cb) → norm 后委托 _array_<m>_rt
         const cb2 = [
@@ -2341,6 +2354,10 @@ export class ArrayGenerator {
             ["_agen_filter", "_array_filter_rt"],
             ["_agen_some", "_array_some_rt"],
             ["_agen_every", "_array_every_rt"],
+            // [I3] 回调型(recv, cb)同构,泛型 norm 后委托 _rt(见 generateArefI3Methods)。
+            ["_agen_find", "_array_find_rt"],
+            ["_agen_findIndex", "_array_findIndex_rt"],
+            ["_agen_flatMap", "_array_flatMap_rt"],
         ];
         for (const [label, target] of cb2) {
             vm.label(label);
@@ -2464,11 +2481,489 @@ export class ArrayGenerator {
         vm.epilogue([VReg.S0], 0);
     }
 
+    // [I3] 内建数组方法一等值(方法值读取)的运行时 helper。全部 _aref_generic-safe:
+    // 接收者在 A0(boxed 真数组,实例值读取派发前已 tag 0x7FFE 守卫;泛型 .call 经
+    // _agen_* 先 norm 成真数组再委托),用户实参上移到 A1..。回调型镜像 _array_*_rt
+    // (运行时驱动回调 _aref_invoke_cb);flat/fill/copyWithin/迭代器为非回调型。
+    // 新增 helper 不触碰任何既有共享热路径 → 直调字节不变。
+    generateArefI3Methods() {
+        const vm = this.vm;
+        const UNDEF = 0x7ffb000000000000n;
+        const BOXARR = 0x7ffe000000000000n;
+
+        // arr.find(cb) -> 命中元素(boxed)或 undefined(短路)。element 存栈槽 [SP+0]
+        // (GC 扫栈可见)以跨回调保活、命中时返回。镜像 _array_filter_rt 的栈槽手法。
+        vm.label("_array_find_rt");
+        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.mov(VReg.S0, VReg.A0); // arr
+        vm.mov(VReg.S1, VReg.A1); // cb
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_length");
+        vm.mov(VReg.S2, VReg.RET); // len
+        vm.movImm(VReg.S3, 0);     // i
+        vm.label("_find_loop");
+        vm.cmp(VReg.S3, VReg.S2);
+        vm.jge("_find_undef");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_array_get");     // RET = element
+        vm.store(VReg.SP, 0, VReg.RET); // 跨回调保活
+        vm.mov(VReg.A0, VReg.RET); // arg0 = element
+        vm.scvtf(0, VReg.S3);
+        vm.fmovToInt(VReg.A1, 0);  // arg1 = 装箱 index
+        vm.mov(VReg.A2, VReg.S0);  // arg2 = arr
+        vm.mov(VReg.A3, VReg.S1);  // cb
+        vm.call("_aref_invoke_cb");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_boolean");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_find_found");
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_find_loop");
+        vm.label("_find_found");
+        vm.load(VReg.RET, VReg.SP, 0); // 返回命中元素
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 16);
+        vm.label("_find_undef");
+        vm.movImm64(VReg.RET, UNDEF);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 16);
+
+        // arr.findIndex(cb) -> 命中下标(装箱数字)或 -1(短路)。
+        vm.label("_array_findIndex_rt");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_length");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.movImm(VReg.S3, 0);
+        vm.label("_findi_loop");
+        vm.cmp(VReg.S3, VReg.S2);
+        vm.jge("_findi_neg");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_array_get");
+        vm.mov(VReg.A0, VReg.RET); // element
+        vm.scvtf(0, VReg.S3);
+        vm.fmovToInt(VReg.A1, 0);
+        vm.mov(VReg.A2, VReg.S0);
+        vm.mov(VReg.A3, VReg.S1);
+        vm.call("_aref_invoke_cb");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_boolean");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_findi_box");      // S3 = 命中下标
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_findi_loop");
+        vm.label("_findi_neg");
+        vm.movImm(VReg.S3, -1);
+        vm.label("_findi_box");
+        vm.scvtf(0, VReg.S3);      // 装箱数字(同静态派发出口)
+        vm.fmovToInt(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+
+        // arr.flatMap(cb) -> 新数组:cb(el,i,arr) 返回数组则展开一层、否则原样追加。
+        // 结果(S4)裸头存 callee-saved,每轮 _array_push 回写;内层数组(S5)与循环变量 j
+        // (栈槽 [SP+0])跨 _array_push 保活(GC 扫栈可见;_array_push 仅增长目标 data 区,
+        // 不搬移内层对象,同 _array_flat 的内层展开纪律)。
+        vm.label("_array_flatMap_rt");
+        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_length");
+        vm.mov(VReg.S2, VReg.RET); // len
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.mov(VReg.S4, VReg.RET); // result(裸头)
+        vm.movImm(VReg.S3, 0);     // i
+        vm.label("_fm_loop");
+        vm.cmp(VReg.S3, VReg.S2);
+        vm.jge("_fm_done");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_array_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.scvtf(0, VReg.S3);
+        vm.fmovToInt(VReg.A1, 0);
+        vm.mov(VReg.A2, VReg.S0);
+        vm.mov(VReg.A3, VReg.S1);
+        vm.call("_aref_invoke_cb"); // RET = mapped
+        vm.mov(VReg.S5, VReg.RET);
+        vm.shrImm(VReg.V0, VReg.S5, 48);
+        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jne("_fm_push_one");
+        // mapped 是数组:展开一层
+        vm.emitMaskLoad(VReg.V4);
+        vm.andMaskReg(VReg.S5, VReg.S5, VReg.V4); // S5 = 内层(裸)
+        vm.movImm(VReg.V0, 0);
+        vm.store(VReg.SP, 0, VReg.V0); // j = 0
+        vm.label("_fm_inner");
+        vm.load(VReg.V0, VReg.S5, 8);      // 内层 len(每轮重载,S5 稳定)
+        vm.load(VReg.V1, VReg.SP, 0);      // j
+        vm.cmp(VReg.V1, VReg.V0);
+        vm.jge("_fm_next");
+        vm.load(VReg.V0, VReg.S5, 24);
+        vm.shl(VReg.V2, VReg.V1, 3);
+        vm.add(VReg.V0, VReg.V0, VReg.V2);
+        vm.load(VReg.A1, VReg.V0, 0);      // 内层元素
+        vm.mov(VReg.A0, VReg.S4);
+        vm.call("_array_push");
+        vm.mov(VReg.S4, VReg.RET);
+        vm.load(VReg.V0, VReg.SP, 0);
+        vm.addImm(VReg.V0, VReg.V0, 1);
+        vm.store(VReg.SP, 0, VReg.V0);     // j++
+        vm.jmp("_fm_inner");
+        vm.label("_fm_push_one");
+        vm.mov(VReg.A0, VReg.S4);
+        vm.mov(VReg.A1, VReg.S5);
+        vm.call("_array_push");
+        vm.mov(VReg.S4, VReg.RET);
+        vm.label("_fm_next");
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_fm_loop");
+        vm.label("_fm_done");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.RET, VReg.S4, VReg.V1);
+        vm.movImm64(VReg.V1, BOXARR);
+        vm.or(VReg.RET, VReg.RET, VReg.V1); // 装箱 0x7FFE
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 16);
+
+        // arr.flat(depth=1) -> 新数组。循环 _array_flat(深度 1)depth 次。depth 缺省
+        // (undefined)→ 1;非数字经 _to_int32;depth<=0 → 返回原数组(记偏差:未浅拷贝)。
+        vm.label("_array_flat_rt");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0); // arr(boxed)
+        vm.shrImm(VReg.V0, VReg.A1, 48);
+        vm.cmpImm(VReg.V0, 0x7ffb); // depth undefined?
+        vm.jne("_flatrt_hasdepth");
+        vm.movImm(VReg.S1, 1);
+        vm.jmp("_flatrt_depthok");
+        vm.label("_flatrt_hasdepth");
+        vm.mov(VReg.A0, VReg.A1);
+        vm.call("_to_int32");       // 装箱 depth → 裸 int
+        vm.mov(VReg.S1, VReg.RET);
+        vm.label("_flatrt_depthok");
+        vm.label("_flatrt_loop");
+        vm.cmpImm(VReg.S1, 0);
+        vm.jle("_flatrt_done");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_flat");     // boxed arr → boxed 新数组
+        vm.mov(VReg.S0, VReg.RET);
+        vm.subImm(VReg.S1, VReg.S1, 1);
+        vm.jmp("_flatrt_loop");
+        vm.label("_flatrt_done");
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+
+        // _aref_relidx(A0=装箱 idx 或 undefined, A1=裸 len, A2=裸 default) -> 裸归一下标。
+        // idx 缺省(undefined)→ default(调用方保证 default∈[0,len]);否则 ToInt32 后
+        // ES 相对下标归一:负数 +len,仍负 → 0;>len → len。供 fill/copyWithin 复用。
+        vm.label("_aref_relidx");
+        vm.prologue(0, [VReg.S1, VReg.S2]);
+        vm.mov(VReg.S1, VReg.A1); // len
+        vm.mov(VReg.S2, VReg.A2); // default
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0x7ffb);
+        vm.jne("_relidx_have");
+        vm.mov(VReg.RET, VReg.S2);
+        vm.epilogue([VReg.S1, VReg.S2], 0);
+        vm.label("_relidx_have");
+        vm.call("_to_int32");      // A0=装箱 idx → RET 裸
+        vm.cmpImm(VReg.RET, 0);
+        vm.jge("_relidx_pos");
+        vm.add(VReg.RET, VReg.RET, VReg.S1); // += len
+        vm.cmpImm(VReg.RET, 0);
+        vm.jge("_relidx_pos");
+        vm.movImm(VReg.RET, 0);
+        vm.label("_relidx_pos");
+        vm.cmp(VReg.RET, VReg.S1);
+        vm.jle("_relidx_done");
+        vm.mov(VReg.RET, VReg.S1);
+        vm.label("_relidx_done");
+        vm.epilogue([VReg.S1, VReg.S2], 0);
+
+        // arr.fill(value, start=0, end=len) -> 原地填 value,返回接收者。
+        vm.label("_array_fill_rt");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
+        vm.mov(VReg.S0, VReg.A0); // arr
+        vm.mov(VReg.S1, VReg.A1); // value
+        vm.mov(VReg.S3, VReg.A2); // 装箱 start
+        vm.mov(VReg.S4, VReg.A3); // 装箱 end
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_length");
+        vm.mov(VReg.S2, VReg.RET); // len
+        vm.mov(VReg.A0, VReg.S3);
+        vm.mov(VReg.A1, VReg.S2);
+        vm.movImm(VReg.A2, 0);     // start 缺省 0
+        vm.call("_aref_relidx");
+        vm.mov(VReg.S3, VReg.RET); // start
+        vm.mov(VReg.A0, VReg.S4);
+        vm.mov(VReg.A1, VReg.S2);
+        vm.mov(VReg.A2, VReg.S2);  // end 缺省 len
+        vm.call("_aref_relidx");
+        vm.mov(VReg.S4, VReg.RET); // end
+        vm.label("_fill_loop");
+        vm.cmp(VReg.S3, VReg.S4);
+        vm.jge("_fill_done");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.mov(VReg.A2, VReg.S1);
+        vm.call("_array_set");
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_fill_loop");
+        vm.label("_fill_done");
+        vm.mov(VReg.RET, VReg.S0); // 返回接收者(boxed)
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+
+        // arr.copyWithin(target, start=0, end=len) -> 原地拷贝 [start,end) 到 target,
+        // 返回接收者。count=min(end-start, len-target);重叠按方向复制避自覆盖。
+        // 镜像 compileArrayCopyWithin 的内联逻辑,状态落栈槽(callee-saved 不够)。
+        vm.label("_array_copyWithin_rt");
+        // 栈帧须 16 对齐(arm64 bl 要求):5 槽 40B → 补足 48B([SP+40] 闲置)。
+        vm.prologue(48, [VReg.S0, VReg.S1]);
+        vm.store(VReg.SP, 0, VReg.A1);  // [0] 装箱 target(后覆写为 tgt)
+        vm.store(VReg.SP, 8, VReg.A2);  // [8] 装箱 start(后覆写为 from)
+        vm.store(VReg.SP, 16, VReg.A3); // [16] 装箱 end(后覆写为 count)
+        vm.mov(VReg.S0, VReg.A0);       // arr
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_length");
+        vm.mov(VReg.S1, VReg.RET);      // len
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.movImm(VReg.A2, 0);
+        vm.call("_aref_relidx");
+        vm.store(VReg.SP, 0, VReg.RET); // [0]=tgt
+        vm.load(VReg.A0, VReg.SP, 8);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.movImm(VReg.A2, 0);
+        vm.call("_aref_relidx");
+        vm.store(VReg.SP, 8, VReg.RET); // [8]=from
+        vm.load(VReg.A0, VReg.SP, 16);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.mov(VReg.A2, VReg.S1);       // end 缺省 len
+        vm.call("_aref_relidx");        // RET=end
+        vm.load(VReg.V0, VReg.SP, 8);   // from
+        vm.sub(VReg.V0, VReg.RET, VReg.V0); // V0 = end-from
+        vm.load(VReg.V1, VReg.SP, 0);   // tgt
+        vm.sub(VReg.V1, VReg.S1, VReg.V1);  // V1 = len-tgt
+        vm.cmp(VReg.V1, VReg.V0);
+        vm.jle("_cw_cnt");              // V1<=V0 → count=V1
+        vm.mov(VReg.V1, VReg.V0);       // 否则 count=V0
+        vm.label("_cw_cnt");
+        vm.store(VReg.SP, 16, VReg.V1); // [16]=count
+        vm.cmpImm(VReg.V1, 0);
+        vm.jle("_cw_done");
+        vm.load(VReg.V0, VReg.SP, 8);   // from
+        vm.add(VReg.V0, VReg.V0, VReg.V1); // V0 = fc = from+count
+        vm.load(VReg.V2, VReg.SP, 8);   // from
+        vm.load(VReg.V3, VReg.SP, 0);   // tgt
+        vm.cmp(VReg.V2, VReg.V3);
+        vm.jge("_cw_fwd");              // from>=tgt → 前向
+        vm.cmp(VReg.V3, VReg.V0);
+        vm.jge("_cw_fwd");              // tgt>=fc → 前向
+        // 后向:to=tgt+count-1; from=fc-1; step=-1
+        vm.load(VReg.V3, VReg.SP, 0);   // tgt
+        vm.add(VReg.V3, VReg.V3, VReg.V1);
+        vm.subImm(VReg.V3, VReg.V3, 1);
+        vm.store(VReg.SP, 24, VReg.V3); // [24]=to
+        vm.subImm(VReg.V0, VReg.V0, 1);
+        vm.store(VReg.SP, 8, VReg.V0);  // [8]=from(fc-1)
+        vm.movImm(VReg.V3, -1);
+        vm.store(VReg.SP, 32, VReg.V3); // [32]=step
+        vm.jmp("_cw_copy");
+        vm.label("_cw_fwd");
+        vm.load(VReg.V3, VReg.SP, 0);   // tgt
+        vm.store(VReg.SP, 24, VReg.V3); // to=tgt
+        vm.movImm(VReg.V3, 1);
+        vm.store(VReg.SP, 32, VReg.V3); // step=+1
+        vm.label("_cw_copy");
+        vm.label("_cw_loop");
+        vm.load(VReg.V0, VReg.SP, 16);  // count
+        vm.cmpImm(VReg.V0, 0);
+        vm.jle("_cw_done");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.load(VReg.A1, VReg.SP, 8);   // from
+        vm.call("_array_get");          // RET = val
+        vm.mov(VReg.A2, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.load(VReg.A1, VReg.SP, 24);  // to
+        vm.call("_array_set");
+        vm.load(VReg.V0, VReg.SP, 8);
+        vm.load(VReg.V1, VReg.SP, 32);
+        vm.add(VReg.V0, VReg.V0, VReg.V1);
+        vm.store(VReg.SP, 8, VReg.V0);  // from+=step
+        vm.load(VReg.V0, VReg.SP, 24);
+        vm.load(VReg.V1, VReg.SP, 32);
+        vm.add(VReg.V0, VReg.V0, VReg.V1);
+        vm.store(VReg.SP, 24, VReg.V0); // to+=step
+        vm.load(VReg.V0, VReg.SP, 16);
+        vm.subImm(VReg.V0, VReg.V0, 1);
+        vm.store(VReg.SP, 16, VReg.V0); // count--
+        vm.jmp("_cw_loop");
+        vm.label("_cw_done");
+        vm.mov(VReg.RET, VReg.S0);      // 返回接收者
+        vm.epilogue([VReg.S0, VReg.S1], 48);
+
+        // _concat_append(A0=result, A1=item) -> result:item 是数组则逐元素并入(手动展开,
+        // 同 _array_flat 内层循环;不走 dormant 的 _array_concat),否则 _array_push 单元素。
+        // result 标签随 _array_push 保持。内层裸指针(S1)与 j(S2)跨 _array_push 保活。
+        vm.label("_concat_append");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.shrImm(VReg.V0, VReg.S1, 48);
+        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jne("_ccat_one");
+        // 数组:展开一层 push
+        vm.emitMaskLoad(VReg.V4);
+        vm.andMaskReg(VReg.S1, VReg.S1, VReg.V4); // S1 = 内层(裸)
+        vm.movImm(VReg.S2, 0);                    // j
+        vm.label("_ccat_loop");
+        vm.load(VReg.V0, VReg.S1, 8);             // 内层 len(每轮重载,S1 稳定)
+        vm.cmp(VReg.S2, VReg.V0);
+        vm.jge("_ccat_done");
+        vm.load(VReg.V0, VReg.S1, 24);
+        vm.shl(VReg.V1, VReg.S2, 3);
+        vm.add(VReg.V0, VReg.V0, VReg.V1);
+        vm.load(VReg.A1, VReg.V0, 0);             // 内层元素
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_push");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.addImm(VReg.S2, VReg.S2, 1);
+        vm.jmp("_ccat_loop");
+        vm.label("_ccat_one");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.S1, VReg.A1); // 非数组:item 原样(重取 A1,S1 未被 mask)
+        vm.call("_array_push");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.label("_ccat_done");
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+
+        // arr.concat(a, b, ...) -> 新数组。变参:实参个数读 _call_argc(调用点写、runtime
+        // helper 不改写),截断到 4(蹦床仅移位 A0-A3)。result = _array_slice(recv 全拷贝)
+        // 后逐个 _concat_append 实参。A1-A4 先存栈(随后的 call 会毁)。
+        vm.label("_array_concat_rt");
+        vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.lea(VReg.V0, "_call_argc");
+        vm.load(VReg.S1, VReg.V0, 0);   // argc(须在任何 call 前读)
+        vm.cmpImm(VReg.S1, 4);
+        vm.jle("_concat_argc_ok");
+        vm.movImm(VReg.S1, 4);
+        vm.label("_concat_argc_ok");
+        vm.store(VReg.SP, 0, VReg.A1);
+        vm.store(VReg.SP, 8, VReg.A2);
+        vm.store(VReg.SP, 16, VReg.A3);
+        vm.store(VReg.SP, 24, VReg.A4);
+        // result = recv 全拷贝(_array_slice 0..INT_MAX,boxed)
+        vm.movImm(VReg.A1, 0);
+        vm.movImm(VReg.A2, 2147483647);
+        vm.call("_array_slice");        // A0=recv(未动)→ boxed 副本
+        vm.mov(VReg.S0, VReg.RET);      // result
+        vm.cmpImm(VReg.S1, 1);
+        vm.jlt("_concat_done");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.load(VReg.A1, VReg.SP, 0);
+        vm.call("_concat_append");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.cmpImm(VReg.S1, 2);
+        vm.jlt("_concat_done");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.load(VReg.A1, VReg.SP, 8);
+        vm.call("_concat_append");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.cmpImm(VReg.S1, 3);
+        vm.jlt("_concat_done");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.load(VReg.A1, VReg.SP, 16);
+        vm.call("_concat_append");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.cmpImm(VReg.S1, 4);
+        vm.jlt("_concat_done");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.load(VReg.A1, VReg.SP, 24);
+        vm.call("_concat_append");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.label("_concat_done");
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 48);
+
+        // ---- 泛型(.call 非数组接收者)norm 委托层 ----
+        // flat: _agen_flat(A0=recv, A1=depth)
+        vm.label("_agen_flat");
+        vm.prologue(0, [VReg.S0]);
+        vm.mov(VReg.S0, VReg.A1);
+        vm.call("_agen_norm");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.call("_array_flat_rt");
+        vm.epilogue([VReg.S0], 0);
+
+        // fill: _agen_fill(A0=recv, A1=value, A2=start, A3=end)。变异落快照(记偏差,
+        // 同既有 _agen_* 的快照语义)。
+        vm.label("_agen_fill");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.mov(VReg.S0, VReg.A1);
+        vm.mov(VReg.S1, VReg.A2);
+        vm.mov(VReg.S2, VReg.A3);
+        vm.call("_agen_norm");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.mov(VReg.A2, VReg.S1);
+        vm.mov(VReg.A3, VReg.S2);
+        vm.call("_array_fill_rt");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+
+        // copyWithin: _agen_copyWithin(A0=recv, A1=target, A2=start, A3=end)。
+        vm.label("_agen_copyWithin");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.mov(VReg.S0, VReg.A1);
+        vm.mov(VReg.S1, VReg.A2);
+        vm.mov(VReg.S2, VReg.A3);
+        vm.call("_agen_norm");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.mov(VReg.A2, VReg.S1);
+        vm.mov(VReg.A3, VReg.S2);
+        vm.call("_array_copyWithin_rt");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+
+        // concat 泛型:_agen_concat(A0=recv, A1..A4)。先存实参(norm 毁 A1..),norm 后
+        // 委托 _array_concat_rt(其自读 _call_argc;runtime helper 不改写 → 透传)。
+        vm.label("_agen_concat");
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.S2, VReg.A2);
+        vm.mov(VReg.S3, VReg.A3);
+        vm.mov(VReg.S4, VReg.A4);
+        vm.call("_agen_norm");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.mov(VReg.A3, VReg.S3);
+        vm.mov(VReg.A4, VReg.S4);
+        vm.call("_array_concat_rt");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 32);
+
+        // 迭代器泛型:_agen_<kind>(A0=recv) -> norm 后 _array_iterator_new(norm, kind)。
+        const agenIt = [["_agen_values", 0], ["_agen_keys", 1], ["_agen_entries", 2]];
+        for (const [label, kind] of agenIt) {
+            vm.label(label);
+            vm.prologue(0, []);
+            vm.call("_agen_norm");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.movImm(VReg.A1, kind);
+            vm.call("_array_iterator_new");
+            vm.epilogue([], 0);
+        }
+    }
+
     generate() {
         this.generateArefGeneric();
         this.generateArefIntWrappers();
         this.generateArefCallbackMethods();
         this.generateAgenGeneric();
+        this.generateArefI3Methods();
         this.generateSpreadCall0();
         this.generateArraySpreadInto();
         this.generateArrayEnsureCap();
