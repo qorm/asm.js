@@ -46,6 +46,16 @@ const ATTR_WRITABLE = 1; // bit0
 const ATTR_ENUMERABLE = 2; // bit1
 const ATTR_CONFIGURABLE = 4; // bit2
 const ATTR_DEFAULT = 7; // 普通属性:writable+enumerable+configurable 全 1
+// [I6] 函数值 name/length 删除墓碑位(仅用于闭包属性侧表条目;attr 常规位只用低 3 位,
+// 0x80 不会由 defineProperty/freeze/seal 产生)。_closure_prop_del 删除 name/length 时
+// 把侧表条目 value 置 undefined、attr 落 ATTR_FN_DELETED_TOMB(= 0x80|ATTR_CONFIGURABLE):
+// _closure_prop_get 扫到 0x80 位即返 undefined **且不落元数据回落**(否则 _func_meta_name/
+// _func_meta_arity 按 code_ptr 复活被删属性,delete 的"永久移除"语义失败)。保留
+// CONFIGURABLE 位是必须:删后重赋时 _closure_prop_set 先以 _object_delete 清墓碑条目
+// (其 _odel_hit 的 configurable 守卫见 0x80 无配置位会拒删 → 重赋永不生效),清后新值
+// 按默认 attr=7(可写)落回(ES:configurable 属性删后可重建为普通数据属性)。
+const ATTR_FN_DELETED = 0x80; // bit7: 函数 name/length 已删除墓碑(抑制元数据回落)
+const ATTR_FN_DELETED_TOMB = 0x80 | ATTR_CONFIGURABLE; // 墓碑条目实际 attr(可配置 → 可被 _object_delete 清除)
 
 // [#dp-mask] Object.defineProperty 字段存在位掩码(field-presence mask)。
 // 编译器按描述符里**实际出现**的字段置位,运行时仅对出现的字段做验证/强制/改写;
@@ -517,7 +527,7 @@ export class ObjectGenerator {
         // (使运行期函数值——参数/成员链等——的 fn.name / fn.length 生效,不止编译期
         // 静态可知的访问点)。侧表**优先**:defineProperty 的覆盖值先命中。
         vm.label("_closure_prop_get");
-        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
         vm.mov(VReg.S0, VReg.A1); // 保存 key
         vm.mov(VReg.S1, VReg.A0); // 保存 fn(跨 _closure_props_find)
         vm.call("_closure_props_find"); // A0=fn → RET=props/undefined
@@ -525,17 +535,43 @@ export class ObjectGenerator {
         vm.load(VReg.V1, VReg.V1, 0);
         vm.cmp(VReg.RET, VReg.V1);
         vm.jeq("_cpg_miss");
-        vm.mov(VReg.A0, VReg.RET);
+        // [I6] 侧表命中判定改自扫描(不再委托 _object_get):需要命中槽的 attr 字节——
+        // 墓碑位 ATTR_FN_DELETED(0x80,_closure_prop_del 落)标记 name/length 已删除,
+        // 命中墓碑 → 直接返 undefined(**不落** _cpg_miss 元数据回落,否则被删属性经
+        // _func_meta_* 复活,delete 永久移除语义失败)。普通命中(含删除后用户重建的
+        // 条目,attr 默认 7)→ 返回槽值(即使 undefined);键 miss → _cpg_miss 元数据
+        // 回落(W-22 语义不变:fn.x=1 之后 fn.name 仍经元数据反射)。侧表 props 是
+        // _object_new 出的普通对象(__proto__=0),自扫描与 _object_get 语义等价。
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.S2, VReg.RET, VReg.V1); // S2 = raw props
+        vm.load(VReg.S3, VReg.S2, 8);       // S3 = count
+        vm.movImm(VReg.S4, 0);              // S4 = idx
+        vm.label("_cpg_scan");
+        vm.cmp(VReg.S4, VReg.S3);
+        vm.jge("_cpg_miss");                // 侧表键 miss → 元数据回落
+        vm.load(VReg.V2, VReg.S2, OBJECT_PROPS_PTR_OFFSET);
+        vm.shlImm(VReg.V0, VReg.S4, 4);
+        vm.add(VReg.V0, VReg.V2, VReg.V0);  // V0 = 槽地址
+        vm.load(VReg.A0, VReg.V0, 0);       // 槽键
         vm.mov(VReg.A1, VReg.S0);
-        vm.call("_object_get");
-        // [W-22] 侧表**存在**但该键 miss(_object_get → undefined)时也须落回元数据反射:
-        // 否则函数一旦挂过任意自定义属性(fn.x = 1),其 fn.name 就永久变 undefined
-        // (侧表对象里根本没有 "name" 键)。此前只有「无侧表」才走 _cpg_miss。
-        vm.lea(VReg.V1, "_js_undefined");
-        vm.load(VReg.V1, VReg.V1, 0);
-        vm.cmp(VReg.RET, VReg.V1);
-        vm.jeq("_cpg_miss");
-        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.call("_object_key_eq");          // 内容比较(驻留/堆串通用)
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_cpg_hit");
+        vm.addImm(VReg.S4, VReg.S4, 1);
+        vm.jmp("_cpg_scan");
+        vm.label("_cpg_hit");
+        vm.load(VReg.V2, VReg.S2, OBJECT_PROPS_PTR_OFFSET);
+        vm.shlImm(VReg.V0, VReg.S4, 4);
+        vm.add(VReg.V0, VReg.V2, VReg.V0);
+        vm.load(VReg.V3, VReg.V0, 8);       // V3 = 槽值(_object_get_attr 调用前取出)
+        vm.mov(VReg.A0, VReg.S2);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_object_get_attr");        // RET = attr 字节(flags_ptr=0 → ATTR_DEFAULT)
+        vm.andImm(VReg.V0, VReg.RET, ATTR_FN_DELETED);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_cpg_undef");               // 墓碑 → undefined(抑制元数据回落)
+        vm.mov(VReg.RET, VReg.V3);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
         // 键 miss:若 key==="name" 反射元数据名、key==="length" 反射元数据 arity(否则 undefined)。
         // [W-41] key==="prototype":惰性创建 F.prototype + constructor 回链(仅闭包 magic 0xc105)。
         vm.label("_cpg_miss");
@@ -586,7 +622,7 @@ export class ObjectGenerator {
         vm.call("_closure_prop_set");
         // 5. return boxed prototype
         vm.mov(VReg.RET, VReg.S0);
-        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
         vm.label("_cpg_key_ck");
         // key 去壳 == addString("name")/addString("length") 地址?
         // (emitBoxedStringKey 经 addString dedup,同址)
@@ -614,7 +650,7 @@ export class ObjectGenerator {
         vm.jeq("_cpg_undef");
         vm.mov(VReg.A0, VReg.RET);
         vm.call("_js_box_string");                  // RET = 装箱字符串
-        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
         // [W-27] key==="length":同一套闭包脱壳(与 name 路径逐字同形),查 _func_meta_arity。
         // 未登记(匿名普通函数/内建)返 -1 → undefined(不编造 0);>=0 → canonical JS number。
         // 脱壳代码在此复制而非与 name 路径共享:共享需一个跨分支存活的标志寄存器,而本函数
@@ -636,24 +672,144 @@ export class ObjectGenerator {
         vm.jeq("_cpg_undef");
         vm.scvtf(0, VReg.RET);
         vm.fmovToInt(VReg.RET, 0);                  // 裸 int → canonical float64 位模式
-        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
         vm.label("_cpg_undef");
         vm.lea(VReg.RET, "_js_undefined");
         vm.load(VReg.RET, VReg.RET, 0);
-        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
 
         // _closure_prop_set(A0=fn, A1=key, A2=val) -> val(赋值表达式之值)。
+        // [I6] 函数值 name/length 的 [[Set]] 守卫:规范形状恒 {writable:false,
+        // enumerable:false, configurable:true}(_ogopd_fn 硬编),属性**有效存在**
+        // (_closure_prop_get 非 undefined——侧表命中或元数据回落)时赋值静默忽略
+        // (sloppy 语义返 RHS;asm.js 无 strict 上下文,不抛 TypeError,与 _object_set
+        // 的 _object_set_wcheck「sloppy 静默」同形——strict 抛为残差)。此前无守卫:
+        // fn.name="x" 落侧表遮蔽元数据/规范值,test262 verifyProperty 的 isWritable
+        // 探针(写后值变)恒败。编译期登记站点(emitBuiltinMethodRefClosureMeta /
+        // emitRegExpMethodClosure / emitDateProtoMethodEntry / _ta_intrinsic 等)不受影响:
+        // 新闭包 code_ptr 是运行时蹦床标签(_aref_generic 等),函数元数据侧表无登记 →
+        // _closure_prop_get → undefined → 放行。删除后重赋亦放行(墓碑 → undefined,
+        // 且先清墓碑槽使新值按默认 attr=7 落回,符合 ES 删后重建语义)。
         vm.label("_closure_prop_set");
-        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
         vm.mov(VReg.S0, VReg.A1); // key
         vm.mov(VReg.S1, VReg.A2); // val
+        vm.mov(VReg.S2, VReg.A0); // fn
+        vm.shrImm(VReg.V1, VReg.S0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFC);
+        vm.jne("_cps_set");                    // 非字符串键 → 常规侧表写
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_getStrContent");
+        vm.mov(VReg.V3, VReg.RET);             // 内容指针
+        vm.mov(VReg.A0, VReg.V3);
+        vm.lea(VReg.A1, vm.asm.addString("name"));
+        vm.call("_strcmp");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_cps_nl_name");
+        vm.mov(VReg.A0, VReg.V3);
+        vm.lea(VReg.A1, vm.asm.addString("length"));
+        vm.call("_strcmp");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_cps_set");                    // 非 name/length → 常规写
+        vm.label("_cps_nl_len");
+        vm.lea(VReg.S3, vm.asm.addString("length"));
+        vm.jmp("_cps_nl");
+        vm.label("_cps_nl_name");
+        vm.lea(VReg.S3, vm.asm.addString("name"));
+        vm.label("_cps_nl");
+        // 键换数据段字面量(_closure_prop_get 的元数据回落按 payload 地址比较)
+        vm.mov(VReg.A0, VReg.S2);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.S3, VReg.V1);      // 装箱字面量键
+        vm.call("_closure_prop_get");          // 侧表 → 元数据回落(墓碑 → undefined)
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jne("_cps_ignored");                // 有效存在且不可写 → 忽略本次赋值
+        // 有效不存在:若侧表留有墓碑槽(曾删除),先移除,使下方常规写以默认 attr=7
+        // 重建条目(否则 _object_set 命中路径的 writable 守卫见 0x80 无写位 → 静默丢弃,
+        // 删后重赋永不生效)。
+        vm.mov(VReg.A0, VReg.S2);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.S3, VReg.V1);
+        vm.call("_closure_prop_tombstoned");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_cps_set");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_closure_props_find");        // 墓碑 ⟹ 侧表必在 → 非 undefined
+        vm.mov(VReg.A0, VReg.RET);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.S3, VReg.V1);
+        vm.call("_object_delete");             // 移除墓碑槽(装箱布尔返回值弃)
+        vm.label("_cps_set");
+        vm.mov(VReg.A0, VReg.S2);
         vm.call("_closure_props_ensure"); // A0=fn → RET=props(装箱)
         vm.mov(VReg.A0, VReg.RET);
         vm.mov(VReg.A1, VReg.S0);
         vm.mov(VReg.A2, VReg.S1);
         vm.call("_object_set");
         vm.mov(VReg.RET, VReg.S1); // 返回被赋值
-        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+        vm.label("_cps_ignored");
+        vm.mov(VReg.RET, VReg.S1);             // 返回 RHS(sloppy 赋值表达式值不变)
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+
+        // [I6] _closure_prop_define(A0=fn, A1=key, A2=val) -> val。[[DefineOwnProperty]]
+        // 语义(defineProperty 路由,经 _object_set_fnprops 的 define 标志分流到此):
+        // **不受** name/length 不可写守卫阻(ES:DefineOwnProperty 与 writable 无关,
+        // defineProperty(fn,"length",{value:1}) 覆盖必须生效——fixture fn-name-length-
+        // descriptor / function-name-reflect 的 defineProperty 覆盖读回依赖此路)。但若
+        // name/length 曾被删除(墓碑槽在侧表),须先清墓碑:否则 _closure_prop_get 的
+        // 墓碑位使读恒 undefined,defineProperty 的覆盖值读不回。落值经 _object_define
+        // (define 标志 → found 路径直覆值、不查原型链访问器、不受 writable 位阻)。
+        vm.label("_closure_prop_define");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.mov(VReg.S0, VReg.A1); // key
+        vm.mov(VReg.S1, VReg.A2); // val
+        vm.mov(VReg.S2, VReg.A0); // fn
+        vm.shrImm(VReg.V1, VReg.S0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFC);
+        vm.jne("_cpdf_set");                   // 非字符串键 → 直接 define 落侧表
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_getStrContent");
+        vm.mov(VReg.V3, VReg.RET);
+        vm.mov(VReg.A0, VReg.V3);
+        vm.lea(VReg.A1, vm.asm.addString("name"));
+        vm.call("_strcmp");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_cpdf_nl_name");
+        vm.mov(VReg.A0, VReg.V3);
+        vm.lea(VReg.A1, vm.asm.addString("length"));
+        vm.call("_strcmp");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_cpdf_set");                   // 非 name/length → 直接 define 落侧表
+        vm.label("_cpdf_nl_len");
+        vm.lea(VReg.S3, vm.asm.addString("length"));
+        vm.jmp("_cpdf_nl");
+        vm.label("_cpdf_nl_name");
+        vm.lea(VReg.S3, vm.asm.addString("name"));
+        vm.label("_cpdf_nl");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.S3, VReg.V1);
+        vm.call("_closure_prop_tombstoned");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_cpdf_set");                   // 无墓碑 → 直接 define 覆写
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_closure_props_find");        // 墓碑 ⟹ 侧表必在
+        vm.mov(VReg.A0, VReg.RET);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.S3, VReg.V1);
+        vm.call("_object_delete");             // 清墓碑槽(新定义以默认 attr 重建)
+        vm.label("_cpdf_set");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_closure_props_ensure");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.mov(VReg.A2, VReg.S1);
+        vm.call("_object_define");             // define 语义:found 直覆、miss 追加
+        vm.mov(VReg.RET, VReg.S1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
 
         // [Date 一等值] _closure_prop_set_attr(A0=fn, A1=key, A2=attr):给闭包属性侧表里
         // 的某键落属性特性位。_closure_prop_set 只 _object_set 落值(侧表 props 是普通对象,
@@ -671,6 +827,244 @@ export class ObjectGenerator {
         vm.mov(VReg.A2, VReg.S1);
         vm.call("_object_set_prop_attr");
         vm.epilogue([VReg.S0, VReg.S1], 0);
+
+        // [I5] _js_length_dyn(A0=任意值)→ RET=裸整数长度。契约同 _js_length(裸整数),
+        // 差异仅在函数值(0x7FFF):**先**查闭包属性侧表 "length"——内建方法值闭包
+        // (Array.prototype.<m>、arr.<m>、"s".<m> 等取值形态)code_ptr 全共享 _aref_generic,
+        // 按 code_ptr 登记的函数元数据侧表无法区分逐方法身份,规范 length 由编译期
+        // _closure_prop_set 逐闭包落在侧表;命中 → canonical number 转裸整数返回。
+        // miss(用户函数/未挂侧表的内建)→ _closure_prop_get 自身回落元数据 arity,仍命中
+        // 即返;彻底无值(undefined)才落 _js_length 原路(其 _js_length_func 把 -1 归 0,
+        // 与改前逐字节同行为)。非函数值形态直走 _js_length,逐字节等价。
+        // 消费方:编译期未知接收者 .length 读位(members.js,静态 String/Array 等不经此)。
+        // [I6] 契约变更:RET 由裸整数改为**装箱 JS 值**(canonical number 位模式,或墓碑
+        // 情形的装箱 undefined——函数值 length 删除后读必须 undefined,不得被 _jsld_plain
+        // 的 _js_length 元数据 arity 复活)。调用点(members.js 单一站点)相应不再做
+        // scvtf/fmovToInt 转换;非函数路径内部自转换,逐值语义与改前等价。
+        vm.label("_js_length_dyn");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0); // 保存原值
+        vm.shrImm(VReg.V1, VReg.A0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFF);
+        vm.jne("_jsld_plain"); // 非函数 → 原路
+        vm.lea(VReg.A1, vm.asm.addString("length"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1); // 装箱字符串键 "length"(数据段字面量,与
+        //                                   _closure_prop_get 的 _cpg_key_ck 地址比较同源)
+        vm.call("_closure_prop_get");     // RET = canonical number / undefined(墓碑 → undefined)
+        vm.shrImm(VReg.V1, VReg.RET, 48);
+        vm.cmpImm(VReg.V1, 0x7FFB);       // undefined → 侧表+元数据皆无值(或墓碑)
+        vm.jne("_jsld_hit");
+        // [I6] undefined 二态判别:墓碑(曾删除)→ 装箱 undefined 直返;从未存在 →
+        // 原路 _js_length(其 _js_length_func 把 -1 归 0,改前行为不变)。
+        vm.mov(VReg.A0, VReg.S0);
+        vm.lea(VReg.A1, vm.asm.addString("length"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_closure_prop_tombstoned");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_jsld_plain");
+        vm.lea(VReg.RET, "_js_undefined");
+        vm.load(VReg.RET, VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_jsld_hit");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_number_coerce");        // RET = float64 位(用户 defineProperty 落装箱整数亦归一)
+        vm.fmovToFloat(0, VReg.RET);
+        vm.fcvtzs(VReg.RET, 0);           // canonical number → 裸整数(同 _js_length_object 尾段)
+        vm.scvtf(0, VReg.RET);
+        vm.fmovToInt(VReg.RET, 0);        // 裸整数 → canonical number 位(新契约:装箱值)
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_jsld_plain");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_js_length");            // RET = 裸整数
+        vm.scvtf(0, VReg.RET);
+        vm.fmovToInt(VReg.RET, 0);        // canonical number 位(新契约:装箱值)
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+
+        // [I6] _closure_prop_tombstoned(A0=fn 任意形, A1=装箱键) -> RET=裸 0/1(0x80/0)。
+        // 判侧表该键条目是否带墓碑位 ATTR_FN_DELETED(_closure_prop_del 所落)。供带
+        // 「miss → 静态/元数据回落」的读位区分「从未存在」(可回落)与「存在过已删除」
+        // (须抑制回落、规范读 undefined):_js_length_dyn 的 _jsld_plain 回落、members.js
+        // 静态 fn.name/fn.length 读的编译期值回落。_closure_prop_get/_fn_has_own/_prop_in/
+        // _ogopd_fn 无需本 helper——它们直接以 _closure_prop_get 的 undefined 为「不存在」。
+        vm.label("_closure_prop_tombstoned");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
+        vm.mov(VReg.S0, VReg.A0); // fn
+        vm.mov(VReg.S1, VReg.A1); // 键
+        vm.call("_closure_props_find");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_cpt_false");             // 无侧表 → 无墓碑
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.S2, VReg.RET, VReg.V1); // raw props
+        vm.load(VReg.S3, VReg.S2, 8);       // count
+        vm.movImm(VReg.S4, 0);              // idx
+        vm.label("_cpt_loop");
+        vm.cmp(VReg.S4, VReg.S3);
+        vm.jge("_cpt_false");
+        vm.load(VReg.V2, VReg.S2, OBJECT_PROPS_PTR_OFFSET);
+        vm.shlImm(VReg.V0, VReg.S4, 4);
+        vm.add(VReg.V0, VReg.V2, VReg.V0);
+        vm.load(VReg.A0, VReg.V0, 0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_key_eq");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_cpt_hit");
+        vm.addImm(VReg.S4, VReg.S4, 1);
+        vm.jmp("_cpt_loop");
+        vm.label("_cpt_hit");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_object_get_attr");        // RET = attr 字节
+        vm.andImm(VReg.RET, VReg.RET, ATTR_FN_DELETED); // 0x80 / 0(消费方 cmpImm 0 判别)
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+        vm.label("_cpt_false");
+        vm.movImm(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+
+        // [I6] _closure_prop_del(A0=fn 任意形, A1=键) -> RET=装箱布尔(delete 表达式值)。
+        // 函数值(闭包)[[Delete]]:
+        //   name/length → 规范 configurable:true,delete 恒返 true 且须**永久移除**:
+        //     值双源并存——闭包属性侧表(编译期登记/用户写)+ 函数元数据侧表(按 code_ptr,
+        //     _func_meta_name/_func_meta_arity)——仅删侧表条目会被元数据回落复活。故删除
+        //     落墓碑槽:value=undefined、attr=ATTR_FN_DELETED(0x80);_closure_prop_get 见
+        //     墓碑位直返 undefined 不落元数据。属性有效不存在(双源皆无/已墓碑)→ 不动作返
+        //     true(规范 delete-miss=true)。
+        //   其余键 → 侧表 props 普通对象 _object_delete(尊重 per-property configurable,
+        //     装箱布尔透传:不可配置 → false);无侧表 → true。
+        vm.label("_closure_prop_del");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.mov(VReg.S0, VReg.A0); // fn
+        // 键归一(数值键 → 字符串,同 _odel_key_ok 形态)
+        vm.shrImm(VReg.V1, VReg.A1, 48);
+        vm.cmpImm(VReg.V1, 0x7FFC);
+        vm.jeq("_cpd_key_str");
+        vm.mov(VReg.A0, VReg.A1);
+        vm.call("_js_prop_key");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.jmp("_cpd_key_done");
+        vm.label("_cpd_key_str");
+        vm.mov(VReg.S1, VReg.A1);
+        vm.label("_cpd_key_done");
+        // name/length 判别(同 _fn_has_own 的 strcmp 形态)
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_getStrContent");
+        vm.mov(VReg.S2, VReg.RET);          // 内容指针
+        vm.mov(VReg.A0, VReg.S2);
+        vm.lea(VReg.A1, vm.asm.addString("name"));
+        vm.call("_strcmp");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_cpd_name");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.lea(VReg.A1, vm.asm.addString("length"));
+        vm.call("_strcmp");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_cpd_len");
+        // 其余键:侧表常规删除
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_closure_props_find");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_cpd_true");                // 无侧表 → delete-miss → true
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_delete");          // 装箱布尔透传
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+        vm.label("_cpd_name");
+        vm.lea(VReg.S2, vm.asm.addString("name")); // S2 复用为字面量载荷(内容指针不再用)
+        vm.jmp("_cpd_nl");
+        vm.label("_cpd_len");
+        vm.lea(VReg.S2, vm.asm.addString("length"));
+        vm.label("_cpd_nl");
+        // 有效存在判定:_closure_prop_get(侧表 → 元数据;墓碑 → undefined)
+        vm.mov(VReg.A0, VReg.S0);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.S2, VReg.V1);
+        vm.call("_closure_prop_get");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_cpd_true");                // 有效不存在(含已墓碑)→ true
+        // 侧表条目若被 defineProperty 落成不可配置(如 {configurable:false} 覆盖),
+        // delete 须拒(sloppy 返 false,同 _odel_hit 的 configurable 守卫)。元数据提供
+        // (侧表无条目,attr=0x100 哨兵)的规范 name/length 恒 configurable:true → 放行。
+        vm.mov(VReg.A0, VReg.S0);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.S2, VReg.V1);
+        vm.call("_closure_prop_attr");      // RET = attr 字节(0x100=侧表无此条目)
+        vm.cmpImm(VReg.RET, 0x100);
+        vm.jeq("_cpd_cfg_ok");
+        vm.andImm(VReg.V0, VReg.RET, ATTR_CONFIGURABLE);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_cpd_false");               // 不可配置 → 拒删,返 false
+        vm.label("_cpd_cfg_ok");
+        // 落墓碑:ensure 侧表 → 写 value undefined → attr=ATTR_FN_DELETED_TOMB(0x84)
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_closure_props_ensure");   // RET = 装箱 props
+        vm.mov(VReg.S0, VReg.RET);          // S0 = props(fn 不再需要)
+        vm.mov(VReg.A0, VReg.S0);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.S2, VReg.V1);
+        vm.lea(VReg.A2, "_js_undefined");
+        vm.load(VReg.A2, VReg.A2, 0);
+        vm.call("_object_set");             // 追加/覆写墓碑值(旧槽 attr 默认 7 → 写生效)
+        vm.mov(VReg.A0, VReg.S0);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.S2, VReg.V1);
+        vm.movImm(VReg.A2, ATTR_FN_DELETED_TOMB);
+        vm.call("_object_set_prop_attr");   // flags[idx]=0x84(副作用 materialize flags;
+        //                                   保 CONFIGURABLE 位使 _cps_set 的 _object_delete 可清)
+        vm.label("_cpd_true");
+        vm.lea(VReg.RET, "_js_true");
+        vm.load(VReg.RET, VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+        vm.label("_cpd_false");
+        vm.lea(VReg.RET, "_js_false");
+        vm.load(VReg.RET, VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+
+        // [I6] _closure_prop_attr(A0=fn 任意形, A1=装箱键) -> RET=侧表条目 attr 字节;
+        // 侧表无此条目(或无侧表)→ 0x100 哨兵(任何真实 attr ≤ 0x87,不会撞)。供
+        // _closure_prop_del 判侧表 name/length 条目可配置性(defineProperty 覆盖落过的
+        // 非默认 attr 须被尊重:configurable:false → delete 返 false)。扫描体与
+        // _closure_prop_tombstoned 同形(命中 → _object_get_attr;miss → 哨兵)。
+        vm.label("_closure_prop_attr");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
+        vm.mov(VReg.S0, VReg.A0); // fn
+        vm.mov(VReg.S1, VReg.A1); // 键
+        vm.call("_closure_props_find");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_cpa_absent");
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.S2, VReg.RET, VReg.V1); // raw props
+        vm.load(VReg.S3, VReg.S2, 8);       // count
+        vm.movImm(VReg.S4, 0);              // idx
+        vm.label("_cpa_loop");
+        vm.cmp(VReg.S4, VReg.S3);
+        vm.jge("_cpa_absent");
+        vm.load(VReg.V2, VReg.S2, OBJECT_PROPS_PTR_OFFSET);
+        vm.shlImm(VReg.V0, VReg.S4, 4);
+        vm.add(VReg.V0, VReg.V2, VReg.V0);
+        vm.load(VReg.A0, VReg.V0, 0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_key_eq");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_cpa_hit");
+        vm.addImm(VReg.S4, VReg.S4, 1);
+        vm.jmp("_cpa_loop");
+        vm.label("_cpa_hit");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_object_get_attr");        // RET = attr 字节(flags_ptr=0 → ATTR_DEFAULT)
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+        vm.label("_cpa_absent");
+        vm.movImm(VReg.RET, 0x100);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
     }
 
     // 创建新对象
@@ -2135,6 +2529,11 @@ export class ObjectGenerator {
         vm.jeq("_odel_tag_ok");
         vm.cmpImm(VReg.V1, 0x7FFD);
         vm.jeq("_odel_tag_ok");
+        // [I6] 函数值(0x7FFF)→ 闭包属性侧表删除(_closure_prop_del:name/length 落墓碑
+        // 永久移除,其余键侧表常规删)。此前落 _odel_true 空转(delete 返 true 但属性被
+        // 元数据回落复活,verifyProperty 的 isConfigurable 探针恒败)。
+        vm.cmpImm(VReg.V1, 0x7FFF);
+        vm.jeq("_odel_fn");
         vm.jmp("_odel_true");
         vm.label("_odel_tag_ok");
         vm.emitMaskLoad(VReg.V1);
@@ -2142,11 +2541,19 @@ export class ObjectGenerator {
         vm.movImm64(VReg.V1, vm.ptrFloor);
         vm.cmp(VReg.S0, VReg.V1);
         vm.jlt("_odel_true");
+        // [I6] 裸闭包指针(高16=0 堆闭包,全字 magic 0xc105/0xa51c;低字节 0x05 与
+        // TYPE_SET 撞,字节分派不可辨——同 _prop_in :3196 全字判定)→ 函数值删除路径。
+        // 普通对象 [S0]=type@0(8B)=2、数组=1,全字比较不与 magic 撞。
+        vm.load(VReg.V1, VReg.S0, 0);
+        vm.cmpImm(VReg.V1, 0xc105);
+        vm.jeq("_odel_fn_raw");
+        vm.cmpImm(VReg.V1, 0xa51c);
+        vm.jeq("_odel_fn_raw");
         vm.loadByte(VReg.V1, VReg.S0, 0);
         vm.cmpImm(VReg.V1, TYPE_PROXY); // Proxy:冷分支调 handler.deleteProperty
         vm.jeq("_odel_proxy");
         vm.cmpImm(VReg.V1, TYPE_OBJECT);
-        vm.jne("_odel_true");
+        vm.jne("_odel_maybe_fn");
 
         vm.load(VReg.S2, VReg.S0, 8); // count
         vm.movImm(VReg.S3, 0); // idx
@@ -2265,6 +2672,37 @@ export class ObjectGenerator {
         vm.mov(VReg.A0, VReg.S2);
         vm.mov(VReg.A1, VReg.S1);
         vm.call("_object_delete");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+
+        // [I6] 函数值删除分派。_odel_fn:0x7FFF 装箱入口(脱壳 + NaN 载荷防御——
+        // NaN 0x7FFF000000000001 与函数同高16,载荷 1 < ptrFloor → delete-miss true,
+        // 同 _object_has :2979 形态)。_odel_fn_raw:裸闭包共享入口(S0=裸闭包指针,
+        // S1=已归一装箱键),委托 _closure_prop_del(装箱布尔透传 delete 表达式值)。
+        // [I6] 非对象类型字节出口:探测裸 TEXT 函数指针(类构造器/裸函数指针形态——
+        // 高16=0、块头无闭包 magic、type 字节是指令字节恒 ≠ TYPE_OBJECT,此前一律落
+        // _odel_true 使 delete 空转、name/length 被元数据复活)。函数元数据侧表按
+        // code_ptr 登记全部编译期函数,命中 ⟹ 函数值 → 墓碑删除路。仅 type 字节非
+        // TYPE_OBJECT/TYPE_PROXY 的裸堆指针入此(装箱数组/字符串/数值在上面 tag 分派
+        // 已短路;数组 type=1 免探直接 true),delete 本为冷路径,探测开销可接受。
+        vm.label("_odel_maybe_fn");
+        vm.cmpImm(VReg.V1, 1); // TYPE_ARRAY:确定非函数,免探测
+        vm.jeq("_odel_true");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_func_meta_entry"); // RET=entry_ptr(0=未登记)
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_odel_true");
+        vm.jmp("_odel_fn_raw");
+
+        vm.label("_odel_fn");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.S0, VReg.S0, VReg.V1);
+        vm.movImm64(VReg.V1, vm.ptrFloor);
+        vm.cmp(VReg.S0, VReg.V1);
+        vm.jlt("_odel_true");
+        vm.label("_odel_fn_raw");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_closure_prop_del");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
     }
 
@@ -2397,11 +2835,23 @@ export class ObjectGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
 
         // 函数值属性写:委托 _closure_prop_set(fn, key, val)(ensure 侧表 → 普通对象 _object_set)。
+        // [I6] define 语义([SP+24]=1,_object_define 入口)分流 _closure_prop_define:
+        // [[DefineOwnProperty]] 不受 name/length 不可写守卫阻(defineProperty 覆盖必须
+        // 生效);赋值表达式路(标志=0)经 _closure_prop_set 带守卫。
         vm.label("_object_set_fnprops");
+        vm.load(VReg.V0, VReg.SP, 24);
+        vm.cmpImm(VReg.V0, 1);
+        vm.jeq("_object_set_fnprops_def");
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S1);
         vm.mov(VReg.A2, VReg.S2);
         vm.call("_closure_prop_set");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
+        vm.label("_object_set_fnprops_def");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_closure_prop_define");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
 
         // 数组具名/索引属性写分派(S0=arr[boxed 0x7FFE 或裸], S1=key, S2=value)。
@@ -2711,6 +3161,19 @@ export class ObjectGenerator {
         // 存储 key / value
         vm.store(VReg.V0, 0, VReg.S1);
         vm.store(VReg.V0, 8, VReg.S2);
+        // [I6] 追加须复位新槽 per-property attr(仅 flags 已 materialize 时):_object_delete
+        // 的整体移位把被删槽旧 attr 残留在尾部(flags[count] 无人重置),追加入该下标的新
+        // 属性会错误承袭——闭包侧表 name/length 墓碑槽(0x84)删除后重加即承袭墓碑位 →
+        // 读恒 undefined、删后重赋永不生效(本增量删后重建语义的最后一环);普通对象同理
+        // (defineProperty 加过非默认 attr 后删除某键、再追加新键会误承袭旧 attr 位)。
+        // flags_ptr=0 时全属性默认 attr,一条 cmp 即过,普通对象追加路径近零税。
+        vm.load(VReg.V1, VReg.S0, OBJECT_FLAGS_PTR_OFFSET);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_object_set_append_noflags");
+        vm.add(VReg.V1, VReg.V1, VReg.S3);    // &flags[旧 count] = 新槽下标
+        vm.movImm(VReg.V2, ATTR_DEFAULT);
+        vm.storeByte(VReg.V1, 0, VReg.V2);
+        vm.label("_object_set_append_noflags");
         // 更新 count
         vm.addImm(VReg.S3, VReg.S3, 1);
         vm.store(VReg.S0, 8, VReg.S3);
@@ -2929,7 +3392,7 @@ export class ObjectGenerator {
         vm.mov(VReg.S1, VReg.RET);
         vm.label("_object_has_key_ok");
 
-        // 类型标签守卫:仅对象(0x7FFD)/数组(0x7FFE)/裸堆指针(高16=0)才查属性;
+        // 类型标签守卫:仅对象(0x7FFD)/数组(0x7FFE)/函数(0x7FFF)/裸堆指针(高16=0)才查属性;
         // 数字/布尔等非容器返回 0(否则脱壳成垃圾地址解引用崩,如 with(非对象) / 误用 hasOwn)。
         vm.shrImm(VReg.V1, VReg.S0, 48);
         vm.cmpImm(VReg.V1, 0);
@@ -2938,6 +3401,18 @@ export class ObjectGenerator {
         vm.jeq("_object_has_tagok");
         vm.cmpImm(VReg.V1, 0x7FFE);
         vm.jeq("_object_has_tagok");
+        // [I5] 函数值(0x7FFF)亦属性容器(闭包属性侧表 + 规范 name/length):放过守卫,脱壳后
+        // 按闭包全字 magic 分流(见下)。NaN(0x7FFF000000000001)与函数同高16、载荷 1,须以
+        // ptrFloor 挡掉(否则把尾数位当地址解引用崩,与 _ogopd :6127 同形防御)。
+        vm.cmpImm(VReg.V1, 0x7FFF);
+        vm.jne("_object_has_notcont");
+        vm.movImm64(VReg.V2, 0x0000ffffffffffffn);
+        vm.and(VReg.V3, VReg.S0, VReg.V2);   // 载荷
+        vm.movImm64(VReg.V2, vm.ptrFloor);
+        vm.cmp(VReg.V3, VReg.V2);
+        vm.jlt("_object_has_notcont");       // NaN/数值尾数 → 非容器 → false
+        vm.jmp("_object_has_tagok");
+        vm.label("_object_has_notcont");
         vm.movImm(VReg.RET, 0);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
         vm.label("_object_has_tagok");
@@ -2949,6 +3424,16 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.S0, 0);
         vm.jeq("_object_has_false");
 
+        // [I5] 闭包函数值先按全字 magic 判(0xc105/0xa51c;低字节 0x05 与 TYPE_SET 撞,字节
+        // 分派不可辨——与 _subscript_get_closure :83 全字判定同源)。own 判定与 _ogopd_fn 的
+        // own 性同构(侧表 + name/length 元数据回落),使 hasOwnProperty.call(fn,"name")/
+        // symbol 键 `in`(经本 helper)与 gOPD 一致。此前函数恒 false → test262
+        // propertyHelper verifyProperty 的 "should be an own property" 断言恒败。
+        vm.load(VReg.V1, VReg.S0, 0);
+        vm.cmpImm(VReg.V1, 0xc105);
+        vm.jeq("_object_has_fn");
+        vm.cmpImm(VReg.V1, 0xa51c);
+        vm.jeq("_object_has_fn");
         // 数组(TYPE_ARRAY=1):数值键界内判定(同 _prop_in),对象块布局在数组上
         // 读 props_ptr@32 越界崩(`Object.hasOwn([...],0)`/`arr.hasOwnProperty(0)` 崩根因)。
         vm.loadByte(VReg.V0, VReg.S0, 0);
@@ -3040,6 +3525,76 @@ export class ObjectGenerator {
         vm.label("_object_has_false");
         vm.movImm(VReg.RET, 0);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
+
+        // [I5] 函数值 own 判定(S0=裸闭包指针, S1=归一装箱键)。与 _ogopd_fn 同构
+        // (gOPD(fn,k) !== undefined ⟺ hasOwn(fn,k)):
+        //   name/length → _closure_prop_get(侧表优先;miss 落 _func_meta_name/_func_meta_arity——
+        //                 键须换数据段字面量其地址比较才命中;未登记匿名函数名/无 arity 的
+        //                 length → undefined → false,不编造 true);
+        //   其余键 → 闭包属性侧表 props 对象判 has(普通对象,无递归;用 has 而非 get:
+        //            fn.x=undefined 亦 own,与 node 同)。
+        // 非字符串键(symbol 等)直落侧表分支(不把 tag 位当内容地址做 strcmp)。
+        // 共用入口 _fn_has_own(A0=fn 任意形, A1=装箱键)→ RET=裸 0/1;_prop_in 的闭包分支同经
+        // 此路(has/in/gOPD 三者 own 性一致)。
+        vm.label("_object_has_fn");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_fn_has_own");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
+
+        vm.label("_fn_has_own");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0); // fn(装箱/裸皆可,受调方内部脱壳)
+        vm.mov(VReg.S1, VReg.A1); // 装箱键
+        vm.shrImm(VReg.V0, VReg.S1, 48);
+        vm.cmpImm(VReg.V0, 0x7FFC);
+        vm.jne("_fho_side");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_getStrContent");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, vm.asm.addString("name"));
+        vm.call("_strcmp");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_fho_name");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_getStrContent");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, vm.asm.addString("length"));
+        vm.call("_strcmp");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_fho_len");
+        vm.label("_fho_side");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_closure_props_find");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_fho_false");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_has"); // props 普通对象;RET=裸 0/1 直接透传
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        // name/length:键换数据段字面量再传(_closure_prop_get 的元数据回落按 payload 与
+        // addString 字面量的**地址**比较,堆串即便同内容不命中——同 _ogopd_fn_meta 再装箱)。
+        vm.label("_fho_name");
+        vm.lea(VReg.A1, vm.asm.addString("name"));
+        vm.jmp("_fho_meta");
+        vm.label("_fho_len");
+        vm.lea(VReg.A1, vm.asm.addString("length"));
+        vm.label("_fho_meta");
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_closure_prop_get"); // 侧表 → 元数据回落;彻底无值 → undefined
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_fho_false");
+        vm.movImm(VReg.RET, 1);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_fho_false");
+        vm.movImm(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
     }
 
     // 检查属性是否在对象中（包含原型链检查）
@@ -3062,6 +3617,17 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.S0, 0);
         vm.jeq("_prop_in_false");
 
+        // [I5] 闭包函数值先按全字 magic 判(0xc105/0xa51c;低字节 0x05 与 TYPE_SET 撞,且按
+        // 对象头读 count/props_ptr 是垃圾解引用)。own 判定经 _fn_has_own(与 _ogopd_fn /
+        // _object_has fn 分支同构)。in 语义还应走原型链(fn → Function.prototype →
+        // Object.prototype),但 Function.prototype 未物化成对象,故不走:"call" in f /
+        // "toString" in f 为 false(记偏差,与 _object_gopn_fn 不含 'prototype' 同源);
+        // name/length/侧表键为 true,与 gOPD 一致。
+        vm.load(VReg.V1, VReg.S0, 0);
+        vm.cmpImm(VReg.V1, 0xc105);
+        vm.jeq("_prop_in_fn");
+        vm.cmpImm(VReg.V1, 0xa51c);
+        vm.jeq("_prop_in_fn");
         // [in] 数组(TYPE_ARRAY=1):数值键界内判定 `"i" in arr ≡ 0<=i<length`。
         // 数组块布局 length@8、无 props_ptr;走对象路径会把 length 当 count、把
         // cap/data_ptr 当 props 读 → 崩(`"0" in [...]` SIGSEGV 根因)。先按类型字节分流。
@@ -3191,6 +3757,16 @@ export class ObjectGenerator {
         vm.mov(VReg.A0, VReg.RET);
         vm.mov(VReg.A1, VReg.S1);       // content 指针(未改)
         vm.call("_prop_in");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 16);
+
+        // [I5] 闭包函数值(S0=裸闭包, S1=键 content 指针):content 指针 OR 0x7FFC 装箱
+        // (同 _prop_in_proxy :3212 的 content→string 形态,_getStrContent 认),委托
+        // _fn_has_own(own 性同构 gOPD;原型链不走,见 _prop_in 头注)。
+        vm.label("_prop_in_fn");
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.S1, VReg.V1); // 装箱键
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_fn_has_own");         // RET = 裸 0/1
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 16);
     }
 

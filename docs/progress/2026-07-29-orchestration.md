@@ -199,7 +199,7 @@
 
 ## 11. 后续演进待办（按优先级）
 
-0. **~~Object/内建杠杆~~（v0.3.6 强制 → v0.3.7 补全 → v0.3.8 枚举 → v0.3.9 gOPD 数组 → v0.3.10 Date 具现，见 §13–§17）**：built-ins/Object 46.3% → 53.7% → 55.0% → 55.4% → 55.6% → **56.9%**（v0.3.10）；整体 43.89% → 44.55% → 44.69% → 44.75% → 44.77% → 44.91% → **45.90%**（v0.3.11 解析器早期错误 SAFE 层 +64，集中 language/）。v0.3.10 具现 Date。**距 70% 还需 ~+24pp（~1560 翻转）**。**下一步杠杆（按 翻转/难度）**：①**【最高价值】内建函数一等化**（Lever 1，~250-320：`typeof fn` → "function"、`.apply/.call/.bind` 可用；`typeof Object` 仍为 "number"，最跨目录根因，解锁 name/length 与大量 typeof 首断言）；②**内建函数 name/length 自有属性**（Lever 2，~150-200，依赖①，附加低风险）；③**补全解析器早期错误**（类别 A 对象模式绑定点 + Tier 2/3，~187+）；④**缺失内建方法 + String 迭代/Symbol 协议**（Lever 4，~150-230）；⑤**Date 加固**（修 11 个边角 SIGSEGV：`_aref_date_*` this 类型检查、setter 实参强转、Symbol.toPrimitive、扩展年份 toString、`class extends Date`）；⑥其余内建构造器具现（Object/Array/Function/Number/Boolean/Error/JSON + prototype，复用 Date/Math 模板）；⑦全局对象具现 + 顶层 `this`；⑧`new String` 索引字符 + `JSON.stringify(new String)`；⑨原语字符串/TypedArray 元素描述符；⑩RegExp source/flags 移到 prototype 以对齐 gOPN；⑪**突发完成传播 + TDZ**（Lever 5，~400-570，最高但最难/最高风险）；⑫async fn/generator/for-await-of。**说明**：top 5-6 杠杆约到 58-63%；70% 需 ~12 簇含至少一个硬语义杠杆 + async 进展。
+0. **~~Object/内建杠杆~~（v0.3.6 强制 → v0.3.7 补全 → v0.3.8 枚举 → v0.3.9 gOPD 数组 → v0.3.10 Date 具现，见 §13–§17）**：built-ins/Object 46.3% → 53.7% → 55.0% → 55.4% → 55.6% → **56.9%**（v0.3.10）；整体 43.89% → 44.55% → 44.69% → 44.75% → 44.77% → 44.91% → 45.90% → **46.98%**（v0.3.12，内建函数一等化 I5+I6 +70）；built-ins/Object 46.3% → **57.6%**。**距 70% 还需 ~+23pp（~1490 翻转）**。**Lever 1（内建函数一等化）已做 I5（name/length 登记）+ I6（[[Set]]/[[Delete]] 语义），合计 +70**。**下一步杠杆（按 翻转/难度）**：①**【最高价值】I3 暴露缺失 Array.prototype 方法**（flat/flatMap/fill/find/keys/values/entries/sort/splice/concat/copyWithin，~48-65；`[1].values`/`[1].flat` 现 undefined，需 `_aref_generic`-safe wrapper）；②**I2 物化 Map/Set/Promise 构造器 + prototype**（~38-61，中高风险——13 SIGSEGV + species/subclass；Map/Set helpers 已存在）；③**I1/I4 JSON/Number 静态 + String.fromCodePoint/fromCharCode**（~6-16，廉价 drive-by；JSON 现为每次新建空对象致值读 undefined）；④**补全解析器早期错误**（类别 A 对象模式绑定点 + Tier 2/3，~187+）；⑤**缺失内建方法 + String 迭代/Symbol 协议**（Lever 4 余项，~150-230）；⑤**Date 加固**（修 11 个边角 SIGSEGV：`_aref_date_*` this 类型检查、setter 实参强转、Symbol.toPrimitive、扩展年份 toString、`class extends Date`）；⑥其余内建构造器具现（Object/Array/Function/Number/Boolean/Error/JSON + prototype，复用 Date/Math 模板）；⑦全局对象具现 + 顶层 `this`；⑧`new String` 索引字符 + `JSON.stringify(new String)`；⑨原语字符串/TypedArray 元素描述符；⑩RegExp source/flags 移到 prototype 以对齐 gOPN；⑪**突发完成传播 + TDZ**（Lever 5，~400-570，最高但最难/最高风险）；⑫async fn/generator/for-await-of。**说明**：top 5-6 杠杆约到 58-63%；70% 需 ~12 簇含至少一个硬语义杠杆 + async 进展。
 1. **looksLikeCjsSource 运行期 CJS 误判（P2，既有，Wave 4 暴露）**：复用朴素 `cjsHasEsmSyntax`，注释/字符串/模板/正则里含 “export ”/“import ” 文字的 CJS 被判为非 CJS、不做 CJS 包装，`import` 之运行期崩 `FATAL: _object_set called with NULL object`（Node 正常执行）。HEAD 逐字相同、与 Wave 4 无关；Wave 4 仅解除编译期误杀使其显形。彻底修复需把 CJS 检测改 AST/词法感知（与 Wave 4 的 `astHasRealTopLevelEsm` 同源思路）。
 2. **resolvePackageSpecifier 损坏 package.json 静默丢弃（P2，既有）**：`compiler/index.js:3837-3838` 对损坏 JSON `catch return ""`，经包说明符的导入被静默丢弃、编译成功（Node 抛 ERR_INVALID_PACKAGE_CONFIG）。与 `nearestPackageJsonExplicitCommonjs` 的抛错路径不一致。
 3. **--static 端到端 codegen 缺陷（P2，既有）**：含导出函数的程序 `--static` 在 `asm/arm64.js:1603` 报 “Unknown label: _js_add”（在 writeStaticLibrary 之前）。C_INTEROP_DESIGN.md B4 已登记。修复须过完整门禁。
@@ -248,6 +248,9 @@ P1/P2 残留：enumerable 变更与 accessor get/set 恒等未强制（漏拒）
 - 2026-07-31：Wave 10 已知残留（built-ins/Date 非计分子集）：经 prototype 现可达的 **11 个边角 SIGSEGV**——5× 非对象 this（`_aref_date_*` 无防护读 `[this+8]`，本应抛 TypeError：getDate/getMinutes/getUTCDate/getUTCMinutes/setSeconds/setFullYear 的 this-value-non-object）、2× setter 实参 ToNumber 强转（setHours/arg-ms、setSeconds/arg-sec）、1× Symbol.toPrimitive/called-as-function、1× toString/negative-year（扩展年份格式）、1× subclassing（class extends Date）。具现前 Date.prototype 为 undefined，这些测试在 undefined 上抛预期 TypeError 计 PASS；具现后可调用方法在边角输入上崩溃。列 Date 加固波次。**发布 v0.3.10 并推送**。注：本波实施 agent 因 token-plan 5 小时配额耗尽（429，07-31 09:00 UTC 重置）于验证途中终止，主控自行完成差分/fixtures/门禁验证与发布；配额恢复前暂停子代理波次。
 - 2026-07-31：Wave 11 解析器早期错误强制（Lever 3 SAFE 层）。主人指示“继续一直到 70% 能才停”。先做 FAIL 模式分析（top 杠杆排序 + 距 70% 缺口分析），再实现解析器早期错误安全层（附加 `this.errors.push`，按阶段计分）：D rest 尾逗号、F 类 constructor/prototype 命名、E 类私有名校验、B use-strict 非简单形参（箭头+对象方法）、C 严格重复形参（扩展继承严格）、G 杂项语法、A 严格/上下文保留字作绑定（含转义、eval/arguments）。类别 A 因实施 agent token 配额（再次 429，重置 14:01 UTC）途中截断（对象模式绑定点部分未完成）；主控补 eval/arguments 严格绑定检查并验证严格门控正确（严格拒 public/eval/arguments/重复形参，sloppy 允许 yield/f(a,a)）。
 - 2026-07-31：Wave 11 验证：完整 test262 44.91% → **45.90%（2966，+64，集中 language/：expressions 990→1024、statements 806→836）**，**零 PASS→COMPILE_FAIL 误拒**；fixtures 385/0/0/0；门禁绿（gen1==gen2==gen3）。**发布 v0.3.11 并推送**。剩余早期错误（Tier 2/3 + 类别 A 对象模式绑定点）与其余杠杆列 §11。
+- 2026-07-31：Wave 12 内建函数一等化（Lever 1）。调查确认 `.call/.apply/.bind` 已对任意 0x7FFF 闭包可用，失败全因内建未物化为闭包值；最佳首增量 I5（已物化内建函数值登记正确 name/length，最低风险）。
+- 2026-07-31：I5 实施（members.js 五个闭包构建点补逐闭包 name/length + object/index.js `_js_length_dyn`/`_fn_has_own`/`_prop_in` 闭包分支 + 修正错 arity）。差分 ~104 例与 Node 全一致，fixtures 385/0/0/0，test262 2966 → 2972（+6，零误拒），门禁绿。仅 +6（非预估 ~55）：name/length 的 [[Set]]/[[Delete]] 语义未强制（`fn.name=x` 生效、delete 后元数据复活），~40+ verifyProperty 探针仍败——即 I6。
+- 2026-07-31：I6 实施（`_closure_prop_set` name/length 写守卫 + `_object_delete` 函数值墓碑 0x84 + 墓碑感知读路径 `_closure_prop_get`/`_js_length_dyn`/`_fn_has_own`/`_prop_in`/`_ogopd_fn` + `_object_set` 追加复位 flags）。差分 39 例与 Node 全一致，fixtures 385/0/0/0（途中修 2 回归），test262 2972 → **3036（+64，较 v0.3.10 基线 +70）**，byArea Object 57.6%/Math 69.2%/Array 48.8%/String 38.5%，零误拒。门禁绿（gen1==gen2==gen3）。**发布 v0.3.12 并推送**。残留与下一杠杆（I3/I2/I1·I4）列 §11。
 
 ### 12.4 重做设计（字段存在位掩码）
 
@@ -367,3 +370,20 @@ Date 由哨兵数值（typeof "number"）具现为真闭包构造器对象（仿
 | 发布 | 达成 | v0.3.11 已推送（branch dev + tag） |
 
 残留（列 §11 ③）：类别 A 对象模式绑定点（rest/computed/colon/shorthand/shorthand-default 的保留字检查）因实施 agent token 配额（再次 429，重置 07-31 14:01 UTC）途中截断；Tier 2（类 delete 私有/标识符、字段初始化器 ContainsArguments/SuperCall、RegExp `\p{}`/v 校验）与 Tier 3（词法重声明/作用域、语句位词法声明+ASI、break/continue/return 上下文、await/async 上下文）未做。
+
+## 19. Wave 12 结果（内建函数一等化 I5+I6，v0.3.12）
+
+Lever 1（内建函数一等化）首两个增量。`.call/.apply/.bind` 本已对任意 0x7FFF 闭包可用；失败全因内建未物化为闭包值（读回 undefined/裸 0）。
+
+| 项 | 状态 | 证据 |
+|---|---|---|
+| I5：已物化内建函数值登记正确 name/length（描述符 w:false,e:false,c:true） | 达成 | Array.prototype.every.name="every"/.length=1 等；五闭包构建点补逐闭包 `_closure_prop_set`；修正错 arity（padStart/padEnd 2→1、split 1→2、setFullYear/setUTCFullYear 2→3） |
+| I5：`_js_length_dyn`/`_fn_has_own`/`_prop_in` 闭包分支（hasOwn/in/gOPD 对函数自有属性一致，NaN 载荷守卫） | 达成 | 差分 ~104 例与 Node 全一致 |
+| I6：name/length `[[Set]]` 守卫（非 writable 写忽略，sloppy；`[[DefineOwnProperty]]` 分流使 dP 覆盖生效） | 达成 | `fn.name="x"` 忽略、`Math.abs.length=99` 写忽略 |
+| I6：name/length `[[Delete]]` 墓碑 0x84（永久移除，不被元数据复活；`_closure_prop_get`/`_js_length_dyn`/`_fn_has_own`/`_prop_in`/`_ogopd_fn` 一致尊重） | 达成 | `delete fn.name` 后 `fn.name===undefined`、`"name" in f===false`、delete 返 true |
+| `_object_set` 追加复位 `flags[count]=ATTR_DEFAULT`（修 `_object_delete` 左移残留误承袭墓碑） | 达成 | 删后重赋重建成功 |
+| 完整 bootstrap gate | 达成 | `gen1==gen2==gen3` 逐字节 + fixtures `385/0/0/0` |
+| test262 | 达成 | 45.90% → **46.98%**（3036；I5 +6、I6 +64，较 v0.3.10 基线 +70）；Object 57.6%、Math 69.2%、Array 48.8%、String 38.5%；零误拒（+1 CRASH 为既有 String/substring 布局 flake） |
+| 发布 | 达成 | v0.3.12 已推送（branch dev + tag） |
+
+残留（列 §11）：strict 写 name/length 不抛（无 strict 上下文，全模式忽略，满足 sloppy verifyProperty 探针）；`in` 不走 Function.prototype 链（未物化）；静态 gOPD 编译期拦截不反映 defineProperty 覆盖；类值（TYPE_FUNCTION=3）name/length 删除未处理。下一杠杆 I3（暴露缺失 Array.prototype 方法 flat/values/entries/...，~48-65）。

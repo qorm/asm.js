@@ -14,39 +14,43 @@ import { VReg } from "../../vm/index.js";
 // `arr.<m>`/`str.<m>` 解析为经 _aref_generic 蹦床调该 helper 的函数值。首批仅收 helper
 // 型且**忽略多余实参**的方法(蹦床把接收者插到 A0、用户实参上移一位,不处理可选参默认;
 // 需默认值的 slice/indexOf/join 等待后续按方法定制 helper 批次)。方法调用仍走静态派发。
+// [I5] 表值 = [运行时 helper 标签, 规范 Function.length]。方法值闭包经
+// emitBuiltinMethodRefClosureMeta 逐闭包挂 .name/.length(code_ptr 共享 _aref_generic,
+// 元数据侧表按 code_ptr 查不出逐方法身份,必须落闭包属性侧表)。#32 命中判据相应从
+// typeof==="string" 改 Array.isArray(Object.prototype 上无数组值属性,污染-safe)。
 const ArefMethodRef = {
     // 直连 helper 型:helper 自身正确处理装箱实参/undefined 缺参,generic 蹦床可直接透传。
     // 需**裸 int** 下标/fromIndex 的方法(indexOf/charAt/at/array slice/lastIndexOf 等)不在此
     // (蹦床传装箱值 → helper 读裸 int 得垃圾),待 Batch 2b 经定制 wrapper helper 转换后接入。
     array: {
-        push: "_array_push",
-        pop: "_array_pop",
-        reverse: "_array_reverse",
+        push: ["_array_push", 1],
+        pop: ["_array_pop", 0],
+        reverse: ["_array_reverse", 0],
         // Batch 2b:经 wrapper 把装箱下标/fromIndex 转裸 int(缺省 0)
-        at: "_aref_arr_at",
-        indexOf: "_aref_arr_indexOf",
-        slice: "_aref_arr_slice", // Batch 2c:start 缺省 0、end 缺省 INT_MAX
+        at: ["_aref_arr_at", 1],
+        indexOf: ["_aref_arr_indexOf", 1],
+        slice: ["_aref_arr_slice", 2], // Batch 2c:start 缺省 0、end 缺省 INT_MAX
         // Batch 3:回调型(运行时驱动回调)
-        forEach: "_array_forEach_rt",
-        map: "_array_map_rt",
-        filter: "_array_filter_rt",
-        some: "_array_some_rt",
-        every: "_array_every_rt",
-        reduce: "_array_reduce_rt",
-        reduceRight: "_array_reduceRight_rt",
+        forEach: ["_array_forEach_rt", 1],
+        map: ["_array_map_rt", 1],
+        filter: ["_array_filter_rt", 1],
+        some: ["_array_some_rt", 1],
+        every: ["_array_every_rt", 1],
+        reduce: ["_array_reduce_rt", 1],
+        reduceRight: ["_array_reduceRight_rt", 1],
     },
     string: {
-        toUpperCase: "_str_toUpperCase",
-        toLowerCase: "_str_toLowerCase",
-        trim: "_str_trim",
-        slice: "_str_slice",
-        substring: "_str_substring",
-        at: "_str_at",
-        includes: "_str_includes",
-        charCodeAt: "_str_charCodeAt", // Batch 2c:自归一化下标+装箱结果,直连
+        toUpperCase: ["_str_toUpperCase", 0],
+        toLowerCase: ["_str_toLowerCase", 0],
+        trim: ["_str_trim", 0],
+        slice: ["_str_slice", 2],
+        substring: ["_str_substring", 2],
+        at: ["_str_at", 1],
+        includes: ["_str_includes", 1],
+        charCodeAt: ["_str_charCodeAt", 1], // Batch 2c:自归一化下标+装箱结果,直连
         // Batch 2b:经 wrapper 转裸 int 下标/fromIndex
-        charAt: "_aref_str_charAt",
-        indexOf: "_aref_str_indexOf",
+        charAt: ["_aref_str_charAt", 1],
+        indexOf: ["_aref_str_indexOf", 1],
     },
 };
 
@@ -199,9 +203,9 @@ const STRING_PROTO_METHODS = [
     ["endsWith", "_str_endsWith", 1],
     ["repeat", "_str_repeat", 1],
     ["concat", "_strconcat", 1],
-    ["padStart", "_str_padStart", 2],
-    ["padEnd", "_str_padEnd", 2],
-    ["split", "_str_split", 1],
+    ["padStart", "_str_padStart", 1], // 规范 length = 1(maxLength;fillString 为可选第二参不计)
+    ["padEnd", "_str_padEnd", 1],     // 同 padStart
+    ["split", "_str_split", 2],       // 规范 length = 2(separator, limit)
     ["localeCompare", "_str_localeCompare", 1],
     ["indexOf", "_aref_str_indexOf", 1], // aref wrapper:boxed fromIndex→raw int
     ["toString", "_str_toString_wrapper", 0], // returns this.__value (primitive string)
@@ -251,8 +255,8 @@ const DATE_PROTO_METHODS = [
     ["getMilliseconds", "_aref_date_gp7", 0],
     ["getUTCMilliseconds", "_aref_date_gp7", 0],
     ["setTime", "_aref_date_setTime", 1],
-    ["setFullYear", "_aref_date_sp0", 2],
-    ["setUTCFullYear", "_aref_date_sp0", 2],
+    ["setFullYear", "_aref_date_sp0", 3],    // 规范 length = 3(year, month, date)
+    ["setUTCFullYear", "_aref_date_sp0", 3], // 同 setFullYear
     ["setMonth", "_aref_date_sp1", 2],
     ["setUTCMonth", "_aref_date_sp1", 2],
     ["setDate", "_aref_date_sp2", 1],
@@ -1263,6 +1267,33 @@ export const MemberCompiler = {
         this.vm.call("_js_box_function");
     },
 
+    // [I5] emitBuiltinMethodRefClosure + 逐闭包挂 .name/.length(规范值,闭包属性侧表)。
+    // 所有经 _aref_generic 蹦床的内建方法值闭包 code_ptr 全同 → 函数元数据侧表(按 code_ptr
+    // 登记)无法区分逐方法身份,fn.name/fn.length 必须落在闭包属性侧表:
+    //   .name 读经 _object_get(0x7FFF)→ _closure_prop_get 命中侧表;
+    //   .length 读经 _js_length_dyn(未知接收者 .length 编译位)先查侧表;
+    //   gOPD(fn,"name"/"length")经 _ogopd_fn → _closure_prop_get,属性形状硬编
+    //   {writable:false, enumerable:false, configurable:true}(无需另落 attr)。
+    // 与 emitDateProtoMethodEntry / emitRegExpMethodClosure 逐字同形;RET = 装箱闭包。
+    emitBuiltinMethodRefClosureMeta(helperLabel, methodName, arity) {
+        const vm = this.vm;
+        this.emitBuiltinMethodRefClosure(helperLabel); // RET = 闭包
+        vm.mov(VReg.S0, VReg.RET);                     // 跨 call 暂存(closure_prop_set 毁 RET)
+        vm.mov(VReg.A0, VReg.S0);
+        this.emitBoxedStringKey("name", VReg.A1);
+        vm.lea(VReg.A2, this.asm.addString(methodName));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A2, VReg.A2, VReg.V1);
+        vm.call("_closure_prop_set");
+        vm.mov(VReg.A0, VReg.S0);
+        this.emitBoxedStringKey("length", VReg.A1);
+        vm.movImm(VReg.A2, arity);
+        vm.scvtf(0, VReg.A2);
+        vm.fmovToInt(VReg.A2, 0);
+        vm.call("_closure_prop_set");
+        vm.mov(VReg.RET, VReg.S0);                     // 恢复闭包供调用点使用
+    },
+
     // 编译 this 表达式
     compileThisExpression(expr) {
         // this 存储在 __this 局部变量中
@@ -1988,16 +2019,18 @@ export const MemberCompiler = {
                 expr.object.object.name === "Object" &&
                 expr.object.property && expr.object.property.name === "prototype" &&
                 !(this.ctx.getLocal && this.ctx.getLocal("Object"))) {
+                // [I5] 表值 = [helper, 规范 length];闭包经 meta 版挂 .name/.length。
+                // 命中判据 Array.isArray(原型链上的 Object.prototype 方法全是函数,无数组值 → 污染-safe,#32)。
                 const _opHelpers = {
-                    toString: "_object_proto_toString",
-                    hasOwnProperty: "_aref_obj_hasOwn",
-                    valueOf: "_aref_obj_valueOf",
-                    isPrototypeOf: "_is_prototype_of",
-                    propertyIsEnumerable: "_object_propertyIsEnumerable",
+                    toString: ["_object_proto_toString", 0],
+                    hasOwnProperty: ["_aref_obj_hasOwn", 1],
+                    valueOf: ["_aref_obj_valueOf", 0],
+                    isPrototypeOf: ["_is_prototype_of", 1],
+                    propertyIsEnumerable: ["_object_propertyIsEnumerable", 1],
                 };
                 const _oph = _opHelpers[propName];
-                if (typeof _oph === "string") {
-                    this.emitBuiltinMethodRefClosure(_oph);
+                if (Array.isArray(_oph)) {
+                    this.emitBuiltinMethodRefClosureMeta(_oph[0], propName, _oph[1]);
                     return;
                 }
             }
@@ -2015,31 +2048,33 @@ export const MemberCompiler = {
                 expr.object.object.name === "Array" &&
                 expr.object.property && expr.object.property.name === "prototype" &&
                 !(this.ctx.getLocal && this.ctx.getLocal("Array"))) {
+                // [I5] 表值 = [helper, 规范 length];闭包经 meta 版逐闭包挂 .name/.length
+                // (code_ptr 全同 _agen_*... 实际全经 _aref_generic 蹦床,元数据侧表不可辨)。
                 const _apHelpers = {
-                    forEach: "_agen_forEach",
-                    map: "_agen_map",
-                    filter: "_agen_filter",
-                    some: "_agen_some",
-                    every: "_agen_every",
-                    reduce: "_agen_reduce",
-                    reduceRight: "_agen_reduceRight",
-                    indexOf: "_agen_indexOf",
-                    lastIndexOf: "_agen_lastIndexOf",
-                    includes: "_agen_includes",
-                    join: "_agen_join",
-                    slice: "_agen_slice",
-                    at: "_agen_at",
+                    forEach: ["_agen_forEach", 1],
+                    map: ["_agen_map", 1],
+                    filter: ["_agen_filter", 1],
+                    some: ["_agen_some", 1],
+                    every: ["_agen_every", 1],
+                    reduce: ["_agen_reduce", 1],
+                    reduceRight: ["_agen_reduceRight", 1],
+                    indexOf: ["_agen_indexOf", 1],
+                    lastIndexOf: ["_agen_lastIndexOf", 1],
+                    includes: ["_agen_includes", 1],
+                    join: ["_agen_join", 1],
+                    slice: ["_agen_slice", 2],
+                    at: ["_agen_at", 1],
                     // [test262 propertyHelper] `Function.prototype.call.bind(Array.prototype.push)`。
                     // 无 _agen_push;走守卫版 _fpg_arr_push(真数组尾跳 _array_push,非数组
                     // 返 undefined 而非按数组头解引用 SIGSEGV —— `Array.prototype.push` 的
                     // 泛型用法就是拿非数组当接收者)。偏差同 `arr.push` 取值形态:返回数组
                     // 而非新长度。未加此项时 Array.prototype.push 落通用 _object_get(裸
                     // 标识 1)→ 崩,propertyHelper.js 恰死在这一行。
-                    push: "_fpg_arr_push",
+                    push: ["_fpg_arr_push", 1],
                 };
                 const _aph = _apHelpers[propName];
-                if (typeof _aph === "string") {
-                    this.emitBuiltinMethodRefClosure(_aph);
+                if (Array.isArray(_aph)) {
+                    this.emitBuiltinMethodRefClosureMeta(_aph[0], propName, _aph[1]);
                     return;
                 }
             }
@@ -2250,14 +2285,25 @@ export const MemberCompiler = {
                 if (_fm) {
                     // [t671] 先查闭包属性侧表:defineProperty(fn,"length"/"name",{value})
                     // 的覆盖须被读回(容器命中即用);miss(undefined)回落编译期静态值。
+                    // [I6] 墓碑例外:侧表条目带墓碑位(曾 delete)时规范读 undefined——
+                    // 不得回落编译期静态值(否则 delete f.name; f.name 复活,_closure_prop_get
+                    // 的墓碑抑制被静态回落旁路)。S0 暂存函数值(callee-saved,被调方保存;
+                    // 同 emitBuiltinMethodRefClosureMeta 的用 S0 跨 call 形态)。
                     const fmDone = this.ctx.newLabel("fnnl_done");
+                    const fmDeleted = this.ctx.newLabel("fnnl_deleted");
                     this.compileExpression(expr.object);
-                    this.vm.mov(VReg.A0, VReg.RET);
+                    this.vm.mov(VReg.S0, VReg.RET);
+                    this.vm.mov(VReg.A0, VReg.S0);
                     this.emitBoxedStringKey(propName, VReg.A1);
                     this.vm.call("_closure_prop_get");
                     this.vm.shrImm(VReg.V1, VReg.RET, 48);
-                    this.vm.cmpImm(VReg.V1, 0x7FFB); // undefined → 静态回落
+                    this.vm.cmpImm(VReg.V1, 0x7FFB); // undefined → 墓碑判定/静态回落
                     this.vm.jne(fmDone);
+                    this.vm.mov(VReg.A0, VReg.S0);
+                    this.emitBoxedStringKey(propName, VReg.A1);
+                    this.vm.call("_closure_prop_tombstoned");
+                    this.vm.cmpImm(VReg.RET, 0);
+                    this.vm.jne(fmDeleted);
                     if (propName === "name") {
                         this.vm.lea(VReg.A0, this.asm.addString(_fm.name));
                         this.vm.call("_js_box_string");
@@ -2265,6 +2311,10 @@ export const MemberCompiler = {
                         this.vm.movImm(VReg.RET, _fm.length);
                         this.intToFloat64Bits(VReg.RET);
                     }
+                    this.vm.jmp(fmDone);
+                    this.vm.label(fmDeleted);
+                    this.vm.lea(VReg.RET, "_js_undefined");
+                    this.vm.load(VReg.RET, VReg.RET, 0);
                     this.vm.label(fmDone);
                     return;
                 }
@@ -2308,9 +2358,20 @@ export const MemberCompiler = {
                 } else {
                     // 字符串或未知类型：运行时按值形态分派（数组/TypedArray/字符串）
                     this.vm.mov(VReg.A0, VReg.RET);
-                    this.vm.call("_js_length");
-                    this.vm.scvtf(0, VReg.RET);
-                    this.vm.fmovToInt(VReg.RET, 0);
+                    // [I5] 未知接收者可能是函数值:经 _js_length_dyn(0x7FFF 先查闭包属性侧表
+                    // "length"——内建方法值闭包 code_ptr 共享 _aref_generic、元数据侧表不可辨;
+                    // 非函数逐字节等价 _js_length)。静态可知接收者(String 等)非函数,仍直走
+                    // _js_length,快路字节不变。
+                    if (objType === "unknown") {
+                        // [I6] _js_length_dyn 新契约:直接返回装箱 JS 值(canonical number 位,
+                        // 或函数值 length 墓碑——删除后读 undefined 不被元数据复活),调用点
+                        // 不再做 int→float 转换。
+                        this.vm.call("_js_length_dyn");
+                    } else {
+                        this.vm.call("_js_length");
+                        this.vm.scvtf(0, VReg.RET);
+                        this.vm.fmovToInt(VReg.RET, 0);
+                    }
                 }
             } else if (propName === "size") {
                 // Map/Set 的 .size 存于对象偏移 8（整数计数）；其它对象退回普通 "size" 属性读。
@@ -2363,9 +2424,10 @@ export const MemberCompiler = {
                 // 故纯增量、不改调用语义。运行时判接收者 tag:数组(0x7FFE)/字符串(0x7FFC)
                 // 且方法名命中表 → 建闭包;否则(对象/基元/用户同名属性)退回通用属性读。
                 // 首批仅收 helper 型且忽略多余实参的方法(避免可选参默认值问题)。
-                // [#32 守卫] 用 typeof==="string" 判命中——`ArefMethodRef.array[propName]` 对
-                // propName="toString"/"constructor"/"hasOwnProperty" 等会经原型链返回
-                // Object.prototype 方法(函数),裸真值判会误当 helper → lea(函数)崩。
+                // [#32 守卫] 用 Array.isArray 判命中(I5 起表值 = [helper, arity] 对)——
+                // `ArefMethodRef.array[propName]` 对 propName="toString"/"constructor"/
+                // "hasOwnProperty" 等会经原型链返回 Object.prototype 方法(函数),裸真值判
+                // 会误当 helper → lea(函数)崩;Object.prototype 无数组值属性,数组判安全。
                 // [W-28] 接收者静态类型为 RegExp 的 `re.exec` / `re.test` / `re.toString`
                 // 作**值读取**(非调用)→ _aref_generic 方法值闭包(不绑定接收者)。
                 // **调用**位 `re.exec(s)` 在 compileCallExpression 里已静态改派
@@ -2375,10 +2437,13 @@ export const MemberCompiler = {
                 // 局部槽就会把自举编译 cli.js 的递归推爆(实测 SIGSEGV),故此处零新局部。
                 if (this._tryEmitRegExpMethodRef(expr, propName)) return;
 
+                // [I5] 表值 = [helper, 规范 length];命中判据 Array.isArray(表是字面量,
+                // 原型链上只可能撞 Object.prototype 的函数值属性 → 必非数组,污染-safe,#32)。
+                // 闭包经 meta 版逐闭包挂 .name/.length(不新增局部槽——深递归热函数铁律)。
                 const _ah = ArefMethodRef.array[propName];
                 const _sh = ArefMethodRef.string[propName];
-                const arefHelper = typeof _ah === "string" ? _ah : null;
-                const strefHelper = typeof _sh === "string" ? _sh : null;
+                const arefHelper = Array.isArray(_ah) ? _ah[0] : null;
+                const strefHelper = Array.isArray(_sh) ? _sh[0] : null;
                 if (arefHelper || strefHelper) {
                     const id = this.nextLabelId();
                     const endL = this.ctx.newLabel("aref_end");
@@ -2400,7 +2465,7 @@ export const MemberCompiler = {
                             this.emitObjectGetIC(propName);
                             this.vm.jmp(endL);
                             this.vm.label(buildStrL);
-                            this.emitBuiltinMethodRefClosure(strefHelper);
+                            this.emitBuiltinMethodRefClosureMeta(strefHelper, propName, _sh[1]);
                             this.vm.jmp(endL);
                         } else {
                             // fallback
@@ -2409,7 +2474,7 @@ export const MemberCompiler = {
                             this.vm.jmp(endL);
                         }
                         this.vm.label(buildArrL);
-                        this.emitBuiltinMethodRefClosure(arefHelper);
+                        this.emitBuiltinMethodRefClosureMeta(arefHelper, propName, _ah[1]);
                         this.vm.jmp(endL);
                     } else {
                         // 仅字符串方法
@@ -2420,7 +2485,7 @@ export const MemberCompiler = {
                         this.emitObjectGetIC(propName);
                         this.vm.jmp(endL);
                         this.vm.label(buildStrL);
-                        this.emitBuiltinMethodRefClosure(strefHelper);
+                        this.emitBuiltinMethodRefClosureMeta(strefHelper, propName, _sh[1]);
                     }
                     this.vm.label(endL);
                     return;

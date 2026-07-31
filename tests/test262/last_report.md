@@ -1,10 +1,10 @@
 # asm.js test262 conformance report
 
-_Generated 2026-07-31T16:01:52.471Z — target macos-arm64_
+_Generated 2026-07-31T18:58:10.831Z — target macos-arm64_
 
 ## Headline
 
-**asm.js passes 2966 / 6462 = 45.90% of the run test262 subset**
+**asm.js passes 3036 / 6462 = 46.98% of the run test262 subset**
 (selected `language/` + core `built-ins/`), one variant per test.
 
 Of 33776 discovered test files in the selected dirs, 1466 were excluded up front (module=83, unsupported-feature=1383, intl/staging-dir=0); 32310 were eligible; 6462 were actually run (deterministic stride=5).
@@ -13,31 +13,31 @@ Of 33776 discovered test files in the selected dirs, 1466 were excluded up front
 
 | class | count | % of run |
 |-------|------:|---------:|
-| PASS         | 2966 | 45.90 |
-| FAIL         | 3260 | 50.45 |
+| PASS         | 3036 | 46.98 |
+| FAIL         | 3189 | 49.35 |
 | COMPILE_FAIL | 69 | 1.07 |
-| CRASH        | 167 | 2.58 |
+| CRASH        | 168 | 2.60 |
 | **run**      | **6462** | 100 |
 
 ## By area
 
 | area | run | PASS | FAIL | COMPILE_FAIL | CRASH | pass% |
 |------|----:|-----:|-----:|-------------:|------:|------:|
-| built-ins/Array | 594 | 278 | 294 | 0 | 22 | 46.8 |
+| built-ins/Array | 594 | 290 | 282 | 0 | 22 | 48.8 |
 | built-ins/Boolean | 10 | 1 | 9 | 0 | 0 | 10.0 |
 | built-ins/JSON | 33 | 9 | 24 | 0 | 0 | 27.3 |
 | built-ins/Map | 41 | 15 | 24 | 0 | 2 | 36.6 |
-| built-ins/Math | 65 | 32 | 33 | 0 | 0 | 49.2 |
+| built-ins/Math | 65 | 45 | 20 | 0 | 0 | 69.2 |
 | built-ins/Number | 68 | 25 | 42 | 0 | 1 | 36.8 |
-| built-ins/Object | 682 | 388 | 283 | 0 | 11 | 56.9 |
+| built-ins/Object | 682 | 393 | 278 | 0 | 11 | 57.6 |
 | built-ins/Promise | 145 | 50 | 76 | 6 | 13 | 34.5 |
 | built-ins/RegExp | 374 | 133 | 235 | 5 | 1 | 35.6 |
 | built-ins/Set | 76 | 40 | 26 | 2 | 8 | 52.6 |
-| built-ins/String | 244 | 78 | 164 | 1 | 1 | 32.0 |
+| built-ins/String | 244 | 94 | 147 | 1 | 2 | 38.5 |
 | built-ins/Symbol | 15 | 4 | 11 | 0 | 0 | 26.7 |
-| built-ins/TypedArray | 288 | 53 | 232 | 0 | 3 | 18.4 |
-| language/expressions | 2005 | 1024 | 889 | 30 | 62 | 51.1 |
-| language/statements | 1822 | 836 | 918 | 25 | 43 | 45.9 |
+| built-ins/TypedArray | 288 | 67 | 218 | 0 | 3 | 23.3 |
+| language/expressions | 2005 | 1027 | 886 | 30 | 62 | 51.2 |
+| language/statements | 1822 | 843 | 911 | 25 | 43 | 46.3 |
 
 ## Excluded categories (counted, not scored)
 
@@ -59,12 +59,12 @@ Excluded-by-feature detail:
 
 ## Top failing patterns (FAIL / COMPILE_FAIL / CRASH detail strings)
 
-- **1827×** FAIL: assertion mismatch (Test262Error / wrong value)
-- **443×** FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)
+- **1818×** FAIL: assertion mismatch (Test262Error / wrong value)
 - **418×** FAIL: async ($DONE not signalled / promise rejected)
+- **381×** FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)
 - **263×** FAIL: negative test wrong outcome (phase=parse)
 - **147×** FAIL: TypedArray/ArrayBuffer semantics
-- **117×** CRASH: run signal SIGSEGV
+- **118×** CRASH: run signal SIGSEGV
 - **110×** FAIL: array contents mismatch (compareArray)
 - **69×** COMPILE_FAIL: asm.js could not compile (unsupported syntax / parser gap)
 - **50×** FAIL: constructor-ness reflection (isConstructor / not-a-constructor)
@@ -74,13 +74,13 @@ Excluded-by-feature detail:
 
 ## Failures correlated with features (top tags among failing tests)
 
-- `destructuring-binding`: 642
-- `async-iteration`: 551
-- `class`: 437
-- `generators`: 366
+- `destructuring-binding`: 636
+- `async-iteration`: 549
+- `class`: 436
+- `generators`: 361
 - `Symbol.iterator`: 299
 - `class-fields-public`: 240
-- `TypedArray`: 219
+- `TypedArray`: 206
 - `default-parameters`: 199
 - `class-methods-private`: 152
 - `class-fields-private`: 136
@@ -125,4 +125,4 @@ mkdir -p .test262-corpus && tar xzf /tmp/t262.tgz -C .test262-corpus --strip-com
 node tests/test262/run.mjs --stride 5 --jobs 8 --target macos-arm64
 ```
 
-_Run wall-clock: 425.8s._
+_Run wall-clock: 399.0s._

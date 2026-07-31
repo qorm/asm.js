@@ -1,6 +1,6 @@
 {
-  "generated": "2026-07-31T16:01:52.474Z",
-  "runnerSha": "10a40a06a773a5b37b3f8b8168d55635a7542849",
+  "generated": "2026-07-31T18:58:10.833Z",
+  "runnerSha": "89ffb1c37754e02a10ada5c3a88ea0b628af3c5a",
   "corpusPin": "9e61c12835c5e4a3bdba93850427e6742c4f64c4",
   "config": {
     "corpus": ".test262-corpus",
@@ -46,16 +46,16 @@
   "eligible": 32310,
   "run": 6462,
   "totals": {
-    "PASS": 2966,
-    "FAIL": 3260,
+    "PASS": 3036,
+    "FAIL": 3189,
     "COMPILE_FAIL": 69,
-    "CRASH": 167
+    "CRASH": 168
   },
-  "passRatePct": 45.9,
+  "passRatePct": 46.98,
   "byArea": {
     "built-ins/Array": {
-      "PASS": 278,
-      "FAIL": 294,
+      "PASS": 290,
+      "FAIL": 282,
       "COMPILE_FAIL": 0,
       "CRASH": 22
     },
@@ -78,8 +78,8 @@
       "CRASH": 2
     },
     "built-ins/Math": {
-      "PASS": 32,
-      "FAIL": 33,
+      "PASS": 45,
+      "FAIL": 20,
       "COMPILE_FAIL": 0,
       "CRASH": 0
     },
@@ -90,8 +90,8 @@
       "CRASH": 1
     },
     "built-ins/Object": {
-      "PASS": 388,
-      "FAIL": 283,
+      "PASS": 393,
+      "FAIL": 278,
       "COMPILE_FAIL": 0,
       "CRASH": 11
     },
@@ -114,10 +114,10 @@
       "CRASH": 8
     },
     "built-ins/String": {
-      "PASS": 78,
-      "FAIL": 164,
+      "PASS": 94,
+      "FAIL": 147,
       "COMPILE_FAIL": 1,
-      "CRASH": 1
+      "CRASH": 2
     },
     "built-ins/Symbol": {
       "PASS": 4,
@@ -126,20 +126,20 @@
       "CRASH": 0
     },
     "built-ins/TypedArray": {
-      "PASS": 53,
-      "FAIL": 232,
+      "PASS": 67,
+      "FAIL": 218,
       "COMPILE_FAIL": 0,
       "CRASH": 3
     },
     "language/expressions": {
-      "PASS": 1024,
-      "FAIL": 889,
+      "PASS": 1027,
+      "FAIL": 886,
       "COMPILE_FAIL": 30,
       "CRASH": 62
     },
     "language/statements": {
-      "PASS": 836,
-      "FAIL": 918,
+      "PASS": 843,
+      "FAIL": 911,
       "COMPILE_FAIL": 25,
       "CRASH": 43
     }
@@ -147,15 +147,15 @@
   "topFailPatterns": [
     {
       "pattern": "FAIL: assertion mismatch (Test262Error / wrong value)",
-      "count": 1827
-    },
-    {
-      "pattern": "FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)",
-      "count": 443
+      "count": 1818
     },
     {
       "pattern": "FAIL: async ($DONE not signalled / promise rejected)",
       "count": 418
+    },
+    {
+      "pattern": "FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)",
+      "count": 381
     },
     {
       "pattern": "FAIL: negative test wrong outcome (phase=parse)",
@@ -167,7 +167,7 @@
     },
     {
       "pattern": "CRASH: run signal SIGSEGV",
-      "count": 117
+      "count": 118
     },
     {
       "pattern": "FAIL: array contents mismatch (compareArray)",
