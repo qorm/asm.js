@@ -1,6 +1,6 @@
 {
-  "generated": "2026-07-30T21:35:03.975Z",
-  "runnerSha": "9537c3d307b6e0f609c9a1ce841bafd7c5fcde32",
+  "generated": "2026-07-31T04:38:44.260Z",
+  "runnerSha": "687ad708dc32cad2a47368b3719ad9eac0f1254e",
   "corpusPin": "9e61c12835c5e4a3bdba93850427e6742c4f64c4",
   "config": {
     "corpus": ".test262-corpus",
@@ -46,12 +46,12 @@
   "eligible": 32310,
   "run": 6462,
   "totals": {
-    "PASS": 2888,
-    "FAIL": 3338,
+    "PASS": 2892,
+    "FAIL": 3335,
     "COMPILE_FAIL": 69,
-    "CRASH": 167
+    "CRASH": 166
   },
-  "passRatePct": 44.69,
+  "passRatePct": 44.75,
   "byArea": {
     "built-ins/Array": {
       "PASS": 278,
@@ -66,8 +66,8 @@
       "CRASH": 0
     },
     "built-ins/JSON": {
-      "PASS": 8,
-      "FAIL": 25,
+      "PASS": 9,
+      "FAIL": 24,
       "COMPILE_FAIL": 0,
       "CRASH": 0
     },
@@ -90,8 +90,8 @@
       "CRASH": 1
     },
     "built-ins/Object": {
-      "PASS": 375,
-      "FAIL": 296,
+      "PASS": 378,
+      "FAIL": 293,
       "COMPILE_FAIL": 0,
       "CRASH": 11
     },
@@ -115,9 +115,9 @@
     },
     "built-ins/String": {
       "PASS": 78,
-      "FAIL": 163,
+      "FAIL": 164,
       "COMPILE_FAIL": 1,
-      "CRASH": 2
+      "CRASH": 1
     },
     "built-ins/Symbol": {
       "PASS": 4,
@@ -147,7 +147,7 @@
   "topFailPatterns": [
     {
       "pattern": "FAIL: assertion mismatch (Test262Error / wrong value)",
-      "count": 1841
+      "count": 1838
     },
     {
       "pattern": "FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)",
@@ -187,7 +187,7 @@
     },
     {
       "pattern": "CRASH: run signal SIGBUS",
-      "count": 17
+      "count": 16
     },
     {
       "pattern": "FAIL: negative test wrong outcome (phase=runtime)",

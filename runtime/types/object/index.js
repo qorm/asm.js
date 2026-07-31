@@ -4450,6 +4450,20 @@ export class ObjectGenerator {
         vm.cmp(VReg.S3, VReg.S2);
         vm.jge("_object_assign_done");
 
+        // 可枚举判别(与 Object.keys 行走器同款,见 _object_keys_loop):
+        // flags_ptr==0 → 全默认可枚举(收);否则 flags[idx]&ATTR_ENUMERABLE==0 → 跳过。
+        // 修复 Object.assign({}, new RegExp(...))/对象展开复制包装对象内部槽的问题。
+        vm.load(VReg.V2, VReg.S1, OBJECT_FLAGS_PTR_OFFSET);
+        vm.cmpImm(VReg.V2, 0);
+        vm.jeq("_object_assign_take");
+        vm.add(VReg.V2, VReg.V2, VReg.S3);
+        vm.loadByte(VReg.V2, VReg.V2, 0);
+        vm.movImm(VReg.V0, ATTR_ENUMERABLE);
+        vm.and(VReg.V2, VReg.V2, VReg.V0);
+        vm.cmpImm(VReg.V2, 0);
+        vm.jeq("_object_assign_next"); // 不可枚举 → 跳过
+
+        vm.label("_object_assign_take");
         // 获取 source 的 key 和 value（source props_ptr 在 S1 头 @32）
         vm.load(VReg.V2, VReg.S1, OBJECT_PROPS_PTR_OFFSET);
         vm.shl(VReg.V0, VReg.S3, 4);
@@ -4464,6 +4478,7 @@ export class ObjectGenerator {
         vm.mov(VReg.A2, VReg.V2);
         vm.call("_object_set");
 
+        vm.label("_object_assign_next");
         vm.addImm(VReg.S3, VReg.S3, 1);
         vm.jmp("_object_assign_loop");
 

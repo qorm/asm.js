@@ -308,6 +308,17 @@ export const ExpressionCompiler = {
                 this.vm.mov(VReg.A2, VReg.RET); // A2 = boxed number
                 this.vm.load(VReg.A0, VReg.FP, objPtrOff);
                 this.vm.call("_object_set");
+                // 内部槽落不可枚举:__value(idx 0)、length(idx 1)按存储顺序。
+                // attr = ATTR_WRITABLE|ATTR_CONFIGURABLE (= 1|4 = 5),不含 ATTR_ENUMERABLE。
+                // _object_set_attr 自建 flags 表(_object_ensure_flags);保持 writable 以免破坏写槽代码。
+                this.vm.load(VReg.A0, VReg.FP, objPtrOff);
+                this.vm.movImm(VReg.A1, 0); // idx 0 = __value
+                this.vm.movImm(VReg.A2, 5); // writable|configurable, not enumerable
+                this.vm.call("_object_set_attr");
+                this.vm.load(VReg.A0, VReg.FP, objPtrOff);
+                this.vm.movImm(VReg.A1, 1); // idx 1 = length
+                this.vm.movImm(VReg.A2, 5); // writable|configurable, not enumerable
+                this.vm.call("_object_set_attr");
                 // Box the object
                 this.vm.load(VReg.RET, VReg.FP, objPtrOff);
                 this.vm.call("_box_obj_r"); // RET = 0x7FFD-tagged wrapper object

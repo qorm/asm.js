@@ -199,7 +199,7 @@
 
 ## 11. 后续演进待办（按优先级）
 
-0. **~~Object.defineProperty 杠杆~~（v0.3.6 落地强制 + v0.3.7 补全缺口，见 §13/§14）**：built-ins/Object 46.3% → 53.7%（v0.3.6）→ **55.0%**（v0.3.7）；整体 43.89% → 44.55% → **44.69%**。**Object 杠杆仍剩**：①gOPD 对数组 length/下标、全局对象、内建构造器的覆盖（~25 FAIL + 内建反射）；②**【新首要】`Object.keys` 对奇异对象（RegExp/`new String()` 等）过度枚举内部槽**——既有 bug，v0.3.7 收紧“描述符须对象”校验后暴露为 3 个 test262 损失（create/15.2.3.5-4-35、defineProperties/15.2.3.7-5-b-241/-246）；修复应收回这 3 个并改善其它依赖 keys 的用例。
+0. **~~Object 杠杆~~（v0.3.6 强制 → v0.3.7 补全 → v0.3.8 枚举修复，见 §13/§14/§15）**：built-ins/Object 46.3% → 53.7% → 55.0% → **55.4%**（v0.3.8）；整体 43.89% → 44.55% → 44.69% → **44.75%**。v0.3.8 修复 Object.keys 对奇异包装对象（RegExp/new String）过度枚举，收回 v0.3.7 暴露的 3 个 wrapper-as-map 损失。**Object 杠杆仍剩**：①gOPD 对数组 length/下标、全局对象、内建构造器的覆盖（~25 FAIL + 内建反射；并可把 RegExp source/flags 等移到 prototype 以对齐 gOPN 的 `["lastIndex"]`）；②`new String` 自有可枚举索引字符（`Object.keys(new String("hi"))` 应为 `["0","1"]`）；③`JSON.stringify(new String(...))` 应序列化为原始字符串。
 1. **looksLikeCjsSource 运行期 CJS 误判（P2，既有，Wave 4 暴露）**：复用朴素 `cjsHasEsmSyntax`，注释/字符串/模板/正则里含 “export ”/“import ” 文字的 CJS 被判为非 CJS、不做 CJS 包装，`import` 之运行期崩 `FATAL: _object_set called with NULL object`（Node 正常执行）。HEAD 逐字相同、与 Wave 4 无关；Wave 4 仅解除编译期误杀使其显形。彻底修复需把 CJS 检测改 AST/词法感知（与 Wave 4 的 `astHasRealTopLevelEsm` 同源思路）。
 2. **resolvePackageSpecifier 损坏 package.json 静默丢弃（P2，既有）**：`compiler/index.js:3837-3838` 对损坏 JSON `catch return ""`，经包说明符的导入被静默丢弃、编译成功（Node 抛 ERR_INVALID_PACKAGE_CONFIG）。与 `nearestPackageJsonExplicitCommonjs` 的抛错路径不一致。
 3. **--static 端到端 codegen 缺陷（P2，既有）**：含导出函数的程序 `--static` 在 `asm/arm64.js:1603` 报 “Unknown label: _js_add”（在 writeStaticLibrary 之前）。C_INTEROP_DESIGN.md B4 已登记。修复须过完整门禁。
@@ -239,6 +239,8 @@ P1/P2 残留：enumerable 变更与 accessor get/set 恒等未强制（漏拒）
 - 2026-07-30：Wave 6 门禁绿（`gen1==gen2==gen3` 逐字节 + fixtures `385/0/0/0`）；test262 升至 **44.55%（2879/6462，+43）**、built-ins/Object **53.7%（366/682，+50）**。残留 4 处宽松欠强制（动态非对象描述符未拒、动态 data+accessor 混用未拒——动态路径仍先脱糖、non-config+non-writable 改值未强制——需内容 SameValue）严格优于旧“一律接受”、列入后续。**发布 v0.3.6 并推送**。注：本周期子代理 API 多次 SSL 证书主机名不匹配（4+ 个 agent 终止/卡死），Wave 6/7 的验证以主控差分电池 + 门禁为主。
 - 2026-07-30：Wave 7 补全 v0.3.6 遗留四处 defineProperty 缺口：①non-configurable + non-writable 改值强制（内容 SameValue：字符串按 `_getStrContent`+`_strcmp` 比内容，否则全 64 位位模式，0/-0 抛、NaN==NaN；顺带修键相等快路屏蔽小 double 高位的旧假相等）；②动态路径非对象描述符拒绝；③动态 data+accessor 混用拒绝（动态路计算完整掩码经 `_object_define_property`，不再先脱糖）。实现途中修两处自引入回归（动态字段存在读取器数组 SIGSEGV → 改 `_object_get`；`_maybe_getter` 按 [[Get]] 调访问器值字段）。
 - 2026-07-30：Wave 7 主控独立差分 25 例与 Node 全一致（四处缺口 + P0 误拒守卫 + SameValue 边角），fixtures `385/0/0/0`；门禁绿（`gen1==gen2==gen3` + 385）。test262 44.55% → **44.69%（2888，+9）**、built-ins/Object 53.7% → **55.0%（375，+9）**。净 +9 = +12 − 3：3 个损失（create/15.2.3.5-4-35、defineProperties/15.2.3.7-5-b-241/-246）由**既有** `Object.keys` 对奇异对象（RegExp/`new String()` 内部槽）过度枚举 bug 被本次正确收紧的“描述符须对象”校验暴露（基线仅因旧宽松路静默忽略侥幸通过），列为下一目标。**发布 v0.3.7 并推送**。
+- 2026-07-31：Wave 8 修复 `Object.keys` 对奇异包装对象过度枚举。根因：RegExp（`__regexp_shim` 的 `__RE_new`）与 `new String` 包装把内部槽存为默认可枚举自有属性、无 flags 表（flags_ptr==0 → 全枚举），而枚举行走器本就遵循 ATTR_ENUMERABLE。修复在构造时标内部槽不可枚举：RegExp shim 对 16 槽各 `Object.defineProperty {writable,non-enumerable,configurable}`；`new String` codegen 对 `__value`/`length` 发 `_object_set_attr`（attr=5）；`_object_assign` 补 ATTR_ENUMERABLE 过滤。
+- 2026-07-31：Wave 8 主控独立差分 27 例与 Node 全一致（枚举 + RegExp/String 功能 + create/defineProperties 机制），fixtures `385/0/0/0`，门禁绿（`gen1==gen2==gen3` + 385）。test262 44.69% → **44.75%（2892，+4）**、built-ins/Object 55.0% → **55.4%（378，+3）**——收回 v0.3.7 暴露的 3 个 wrapper-as-properties-map 用例（create/15.2.3.5-4-35、defineProperties/...-241/-246）。**发布 v0.3.8 并推送**。
 
 ### 12.4 重做设计（字段存在位掩码）
 
@@ -286,3 +288,18 @@ P1/P2 残留：enumerable 变更与 accessor get/set 恒等未强制（漏拒）
 净 +9 = +12 增益 − 3 损失。3 个损失（create/15.2.3.5-4-35、defineProperties/15.2.3.7-5-b-241/-246）根因为**既有** `Object.keys` 对奇异对象（RegExp/`new String()`）过度枚举内部槽：用奇异对象作属性表时 `Object.keys` 返回 source/flags 等内部槽名，defineProperties 取其值（字符串/原语）作描述符 → v0.3.7 正确的“描述符须对象”校验抛错；基线因旧宽松路静默忽略非对象描述符侥幸通过。修复 `Object.keys` 奇异对象枚举即可收回（列 §11 新首要）。
 
 实现途中修掉两处自引入回归：动态字段存在读取器 `_prop_in` 对数组只判数值索引、装箱键经数组路径 `loadByte` → SIGSEGV（改 `_object_get` 读一次 + `!== undefined` 判 presence）；`_object_get` 对访问器属性只返 getter 标记块，须继以 `_maybe_getter`（this=desc）调其 getter 取真值（对齐 [[Get]]），否则描述符上由访问器提供的字段被当标记块误判（回收 18 个 Object 用例）。
+
+## 15. Wave 8 结果（Object.keys 奇异包装对象枚举修复，v0.3.8）
+
+根因：枚举行走器（keys/values/entries/for-in）本就遵循每属性 ATTR_ENUMERABLE 位；bug 在 RegExp（`__regexp_shim` 的 `__RE_new`）与 `new String` 包装把内部槽存为默认可枚举自有属性、无 flags 表（flags_ptr==0 → 全枚举）。
+
+| 项 | 状态 | 证据 |
+|---|---|---|
+| RegExp 16 个内部槽构造时标不可枚举（writable/configurable 保留） | 达成 | `Object.keys(new RegExp("a","g"))` == []（Node []）；功能 test/source/flags/match/exec/lastIndex/replace/split 完好 |
+| new String 的 __value/length 标不可枚举 | 达成 | Object.keys 不再含 __value/length；valueOf/toString/length/toUpperCase 完好 |
+| _object_assign 补 ATTR_ENUMERABLE 过滤 | 达成 | `Object.assign({}, new RegExp(...))` == {}（Node {}） |
+| 完整 bootstrap gate | 达成 | `gen1==gen2==gen3` 逐字节 + fixtures `385/0/0/0` |
+| test262 | 达成 | 整体 44.69% → **44.75%**（2892，+4）；built-ins/Object 55.0% → **55.4%**（378，+3）——收回 v0.3.7 暴露的 3 个 wrapper-as-map 用例 |
+| 发布 | 达成 | v0.3.8 已推送（branch dev + tag） |
+
+延期项（列 §11）：①gOPD 对数组/全局/内建覆盖（并把 RegExp source/flags 移到 prototype 以对齐 gOPN 的 `["lastIndex"]`）；②`new String` 自有可枚举索引字符；③`JSON.stringify(new String(...))` 序列化为原始字符串。

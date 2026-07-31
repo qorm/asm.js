@@ -1305,6 +1305,21 @@ function __re_checkFlags(f) {
     }
 }
 
+// 把内部槽落成"可写+可配置但不可枚举"的自有属性。
+// 枚举器(Object.keys/values/entries、for-in、Object.assign)按 flags 表判别可枚举性;
+// 普通 _object_set 不留 flags 表 → 默认全可枚举,会让 Object.keys(new RegExp(...))
+// 吐出 source/flags/.../__err(Node 为 [])。这里逐槽 defineProperty 落 enumerable:false,
+// 保持 writable:true(lastIndex/__prog/__bad/__err 后续会被改写)。__isRegExp 品牌检查
+// 走存在性(_object_has)而非可枚举性,不受影响;属性读写也不受可枚举性影响。
+function __re_hide(o, names) {
+    var i = 0;
+    while (i < names.length) {
+        var k = names[i];
+        Object.defineProperty(o, k, { value: o[k], writable: true, enumerable: false, configurable: true });
+        i = i + 1;
+    }
+}
+
 export function __RE_new(pattern, flags) {
     var src = pattern;
     var f = flags;
@@ -1345,6 +1360,8 @@ export function __RE_new(pattern, flags) {
         __bad: false,
         __err: "",
     };
+    // 内部槽落不可枚举(见 __re_hide 注):须在 __re_compile 前,__re_compile 会读写 __prog/__bad/__err。
+    __re_hide(re, ["source", "flags", "global", "ignoreCase", "multiline", "dotAll", "sticky", "unicode", "unicodeSets", "hasIndices", "lastIndex", "__isRegExp", "__pat", "__prog", "__bad", "__err"]);
     // 规范:模式在构造期编译,语法错立即抛 SyntaxError(此前是懒编译+静默不匹配)。
     __re_compile(re);
     if (re.__bad && re.__err !== "") {
