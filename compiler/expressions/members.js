@@ -298,6 +298,25 @@ const DATE_PROTO_SHIM_METHODS = [
     ["toGMTString", "__DATE_toUTCString", 0],
     ["toDateString", "__DATE_toDateString", 0],
 ];
+// [W5a Date 实例方法值读] 实例成员值读 `d.m` 覆盖的方法名集合(35 名,值恒 true;
+// 命中判据 hasOwnProperty,#32 防原型链污染)。覆盖 = v0.3.14 有守卫包装的方法族:
+// getter 族(gp0..7 十六名 + getTime + getTimezoneOffset)、setter 族(sp0..6 十四名 +
+// setTime)、toString、toISOString。无 _aref_date_* 包装的 toDateString/toTimeString/
+// toUTCString/toJSON 宁缺勿滥(仍落通用属性读,记偏差);valueOf 同偏差(未列入枚举)。
+// 发射在 compileMemberExpression 通用兜底前(见该处注)。
+const DATE_INST_METHOD_REF = {
+    getTime: true, getTimezoneOffset: true,
+    getFullYear: true, getUTCFullYear: true, getMonth: true, getUTCMonth: true,
+    getDate: true, getUTCDate: true, getHours: true, getUTCHours: true,
+    getMinutes: true, getUTCMinutes: true, getSeconds: true, getUTCSeconds: true,
+    getDay: true, getUTCDay: true, getMilliseconds: true, getUTCMilliseconds: true,
+    setTime: true,
+    setFullYear: true, setUTCFullYear: true, setMonth: true, setUTCMonth: true,
+    setDate: true, setUTCDate: true, setHours: true, setUTCHours: true,
+    setMinutes: true, setUTCMinutes: true, setSeconds: true, setUTCSeconds: true,
+    setMilliseconds: true, setUTCMilliseconds: true,
+    toString: true, toISOString: true,
+};
 // RegExp.prototype 的**访问器**属性(规范 22.2.6:get 访问器,set 为 undefined,
 // {enumerable:false, configurable:true})。[名, this 上无该属性时的默认值]:
 // 规范里 `get RegExp.prototype.source` / `flags` 以 %RegExpPrototype% 为 this 时
@@ -3050,8 +3069,11 @@ export const MemberCompiler = {
                     Int16Array: 2, Uint16Array: 2, Int32Array: 4, Uint32Array: 4,
                     Float32Array: 4, BigInt64Array: 8, BigUint64Array: 8, Float64Array: 8 };
                 // 静态 Int32Array.BYTES_PER_ELEMENT → 常量 number。
+                // [#32] TA_BPE 裸字典原型安全判定(同上方 TA_CTOR_TAGS):裸 `X !== undefined`
+                // 沿 Object.prototype 误命中(valueOf/toString 等 7 名 → 印 0,Node 印
+                // undefined);改 hasOwnProperty 后仅真 TA 构造器名命中。
                 if (propName === "BYTES_PER_ELEMENT" && expr.object.type === "Identifier" &&
-                    TA_BPE[expr.object.name] !== undefined && !this.ctx.getLocal(expr.object.name)) {
+                    Object.prototype.hasOwnProperty.call(TA_BPE, expr.object.name) && !this.ctx.getLocal(expr.object.name)) {
                     this.vm.movImm(VReg.RET, TA_BPE[expr.object.name]);
                     this.vm.scvtf(0, VReg.RET);
                     this.vm.fmovToInt(VReg.RET, 0);
@@ -3312,6 +3334,60 @@ export const MemberCompiler = {
                         this.emitBuiltinMethodRefClosureMeta(strefHelper, propName, _sh[1]);
                     }
                     this.vm.label(endL);
+                    return;
+                }
+
+                // [W5a Date 实例方法值读] 静态 Date 接收者 `d.m`(m ∈ DATE_INST_METHOD_REF)
+                // 作**值读取**(非调用)→ 运行时按对象头类型字节(TYPE_DATE=7)判别:
+                // 是 Date → _object_get 读物化原型单例上的方法值闭包(与 `Date.prototype.m`
+                // 值读同槽 → `d.m === Date.prototype.m` 恒等 true,.name/.length 随闭包
+                // 属性侧表);非 Date(推断偶误/用户同名属性对象)→ 退回通用属性读(语义
+                // 同此前,emitObjectGetIC)。调用位 `d.m(...)` 走 compileDateMethod 静态
+                // 派发,不经此 → 快路字节不变;`X.prototype` 值读、array/string 方法值
+                // 引用族均不经此。接收者脱壳判别与 size 分支同形态,ptrFloor 防小整数
+                // 解引用(同 _tam_validate 契约)。[#32] 表命中用 hasOwnProperty。
+                // [F10 门控] x64 系目标不启用本分支(保持 fallback ≡HEAD):路由激活后
+                // 命中 F8(x64 Date 构造器/原型物化既有崩,HEAD 同点,另案修)→ 行为
+                // 由静默 undefined 劣化为 SIGSEGV。arm64/wasm32 正常启用;Wave 6 F8
+                // 根因修复后移除本门控在 x64 激活。判定惯例同 functions.js:659 的
+                // x64 devirt 门(this.vm.arch);arm64 上恒真 → 发射路径零变化。
+                if (this.vm.arch !== "x64" &&
+                    Object.prototype.hasOwnProperty.call(DATE_INST_METHOD_REF, propName) &&
+                    (this.inferObjectType ? this.inferObjectType(expr.object) : "unknown") === "Date") {
+                    const dmId = this.nextLabelId();
+                    const dmEndL = this.ctx.newLabel("dmref_end");
+                    const dmFbL = this.ctx.newLabel("dmref_fallback");
+                    const dmChkL = this.ctx.newLabel("dmref_chk");
+                    const dmRecvSlot = this.ctx.allocLocal(`__dmref_recv_${dmId}`);
+                    this.compileExpression(expr.object);          // RET = 接收者
+                    this.vm.store(VReg.FP, dmRecvSlot, VReg.RET);
+                    // 用 V1 取 tag(避 x64 V0==RET 别名:读入 V0 会先毁接收者,
+                    // 后续 andMaskReg(V0,RET,…) 拿 tag 当指针 → 恒落 fallback;
+                    // 惯例同上方 aref 分支 members.js:3299)。
+                    this.vm.load(VReg.V1, VReg.FP, dmRecvSlot);
+                    this.vm.shrImm(VReg.V1, VReg.V1, 48);
+                    this.vm.cmpImm(VReg.V1, 0x7FFD);
+                    this.vm.jeq(dmChkL);
+                    this.vm.cmpImm(VReg.V1, 0);
+                    this.vm.jne(dmFbL);                            // 装箱非对象/原语 → 通用读
+                    this.vm.label(dmChkL);
+                    this.vm.emitMaskLoad(VReg.V1);
+                    this.vm.andMaskReg(VReg.V0, VReg.RET, VReg.V1); // 裸指针
+                    this.vm.movImm64(VReg.V1, this.vm.ptrFloor);
+                    this.vm.cmp(VReg.V0, VReg.V1);
+                    this.vm.jlt(dmFbL);                              // 小整数/浮点载荷 → 通用读
+                    this.vm.loadByte(VReg.V0, VReg.V0, 0);
+                    this.vm.cmpImm(VReg.V0, 7);                      // TYPE_DATE
+                    this.vm.jne(dmFbL);
+                    this.emitDateProtoObject();                      // RET = 装箱原型(槽已填则零开销)
+                    this.vm.mov(VReg.A0, VReg.RET);
+                    this.emitBoxedStringKey(propName, VReg.A1);
+                    this.vm.call("_object_get");                     // RET = 同槽方法值闭包
+                    this.vm.jmp(dmEndL);
+                    this.vm.label(dmFbL);
+                    this.vm.load(VReg.RET, VReg.FP, dmRecvSlot);
+                    this.emitObjectGetIC(propName);
+                    this.vm.label(dmEndL);
                     return;
                 }
 

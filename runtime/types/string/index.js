@@ -1010,6 +1010,12 @@ export class StringGenerator {
         const TYPE_FLOAT64 = 29;
         const TYPE_CLOSURE = 3;
         const TYPE_DATE = 7;
+        // [w5c] 内建品牌类型字节(与 runtime/core/types.js、_object_proto_toString 一致)
+        const TYPE_MAP = 4;
+        const TYPE_SET = 5;
+        const TYPE_PROMISE = 11;
+        const TYPE_ARRAY_BUFFER = 12;
+        const TYPE_DATA_VIEW = 14;
 
         vm.label("_valueToStr");
         vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2]);
@@ -1096,6 +1102,21 @@ export class StringGenerator {
         vm.andImm(VReg.V0, VReg.V0, 0xff);
         vm.cmpImm(VReg.V0, TYPE_DATE);
         vm.jeq("_valueToStr_js_date");
+        // [w5c] 内建品牌:Map/Set(4/5,WeakMap/WeakSet 由 @+48 weakness 标志再分,
+        // 同 _object_proto_toString :4383-4390 先例)、ArrayBuffer(12)、DataView(14)、
+        // Promise(11) → "[object <品牌>]"。必须先于 _is_asmjs_err:这些块都不是属性
+        // 对象,_object_has 野扫 + 后续 toprimitive/user_tostr 链把块内容误读
+        // (String(new Map())/""+new Set() 打垃圾浮点的根因)。判序照抄 print.js:602-611。
+        vm.cmpImm(VReg.V0, TYPE_MAP);
+        vm.jeq("_valueToStr_js_mapset");
+        vm.cmpImm(VReg.V0, TYPE_SET);
+        vm.jeq("_valueToStr_js_mapset");
+        vm.cmpImm(VReg.V0, TYPE_ARRAY_BUFFER);
+        vm.jeq("_valueToStr_js_arraybuffer");
+        vm.cmpImm(VReg.V0, TYPE_DATA_VIEW);
+        vm.jeq("_valueToStr_js_dataview");
+        vm.cmpImm(VReg.V0, TYPE_PROMISE);
+        vm.jeq("_valueToStr_js_promise");
         // [#36] Error 族对象(装箱 0x7FFD)→ "name: message"。S0 仍是装箱值。
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_is_asmjs_err");
@@ -1135,6 +1156,45 @@ export class StringGenerator {
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_date_toString"); // RET = 装箱堆串
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
+
+        // [w5c] 内建品牌分支目标(全部经 addString 数据段串 + 既有 create_heap 返回路,
+        // 与 _str_object 同形;标签无条件发射,字节确定性)
+        vm.label("_valueToStr_js_mapset");
+        // Weak 判别:@+48 weakness 标志(非 0 → WeakMap/WeakSet);V0 重算裸块指针
+        vm.mov(VReg.V0, VReg.S0);
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V0, VReg.V0, VReg.V1);
+        vm.load(VReg.V2, VReg.V0, 48); // x64 V2==A2,此处无活值
+        vm.cmpImm(VReg.V2, 0);
+        vm.jne("_valueToStr_js_weakmapset");
+        vm.loadByte(VReg.V2, VReg.V0, 0);
+        vm.andImm(VReg.V2, VReg.V2, 0xff);
+        vm.cmpImm(VReg.V2, TYPE_MAP);
+        vm.jne("_valueToStr_js_set");
+        vm.lea(VReg.A0, vm.asm.addString("[object Map]"));
+        vm.jmp("_valueToStr_data_str_create_heap");
+        vm.label("_valueToStr_js_set");
+        vm.lea(VReg.A0, vm.asm.addString("[object Set]"));
+        vm.jmp("_valueToStr_data_str_create_heap");
+        vm.label("_valueToStr_js_weakmapset");
+        vm.loadByte(VReg.V2, VReg.V0, 0);
+        vm.andImm(VReg.V2, VReg.V2, 0xff);
+        vm.cmpImm(VReg.V2, TYPE_MAP);
+        vm.jne("_valueToStr_js_weakset");
+        vm.lea(VReg.A0, vm.asm.addString("[object WeakMap]"));
+        vm.jmp("_valueToStr_data_str_create_heap");
+        vm.label("_valueToStr_js_weakset");
+        vm.lea(VReg.A0, vm.asm.addString("[object WeakSet]"));
+        vm.jmp("_valueToStr_data_str_create_heap");
+        vm.label("_valueToStr_js_arraybuffer");
+        vm.lea(VReg.A0, vm.asm.addString("[object ArrayBuffer]"));
+        vm.jmp("_valueToStr_data_str_create_heap");
+        vm.label("_valueToStr_js_dataview");
+        vm.lea(VReg.A0, vm.asm.addString("[object DataView]"));
+        vm.jmp("_valueToStr_data_str_create_heap");
+        vm.label("_valueToStr_js_promise");
+        vm.lea(VReg.A0, vm.asm.addString("[object Promise]"));
+        vm.jmp("_valueToStr_data_str_create_heap");
 
         vm.label("_valueToStr_js_array");
         // Array: extract low 48 bits as array pointer
@@ -1295,6 +1355,18 @@ export class StringGenerator {
         vm.jeq("_valueToStr_as_array");
         vm.cmpImm(VReg.V1, TYPE_OBJECT);
         vm.jeq("_valueToStr_as_object");
+        // [w5c] 内建品牌(裸堆指针形态):Map/Set(4/5,@+48 weakness 再分 Weak 族)、
+        // ArrayBuffer(12)、DataView(14) → "[object <品牌>]"。此前落 raw_number 把块
+        // 内容当浮点打(String(new Map())/""+new Set() 垃圾浮点根因);均 < 0x40,
+        // 与下方 TypedArray 区间无冲突。分支目标与装箱族共用(脱壳对裸指针幂等)。
+        vm.cmpImm(VReg.V1, TYPE_MAP);
+        vm.jeq("_valueToStr_js_mapset");
+        vm.cmpImm(VReg.V1, TYPE_SET);
+        vm.jeq("_valueToStr_js_mapset");
+        vm.cmpImm(VReg.V1, TYPE_ARRAY_BUFFER);
+        vm.jeq("_valueToStr_js_arraybuffer");
+        vm.cmpImm(VReg.V1, TYPE_DATA_VIEW);
+        vm.jeq("_valueToStr_js_dataview");
         // TypedArray(类型字节 0x40-0x61)→ 逗号连接串(String(ta)/`${ta}`/`""+ta`,
         // 对齐 node "1,2,3")。此前落 raw_number → 把 ta 头指针当浮点位模式 → 垃圾浮点。
         // 委托 _ta_join(ta, ","):经 _ta_to_array 转普通数组再 _array_join。

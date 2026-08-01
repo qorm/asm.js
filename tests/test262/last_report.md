@@ -1,6 +1,6 @@
 # asm.js test262 conformance report
 
-_Generated 2026-08-01T12:05:35.307Z — target macos-arm64_
+_Generated 2026-08-01T17:51:13.126Z — target macos-arm64_
 
 ## Headline
 
@@ -14,9 +14,9 @@ Of 33776 discovered test files in the selected dirs, 1466 were excluded up front
 | class | count | % of run |
 |-------|------:|---------:|
 | PASS         | 3087 | 47.77 |
-| FAIL         | 3148 | 48.72 |
+| FAIL         | 3144 | 48.65 |
 | COMPILE_FAIL | 69 | 1.07 |
-| CRASH        | 158 | 2.45 |
+| CRASH        | 162 | 2.51 |
 | **run**      | **6462** | 100 |
 
 ## By area
@@ -33,11 +33,11 @@ Of 33776 discovered test files in the selected dirs, 1466 were excluded up front
 | built-ins/Promise | 145 | 62 | 70 | 6 | 7 | 42.8 |
 | built-ins/RegExp | 374 | 133 | 235 | 5 | 1 | 35.6 |
 | built-ins/Set | 76 | 40 | 26 | 2 | 8 | 52.6 |
-| built-ins/String | 244 | 95 | 146 | 1 | 2 | 38.9 |
+| built-ins/String | 244 | 95 | 147 | 1 | 1 | 38.9 |
 | built-ins/Symbol | 15 | 5 | 10 | 0 | 0 | 33.3 |
 | built-ins/TypedArray | 288 | 69 | 216 | 0 | 3 | 24.0 |
-| language/expressions | 2005 | 1036 | 882 | 30 | 57 | 51.7 |
-| language/statements | 1822 | 842 | 913 | 25 | 42 | 46.2 |
+| language/expressions | 2005 | 1036 | 878 | 30 | 61 | 51.7 |
+| language/statements | 1822 | 842 | 912 | 25 | 43 | 46.2 |
 
 ## Excluded categories (counted, not scored)
 
@@ -59,17 +59,17 @@ Excluded-by-feature detail:
 
 ## Top failing patterns (FAIL / COMPILE_FAIL / CRASH detail strings)
 
-- **1803×** FAIL: assertion mismatch (Test262Error / wrong value)
-- **423×** FAIL: async ($DONE not signalled / promise rejected)
+- **1801×** FAIL: assertion mismatch (Test262Error / wrong value)
+- **421×** FAIL: async ($DONE not signalled / promise rejected)
 - **359×** FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)
 - **261×** FAIL: negative test wrong outcome (phase=parse)
 - **145×** FAIL: TypedArray/ArrayBuffer semantics
+- **112×** CRASH: run signal SIGSEGV
 - **107×** FAIL: array contents mismatch (compareArray)
-- **105×** CRASH: run signal SIGSEGV
 - **69×** COMPILE_FAIL: asm.js could not compile (unsupported syntax / parser gap)
 - **48×** FAIL: constructor-ness reflection (isConstructor / not-a-constructor)
 - **35×** CRASH: run timeout
-- **18×** CRASH: run signal SIGBUS
+- **15×** CRASH: run signal SIGBUS
 - **2×** FAIL: negative test wrong outcome (phase=runtime)
 
 ## Failures correlated with features (top tags among failing tests)
@@ -125,4 +125,4 @@ mkdir -p .test262-corpus && tar xzf /tmp/t262.tgz -C .test262-corpus --strip-com
 node tests/test262/run.mjs --stride 5 --jobs 8 --target macos-arm64
 ```
 
-_Run wall-clock: 434.1s._
+_Run wall-clock: 431.6s._

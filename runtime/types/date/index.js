@@ -625,27 +625,46 @@ export class DateGenerator {
             vm.jle(L + "_cok");
             vm.movImm(VReg.S1, maxA);
             vm.label(L + "_cok");
-            // 逐位 ToNumber → int → values[i](生成器展开;count 连续,i>=count 直落调用)。
-            // [Date 加固] NaN/±Inf(指数全 1)不短路:仅置 [SP+80]=1 继续强转后续位
-            // (全部实参先求值强转、副作用保序,与 node 一致;此前 jeq _nan 短路会吞掉
-            // 后续位 valueOf 副作用),L_call 处统一分流 _nan。
-            vm.movImm(VReg.V0, 0);
-            vm.store(VReg.SP, 80, VReg.V0); // argNaN = 0
+            // 逐位 ToNumber(生成器展开;count 连续,i>=count 直落调用,全位强转保序)。
+            // 日历族(part 0..2):转 int 落槽;NaN/±Inf(指数全 1)或超 V8 MakeDay 原参界
+            //   (|year|>1e6、|month|>1e7、|date|>1e9,fcmp 守 §1.2,与直调 SETTER_MAG_BITS
+            //   同界)→ 置 [SP+80] 标志不短路,L_call 统一分流 _nan(写回 NaN,同 node)。
+            // 时间族(part 3..6):f64 位直落槽(ToInteger/NaN/巨大值全由 _date_set_time_f64_t
+            //   的 float 域组合自然处理,跨字段对消与 node 逐位一致),无需标志与门。
+            const isTime = part >= 3;
+            const CAL_MAG = [0x412e848000000000n, 0x416312d000000000n, 0x41cdcd6500000000n]; // 1e6/1e7/1e9
+            if (!isTime) {
+                vm.movImm(VReg.V0, 0);
+                vm.store(VReg.SP, 80, VReg.V0); // argNaN = 0
+            }
             for (let i = 0; i < maxA; i = i + 1) {
                 vm.cmpImm(VReg.S1, i + 1);
                 vm.jlt(L + "_call");
                 vm.load(VReg.A0, VReg.SP, i * 8);
                 vm.call("_number_coerce"); // RET = float64 位(先于任何用户 valueOf 读 argc)
-                vm.shrImm(VReg.V1, VReg.RET, 52);
-                vm.andImm(VReg.V1, VReg.V1, 0x7ff);
-                vm.cmpImm(VReg.V1, 0x7ff);
-                vm.jne(L + "_argok" + i);
-                vm.movImm(VReg.V1, 1);
-                vm.store(VReg.SP, 80, VReg.V1); // argNaN = 1(不跳出循环)
-                vm.label(L + "_argok" + i);
-                vm.fmovToFloat(0, VReg.RET);
-                vm.fcvtzs(VReg.V0, 0); // 向零截断(NaN→0;标志命中时槽值不被使用)
-                vm.store(VReg.SP, 40 + i * 8, VReg.V0);
+                if (isTime) {
+                    vm.store(VReg.SP, 40 + i * 8, VReg.RET); // f64 位直落槽
+                } else {
+                    vm.shrImm(VReg.V1, VReg.RET, 52);
+                    vm.andImm(VReg.V1, VReg.V1, 0x7ff);
+                    vm.cmpImm(VReg.V1, 0x7ff);
+                    vm.jeq(L + "_argnan" + i); // NaN/±Inf
+                    vm.movImm64(VReg.V1, 0x7fffffffffffffffn);
+                    vm.and(VReg.V1, VReg.RET, VReg.V1); // |v|(x64 V1==A3,循环内无活值)
+                    vm.movImm64(VReg.V2, CAL_MAG[part + i]); // (x64 V2==A2,循环内无活值)
+                    vm.fmovToFloat(0, VReg.V1);
+                    vm.fmovToFloat(1, VReg.V2);
+                    vm.fcmp(0, 1);
+                    vm.jfgt(L + "_argnan" + i); // 超 V8 原参界
+                    vm.jmp(L + "_argok" + i);
+                    vm.label(L + "_argnan" + i);
+                    vm.movImm(VReg.V1, 1);
+                    vm.store(VReg.SP, 80, VReg.V1); // argNaN = 1(不跳出循环)
+                    vm.label(L + "_argok" + i);
+                    vm.fmovToFloat(0, VReg.RET);
+                    vm.fcvtzs(VReg.V0, 0); // 向零截断(NaN→0;标志命中时槽值不被使用)
+                    vm.store(VReg.SP, 40 + i * 8, VReg.V0);
+                }
                 if (part === 0 && i === 0) {
                     // setFullYear:V8 于 year 强转后读 t(见上)
                     vm.load(VReg.V0, VReg.S0, 8);
@@ -655,15 +674,21 @@ export class DateGenerator {
             vm.label(L + "_call");
             vm.cmpImm(VReg.S2, 1);
             vm.jeq(L + "_nan"); // 强转前已 Invalid → 由 _nan 分流到不写回支路
-            vm.load(VReg.V0, VReg.SP, 80);
-            vm.cmpImm(VReg.V0, 0);
-            vm.jne(L + "_nan"); // 任一位 NaN/±Inf → 写回 NaN(全部强转已完成)
+            if (!isTime) {
+                vm.load(VReg.V0, VReg.SP, 80);
+                vm.cmpImm(VReg.V0, 0);
+                vm.jne(L + "_nan"); // 任一位 NaN/±Inf → 写回 NaN(全部强转已完成)
+            }
             vm.mov(VReg.A0, VReg.S0);
             vm.movImm(VReg.A1, part);
             vm.mov(VReg.A2, VReg.S1);
             vm.addImm(VReg.A3, VReg.SP, 40); // valuesPtr
             vm.load(VReg.A4, VReg.SP, 72);   // t(读取时点按 part 分流,见上)
-            vm.call("_date_set_parts_t");  // RET = 新 ms(裸 float 位 = number)
+            if (isTime) {
+                vm.call("_date_set_time_f64_t"); // float 域组合(RET = number)
+            } else {
+                vm.call("_date_set_parts_t");  // RET = 新 ms(裸 float 位 = number)
+            }
             vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 96);
             vm.label(L + "_nan");
             // 强转得 NaN(t 有效)→ 规范写回 NaN;强转前已 Invalid(S2=1)→ 规范只
@@ -2088,6 +2113,231 @@ export class DateGenerator {
         vm.store(VReg.V4, 8, VReg.V3);
         vm.mov(VReg.RET, VReg.V3);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 128);
+
+        // _fma_emu(A0=x 位, A1=c 位, A2=Kodd 位, A3=2^shift 位) -> RET = fl(x×(Kodd·2^shift) + c)
+        // [Date 加固] 无 fma 指令平台的 fma 仿真:复现 V8 MakeTime 的编译器收缩
+        // (h*3600000 精确入加、m*60000 先舍入——v8/src/date/date.cc MakeTime 经 clang
+        // contraction;实测残差 167772160=−δ(fl(3.6e24)) 等 5 例逐位吻合)。
+        // 结构:Dekker twoProd(x, Kodd)(Veltkamp 分裂,分裂常数 2^27+1)→ P+E = x×K 精确;
+        // twoSum(P, c) → s+u;result = fl(s + (u+E))(Boldo/Muller 仿真,舍入一次)。
+        // 巨大值支路:|x| ≥ 2^990(fcmp,守 §1.2)时分裂会溢出——查尾数:积精确
+        // (M 低 15 位全 0,或低 14 位全 0 且 M < 2^67/28125)则 E=0 直走;否则 δ≠0 且
+        // |δ| ≥ 2^937 ≫ 8.64e15 → 直接 NaN(超出验收矩阵 ~1e292 覆盖,记档)。
+        // FP 寄存器:D0=x D1=c D5=2^shift D6=Kodd D2/D3/D4/D7 暂存。
+        vm.label("_fma_emu");
+        vm.prologue(0, []);
+        vm.fmovToFloat(0, VReg.A0);
+        vm.fmovToFloat(1, VReg.A1);
+        vm.fmovToFloat(6, VReg.A2);
+        vm.fmovToFloat(5, VReg.A3);
+        // |x| ≥ 2^990 → 巨大支路(V0==A0==RET 别名:掩码先落 V1,and 的 dest==src1 合法)
+        vm.movImm64(VReg.V1, 0x7fffffffffffffffn);
+        vm.and(VReg.V0, VReg.A0, VReg.V1); // V0 = |x| 位
+        vm.movImm64(VReg.V1, 0x7dd0000000000000n); // 2^990
+        vm.fmovToFloat(2, VReg.V0);
+        vm.fmovToFloat(3, VReg.V1);
+        vm.fcmp(2, 3);
+        vm.jfge("_fma_emu_huge");
+        // Veltkamp 分裂 x(分裂常数 134217729 = 2^27+1)
+        vm.movImm64(VReg.V0, 0x41a0000002000000n); // 134217729.0
+        vm.fmovToFloat(2, VReg.V0);
+        vm.fmul(2, 0, 2);   // D2 = xs
+        vm.fsub(3, 2, 0);   // D3 = xs - x
+        vm.fsub(3, 2, 3);   // D3 = xh
+        vm.fsub(4, 0, 3);   // D4 = xl
+        // Dekker 误差:e0 = (xh×Kodd - p0) + xl×Kodd(Kodd < 2^27,高低直取)
+        vm.fmul(7, 0, 6);   // D7 = p0 = x×Kodd(舍入)
+        vm.fmul(2, 3, 6);   // D2 = xh×Kodd
+        vm.fsub(2, 2, 7);   // D2 = xh×Kodd - p0(精确)
+        vm.fmul(3, 4, 6);   // D3 = xl×Kodd
+        vm.fadd(2, 2, 3);   // D2 = e0
+        // 缩放:P = p0×2^shift、E = e0×2^shift(2 的幂乘法精确)
+        vm.fmul(7, 7, 5);   // D7 = P
+        vm.fmul(2, 2, 5);   // D2 = E
+        vm.jmp("_fma_emu_sum");
+        vm.label("_fma_emu_exact");
+        // 积精确:P 直接取,E = +0
+        vm.fmul(7, 0, 6);   // D7 = x×Kodd(精确)
+        vm.fmul(7, 7, 5);   // D7 = P
+        vm.fsub(2, 7, 7);   // D2 = +0.0
+        vm.label("_fma_emu_sum");
+        // twoSum(P=D7, c=D1):s = P+c;u = (P - (s - (s - P))) + (c - (s - P))
+        vm.fadd(3, 7, 1);   // D3 = s
+        vm.fsub(4, 3, 7);   // D4 = bp = s - P
+        vm.fsub(5, 3, 4);   // D5 = ap = s - bp
+        vm.fsub(5, 7, 5);   // D5 = P - ap
+        vm.fsub(4, 1, 4);   // D4 = c - bp
+        vm.fadd(5, 5, 4);   // D5 = u
+        vm.fadd(2, 5, 2);   // D2 = u + E
+        vm.fadd(3, 3, 2);   // D3 = fl(s + (u+E))
+        vm.fmovToInt(VReg.RET, 3);
+        vm.epilogue([], 0);
+        vm.label("_fma_emu_huge");
+        // M = (bits & 0xfffffffffffff) | 2^52(正规数;调用方保证 x 整数值/Inf,非次正规)
+        // (V0==A0 别名:掩码先落 V1,and 的 dest==src1 合法)
+        vm.movImm64(VReg.V1, 0xfffffffffffffn);
+        vm.and(VReg.V0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x10000000000000n);
+        vm.or(VReg.V0, VReg.V0, VReg.V1); // M(≤2^53,int64 安全)
+        // (M & 32767)==0 → 积精确
+        vm.movImm(VReg.V1, 32767);
+        vm.and(VReg.V1, VReg.V0, VReg.V1);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_fma_emu_exact");
+        // (M & 16383)==0 且 M < 2^67/28125(=5247087198758.28…取整 5247087198758)→ 精确
+        vm.movImm(VReg.V1, 16383);
+        vm.and(VReg.V1, VReg.V0, VReg.V1);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_fma_emu_nan");
+        vm.movImm64(VReg.V1, 5247087198758n);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jlt("_fma_emu_exact");
+        vm.label("_fma_emu_nan");
+        vm.movImm64(VReg.RET, 0x7ff0000000000001n); // canonical NaN(同 _dp_invalid)
+        vm.epilogue([], 0);
+
+        // _date_set_time_f64(A0=date, A1=startPart(3=h 4=mi 5=s 6=ms), A2=count,
+        //                    A3=valuesPtr(逐参 f64 位)) -> 新 ms(number)
+        // 薄壳:读当前 [[DateValue]] → A4 尾跳 _t(编译器直调"调用时"语义,同 _date_set_parts)。
+        // [Date 加固] 时间族多字段 float 域组合(spec MakeTime/MakeDate/TimeClip 字面,
+        // 复现 V8 FMA 收缩序——跨字段对消/巨大值全谱与 node 逐位一致):
+        //   字段 h/mi/s/ms:实参覆盖位取槽值(逐参 ToInteger:指数全 1 或 |v|≥2^63 恒等,
+        //   否则 fcvtzs+scvtf 往返);未覆盖位取 t 现字段(_date_get_part_ts → scvtf)。
+        //   time = fma(h,3600000, mi×60000) → fma(s,1000, ·) → +ms(_fma_emu 仿真);
+        //   day = floor(fcvtzs(t)/86400000)(int64,fcvtzs(NaN)=0 → 纪元,同 _date_set_parts);
+        //   total = time + day×86400000(f64);TimeClip(指数全 1 或 |total|>8.64e15 →
+        //   canonical NaN 写回并返回;否则 fcvtzs+scvtf 截断写回并返回)。
+        // 栈:[0]date [8]startPart [16]count [24]valuesPtr [32]t [40..64]cur h/mi/s/ms(int)
+        //     [72..96]field h/mi/s/ms(f64 位) [104]time 累积
+        vm.label("_date_set_time_f64");
+        vm.movImm64(VReg.V3, 0x0000ffffffffffffn);
+        vm.and(VReg.V0, VReg.A0, VReg.V3);
+        vm.load(VReg.A4, VReg.V0, 8);
+        // fall through / jmp 到 _t
+        vm.label("_date_set_time_f64_t");
+        vm.prologue(128, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.store(VReg.SP, 0, VReg.A0);
+        vm.store(VReg.SP, 8, VReg.A1);
+        vm.store(VReg.SP, 16, VReg.A2);
+        vm.store(VReg.SP, 24, VReg.A3);
+        vm.store(VReg.SP, 32, VReg.A4);
+        vm.movImm64(VReg.V3, 0x0000ffffffffffffn);
+        vm.and(VReg.S0, VReg.A0, VReg.V3); // S0 = 裸 date 指针
+        // 提取现字段(_date_get_part_ts 毁 A 系;S0-S3 由其 prologue 自保)
+        vm.load(VReg.A0, VReg.SP, 32); vm.movImm(VReg.A1, 3); vm.call("_date_get_part_ts"); vm.store(VReg.SP, 40, VReg.RET);
+        vm.load(VReg.A0, VReg.SP, 32); vm.movImm(VReg.A1, 4); vm.call("_date_get_part_ts"); vm.store(VReg.SP, 48, VReg.RET);
+        vm.load(VReg.A0, VReg.SP, 32); vm.movImm(VReg.A1, 5); vm.call("_date_get_part_ts"); vm.store(VReg.SP, 56, VReg.RET);
+        vm.load(VReg.A0, VReg.SP, 32); vm.movImm(VReg.A1, 7); vm.call("_date_get_part_ts"); vm.store(VReg.SP, 64, VReg.RET);
+        // 逐字段定值(生成器展开;SPART = 3+k)
+        const SPART = [3, 4, 5, 6];
+        for (let k = 0; k < 4; k = k + 1) {
+            const useCur = "_dstf_cur" + k;
+            const haveV = "_dstf_have" + k;
+            // startPart ≤ pk ≤ startPart+count-1 → 实参槽
+            vm.load(VReg.V0, VReg.SP, 8);
+            vm.cmpImm(VReg.V0, SPART[k]);
+            vm.jgt(useCur);
+            vm.load(VReg.V1, VReg.SP, 16);
+            vm.add(VReg.V0, VReg.V0, VReg.V1); // startPart+count
+            vm.cmpImm(VReg.V0, SPART[k]);
+            vm.jle(useCur);
+            // idx = pk - startPart;v = values[idx](f64 位)
+            vm.load(VReg.V1, VReg.SP, 8);
+            vm.movImm(VReg.V2, SPART[k]);
+            vm.sub(VReg.V1, VReg.V2, VReg.V1);
+            vm.movImm(VReg.V2, 8);
+            vm.mul(VReg.V1, VReg.V1, VReg.V2);
+            vm.load(VReg.V2, VReg.SP, 24);
+            vm.add(VReg.V1, VReg.V1, VReg.V2);
+            vm.load(VReg.V0, VReg.V1, 0);
+            // ToInteger:指数全 1 或 |v| ≥ 2^63(fcmp)恒等保留;否则 fcvtzs+scvtf 往返
+            vm.shrImm(VReg.V1, VReg.V0, 52);
+            vm.andImm(VReg.V1, VReg.V1, 0x7ff);
+            vm.cmpImm(VReg.V1, 0x7ff);
+            vm.jeq(haveV);
+            vm.movImm64(VReg.V1, 0x7fffffffffffffffn);
+            vm.and(VReg.V1, VReg.V0, VReg.V1);
+            vm.movImm64(VReg.V2, 0x43e0000000000000n); // 2^63
+            vm.fmovToFloat(0, VReg.V1);
+            vm.fmovToFloat(1, VReg.V2);
+            vm.fcmp(0, 1);
+            vm.jfge(haveV);
+            vm.fmovToFloat(0, VReg.V0);
+            vm.fcvtzs(VReg.V1, 0);
+            vm.scvtf(0, VReg.V1);
+            vm.fmovToInt(VReg.V0, 0);
+            vm.jmp(haveV);
+            vm.label(useCur);
+            vm.load(VReg.V0, VReg.SP, 40 + k * 8);
+            vm.scvtf(0, VReg.V0);
+            vm.fmovToInt(VReg.V0, 0);
+            vm.label(haveV);
+            vm.store(VReg.SP, 72 + k * 8, VReg.V0);
+        }
+        // time = fma(h, 3600000, fl(mi×60000))(60000.0 = 0x40ed4c0000000000)
+        vm.load(VReg.V0, VReg.SP, 80);
+        vm.movImm64(VReg.V1, 0x40ed4c0000000000n);
+        vm.fmovToFloat(0, VReg.V0);
+        vm.fmovToFloat(1, VReg.V1);
+        vm.fmul(0, 0, 1);
+        vm.fmovToInt(VReg.A1, 0); // c = fl(mi×60000)
+        vm.load(VReg.A0, VReg.SP, 72); // x = h
+        vm.movImm64(VReg.A2, 0x40db774000000000n); // 28125.0(3600000 = 28125×2^7)
+        vm.movImm64(VReg.A3, 0x4060000000000000n); // 128.0
+        vm.call("_fma_emu");
+        vm.store(VReg.SP, 104, VReg.RET); // time = s1
+        // time = fma(s, 1000, s1)(1000 = 125×2^3)
+        // 注意 RET==A0 别名(arm64 X0/wasm 全局 1 同语义):必须先 mov 走 s1 再载入 A0,
+        // 否则 load A0 会把 RET 里的 s1 覆盖成 s(c 错取为 s → s×1001)。
+        vm.mov(VReg.A1, VReg.RET);     // c = s1(先取)
+        vm.load(VReg.A0, VReg.SP, 88); // x = s(后取)
+        vm.movImm64(VReg.A2, 0x405f400000000000n); // 125.0
+        vm.movImm64(VReg.A3, 0x4020000000000000n); // 8.0
+        vm.call("_fma_emu");
+        // time = fl(s2 + ms)
+        vm.fmovToFloat(0, VReg.RET);
+        vm.load(VReg.V1, VReg.SP, 96);
+        vm.fmovToFloat(1, VReg.V1);
+        vm.fadd(0, 0, 1);
+        vm.fmovToInt(VReg.V0, 0); // V0 = time 位
+        // day_ms = floor(fcvtzs(t)/86400000)×86400000(int64,精确;NaN→0 纪元)
+        vm.load(VReg.S1, VReg.SP, 32);
+        vm.fmovToFloat(1, VReg.S1);
+        vm.fcvtzs(VReg.S1, 1); // t_int
+        vm.movImm(VReg.S2, 86400000);
+        vm.div(VReg.V3, VReg.S1, VReg.S2);
+        vm.mod(VReg.V4, VReg.S1, VReg.S2);
+        vm.cmpImm(VReg.V4, 0);
+        vm.jge("_dstf_dayok");
+        vm.subImm(VReg.V3, VReg.V3, 1);
+        vm.label("_dstf_dayok");
+        vm.mul(VReg.V3, VReg.V3, VReg.S2); // day_ms
+        vm.scvtf(1, VReg.V3);
+        vm.fmovToFloat(0, VReg.V0);
+        vm.fadd(0, 0, 1); // total = time + day_ms(f64)
+        vm.fmovToInt(VReg.V0, 0);
+        // TimeClip:指数全 1 或 |total| > 8.64e15(fcmp,守 §1.2)→ canonical NaN
+        vm.shrImm(VReg.V1, VReg.V0, 52);
+        vm.andImm(VReg.V1, VReg.V1, 0x7ff);
+        vm.cmpImm(VReg.V1, 0x7ff);
+        vm.jeq("_dstf_nan");
+        vm.movImm64(VReg.V1, 0x7fffffffffffffffn);
+        vm.and(VReg.V1, VReg.V0, VReg.V1);
+        vm.movImm64(VReg.V2, 0x433eb208c2dc0000n); // 8.64e15
+        vm.fmovToFloat(0, VReg.V1);
+        vm.fmovToFloat(1, VReg.V2);
+        vm.fcmp(0, 1);
+        vm.jfgt("_dstf_nan");
+        vm.fmovToFloat(0, VReg.V0);
+        vm.fcvtzs(VReg.V1, 0); // 向零截断(-0→+0)
+        vm.scvtf(0, VReg.V1);
+        vm.fmovToInt(VReg.RET, 0);
+        vm.store(VReg.S0, 8, VReg.RET);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 128);
+        vm.label("_dstf_nan");
+        vm.movImm64(VReg.RET, 0x7ff0000000000001n);
+        vm.store(VReg.S0, 8, VReg.RET);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 128);
 
         // _parse_int_n: 解析 N 位数字
         // A0 = 字符串指针, A1 = 位数

@@ -336,6 +336,20 @@ export const BuiltinCollectionMethodCompiler = {
             setMinutes: 3, setUTCMinutes: 3, setSeconds: 2, setUTCSeconds: 2,
             setMilliseconds: 1, setUTCMilliseconds: 1,
         };
+        // [Date 加固] 日历族判别界 B(float64 位):|v| > B → 组合必 NaN,fcmp 守 §1.2。
+        // year/month 对齐 V8 MakeDay 原始实参范围拒收(|year|≤1e6、|month|≤1e7,见
+        // v8/src/date/date.cc kMinYear/kMaxYear/kMinMonth/kMaxMonth)——超界及对消后
+        // 落界的由 _date_set_parts 组合后 TimeClip 兜底(如 ym=275303 合法);
+        // date 无原值界(MakeDay 仅查 isfinite),1e9 仅防 int64 溢出,clip 兜底。
+        const SETTER_MAG_BITS = [
+            0x412e848000000000n, // 0 year: 1e6(V8 kMaxYear)
+            0x416312d000000000n, // 1 month: 1e7(V8 kMaxMonth)
+            0x41cdcd6500000000n, // 2 date: 1e9(int64 界;合法 |d|≤2e8 由 clip 兜底)
+            0x4202a05f20000000n, // 3 hours: 1e10(合法 |h|≤4.8e9;int64 界 ~2.5e12)
+            0x426d1a94a2000000n, // 4 minutes: 1e12(合法 |mi|≤2.88e11;int64 界 ~1.5e14)
+            0x42d6bcc41e900000n, // 5 seconds: 1e14(合法 |s|≤1.728e13;int64 界 ~9.2e15)
+            0x4376345785d8a000n, // 6 ms: 1e17(合法 |v|≤1.728e16;int64 界 ~9.2e18)
+        ];
         // [Date 加固] 零参 setter(含 setTime):字段缺省 = undefined → ToNumber NaN →
         // timestamp 写 canonical NaN(0x7ff0…01,同 _dp_invalid)并返回 NaN——对齐 aref 路
         // _aref_date_sp* 零参语义(count 按 1、arg0=padded undefined → _nan 支路)。
@@ -355,9 +369,33 @@ export const BuiltinCollectionMethodCompiler = {
             const count = Math.min(args.length, SETTER_MAX[method]);
             if (count === 1) {
                 // 单字段:沿用 _date_set_part(与既有 codegen 一致)
+                const id = this.nextLabelId();
                 const nanLbl = this.ctx.newLabel("dset_nan");
                 const okLbl = this.ctx.newLabel("dset_ok");
-                this.compileExpression(obj);
+                const invLbl = part !== 0 ? this.ctx.newLabel("dset_inv") : null;
+                this.compileExpression(obj); // RET = date(boxed)
+                // [Date 加固] Invalid 接收者预检(镜像 aref _aref_date_sp* 的 S2 语义):
+                // part 1..6 强转前读 t,指数全 1 → 标志=1;强转照做(保副作用),统一分流
+                // RET=NaN【不写回】(valueOf 内 setTime 修复的 [[DateValue]] 必须保留)。
+                // part=0(setFullYear 族)NaN→+0 重组例外,不预检(_date_set_part 内
+                // fcvtzs(NaN)=0 → 纪元字段天然满足,与 aref/红队顺序矩阵一致)。
+                let invOff = 0;
+                if (part !== 0) {
+                    const freshLbl = this.ctx.newLabel("dset_fresh");
+                    invOff = this.ctx.allocLocal(`__dset_inv_${id}`);
+                    this.vm.emitMaskLoad(VReg.V1);
+                    this.vm.andMaskReg(VReg.V2, VReg.RET, VReg.V1); // V2 = 裸 ptr(x64 V2==A2,此处无活值;RET 保留)
+                    this.vm.load(VReg.V2, VReg.V2, 8); // V2 = ts 位
+                    this.vm.shrImm(VReg.V1, VReg.V2, 52);
+                    this.vm.andImm(VReg.V1, VReg.V1, 0x7ff);
+                    this.vm.movImm(VReg.V2, 0);
+                    this.vm.store(VReg.FP, invOff, VReg.V2); // invalidBefore = 0
+                    this.vm.cmpImm(VReg.V1, 0x7ff);
+                    this.vm.jne(freshLbl);
+                    this.vm.movImm(VReg.V1, 1);
+                    this.vm.store(VReg.FP, invOff, VReg.V1); // invalidBefore = 1
+                    this.vm.label(freshLbl);
+                }
                 this.vm.push(VReg.RET); // 保存 date 值
                 this.compileExpression(args[0]);
                 this.emitNumberCoerceFast(); // RET = 裸 float 位
@@ -369,8 +407,23 @@ export const BuiltinCollectionMethodCompiler = {
                 this.vm.andImm(VReg.V1, VReg.V1, 0x7ff);
                 this.vm.cmpImm(VReg.V1, 0x7ff);
                 this.vm.jeq(nanLbl);
+                // [Date 加固] 巨大有限值量纲判别:|v| > B[part] 组合必 NaN(fcmp 守 §1.2;
+                // 组合后 TimeClip 对 int64 溢出/饱和值不可达,故转换前按量纲前置判别)。
+                this.vm.movImm64(VReg.V1, 0x7fffffffffffffffn);
+                this.vm.and(VReg.V1, VReg.RET, VReg.V1); // V1 = |v| 位(x64 V1==A3,A3 无活值)
+                this.vm.movImm64(VReg.V2, SETTER_MAG_BITS[part]); // B(x64 V2==A2,A2 下方才接 fcvtzs 结果)
+                this.vm.fmovToFloat(0, VReg.V1);
+                this.vm.fmovToFloat(1, VReg.V2);
+                this.vm.fcmp(0, 1);
+                this.vm.jfgt(nanLbl);
                 this.vm.fmovToFloat(0, VReg.RET);
                 this.vm.fcvtzs(VReg.A2, 0); // A2 = int 值
+                if (part !== 0) {
+                    // 强转完毕;强转前已 Invalid → RET=NaN 不写回(保 valueOf 修复)
+                    this.vm.load(VReg.V0, VReg.FP, invOff);
+                    this.vm.cmpImm(VReg.V0, 0);
+                    this.vm.jne(invLbl);
+                }
                 this.vm.pop(VReg.A0); // date 值
                 this.vm.movImm(VReg.A1, part);
                 this.vm.call("_date_set_part"); // RET = 新 ms(裸 float number)
@@ -382,34 +435,131 @@ export const BuiltinCollectionMethodCompiler = {
                 this.vm.movImm64(VReg.V1, 0x7ff0000000000001n); // canonical NaN(同 _dp_invalid)
                 this.vm.store(VReg.A0, 8, VReg.V1);
                 this.vm.mov(VReg.RET, VReg.V1);
+                this.vm.jmp(okLbl);
+                if (part !== 0) {
+                    this.vm.label(invLbl);
+                    this.vm.pop(VReg.V0); // 平衡栈(date 废弃;不写回)
+                    this.vm.movImm64(VReg.RET, 0x7ff0000000000001n); // RET = NaN
+                }
                 this.vm.label(okLbl);
                 return true;
             }
-            // 多字段:原子写。逐参转 int 存入连续 FP 槽(allocLocal 地址递减,
+            // 多字段时间族(part 3..5:setHours/setMinutes/setSeconds 及 UTC 变体):
+            // float 域组合(spec MakeTime/MakeDate/TimeClip 字面,经 _date_set_time_f64;
+            // 复现 V8 FMA 收缩序,跨字段对消/巨大值与 node 逐位一致——独立量纲门会
+            // 误杀对消合法值,已废)。逐参 ToNumber 落 f64 位槽(ToInteger 由 helper 逐参
+            // 做),Invalid 接收者预检同单字段路(镜像 aref S2:返 NaN 不写回)。
+            if (part >= 3) {
+                const id = this.nextLabelId();
+                const okLbl = this.ctx.newLabel("dset_ok");
+                const invLbl = this.ctx.newLabel("dset_inv");
+                this.compileExpression(obj); // RET = date(boxed)
+                const invOff = this.ctx.allocLocal(`__dset_inv_${id}`);
+                {
+                    const freshLbl = this.ctx.newLabel("dset_fresh");
+                    this.vm.emitMaskLoad(VReg.V1);
+                    this.vm.andMaskReg(VReg.V2, VReg.RET, VReg.V1); // V2 = 裸 ptr(RET 保留)
+                    this.vm.load(VReg.V2, VReg.V2, 8); // V2 = ts 位
+                    this.vm.shrImm(VReg.V1, VReg.V2, 52);
+                    this.vm.andImm(VReg.V1, VReg.V1, 0x7ff);
+                    this.vm.movImm(VReg.V2, 0);
+                    this.vm.store(VReg.FP, invOff, VReg.V2); // invalidBefore = 0
+                    this.vm.cmpImm(VReg.V1, 0x7ff);
+                    this.vm.jne(freshLbl);
+                    this.vm.movImm(VReg.V1, 1);
+                    this.vm.store(VReg.FP, invOff, VReg.V1); // invalidBefore = 1
+                    this.vm.label(freshLbl);
+                }
+                this.vm.push(VReg.RET); // 保存 date(boxed)
+                const bufOffs = [];
+                for (let i = 0; i < count; i++) {
+                    bufOffs.push(this.ctx.allocLocal(`__dset_buf${i}_${id}`));
+                }
+                // 全部实参按序求值+ToNumber 落 f64 位槽(副作用保序,与 node 一致)
+                for (let i = 0; i < count; i++) {
+                    this.compileExpression(args[i]);
+                    this.emitNumberCoerceFast(); // RET = 裸 float 位
+                    this.vm.store(VReg.FP, bufOffs[count - 1 - i], VReg.RET); // values[i] 落最低+i*8
+                }
+                // 强转完毕;强转前已 Invalid → RET=NaN 不写回(保 valueOf 修复)
+                this.vm.load(VReg.V0, VReg.FP, invOff);
+                this.vm.cmpImm(VReg.V0, 0);
+                this.vm.jne(invLbl);
+                // A3 = valuesPtr = FP + bufOffs[count-1](最低槽);用寄存器减法避免大立即数
+                this.vm.movImm(VReg.A3, -bufOffs[count - 1]);
+                this.vm.sub(VReg.A3, VReg.FP, VReg.A3);
+                this.vm.pop(VReg.A0); // date(boxed)
+                this.vm.movImm(VReg.A1, part);   // startPart
+                this.vm.movImm(VReg.A2, count);  // count
+                this.vm.call("_date_set_time_f64"); // RET = 新 ms(number)
+                this.vm.jmp(okLbl);
+                this.vm.label(invLbl);
+                this.vm.pop(VReg.V0); // 平衡栈(date 废弃;不写回)
+                this.vm.movImm64(VReg.RET, 0x7ff0000000000001n); // RET = NaN
+                this.vm.label(okLbl);
+                return true;
+            }
+            // 多字段日历族(part 0..1:setFullYear/setMonth 及 UTC 变体):原子写。
+            // 逐参转 int 存入连续 FP 槽(allocLocal 地址递减,
             // 故 values[i](part+i)存到 bufOffs[count-1-i]),再传 valuesPtr=最低槽地址。
+            // (node 的 MakeDay 对原始 year/month 实参自带范围拒收——实证 |y|>1e6 或
+            // |m|>1e7 及对消极大值全 NaN——故日历族独立量纲门安全,保留。)
             const id = this.nextLabelId();
             const mNanLbl = this.ctx.newLabel("dset_nan");
             const mOkLbl = this.ctx.newLabel("dset_ok");
-            this.compileExpression(obj);
+            const mInvLbl = part !== 0 ? this.ctx.newLabel("dset_inv") : null;
+            this.compileExpression(obj); // RET = date(boxed)
+            // [Date 加固] Invalid 接收者预检(同单字段路,镜像 aref S2):part 1..6
+            // 强转前读 t,指数全 1 → 标志=1;全部实参仍按序求值强转(副作用保序),
+            // 统一分流 RET=NaN【不写回】。part=0 例外不预检(NaN→+0 重组)。
+            let minvOff = 0;
+            if (part !== 0) {
+                const mFreshLbl = this.ctx.newLabel("dset_fresh");
+                minvOff = this.ctx.allocLocal(`__dset_inv_${id}`);
+                this.vm.emitMaskLoad(VReg.V1);
+                this.vm.andMaskReg(VReg.V2, VReg.RET, VReg.V1); // V2 = 裸 ptr(RET 保留)
+                this.vm.load(VReg.V2, VReg.V2, 8); // V2 = ts 位
+                this.vm.shrImm(VReg.V1, VReg.V2, 52);
+                this.vm.andImm(VReg.V1, VReg.V1, 0x7ff);
+                this.vm.movImm(VReg.V2, 0);
+                this.vm.store(VReg.FP, minvOff, VReg.V2); // invalidBefore = 0
+                this.vm.cmpImm(VReg.V1, 0x7ff);
+                this.vm.jne(mFreshLbl);
+                this.vm.movImm(VReg.V1, 1);
+                this.vm.store(VReg.FP, minvOff, VReg.V1); // invalidBefore = 1
+                this.vm.label(mFreshLbl);
+            }
             this.vm.push(VReg.RET); // 保存 date(boxed)
             const bufOffs = [];
             for (let i = 0; i < count; i++) {
                 bufOffs.push(this.ctx.allocLocal(`__dset_buf${i}_${id}`));
             }
-            // [Date 加固] NaN/±Inf(指数全 1)判别不短路:全部实参先按序求值+强转落槽
-            // (副作用保序,与 node 一致——先求值全部实参再判定),命中仅置标志,
-            // 循环后统一分流:写 canonical NaN 返 NaN(值轴与单字段路一致)。
+            // [Date 加固] NaN/±Inf(指数全 1)与巨大有限值(|v| > B[part+i],fcmp 守 §1.2)
+            // 判别不短路:全部实参先按序求值+强转落槽(副作用保序,与 node 一致——先求值
+            // 全部实参再判定),命中仅置标志,循环后统一分流:写 canonical NaN 返 NaN
+            // (值轴与单字段路一致)。
             const nanOff = this.ctx.allocLocal(`__dset_nan_${id}`);
             this.vm.movImm(VReg.V0, 0);
             this.vm.store(VReg.FP, nanOff, VReg.V0); // argNaN = 0
             for (let i = 0; i < count; i++) {
+                const argNan2Lbl = this.ctx.newLabel("dset_argnan");
                 const argOkLbl = this.ctx.newLabel("dset_argok");
                 this.compileExpression(args[i]);
                 this.emitNumberCoerceFast(); // RET = 裸 float 位
                 this.vm.shrImm(VReg.V1, VReg.RET, 52);
                 this.vm.andImm(VReg.V1, VReg.V1, 0x7ff);
                 this.vm.cmpImm(VReg.V1, 0x7ff);
-                this.vm.jne(argOkLbl);
+                this.vm.jeq(argNan2Lbl); // NaN/±Inf(指数全 1)
+                // 巨大有限值量纲判别:B[part+i](arg i 对应字段 part+i)
+                this.vm.movImm64(VReg.V1, 0x7fffffffffffffffn);
+                this.vm.and(VReg.V1, VReg.RET, VReg.V1); // V1 = |v| 位(x64 V1==A3,A3 无活值)
+                this.vm.movImm64(VReg.V2, SETTER_MAG_BITS[part + i]); // (x64 V2==A2,循环内无活值)
+                this.vm.fmovToFloat(0, VReg.V1);
+                this.vm.fmovToFloat(1, VReg.V2);
+                this.vm.fcmp(0, 1);
+                this.vm.jfgt(argNan2Lbl);
+                this.vm.jmp(argOkLbl);
+                this.vm.label(argNan2Lbl);
                 this.vm.movImm(VReg.V1, 1);
                 this.vm.store(VReg.FP, nanOff, VReg.V1); // argNaN = 1(不跳出循环)
                 this.vm.label(argOkLbl);
@@ -417,10 +567,16 @@ export const BuiltinCollectionMethodCompiler = {
                 this.vm.fcvtzs(VReg.V0, 0); // V0 = int 值(NaN→0;标志命中时槽值不被使用)
                 this.vm.store(VReg.FP, bufOffs[count - 1 - i], VReg.V0); // values[i] 落最低+i*8
             }
-            // 全部实参求值强转完毕,统一判别:任一位 NaN/±Inf → 写 NaN 返 NaN
+            // 全部实参求值强转完毕,统一判别:任一位 NaN/±Inf/超界 → 写 NaN 返 NaN
             this.vm.load(VReg.V0, VReg.FP, nanOff);
             this.vm.cmpImm(VReg.V0, 0);
             this.vm.jne(mNanLbl);
+            if (part !== 0) {
+                // 强转前已 Invalid → RET=NaN 不写回(保 valueOf 修复)
+                this.vm.load(VReg.V0, VReg.FP, minvOff);
+                this.vm.cmpImm(VReg.V0, 0);
+                this.vm.jne(mInvLbl);
+            }
             // A3 = valuesPtr = FP + bufOffs[count-1](最低槽);用寄存器减法避免大立即数
             this.vm.movImm(VReg.A3, -bufOffs[count - 1]);
             this.vm.sub(VReg.A3, VReg.FP, VReg.A3);
@@ -436,18 +592,46 @@ export const BuiltinCollectionMethodCompiler = {
             this.vm.movImm64(VReg.V1, 0x7ff0000000000001n); // canonical NaN(同 _dp_invalid)
             this.vm.store(VReg.A0, 8, VReg.V1);
             this.vm.mov(VReg.RET, VReg.V1);
+            this.vm.jmp(mOkLbl);
+            if (part !== 0) {
+                this.vm.label(mInvLbl);
+                this.vm.pop(VReg.V0); // 平衡栈(date 废弃;不写回)
+                this.vm.movImm64(VReg.RET, 0x7ff0000000000001n); // RET = NaN
+            }
             this.vm.label(mOkLbl);
             return true;
         }
-        // setTime(ms):直接写 timestamp,返回 ms
+        // setTime(ms):ToNumber + TimeClip(镜像 aref 路 _aref_date_setTime):
+        // NaN/±Inf(指数全 1)或 |v| > 8.64e15(fcmp 比较,守 §1.2 不用整数比 float 位)
+        // → 写 canonical NaN 返 NaN;否则向零截断(-0→+0)写回并返回新 ms。
         // 注意 RET==A0==V0==X0 别名:coerce 后的值须先存 A2(=X2),再 pop A0 取 date,
         // 否则 pop 会覆盖 X0 里的新 timestamp,反把 date 指针写进去。
         if (method === "setTime" && args.length >= 1) {
+            const stNanLbl = this.ctx.newLabel("stime_nan");
+            const stOkLbl = this.ctx.newLabel("stime_ok");
             this.compileExpression(obj);
             this.vm.push(VReg.RET);
             this.compileExpression(args[0]);
             this.emitNumberCoerceFast(); // RET = 裸 float 位(= 新 timestamp)
-            this.vm.mov(VReg.A2, VReg.RET); // A2 = 新 ms(避开 X0 别名)
+            this.vm.shrImm(VReg.V1, VReg.RET, 52);
+            this.vm.andImm(VReg.V1, VReg.V1, 0x7ff);
+            this.vm.cmpImm(VReg.V1, 0x7ff);
+            this.vm.jeq(stNanLbl);
+            this.vm.movImm64(VReg.V1, 0x7fffffffffffffffn);
+            this.vm.and(VReg.V2, VReg.RET, VReg.V1); // V2 = |v| 位(x64 V2==A2,A2 无活值)
+            this.vm.movImm64(VReg.V1, 0x433eb208c2dc0000n); // 8.64e15
+            this.vm.fmovToFloat(0, VReg.V2);
+            this.vm.fmovToFloat(1, VReg.V1);
+            this.vm.fcmp(0, 1);
+            this.vm.jfgt(stNanLbl);
+            this.vm.fmovToFloat(0, VReg.RET);
+            this.vm.fcvtzs(VReg.A2, 0); // 向零截断(x64 A2==V2,覆写无妨)
+            this.vm.scvtf(0, VReg.A2);
+            this.vm.fmovToInt(VReg.A2, 0); // A2 = 截断后 ms 位(避开 X0 别名)
+            this.vm.jmp(stOkLbl);
+            this.vm.label(stNanLbl);
+            this.vm.movImm64(VReg.A2, 0x7ff0000000000001n); // canonical NaN(同 _dp_invalid)
+            this.vm.label(stOkLbl);
             this.vm.pop(VReg.A0); // date 值
             this.vm.emitMaskLoad(VReg.V1);
             this.vm.andMaskReg(VReg.A0, VReg.A0, VReg.V1); // 裸 date 指针
