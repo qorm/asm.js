@@ -387,6 +387,10 @@ const BUILTIN_REF_ARITY = {
     map_groupBy: 2,
     promise_resolve: 1, promise_reject: 1, promise_all: 1, promise_race: 1,
     promise_allSettled: 1, promise_any: 1, promise_withResolvers: 0,
+    // [W3 Number 一等值] Number.parse* 静态(emitNumberCtorObject/静态值读的
+    // emitMemoizedBuiltinRef 槽键 = "number_" + 属性名):直连既有 _js_parseInt/
+    // _js_parseFloat(与调用快路同一 helper),规范 length 2/1(ES2015 与全局函数同)。
+    number_parseFloat: 1, number_parseInt: 2,
 };
 // 内建**方法**数据属性 attrs:writable(1) | configurable(4),enumerable 关闭
 // (规范 17 节:{[[Writable]]:true, [[Enumerable]]:false, [[Configurable]]:true})。
@@ -777,6 +781,32 @@ export const MemberCompiler = {
             (this.ctx.getMainCapturedVar && this.ctx.getMainCapturedVar(name)));
     },
 
+    // [W3 Number 一等值] `Number` 标识符被遮蔽?同 stringNameShadowed 守卫组。
+    numberNameShadowed() {
+        return !!((this.ctx.getLocal && this.ctx.getLocal("Number")) ||
+            (this.ctx.getFunction && this.ctx.getFunction("Number")) ||
+            (this.ctx.getMainCapturedVar && this.ctx.getMainCapturedVar("Number")));
+    },
+
+    // [JSON 一等值] `JSON` 标识符被遮蔽?同 stringNameShadowed 守卫组。
+    jsonNameShadowed() {
+        return !!((this.ctx.getLocal && this.ctx.getLocal("JSON")) ||
+            (this.ctx.getFunction && this.ctx.getFunction("JSON")) ||
+            (this.ctx.getMainCapturedVar && this.ctx.getMainCapturedVar("JSON")));
+    },
+
+    // [JSON 一等值] 本编译单元是否注入了 __json_shim(两个 __JSON_* 导出都有真标签,
+    // 与 regexpShimReady 同法)。注入由 readModuleSource 按源码文本触发("JSON.stringify"/
+    // "JSON.parse"/"structuredClone");仅引用裸 `JSON` 的模块不触发注入 → 门关闭,
+    // 命名空间物化为仅 @@toStringTag 的对象(方法无从链接,宁缺勿滥,记偏差)。
+    jsonShimReady() {
+        if (!this.ctx || !this.ctx.hasFunction) return false;
+        if (!this.getFunctionLabel) return false;
+        if (!this.getFunctionLabel("__JSON_stringify")) return false;
+        if (!this.getFunctionLabel("__JSON_parse")) return false;
+        return true;
+    },
+
     // [Date 一等值] 本编译单元是否注入了 __date_shim(五个 __DATE_* 导出全有真标签)。
     // 门未开时 locale 族方法用占位闭包(见 DATE_PROTO_SHIM_METHODS 注)。
     dateShimReady() {
@@ -1127,6 +1157,28 @@ export const MemberCompiler = {
         vm.lea(VReg.V0, protoSlot);
         vm.load(VReg.A2, VReg.V0, 0);
         vm.call("_closure_prop_set");
+        // [W3] 静态方法 fromCharCode/fromCodePoint 作构造器闭包属性(attr 5,规范 21.1.2;
+        // 落位顺序与 Node gOPN 一致)。值经 emitStringStaticRef 的合成函数 memoized 闭包
+        // (与静态值读同槽 → String.fromCharCode === gOPD(String,"fromCharCode").value);
+        // 落值后经 _closure_prop_set_attr 落 attr,否则 gOPD 误报 enumerable:true。
+        // String.raw 未实现,记偏差。
+        const setCtorProp = (name, attr, emitValue) => {
+            emitValue();                                   // RET = 值
+            vm.mov(VReg.A2, VReg.RET);
+            vm.lea(VReg.V0, ctorSlot);
+            vm.load(VReg.A0, VReg.V0, 0);
+            this.emitBoxedStringKey(name, VReg.A1);
+            vm.call("_closure_prop_set");
+            vm.lea(VReg.V0, ctorSlot);
+            vm.load(VReg.A0, VReg.V0, 0);
+            this.emitBoxedStringKey(name, VReg.A1);
+            vm.movImm(VReg.A2, attr);
+            vm.call("_closure_prop_set_attr");
+        };
+        setCtorProp("fromCharCode", BUILTIN_PROP_ATTR,
+            () => this.emitStringStaticRef("fromCharCode"));
+        setCtorProp("fromCodePoint", BUILTIN_PROP_ATTR,
+            () => this.emitStringStaticRef("fromCodePoint"));
         // RET = 装箱构造器(稳定身份)
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.RET, VReg.V0, 0);
@@ -1146,6 +1198,352 @@ export const MemberCompiler = {
         vm.jne(doneL);
         this.emitStringCtorObject(); // 填两槽(RET = 构造器,下面重载原型)
         vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.label(doneL);
+    },
+
+    // ── [W3] JSON 命名空间 / String·Number 静态族 一等值物化 ─────────────────────
+    // 三项全部复用既有模板且**零新增运行时 helper**:JSON 方法值直连 shim 导出函数
+    // (与调用快路同一函数),String.fromCharCode/fromCodePoint 与 Number.is* 谓词的方法值
+    // 经 compileFunctionExpression 现场编译合成函数(体内走同一静态快路,偏差口径自动
+    // 一致),Number.parse* 直连既有 _js_parseInt/_js_parseFloat。全部只在裸标识符/反射位
+    // 惰性物化,四条语法快路(静态调用/方法派发/new/instanceof)先命中 → 快路字节不变。
+
+    // [JSON 一等值] memoized JSON 静态方法闭包 _builtinref_json_<name>(GC 根,与
+    // emitMemoizedBuiltinRef 同模式)。16B 直连闭包 {magic, shim 函数标签}:shim 导出
+    // __JSON_stringify/__JSON_parse 是普通编译函数(A0.. 装箱实参、缺参由调用点
+    // undefined 填充,不经 _aref_generic —— 蹦床会把 this 插到 A0 错位实参),与快路
+    // 改派同一函数 → `var s=JSON.stringify; s(v,r,sp)` 与 JSON.stringify(v,r,sp) 逐字一致。
+    // name/length 经 _closure_prop_define 落侧表:shim 函数自身元数据名是
+    // "__JSON_stringify",_closure_prop_set 的 name/length 不可写守卫见元数据非 undefined
+    // 会静默忽略,必须用 define 语义覆盖为规范名("stringify"/"parse",length 3/2)。
+    emitJSONMethodRef(propName, arity) {
+        const vm = this.vm;
+        const label = "_builtinref_json_" + propName;
+        if (!this._addedBuiltinRefLabels) this._addedBuiltinRefLabels = new Set();
+        if (!this._addedBuiltinRefLabels.has(label)) {
+            this.asm.addDataLabel(label);
+            this.asm.addDataQword(0);
+            this._addedBuiltinRefLabels.add(label);
+        }
+        const doneL = this.ctx.newLabel("jref_done");
+        vm.lea(VReg.V0, label);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne(doneL);
+        this.emitBuiltinFnClosure(this.getFunctionLabel("__JSON_" + propName)); // RET = 装箱闭包
+        vm.lea(VReg.V0, label);
+        vm.store(VReg.V0, 0, VReg.RET);
+        vm.mov(VReg.S0, VReg.RET);                     // 跨 call 暂存(define 毁 RET)
+        vm.mov(VReg.A0, VReg.S0);
+        this.emitBoxedStringKey("name", VReg.A1);
+        vm.lea(VReg.A2, this.asm.addString(propName));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A2, VReg.A2, VReg.V1);
+        vm.call("_closure_prop_define");
+        vm.mov(VReg.A0, VReg.S0);
+        this.emitBoxedStringKey("length", VReg.A1);
+        vm.movImm(VReg.A2, arity);
+        vm.scvtf(0, VReg.A2);
+        vm.fmovToInt(VReg.A2, 0);
+        vm.call("_closure_prop_define");
+        vm.lea(VReg.V0, label);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.label(doneL);
+    },
+
+    // [JSON 一等值] 裸 `JSON` 求值:惰性物化真命名空间对象到全局槽 _nsobj_json
+    // (数据段 qword,GC 保守扫数据段即根)。RET = 装箱对象(稳定身份 → JSON===JSON
+    // 由假变真)。own props:shim 就绪时 parse/stringify 为方法值闭包(attr 5,规范 17
+    // 节;落位顺序 parse → stringify,与 Node gOPN 前两项一致),Symbol.toStringTag="JSON"
+    // (attr 4:{writable:false,enumerable:false,configurable:true},与 Node 逐对拍)。
+    // shim 未注入(仅反射用裸 JSON)时物化为仅 @@toStringTag 的对象(方法无从链接,
+    // 宁缺勿滥,记偏差;typeof/gOPN 之外的反射仍成立)。rawJSON/isRawJSON 未实现,记偏差。
+    emitJSONNamespaceObject() {
+        const vm = this.vm;
+        const slot = "_nsobj_json";
+        this._reEnsureSlot(slot);
+        const doneL = this.ctx.newLabel("nsjson_done");
+        vm.lea(VReg.V0, slot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne(doneL);
+        // 建空对象并**先**存槽(同 emitMathNamespaceObject 注:跨 call 安全 + 重入安全)。
+        vm.call("_object_new");
+        vm.call("_box_obj_r");
+        vm.lea(VReg.V0, slot);
+        vm.store(VReg.V0, 0, VReg.RET);
+        if (this.jsonShimReady()) {
+            // 先 _object_set 落值,再 _object_set_prop_attr 落 attrs(顺序不可反,同
+            // emitMathNamespaceObject 注)。
+            const emitProp = (name, arity) => {
+                this.emitJSONMethodRef(name, arity);         // RET = 方法值闭包
+                vm.mov(VReg.A2, VReg.RET);
+                vm.lea(VReg.V0, slot);
+                vm.load(VReg.A0, VReg.V0, 0);
+                this.emitBoxedStringKey(name, VReg.A1);
+                vm.call("_object_set");
+                vm.lea(VReg.V0, slot);
+                vm.load(VReg.A0, VReg.V0, 0);
+                this.emitBoxedStringKey(name, VReg.A1);
+                vm.movImm(VReg.A2, BUILTIN_PROP_ATTR);
+                vm.call("_object_set_prop_attr");
+            };
+            emitProp("parse", 2);
+            emitProp("stringify", 3);
+        }
+        // Symbol.toStringTag = "JSON"(attr 4)。well-known 符号单例作键(_object_set
+        // 指针比较快路径必中;gOPN/keys 滤 symbol 键,Object.prototype.toString 与
+        // getOwnPropertySymbols 经既有 symbol 键路径读到,与类静态字段 [Symbol.x]=v 同法)。
+        vm.lea(VReg.A0, "_symwk_toStringTag");
+        vm.lea(VReg.A1, this.asm.addString("Symbol.toStringTag"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_symbol_wellknown");                  // RET = 裸符号指针
+        vm.mov(VReg.S0, VReg.RET);                     // S0 = 键(跨 call)
+        vm.lea(VReg.V0, slot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.lea(VReg.A2, this.asm.addString("JSON"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A2, VReg.A2, VReg.V1);
+        vm.call("_object_set");
+        vm.lea(VReg.V0, slot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.movImm(VReg.A2, 4);                         // {writable:false,enumerable:false,configurable:true}
+        vm.call("_object_set_prop_attr");
+        vm.lea(VReg.V0, slot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.label(doneL);
+    },
+
+    // [W3] 合成函数 memoized 方法值闭包 _builtinref_<slotKey>(GC 根):
+    // compileFunctionExpression 现场编译合成 AST(函数体延迟进 pendingFunctions,
+    // 此处只发闭包创建码),RET = 装箱闭包存槽;name/length 经 _closure_prop_set 落侧表
+    // (合成函数匿名普通函数 → registerFuncMeta 丢弃不入表,name/length 写守卫放行)。
+    // 构造器物化与静态值读两处同槽 → X.m === gOPD(X,"m").value 恒等。
+    emitSynthStaticRef(slotKey, ast, propName, arity) {
+        const vm = this.vm;
+        const label = "_builtinref_" + slotKey;
+        if (!this._addedBuiltinRefLabels) this._addedBuiltinRefLabels = new Set();
+        if (!this._addedBuiltinRefLabels.has(label)) {
+            this.asm.addDataLabel(label);
+            this.asm.addDataQword(0);
+            this._addedBuiltinRefLabels.add(label);
+        }
+        const doneL = this.ctx.newLabel("sref_done");
+        vm.lea(VReg.V0, label);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne(doneL);
+        this.compileFunctionExpression(ast); // RET = 装箱闭包(16B,零捕获)
+        vm.lea(VReg.V0, label);
+        vm.store(VReg.V0, 0, VReg.RET);
+        vm.mov(VReg.S0, VReg.RET);           // 跨 call 暂存
+        vm.mov(VReg.A0, VReg.S0);
+        this.emitBoxedStringKey("name", VReg.A1);
+        vm.lea(VReg.A2, this.asm.addString(propName));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A2, VReg.A2, VReg.V1);
+        vm.call("_closure_prop_set");
+        vm.mov(VReg.A0, VReg.S0);
+        this.emitBoxedStringKey("length", VReg.A1);
+        vm.movImm(VReg.A2, arity);
+        vm.scvtf(0, VReg.A2);
+        vm.fmovToInt(VReg.A2, 0);
+        vm.call("_closure_prop_set");
+        vm.lea(VReg.V0, label);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.label(doneL);
+    },
+
+    // [W3] String.fromCharCode/fromCodePoint 方法值的合成函数 AST:
+    //   function (...args) { var out = ""; for (var i = 0; i < args.length; i = i + 1)
+    //       out += String.fromCharCode(args[i]); return out; }
+    // (fromCodePoint 换 callee 名;BMP 等价 fromCharCode、astral 记偏差 —— 合成体走
+    //  functions.js 同一静态快路,偏差口径与调用位自动一致。)rest 参收集 A0..A4
+    // (≤5 参、显式 undefined 截断,emitRestParam 既有口径,记偏差;调用快路不限参
+    // 不受影响)。用 rest 而非 arguments:arguments 非 isBuiltinOrGlobal,外层函数
+    // 若自建 arguments 会被闭包捕获误读;String 经 isBuiltinOrGlobal 排除 → 零捕获。
+    _stringStaticSynthAst(propName) {
+        const id = (name) => ({ type: "Identifier", name: name });
+        const member = (obj, prop, computed) => ({
+            type: "MemberExpression", object: obj, property: prop,
+            computed: !!computed, optional: false,
+        });
+        return {
+            type: "FunctionExpression",
+            id: null,
+            params: [{ type: "SpreadElement", argument: id("args") }],
+            body: {
+                type: "BlockStatement",
+                body: [
+                    { type: "VariableDeclaration", kind: "var", declarations: [
+                        { type: "VariableDeclarator", id: id("out"),
+                            init: { type: "Literal", value: "" } },
+                    ] },
+                    { type: "ForStatement",
+                        init: { type: "VariableDeclaration", kind: "var", declarations: [
+                            { type: "VariableDeclarator", id: id("i"),
+                                init: { type: "Literal", value: 0 } },
+                        ] },
+                        test: { type: "BinaryExpression", operator: "<",
+                            left: id("i"), right: member(id("args"), id("length")) },
+                        update: { type: "AssignmentExpression", operator: "=",
+                            left: id("i"),
+                            right: { type: "BinaryExpression", operator: "+",
+                                left: id("i"), right: { type: "Literal", value: 1 } } },
+                        body: { type: "BlockStatement", body: [
+                            { type: "ExpressionStatement", expression: {
+                                type: "AssignmentExpression", operator: "+=",
+                                left: id("out"),
+                                right: { type: "CallExpression",
+                                    callee: member(id("String"), id(propName)),
+                                    arguments: [member(id("args"), id("i"), true)],
+                                    optional: false } } },
+                        ] },
+                    },
+                    { type: "ReturnStatement", argument: id("out") },
+                ],
+            },
+        };
+    },
+
+    // [W3] String 静态方法值(fromCharCode/fromCodePoint,规范 length 均 1)。
+    emitStringStaticRef(propName) {
+        this.emitSynthStaticRef("string_" + propName,
+            this._stringStaticSynthAst(propName), propName, 1);
+    },
+
+    // [W3] Number.is* 谓词方法值的合成函数 AST:
+    //   function (v) { return Number.isInteger(v); }
+    // 调用即 functions.js 的 Number.is* 静态快路(同一内联位逻辑实现,装箱 bool 返回,
+    // 语义与调用位逐字一致 —— 含 Number.isNaN 不强转、与全局 isNaN 有别)。
+    // Number 经 isBuiltinOrGlobal 排除 → 零捕获。
+    _numberPredicateSynthAst(propName) {
+        const id = (name) => ({ type: "Identifier", name: name });
+        return {
+            type: "FunctionExpression",
+            id: null,
+            params: [id("v")],
+            body: {
+                type: "BlockStatement",
+                body: [{ type: "ReturnStatement", argument: {
+                    type: "CallExpression",
+                    callee: { type: "MemberExpression", object: id("Number"),
+                        property: id(propName), computed: false, optional: false },
+                    arguments: [id("v")],
+                    optional: false,
+                } }],
+            },
+        };
+    },
+
+    // [W3] Number.is* 谓词方法值(规范 length 均 1)。
+    emitNumberPredicateRef(propName) {
+        this.emitSynthStaticRef("number_" + propName,
+            this._numberPredicateSynthAst(propName), propName, 1);
+    },
+
+    // [W3 Number 一等值] 惰性物化 Number 构造器函数对象到全局槽 _nsobj_number
+    // (数据段 qword,GC 根)。形态逐字镜像 Date 模板但**不建原型**(本波明确不做
+    // Number.prototype 物化/new Number() 包装语义变更):构造器闭包 16B
+    // {magic, _builtin_number}(裸 Number 作值调用 N(x) → _number_coerce,与既有
+    // emitBuiltinFnClosure 同一入口 → `var N=Number; N("42")` 行为不变)、
+    // name="Number"/length=1(闭包属性侧表)、own props = 静态方法 ×6(attr 5,
+    // gOPN 顺序与 Node 一致:isFinite 先于 isInteger、parseFloat 先于 parseInt)+
+    // 常量 ×8(attr 0,writable/enumerable/configurable 全 false,与 Node gOPD 逐对拍;
+    // gOPN 顺序与 Node 一致)。RET = 装箱构造器(稳定身份 → Number===Number 由假变真,
+    // typeof Number 保持 "function")。
+    // Number(x)/new Number(...)/Number.isX(...)/Number.parse*(...)/Number.MAX_* 常量
+    // 折叠等静态快路全在 functions.js/expressions.js/下方常量分支先命中 → 字节不变。
+    emitNumberCtorObject() {
+        const vm = this.vm;
+        const ctorSlot = "_nsobj_number";
+        this._reEnsureSlot(ctorSlot);
+        const doneL = this.ctx.newLabel("nsnum_done");
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne(doneL);
+        vm.movImm(VReg.A0, 16);
+        vm.call("_alloc");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.movImm(VReg.V1, 0xc105); // CLOSURE_MAGIC
+        vm.store(VReg.S0, 0, VReg.V1);
+        vm.lea(VReg.V1, "_builtin_number");
+        vm.store(VReg.S0, 8, VReg.V1);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_js_box_function");
+        vm.lea(VReg.V0, ctorSlot);
+        vm.store(VReg.V0, 0, VReg.RET); // **先**存槽(跨 call 从槽重载,同 Date 模板)
+        // Number.name / Number.length(闭包属性侧表;name/length 的 gOPD 形状由
+        // _ogopd_fn 硬编 {w:false,e:false,c:true},无需落 attr)
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("name", VReg.A1);
+        vm.lea(VReg.A2, this.asm.addString("Number"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A2, VReg.A2, VReg.V1);
+        vm.call("_closure_prop_set");
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("length", VReg.A1);
+        vm.movImm(VReg.A2, 1);
+        vm.scvtf(0, VReg.A2);
+        vm.fmovToInt(VReg.A2, 0);
+        vm.call("_closure_prop_set");
+        // 静态方法/常量作构造器闭包属性(Date 模板 setCtorProp:先 _closure_prop_set
+        // 落值,再 _closure_prop_set_attr 落 attr —— 顺序不可反,attr=0 的常量若先落
+        // attr 则写值被拒;不落 attr 则 gOPD 误报 enumerable:true)。
+        const setCtorProp = (name, attr, emitValue) => {
+            emitValue();                                   // RET = 值
+            vm.mov(VReg.A2, VReg.RET);
+            vm.lea(VReg.V0, ctorSlot);
+            vm.load(VReg.A0, VReg.V0, 0);
+            this.emitBoxedStringKey(name, VReg.A1);
+            vm.call("_closure_prop_set");
+            vm.lea(VReg.V0, ctorSlot);
+            vm.load(VReg.A0, VReg.V0, 0);
+            this.emitBoxedStringKey(name, VReg.A1);
+            vm.movImm(VReg.A2, attr);
+            vm.call("_closure_prop_set_attr");
+        };
+        // 谓词族:合成函数闭包(体内即 Number.is* 静态快路,与调用位同一实现);
+        // 与静态值读同槽 → Number.isInteger === gOPD(Number,"isInteger").value。
+        const preds = ["isFinite", "isInteger", "isNaN", "isSafeInteger"];
+        for (let i = 0; i < preds.length; i = i + 1) {
+            const pn = preds[i];
+            setCtorProp(pn, BUILTIN_PROP_ATTR,
+                () => this.emitNumberPredicateRef(pn));
+        }
+        // parse 族:直连既有 _js_parseFloat/_js_parseInt(与调用快路同一 helper;
+        // ES2015 起与全局 parseFloat/parseInt 同函数 —— 本系统全局 parseInt/parseFloat
+        // 标识符非一等值(兜底 0),恒等不可达,记偏差)。
+        setCtorProp("parseFloat", BUILTIN_PROP_ATTR,
+            () => this.emitMemoizedBuiltinRef("number_parseFloat", "_js_parseFloat", "parseFloat"));
+        setCtorProp("parseInt", BUILTIN_PROP_ATTR,
+            () => this.emitMemoizedBuiltinRef("number_parseInt", "_js_parseInt", "parseInt"));
+        // 常量 ×8(attr 0):值 = 规范 float64 位(movImm64,与下方静态折叠分支同源同位)。
+        // MIN_VALUE=5e-324 位 0x1 属 denormal、high16=0,读回呈现与静态折叠分支的排除
+        // 口径同偏差(值位仍忠实存储,供 gOPD/gOPN/hasOwnProperty 反射)。
+        const consts = [
+            ["MAX_VALUE", 0x7fefffffffffffffn],
+            ["MIN_VALUE", 0x0000000000000001n],
+            ["NaN", 0x7ff0000000000001n],              // 与 NaN 标识符同位
+            ["NEGATIVE_INFINITY", 0xfff0000000000000n],
+            ["POSITIVE_INFINITY", 0x7ff0000000000000n],
+            ["MAX_SAFE_INTEGER", 0x433fffffffffffffn], // 2^53-1
+            ["MIN_SAFE_INTEGER", 0xc33fffffffffffffn], // -(2^53-1)
+            ["EPSILON", 0x3cb0000000000000n],          // 2^-52
+        ];
+        for (let i = 0; i < consts.length; i = i + 1) {
+            const bits = consts[i][1];
+            setCtorProp(consts[i][0], BUILTIN_CONST_ATTR, () => vm.movImm64(VReg.RET, bits));
+        }
+        // RET = 装箱构造器(稳定身份)
+        vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.RET, VReg.V0, 0);
         vm.label(doneL);
     },
@@ -1773,7 +2171,16 @@ export const MemberCompiler = {
             return;
         }
         if (name === "Boolean") { this.emitBuiltinFnClosure("_builtin_boolean"); return; }
-        if (name === "Number") { this.emitBuiltinFnClosure("_builtin_number"); return; }
+        // [W3 Number 一等值] 裸 `Number`(反射位):惰性物化真构造器函数对象(带
+        // .name/.length、6 静态方法值、8 常量)→ typeof "function"(不变)、Number===Number
+        // 由假变真、gOPN/gOPD(Number,…) 成立。作值调用 `var N=Number; N(x)` 命中同一
+        // _builtin_number 入口 → 行为不变。Number(x) 调用/new Number(...)/Number.isX*(...)
+        // 静态快路在 functions.js/expressions.js 先于本路径命中 → 快路字节不变。
+        // 遮蔽守卫同 String(局部 Number 退回词法解析)。
+        if (name === "Number" && !this.numberNameShadowed()) {
+            this.emitNumberCtorObject();
+            return;
+        }
         // [W-29] 裸 `String`(反射位):惰性物化真函数对象(带 .prototype/.name/.length)
         // → typeof "function"、`String.prototype` 可达。String(x) 的静态改派在
         // compileCallExpression 先于本路径命中 → 快路字节不变。遮蔽守卫同 Math/RegExp。
@@ -1816,9 +2223,13 @@ export const MemberCompiler = {
             this.emitErrorCtorRef(name);
             return;
         }
-        if (name === "JSON") {
-            this.vm.call("_object_new");
-            this.vm.call("_box_obj_r"); // box->helper
+        // [JSON 一等值] 裸 `JSON`(反射位):惰性物化真命名空间对象(方法值闭包 +
+        // @@toStringTag)→ typeof "object"(不变)、gOPN/gOPD 可见、JSON===JSON 由假变真
+        // (此前每次求值新建空对象)。JSON.stringify(...)/JSON.parse(...) 调用快路
+        // (functions.js __JSON_* 改派)先于本路径命中 → 快路字节不变。遮蔽守卫同
+        // String;shim 未注入(仅反射用)时物化为仅 @@toStringTag 的对象(记偏差)。
+        if (name === "JSON" && !this.jsonNameShadowed()) {
+            this.emitJSONNamespaceObject();
             return;
         }
         // [W-18] 裸 `Math`(反射位):惰性物化真命名空间对象 → typeof "object"、
@@ -1843,7 +2254,10 @@ export const MemberCompiler = {
         // [构造器全局值] TypedArray 族/ArrayBuffer → 24B 闭包(memoized),`new TA(...)`
         // 值路径(经 _ta_construct→_ta_ctor_tramp)与 typeof X === "function" 由此成立。
         // 直接 `new Int8Array(...)` 仍走 compileNewExpression 静态特判(字节不变);遮蔽守卫同 Function。
-        if (TA_CTOR_TAGS[name] !== undefined &&
+        // [#32] TA_CTOR_TAGS 是裸字面对象:未解析的 valueOf/constructor 等会沿原型链
+        // 误命中 → 被错编成伪构造器闭包(打印 [Function])。hasOwnProperty 自有判定,
+        // 写法同 isUnresolvableIdentifier。
+        if (Object.prototype.hasOwnProperty.call(TA_CTOR_TAGS, name) &&
             !(this.ctx.getLocal && this.ctx.getLocal(name)) &&
             !(this.ctx.getFunction && this.ctx.getFunction(name))) {
             this.emitCtorClosureRef(name, TA_CTOR_TAGS[name]);
@@ -2497,6 +2911,50 @@ export const MemberCompiler = {
                 }
             }
 
+            // [W3 一等值] String.fromCharCode/fromCodePoint 作值读取 → 合成函数
+            // memoized 闭包(与 String 构造器 own prop 同槽 →
+            // String.fromCharCode === gOPD(String,"fromCharCode").value;typeof "function"、
+            // 可存变量/传回调)。调用位 functions.js 静态快路先命中 → 字节不变;
+            // 用户遮蔽(局部 String 等)退回通用路径。显式 === 链而非 {} 查表(#32)。
+            if (expr.object && expr.object.type === "Identifier" &&
+                expr.object.name === "String" && !this.stringNameShadowed() &&
+                (propName === "fromCharCode" || propName === "fromCodePoint")) {
+                this.emitStringStaticRef(propName);
+                return;
+            }
+
+            // [W3 Number 一等值] Number.is*/parse* 静态作值读取 → memoized 闭包
+            // (与 Number 构造器 own prop 同槽,恒等/可调/typeof "function")。
+            // 调用位静态快路(functions.js Number.is*/parse* 内联)先命中 → 字节不变;
+            // 常量族由下方折叠分支处理(先于通用路径),互不重叠。遮蔽守卫同 String。
+            if (expr.object && expr.object.type === "Identifier" &&
+                expr.object.name === "Number" && !this.numberNameShadowed()) {
+                if (propName === "isInteger" || propName === "isFinite" ||
+                    propName === "isNaN" || propName === "isSafeInteger") {
+                    this.emitNumberPredicateRef(propName);
+                    return;
+                }
+                if (propName === "parseFloat" || propName === "parseInt") {
+                    this.emitMemoizedBuiltinRef("number_" + propName,
+                        propName === "parseInt" ? "_js_parseInt" : "_js_parseFloat", propName);
+                    return;
+                }
+            }
+
+            // [JSON 一等值] JSON.stringify/JSON.parse 作值读取 → 直连 shim 函数的
+            // memoized 闭包(与 JSON 命名空间 own prop 同槽 →
+            // JSON.stringify === gOPD(JSON,"stringify").value;与调用快路同一函数)。
+            // 调用位 functions.js __JSON_* 改派先命中 → 字节不变。门:shim 已注入
+            // (本分支源码文本必含 "JSON.stringify"/"JSON.parse" → 注入恒触发,门实为
+            // 防御)且名字未被遮蔽。
+            if (expr.object && expr.object.type === "Identifier" &&
+                expr.object.name === "JSON" && !this.jsonNameShadowed() &&
+                (propName === "stringify" || propName === "parse") &&
+                this.jsonShimReady()) {
+                this.emitJSONMethodRef(propName, propName === "stringify" ? 3 : 2);
+                return;
+            }
+
             // Number.MAX_SAFE_INTEGER 等常量(纯 float64 位直发,不入字符串池,与 Math
             // E/PI 同法)。此前 `Number.X` 成员访问落 miss → 恒 0。仅收录**正规**浮点位
             // (避开 high16=0 的 denormal MIN_VALUE:与裸指针区间冲突,单列不做)。
@@ -2576,8 +3034,9 @@ export const MemberCompiler = {
             // [构造器 .prototype] X.prototype(X∈TA 族/ArrayBuffer)→ _get_ctor_proto 单例对象。
             // ArrayBuffer.prototype 为空对象:test262 TA include 的 resize/transferToImmutable
             // 特性探测安全返 undefined(此前 undefined.resize 抛异常 → TA 区 288 项全灭)。
+            // [#32] TA_CTOR_TAGS 裸字典原型安全判定(同 compileIdentifier)。
             if (propName === "prototype" && expr.object.type === "Identifier" &&
-                TA_CTOR_TAGS[expr.object.name] !== undefined &&
+                Object.prototype.hasOwnProperty.call(TA_CTOR_TAGS, expr.object.name) &&
                 !(this.ctx.getLocal && this.ctx.getLocal(expr.object.name))) {
                 this.vm.movImm(VReg.A0, TA_CTOR_TAGS[expr.object.name]);
                 this.vm.call("_get_ctor_proto");

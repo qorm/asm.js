@@ -22,6 +22,8 @@ const TYPE_PROXY = 8; // Proxy 对象块:type@0=8, target@8, handler@16(装箱 0
 // 非属性容器堆块类型字节(布局与 [count@8, props_ptr@32] 不兼容,通用属性遍历必须绕开):
 const TYPE_MAP = 4; // Map:哈希/链表布局
 const TYPE_SET = 5; // Set:哈希/链表布局
+const TYPE_DATE = 7; // Date:16B 块 [type@0, ts@8],ts 被当 count/props_ptr 即野扫
+const TYPE_PROMISE = 11; // Promise:[type@0, status@8, value@16, ...],同隐患(print.js:607 实证)
 const TYPE_ARRAY_BUFFER = 12; // ArrayBuffer:[type@0, byteLength@8, data_ptr@16, owner@24]
 const TYPE_DATA_VIEW = 14; // DataView:[type@0, data_ptr@8, byteOffset@16, byteLength@24](32B,无 props_ptr)
 const TYPE_TA_LO = 0x40; // TypedArray 类型字节区间 [0x40, 0x7f]:[type@0, length@8, 内联元素@16]
@@ -1249,6 +1251,15 @@ export class ObjectGenerator {
         // (2026-07-10 实证:f32.buffer 落此路径,bump 邻居为 0 时静默 undefined,
         // GC 复用后邻居非零 → 确定性崩,任务 #19)。
         vm.cmpImm(VReg.V1, 12);
+        vm.jeq("_object_get_notfound");
+        // Date(7)/Promise(11) 同理不是属性对象:16B Date 块 [type@0, ts@8] 的 ts、
+        // Promise 块 [type@0, status@8, value@16, ...] 的 status 会被当 count、
+        // 邻域垃圾当 props_ptr 野扫解引用崩(String(d)/""+d/`${d}` 经 _is_asmjs_err/
+        // _call_toprimitive 前导遍历全崩根因;Promise 同隐患,见 print.js:607 实证)。
+        // 它们的方法由编译器 tag 分派,不经此路径;任意字符串属性一律 undefined。
+        vm.cmpImm(VReg.V1, TYPE_DATE);
+        vm.jeq("_object_get_notfound");
+        vm.cmpImm(VReg.V1, TYPE_PROMISE);
         vm.jeq("_object_get_notfound");
         // DataView(14):32B 块 [type@0, data_ptr@8, byteOffset@16, byteLength@24],**块尾即 32**,
         // 根本没有 props_ptr@32。按对象头遍历会把 data_ptr 当 count(天文数字)、把块外邻居
@@ -3463,6 +3474,12 @@ export class ObjectGenerator {
         vm.jeq("_object_has_false");
         vm.cmpImm(VReg.V0, TYPE_SYMBOL);
         vm.jeq("_object_has_false");
+        // Date(7)/Promise(11):布局同上与对象头不兼容(ts/status 被当 count 野扫,
+        // _is_asmjs_err(Date) 段错误根因)。规范语义"无此自有属性" → false,不抛。
+        vm.cmpImm(VReg.V0, TYPE_DATE);
+        vm.jeq("_object_has_false");
+        vm.cmpImm(VReg.V0, TYPE_PROMISE);
+        vm.jeq("_object_has_false");
         vm.jmp("_object_has_obj");
 
         vm.label("_object_has_idx");
@@ -3654,6 +3671,11 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.V0, TYPE_DATA_VIEW);
         vm.jeq("_prop_in_false");
         vm.cmpImm(VReg.V0, TYPE_SYMBOL);
+        vm.jeq("_prop_in_false");
+        // Date(7)/Promise(11):ts/status 被当 count 野扫(`"foo" in date` SIGSEGV 根因)。
+        vm.cmpImm(VReg.V0, TYPE_DATE);
+        vm.jeq("_prop_in_false");
+        vm.cmpImm(VReg.V0, TYPE_PROMISE);
         vm.jeq("_prop_in_false");
         vm.jmp("_prop_in_obj");
 

@@ -175,7 +175,9 @@ export const ClosureCompiler = {
         for (let i = 0; i < captured.length; i++) {
             const varName = captured[i];
             const offset = outerLocals[varName];
-            if (offset) {
+            // [#32] 纵深防御:outerLocals 是裸字典,合法偏移恒为负数;typeof 守卫挡
+            // 一切沿原型链命中的污染值(closure.js 修复后 captured 必为自有局部)。
+            if (typeof offset === "number" && offset) {
                 // 闭包指针在栈顶，弹出保存到 V3（因为 _alloc 会 clobber V1, V2）
                 this.vm.pop(VReg.V3);  // V3 = closure pointer
 

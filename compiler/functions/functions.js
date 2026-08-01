@@ -4200,18 +4200,21 @@ export const FunctionCompiler = {
                 const tsGenLbl = this.ctx.newLabel("tostr_generic");
                 this.vm.cmpImm(VReg.V2, 0x7FFD);
                 this.vm.jne(tsGenLbl);
-                // [#36] Error 族对象.toString() → "name: message"(否则落通用路径找不到
-                // toString 方法而崩)。obj 仍在栈顶,装箱 0x7FFD。
-                this.vm.load(VReg.A0, VReg.SP, 0);
-                this.vm.call("_is_asmjs_err");
-                this.vm.cmpImm(VReg.RET, 0);
-                this.vm.jne(tsErrLbl);
+                // [Date] 先查对象头类型字节(7)→ _date_toString,先于 _is_asmjs_err:
+                // 省一次对 16B Date 块的无谓 Error 品牌遍历,正确性不依赖 _object_has
+                // 黑名单兜底(非零 ts 的 Date 会被当 [count,props_ptr] 野扫)。
                 this.vm.load(VReg.V0, VReg.SP, 0);
                 this.vm.emitMaskLoad(VReg.V1);
                 this.vm.andMaskReg(VReg.V0, VReg.V0, VReg.V1);
                 this.vm.loadByte(VReg.V0, VReg.V0, 0);
                 this.vm.cmpImm(VReg.V0, 7);
                 this.vm.jeq(tsDateLbl);
+                // [#36] Error 族对象.toString() → "name: message"(否则落通用路径找不到
+                // toString 方法而崩)。obj 仍在栈顶,装箱 0x7FFD。
+                this.vm.load(VReg.A0, VReg.SP, 0);
+                this.vm.call("_is_asmjs_err");
+                this.vm.cmpImm(VReg.RET, 0);
+                this.vm.jne(tsErrLbl);
                 this.vm.label(tsGenLbl);
                 // 通用:用户对象方法;若无用户 toString(数组/plain 对象)则回退默认转换。
                 {

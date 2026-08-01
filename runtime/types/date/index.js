@@ -530,20 +530,47 @@ export class DateGenerator {
 
         // getter 族 wrapper:_aref_generic 把 this 插 A0、用户实参上移( getter 无视之)。
         // [Date 加固] 先经 _date_this_get 校验接收者(非 Date 抛 TypeError,不再无防护读
-        // [this+8])。各 wrapper 覆写 A1 = part 码、调 _date_get_part(返裸 int)、装箱成 number。
-        // part: 0=year 1=month(0基) 2=date 3=hours 4=minutes 5=seconds 6=day-of-week 7=ms。
-        // UTC 变体与本地变体同 part(本运行时全 UTC)→ 两名共享同一 wrapper。
+        // [this+8])。各 wrapper 覆写 A1 = part 码、调 _date_get_part_num(Invalid → NaN,
+        // 否则裸 int 装箱 number)。part: 0=year 1=month(0基) 2=date 3=hours 4=minutes
+        // 5=seconds 6=day-of-week 7=ms。UTC 变体与本地变体同 part(本运行时全 UTC)
+        // → 两名共享同一 wrapper。
         for (let part = 0; part <= 7; part = part + 1) {
             vm.label("_aref_date_gp" + part);
             vm.prologue(0, []);
             vm.call("_date_this_get"); // 非 Date 抛 TypeError;RET = 裸 date 指针
             vm.mov(VReg.A0, VReg.RET);
             vm.movImm(VReg.A1, part);
-            vm.call("_date_get_part"); // RET = 裸 int
-            vm.scvtf(0, VReg.RET);
-            vm.fmovToInt(VReg.RET, 0); // 装箱 number
+            vm.call("_date_get_part_num"); // RET = number(Invalid → canonical NaN)
             vm.epilogue([], 0);
         }
+
+        // _date_get_part_num(A0=date(装箱 0x7ffd 或裸指针), A1=part) -> RET = number(float64 位)
+        // [Date 加固] 装箱版 _date_get_part:timestamp 指数全 1(Invalid Date)→ canonical
+        // NaN(0x7ff0…01,同 _dp_invalid);否则委托 _date_get_part 取裸 int 后 scvtf 装箱
+        // (尾巴同 boxIntAsNumber/原 _aref_date_gp*)。此前调用方对 ts 直接 fcvtzs,
+        // NaN→0 → Invalid Date 的 getter 全返 1970 字段(规范 NaN;直调 compileDateMethod
+        // 与 aref 两路同病)。_date_toString/toISOString 内部已先查 Invalid,继续用裸
+        // _date_get_part,不动。位提取等值判别为既有惯例(_date_toString:266-269),不触 §1.2。
+        vm.label("_date_get_part_num");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0); // date
+        vm.mov(VReg.S1, VReg.A1); // part
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V0, VReg.A0, VReg.V1); // 裸 date 指针(V0==A0 别名,dest==src 既有形态)
+        vm.load(VReg.V0, VReg.V0, 8); // ts(float64 位)
+        vm.shrImm(VReg.V1, VReg.V0, 52);
+        vm.andImm(VReg.V1, VReg.V1, 0x7ff);
+        vm.cmpImm(VReg.V1, 0x7ff);
+        vm.jne("_dgpn_valid");
+        vm.movImm64(VReg.RET, 0x7ff0000000000001n); // canonical NaN(number)
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_dgpn_valid");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_date_get_part"); // RET = 裸 int
+        vm.scvtf(0, VReg.RET);
+        vm.fmovToInt(VReg.RET, 0); // 装箱 number
+        vm.epilogue([VReg.S0, VReg.S1], 0);
 
         // setter 族 wrapper(原子多字段,_date_set_parts;直调仍经 functions.js 内联快路)。
         // [Date 加固] ①接收者经 _date_this_named 校验(非 Date 按 V8 文案抛 TypeError;
@@ -598,7 +625,12 @@ export class DateGenerator {
             vm.jle(L + "_cok");
             vm.movImm(VReg.S1, maxA);
             vm.label(L + "_cok");
-            // 逐位 ToNumber → int → values[i](生成器展开;count 连续,i>=count 直落调用)
+            // 逐位 ToNumber → int → values[i](生成器展开;count 连续,i>=count 直落调用)。
+            // [Date 加固] NaN/±Inf(指数全 1)不短路:仅置 [SP+80]=1 继续强转后续位
+            // (全部实参先求值强转、副作用保序,与 node 一致;此前 jeq _nan 短路会吞掉
+            // 后续位 valueOf 副作用),L_call 处统一分流 _nan。
+            vm.movImm(VReg.V0, 0);
+            vm.store(VReg.SP, 80, VReg.V0); // argNaN = 0
             for (let i = 0; i < maxA; i = i + 1) {
                 vm.cmpImm(VReg.S1, i + 1);
                 vm.jlt(L + "_call");
@@ -607,9 +639,12 @@ export class DateGenerator {
                 vm.shrImm(VReg.V1, VReg.RET, 52);
                 vm.andImm(VReg.V1, VReg.V1, 0x7ff);
                 vm.cmpImm(VReg.V1, 0x7ff);
-                vm.jeq(L + "_nan");
+                vm.jne(L + "_argok" + i);
+                vm.movImm(VReg.V1, 1);
+                vm.store(VReg.SP, 80, VReg.V1); // argNaN = 1(不跳出循环)
+                vm.label(L + "_argok" + i);
                 vm.fmovToFloat(0, VReg.RET);
-                vm.fcvtzs(VReg.V0, 0); // 向零截断
+                vm.fcvtzs(VReg.V0, 0); // 向零截断(NaN→0;标志命中时槽值不被使用)
                 vm.store(VReg.SP, 40 + i * 8, VReg.V0);
                 if (part === 0 && i === 0) {
                     // setFullYear:V8 于 year 强转后读 t(见上)
@@ -620,6 +655,9 @@ export class DateGenerator {
             vm.label(L + "_call");
             vm.cmpImm(VReg.S2, 1);
             vm.jeq(L + "_nan"); // 强转前已 Invalid → 由 _nan 分流到不写回支路
+            vm.load(VReg.V0, VReg.SP, 80);
+            vm.cmpImm(VReg.V0, 0);
+            vm.jne(L + "_nan"); // 任一位 NaN/±Inf → 写回 NaN(全部强转已完成)
             vm.mov(VReg.A0, VReg.S0);
             vm.movImm(VReg.A1, part);
             vm.mov(VReg.A2, VReg.S1);

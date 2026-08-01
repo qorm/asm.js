@@ -67,15 +67,19 @@ export function analyzeCapturedVariables(funcExpr, outerLocals, functions) {
     // 找出需要捕获的变量
     const captured = [];
     for (const name in referenced) {
+        // [#32] paramNames/localVars/functions/outerLocals 均为裸 {},裸取下标会沿
+        // Object.prototype 命中(valueOf/toString/constructor/...),把从未声明的名误判成
+        // 参数/局部/函数 → 这些名的变量永不入捕获表。一律 hasOwnProperty 自有判定
+        // (与 members.js TA_CTOR_TAGS 同款,gen1 已验证)。
         // 跳过参数和局部变量
-        if (paramNames[name]) continue;
-        if (localVars[name]) continue;
+        if (Object.prototype.hasOwnProperty.call(paramNames, name)) continue;
+        if (Object.prototype.hasOwnProperty.call(localVars, name)) continue;
         // 跳过全局函数和内置函数
-        if (functions && functions[name]) continue;
+        if (functions && Object.prototype.hasOwnProperty.call(functions, name)) continue;
         if (isBuiltinOrGlobal(name)) continue;
 
         // 检查是否在外部作用域中
-        if (outerLocals && outerLocals[name]) {
+        if (outerLocals && Object.prototype.hasOwnProperty.call(outerLocals, name)) {
             captured.push(name);
         }
     }
@@ -235,10 +239,12 @@ export function collectNestedFunctionReferences(node, referenced, localScope) {
 
         // 找出嵌套函数引用但不在它自己作用域中的变量
         for (const name in nestedReferenced) {
-            if (nestedParams[name]) continue;
-            if (nestedLocals[name]) continue;
+            // [#32] 裸字典原型安全判定(同 analyzeCapturedVariables,否则嵌套路径
+            // 对同名污染变量仍漏上抛)
+            if (Object.prototype.hasOwnProperty.call(nestedParams, name)) continue;
+            if (Object.prototype.hasOwnProperty.call(nestedLocals, name)) continue;
             // 如果这个变量也不在当前函数的局部作用域中，说明它需要从更外层捕获
-            if (!localScope[name]) {
+            if (!Object.prototype.hasOwnProperty.call(localScope, name)) {
                 referenced[name] = true;
             }
         }

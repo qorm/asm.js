@@ -1009,6 +1009,7 @@ export class StringGenerator {
         const TYPE_NUMBER = 13;
         const TYPE_FLOAT64 = 29;
         const TYPE_CLOSURE = 3;
+        const TYPE_DATE = 7;
 
         vm.label("_valueToStr");
         vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2]);
@@ -1085,6 +1086,16 @@ export class StringGenerator {
         vm.jmp("_valueToStr_data_str_create_heap");
 
         vm.label("_valueToStr_js_object");
+        // [Date] 装箱 Date(对象头字节 TYPE_DATE=7)→ _date_toString("Www Mmm DD YYYY ...")。
+        // 必须先于 _is_asmjs_err:16B Date 块被当 Error 品牌遍历即野扫(判序照抄
+        // print.js:591-617 既有先例;String(d)/""+d/`${d}` 对 Date 全崩根因)。
+        vm.mov(VReg.V0, VReg.S0);
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V0, VReg.V0, VReg.V1); // 裸块指针
+        vm.loadByte(VReg.V0, VReg.V0, 0);
+        vm.andImm(VReg.V0, VReg.V0, 0xff);
+        vm.cmpImm(VReg.V0, TYPE_DATE);
+        vm.jeq("_valueToStr_js_date");
         // [#36] Error 族对象(装箱 0x7FFD)→ "name: message"。S0 仍是装箱值。
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_is_asmjs_err");
@@ -1118,6 +1129,12 @@ export class StringGenerator {
         vm.label("_valueToStr_object_default");
         vm.lea(VReg.A0, "_str_object");
         vm.jmp("_valueToStr_data_str_create_heap");
+
+        vm.label("_valueToStr_js_date");
+        // Date → _date_toString(接受装箱 0x7ffd/裸指针;非 Date 已被上方类型字节拦截)
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_date_toString"); // RET = 装箱堆串
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
 
         vm.label("_valueToStr_js_array");
         // Array: extract low 48 bits as array pointer

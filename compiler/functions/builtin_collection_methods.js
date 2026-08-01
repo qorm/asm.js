@@ -336,38 +336,91 @@ export const BuiltinCollectionMethodCompiler = {
             setMinutes: 3, setUTCMinutes: 3, setSeconds: 2, setUTCSeconds: 2,
             setMilliseconds: 1, setUTCMilliseconds: 1,
         };
+        // [Date 加固] 零参 setter(含 setTime):字段缺省 = undefined → ToNumber NaN →
+        // timestamp 写 canonical NaN(0x7ff0…01,同 _dp_invalid)并返回 NaN——对齐 aref 路
+        // _aref_date_sp* 零参语义(count 按 1、arg0=padded undefined → _nan 支路)。
+        // 此前 args.length>=1 门把零参漏到通用对象方法调用:静态接收者野扫/取到 undefined
+        // 再调用,unknown 接收者 emitTagDispatchMethod type-7 分支静默错值。
+        if ((method in SETTER_PARTS || method === "setTime") && args.length === 0) {
+            this.compileExpression(obj); // RET = date(装箱 0x7ffd)
+            this.vm.emitMaskLoad(VReg.V1);
+            this.vm.andMaskReg(VReg.A0, VReg.RET, VReg.V1); // 裸 date 指针(RET==A0 别名,同 setTime 路)
+            this.vm.movImm64(VReg.V1, 0x7ff0000000000001n); // canonical NaN
+            this.vm.store(VReg.A0, 8, VReg.V1); // [[DateValue]] = NaN
+            this.vm.mov(VReg.RET, VReg.V1); // RET = NaN(number)
+            return true;
+        }
         if (method in SETTER_PARTS && args.length >= 1) {
             const part = SETTER_PARTS[method];
             const count = Math.min(args.length, SETTER_MAX[method]);
             if (count === 1) {
                 // 单字段:沿用 _date_set_part(与既有 codegen 一致)
+                const nanLbl = this.ctx.newLabel("dset_nan");
+                const okLbl = this.ctx.newLabel("dset_ok");
                 this.compileExpression(obj);
                 this.vm.push(VReg.RET); // 保存 date 值
                 this.compileExpression(args[0]);
                 this.emitNumberCoerceFast(); // RET = 裸 float 位
+                // [Date 加固] NaN/±Inf(指数全 1)判别:此前直接 fcvtzs,NaN→0 静默当 0 写、
+                // ±Inf→INT64_MAX 饱和;规范 → timestamp 写 canonical NaN 并返回 NaN
+                // (同 aref 路 _aref_date_sp* _nan 支路;位提取等值判别是既有惯例,
+                // 见 _date_toString:266-269,不触 §1.2 的 float 位序整数排序禁令)。
+                this.vm.shrImm(VReg.V1, VReg.RET, 52);
+                this.vm.andImm(VReg.V1, VReg.V1, 0x7ff);
+                this.vm.cmpImm(VReg.V1, 0x7ff);
+                this.vm.jeq(nanLbl);
                 this.vm.fmovToFloat(0, VReg.RET);
                 this.vm.fcvtzs(VReg.A2, 0); // A2 = int 值
                 this.vm.pop(VReg.A0); // date 值
                 this.vm.movImm(VReg.A1, part);
                 this.vm.call("_date_set_part"); // RET = 新 ms(裸 float number)
+                this.vm.jmp(okLbl);
+                this.vm.label(nanLbl);
+                this.vm.pop(VReg.A0); // date 值
+                this.vm.emitMaskLoad(VReg.V1);
+                this.vm.andMaskReg(VReg.A0, VReg.A0, VReg.V1); // 裸 date 指针
+                this.vm.movImm64(VReg.V1, 0x7ff0000000000001n); // canonical NaN(同 _dp_invalid)
+                this.vm.store(VReg.A0, 8, VReg.V1);
+                this.vm.mov(VReg.RET, VReg.V1);
+                this.vm.label(okLbl);
                 return true;
             }
             // 多字段:原子写。逐参转 int 存入连续 FP 槽(allocLocal 地址递减,
             // 故 values[i](part+i)存到 bufOffs[count-1-i]),再传 valuesPtr=最低槽地址。
             const id = this.nextLabelId();
+            const mNanLbl = this.ctx.newLabel("dset_nan");
+            const mOkLbl = this.ctx.newLabel("dset_ok");
             this.compileExpression(obj);
             this.vm.push(VReg.RET); // 保存 date(boxed)
             const bufOffs = [];
             for (let i = 0; i < count; i++) {
                 bufOffs.push(this.ctx.allocLocal(`__dset_buf${i}_${id}`));
             }
+            // [Date 加固] NaN/±Inf(指数全 1)判别不短路:全部实参先按序求值+强转落槽
+            // (副作用保序,与 node 一致——先求值全部实参再判定),命中仅置标志,
+            // 循环后统一分流:写 canonical NaN 返 NaN(值轴与单字段路一致)。
+            const nanOff = this.ctx.allocLocal(`__dset_nan_${id}`);
+            this.vm.movImm(VReg.V0, 0);
+            this.vm.store(VReg.FP, nanOff, VReg.V0); // argNaN = 0
             for (let i = 0; i < count; i++) {
+                const argOkLbl = this.ctx.newLabel("dset_argok");
                 this.compileExpression(args[i]);
                 this.emitNumberCoerceFast(); // RET = 裸 float 位
+                this.vm.shrImm(VReg.V1, VReg.RET, 52);
+                this.vm.andImm(VReg.V1, VReg.V1, 0x7ff);
+                this.vm.cmpImm(VReg.V1, 0x7ff);
+                this.vm.jne(argOkLbl);
+                this.vm.movImm(VReg.V1, 1);
+                this.vm.store(VReg.FP, nanOff, VReg.V1); // argNaN = 1(不跳出循环)
+                this.vm.label(argOkLbl);
                 this.vm.fmovToFloat(0, VReg.RET);
-                this.vm.fcvtzs(VReg.V0, 0); // V0 = int 值
+                this.vm.fcvtzs(VReg.V0, 0); // V0 = int 值(NaN→0;标志命中时槽值不被使用)
                 this.vm.store(VReg.FP, bufOffs[count - 1 - i], VReg.V0); // values[i] 落最低+i*8
             }
+            // 全部实参求值强转完毕,统一判别:任一位 NaN/±Inf → 写 NaN 返 NaN
+            this.vm.load(VReg.V0, VReg.FP, nanOff);
+            this.vm.cmpImm(VReg.V0, 0);
+            this.vm.jne(mNanLbl);
             // A3 = valuesPtr = FP + bufOffs[count-1](最低槽);用寄存器减法避免大立即数
             this.vm.movImm(VReg.A3, -bufOffs[count - 1]);
             this.vm.sub(VReg.A3, VReg.FP, VReg.A3);
@@ -375,6 +428,15 @@ export const BuiltinCollectionMethodCompiler = {
             this.vm.movImm(VReg.A1, part);   // startPart
             this.vm.movImm(VReg.A2, count);  // count
             this.vm.call("_date_set_parts"); // RET = 新 ms(裸 float number)
+            this.vm.jmp(mOkLbl);
+            this.vm.label(mNanLbl);
+            this.vm.pop(VReg.A0); // date(boxed)
+            this.vm.emitMaskLoad(VReg.V1);
+            this.vm.andMaskReg(VReg.A0, VReg.A0, VReg.V1); // 裸 date 指针
+            this.vm.movImm64(VReg.V1, 0x7ff0000000000001n); // canonical NaN(同 _dp_invalid)
+            this.vm.store(VReg.A0, 8, VReg.V1);
+            this.vm.mov(VReg.RET, VReg.V1);
+            this.vm.label(mOkLbl);
             return true;
         }
         // setTime(ms):直接写 timestamp,返回 ms
@@ -425,8 +487,7 @@ export const BuiltinCollectionMethodCompiler = {
             case "getMilliseconds":
             case "getUTCMilliseconds":
                 this.vm.movImm(VReg.A1, 7);
-                this.vm.call("_date_get_part");
-                this.boxIntAsNumber(VReg.RET);
+                this.vm.call("_date_get_part_num"); // Invalid → canonical NaN;否则裸 int 装箱 number
                 return true;
 
             // [#35] 历法 getter 家族(原无分派无运行时,落通用路径崩溃)。
@@ -435,44 +496,37 @@ export const BuiltinCollectionMethodCompiler = {
             case "getFullYear":
             case "getUTCFullYear":
                 this.vm.movImm(VReg.A1, 0);
-                this.vm.call("_date_get_part");
-                this.boxIntAsNumber(VReg.RET);
+                this.vm.call("_date_get_part_num"); // Invalid → canonical NaN;否则裸 int 装箱 number
                 return true;
             case "getMonth":
             case "getUTCMonth":
                 this.vm.movImm(VReg.A1, 1);
-                this.vm.call("_date_get_part");
-                this.boxIntAsNumber(VReg.RET);
+                this.vm.call("_date_get_part_num"); // Invalid → canonical NaN;否则裸 int 装箱 number
                 return true;
             case "getDate":
             case "getUTCDate":
                 this.vm.movImm(VReg.A1, 2);
-                this.vm.call("_date_get_part");
-                this.boxIntAsNumber(VReg.RET);
+                this.vm.call("_date_get_part_num"); // Invalid → canonical NaN;否则裸 int 装箱 number
                 return true;
             case "getHours":
             case "getUTCHours":
                 this.vm.movImm(VReg.A1, 3);
-                this.vm.call("_date_get_part");
-                this.boxIntAsNumber(VReg.RET);
+                this.vm.call("_date_get_part_num"); // Invalid → canonical NaN;否则裸 int 装箱 number
                 return true;
             case "getMinutes":
             case "getUTCMinutes":
                 this.vm.movImm(VReg.A1, 4);
-                this.vm.call("_date_get_part");
-                this.boxIntAsNumber(VReg.RET);
+                this.vm.call("_date_get_part_num"); // Invalid → canonical NaN;否则裸 int 装箱 number
                 return true;
             case "getSeconds":
             case "getUTCSeconds":
                 this.vm.movImm(VReg.A1, 5);
-                this.vm.call("_date_get_part");
-                this.boxIntAsNumber(VReg.RET);
+                this.vm.call("_date_get_part_num"); // Invalid → canonical NaN;否则裸 int 装箱 number
                 return true;
             case "getDay":
             case "getUTCDay":
                 this.vm.movImm(VReg.A1, 6);
-                this.vm.call("_date_get_part");
-                this.boxIntAsNumber(VReg.RET);
+                this.vm.call("_date_get_part_num"); // Invalid → canonical NaN;否则裸 int 装箱 number
                 return true;
         }
 
