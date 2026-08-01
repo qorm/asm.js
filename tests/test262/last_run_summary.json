@@ -1,6 +1,6 @@
 {
-  "generated": "2026-07-31T20:27:10.853Z",
-  "runnerSha": "71dc2fb5b37f239fe6311c1829c2dece8aec876e",
+  "generated": "2026-08-01T07:07:42.275Z",
+  "runnerSha": "51aea65f019813ee5d061d3b6011382c0ae51184",
   "corpusPin": "9e61c12835c5e4a3bdba93850427e6742c4f64c4",
   "config": {
     "corpus": ".test262-corpus",
@@ -46,12 +46,12 @@
   "eligible": 32310,
   "run": 6462,
   "totals": {
-    "PASS": 3043,
-    "FAIL": 3181,
+    "PASS": 3063,
+    "FAIL": 3167,
     "COMPILE_FAIL": 69,
-    "CRASH": 169
+    "CRASH": 163
   },
-  "passRatePct": 47.09,
+  "passRatePct": 47.4,
   "byArea": {
     "built-ins/Array": {
       "PASS": 297,
@@ -72,8 +72,8 @@
       "CRASH": 0
     },
     "built-ins/Map": {
-      "PASS": 15,
-      "FAIL": 24,
+      "PASS": 21,
+      "FAIL": 18,
       "COMPILE_FAIL": 0,
       "CRASH": 2
     },
@@ -96,10 +96,10 @@
       "CRASH": 11
     },
     "built-ins/Promise": {
-      "PASS": 50,
-      "FAIL": 76,
+      "PASS": 62,
+      "FAIL": 70,
       "COMPILE_FAIL": 6,
-      "CRASH": 13
+      "CRASH": 7
     },
     "built-ins/RegExp": {
       "PASS": 133,
@@ -115,9 +115,9 @@
     },
     "built-ins/String": {
       "PASS": 94,
-      "FAIL": 148,
+      "FAIL": 147,
       "COMPILE_FAIL": 1,
-      "CRASH": 1
+      "CRASH": 2
     },
     "built-ins/Symbol": {
       "PASS": 4,
@@ -132,14 +132,14 @@
       "CRASH": 3
     },
     "language/expressions": {
-      "PASS": 1027,
-      "FAIL": 886,
+      "PASS": 1030,
+      "FAIL": 884,
       "COMPILE_FAIL": 30,
-      "CRASH": 62
+      "CRASH": 61
     },
     "language/statements": {
-      "PASS": 843,
-      "FAIL": 911,
+      "PASS": 842,
+      "FAIL": 912,
       "COMPILE_FAIL": 25,
       "CRASH": 43
     }
@@ -147,19 +147,19 @@
   "topFailPatterns": [
     {
       "pattern": "FAIL: assertion mismatch (Test262Error / wrong value)",
-      "count": 1817
+      "count": 1816
     },
     {
       "pattern": "FAIL: async ($DONE not signalled / promise rejected)",
-      "count": 418
+      "count": 421
     },
     {
       "pattern": "FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)",
-      "count": 377
+      "count": 365
     },
     {
       "pattern": "FAIL: negative test wrong outcome (phase=parse)",
-      "count": 263
+      "count": 261
     },
     {
       "pattern": "FAIL: TypedArray/ArrayBuffer semantics",
@@ -167,7 +167,7 @@
     },
     {
       "pattern": "CRASH: run signal SIGSEGV",
-      "count": 119
+      "count": 112
     },
     {
       "pattern": "FAIL: array contents mismatch (compareArray)",
@@ -179,7 +179,7 @@
     },
     {
       "pattern": "FAIL: constructor-ness reflection (isConstructor / not-a-constructor)",
-      "count": 50
+      "count": 48
     },
     {
       "pattern": "CRASH: run timeout",
@@ -187,7 +187,7 @@
     },
     {
       "pattern": "CRASH: run signal SIGBUS",
-      "count": 15
+      "count": 16
     },
     {
       "pattern": "FAIL: negative test wrong outcome (phase=runtime)",

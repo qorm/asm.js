@@ -654,5 +654,154 @@ export class SetGenerator {
         vm.lea(VReg.RET, "_js_false");
         vm.load(VReg.RET, VReg.RET, 0);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 48);
+
+        // ============================================================
+        // [I2 一等值] Set.prototype 方法值闭包用的 _aref_generic 安全 wrapper 族。
+        // 蹦床把 this 插 A0、实参上移一位后尾调 helper(契约同 map/index.js 同名族注)。
+        // size getter 复用 map 文件的 _aref_coll_size(Map/Set 头同布局,标签全局解析)。
+        // ============================================================
+
+        // _aref_set_clear(A0 = set) -> undefined(规范返 undefined;_set_clear 返 set)。
+        // [I2 红队] 头部内联品牌守卫(形态与 map/index.js guardHead 一致)。
+        vm.label("_aref_set_clear");
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_asc_chk");
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jne("_asc_bad");
+        vm.label("_asc_chk");
+        vm.emitMaskLoad(VReg.V5);
+        vm.andMaskReg(VReg.V0, VReg.A0, VReg.V5);
+        vm.movImm64(VReg.V5, vm.ptrFloor);
+        vm.cmp(VReg.V0, VReg.V5);
+        vm.jlt("_asc_bad");
+        vm.loadByte(VReg.V0, VReg.V0, 0);
+        vm.cmpImm(VReg.V0, TYPE_SET);
+        vm.jne("_asc_bad");
+        vm.emitMaskLoad(VReg.V5);
+        vm.andMaskReg(VReg.V0, VReg.A0, VReg.V5);
+        vm.load(VReg.V0, VReg.V0, 48);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_asc_bad");
+        vm.prologue(16, [VReg.S0]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.call("_set_clear");
+        vm.movImm64(VReg.RET, 0x7ffb000000000000n); // JS_UNDEFINED
+        vm.epilogue([VReg.S0], 16);
+        vm.label("_asc_bad");
+        vm.lea(VReg.A1, vm.asm.addString("Method Set.prototype.clear called on incompatible receiver "));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.jmp("_aref_throw_incompat");
+
+        // _aref_set_forEach(A0 = set, A1 = callback, A2 = thisArg[忽略,记偏差]) ->
+        // undefined。节点布局 value@0/next@8;cb(value, value, set)(Set 语义同值两传,
+        // 与 compileSetForEach 一致)。循环态/GC 契约镜像 _aref_map_forEach。
+        // [I2 红队] 头部内联品牌守卫。
+        vm.label("_aref_set_forEach");
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_asfe_chk");
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jne("_asfe_bad");
+        vm.label("_asfe_chk");
+        vm.emitMaskLoad(VReg.V5);
+        vm.andMaskReg(VReg.V0, VReg.A0, VReg.V5);
+        vm.movImm64(VReg.V5, vm.ptrFloor);
+        vm.cmp(VReg.V0, VReg.V5);
+        vm.jlt("_asfe_bad");
+        vm.loadByte(VReg.V0, VReg.V0, 0);
+        vm.cmpImm(VReg.V0, TYPE_SET);
+        vm.jne("_asfe_bad");
+        vm.emitMaskLoad(VReg.V5);
+        vm.andMaskReg(VReg.V0, VReg.A0, VReg.V5);
+        vm.load(VReg.V0, VReg.V0, 48);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_asfe_bad");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.S0, VReg.A0, VReg.V1); // S0 = 裸 set
+        vm.mov(VReg.S1, VReg.A1);                 // S1 = callback
+        vm.load(VReg.S2, VReg.S0, 16);            // S2 = cur = head
+        vm.label("_asfe_loop");
+        vm.cmpImm(VReg.S2, 0);
+        vm.jeq("_asfe_done");
+        vm.load(VReg.A0, VReg.S2, 0);   // arg0 = value
+        vm.load(VReg.A1, VReg.S2, 0);   // arg1 = value(第二传)
+        vm.mov(VReg.A2, VReg.S0);       // arg2 = set
+        vm.mov(VReg.A3, VReg.S1);       // callback
+        vm.call("_aref_invoke_cb");
+        vm.load(VReg.S2, VReg.S2, 8);   // cur = node.next@8
+        vm.jmp("_asfe_loop");
+        vm.label("_asfe_done");
+        vm.movImm64(VReg.RET, 0x7ffb000000000000n); // undefined
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+        vm.label("_asfe_bad");
+        vm.lea(VReg.A1, vm.asm.addString("Method Set.prototype.forEach called on incompatible receiver "));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.jmp("_aref_throw_incompat");
+
+        // _set_ctor_call - `Set()` 不带 new(经值路径调用)→ TypeError
+        // (规范 24.2.1.1:Constructor Set requires 'new')。
+        vm.label("_set_ctor_call");
+        vm.prologue(16, [VReg.S0]);
+        vm.lea(VReg.A0, vm.asm.addString("Constructor Set requires 'new'"));
+        vm.call("_js_box_string");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_throw_type_error");   // 不返回
+        vm.epilogue([VReg.S0], 16);     // 理论不达
+
+        // ============================================================
+        // [I2 红队] 接收者品牌守卫薄壳(契约/寄存器纪律/消息形状见 map/index.js
+        // 同名守卫组注;_aref_throw_incompat 定义于 map 文件,标签全局解析)。
+        // keys 无独立壳:成员表经别名机制让 keys 与 values 共享同一方法值闭包
+        // (规范同一性 Set.prototype.keys === Set.prototype.values)。
+        // ============================================================
+        // [I2 红队 F3] 原型单例槽运行时无条件登记(同 map 文件 _nsobj_map_proto 注)。
+        vm.asm.addDataLabel("_nsobj_set_proto");
+        vm.asm.addDataQword(0);
+        const STRTAG_I2 = 0x7ffc000000000000n;
+        const guardHead = (tag, typeByte) => {
+            vm.shrImm(VReg.V0, VReg.A0, 48);
+            vm.cmpImm(VReg.V0, 0);
+            vm.jeq(tag + "_chk");
+            vm.cmpImm(VReg.V0, 0x7FFD);
+            vm.jne(tag + "_bad");
+            vm.label(tag + "_chk");
+            vm.emitMaskLoad(VReg.V5);
+            vm.andMaskReg(VReg.V0, VReg.A0, VReg.V5); // V0 = 裸指针
+            vm.movImm64(VReg.V5, vm.ptrFloor);
+            vm.cmp(VReg.V0, VReg.V5);
+            vm.jlt(tag + "_bad");
+            vm.loadByte(VReg.V0, VReg.V0, 0);
+            vm.cmpImm(VReg.V0, typeByte);
+            vm.jne(tag + "_bad");
+            vm.emitMaskLoad(VReg.V5);
+            vm.andMaskReg(VReg.V0, VReg.A0, VReg.V5);
+            vm.load(VReg.V0, VReg.V0, 48);            // weakness 标志
+            vm.cmpImm(VReg.V0, 0);
+            vm.jne(tag + "_bad");
+        };
+        const guardBad = (tag, prefix) => {
+            vm.label(tag + "_bad");
+            vm.lea(VReg.A1, vm.asm.addString(prefix));
+            vm.movImm64(VReg.V1, STRTAG_I2);
+            vm.or(VReg.A1, VReg.A1, VReg.V1);
+            vm.jmp("_aref_throw_incompat");
+        };
+        const guarded = (label, typeByte, helper, prefix) => {
+            vm.label(label);
+            guardHead(label, typeByte);
+            vm.jmp(helper);
+            guardBad(label, prefix);
+        };
+        guarded("_aref_set_add", TYPE_SET, "_set_add", "Method Set.prototype.add called on incompatible receiver ");
+        guarded("_aref_set_has", TYPE_SET, "_set_has", "Method Set.prototype.has called on incompatible receiver ");
+        guarded("_aref_set_delete", TYPE_SET, "_set_delete", "Method Set.prototype.delete called on incompatible receiver ");
+        // keys 的错误消息也用 "values"(Node:keys 即 values 同一函数,取其 name)
+        guarded("_aref_set_values", TYPE_SET, "_set_values", "Method Set.prototype.values called on incompatible receiver ");
+        guarded("_aref_set_entries", TYPE_SET, "_set_entries", "Method Set.prototype.entries called on incompatible receiver ");
+        guarded("_aref_set_size", TYPE_SET, "_aref_coll_size", "Method get Set.prototype.size called on incompatible receiver ");
     }
 }

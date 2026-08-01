@@ -29,6 +29,13 @@ const STRICT_RESERVED = {
     "implements": 1, "interface": 1, "package": 1, "private": 1, "protected": 1, "public": 1,
     "let": 1, "static": 1, "yield": 1,
 };
+// [test262 早期错误 A] 上下文词:任何模式下皆可作绑定名,但词法各自独立成 token 类型
+// (AWAIT/ASYNC/GET/SET/FROM/AS/OF/UNDEFINED/INT_TYPE)。对象模式绑定位靠本表识别
+// 「词形 token」;yield/await 的生成器/异步门控由 checkYieldAwaitBinding 负责,不在此表。
+const CONTEXTUAL_WORD = {
+    "await": 1, "async": 1, "get": 1, "set": 1, "from": 1, "as": 1, "of": 1,
+    "undefined": 1, "int": 1,
+};
 
 // 语句解析混入
 export const StatementParser = {
@@ -141,13 +148,17 @@ export const StatementParser = {
 
     parseVariableDeclaration() {
         let decl = new AST.VariableDeclaration(this.curToken.literal);
+        // [test262 早期错误 A] 词法声明(let/const)下模式绑定位的 let 名恒拒(sloppy 亦拒);
+        // var 位 sloppy 收。lexical 经 parseObjectPattern/parseArrayPattern 透传嵌套模式
+        // (for-of/in 头经本函数解析,同样覆盖)。
+        const lexical = decl.kind === "let" || decl.kind === "const";
         do {
             this.nextToken();
             let id;
             if (this.curTokenIs(TokenType.LBRACE)) {
-                id = this.parseObjectPattern();
+                id = this.parseObjectPattern(lexical);
             } else if (this.curTokenIs(TokenType.LBRACKET)) {
-                id = this.parseArrayPattern();
+                id = this.parseArrayPattern(lexical);
             } else if (this.curTokenIsIdentifier()) {
                 this.checkYieldAwaitBinding(this.curToken.literal);   // [test262 S1] var yield/await
                 this.checkReservedBinding(this.curToken.literal);     // [test262 早期错误 A] 保留字
@@ -246,6 +257,35 @@ export const StatementParser = {
         }
         if (STRICT_RESERVED[name] === 1 && this.inStrictMode()) {
             this.errors.push("Cannot use reserved word '" + name + "' as an identifier in strict mode");
+        }
+    },
+
+    // [test262 早期错误 A] 对象模式绑定位的「词形 token」判定:IDENT,或 literal 命中
+    // 保留字表/上下文词表的关键字 token(yield/let/static/await/async/get/set 等,词法
+    // 把关键字各自分成独立 token 类型)。curTokenIsIdentifier 是黑名单(运算符/字符串/
+    // 正则/模板皆真)过宽:`{x: "if"}` 的 STRING literal 恰为词形,误判为绑定名会误收
+    // 非法程序,故字面量类 token 先行排除。命中仅表示「可占绑定位」,保留字/strict/
+    // 上下文门控仍由 checkReservedBinding/checkYieldAwaitBinding 在绑定点执行。
+    isBindingWordToken(tok) {
+        if (!tok) return false;
+        const t = tok.type;
+        if (t === TokenType.IDENT) return true;
+        if (t === TokenType.STRING || t === TokenType.INT || t === TokenType.FLOAT ||
+            t === TokenType.BIGINT || t === TokenType.REGEX ||
+            t === TokenType.TEMPLATE_STRING || t === TokenType.TEMPLATE_HEAD ||
+            t === TokenType.TEMPLATE_MIDDLE || t === TokenType.TEMPLATE_TAIL) return false;
+        const lit = tok.literal;
+        if (typeof lit !== "string" || lit.length === 0) return false;
+        return ALWAYS_RESERVED[lit] === 1 || STRICT_RESERVED[lit] === 1 || CONTEXTUAL_WORD[lit] === 1;
+    },
+
+    // [test262 早期错误 A] let 作绑定名在**词法声明**(let/const/catch pattern 参数)下恒拒
+    // (sloppy 亦拒,Node:"let is disallowed as a lexically bound name");var 声明与形参位
+    // sloppy 收(`var {let} = o` / `function f({let}) {}` 合法,故调用点不传 lexical)。
+    // strict 下 var {let} 的拒绝由 checkReservedBinding(STRICT_RESERVED)覆盖,与此正交。
+    checkLexicalLetBinding(name, lexical) {
+        if (lexical && name === "let") {
+            this.errors.push("Cannot use 'let' as a binding name in a lexical declaration");
         }
     },
 
@@ -645,10 +685,12 @@ export const StatementParser = {
                 this.nextToken();
                 this.nextToken();
                 // catch 头解构 catch([i,j])/catch({a,b}):param 可为数组/对象 pattern。
+                // [test262 早期错误 A] catch pattern 绑定位属词法声明:{let} 恒拒
+                // (裸标识符 catch (let) sloppy 收,走下 else 分支不经 pattern,不受影响)。
                 if (this.curTokenIs(TokenType.LBRACE)) {
-                    param = this.parseObjectPattern();
+                    param = this.parseObjectPattern(true);
                 } else if (this.curTokenIs(TokenType.LBRACKET)) {
-                    param = this.parseArrayPattern();
+                    param = this.parseArrayPattern(true);
                 } else {
                     param = new AST.Identifier(this.curToken.literal);
                 }

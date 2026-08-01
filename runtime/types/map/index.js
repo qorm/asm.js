@@ -648,5 +648,405 @@ export class MapGenerator {
         vm.label("_mgb_done");
         vm.mov(VReg.RET, VReg.S2);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
+
+        // ============================================================
+        // [I2 一等值] Map.prototype 方法值闭包用的 _aref_generic 安全 wrapper 族。
+        // 蹦床 _aref_generic 把 this 插 A0、用户实参上移一位后尾调 helper,故 helper
+        // 必须吃装箱 this/实参、返装箱结果。
+        // ============================================================
+
+        // _aref_coll_size(A0 = Map/Set 装箱或裸) -> 装箱 number。Map/Set 头同布局
+        // (size@8 裸 int),故本 helper 通用于两者的 size getter。读前掩码脱壳
+        // (裸指针高16=0,掩码恒等)。[I2 红队] 本标签不再直连方法值闭包:品牌检查在
+        // 各自的守卫壳 _aref_map_size/_aref_set_size(Map 与 Set 是不同品牌,互相
+        // 访问须抛 TypeError,与 Node 逐字一致),全过才尾调至此。
+        vm.label("_aref_coll_size");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.A0, VReg.A0, VReg.V1); // 裸集合指针
+        vm.load(VReg.RET, VReg.A0, 8);            // size(裸 int)
+        vm.scvtf(0, VReg.RET);
+        vm.fmovToInt(VReg.RET, 0);                // canonical float64 number
+        vm.ret();
+
+        // _aref_map_clear(A0 = map) -> undefined。规范 Map.prototype.clear 返 undefined;
+        // _map_clear 返 map 本身,经方法值闭包直连会使 `const r=m.clear(); r===m` 误真,
+        // 故包一层丢弃结果。[I2 红队] 头部内联品牌守卫(同下方 guardHead 形态)。
+        vm.label("_aref_map_clear");
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_amc_chk");
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jne("_amc_bad");
+        vm.label("_amc_chk");
+        vm.emitMaskLoad(VReg.V5);
+        vm.andMaskReg(VReg.V0, VReg.A0, VReg.V5);
+        vm.movImm64(VReg.V5, vm.ptrFloor);
+        vm.cmp(VReg.V0, VReg.V5);
+        vm.jlt("_amc_bad");
+        vm.loadByte(VReg.V0, VReg.V0, 0);
+        vm.cmpImm(VReg.V0, TYPE_MAP);
+        vm.jne("_amc_bad");
+        vm.emitMaskLoad(VReg.V5);
+        vm.andMaskReg(VReg.V0, VReg.A0, VReg.V5);
+        vm.load(VReg.V0, VReg.V0, 48);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_amc_bad");
+        vm.prologue(16, [VReg.S0]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.call("_map_clear");
+        vm.movImm64(VReg.RET, 0x7ffb000000000000n); // JS_UNDEFINED
+        vm.epilogue([VReg.S0], 16);
+        vm.label("_amc_bad");
+        vm.lea(VReg.A1, vm.asm.addString("Method Map.prototype.clear called on incompatible receiver "));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.jmp("_aref_throw_incompat");
+
+        // _aref_map_forEach(A0 = map, A1 = callback, A2 = thisArg[忽略,记偏差:
+        // 回调 this 恒 undefined,与 _array_forEach_rt 同容忍度]) -> undefined。
+        // 遍历插入序链表(head@16 → node.next@16),对每节点经 _aref_invoke_cb 调
+        // cb(value@8, key@0, map)(argc=3)。循环态存 callee-saved(prologue 落栈,
+        // GC 保守扫栈可见;裸 map 指针亦在堆界内被认根,同 _map_keys 跨 _array_new
+        // 持裸 S0 的形态)。回调内 delete/clear 只动桶/摘链,节点内存不被即刻回收,
+        // cur 的 next@16 仍可读(与 compileMapForEach 编译期遍历同语义)。
+        vm.label("_aref_map_forEach");
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_amfe_chk");
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jne("_amfe_bad");
+        vm.label("_amfe_chk");
+        vm.emitMaskLoad(VReg.V5);
+        vm.andMaskReg(VReg.V0, VReg.A0, VReg.V5);
+        vm.movImm64(VReg.V5, vm.ptrFloor);
+        vm.cmp(VReg.V0, VReg.V5);
+        vm.jlt("_amfe_bad");
+        vm.loadByte(VReg.V0, VReg.V0, 0);
+        vm.cmpImm(VReg.V0, TYPE_MAP);
+        vm.jne("_amfe_bad");
+        vm.emitMaskLoad(VReg.V5);
+        vm.andMaskReg(VReg.V0, VReg.A0, VReg.V5);
+        vm.load(VReg.V0, VReg.V0, 48);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_amfe_bad");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.S0, VReg.A0, VReg.V1); // S0 = 裸 map
+        vm.mov(VReg.S1, VReg.A1);                 // S1 = callback(装箱保持)
+        vm.load(VReg.S2, VReg.S0, 16);            // S2 = cur = head
+        vm.label("_amfe_loop");
+        vm.cmpImm(VReg.S2, 0);
+        vm.jeq("_amfe_done");
+        vm.load(VReg.A0, VReg.S2, 8);   // arg0 = value
+        vm.load(VReg.A1, VReg.S2, 0);   // arg1 = key
+        vm.mov(VReg.A2, VReg.S0);       // arg2 = map(裸,与值表示一致)
+        vm.mov(VReg.A3, VReg.S1);       // callback
+        vm.call("_aref_invoke_cb");
+        vm.load(VReg.S2, VReg.S2, 16);  // cur = node.next
+        vm.jmp("_amfe_loop");
+        vm.label("_amfe_done");
+        vm.movImm64(VReg.RET, 0x7ffb000000000000n); // undefined
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+        vm.label("_amfe_bad");
+        vm.lea(VReg.A1, vm.asm.addString("Method Map.prototype.forEach called on incompatible receiver "));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.jmp("_aref_throw_incompat");
+
+        // _map_ctor_call - `Map()` 不带 new(经值路径调用,如 `const M=Map; M()`)→
+        // TypeError(规范 24.1.1.1:Constructor Map requires 'new')。new Map(...) 在
+        // compileNewExpression 静态特判,从不落此。
+        vm.label("_map_ctor_call");
+        vm.prologue(16, [VReg.S0]);
+        vm.lea(VReg.A0, vm.asm.addString("Constructor Map requires 'new'"));
+        vm.call("_js_box_string");      // RET = 装箱堆串
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_throw_type_error");   // 不返回
+        vm.epilogue([VReg.S0], 16);     // 理论不达
+
+        // ============================================================
+        // [I2 红队] 接收者品牌守卫 + V8 风格消息构造。
+        // 物化的 Map.prototype 方法值闭包(成员表 MAP_PROTO_METHODS)不再直连裸
+        // helper:`X.prototype.m.call(wrongRecv, …)` 会把任意值当集合头读 →
+        // SIGSEGV。守卫壳先做品牌检查再纯尾调裸 helper:
+        //   tag 判(裸 high16==0 / 装箱对象 0x7FFD)→ 掩码脱壳 → 堆界(ptrFloor,
+        //   同 _tam_validate)→ 类型字节 → weakness(+48:WeakMap/WeakSet 与 Map/Set
+        //   共享类型字节,但规范不具其品牌,`Map.prototype.get.call(weakMap)` 在
+        //   Node 抛 TypeError)。
+        // 全程只用 V0/V5 作 scratch(x64 上 V0==RET、V5==R10,均不别名 A0-A5;
+        // V1 只在失败桩用,彼时实参已死),无帧、A0-A4 实参原样;成功零栈尾调,
+        // 失败时 A0 仍是原接收者,交 _aref_throw_incompat 构消息抛 TypeError。
+        // ============================================================
+        // [I2 红队 F3] 原型单例槽运行时无条件登记:_fmt_receiver 做身份比较
+        // 引用此标签,程序不触裸 Map 时 members.js 不会登记 → 链接期缺标签
+        // 即 "Unknown label"(members.js _reEnsureSlot 对已登记同名槽查重跳过)。
+        vm.asm.addDataLabel("_nsobj_map_proto");
+        vm.asm.addDataQword(0);
+        const STRTAG_I2 = 0x7ffc000000000000n;
+        // 守卫头:成功落穿到紧跟的代码;失败 jmp <tag>_bad(A0 保持原接收者)。
+        const guardHead = (tag, typeByte) => {
+            vm.shrImm(VReg.V0, VReg.A0, 48);
+            vm.cmpImm(VReg.V0, 0);
+            vm.jeq(tag + "_chk");
+            vm.cmpImm(VReg.V0, 0x7FFD);
+            vm.jne(tag + "_bad");
+            vm.label(tag + "_chk");
+            vm.emitMaskLoad(VReg.V5);
+            vm.andMaskReg(VReg.V0, VReg.A0, VReg.V5); // V0 = 裸指针
+            vm.movImm64(VReg.V5, vm.ptrFloor);
+            vm.cmp(VReg.V0, VReg.V5);
+            vm.jlt(tag + "_bad");
+            vm.loadByte(VReg.V0, VReg.V0, 0);
+            vm.cmpImm(VReg.V0, typeByte);
+            vm.jne(tag + "_bad");
+            vm.emitMaskLoad(VReg.V5);
+            vm.andMaskReg(VReg.V0, VReg.A0, VReg.V5);
+            vm.load(VReg.V0, VReg.V0, 48);            // weakness 标志
+            vm.cmpImm(VReg.V0, 0);
+            vm.jne(tag + "_bad");
+        };
+        // 失败桩:前缀(数据段串,装箱)+ 接收者格式化 → _aref_throw_incompat,不返回。
+        const guardBad = (tag, prefix) => {
+            vm.label(tag + "_bad");
+            vm.lea(VReg.A1, vm.asm.addString(prefix));
+            vm.movImm64(VReg.V1, STRTAG_I2);
+            vm.or(VReg.A1, VReg.A1, VReg.V1);
+            vm.jmp("_aref_throw_incompat");
+        };
+        // 薄壳:品牌守卫 → 纯尾调既有裸 helper(消息前缀与 Node 逐字一致)。
+        const guarded = (label, typeByte, helper, prefix) => {
+            vm.label(label);
+            guardHead(label, typeByte);
+            vm.jmp(helper);
+            guardBad(label, prefix);
+        };
+        guarded("_aref_map_get", TYPE_MAP, "_map_get", "Method Map.prototype.get called on incompatible receiver ");
+        guarded("_aref_map_set", TYPE_MAP, "_map_set", "Method Map.prototype.set called on incompatible receiver ");
+        guarded("_aref_map_has", TYPE_MAP, "_map_has", "Method Map.prototype.has called on incompatible receiver ");
+        guarded("_aref_map_delete", TYPE_MAP, "_map_delete", "Method Map.prototype.delete called on incompatible receiver ");
+        guarded("_aref_map_keys", TYPE_MAP, "_map_keys", "Method Map.prototype.keys called on incompatible receiver ");
+        guarded("_aref_map_values", TYPE_MAP, "_map_values", "Method Map.prototype.values called on incompatible receiver ");
+        guarded("_aref_map_entries", TYPE_MAP, "_map_entries", "Method Map.prototype.entries called on incompatible receiver ");
+        guarded("_aref_map_size", TYPE_MAP, "_aref_coll_size", "Method get Map.prototype.size called on incompatible receiver ");
+
+        // _fmt_receiver(A0 = 任意 JS 值/裸堆指针) -> RET = 装箱串。V8 "%r" 接收者
+        // 格式化("called on incompatible receiver"/"is not a constructor" 消息的
+        // 接收者段,逐字对拍 Node):
+        //   原语(含 BigInt)→ ToString(_valueToStr 委托;BigInt 无 n 后缀同 Node);
+        //   Symbol → "Symbol(desc)"(_symbol_to_string);
+        //   Object/Map/Set/Promise/ArrayBuffer/DataView/WeakMap/WeakSet → "#<X>";
+        //   Array/Date/RegExp/TypedArray 族/Generator → "[object X]";
+        //   Error 族(__asmjs_err 品牌)→ "name: message"(_error_to_str);
+        //   函数(闭包)→ "[Function]"(V8 印源码形如 "function foo(){}",无法复现,记偏差)。
+        const litRet = (s) => { // RET = 装箱数据段串(无堆分配)
+            vm.lea(VReg.RET, vm.asm.addString(s));
+            vm.movImm64(VReg.V1, STRTAG_I2);
+            vm.or(VReg.RET, VReg.RET, VReg.V1);
+            vm.epilogue([VReg.S0, VReg.S1], 0);
+        };
+        vm.label("_fmt_receiver");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0);                 // S0 = 原值(全程保留)
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jeq("_fr_unbox");
+        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jeq("_fr_arr");
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jeq("_fr_fn");
+        vm.cmpImm(VReg.V0, 0x7FF8);
+        vm.jge("_fr_tostr");                      // int/bool/null/undefined/string
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_fr_tostr");                      // 浮点高位 ≠ 0 → number
+        // high16==0 裸值:堆界下 → number 等(_valueToStr);堆界上 → 裸堆指针
+        vm.movImm64(VReg.V0, vm.ptrFloor);
+        vm.cmp(VReg.S0, VReg.V0);
+        vm.jlt("_fr_tostr");
+        // BigInt:[ptr-16]&0xff==TYPE_BIGINT(与 _is_bigint 同判据,内联省一次调用)
+        vm.load(VReg.V0, VReg.S0, -16);
+        vm.andImm(VReg.V0, VReg.V0, 0xff);
+        vm.cmpImm(VReg.V0, 14);
+        vm.jeq("_fr_tostr");
+        vm.mov(VReg.S1, VReg.S0);                 // S1 = 裸 ptr
+        vm.jmp("_fr_dispatch");
+        vm.label("_fr_unbox");
+        vm.emitMaskLoad(VReg.V5);
+        vm.andMaskReg(VReg.S1, VReg.A0, VReg.V5); // S1 = 裸 ptr(S0 仍持装箱原值)
+        vm.label("_fr_dispatch");
+        vm.loadByte(VReg.V0, VReg.S1, 0);
+        vm.cmpImm(VReg.V0, TYPE_MAP);
+        vm.jeq("_fr_map");
+        vm.cmpImm(VReg.V0, 5); // TYPE_SET
+        vm.jeq("_fr_set");
+        vm.cmpImm(VReg.V0, 11); // TYPE_PROMISE
+        vm.jeq("_fr_promise");
+        vm.cmpImm(VReg.V0, 1); // TYPE_ARRAY(裸数组指针路径)
+        vm.jeq("_fr_arr");
+        vm.cmpImm(VReg.V0, 2); // TYPE_OBJECT
+        vm.jeq("_fr_obj");
+        vm.cmpImm(VReg.V0, 7); // TYPE_DATE
+        vm.jeq("_fr_date");
+        vm.cmpImm(VReg.V0, 8); // TYPE_REGEXP
+        vm.jeq("_fr_regexp");
+        vm.cmpImm(VReg.V0, 9); // TYPE_GENERATOR
+        vm.jeq("_fr_gen");
+        vm.cmpImm(VReg.V0, 12); // TYPE_ARRAY_BUFFER
+        vm.jeq("_fr_ab");
+        vm.cmpImm(VReg.V0, 14); // TYPE_DATA_VIEW
+        vm.jeq("_fr_dv");
+        vm.cmpImm(VReg.V0, 61); // TYPE_SYMBOL
+        vm.jeq("_fr_sym");
+        // TypedArray 族(0x40..0x61)
+        vm.cmpImm(VReg.V0, 0x40);
+        vm.jeq("_fr_ta_i8");
+        vm.cmpImm(VReg.V0, 0x41);
+        vm.jeq("_fr_ta_i16");
+        vm.cmpImm(VReg.V0, 0x42);
+        vm.jeq("_fr_ta_i32");
+        vm.cmpImm(VReg.V0, 0x43);
+        vm.jeq("_fr_ta_bi64");
+        vm.cmpImm(VReg.V0, 0x50);
+        vm.jeq("_fr_ta_u8");
+        vm.cmpImm(VReg.V0, 0x51);
+        vm.jeq("_fr_ta_u16");
+        vm.cmpImm(VReg.V0, 0x52);
+        vm.jeq("_fr_ta_u32");
+        vm.cmpImm(VReg.V0, 0x53);
+        vm.jeq("_fr_ta_bu64");
+        vm.cmpImm(VReg.V0, 0x54);
+        vm.jeq("_fr_ta_u8c");
+        vm.cmpImm(VReg.V0, 0x60);
+        vm.jeq("_fr_ta_f32");
+        vm.cmpImm(VReg.V0, 0x61);
+        vm.jeq("_fr_ta_f64");
+        // 其余(闭包裸指针/内部形状节点等)按普通对象
+        vm.jmp("_fr_lit_object");
+
+        vm.label("_fr_tostr");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_valueToStr");
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_fr_arr");
+        litRet("[object Array]");
+        vm.label("_fr_fn");
+        litRet("[Function]");
+        vm.label("_fr_map");
+        vm.load(VReg.V0, VReg.S1, 48);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_fr_wmap");
+        vm.label("_fr_lit_map");                  // F3 原型单例直达(不读 weak 槽)
+        litRet("#<Map>");
+        vm.label("_fr_wmap");
+        litRet("#<WeakMap>");
+        vm.label("_fr_set");
+        vm.load(VReg.V0, VReg.S1, 48);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_fr_wset");
+        vm.label("_fr_lit_set");                  // F3 原型单例直达
+        litRet("#<Set>");
+        vm.label("_fr_wset");
+        litRet("#<WeakSet>");
+        vm.label("_fr_promise");
+        litRet("#<Promise>");
+        vm.label("_fr_date");
+        litRet("[object Date]");
+        vm.label("_fr_regexp");
+        litRet("[object RegExp]");
+        vm.label("_fr_gen");
+        litRet("[object Generator]");
+        vm.label("_fr_ab");
+        litRet("#<ArrayBuffer>");
+        vm.label("_fr_dv");
+        litRet("#<DataView>");
+        vm.label("_fr_sym");
+        vm.mov(VReg.A0, VReg.S1);                 // 裸 Symbol 指针
+        vm.call("_symbol_to_string");
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_fr_obj");
+        vm.mov(VReg.A0, VReg.S0);                 // 装箱原值(0x7FFD 才查得到品牌)
+        vm.call("_is_asmjs_err");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_fr_err");
+        // [I2 红队 F2] RegExp 品牌:__RE_new 产物持有 __isRegExp 自有槽
+        // (判别法与 _object_proto_toString 一致:存在性检查,不读值)。
+        vm.mov(VReg.A0, VReg.S0);
+        vm.lea(VReg.A1, vm.asm.addString("__isRegExp"));
+        vm.movImm64(VReg.V1, STRTAG_I2);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_fr_regexp");
+        // [I2 红队 F3] 物化原型单例身份比较:V8 "%r" 对 X.prototype 打构造器
+        // 品牌(#<Map>/#<Set>/#<Promise>)。槽由运行时无条件登记(map/set/promise
+        // 生成器),未物化时为 0 必不匹配。Object.create(proto)/Object.create(null)
+        // 本仓对象无原型链不可辨 → "#<Object>",记偏差(Node 分别 #<Map>/[object Object])。
+        vm.lea(VReg.V0, "_nsobj_map_proto");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmp(VReg.V0, VReg.S0);
+        vm.jeq("_fr_lit_map");
+        vm.lea(VReg.V0, "_nsobj_set_proto");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmp(VReg.V0, VReg.S0);
+        vm.jeq("_fr_lit_set");
+        vm.lea(VReg.V0, "_nsobj_promise_proto");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmp(VReg.V0, VReg.S0);
+        vm.jeq("_fr_promise");
+        vm.label("_fr_lit_object");
+        litRet("#<Object>");
+        vm.label("_fr_err");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_error_to_str");
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_fr_ta_i8");
+        litRet("[object Int8Array]");
+        vm.label("_fr_ta_i16");
+        litRet("[object Int16Array]");
+        vm.label("_fr_ta_i32");
+        litRet("[object Int32Array]");
+        vm.label("_fr_ta_bi64");
+        litRet("[object BigInt64Array]");
+        vm.label("_fr_ta_u8");
+        litRet("[object Uint8Array]");
+        vm.label("_fr_ta_u16");
+        litRet("[object Uint16Array]");
+        vm.label("_fr_ta_u32");
+        litRet("[object Uint32Array]");
+        vm.label("_fr_ta_bu64");
+        litRet("[object BigUint64Array]");
+        vm.label("_fr_ta_u8c");
+        litRet("[object Uint8ClampedArray]");
+        vm.label("_fr_ta_f32");
+        litRet("[object Float32Array]");
+        vm.label("_fr_ta_f64");
+        litRet("[object Float64Array]");
+
+        // _aref_throw_incompat(A0 = 接收者, A1 = 装箱前缀串):消息 = 前缀 +
+        // _fmt_receiver(接收者),抛 TypeError,不返回。守卫失败桩的公共出口。
+        vm.label("_aref_throw_incompat");
+        vm.prologue(16, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S1, VReg.A1);                 // S1 = 前缀
+        vm.call("_fmt_receiver");                 // A0 = 接收者 → RET = 格式化串
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_strconcat");                    // RET = 完整消息
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_throw_type_error");             // 不返回
+        vm.epilogue([VReg.S0, VReg.S1], 16);      // 理论不达
+
+        // _aref_throw_not_ctor(A0 = 接收者):消息 = _fmt_receiver(接收者) +
+        // " is not a constructor",抛 TypeError,不返回。Promise 静态守卫的失败出口
+        // (this 是对象但非 %Promise% 构造器)。
+        vm.label("_aref_throw_not_ctor");
+        vm.prologue(16, [VReg.S0]);
+        vm.call("_fmt_receiver");                 // A0 = 接收者 → RET = 格式化串
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, vm.asm.addString(" is not a constructor"));
+        vm.movImm64(VReg.V1, STRTAG_I2);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_strconcat");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_throw_type_error");             // 不返回
+        vm.epilogue([VReg.S0], 16);               // 理论不达
     }
 }

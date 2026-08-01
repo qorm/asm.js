@@ -244,18 +244,216 @@ export class DateGenerator {
         // _date_getTime - 获取 Date 对象的时间戳
         // A0 = Date 值(装箱 0x7ffd 或裸指针)
         vm.label("_date_getTime");
-        // [#62] 脱壳:装箱 Date 高16=0x7ffd,直接 load 会解引用被污染地址而崩。
-        vm.emitMaskLoad(VReg.V1);
-        vm.andMaskReg(VReg.A0, VReg.A0, VReg.V1);
-        vm.load(VReg.RET, VReg.A0, 8);
-        vm.ret();
+        // [Date 加固] this 类型检查:原型方法 .call({})/.call(null) 等非 Date 接收者
+        // 抛 TypeError("this is not a Date object."),不再无防护读 [this+8](段错误根因)。
+        vm.prologue(0, []);
+        vm.call("_date_this_get"); // RET = 裸 date 指针(非 Date 不返回)
+        vm.load(VReg.RET, VReg.RET, 8);
+        vm.epilogue([], 0);
 
-        // _date_toString - 返回日期字符串
-        // A0 = Date 对象指针
-        // 返回: 字符串指针（与 toISOString 相同格式）
+        // _date_toString - "Www Mmm DD YYYY HH:mm:ss GMT+0000 (Coordinated Universal Time)"
+        // A0 = Date 值(装箱 0x7ffd 或裸指针;非 Date 接收者 → TypeError,见 _date_this_named)。
+        // 与 node 逐字对齐的 V8 格式:星期/月英文缩写、日/时/分/秒 2 位前导零、
+        // 年份 0..9999 四位前导零、负年 '-' + ≥4 位、>9999 无符号直写(注意:toString 不打
+        // '+' —— ±YYYYYY 扩展形只属 toISOString/解析,见 _date_toISOString/_date_parse_iso)。
+        // Invalid Date(timestamp NaN/±Inf)→ "Invalid Date"。本运行时全 UTC,时区段恒定。
         vm.label("_date_toString");
-        // 直接调用 toISOString 返回格式化字符串
-        vm.jmp("_date_toISOString");
+        vm.prologue(96, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.lea(VReg.A1, vm.asm.addString("toString"));
+        vm.call("_date_this_named"); // RET = 裸 date 指针(非 Date 不返回)
+        vm.store(VReg.SP, 40, VReg.RET);
+        // Invalid Date:timestamp 指数全 1(NaN/±Inf)→ "Invalid Date"
+        vm.load(VReg.V1, VReg.RET, 8);
+        vm.shrImm(VReg.V0, VReg.V1, 52);
+        vm.andImm(VReg.V0, VReg.V0, 0x7ff);
+        vm.cmpImm(VReg.V0, 0x7ff);
+        vm.jne("_dts_valid");
+        vm.lea(VReg.A0, vm.asm.addString("Invalid Date"));
+        vm.call("_cstr_to_heap_str");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 96);
+        vm.label("_dts_valid");
+        // 经 _date_get_part 逐字段拆解(get_part 会破坏 S3-S5,全部经栈中转,布局同 toISOString)
+        // 栈: [8]sec [16]min [24]hour [32]strblock [40]date [48]year [56]month0 [64]day [72]dow
+        //     [80]digits [88]sign
+        vm.load(VReg.A0, VReg.SP, 40); vm.movImm(VReg.A1, 5); vm.call("_date_get_part"); vm.store(VReg.SP, 8, VReg.RET);
+        vm.load(VReg.A0, VReg.SP, 40); vm.movImm(VReg.A1, 4); vm.call("_date_get_part"); vm.store(VReg.SP, 16, VReg.RET);
+        vm.load(VReg.A0, VReg.SP, 40); vm.movImm(VReg.A1, 3); vm.call("_date_get_part"); vm.store(VReg.SP, 24, VReg.RET);
+        vm.load(VReg.A0, VReg.SP, 40); vm.movImm(VReg.A1, 0); vm.call("_date_get_part"); vm.store(VReg.SP, 48, VReg.RET);
+        vm.load(VReg.A0, VReg.SP, 40); vm.movImm(VReg.A1, 1); vm.call("_date_get_part"); vm.store(VReg.SP, 56, VReg.RET);
+        vm.load(VReg.A0, VReg.SP, 40); vm.movImm(VReg.A1, 2); vm.call("_date_get_part"); vm.store(VReg.SP, 64, VReg.RET);
+        vm.load(VReg.A0, VReg.SP, 40); vm.movImm(VReg.A1, 6); vm.call("_date_get_part"); vm.store(VReg.SP, 72, VReg.RET);
+
+        // 年字段宽度:V1=sign(负年 1),V2=digits(负年/0..9999 至少 4 位,>9999 按实际位数)
+        vm.load(VReg.V0, VReg.SP, 48); // year
+        vm.movImm(VReg.V1, 0); // sign
+        vm.cmpImm(VReg.V0, 0);
+        vm.jge("_dts_abs_done");
+        vm.movImm(VReg.V1, 1);
+        vm.mov(VReg.V2, VReg.V0);
+        vm.movImm(VReg.V0, 0);
+        vm.sub(VReg.V0, VReg.V0, VReg.V2); // ay = -year(dest==a 既有形态)
+        vm.label("_dts_abs_done");
+        // ndig(ay):V2 = 十进制位数(ay=0 得 1,由下方 4 位规则兜底)
+        vm.movImm(VReg.V2, 1);
+        vm.mov(VReg.V3, VReg.V0);
+        vm.movImm(VReg.V4, 10);
+        vm.label("_dts_nd_loop");
+        vm.cmpImm(VReg.V3, 10);
+        vm.jlt("_dts_nd_done");
+        vm.div(VReg.V3, VReg.V3, VReg.V4);
+        vm.addImm(VReg.V2, VReg.V2, 1);
+        vm.jmp("_dts_nd_loop");
+        vm.label("_dts_nd_done");
+        vm.load(VReg.V3, VReg.SP, 48); // year
+        vm.cmpImm(VReg.V3, 0);
+        vm.jlt("_dts_pad4");
+        vm.cmpImm(VReg.V3, 9999);
+        vm.jgt("_dts_d_done");
+        vm.label("_dts_pad4");
+        vm.cmpImm(VReg.V2, 4);
+        vm.jge("_dts_d_done");
+        vm.movImm(VReg.V2, 4);
+        vm.label("_dts_d_done");
+        vm.store(VReg.SP, 80, VReg.V2); // digits
+        vm.store(VReg.SP, 88, VReg.V1); // sign
+
+        // 总长 len = 58 + digits + sign("Www Mmm DD " 11 + 年字段 + " " 1 + "HH:mm:ss" 8
+        // + " GMT+0000 (Coordinated Universal Time)" 38);size = align8(16 + len + 1)
+        vm.load(VReg.V0, VReg.SP, 80);
+        vm.load(VReg.V1, VReg.SP, 88);
+        vm.add(VReg.V0, VReg.V0, VReg.V1);
+        vm.addImm(VReg.V0, VReg.V0, 75);
+        vm.addImm(VReg.V0, VReg.V0, 7);
+        vm.movImm64(VReg.V1, 0xfffffffffffffff8n);
+        vm.and(VReg.V0, VReg.V0, VReg.V1);
+        vm.mov(VReg.A0, VReg.V0);
+        vm.call("_alloc");
+        vm.store(VReg.SP, 32, VReg.RET); // 字符串块指针落栈(alloc 后寄存器即毁)
+
+        // 字符串头:[type=6 保高位][length](与 toISOString 同款,保 GC size/mark 高位)
+        vm.load(VReg.S0, VReg.SP, 32);
+        vm.load(VReg.V0, VReg.S0, 0);
+        vm.movImm64(VReg.V1, 0xffffffffffffff00n);
+        vm.and(VReg.V0, VReg.V0, VReg.V1);
+        vm.movImm(VReg.V1, TYPE_STRING);
+        vm.or(VReg.V0, VReg.V0, VReg.V1);
+        vm.store(VReg.S0, 0, VReg.V0);
+        vm.load(VReg.V0, VReg.SP, 80);
+        vm.load(VReg.V1, VReg.SP, 88);
+        vm.add(VReg.V0, VReg.V0, VReg.V1);
+        vm.addImm(VReg.V0, VReg.V0, 58);
+        vm.store(VReg.S0, 8, VReg.V0);
+
+        // S1 = 内容起始(block+16);S3=year S4=month0 S5=day(写入函数均为叶子,不毁 S)
+        vm.load(VReg.S1, VReg.SP, 32);
+        vm.addImm(VReg.S1, VReg.S1, 16);
+        vm.load(VReg.S3, VReg.SP, 48);
+        vm.load(VReg.S4, VReg.SP, 56);
+        vm.load(VReg.S5, VReg.SP, 64);
+
+        // [0..2] 星期缩写("SunMonTueWedThuFriSat" + dow*3)
+        vm.load(VReg.V1, VReg.SP, 72);
+        vm.movImm(VReg.V2, 3);
+        vm.mul(VReg.V1, VReg.V1, VReg.V2);
+        vm.lea(VReg.V0, vm.asm.addString("SunMonTueWedThuFriSat"));
+        vm.add(VReg.V0, VReg.V0, VReg.V1);
+        vm.loadByte(VReg.V1, VReg.V0, 0);
+        vm.storeByte(VReg.S1, 0, VReg.V1);
+        vm.loadByte(VReg.V1, VReg.V0, 1);
+        vm.storeByte(VReg.S1, 1, VReg.V1);
+        vm.loadByte(VReg.V1, VReg.V0, 2);
+        vm.storeByte(VReg.S1, 2, VReg.V1);
+        // [3] ' '
+        vm.movImm(VReg.V0, 32);
+        vm.storeByte(VReg.S1, 3, VReg.V0);
+        // [4..6] 月缩写("JanFeb...Dec" + month0*3)
+        vm.movImm(VReg.V2, 3);
+        vm.mul(VReg.V1, VReg.S4, VReg.V2);
+        vm.lea(VReg.V0, vm.asm.addString("JanFebMarAprMayJunJulAugSepOctNovDec"));
+        vm.add(VReg.V0, VReg.V0, VReg.V1);
+        vm.loadByte(VReg.V1, VReg.V0, 0);
+        vm.storeByte(VReg.S1, 4, VReg.V1);
+        vm.loadByte(VReg.V1, VReg.V0, 1);
+        vm.storeByte(VReg.S1, 5, VReg.V1);
+        vm.loadByte(VReg.V1, VReg.V0, 2);
+        vm.storeByte(VReg.S1, 6, VReg.V1);
+        // [7] ' '
+        vm.movImm(VReg.V0, 32);
+        vm.storeByte(VReg.S1, 7, VReg.V0);
+        // [8..9] 日(2 位)
+        vm.addImm(VReg.A0, VReg.S1, 8);
+        vm.mov(VReg.A1, VReg.S5);
+        vm.call("_write_int_padded_2");
+        // [10] ' '
+        vm.movImm(VReg.V0, 32);
+        vm.storeByte(VReg.S1, 10, VReg.V0);
+        // [11] 起年字段(可选 '-' + digits 位,_date_write_num_rev 自带前导零)
+        vm.load(VReg.V1, VReg.SP, 88);
+        vm.cmpImm(VReg.V1, 1);
+        vm.jne("_dts_y_nosign");
+        vm.movImm(VReg.V0, 45); // '-'
+        vm.storeByte(VReg.S1, 11, VReg.V0);
+        vm.label("_dts_y_nosign");
+        vm.load(VReg.V1, VReg.SP, 88);
+        vm.addImm(VReg.A0, VReg.S1, 11);
+        vm.add(VReg.A0, VReg.A0, VReg.V1); // A0 = 年数字起始(x64 V1==A3,A3 无活值)
+        vm.mov(VReg.A1, VReg.S3); // year
+        vm.cmpImm(VReg.S3, 0);
+        vm.jge("_dts_y_abs");
+        vm.mov(VReg.V2, VReg.A1);
+        vm.movImm(VReg.A1, 0);
+        vm.sub(VReg.A1, VReg.A1, VReg.V2); // A1 = |year|(x64 V2==A2,此后才装 A2)
+        vm.label("_dts_y_abs");
+        vm.load(VReg.A2, VReg.SP, 80); // digits
+        vm.call("_date_write_num_rev");
+
+        // S2 = 时间基址 = content + 12 + ylen(' ' 在其前一格;不用负偏移 storeByte)
+        vm.load(VReg.V0, VReg.SP, 80);
+        vm.load(VReg.V1, VReg.SP, 88);
+        vm.add(VReg.V0, VReg.V0, VReg.V1);
+        vm.addImm(VReg.S2, VReg.S1, 12);
+        vm.add(VReg.S2, VReg.S2, VReg.V0);
+        vm.movImm(VReg.V0, 32); // ' '
+        vm.subImm(VReg.V1, VReg.S2, 1);
+        vm.storeByte(VReg.V1, 0, VReg.V0);
+        // HH:mm:ss(2 位 ×3,':' 分隔)
+        vm.mov(VReg.A0, VReg.S2);
+        vm.load(VReg.A1, VReg.SP, 24); // hour
+        vm.call("_write_int_padded_2");
+        vm.movImm(VReg.V0, 58); // ':'
+        vm.storeByte(VReg.S2, 2, VReg.V0);
+        vm.addImm(VReg.A0, VReg.S2, 3);
+        vm.load(VReg.A1, VReg.SP, 16); // min
+        vm.call("_write_int_padded_2");
+        vm.movImm(VReg.V0, 58);
+        vm.storeByte(VReg.S2, 5, VReg.V0);
+        vm.addImm(VReg.A0, VReg.S2, 6);
+        vm.load(VReg.A1, VReg.SP, 8); // sec
+        vm.call("_write_int_padded_2");
+        // " GMT+0000 (Coordinated Universal Time)"(38 字节)@ time+8
+        vm.lea(VReg.V0, vm.asm.addString(" GMT+0000 (Coordinated Universal Time)"));
+        vm.addImm(VReg.V1, VReg.S2, 8);
+        vm.movImm(VReg.V2, 38);
+        vm.label("_dts_tail_loop");
+        vm.loadByte(VReg.V3, VReg.V0, 0);
+        vm.storeByte(VReg.V1, 0, VReg.V3);
+        vm.addImm(VReg.V0, VReg.V0, 1);
+        vm.addImm(VReg.V1, VReg.V1, 1);
+        vm.subImm(VReg.V2, VReg.V2, 1);
+        vm.cmpImm(VReg.V2, 0);
+        vm.jne("_dts_tail_loop");
+        // NUL @ time+46(= 58+ylen)
+        vm.movImm(VReg.V0, 0);
+        vm.storeByte(VReg.S2, 46, VReg.V0);
+
+        // 返回装箱字符串值(content|0x7FFC,与 _date_toISOString 尾部同式)
+        vm.load(VReg.RET, VReg.SP, 32);
+        vm.addImm(VReg.RET, VReg.RET, 16);
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.RET, VReg.RET, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 96);
 
         // 生成 toISOString 相关辅助函数
         this.generateToISOString();
@@ -331,12 +529,15 @@ export class DateGenerator {
         vm.epilogue([VReg.S0], 128);
 
         // getter 族 wrapper:_aref_generic 把 this 插 A0、用户实参上移( getter 无视之)。
-        // 各 wrapper 覆写 A1 = part 码、调 _date_get_part(返裸 int)、装箱成 number。
+        // [Date 加固] 先经 _date_this_get 校验接收者(非 Date 抛 TypeError,不再无防护读
+        // [this+8])。各 wrapper 覆写 A1 = part 码、调 _date_get_part(返裸 int)、装箱成 number。
         // part: 0=year 1=month(0基) 2=date 3=hours 4=minutes 5=seconds 6=day-of-week 7=ms。
         // UTC 变体与本地变体同 part(本运行时全 UTC)→ 两名共享同一 wrapper。
         for (let part = 0; part <= 7; part = part + 1) {
             vm.label("_aref_date_gp" + part);
             vm.prologue(0, []);
+            vm.call("_date_this_get"); // 非 Date 抛 TypeError;RET = 裸 date 指针
+            vm.mov(VReg.A0, VReg.RET);
             vm.movImm(VReg.A1, part);
             vm.call("_date_get_part"); // RET = 裸 int
             vm.scvtf(0, VReg.RET);
@@ -344,41 +545,324 @@ export class DateGenerator {
             vm.epilogue([], 0);
         }
 
-        // setter 族 wrapper(单字段;多字段 setFullYear(y,m,d) 等经值调用仅设首字段,
-        // 记偏差——直调经 functions.js 的 _date_set_parts 原子多字段快路)。A1=装箱值
-        // → _aref_argint 转裸 int(undefined→0),A1=part,调 _date_set_part(返新 ms 的
-        // 裸 float 位,本身即 number)。part: 0=year 1=month0 2=date 3=h 4=mi 5=s 6=ms。
+        // setter 族 wrapper(原子多字段,_date_set_parts;直调仍经 functions.js 内联快路)。
+        // [Date 加固] ①接收者经 _date_this_named 校验(非 Date 按 V8 文案抛 TypeError;
+        // UTC 变体共享 wrapper,消息用基名,记偏差)。②实参由 _aref_argint 换成 _number_coerce
+        // 真 ToNumber(对象 valueOf/字符串数字强转/null→0/bool/undefined→NaN),按 [_call_argc]
+        // 供给个数逐位强转(顺序与规范一致),缺省位取现字段(_date_set_parts 只覆写前 count 槽);
+        // 任一位 NaN/±Inf(指数全 1)→ timestamp 写 NaN 并返回 NaN(Invalid Date)。
+        // part: 0=year 1=month0 2=date 3=h 4=mi 5=s 6=ms;max 为各 setter 形参上限。
+        // 栈: [0..32]A1-A5 实参 [40..64]values(≤4) —— 帧 96。
+        const SP_NAMES = ["setFullYear", "setMonth", "setDate", "setHours", "setMinutes", "setSeconds", "setMilliseconds"];
+        const SP_MAX = [3, 2, 1, 4, 3, 2, 1];
         for (let part = 0; part <= 6; part = part + 1) {
-            vm.label("_aref_date_sp" + part);
-            vm.prologue(0, [VReg.S0]);
-            vm.mov(VReg.S0, VReg.A0);  // date
-            vm.mov(VReg.A0, VReg.A1);  // 装箱值
-            vm.call("_aref_argint");   // RET = 裸 int
-            vm.mov(VReg.A2, VReg.RET);
-            vm.mov(VReg.A0, VReg.S0);  // date
+            const maxA = SP_MAX[part];
+            const L = "_aref_date_sp" + part;
+            vm.label(L);
+            vm.prologue(96, [VReg.S0, VReg.S1, VReg.S2]);
+            // 实参先落栈(_date_this_named/_number_coerce 毁 A 寄存器)
+            vm.store(VReg.SP, 0, VReg.A1);
+            vm.store(VReg.SP, 8, VReg.A2);
+            vm.store(VReg.SP, 16, VReg.A3);
+            vm.store(VReg.SP, 24, VReg.A4);
+            vm.store(VReg.SP, 32, VReg.A5);
+            vm.lea(VReg.A1, vm.asm.addString(SP_NAMES[part]));
+            vm.call("_date_this_named"); // 非 Date 抛 TypeError;RET = 裸 date 指针
+            vm.mov(VReg.S0, VReg.RET);
+            // [Date 加固] t=[[DateValue]] 读取时点(V8 实测对齐,落 [SP+72] 供 A4):
+            //  part 1..6:全部强转**前**读(ES 顺序);且 t 指数全 1 → S2=1(Invalid:强转
+            //   照做保副作用,返 NaN 且【不写回】)。
+            //  part=0(setFullYear):**year 强转后、month/date 强转前**读(V8:year 的
+            //   valueOf 改 t 影响缺省月日,month 的 valueOf 改 t 不影响);NaN→+0 由
+            //   _date_set_parts_t 内 fcvtzs(NaN)=0 天然满足,不置 S2。
+            vm.movImm(VReg.S2, 0);
+            if (part !== 0) {
+                vm.load(VReg.V0, VReg.S0, 8);
+                vm.store(VReg.SP, 72, VReg.V0);
+                vm.shrImm(VReg.V1, VReg.V0, 52);
+                vm.andImm(VReg.V1, VReg.V1, 0x7ff);
+                vm.cmpImm(VReg.V1, 0x7ff);
+                vm.jne(L + "_fresh");
+                vm.movImm(VReg.S2, 1);
+                vm.label(L + "_fresh");
+            }
+            // count = min(supplied, max);零参按 1(arg0=padded undefined → NaN)
+            vm.lea(VReg.V1, "_call_argc");
+            vm.load(VReg.S1, VReg.V1, 0);
+            vm.cmpImm(VReg.S1, 1);
+            vm.jge(L + "_c1");
+            vm.movImm(VReg.S1, 1);
+            vm.jmp(L + "_cok");
+            vm.label(L + "_c1");
+            vm.cmpImm(VReg.S1, maxA);
+            vm.jle(L + "_cok");
+            vm.movImm(VReg.S1, maxA);
+            vm.label(L + "_cok");
+            // 逐位 ToNumber → int → values[i](生成器展开;count 连续,i>=count 直落调用)
+            for (let i = 0; i < maxA; i = i + 1) {
+                vm.cmpImm(VReg.S1, i + 1);
+                vm.jlt(L + "_call");
+                vm.load(VReg.A0, VReg.SP, i * 8);
+                vm.call("_number_coerce"); // RET = float64 位(先于任何用户 valueOf 读 argc)
+                vm.shrImm(VReg.V1, VReg.RET, 52);
+                vm.andImm(VReg.V1, VReg.V1, 0x7ff);
+                vm.cmpImm(VReg.V1, 0x7ff);
+                vm.jeq(L + "_nan");
+                vm.fmovToFloat(0, VReg.RET);
+                vm.fcvtzs(VReg.V0, 0); // 向零截断
+                vm.store(VReg.SP, 40 + i * 8, VReg.V0);
+                if (part === 0 && i === 0) {
+                    // setFullYear:V8 于 year 强转后读 t(见上)
+                    vm.load(VReg.V0, VReg.S0, 8);
+                    vm.store(VReg.SP, 72, VReg.V0);
+                }
+            }
+            vm.label(L + "_call");
+            vm.cmpImm(VReg.S2, 1);
+            vm.jeq(L + "_nan"); // 强转前已 Invalid → 由 _nan 分流到不写回支路
+            vm.mov(VReg.A0, VReg.S0);
             vm.movImm(VReg.A1, part);
-            vm.call("_date_set_part"); // RET = 新 ms(裸 float 位 = number)
-            vm.epilogue([VReg.S0], 0);
+            vm.mov(VReg.A2, VReg.S1);
+            vm.addImm(VReg.A3, VReg.SP, 40); // valuesPtr
+            vm.load(VReg.A4, VReg.SP, 72);   // t(读取时点按 part 分流,见上)
+            vm.call("_date_set_parts_t");  // RET = 新 ms(裸 float 位 = number)
+            vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 96);
+            vm.label(L + "_nan");
+            // 强转得 NaN(t 有效)→ 规范写回 NaN;强转前已 Invalid(S2=1)→ 规范只
+            // return NaN,【不写】[[DateValue]](valueOf 副作用对时间戳的修复必须保留)。
+            vm.cmpImm(VReg.S2, 1);
+            vm.jeq(L + "_inv");
+            vm.movImm64(VReg.RET, 0x7ff0000000000001n); // 非别名 NaN(同 _dp_invalid)
+            vm.store(VReg.S0, 8, VReg.RET);
+            vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 96);
+            vm.label(L + "_inv");
+            vm.movImm64(VReg.RET, 0x7ff0000000000001n);
+            vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 96);
         }
 
-        // setTime wrapper:直写 timestamp,返回新 ms(number)。x64 上 V1==RCX==A1,
-        // emitMaskLoad(V1) 会冲掉装箱 ms,故先存 S0。
+        // setTime wrapper:ToNumber 实参 + TimeClip(NaN/±Inf 或 |v|>8.64e15 → Invalid Date
+        // 写 NaN 返回 NaN),否则向零截断写回 timestamp 并返回新 ms(number)。
         vm.label("_aref_date_setTime");
-        vm.prologue(0, [VReg.S0]);
-        vm.mov(VReg.S0, VReg.A1);                  // 新 ms(number 的 float 位)
-        vm.emitMaskLoad(VReg.V1);
-        vm.andMaskReg(VReg.A0, VReg.A0, VReg.V1);  // 裸 date 指针
-        vm.store(VReg.A0, 8, VReg.S0);
-        vm.mov(VReg.RET, VReg.S0);
-        vm.epilogue([VReg.S0], 0);
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S1, VReg.A1);                  // 装箱新 ms
+        vm.lea(VReg.A1, vm.asm.addString("setTime"));
+        vm.call("_date_this_named");               // RET = 裸 date 指针
+        vm.mov(VReg.S0, VReg.RET);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_number_coerce");                 // RET = ToNumber 的 float64 位
+        vm.shrImm(VReg.V1, VReg.RET, 52);
+        vm.andImm(VReg.V1, VReg.V1, 0x7ff);
+        vm.cmpImm(VReg.V1, 0x7ff);
+        vm.jeq("_aref_date_setTime_nan");
+        // |v| > 8.64e15 → Invalid(fcmp 比较,守 §1.2 不用整数比 float 位)
+        vm.movImm64(VReg.V1, 0x7fffffffffffffffn);
+        vm.and(VReg.V2, VReg.RET, VReg.V1);        // V2 = |v| 位(x64 V2==A2,A2 无活值)
+        vm.movImm64(VReg.V1, 0x433eb208c2dc0000n); // 8.64e15
+        vm.fmovToFloat(0, VReg.V2);
+        vm.fmovToFloat(1, VReg.V1);
+        vm.fcmp(0, 1);
+        vm.jfgt("_aref_date_setTime_nan");
+        vm.fmovToFloat(0, VReg.RET);
+        vm.fcvtzs(VReg.V2, 0);                     // 向零截断
+        vm.scvtf(0, VReg.V2);
+        vm.fmovToInt(VReg.RET, 0);
+        vm.store(VReg.S0, 8, VReg.RET);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_aref_date_setTime_nan");
+        vm.movImm64(VReg.RET, 0x7ff0000000000001n);
+        vm.store(VReg.S0, 8, VReg.RET);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
 
         // getTimezoneOffset wrapper:本运行时全 UTC,恒返回装箱 0(同 compileDateMethod)。
+        // [Date 加固] 仍先校验接收者(非 Date 抛 TypeError,与 node 一致)。
         vm.label("_aref_date_tzoffset");
         vm.prologue(0, []);
+        vm.call("_date_this_get"); // 仅校验(this 丢弃;非 Date 不返回)
         vm.movImm(VReg.RET, 0);
         vm.scvtf(0, VReg.RET);
         vm.fmovToInt(VReg.RET, 0);
         vm.epilogue([], 0);
+
+        // ── [Date 加固] this 校验族 ────────────────────────────────────────────
+        // _date_this_ptr(A0=装箱 0x7ffd 或裸堆指针)→ RET=裸 Date 指针;否则 RET=0。
+        // 裸指针先验堆界再读类型字节(小整数/浮点载荷绝不解引用)。
+        vm.label("_date_this_ptr");
+        vm.shrImm(VReg.V1, VReg.A0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFD);
+        vm.jeq("_dtp_boxed");
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_dtp_no");
+        vm.lea(VReg.V1, "_heap_base");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.A0, VReg.V1);
+        vm.jlt("_dtp_no");
+        vm.lea(VReg.V1, "_heap_ptr");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.A0, VReg.V1);
+        vm.jge("_dtp_no");
+        vm.mov(VReg.RET, VReg.A0);
+        vm.jmp("_dtp_type");
+        vm.label("_dtp_boxed");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.RET, VReg.A0, VReg.V1);
+        vm.label("_dtp_type");
+        vm.loadByte(VReg.V1, VReg.RET, 0);
+        vm.cmpImm(VReg.V1, 7); // TYPE_DATE
+        vm.jne("_dtp_no");
+        vm.ret();
+        vm.label("_dtp_no");
+        vm.movImm(VReg.RET, 0);
+        vm.ret();
+
+        // _date_this_get(A0=接收者)→ RET=裸 Date 指针;非 Date 抛 TypeError
+        // "this is not a Date object."(getter 族 V8 文案,逐字;不返回)。
+        vm.label("_date_this_get");
+        vm.prologue(0, []);
+        vm.call("_date_this_ptr");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_dtg_ok");
+        vm.lea(VReg.A0, vm.asm.addString("this is not a Date object."));
+        vm.call("_cstr_to_heap_str");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_throw_type_error"); // 不返回
+        vm.label("_dtg_ok");
+        vm.epilogue([], 0);
+
+        // _date_this_named(A0=接收者, A1=方法名 cstr)→ RET=裸 Date 指针;非 Date 按
+        // V8 文案抛 TypeError "Method Date.prototype.<name> called on incompatible
+        // receiver <desc>"(desc 见 _date_recv_desc;不返回)。
+        vm.label("_date_this_named");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.mov(VReg.S0, VReg.A0); // recv
+        vm.mov(VReg.S1, VReg.A1); // name cstr
+        vm.call("_date_this_ptr");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_dtn_bad");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+        vm.label("_dtn_bad");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_date_recv_desc"); // RET = 接收者描述(装箱串)
+        vm.mov(VReg.S2, VReg.RET);
+        vm.lea(VReg.A0, vm.asm.addString("Method Date.prototype."));
+        vm.call("_cstr_to_heap_str");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1); // name cstr → 装箱(同 _throw_read_nullish 的 boxStr 式)
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A1, VReg.A1, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_strconcat");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, vm.asm.addString(" called on incompatible receiver "));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A1, VReg.A1, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_strconcat");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S2);
+        vm.call("_strconcat");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_throw_type_error"); // 不返回
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0); // 理论不达
+
+        // _date_recv_desc(A0=接收者)→ RET=V8 "incompatible receiver" 消息里的接收者
+        // 描述(装箱串):null/undefined/true/false/字符串本体/"#<Object>"(plain 对象)/
+        // "[object Array]"/"Symbol()"/数字 ToString;函数无法复现源码文本 → "#<Function>"
+        // (记偏差),Object.create(Date.prototype) 等原型形态无法区分 → "#<Object>"(记偏差)。
+        vm.label("_date_recv_desc");
+        vm.prologue(0, [VReg.S0]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.shrImm(VReg.V1, VReg.A0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFA);
+        vm.jne("_drd_n1");
+        vm.lea(VReg.A0, vm.asm.addString("null"));
+        vm.jmp("_drd_cstr");
+        vm.label("_drd_n1");
+        vm.cmpImm(VReg.V1, 0x7FFB);
+        vm.jne("_drd_n2");
+        vm.lea(VReg.A0, vm.asm.addString("undefined"));
+        vm.jmp("_drd_cstr");
+        vm.label("_drd_n2");
+        vm.cmpImm(VReg.V1, 0x7FF9);
+        vm.jne("_drd_n3");
+        vm.movImm64(VReg.V1, 0x7ff9000000000001n); // JS_TRUE
+        vm.cmp(VReg.S0, VReg.V1);
+        vm.jne("_drd_false");
+        vm.lea(VReg.A0, vm.asm.addString("true"));
+        vm.jmp("_drd_cstr");
+        vm.label("_drd_false");
+        vm.lea(VReg.A0, vm.asm.addString("false"));
+        vm.jmp("_drd_cstr");
+        vm.label("_drd_n3");
+        vm.cmpImm(VReg.V1, 0x7FFC);
+        vm.jne("_drd_n4");
+        vm.mov(VReg.RET, VReg.S0); // 字符串接收者:消息嵌本体
+        vm.epilogue([VReg.S0], 0);
+        vm.label("_drd_n4");
+        vm.cmpImm(VReg.V1, 0x7FFE);
+        vm.jne("_drd_n5");
+        vm.lea(VReg.A0, vm.asm.addString("[object Array]"));
+        vm.jmp("_drd_cstr");
+        vm.label("_drd_n5");
+        vm.cmpImm(VReg.V1, 0x7FFD);
+        vm.jne("_drd_n6");
+        vm.lea(VReg.A0, vm.asm.addString("#<Object>"));
+        vm.jmp("_drd_cstr");
+        vm.label("_drd_n6");
+        vm.cmpImm(VReg.V1, 0x7FFF);
+        vm.jne("_drd_n7");
+        vm.lea(VReg.A0, vm.asm.addString("#<Function>"));
+        vm.jmp("_drd_cstr");
+        vm.label("_drd_n7");
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_drd_num");
+        // 裸指针:堆内且类型字节 61(TYPE_SYMBOL)→ "Symbol()";其余 "#<Object>"
+        vm.lea(VReg.V1, "_heap_base");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.S0, VReg.V1);
+        vm.jlt("_drd_obj");
+        vm.lea(VReg.V1, "_heap_ptr");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.S0, VReg.V1);
+        vm.jge("_drd_obj");
+        vm.loadByte(VReg.V1, VReg.S0, 0);
+        vm.cmpImm(VReg.V1, 61);
+        vm.jne("_drd_obj");
+        vm.lea(VReg.A0, vm.asm.addString("Symbol()"));
+        vm.jmp("_drd_cstr");
+        vm.label("_drd_obj");
+        vm.lea(VReg.A0, vm.asm.addString("#<Object>"));
+        vm.jmp("_drd_cstr");
+        vm.label("_drd_num");
+        // 数字(装箱 int32 0x7FF8 / float64 位)→ ToString("42"/"2.5"/"NaN")
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_valueToStr");
+        vm.epilogue([VReg.S0], 0);
+        vm.label("_drd_cstr");
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.RET, VReg.A0, VReg.V1);
+        vm.epilogue([VReg.S0], 0);
+
+        // _date_write_num_rev(A0=目标地址, A1=值(≥0), A2=位数)→ 十进制右起写入,
+        // 自带前导零(年字段用:4/6 位定宽与 >4 位变长同一形态,免复制大段 padded 族)。
+        // 叶子;V3=10,V4=地址,V5=数字位,镜像 _write_int_padded_* 的 div/mod 寄存器分工。
+        vm.label("_date_write_num_rev");
+        vm.movImm(VReg.V3, 10);
+        vm.label("_dwnr_loop");
+        vm.cmpImm(VReg.A2, 0);
+        vm.jle("_dwnr_done");
+        vm.subImm(VReg.A2, VReg.A2, 1);
+        vm.add(VReg.V4, VReg.A0, VReg.A2); // &pos[i]
+        vm.mod(VReg.V5, VReg.A1, VReg.V3); // 个位
+        vm.addImm(VReg.V5, VReg.V5, 48);   // +'0'
+        vm.storeByte(VReg.V4, 0, VReg.V5);
+        vm.div(VReg.A1, VReg.A1, VReg.V3);
+        vm.jmp("_dwnr_loop");
+        vm.label("_dwnr_done");
+        vm.ret();
     }
 
     // 生成 _date_toISOString 函数
@@ -392,10 +876,14 @@ export class DateGenerator {
         vm.label("_date_toISOString");
         vm.prologue(96, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
 
+        // [Date 加固] this 检查:原型方法 .call({}) 等非 Date 接收者按 V8 文案抛
+        // TypeError,不再无防护读 [this+8]。直调/打印/JSON 桥路径传入的都是真 Date,直通。
+        vm.lea(VReg.A1, vm.asm.addString("toISOString"));
+        vm.call("_date_this_named"); // RET = 裸 date 指针(非 Date 不返回)
         // 经 _date_get_part 逐字段拆解(UTC 语义,负 ms/1970 前正确;旧浮点分解对负
         // 时间戳产生负字段 → toISOString 输出乱码)。get_part 会破坏 S3-S5,故全部经栈中转。
         // 栈: [0]ms [8]sec [16]min [24]hour [32]strptr [40]date [48]year [56]month(1基) [64]day
-        vm.store(VReg.SP, 40, VReg.A0); // boxed date
+        vm.store(VReg.SP, 40, VReg.RET); // date(裸指针,get_part 脱壳兼容)
         vm.load(VReg.A0, VReg.SP, 40); vm.movImm(VReg.A1, 7); vm.call("_date_get_part"); vm.store(VReg.SP, 0, VReg.RET);
         vm.load(VReg.A0, VReg.SP, 40); vm.movImm(VReg.A1, 5); vm.call("_date_get_part"); vm.store(VReg.SP, 8, VReg.RET);
         vm.load(VReg.A0, VReg.SP, 40); vm.movImm(VReg.A1, 4); vm.call("_date_get_part"); vm.store(VReg.SP, 16, VReg.RET);
@@ -433,12 +921,19 @@ export class DateGenerator {
         // 内容从 offset 16 开始
         // 格式: YYYY-MM-DDTHH:mm:ss.sssZ
 
-        // 写入年 (4位) 到 [RET+16..RET+19]
+        // 写入年:[0,9999] 4 位到 [RET+16..RET+19];界外(负年/>9999)按 ES 扩展形
+        // ±YYYYYY(符号+6 位前导零)——尾部先按 4 位布局写、在下方统一后移 3 字节,
+        // 符号与 6 位年数字在最后才写入(避免被原位尾部覆盖),长度 24→27。
+        vm.cmpImm(VReg.S3, 0);
+        vm.jlt("_diso_year_done");
+        vm.cmpImm(VReg.S3, 9999);
+        vm.jgt("_diso_year_done");
         vm.load(VReg.S0, VReg.SP, 32); // 重新加载字符串指针
         vm.addImm(VReg.S0, VReg.S0, 16); // S0 = 内容起始地址
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S3); // year
         vm.call("_write_int_padded_4");
+        vm.label("_diso_year_done");
 
         // 写入 '-' 到 [RET+20]
         vm.load(VReg.S0, VReg.SP, 32);
@@ -521,6 +1016,45 @@ export class DateGenerator {
         vm.movImm(VReg.V0, 0);
         vm.storeByte(VReg.S0, 40, VReg.V0);
 
+        // ±YYYYYY 扩展年:尾部(block[20..40],含 NUL)后移 3 字节腾出年字段位,
+        // 再写符号 @16 与 6 位前导零 @17..22,长度 24→27(分配 48 不变:16+27+1=44 仍容纳)。
+        vm.cmpImm(VReg.S3, 0);
+        vm.jlt("_diso_shift");
+        vm.cmpImm(VReg.S3, 9999);
+        vm.jle("_diso_shift_done");
+        vm.label("_diso_shift");
+        vm.load(VReg.S0, VReg.SP, 32);
+        vm.movImm(VReg.V3, 41);
+        vm.label("_diso_shift_loop");
+        vm.subImm(VReg.V3, VReg.V3, 1);
+        vm.add(VReg.V4, VReg.S0, VReg.V3);   // &block[i](x64 add 内部 scratch 为 V5/V6,之后方用 V5)
+        vm.loadByte(VReg.V5, VReg.V4, 0);
+        vm.storeByte(VReg.V4, 3, VReg.V5);
+        vm.cmpImm(VReg.V3, 20);
+        vm.jgt("_diso_shift_loop");
+        // 符号 @16('-'=45 / '+'=43)
+        vm.movImm(VReg.V0, 43);
+        vm.cmpImm(VReg.S3, 0);
+        vm.jge("_diso_ext_pos");
+        vm.movImm(VReg.V0, 45);
+        vm.label("_diso_ext_pos");
+        vm.storeByte(VReg.S0, 16, VReg.V0);
+        // |year| 6 位前导零 @17..22
+        vm.mov(VReg.A1, VReg.S3);
+        vm.cmpImm(VReg.S3, 0);
+        vm.jge("_diso_ext_abs");
+        vm.mov(VReg.V2, VReg.A1);
+        vm.movImm(VReg.A1, 0);
+        vm.sub(VReg.A1, VReg.A1, VReg.V2); // x64 V2==A2,此后才装 A2
+        vm.label("_diso_ext_abs");
+        vm.addImm(VReg.A0, VReg.S0, 17);
+        vm.movImm(VReg.A2, 6);
+        vm.call("_date_write_num_rev");
+        vm.load(VReg.S0, VReg.SP, 32); // _date_write_num_rev 叶子不毁 S0,防御性重载亦无妨
+        vm.movImm(VReg.V0, 27);
+        vm.store(VReg.S0, 8, VReg.V0);
+        vm.label("_diso_shift_done");
+
         // 返回标准字符串值 = content 指针 (block+16),与 _strconcat/_getStrContent 一致。
         // (旧实现返回 block 指针,仅 _print_value_heap_date 特判 +16,令 d.toISOString()
         //  作真字符串使用/解析/拼接时全部错位 16 字节;现统一为 user_ptr。)
@@ -563,13 +1097,20 @@ export class DateGenerator {
         // [#35] _date_get_part(A0=boxed date, A1=part) -> 原始整数
         // part: 0=year 1=month(0基) 2=day 3=hours 4=minutes 5=seconds 6=day-of-week
         // UTC 语义;仅支持 ms>=0(1970 起,days_to_ymd 正向循环的既有边界)
+        // [Date 加固] 薄壳拆分:本体读当前 [[DateValue]] 后尾跳共享体 _dgp_ts_body;
+        // _date_get_part_ts(A0=ts float64 位) 供"强转前预读 t"的 setter 从旧 t 拆字段。
         vm.label("_date_get_part");
         vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
         vm.mov(VReg.S1, VReg.A1); // part
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.S0, VReg.A0, VReg.V1); // 裸 date 指针
-        vm.load(VReg.V0, VReg.S0, 8); // ts(float64 位)
-        vm.fmovToFloat(0, VReg.V0);
+        vm.load(VReg.A0, VReg.S0, 8); // ts(float64 位)→ A0
+        vm.jmp("_dgp_ts_body");
+        vm.label("_date_get_part_ts");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.mov(VReg.S1, VReg.A1); // part
+        vm.label("_dgp_ts_body");
+        vm.fmovToFloat(0, VReg.A0); // A0=V0 同寄存器,与原直读 V0 等价
         vm.fcvtzs(VReg.S0, 0); // S0 = ms 整数
         // part 7 = milliseconds: ms mod 1000(负 ms 修正为 [0,1000))
         vm.cmpImm(VReg.S1, 7);
@@ -592,24 +1133,53 @@ export class DateGenerator {
         vm.jne("_dgp_notyear");
         vm.movImm(VReg.V1, 10000);
         vm.div(VReg.RET, VReg.S2, VReg.V1); // year
+        // [Date 加固] 负年修正:编码值 y*10000+m*100+d 中 m*100+d∈[101,1231] 恒正,
+        // 截断除对负年向上进 1(如 -1 年 7 月 → -9298/10000=0),须 floor:余<0 则商-1。
+        vm.mod(VReg.V0, VReg.S2, VReg.V1);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jge("_dgp_year_ok");
+        vm.subImm(VReg.RET, VReg.RET, 1);
+        vm.label("_dgp_year_ok");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
         vm.label("_dgp_notyear");
         vm.cmpImm(VReg.S1, 1);
         vm.jne("_dgp_day");
+        // [Date 加固] 负年同理:y*100+m 取 floor(截断商余<0 则 -1),m 取正余(<0 则 +100)。
         vm.movImm(VReg.V1, 100);
         vm.div(VReg.V0, VReg.S2, VReg.V1); // y*100+m
+        vm.mod(VReg.V2, VReg.S2, VReg.V1);
+        vm.cmpImm(VReg.V2, 0);
+        vm.jge("_dgp_mon_fok");
+        vm.subImm(VReg.V0, VReg.V0, 1);
+        vm.label("_dgp_mon_fok");
         vm.movImm(VReg.V1, 100);
         vm.mod(VReg.RET, VReg.V0, VReg.V1); // m(1基)
+        vm.cmpImm(VReg.RET, 0);
+        vm.jge("_dgp_mon_ok");
+        vm.addImm(VReg.RET, VReg.RET, 100);
+        vm.label("_dgp_mon_ok");
         vm.subImm(VReg.RET, VReg.RET, 1);   // 0 基
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
         vm.label("_dgp_day");
         vm.movImm(VReg.V1, 100);
         vm.mod(VReg.RET, VReg.S2, VReg.V1);
+        // [Date 加固] 负年日取正余(<0 则 +100)
+        vm.cmpImm(VReg.RET, 0);
+        vm.jge("_dgp_day_ok");
+        vm.addImm(VReg.RET, VReg.RET, 100);
+        vm.label("_dgp_day_ok");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
         vm.label("_dgp_dow");
-        // 1970-01-01 是周四(4):dow = (days+4)%7
+        // 1970-01-01 是周四(4):dow = (floor(ms/86400000)+4)%7
+        // [Date 加固] 负 ms 截断除须 floor 修正(同 _dgp_days_ok 形;epoch-1ms 是周三,
+        // 截断得 0 天会误报周四)。x64 V2==A2,此处 A2 无活值。
         vm.movImm(VReg.V1, 86400000);
         vm.div(VReg.V0, VReg.S0, VReg.V1);
+        vm.mod(VReg.V2, VReg.S0, VReg.V1);
+        vm.cmpImm(VReg.V2, 0);
+        vm.jge("_dgp_dow_fok");
+        vm.subImm(VReg.V0, VReg.V0, 1);
+        vm.label("_dgp_dow_fok");
         vm.addImm(VReg.V0, VReg.V0, 4);
         vm.movImm(VReg.V1, 7);
         vm.mod(VReg.RET, VReg.V0, VReg.V1);
@@ -1042,6 +1612,35 @@ export class DateGenerator {
         // 至少 10 字符(日期部分)
         vm.cmpImm(VReg.S5, 10);
         vm.jlt("_dp_invalid");
+        // [Date 加固] 扩展年份 ±YYYYYY:首字符 '+'/'-' → 6 位年在此单独解析(带符号),
+        // 随后指针+3/长度-3,下方标准路径(分隔符/月/日/时间偏移)原样复用。
+        vm.loadByte(VReg.V0, VReg.S1, 0);
+        vm.cmpImm(VReg.V0, 45); // '-'
+        vm.jeq("_dp_ext_year");
+        vm.cmpImm(VReg.V0, 43); // '+'
+        vm.jeq("_dp_ext_year");
+        vm.jmp("_dp_std_year");
+        vm.label("_dp_ext_year");
+        vm.addImm(VReg.A0, VReg.S1, 1);
+        vm.movImm(VReg.A1, 6);
+        vm.call("_date_num");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jlt("_dp_invalid");
+        vm.loadByte(VReg.V0, VReg.S1, 0);
+        vm.cmpImm(VReg.V0, 45);
+        vm.jne("_dp_ext_pos");
+        // 负号且值为 0("-000000")非法(ES 扩展年 -0 无效,同 node;test262 parse/year-zero)
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_dp_invalid");
+        vm.movImm(VReg.V1, 0);
+        vm.sub(VReg.V1, VReg.V1, VReg.RET); // dest==a 形态,避开 RET 别名
+        vm.mov(VReg.RET, VReg.V1);
+        vm.label("_dp_ext_pos");
+        vm.mov(VReg.S2, VReg.RET); // year(带符号)
+        vm.addImm(VReg.S1, VReg.S1, 3);
+        vm.subImm(VReg.S5, VReg.S5, 3);
+        vm.jmp("_dp_month");
+        vm.label("_dp_std_year");
         // 分隔符 '-' @4, @7
         vm.loadByte(VReg.V0, VReg.S1, 4);
         vm.cmpImm(VReg.V0, 45);
@@ -1057,6 +1656,7 @@ export class DateGenerator {
         vm.mov(VReg.S2, VReg.RET);
         vm.cmpImm(VReg.S2, 0);
         vm.jlt("_dp_invalid");
+        vm.label("_dp_month"); // 扩展年路径在此并入(S2 已备,S1/S5 已 +3/-3)
         vm.addImm(VReg.A0, VReg.S1, 5);
         vm.movImm(VReg.A1, 2);
         vm.call("_date_num");
@@ -1308,9 +1908,25 @@ export class DateGenerator {
         vm.mul(VReg.V5, VReg.V5, VReg.V4);
         vm.load(VReg.V3, VReg.SP, 48);
         vm.add(VReg.V5, VReg.V5, VReg.V3);
+        // [Date 加固] TimeClip:|ms| > 8.64e15 → Invalid Date(写 NaN 返 NaN;
+        // 整数比较——V5 是真整数毫秒,非 float 位序,不触 §1.2)
+        vm.movImm64(VReg.V1, 8640000000000000n);
+        vm.cmp(VReg.V5, VReg.V1);
+        vm.jgt("_dsp_clipnan");
+        vm.movImm64(VReg.V1, -8640000000000000n);
+        vm.cmp(VReg.V5, VReg.V1);
+        vm.jlt("_dsp_clipnan");
         // 写回 & 返回
         vm.scvtf(0, VReg.V5);
         vm.fmovToInt(VReg.V3, 0); // 新 ms 的 float 位
+        vm.load(VReg.V4, VReg.SP, 56);
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V4, VReg.V4, VReg.V1);
+        vm.store(VReg.V4, 8, VReg.V3);
+        vm.mov(VReg.RET, VReg.V3);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 128);
+        vm.label("_dsp_clipnan");
+        vm.movImm64(VReg.V3, 0x7ff0000000000001n);
         vm.load(VReg.V4, VReg.SP, 56);
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.V4, VReg.V4, VReg.V1);
@@ -1324,21 +1940,31 @@ export class DateGenerator {
         // (sequential 逐 _date_set_part 会在中间字段溢出翻滚后被下一字段读到错误月份,
         //  故必须原子。)values[i] 为 int64,位于 valuesPtr + i*8(升序地址,升序 part)。
         // 栈: [0]year [8]month0 [16]day [24]hours [32]min [40]sec [48]ms
-        //     [56]boxed date [64]startPart [72]count [80]valuesPtr
+        //     [56]boxed date [64]startPart [72]count [80]valuesPtr [88]预读 ts
+        // [Date 加固] 薄壳:读当前 [[DateValue]] → A4 尾跳 _date_set_parts_t(编译器直调
+        // 快路语义不变,仍是"调用时"的时间戳);aref wrapper 以"强转前预读 t"作 A4 调
+        // _date_set_parts_t(ES:t 先于 ToNumber 读取)。
+        // 注意 x64:V1==RCX==A3,emitMaskLoad(V1) 会冲掉 A3(valuesPtr),故手写 mask 到 V3。
         vm.label("_date_set_parts");
+        vm.movImm64(VReg.V3, 0x0000ffffffffffffn);
+        vm.and(VReg.V0, VReg.A0, VReg.V3);
+        vm.load(VReg.A4, VReg.V0, 8);
+        vm.jmp("_date_set_parts_t");
+        vm.label("_date_set_parts_t");
         vm.prologue(128, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
         vm.store(VReg.SP, 56, VReg.A0);
         vm.store(VReg.SP, 64, VReg.A1);
         vm.store(VReg.SP, 72, VReg.A2);
         vm.store(VReg.SP, 80, VReg.A3);
-        // 采集现字段(get_part: 0..5;7=ms → 槽 6)
-        vm.load(VReg.A0, VReg.SP, 56); vm.movImm(VReg.A1, 0); vm.call("_date_get_part"); vm.store(VReg.SP, 0, VReg.RET);
-        vm.load(VReg.A0, VReg.SP, 56); vm.movImm(VReg.A1, 1); vm.call("_date_get_part"); vm.store(VReg.SP, 8, VReg.RET);
-        vm.load(VReg.A0, VReg.SP, 56); vm.movImm(VReg.A1, 2); vm.call("_date_get_part"); vm.store(VReg.SP, 16, VReg.RET);
-        vm.load(VReg.A0, VReg.SP, 56); vm.movImm(VReg.A1, 3); vm.call("_date_get_part"); vm.store(VReg.SP, 24, VReg.RET);
-        vm.load(VReg.A0, VReg.SP, 56); vm.movImm(VReg.A1, 4); vm.call("_date_get_part"); vm.store(VReg.SP, 32, VReg.RET);
-        vm.load(VReg.A0, VReg.SP, 56); vm.movImm(VReg.A1, 5); vm.call("_date_get_part"); vm.store(VReg.SP, 40, VReg.RET);
-        vm.load(VReg.A0, VReg.SP, 56); vm.movImm(VReg.A1, 7); vm.call("_date_get_part"); vm.store(VReg.SP, 48, VReg.RET);
+        vm.store(VReg.SP, 88, VReg.A4); // 时间戳(float64 位;调用方语义决定"当前"或"预读")
+        // 采集现字段(从 ts 拆;get_part_ts: 0..5;7=ms → 槽 6)
+        vm.load(VReg.A0, VReg.SP, 88); vm.movImm(VReg.A1, 0); vm.call("_date_get_part_ts"); vm.store(VReg.SP, 0, VReg.RET);
+        vm.load(VReg.A0, VReg.SP, 88); vm.movImm(VReg.A1, 1); vm.call("_date_get_part_ts"); vm.store(VReg.SP, 8, VReg.RET);
+        vm.load(VReg.A0, VReg.SP, 88); vm.movImm(VReg.A1, 2); vm.call("_date_get_part_ts"); vm.store(VReg.SP, 16, VReg.RET);
+        vm.load(VReg.A0, VReg.SP, 88); vm.movImm(VReg.A1, 3); vm.call("_date_get_part_ts"); vm.store(VReg.SP, 24, VReg.RET);
+        vm.load(VReg.A0, VReg.SP, 88); vm.movImm(VReg.A1, 4); vm.call("_date_get_part_ts"); vm.store(VReg.SP, 32, VReg.RET);
+        vm.load(VReg.A0, VReg.SP, 88); vm.movImm(VReg.A1, 5); vm.call("_date_get_part_ts"); vm.store(VReg.SP, 40, VReg.RET);
+        vm.load(VReg.A0, VReg.SP, 88); vm.movImm(VReg.A1, 7); vm.call("_date_get_part_ts"); vm.store(VReg.SP, 48, VReg.RET);
         // 覆写循环: for i in [0,count): slot[(startPart+i)*8] = values[i]
         vm.load(VReg.S0, VReg.SP, 64); // startPart
         vm.load(VReg.S1, VReg.SP, 72); // count
@@ -1400,9 +2026,24 @@ export class DateGenerator {
         vm.mul(VReg.V5, VReg.V5, VReg.V4);
         vm.load(VReg.V3, VReg.SP, 48);
         vm.add(VReg.V5, VReg.V5, VReg.V3);
+        // [Date 加固] TimeClip:|ms| > 8.64e15 → Invalid Date(同 _date_set_part)
+        vm.movImm64(VReg.V1, 8640000000000000n);
+        vm.cmp(VReg.V5, VReg.V1);
+        vm.jgt("_dsps_clipnan");
+        vm.movImm64(VReg.V1, -8640000000000000n);
+        vm.cmp(VReg.V5, VReg.V1);
+        vm.jlt("_dsps_clipnan");
         // 写回 & 返回
         vm.scvtf(0, VReg.V5);
         vm.fmovToInt(VReg.V3, 0);
+        vm.load(VReg.V4, VReg.SP, 56);
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V4, VReg.V4, VReg.V1);
+        vm.store(VReg.V4, 8, VReg.V3);
+        vm.mov(VReg.RET, VReg.V3);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 128);
+        vm.label("_dsps_clipnan");
+        vm.movImm64(VReg.V3, 0x7ff0000000000001n);
         vm.load(VReg.V4, VReg.SP, 56);
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.V4, VReg.V4, VReg.V1);

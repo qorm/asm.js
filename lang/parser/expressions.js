@@ -583,7 +583,7 @@ export const ExpressionParser = {
         return new AST.ArrowFunctionExpression(params, body, false, isExpression);
     },
 
-    parseObjectPattern() {
+    parseObjectPattern(lexical) {
         let pattern = new AST.ObjectPattern();
         if (this.peekTokenIs(TokenType.RBRACE)) {
             this.nextToken();
@@ -597,7 +597,15 @@ export const ExpressionParser = {
                 // 对象 rest 目标必须是标识符(ES:ObjectRestProperty = ...BindingIdentifier,
                 // {...{a}} 非法)。数组 rest 才可为模式(见 parseArrayPattern)。
                 this.nextToken();
-                this.checkReservedBinding(this.curToken.literal);   // [test262 早期错误 A] {...rest}
+                // [test262 早期错误 A] rest 绑定位:非词形 token(数值/字符串/{/[ 等)一律拒
+                // (`var {...123} = o` 此前误收);词形名再按 strict/生成器/异步门控。
+                if (!this.isBindingWordToken(this.curToken)) {
+                    this.errors.push("expected identifier in object rest pattern");
+                    return null;
+                }
+                this.checkYieldAwaitBinding(this.curToken.literal);   // [test262 S1] {...yield}/{...await}
+                this.checkReservedBinding(this.curToken.literal);     // [test262 早期错误 A] {...rest}
+                this.checkLexicalLetBinding(this.curToken.literal, lexical);   // [test262 早期错误 A] let/const/catch 下 {...let} 恒拒
                 pattern.properties.push(new AST.SpreadElement(new AST.Identifier(this.curToken.literal)));
                 break;
             }
@@ -612,10 +620,15 @@ export const ExpressionParser = {
                 this.nextToken();                                      // cur = 目标首 token
                 let target = null;
                 if (this.curTokenIs(TokenType.LBRACE)) {
-                    target = this.parseObjectPattern();
+                    target = this.parseObjectPattern(lexical);
                 } else if (this.curTokenIs(TokenType.LBRACKET)) {
-                    target = this.parseArrayPattern();
-                } else if (this.curTokenIs(TokenType.IDENT)) {
+                    target = this.parseArrayPattern(lexical);
+                } else if (this.isBindingWordToken(this.curToken)) {
+                    // [test262 早期错误 A] 计算键绑定位:`{[k]: eval}` strict 拒,
+                    // `{[k]: yield}` 按生成器/strict 门控,`{[k]: if}` 恒拒。
+                    this.checkYieldAwaitBinding(this.curToken.literal);
+                    this.checkReservedBinding(this.curToken.literal);
+                    this.checkLexicalLetBinding(this.curToken.literal, lexical);   // let/const/catch 下 {[k]: let} 恒拒
                     target = new AST.Identifier(this.curToken.literal);
                 } else {
                     this.errors.push("expected target in computed object pattern");
@@ -642,11 +655,14 @@ export const ExpressionParser = {
                 }
             }
             // 属性名文法是 PropertyName:除标识符外还含字符串/数值字面量与保留字
-            // (`{ 0: v }` / `{ 'a-b': v }` / `{ if: v }`)。字面量/保留字键无简写形,
+            // (`{ 0: v }` / `{ 'a-b': v }` / `{ if: v }`)。字面量键无简写形,
             // 必须带 `: 目标`。键统一归一成 Identifier(name=属性字符串),使下游
             // emitBoxedStringKey 走同一条静态键路径(数值按 String(值) 归一:1.0→"1")。
             let keyNeedsColon = false;
-            if (this.curTokenIs(TokenType.IDENT)) {
+            if (this.isBindingWordToken(this.curToken)) {
+                // [test262 早期错误 A] 词形键:IDENT 或关键字 token(yield/let/if/async…)。
+                // 词形键可落简写绑定位(`{ yield }` sloppy 合法)——键本身不在此查保留字:
+                // 带冒号时纯作属性名(`{ if: a }` 合法,永不查);仅简写/简写默认位门控(见下)。
                 prop.key = new AST.Identifier(this.curToken.literal);
             } else if (this.curTokenIs(TokenType.STRING)) {
                 prop.key = new AST.Identifier(this.curToken.literal);
@@ -654,9 +670,13 @@ export const ExpressionParser = {
             } else if (this.curTokenIs(TokenType.INT) || this.curTokenIs(TokenType.FLOAT)) {
                 prop.key = new AST.Identifier(String(this.parseNumberLiteral().value));
                 keyNeedsColon = true;
-            } else if (this.curTokenIsIdentifier() && this.peekTokenIs(TokenType.COLON)) {
-                // 保留字/上下文关键字作键:`{ if: a }` / `{ default: a }`
-                prop.key = new AST.Identifier(this.curToken.literal);
+            } else if (this.curTokenIs(TokenType.BIGINT)) {
+                // [test262 早期错误 A] BigInt 字面量键:与 INT 键同规——必须带冒号(无简写形,
+                // `{1n}` 仍拒),键按数值字符串归一(1n→"1"、0x1n→"1";literal 已去 n 后缀与
+                // 分隔符,见 lexer readNumber)。仅属性名位放行;BigInt 不得作绑定目标
+                // (`{x: 1n}`/`{...1n}` 仍拒),isBindingWordToken 排除 BIGINT 不变。
+                prop.key = new AST.Identifier(String(this.parseBigIntLiteral().value));
+                keyNeedsColon = true;
             } else {
                 this.errors.push("expected property name in object pattern");
                 return null;
@@ -671,10 +691,15 @@ export const ExpressionParser = {
                 // [#47] 嵌套解构:值位可为 {..}/[..] 子 pattern(递归),不再限于 Identifier。
                 let target = null;
                 if (this.curTokenIs(TokenType.LBRACE)) {
-                    target = this.parseObjectPattern();
+                    target = this.parseObjectPattern(lexical);
                 } else if (this.curTokenIs(TokenType.LBRACKET)) {
-                    target = this.parseArrayPattern();
-                } else if (this.curTokenIs(TokenType.IDENT)) {
+                    target = this.parseArrayPattern(lexical);
+                } else if (this.isBindingWordToken(this.curToken)) {
+                    // [test262 早期错误 A] 冒号绑定位:`{x: eval}` strict 拒,
+                    // `{x: yield}` 按生成器/strict 门控,`{x: if}`/`{x: enum}` 恒拒。
+                    this.checkYieldAwaitBinding(this.curToken.literal);
+                    this.checkReservedBinding(this.curToken.literal);
+                    this.checkLexicalLetBinding(this.curToken.literal, lexical);   // let/const/catch 下 {x: let} 恒拒
                     target = new AST.Identifier(this.curToken.literal);
                 } else {
                     this.errors.push("expected identifier in object pattern");
@@ -692,11 +717,20 @@ export const ExpressionParser = {
                 // 简写默认值:{a = 9} —— left 用「新」Identifier 节点(与 key 分离),
                 // 使块级改名 pass 只改绑定名(value.left)而不动源键名(prop.key)。
                 prop.shorthand = true;
+                // [test262 早期错误 A] 简写默认绑定位:`{eval = 1}` strict 拒,`{if = 1}` 恒拒。
+                this.checkYieldAwaitBinding(prop.key.name);
+                this.checkReservedBinding(prop.key.name);
+                this.checkLexicalLetBinding(prop.key.name, lexical);   // let/const/catch 下 {let = 1} 恒拒
                 this.nextToken();
                 this.nextToken();
                 prop.value = new AST.AssignmentPattern(new AST.Identifier(prop.key.name), this.parseExpression(Precedence.ASSIGN - 1));
             } else {
                 prop.shorthand = true;
+                // [test262 早期错误 A] 简写绑定位:`{eval}` strict 拒,`{if}` 恒拒,
+                // `{yield}`/`{await}` 按生成器/异步门控,`{let}`/`{static}` 按 strict 门控。
+                this.checkYieldAwaitBinding(prop.key.name);
+                this.checkReservedBinding(prop.key.name);
+                this.checkLexicalLetBinding(prop.key.name, lexical);   // let/const/catch 下 {let} 恒拒
                 prop.value = prop.key;
             }
             pattern.properties.push(prop);
@@ -715,7 +749,7 @@ export const ExpressionParser = {
         return pattern;
     },
 
-    parseArrayPattern() {
+    parseArrayPattern(lexical) {
         let pattern = new AST.ArrayPattern();
         if (this.peekTokenIs(TokenType.RBRACKET)) {
             this.nextToken();
@@ -730,8 +764,9 @@ export const ExpressionParser = {
                 // [#34] rest 元素 [..., ...rest];[test262 S1] rest 目标可为绑定模式 [...[x]]/[...{a}]
                 this.nextToken();
                 let restTarget;
-                if (this.curTokenIs(TokenType.LBRACE)) restTarget = this.parseObjectPattern();
-                else if (this.curTokenIs(TokenType.LBRACKET)) restTarget = this.parseArrayPattern();
+                // [test262 早期错误 A] lexical 仅透传给嵌套对象模式;数组绑定位本身无检查(既有缺口)。
+                if (this.curTokenIs(TokenType.LBRACE)) restTarget = this.parseObjectPattern(lexical);
+                else if (this.curTokenIs(TokenType.LBRACKET)) restTarget = this.parseArrayPattern(lexical);
                 else restTarget = new AST.Identifier(this.curToken.literal);
                 pattern.elements.push(new AST.SpreadElement(restTarget));
                 restSeen = true;   // [test262 S1] rest 必须末位:此后任何元素/空位皆早期错误
@@ -742,7 +777,7 @@ export const ExpressionParser = {
             } else if (this.curTokenIs(TokenType.LBRACE) || this.curTokenIs(TokenType.LBRACKET)) {
                 if (restSeen) this.errors.push("Rest element must be last element");
                 // [#47] 嵌套解构:元素位可为 {..}/[..] 子 pattern(递归)。
-                const sub = this.curTokenIs(TokenType.LBRACE) ? this.parseObjectPattern() : this.parseArrayPattern();
+                const sub = this.curTokenIs(TokenType.LBRACE) ? this.parseObjectPattern(lexical) : this.parseArrayPattern(lexical);
                 if (this.peekTokenIs(TokenType.ASSIGN)) {
                     this.nextToken();
                     this.nextToken();

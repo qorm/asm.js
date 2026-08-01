@@ -127,18 +127,10 @@ function isBareSubpath(s) {
 // ---- CommonJS(require/module.exports)AOT 子集支持 ----
 // 只对「无 ESM import/export 语句、且用到 CJS 标志(module.exports/exports.\/裸
 // require())」的文件生效。编译器/运行时自身全部是 ESM,永不命中,故自举零影响。
-function cjsHasEsmSyntax(src) {
-    if (!src) return false;
-    if (src.indexOf("export ") !== -1) return true;
-    if (src.indexOf("export{") !== -1) return true;
-    if (src.indexOf("export\t") !== -1) return true;
-    if (src.indexOf("export\n") !== -1) return true;
-    if (src.charCodeAt(0) === 105 && src.indexOf("import ") === 0) return true; // 首行 import
-    if (src.indexOf("\nimport ") !== -1) return true;
-    if (src.indexOf("\nimport{") !== -1) return true;
-    if (src.indexOf("\nimport(") !== -1 && src.indexOf("\nimport ") !== -1) return true;
-    return false;
-}
+// ESM 语法判定用 sourceHasTopLevelEsmDecl(词法感知,见本文件后部):注释/字符串/
+// 模板/正则字面量里的 "export "/"import " 文字不算数——此前的朴素子串扫描
+// (cjsHasEsmSyntax)把这些文字当成 ESM,使含它们的合法 CJS 文件被判为非 CJS、
+// 不做 CJS 包装,import 之运行期崩 _object_set NULL(Node 照常执行)。
 // 裸 require( 调用(排除 obj.require( 与标识符续接)
 function cjsHasBareRequire(src) {
     let idx = src.indexOf("require(");
@@ -153,7 +145,7 @@ function cjsHasBareRequire(src) {
 }
 function looksLikeCjsSource(src) {
     if (!src || src.length === 0) return false;
-    if (cjsHasEsmSyntax(src)) return false;
+    if (sourceHasTopLevelEsmDecl(src)) return false;
     return src.indexOf("module.exports") !== -1 ||
         src.indexOf("exports.") !== -1 ||
         src.indexOf("exports[") !== -1 ||
@@ -197,7 +189,8 @@ function nearestPackageJsonExplicitCommonjs(filePath) {
 // ExportDeclaration(所有 export 形态);无 ExportNamedDeclaration 等分支类型。
 // "__" 前缀排除编译器注入的 shim import(__json_shim、__regexp_shim、
 // __channel_shim、__eval_shim、__number_shim、__date_shim)——这些是合成的,
-// 不算用户 ESM。与 cjsHasEsmSyntax 的文本扫描不同,本判定有词法感知:
+// 不算用户 ESM。与 sourceHasTopLevelEsmDecl(looksLikeCjsSource 用的源码级
+// 词法扫描)同源思路,本判定在 AST 层有词法感知:
 // 注释/字符串里出现 "export "/"import " 文字不产生声明节点,故不误杀
 // 注释里含 "export helper" 的合法 CJS 文件(Node 照常执行)。
 // 已知窄边角:用户裸名导入恰以 "__" 开头(如 import x from "__foo")会被一并
@@ -3711,6 +3704,187 @@ function sourceHasRegExpCall(src) {
             }
             continue;
         }
+        i++;
+    }
+    return false;
+}
+
+// 从 "/"(下标 i)起跳过正则字面量体,返回闭合 "/" 之后的下标;同一行内无合法
+// 闭合(或体为空)返回 -1。规则与 scanRegexLiteralBody 一一对应(后者只判有无、
+// 本函数给出终点,供 sourceHasTopLevelEsmDecl 整体跳过正则)。
+function skipRegexLiteralBody(src, i) {
+    const n = src.length;
+    let j = i + 1;
+    let inClass = false;
+    let any = false;
+    while (j < n) {
+        const c = src.charCodeAt(j);
+        if (c === 10) return -1; // 正则不跨行
+        if (c === 92) { j += 2; any = true; continue; } // 转义
+        if (c === 91) inClass = true;
+        else if (c === 93) inClass = false;
+        else if (c === 47 && !inClass) return any ? j + 1 : -1; // 闭合(体非空)
+        any = true;
+        j++;
+    }
+    return -1;
+}
+
+// [CJS 误判修复] 词法感知判定:源码在**真实代码位置**是否含顶层 import/export
+// 声明关键字。looksLikeCjsSource 的 ESM 判据,取代朴素子串扫描:注释/字符串/
+// 模板文本/正则字面量里的 "export "/"import " 文字不算数(那些文字曾使合法 CJS
+// 文件被误判为非 CJS、不做 CJS 包装,import 之运行期崩
+// "FATAL: _object_set called with NULL object";Node 照常执行)。
+// 手写字符扫描(§1.6 禁正则;本代码在 gen1 运行),状态机与 sourceHasRegExpCall
+// 同源:字符串/模板/注释整体跳过,模板 ${} 用 tplBrace 栈归位,"/" 按
+// regexCanStartAfter 启发式区分正则起始与除法。
+// 语义与原扫描对齐、仅剔除字面量内误报(保守:拿不准的一律维持原判定):
+//   export:花括号深度 0、前一有效字符非 "."(排除 x.export)、紧随字符
+//     ∈ {空白, {, *}(export 声明的全部合法续接;export: 标签/var export 等
+//     保留字误用在 Node 同为 SyntaxError,判 ESM 不算误拒);
+//   import:深度 0、前一有效字符非 "."、同行前方只有空白(与原 "\nimport "
+//     行首锚定一致)、跳过空白后下一字符非 "(" 非 "."(排除动态 import() 与
+//     import.meta;import"x" 副作用导入仍算声明)。
+// 深度 > 0 的 import/export 声明在合法 JS 中不存在;对象字面量 { export: 1 }、
+// 类方法 export(){} 由深度自然排除。
+// 已知偏差(与原扫描同错或更准,不劣化):非 ASCII 字节紧邻的 "export" 子串仍
+// 可能误判(同原扫描);")" 之后的正则按除法处理(regexCanStartAfter 保守分支,
+// 与本编译器解析器自身对 ")" 后 "/" 的处理一致,不引入新分歧)。
+function sourceHasTopLevelEsmDecl(src) {
+    const n = src.length;
+    let i = 0;
+    let inTplText = false;  // 正在扫模板字面量的文本部分(非 ${} 内)
+    const tplBrace = [];    // 每层 ${ 起始时的花括号深度,用于识别配对的 }
+    let brace = 0;
+    let prevEnd = -1; // 最近一个有效字符下标;-1=开头,-2=字符串/模板/正则结尾
+    if (src.charCodeAt(0) === 35 && src.charCodeAt(1) === 33) { // shebang 行跳过
+        while (i < n && src.charCodeAt(i) !== 10) i++;
+    }
+    while (i < n) {
+        const c = src.charCodeAt(i);
+        if (inTplText) {
+            if (c === 92) { i += 2; continue; } // 转义
+            if (c === 96) { inTplText = false; prevEnd = -2; i++; continue; } // ` 收尾
+            if (c === 36 && i + 1 < n && src.charCodeAt(i + 1) === 123) { // ${
+                inTplText = false;
+                tplBrace.push(brace);
+                brace++;
+                i += 2;
+                prevEnd = i - 1; // ${ 的 "{" 是有效字符(其后 / 按正则起始)
+                continue;
+            }
+            i++;
+            continue;
+        }
+        if (c === 96) { inTplText = true; i++; continue; } // 模板起始
+        if (c === 39 || c === 34) { // ' "
+            const q = c;
+            i++;
+            while (i < n) {
+                const d = src.charCodeAt(i);
+                if (d === 92) { i += 2; continue; }
+                if (d === q) break;
+                if (d === 10) break; // 普通串不跨行
+                i++;
+            }
+            i++;
+            prevEnd = -2;
+            continue;
+        }
+        if (c === 47) { // '/'
+            const c2 = i + 1 < n ? src.charCodeAt(i + 1) : 0;
+            if (c2 === 47) { // 行注释
+                i += 2;
+                while (i < n && src.charCodeAt(i) !== 10) i++;
+                continue;
+            }
+            if (c2 === 42) { // 块注释
+                i += 2;
+                while (i + 1 < n && !(src.charCodeAt(i) === 42 && src.charCodeAt(i + 1) === 47)) i++;
+                i += 2;
+                continue;
+            }
+            const reEnd = regexCanStartAfter(src, prevEnd) ? skipRegexLiteralBody(src, i) : -1;
+            if (reEnd > 0) { // 正则字面量:连同 flags 整体跳过
+                i = reEnd;
+                while (i < n) {
+                    const f = src.charCodeAt(i);
+                    if ((f >= 97 && f <= 122) || (f >= 65 && f <= 90)) i++;
+                    else break;
+                }
+                prevEnd = -2;
+                continue;
+            }
+            prevEnd = i; // 除法算符
+            i++;
+            continue;
+        }
+        if (c === 123) { brace++; prevEnd = i; i++; continue; }
+        if (c === 125) {
+            brace--;
+            if (tplBrace.length > 0 && tplBrace[tplBrace.length - 1] === brace) {
+                tplBrace.pop();
+                inTplText = true; // ${} 收尾,回到模板文本
+            }
+            prevEnd = i;
+            i++;
+            continue;
+        }
+        if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95 || c === 36) {
+            const s = i;
+            while (i < n) {
+                const d = src.charCodeAt(i);
+                if ((d >= 48 && d <= 57) || (d >= 65 && d <= 90) ||
+                    (d >= 97 && d <= 122) || d === 95 || d === 36) i++;
+                else break;
+            }
+            if (brace === 0 && i - s === 6) {
+                const prevCh = prevEnd >= 0 ? src.charCodeAt(prevEnd) : 0;
+                if (prevCh !== 46) { // 非 x.export / x.import 成员访问
+                    const word = src.slice(s, i);
+                    if (word === "export") {
+                        const f = i < n ? src.charCodeAt(i) : 0;
+                        // export 声明的合法续接:空白 { *(export: 标签等排除)
+                        if (f === 32 || f === 9 || f === 10 || f === 13 ||
+                            f === 123 || f === 42) return true;
+                    } else if (word === "import") {
+                        // 行首锚定(与原 "\nimport " 语义一致):同行前方只有空白
+                        let ls = s - 1;
+                        let lineStart = true;
+                        while (ls >= 0) {
+                            const w = src.charCodeAt(ls);
+                            if (w === 10) break;
+                            if (w === 32 || w === 9 || w === 13) { ls--; continue; }
+                            lineStart = false;
+                            break;
+                        }
+                        if (lineStart) {
+                            let j = i;
+                            while (j < n) { // import 与下一 token 间允许空白
+                                const w = src.charCodeAt(j);
+                                if (w === 32 || w === 9 || w === 13 || w === 10) j++;
+                                else break;
+                            }
+                            const f = j < n ? src.charCodeAt(j) : 0;
+                            if (f !== 40 && f !== 46) return true; // 非 import( / import.
+                        }
+                    }
+                }
+            }
+            prevEnd = i - 1;
+            continue;
+        }
+        if (c >= 48 && c <= 57) { // 数字:整体跳过,免得 1e5 之类被拆出标识符
+            while (i < n) {
+                const d = src.charCodeAt(i);
+                if ((d >= 48 && d <= 57) || (d >= 65 && d <= 90) ||
+                    (d >= 97 && d <= 122) || d === 95 || d === 46) i++;
+                else break;
+            }
+            prevEnd = i - 1;
+            continue;
+        }
+        if (c !== 32 && c !== 9 && c !== 13 && c !== 10) prevEnd = i;
         i++;
     }
     return false;

@@ -1630,7 +1630,11 @@ export const FunctionCompiler = {
                 const _shadow = _calleeFn ||
                     (this.ctx.getLocal && this.ctx.getLocal(callee.name));
                 if (!_shadow) {
-                    this.emitThrowTypeError("Constructor " + callee.name + " requires 'new'");
+                    // [I2 红队 F1] Promise 直调消息须与 Node 逐字一致(规范 27.2.3.1);
+                    // Map/Set/WeakMap/WeakSet 的通用模板恰与 Node 逐字相同,保持原样。
+                    this.emitThrowTypeError(callee.name === "Promise"
+                        ? "Promise constructor cannot be invoked without 'new'"
+                        : "Constructor " + callee.name + " requires 'new'");
                     return;
                 }
             }

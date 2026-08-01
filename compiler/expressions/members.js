@@ -382,6 +382,11 @@ const BUILTIN_REF_ARITY = {
     date_now: 0, date_parse: 1, date_utc: 7,
     array_isArray: 1,
     fnproto_call: 1, fnproto_apply: 2,
+    // [I2 一等值] Map/Set/Promise 静态(emitCollectionCtorObject 的 emitMemoizedBuiltinRef
+    // 槽键 = 构造器名小写 + "_" + 属性名,须与 PROMISE_STATIC_METHODS/MAP_STATIC_METHODS 同步)。
+    map_groupBy: 2,
+    promise_resolve: 1, promise_reject: 1, promise_all: 1, promise_race: 1,
+    promise_allSettled: 1, promise_any: 1, promise_withResolvers: 0,
 };
 // 内建**方法**数据属性 attrs:writable(1) | configurable(4),enumerable 关闭
 // (规范 17 节:{[[Writable]]:true, [[Enumerable]]:false, [[Configurable]]:true})。
@@ -406,6 +411,88 @@ const ERR_CTOR_PLACEHOLDER_FN = "_object_new";
 const ERR_CTOR_NAMES = [
     "Error", "TypeError", "RangeError", "SyntaxError",
     "ReferenceError", "EvalError", "URIError",
+];
+
+// ── [I2 一等值] Map/Set/Promise 构造器物化(反射用真函数对象 + 原型)──────────────
+// 此前 `Map`/`Set`/`Promise` 只是**编译期构造**:new X(...) 在 compileNewExpression
+// 静态特判(_map_new/_set_new/_promise_new)、X.method(...) 静态改派
+// (functions.js:Map.groupBy / Promise.resolve 族)、x.m(...) 经接收者 type 字节分派
+// (compileMapMethod/compileSetMethod / Promise 实例方法)、instanceof X 在 operators.js
+// 内联([ptr]&0xff==TYPE,从不编译 RHS 标识符)。而**裸标识符**(非 new、非调用、非
+// instanceof)落 compileIdentifier 兜底 movImm(RET,0)→ `typeof Map==="number"`、
+// `Map.prototype===undefined`、`typeof Promise.resolve==="undefined"`。
+//
+// 修法(与 Date 一等值同形):只在**裸标识符** / `X.prototype` 两个反射位惰性物化真
+// 函数对象(带 .name/.length/.prototype、原型方法闭包族、静态方法闭包族)到全局槽。
+// 上述四条快路全按**语法**先于 compileIdentifier 命中 → 快路字节不变。
+//
+// 方法值经 emitBuiltinMethodRefClosureMeta(24B {magic, _aref_generic, helper})——
+// 蹦床把 this 插 A0、实参上移后尾调 helper。[I2 红队] 表内标签一律是**守卫壳**
+// (_aref_map_*/_aref_set_*/_aref_promise_*,见 runtime 同名守卫组注):脱壳后查
+// 类型字节(+weakness 品牌),全过才纯尾调既有裸 helper,失败按 Node 逐字抛
+// TypeError——`X.prototype.m.call(wrongRecv, …)` 不再 SIGSEGV:
+//   Map:  裸 helper 不变(_map_get/_map_set/_map_has/_map_delete/迭代器族),
+//         clear/forEach 在既有 _aref_* wrapper 头内联同一守卫;size 是**访问器**
+//         (getter 闭包经 _aref_map_size 守卫 → _aref_coll_size 脱壳读 size@8 装箱)。
+//   Set:  同构(_aref_set_*);size 访问器经 _aref_set_size(Map 与 Set 是不同品牌,
+//         交叉访问按 Node 抛 TypeError);keys 不建闭包——经 cfg.aliases 与 values
+//         共享同一方法值闭包(规范同一性 Set.prototype.keys === Set.prototype.values,
+//         .name 随之为 "values")。
+//   Promise: then 守卫 → _promise_then2(双回调;初版直连 _promise_then 丢 onRejected);
+//         catch/finally 守卫按规范接收者语义分别抛(null/undefined→_throw_read_nullish /
+//         非对象→"called on non-object"/对象非 promise→"undefined is not a function");
+//         静态 resolve/reject/all/race/allSettled/any/withResolvers 经
+//         _aref_pss_* 守卫(A5=this 须为 _nsobj_promise 单例,否则按 Node 抛
+//         "called on non-object"/"is not a constructor"/"not callable")。
+// 构造器闭包 fnptr = _map_ctor_call/_set_ctor_call/_promise_ctor_call:裸 X() 经值路径
+// 调用(不带 new)命中 → 抛 TypeError(规范分别要求 requires 'new')。
+//
+// 属性描述符:方法 writable|configurable(attr 5,规范 17 节);prototype 全 false
+// (attr 0);size 访问器 configurable(attr 4,规范 24.1.3.4/24.2.3.3:get 访问器、
+// set undefined、enumerable:false)。
+//
+// 未落地(记偏差,见 I2 报告):Symbol.species / @@iterator / toStringTag、
+// 子类化(class X extends Map)、forEach 的 thisArg、实例级方法值读(m.get 作值
+// 仍走通用属性读 → undefined,Map 对象无原型链)、Promise.try(无单 helper)、
+// WeakMap/WeakSet 构造器对象(构造快路仍可用,裸标识符仍兜底)。
+const MAP_PROTO_METHODS = [
+    // [方法名, 守卫壳标签(品牌检查后尾调裸 helper,见 runtime/types/map/index.js), 规范 length]
+    ["get", "_aref_map_get", 1],
+    ["set", "_aref_map_set", 2],
+    ["has", "_aref_map_has", 1],
+    ["delete", "_aref_map_delete", 1],
+    ["clear", "_aref_map_clear", 0],
+    ["forEach", "_aref_map_forEach", 1],
+    ["keys", "_aref_map_keys", 0],
+    ["values", "_aref_map_values", 0],
+    ["entries", "_aref_map_entries", 0],
+];
+const MAP_STATIC_METHODS = [
+    ["groupBy", "_map_groupBy", 2],
+];
+const SET_PROTO_METHODS = [
+    ["add", "_aref_set_add", 1],
+    ["has", "_aref_set_has", 1],
+    ["delete", "_aref_set_delete", 1],
+    ["clear", "_aref_set_clear", 0],
+    ["forEach", "_aref_set_forEach", 1],
+    ["values", "_aref_set_values", 0],
+    ["entries", "_aref_set_entries", 0],
+    // keys 不在此表:经 cfg.aliases 落为 values 的同一闭包(规范同一性)
+];
+const PROMISE_PROTO_METHODS = [
+    ["then", "_aref_promise_then", 2],
+    ["catch", "_aref_promise_catch", 1],
+    ["finally", "_aref_promise_finally", 1],
+];
+const PROMISE_STATIC_METHODS = [
+    ["resolve", "_aref_pss_resolve", 1],
+    ["reject", "_aref_pss_reject", 1],
+    ["all", "_aref_pss_all", 1],
+    ["race", "_aref_pss_race", 1],
+    ["allSettled", "_aref_pss_allSettled", 1],
+    ["any", "_aref_pss_any", 1],
+    ["withResolvers", "_aref_pss_withResolvers", 0],
 ];
 
 // [typeof 未解析名] compileIdentifier 的兜底把**任何**解析不到的裸名编成 movImm(RET,0)
@@ -682,6 +769,14 @@ export const MemberCompiler = {
             (this.ctx.getMainCapturedVar && this.ctx.getMainCapturedVar("Date")));
     },
 
+    // [I2 一等值] Map/Set/Promise 标识符被遮蔽?同 stringNameShadowed 守卫组
+    // (局部变量 / 函数·类声明 / 主程序捕获全局)。
+    collectionNameShadowed(name) {
+        return !!((this.ctx.getLocal && this.ctx.getLocal(name)) ||
+            (this.ctx.getFunction && this.ctx.getFunction(name)) ||
+            (this.ctx.getMainCapturedVar && this.ctx.getMainCapturedVar(name)));
+    },
+
     // [Date 一等值] 本编译单元是否注入了 __date_shim(五个 __DATE_* 导出全有真标签)。
     // 门未开时 locale 族方法用占位闭包(见 DATE_PROTO_SHIM_METHODS 注)。
     dateShimReady() {
@@ -824,12 +919,19 @@ export const MemberCompiler = {
     },
 
     // [W-28] 确保数据段槽(qword,GC 保守扫描即根)只登记一次。
+    // [I2 红队] 运行时侧可能已登记同名槽(promise.js 的 _nsobj_promise 被静态守卫
+    // 引用、由 PromiseGenerator 无条件登记;runtime generate 先于 compileProgram,
+    // 此处可见)→ 扫 dataLabels 查重,避免重复定义占双份。
     _reEnsureSlot(slotLabel) {
         if (!this._addedNsObjLabels) this._addedNsObjLabels = new Set();
         if (this._addedNsObjLabels.has(slotLabel)) return;
+        this._addedNsObjLabels.add(slotLabel);
+        const dl = this.asm.dataLabels || [];
+        for (let i = 0; i < dl.length; i = i + 1) {
+            if (dl[i].name === slotLabel) return;
+        }
         this.asm.addDataLabel(slotLabel);
         this.asm.addDataQword(0);
-        this._addedNsObjLabels.add(slotLabel);
     },
 
     // [W-28] 把 RET 里的值作为数据属性落到原型槽指向的对象上,再落 attrs。
@@ -1188,6 +1290,213 @@ export const MemberCompiler = {
         vm.label(doneL);
     },
 
+    // [I2 一等值] Map/Set.prototype 的 `size` 访问器落位:24B _aref_generic getter 闭包
+    // (helper = _aref_coll_size:脱壳读 size@8 装箱 number)挂 .name="get size"/.length=0
+    // (闭包属性侧表),再包 24B TYPE_GETTER 标记块 {60@0, 裸 getter@8, setter=0@16}
+    // (形态与 emitRegExpFlagAccessor 的标记块一致,由 _maybe_getter / gOPD 消费),经
+    // _object_define 落到原型、_object_set_prop_attr 落 attr 4({enumerable:false,
+    // configurable:true})。getter 闭包经 _aref_generic 蹦床:_maybe_getter 以动态接收者
+    // (this,A5)调用,蹦床插 A0 后尾调 helper,调用约定吻合。实例侧 `m.size` 不经此
+    // (成员读 size 分支按 type 字节直读 @8),本组服务反射与 X.prototype.size 直读。
+    emitCollectionSizeAccessor(protoSlot, helperLabel) {
+        const vm = this.vm;
+        this.emitBuiltinMethodRefClosure(helperLabel); // RET = 装箱 getter 闭包
+        vm.mov(VReg.S0, VReg.RET);                     // 跨 call 暂存
+        vm.mov(VReg.A0, VReg.S0);
+        this.emitBoxedStringKey("name", VReg.A1);
+        vm.lea(VReg.A2, this.asm.addString("get size"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A2, VReg.A2, VReg.V1);
+        vm.call("_closure_prop_set");
+        vm.mov(VReg.A0, VReg.S0);
+        this.emitBoxedStringKey("length", VReg.A1);
+        vm.movImm(VReg.A2, 0);
+        vm.scvtf(0, VReg.A2);
+        vm.fmovToInt(VReg.A2, 0);
+        vm.call("_closure_prop_set");
+        // 24B 标记块(S1 暂存:S0 仍持 getter 闭包)
+        vm.movImm(VReg.A0, 24);
+        vm.call("_alloc");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.movImm(VReg.V1, TYPE_GETTER);
+        vm.store(VReg.S1, 0, VReg.V1);
+        vm.mov(VReg.V2, VReg.S0);
+        vm.movImm64(VReg.V1, PTR_MASK_BITS);
+        vm.and(VReg.V2, VReg.V2, VReg.V1);            // 裸 getter 指针
+        vm.store(VReg.S1, 8, VReg.V2);
+        vm.movImm(VReg.V1, 0);
+        vm.store(VReg.S1, 16, VReg.V1);               // setter = 0(只读访问器)
+        // 落原型:_object_define(裸对象, key, 标记块)
+        this.emitBoxedStringKey("size", VReg.A1);     // 只毁 V1/LR
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.V2, VReg.V0, 0);
+        vm.movImm64(VReg.V1, PTR_MASK_BITS);
+        vm.and(VReg.A0, VReg.V2, VReg.V1);
+        vm.mov(VReg.A2, VReg.S1);
+        vm.call("_object_define");
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.A0, VReg.V0, 0);                 // 装箱对象(attr 侧接受装箱)
+        this.emitBoxedStringKey("size", VReg.A1);
+        vm.movImm(VReg.A2, ACCESSOR_PROP_ATTR);
+        vm.call("_object_set_prop_attr");
+    },
+
+    // [I2 一等值] 惰性物化 Map/Set/Promise 构造器函数对象 + 原型(两个全局槽,GC 保守
+    // 扫数据段即根),形态逐字镜像 emitDateCtorObject:**一次填两槽**、原型侧只从槽读
+    // 构造器(不回调)→ 无编译期递归。RET = 装箱构造器函数值(稳定身份 → `Map===Map`)。
+    // cfg = { name, length(规范 Function.length), ctorFn(裸调用命中、抛 TypeError 的
+    // 运行时标签), ctorSlot, protoSlot, methods([[名, helper, 规范 length]]),
+    // sizeGetter(helper 标签或 null), statics([[名, helper, 规范 length]]) }。
+    emitCollectionCtorObject(cfg) {
+        const vm = this.vm;
+        const ctorSlot = cfg.ctorSlot;
+        const protoSlot = cfg.protoSlot;
+        this._reEnsureSlot(ctorSlot);
+        this._reEnsureSlot(protoSlot);
+        const doneL = this.ctx.newLabel("nscoll_done");
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne(doneL);
+        // 构造器闭包 16B {magic, cfg.ctorFn}:裸 X() 作**值**传递后不带 new 调用
+        // (`const C=Map; C()`)命中 ctorFn → TypeError。new X(...) 的静态特判
+        // (compileNewExpression)先于值路径,从不落此。
+        vm.movImm(VReg.A0, 16);
+        vm.call("_alloc");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.movImm(VReg.V1, 0xc105); // CLOSURE_MAGIC
+        vm.store(VReg.S0, 0, VReg.V1);
+        vm.lea(VReg.V1, cfg.ctorFn);
+        vm.store(VReg.S0, 8, VReg.V1);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_js_box_function");
+        vm.lea(VReg.V0, ctorSlot);
+        vm.store(VReg.V0, 0, VReg.RET); // **先**存槽:后续每步都从槽重载(跨 call 安全)
+        // X.name / X.length(闭包属性侧表)
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("name", VReg.A1);
+        vm.lea(VReg.A2, this.asm.addString(cfg.name));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A2, VReg.A2, VReg.V1);
+        vm.call("_closure_prop_set");
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("length", VReg.A1);
+        vm.movImm(VReg.A2, cfg.length);
+        vm.scvtf(0, VReg.A2);
+        vm.fmovToInt(VReg.A2, 0);
+        vm.call("_closure_prop_set");
+        // 原型对象
+        vm.call("_object_new");
+        vm.call("_box_obj_r");
+        vm.lea(VReg.V0, protoSlot);
+        vm.store(VReg.V0, 0, VReg.RET);
+        // 原型方法落位:_aref_generic 安全 helper 闭包 + 逐闭包 .name/.length + attr 5
+        for (let i = 0; i < cfg.methods.length; i = i + 1) {
+            const m = cfg.methods[i];
+            this.emitBuiltinMethodRefClosureMeta(m[1], m[0], m[2]); // RET = 闭包
+            this._reSetProtoProp(protoSlot, m[0], BUILTIN_PROP_ATTR);
+        }
+        // [规范同一性别名] cfg.aliases = [[别名, 源名]]:回读源方法闭包落别名槽 →
+        // X.prototype.keys === X.prototype.values 同一函数对象(Set 规范 24.2.3.6:
+        // "initial value of keys is the same function object as values",.name 随源
+        // 闭包为 "values",与 Node 一致)。属性位与源同(attr 5)。
+        const aliases = cfg.aliases || [];
+        for (let i = 0; i < aliases.length; i = i + 1) {
+            const al = aliases[i];
+            vm.lea(VReg.V0, protoSlot);
+            vm.load(VReg.A0, VReg.V0, 0);
+            this.emitBoxedStringKey(al[1], VReg.A1);
+            vm.call("_object_get");                      // RET = 源方法闭包(同一身份)
+            this._reSetProtoProp(protoSlot, al[0], BUILTIN_PROP_ATTR);
+        }
+        // size 访问器(Map/Set)
+        if (typeof cfg.sizeGetter === "string") {
+            this.emitCollectionSizeAccessor(protoSlot, cfg.sizeGetter);
+        }
+        // prototype.constructor = X(从槽读,已就绪 → 不回调本函数)
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        this._reSetProtoProp(protoSlot, "constructor", BUILTIN_PROP_ATTR);
+        // 静态方法作构造器闭包属性(attr 5)。值经 emitMemoizedBuiltinRef(与静态值读
+        // 同槽 → Promise.resolve === gOPD(Promise,"resolve").value);落值后经
+        // _closure_prop_set_attr 落 attr,否则 gOPD 误报 enumerable:true。
+        const setCtorProp = (name, attr, emitValue) => {
+            emitValue();                                   // RET = 值
+            vm.mov(VReg.A2, VReg.RET);
+            vm.lea(VReg.V0, ctorSlot);
+            vm.load(VReg.A0, VReg.V0, 0);
+            this.emitBoxedStringKey(name, VReg.A1);
+            vm.call("_closure_prop_set");
+            vm.lea(VReg.V0, ctorSlot);
+            vm.load(VReg.A0, VReg.V0, 0);
+            this.emitBoxedStringKey(name, VReg.A1);
+            vm.movImm(VReg.A2, attr);
+            vm.call("_closure_prop_set_attr");
+        };
+        for (let i = 0; i < cfg.statics.length; i = i + 1) {
+            const s = cfg.statics[i];
+            const slotKey = cfg.name.toLowerCase() + "_" + s[0];
+            setCtorProp(s[0], BUILTIN_PROP_ATTR,
+                () => this.emitMemoizedBuiltinRef(slotKey, s[1], s[0]));
+        }
+        // X.prototype = 原型对象(闭包属性侧表;规范 attrs 全 false → attr 0)
+        setCtorProp("prototype", BUILTIN_CONST_ATTR, () => {
+            vm.lea(VReg.V0, protoSlot);
+            vm.load(VReg.RET, VReg.V0, 0);
+        });
+        // RET = 装箱构造器(稳定身份)
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.label(doneL);
+    },
+
+    // [I2 一等值] 三个构造器的物化入口(配置见 MAP_/SET_/PROMISE_*_METHODS 表注)。
+    emitMapCtorObject() {
+        this.emitCollectionCtorObject({
+            name: "Map", length: 0, ctorFn: "_map_ctor_call",
+            ctorSlot: "_nsobj_map", protoSlot: "_nsobj_map_proto",
+            methods: MAP_PROTO_METHODS, sizeGetter: "_aref_map_size",
+            statics: MAP_STATIC_METHODS,
+        });
+    },
+    emitSetCtorObject() {
+        this.emitCollectionCtorObject({
+            name: "Set", length: 0, ctorFn: "_set_ctor_call",
+            ctorSlot: "_nsobj_set", protoSlot: "_nsobj_set_proto",
+            methods: SET_PROTO_METHODS, sizeGetter: "_aref_set_size",
+            statics: [], aliases: [["keys", "values"]],
+        });
+    },
+    emitPromiseCtorObject() {
+        this.emitCollectionCtorObject({
+            name: "Promise", length: 1, ctorFn: "_promise_ctor_call",
+            ctorSlot: "_nsobj_promise", protoSlot: "_nsobj_promise_proto",
+            methods: PROMISE_PROTO_METHODS, sizeGetter: null,
+            statics: PROMISE_STATIC_METHODS,
+        });
+    },
+
+    // [I2 一等值] `X.prototype` 值读:原型槽已填则直接用,否则整体物化(构造器路径
+    // 一次填两槽)。RET = 装箱原型对象。
+    emitCollectionProtoObject(name) {
+        const vm = this.vm;
+        const protoSlot = "_nsobj_" + name.toLowerCase() + "_proto";
+        this._reEnsureSlot(protoSlot);
+        const doneL = this.ctx.newLabel("nscollproto_done");
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne(doneL);
+        if (name === "Map") this.emitMapCtorObject();
+        else if (name === "Set") this.emitSetCtorObject();
+        else this.emitPromiseCtorObject();
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.label(doneL);
+    },
+
     // [Error 构造器一等值] memoized 错误构造器闭包 _errctorref_<name>(GC 根)。首次建
     // {magic, 工厂 fnptr} 闭包、存槽、并在闭包属性侧表挂 .name=<name>;后续复用同一装箱值
     // → 稳定身份(TypeError===TypeError)。RET 恒为该 memoized 装箱闭包。
@@ -1478,6 +1787,23 @@ export const MemberCompiler = {
         // 均按语法先于本路径命中 → 快路字节不变。遮蔽守卫同 String。
         if (name === "Date" && !this.dateNameShadowed()) {
             this.emitDateCtorObject();
+            return;
+        }
+        // [I2 一等值] 裸 `Map`/`Set`/`Promise`(反射位):惰性物化真函数对象(带
+        // .prototype/.name/.length、原型方法闭包族、静态闭包族)→ typeof "function"、
+        // `X.prototype` 可达、gOPD(X,…) 成立。四条既有快路(new X(...) 静态特判、
+        // X.method(...) 静态改派、x.m(...) type 字节分派、instanceof X 内联)均按语法
+        // 先于本路径命中 → 快路字节不变。遮蔽守卫同 Date。
+        if (name === "Map" && !this.collectionNameShadowed("Map")) {
+            this.emitMapCtorObject();
+            return;
+        }
+        if (name === "Set" && !this.collectionNameShadowed("Set")) {
+            this.emitSetCtorObject();
+            return;
+        }
+        if (name === "Promise" && !this.collectionNameShadowed("Promise")) {
+            this.emitPromiseCtorObject();
             return;
         }
         // Symbol 一等值(批次D):typeof Symbol === "function"、可传递后调用
@@ -2233,6 +2559,17 @@ export const MemberCompiler = {
             if (propName === "prototype" && expr.object.type === "Identifier" &&
                 expr.object.name === "Date" && !this.dateNameShadowed()) {
                 this.emitDateProtoObject();
+                return;
+            }
+
+            // [I2 一等值] `Map.prototype` / `Set.prototype` / `Promise.prototype` → 惰性
+            // 物化的单例原型对象(方法闭包族 + size 访问器 + constructor)。propName 严格
+            // 限定 "prototype" 且接收者是未遮蔽的裸构造器标识符 → 其它接收者字节不变。
+            if (propName === "prototype" && expr.object.type === "Identifier" &&
+                (expr.object.name === "Map" || expr.object.name === "Set" ||
+                    expr.object.name === "Promise") &&
+                !this.collectionNameShadowed(expr.object.name)) {
+                this.emitCollectionProtoObject(expr.object.name);
                 return;
             }
 

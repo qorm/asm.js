@@ -138,6 +138,8 @@ export class PromiseGenerator {
         this.generatePromiseAny();
         this.generatePromiseFinally();
         this.generateBoundTramp();
+        this.generatePromiseCtorCall();
+        this.generateArefGuards();
     }
 
     // _promise_invoke1(A0=cb, A1=arg) -> RET
@@ -1738,5 +1740,237 @@ export class PromiseGenerator {
         vm.call("_combinator_reject_notiterable");
         vm.mov(VReg.RET, VReg.S1);
         vm.epilogue(SAVED, 48);
+    }
+
+    // [I2 一等值] _promise_ctor_call - `Promise()` 不带 new(经值路径调用,如
+    // `const P=Promise; P(()=>{})`)→ TypeError(规范 27.2.3.1:Promise constructor
+    // cannot be invoked without 'new',消息与 Node 逐字一致)。new Promise(executor)
+    // 在 compileNewExpression 静态特判 _promise_new,从不落此。message 经
+    // emitStringConst(数据段串直接打 0x7FFC tag)交给 _throw_type_error(仅存
+    // message 值,与 _promise_reject_type_error 的串表示同容忍度)。
+    generatePromiseCtorCall() {
+        const vm = this.vm;
+        vm.label("_promise_ctor_call");
+        vm.prologue(16, [VReg.S0]);
+        this.emitStringConst(VReg.A0, "Promise constructor cannot be invoked without 'new'");
+        vm.call("_throw_type_error"); // 不返回
+        vm.epilogue([VReg.S0], 16);   // 理论不达
+    }
+
+    // [I2 红队] 物化 Promise 原型/静态方法值闭包的接收者守卫(成员表
+    // PROMISE_PROTO_METHODS/PROMISE_STATIC_METHODS 改指此处标签)。
+    // 原型方法经 _aref_generic 蹦床进入(this 插 A0、实参上移);静态经
+    // emitBuiltinFnClosure 直连进入(A0-A4 实参、A5=this)。错误接收者此前直读
+    // promise 头(SIGSEGV)或静默成功;守卫后按 Node 逐字抛 TypeError。
+    // 品牌检查/寄存器纪律(V0/V5 scratch,x64 不别名 A0-A5)/消息构造
+    // (_aref_throw_incompat/_aref_throw_not_ctor/_fmt_receiver)见
+    // runtime/types/map/index.js 同名守卫组注(标签全局解析)。
+    generateArefGuards() {
+        const vm = this.vm;
+        // 构造器单例槽(数据段 qword,GC 根):静态守卫做 this===%Promise% 身份判,
+        // 标签须无条件存在——程序不触裸 Promise 标识符时 members.js 不会登记它,
+        // 链接期缺标签即 "Unknown label"。members.js _reEnsureSlot 对运行时
+        // 已登记的同名槽查重跳过,不重复定义。[F3] 原型单例槽同理(_fmt_receiver
+        // 身份比较与 catch/finally 的 Promise.prototype 特判引用)。
+        vm.asm.addDataLabel("_nsobj_promise");
+        vm.asm.addDataQword(0);
+        vm.asm.addDataLabel("_nsobj_promise_proto");
+        vm.asm.addDataQword(0);
+
+        // ---- _aref_promise_then(A0=this, A1=onF, A2=onR):品牌守卫 → _promise_then2。
+        // (WIP 表初值直连 _promise_then 只传单回调,值路径 then.call(p,f,r) 丢
+        // onRejected;_promise_then2 双侧归一化,单回调形态语义等价。)
+        vm.label("_aref_promise_then");
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_apt_chk");
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jne("_apt_bad");
+        vm.label("_apt_chk");
+        vm.emitMaskLoad(VReg.V5);
+        vm.andMaskReg(VReg.V0, VReg.A0, VReg.V5);
+        vm.movImm64(VReg.V5, vm.ptrFloor);
+        vm.cmp(VReg.V0, VReg.V5);
+        vm.jlt("_apt_bad");
+        vm.loadByte(VReg.V0, VReg.V0, 0);
+        vm.cmpImm(VReg.V0, TYPE_PROMISE);
+        vm.jne("_apt_bad");
+        vm.jmp("_promise_then2");
+        vm.label("_apt_bad");
+        vm.lea(VReg.A1, vm.asm.addString("Method Promise.prototype.then called on incompatible receiver "));
+        vm.movImm64(VReg.V1, TAG_STRING);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.jmp("_aref_throw_incompat");
+
+        // ---- _aref_promise_catch(A0=this, A1=cb):规范 27.2.5.3 `return this.then(
+        // undefined, onRejected)` 的接收者语义——
+        //   null/undefined → "Cannot read properties of <n> (reading 'then')"
+        //     (_throw_read_nullish 既有实现,逐字一致);
+        //   其余非 promise → this.then 为 undefined,调之 → "undefined is not a function";
+        //   promise → 尾调 _promise_catch。thenable 接收者不展开(记偏差)。
+        vm.label("_aref_promise_catch");
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFA);
+        vm.jeq("_apcc_nullish");
+        vm.cmpImm(VReg.V0, 0x7FFB);
+        vm.jeq("_apcc_nullish");
+        // [I2 红队 F3] this === Promise.prototype 单例:规范 `this.then(undefined, cb)`
+        // 读到真 then 方法(原型自有),其品牌检查按 then 文案抛(Node 实测逐字)。
+        vm.lea(VReg.V5, "_nsobj_promise_proto");
+        vm.load(VReg.V5, VReg.V5, 0);
+        vm.cmp(VReg.V5, VReg.A0);
+        vm.jeq("_apcc_thenbad");
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_apcc_chk");
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jne("_apcc_notfn");
+        vm.label("_apcc_chk");
+        vm.emitMaskLoad(VReg.V5);
+        vm.andMaskReg(VReg.V0, VReg.A0, VReg.V5);
+        vm.movImm64(VReg.V5, vm.ptrFloor);
+        vm.cmp(VReg.V0, VReg.V5);
+        vm.jlt("_apcc_notfn");
+        vm.loadByte(VReg.V0, VReg.V0, 0);
+        vm.cmpImm(VReg.V0, TYPE_PROMISE);
+        vm.jne("_apcc_notfn");
+        vm.jmp("_promise_catch");
+        vm.label("_apcc_nullish");
+        vm.lea(VReg.A1, vm.asm.addString("then"));
+        vm.movImm64(VReg.V1, TAG_STRING);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.jmp("_throw_read_nullish");    // A0 = 接收者原样,不返回
+        vm.label("_apcc_thenbad");
+        vm.lea(VReg.A1, vm.asm.addString("Method Promise.prototype.then called on incompatible receiver "));
+        vm.movImm64(VReg.V1, TAG_STRING);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.jmp("_aref_throw_incompat");
+        vm.label("_apcc_notfn");
+        vm.lea(VReg.A0, vm.asm.addString("undefined is not a function"));
+        vm.movImm64(VReg.V1, TAG_STRING);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.jmp("_throw_type_error");
+
+        // ---- _aref_promise_finally(A0=this, A1=cb):规范 27.2.5.5 步骤 1-2——
+        //   Type(this) 非 Object(原语/Symbol/BigInt)→ "Promise.prototype.finally called on non-object";
+        //   对象但非 promise → then 为 undefined → "undefined is not a function"
+        //   (数组/函数同理;SpeciesConstructor 读取不展开,记偏差);
+        //   promise → 尾调 _promise_finally。
+        vm.label("_aref_promise_finally");
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        // [I2 红队 F3] this === Promise.prototype 单例:规范经 SpeciesConstructor 后
+        // Invoke(this, "then") 命中真 then 方法,品牌错按 then 文案抛(同 catch 注)。
+        vm.lea(VReg.V5, "_nsobj_promise_proto");
+        vm.load(VReg.V5, VReg.V5, 0);
+        vm.cmp(VReg.V5, VReg.A0);
+        vm.jeq("_apff_thenbad");
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jeq("_apff_chk");
+        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jeq("_apff_notfn");            // 数组:对象但无 then
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jeq("_apff_notfn");            // 函数:对象但无 then
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_apff_nonobj");           // 装箱原语/浮点
+        // 裸值:堆界下 → 原语;堆界上 → 裸堆指针(BigInt/Symbol 是原语)
+        vm.movImm64(VReg.V0, vm.ptrFloor);
+        vm.cmp(VReg.A0, VReg.V0);
+        vm.jlt("_apff_nonobj");
+        vm.load(VReg.V0, VReg.A0, -16);
+        vm.andImm(VReg.V0, VReg.V0, 0xff);
+        vm.cmpImm(VReg.V0, 14);           // TYPE_BIGINT([ptr-16] 布局,同 _is_bigint)
+        vm.jeq("_apff_nonobj");
+        vm.loadByte(VReg.V0, VReg.A0, 0);
+        vm.cmpImm(VReg.V0, 61);           // TYPE_SYMBOL
+        vm.jeq("_apff_nonobj");
+        vm.jmp("_apff_chkbyte");
+        vm.label("_apff_chk");
+        vm.emitMaskLoad(VReg.V5);
+        vm.andMaskReg(VReg.V0, VReg.A0, VReg.V5);
+        vm.movImm64(VReg.V5, vm.ptrFloor);
+        vm.cmp(VReg.V0, VReg.V5);
+        vm.jlt("_apff_notfn");
+        vm.loadByte(VReg.V0, VReg.V0, 0);
+        vm.label("_apff_chkbyte");
+        vm.cmpImm(VReg.V0, TYPE_PROMISE);
+        vm.jne("_apff_notfn");
+        vm.jmp("_promise_finally");
+        vm.label("_apff_nonobj");
+        vm.lea(VReg.A0, vm.asm.addString("Promise.prototype.finally called on non-object"));
+        vm.movImm64(VReg.V1, TAG_STRING);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.jmp("_throw_type_error");
+        vm.label("_apff_thenbad");
+        vm.lea(VReg.A1, vm.asm.addString("Method Promise.prototype.then called on incompatible receiver "));
+        vm.movImm64(VReg.V1, TAG_STRING);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.jmp("_aref_throw_incompat");
+        vm.label("_apff_notfn");
+        vm.lea(VReg.A0, vm.asm.addString("undefined is not a function"));
+        vm.movImm64(VReg.V1, TAG_STRING);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.jmp("_throw_type_error");
+
+        // ---- 静态守卫:闭包 {magic, fnptr=本守卫} 经值路径调用(`.call(x,…)`/
+        // apply/传递后调)时 A5=this。规范要求 this 为构造器 %Promise% 本身:
+        //   this === _nsobj_promise 单例 → 纯尾调既有 helper(A0-A4 实参原样);
+        //   原语 this(含 Symbol/BigInt)→ "<Name> called on non-object";
+        //   函数 this(可构造但非 %Promise%)→ "Promise resolve or reject function is
+        //     not callable"(普通函数与 Node 逐字一致;真子类 this 属已记录偏差,
+        //     抛 TypeError 即可,不得崩);
+        //   其余对象 this → _aref_throw_not_ctor("<fmt> is not a constructor")。
+        const staticGuard = (label, helper, nonObjMsg) => {
+            vm.label(label);
+            vm.lea(VReg.V0, "_nsobj_promise");
+            vm.load(VReg.V0, VReg.V0, 0);
+            vm.cmp(VReg.V0, VReg.A5);
+            vm.jeq(label + "_go");
+            vm.shrImm(VReg.V0, VReg.A5, 48);
+            vm.cmpImm(VReg.V0, 0x7FFF);
+            vm.jeq(label + "_notcall");     // 装箱函数
+            vm.cmpImm(VReg.V0, 0x7FFD);
+            vm.jeq(label + "_notctor");     // 装箱对象
+            vm.cmpImm(VReg.V0, 0x7FFE);
+            vm.jeq(label + "_notctor");     // 装箱数组
+            vm.cmpImm(VReg.V0, 0);
+            vm.jne(label + "_nonobj");      // 装箱原语/浮点
+            // 裸值:堆界下 → 原语;堆界上 → BigInt/Symbol 原语、闭包按函数、其余对象
+            vm.movImm64(VReg.V0, vm.ptrFloor);
+            vm.cmp(VReg.A5, VReg.V0);
+            vm.jlt(label + "_nonobj");
+            vm.load(VReg.V0, VReg.A5, -16);
+            vm.andImm(VReg.V0, VReg.V0, 0xff);
+            vm.cmpImm(VReg.V0, 14);         // TYPE_BIGINT
+            vm.jeq(label + "_nonobj");
+            vm.load(VReg.V0, VReg.A5, 0);
+            vm.movImm(VReg.V1, CLOSURE_MAGIC);
+            vm.cmp(VReg.V0, VReg.V1);
+            vm.jeq(label + "_notcall");     // 裸闭包指针
+            vm.loadByte(VReg.V0, VReg.A5, 0);
+            vm.cmpImm(VReg.V0, 61);         // TYPE_SYMBOL
+            vm.jeq(label + "_nonobj");
+            vm.jmp(label + "_notctor");
+            vm.label(label + "_go");
+            vm.jmp(helper);
+            vm.label(label + "_nonobj");
+            vm.lea(VReg.A0, vm.asm.addString(nonObjMsg));
+            vm.movImm64(VReg.V1, TAG_STRING);
+            vm.or(VReg.A0, VReg.A0, VReg.V1);
+            vm.jmp("_throw_type_error");
+            vm.label(label + "_notcall");
+            vm.lea(VReg.A0, vm.asm.addString("Promise resolve or reject function is not callable"));
+            vm.movImm64(VReg.V1, TAG_STRING);
+            vm.or(VReg.A0, VReg.A0, VReg.V1);
+            vm.jmp("_throw_type_error");
+            vm.label(label + "_notctor");
+            vm.mov(VReg.A0, VReg.A5);
+            vm.jmp("_aref_throw_not_ctor");
+        };
+        staticGuard("_aref_pss_resolve", "_Promise_resolve", "PromiseResolve called on non-object");
+        staticGuard("_aref_pss_reject", "_Promise_reject", "PromiseReject called on non-object");
+        staticGuard("_aref_pss_all", "_Promise_all", "Promise.all called on non-object");
+        staticGuard("_aref_pss_race", "_Promise_race", "Promise.race called on non-object");
+        staticGuard("_aref_pss_allSettled", "_Promise_allSettled", "Promise.allSettled called on non-object");
+        staticGuard("_aref_pss_any", "_Promise_any", "Promise.any called on non-object");
+        staticGuard("_aref_pss_withResolvers", "_Promise_withResolvers", "Promise.withResolvers called on non-object");
     }
 }
