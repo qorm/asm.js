@@ -224,13 +224,15 @@ export const BuiltinMathMethodCompiler = {
     emitMathNanNormalize() {
         const vm = this.vm;
         const doneL = this.ctx.newLabel("mnn_done");
+        // (x64 V2==A2,此处无活值;V0≡RET——指数/尾数提取写 V0 会把非 NaN 结果
+        //  盖成纯指数位,曾致 x64 全部经本归一的 Math helper 返回值只剩指数域)
         vm.movImm64(VReg.V1, 0x7FF0000000000000n);
-        vm.and(VReg.V0, VReg.RET, VReg.V1);
-        vm.cmp(VReg.V0, VReg.V1);
+        vm.and(VReg.V2, VReg.RET, VReg.V1);
+        vm.cmp(VReg.V2, VReg.V1);
         vm.jne(doneL);                     // 指数非全 1 → 非 NaN/Inf
         vm.movImm64(VReg.V1, 0x000FFFFFFFFFFFFFn);
-        vm.and(VReg.V0, VReg.RET, VReg.V1);
-        vm.cmpImm(VReg.V0, 0);
+        vm.and(VReg.V2, VReg.RET, VReg.V1);
+        vm.cmpImm(VReg.V2, 0);
         vm.jeq(doneL);                     // 尾数 0 → ±Inf,保留
         vm.movImm64(VReg.RET, 0x7FF0000000000001n); // NaN → 可打印归一
         vm.label(doneL);
@@ -259,8 +261,8 @@ export const BuiltinMathMethodCompiler = {
         // elem 胜(acc 非严格更优)。但 fcmp 视 -0==+0,故相等且为 ±0 时须按 spec 定符号:
         // min 取 -0(任一为 -0),max 取 +0(任一为 +0)。判据:elem 为 ±0(elem<<1==0)时
         // acc 也为 ±0(已比较相等),合并符号位。elem 非零 → 原行为(RET=elem 不变)。
-        vm.shlImm(VReg.V0, VReg.RET, 1);
-        vm.cmpImm(VReg.V0, 0);
+        vm.shlImm(VReg.V2, VReg.RET, 1);   // (x64 V2==A2,此处无活值;V0≡RET 会盖掉 elem)
+        vm.cmpImm(VReg.V2, 0);
         vm.jne(endL);                // elem 非零 → elem 胜,RET 不变
         if (isMin) {
             vm.or(VReg.V0, VReg.V1, VReg.RET);   // 任一 -0 → 结果 -0

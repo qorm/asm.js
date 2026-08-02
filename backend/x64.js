@@ -1470,6 +1470,15 @@ export class X64Backend extends Backend {
 
     // 浮点减法
     fsub(fpDest, fpA, fpB) {
+        // dest==b 且减法不可交换:直接 movsd(dest, a) 会先把 b(=dest)冲掉再 dest-dest=0
+        // (_math_asin/acos 的 fsub(2,1,2) 曾因此在 x64 恒得 0 → asin=π/2、acos=0)。
+        // 经 XMM15(VM 约定只用 D0-D7)过渡:x15 = a - b;dest = x15。
+        if (fpDest === fpB && fpDest !== fpA) {
+            this.asm.movsd(15, fpA);
+            this.asm.subsd(15, fpB);
+            this.asm.movsd(fpDest, 15);
+            return;
+        }
         if (fpDest !== fpA) {
             this.asm.movsd(fpDest, fpA);
         }
@@ -1486,6 +1495,15 @@ export class X64Backend extends Backend {
 
     // 浮点除法
     fdiv(fpDest, fpA, fpB) {
+        // dest==b 且除法不可交换:直接 movsd(dest, a) 会先把 b(=dest)冲掉再 dest/dest=1
+        // (_math_atan id=3 的 fdiv(0,4,0) 曾因此在 x64 恒得 1.0 → atan(|x|≥2.4375) 全错)。
+        // 经 XMM15 过渡(同 fsub)。
+        if (fpDest === fpB && fpDest !== fpA) {
+            this.asm.movsd(15, fpA);
+            this.asm.divsd(15, fpB);
+            this.asm.movsd(fpDest, 15);
+            return;
+        }
         if (fpDest !== fpA) {
             this.asm.movsd(fpDest, fpA);
         }

@@ -694,8 +694,8 @@ export const MemberCompiler = {
         this.vm.cmpImm(VReg.RET, 0);
         this.vm.jne(doneL);
         this.emitBuiltinFnClosure(runtimeLabel); // RET = 装箱闭包
-        this.vm.lea(VReg.V0, label);
-        this.vm.store(VReg.V0, 0, VReg.RET);
+        this.vm.lea(VReg.V1, label);
+        this.vm.store(VReg.V1, 0, VReg.RET);
         this.vm.label(doneL);
     },
 
@@ -721,8 +721,8 @@ export const MemberCompiler = {
         // callee-saved 寄存器,且 emitBuiltinFnClosure 会毁 S0),同时保证重入安全。
         vm.call("_object_new");
         vm.call("_box_obj_r");
-        vm.lea(VReg.V0, slot);
-        vm.store(VReg.V0, 0, VReg.RET);
+        vm.lea(VReg.V1, slot);
+        vm.store(VReg.V1, 0, VReg.RET);
         // 属性落位顺序:常量 → 一元方法 → 二元方法(与规范无关,仅决定 gOPN 顺序)。
         // 先 _object_set 落值,再 _object_set_prop_attr 落 attrs(顺序不可反:后者
         // materialize flags 并置 EXT_HASFLAGS,attr=0 的常量若先落 attrs 则写值被拒)。
@@ -923,8 +923,8 @@ export const MemberCompiler = {
         const vm = this.vm;
         this.compileFunctionExpression(this._regexpGetterAst(flagName, defaultLit)); // RET = 装箱闭包
         // 跨 call 一律经 scratch 槽转手(不占 callee-saved:闭包建造/内建 helper 会毁 S0)
-        vm.lea(VReg.V0, tmpSlot);
-        vm.store(VReg.V0, 0, VReg.RET);
+        vm.lea(VReg.V1, tmpSlot);
+        vm.store(VReg.V1, 0, VReg.RET);
         vm.lea(VReg.V0, tmpSlot);
         vm.load(VReg.A0, VReg.V0, 0);
         this.emitBoxedStringKey("name", VReg.A1);
@@ -1026,8 +1026,8 @@ export const MemberCompiler = {
         vm.store(VReg.S0, 8, VReg.V1);
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_js_box_function");
-        vm.lea(VReg.V0, ctorSlot);
-        vm.store(VReg.V0, 0, VReg.RET); // **先**存槽:后续每步都从槽重载(跨 call 安全)
+        vm.lea(VReg.V1, ctorSlot);
+        vm.store(VReg.V1, 0, VReg.RET); // **先**存槽:后续每步都从槽重载(跨 call 安全)
         // RegExp.name / RegExp.length(闭包属性侧表)
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.A0, VReg.V0, 0);
@@ -1046,8 +1046,8 @@ export const MemberCompiler = {
         // 原型对象
         vm.call("_object_new");
         vm.call("_box_obj_r");
-        vm.lea(VReg.V0, protoSlot);
-        vm.store(VReg.V0, 0, VReg.RET);
+        vm.lea(VReg.V1, protoSlot);
+        vm.store(VReg.V1, 0, VReg.RET);
         // 原型属性落位:先 _object_set 落值,再 _object_set_prop_attr 落 attrs
         // (顺序不可反,同 emitMathNamespaceObject 注)。值先落 RET,再调 _reSetProtoProp。
         for (let i = 0; i < REGEXP_PROTO_METHODS.length; i = i + 1) {
@@ -1118,8 +1118,8 @@ export const MemberCompiler = {
         vm.store(VReg.S0, 8, VReg.V1);
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_js_box_function");
-        vm.lea(VReg.V0, ctorSlot);
-        vm.store(VReg.V0, 0, VReg.RET); // **先**存槽
+        vm.lea(VReg.V1, ctorSlot);
+        vm.store(VReg.V1, 0, VReg.RET); // **先**存槽
         // String.name / String.length(闭包属性侧表)
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.A0, VReg.V0, 0);
@@ -1138,8 +1138,8 @@ export const MemberCompiler = {
         // 原型对象
         vm.call("_object_new");
         vm.call("_box_obj_r");
-        vm.lea(VReg.V0, protoSlot);
-        vm.store(VReg.V0, 0, VReg.RET);
+        vm.lea(VReg.V1, protoSlot);
+        vm.store(VReg.V1, 0, VReg.RET);
         // 原型属性落位:方法闭包 + _object_set_prop_attr(BUILTIN_PROP_ATTR=5)
         for (let i = 0; i < STRING_PROTO_METHODS.length; i = i + 1) {
             const m = STRING_PROTO_METHODS[i];
@@ -1251,8 +1251,8 @@ export const MemberCompiler = {
         vm.cmpImm(VReg.RET, 0);
         vm.jne(doneL);
         this.emitBuiltinFnClosure(this.getFunctionLabel("__JSON_" + propName)); // RET = 装箱闭包
-        vm.lea(VReg.V0, label);
-        vm.store(VReg.V0, 0, VReg.RET);
+        vm.lea(VReg.V1, label);
+        vm.store(VReg.V1, 0, VReg.RET);
         vm.mov(VReg.S0, VReg.RET);                     // 跨 call 暂存(define 毁 RET)
         vm.mov(VReg.A0, VReg.S0);
         this.emitBoxedStringKey("name", VReg.A1);
@@ -1290,8 +1290,8 @@ export const MemberCompiler = {
         // 建空对象并**先**存槽(同 emitMathNamespaceObject 注:跨 call 安全 + 重入安全)。
         vm.call("_object_new");
         vm.call("_box_obj_r");
-        vm.lea(VReg.V0, slot);
-        vm.store(VReg.V0, 0, VReg.RET);
+        vm.lea(VReg.V1, slot);
+        vm.store(VReg.V1, 0, VReg.RET);
         if (this.jsonShimReady()) {
             // 先 _object_set 落值,再 _object_set_prop_attr 落 attrs(顺序不可反,同
             // emitMathNamespaceObject 注)。
@@ -1357,8 +1357,8 @@ export const MemberCompiler = {
         vm.cmpImm(VReg.RET, 0);
         vm.jne(doneL);
         this.compileFunctionExpression(ast); // RET = 装箱闭包(16B,零捕获)
-        vm.lea(VReg.V0, label);
-        vm.store(VReg.V0, 0, VReg.RET);
+        vm.lea(VReg.V1, label);
+        vm.store(VReg.V1, 0, VReg.RET);
         vm.mov(VReg.S0, VReg.RET);           // 跨 call 暂存
         vm.mov(VReg.A0, VReg.S0);
         this.emitBoxedStringKey("name", VReg.A1);
@@ -1495,8 +1495,8 @@ export const MemberCompiler = {
         vm.store(VReg.S0, 8, VReg.V1);
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_js_box_function");
-        vm.lea(VReg.V0, ctorSlot);
-        vm.store(VReg.V0, 0, VReg.RET); // **先**存槽(跨 call 从槽重载,同 Date 模板)
+        vm.lea(VReg.V1, ctorSlot);
+        vm.store(VReg.V1, 0, VReg.RET); // **先**存槽(跨 call 从槽重载,同 Date 模板)
         // Number.name / Number.length(闭包属性侧表;name/length 的 gOPD 形状由
         // _ogopd_fn 硬编 {w:false,e:false,c:true},无需落 attr)
         vm.lea(VReg.V0, ctorSlot);
@@ -1617,8 +1617,8 @@ export const MemberCompiler = {
         vm.store(VReg.S0, 8, VReg.V1);
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_js_box_function");
-        vm.lea(VReg.V0, ctorSlot);
-        vm.store(VReg.V0, 0, VReg.RET); // **先**存槽:后续每步都从槽重载(跨 call 安全)
+        vm.lea(VReg.V1, ctorSlot);
+        vm.store(VReg.V1, 0, VReg.RET); // **先**存槽:后续每步都从槽重载(跨 call 安全)
         // Date.name / Date.length(闭包属性侧表;name/length 的 gOPD 形状由 _ogopd_fn 的
         // name/length 分支硬编 {w:false,e:false,c:true},无需落 attr)
         vm.lea(VReg.V0, ctorSlot);
@@ -1638,8 +1638,8 @@ export const MemberCompiler = {
         // 原型对象
         vm.call("_object_new");
         vm.call("_box_obj_r");
-        vm.lea(VReg.V0, protoSlot);
-        vm.store(VReg.V0, 0, VReg.RET);
+        vm.lea(VReg.V1, protoSlot);
+        vm.store(VReg.V1, 0, VReg.RET);
         // 原型方法落位:_aref_generic 安全 helper 闭包 + attr 5(见 DATE_PROTO_METHODS 注)
         for (let i = 0; i < DATE_PROTO_METHODS.length; i = i + 1) {
             const m = DATE_PROTO_METHODS[i];
@@ -1787,8 +1787,8 @@ export const MemberCompiler = {
         vm.store(VReg.S0, 8, VReg.V1);
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_js_box_function");
-        vm.lea(VReg.V0, ctorSlot);
-        vm.store(VReg.V0, 0, VReg.RET); // **先**存槽:后续每步都从槽重载(跨 call 安全)
+        vm.lea(VReg.V1, ctorSlot);
+        vm.store(VReg.V1, 0, VReg.RET); // **先**存槽:后续每步都从槽重载(跨 call 安全)
         // X.name / X.length(闭包属性侧表)
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.A0, VReg.V0, 0);
@@ -1807,8 +1807,8 @@ export const MemberCompiler = {
         // 原型对象
         vm.call("_object_new");
         vm.call("_box_obj_r");
-        vm.lea(VReg.V0, protoSlot);
-        vm.store(VReg.V0, 0, VReg.RET);
+        vm.lea(VReg.V1, protoSlot);
+        vm.store(VReg.V1, 0, VReg.RET);
         // 原型方法落位:_aref_generic 安全 helper 闭包 + 逐闭包 .name/.length + attr 5
         for (let i = 0; i < cfg.methods.length; i = i + 1) {
             const m = cfg.methods[i];
@@ -1932,8 +1932,8 @@ export const MemberCompiler = {
         this.vm.cmpImm(VReg.RET, 0);
         this.vm.jne(doneL);
         this.emitBuiltinFnClosure(factory); // RET = 装箱闭包(0x7FFF)
-        this.vm.lea(VReg.V0, label);
-        this.vm.store(VReg.V0, 0, VReg.RET); // memoize
+        this.vm.lea(VReg.V1, label);
+        this.vm.store(VReg.V1, 0, VReg.RET); // memoize
         // 侧表挂 .name = <name>(_closure_prop_set: A0=fn, A1=key, A2=boxed 串)
         this.vm.mov(VReg.A0, VReg.RET);
         this.emitBoxedStringKey("name", VReg.A1);
@@ -1986,8 +1986,8 @@ export const MemberCompiler = {
         this.vm.store(VReg.S0, 16, VReg.V1);
         this.vm.mov(VReg.A0, VReg.S0);
         this.vm.call("_js_box_function");
-        this.vm.lea(VReg.V0, label);
-        this.vm.store(VReg.V0, 0, VReg.RET);
+        this.vm.lea(VReg.V1, label);
+        this.vm.store(VReg.V1, 0, VReg.RET);
         this.vm.label(doneL);
     },
 
@@ -2352,8 +2352,8 @@ export const MemberCompiler = {
                     this.vm.store(VReg.S0, 8, VReg.V1);
                     this.vm.mov(VReg.A0, VReg.S0);
                     this.vm.call("_js_box_function"); // RET = 装箱
-                    this.vm.lea(VReg.V0, slotLabel);
-                    this.vm.store(VReg.V0, 0, VReg.RET); // memoize
+                    this.vm.lea(VReg.V1, slotLabel);
+                    this.vm.store(VReg.V1, 0, VReg.RET); // memoize
                     this.vm.label(haveLabel);
                     // RET = memoized 装箱函数
                 } else {
@@ -3346,13 +3346,9 @@ export const MemberCompiler = {
                 // 派发,不经此 → 快路字节不变;`X.prototype` 值读、array/string 方法值
                 // 引用族均不经此。接收者脱壳判别与 size 分支同形态,ptrFloor 防小整数
                 // 解引用(同 _tam_validate 契约)。[#32] 表命中用 hasOwnProperty。
-                // [F10 门控] x64 系目标不启用本分支(保持 fallback ≡HEAD):路由激活后
-                // 命中 F8(x64 Date 构造器/原型物化既有崩,HEAD 同点,另案修)→ 行为
-                // 由静默 undefined 劣化为 SIGSEGV。arm64/wasm32 正常启用;Wave 6 F8
-                // 根因修复后移除本门控在 x64 激活。判定惯例同 functions.js:659 的
-                // x64 devirt 门(this.vm.arch);arm64 上恒真 → 发射路径零变化。
-                if (this.vm.arch !== "x64" &&
-                    Object.prototype.hasOwnProperty.call(DATE_INST_METHOD_REF, propName) &&
+                // [F10 门控已移除] Wave 6 F8 根因(x64 V0≡RET 被当独立 scratch)已修,
+                // x64 三目标正常启用本分支(原门控 this.vm.arch !== "x64" 删除)。
+                if (Object.prototype.hasOwnProperty.call(DATE_INST_METHOD_REF, propName) &&
                     (this.inferObjectType ? this.inferObjectType(expr.object) : "unknown") === "Date") {
                     const dmId = this.nextLabelId();
                     const dmEndL = this.ctx.newLabel("dmref_end");

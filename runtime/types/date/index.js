@@ -1198,8 +1198,8 @@ export class DateGenerator {
         vm.div(VReg.RET, VReg.S2, VReg.V1); // year
         // [Date 加固] 负年修正:编码值 y*10000+m*100+d 中 m*100+d∈[101,1231] 恒正,
         // 截断除对负年向上进 1(如 -1 年 7 月 → -9298/10000=0),须 floor:余<0 则商-1。
-        vm.mod(VReg.V0, VReg.S2, VReg.V1);
-        vm.cmpImm(VReg.V0, 0);
+        vm.mod(VReg.V2, VReg.S2, VReg.V1);
+        vm.cmpImm(VReg.V2, 0);
         vm.jge("_dgp_year_ok");
         vm.subImm(VReg.RET, VReg.RET, 1);
         vm.label("_dgp_year_ok");

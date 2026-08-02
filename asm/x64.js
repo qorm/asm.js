@@ -1362,15 +1362,26 @@ export class X64Assembler {
 
     // 添加 64 位浮点数数据（IEEE 754 double）
     addFloat64(value, bits) {
-        // 检查是否已存在相同的浮点数
+        // 检查是否已存在相同的浮点数（区分 0 和 -0）
         this.floats = this.floats || new Map();
-        if (this.floats.has(value)) {
-            return this.floats.get(value);
+        // 先拆小端字节；用字节序列做 Map key——不能用 value 做 key(Map SameValueZero
+        // 把 -0/+0 撞成同一槽:先池化 -0 后 +0 全部读成 -0,x64 Math.max(-0,0)→-0
+        // 的根因;arm64/wasm32 均按字节 key);也不用 bits.toString()(自举运行时
+        // BigInt.toString 返回空串,见 arm64.js 同段注释)。
+        let b = bits;
+        const bytes = [];
+        for (let i = 0; i < 8; i++) {
+            bytes.push(Number(b & 0xffn));
+            b = b >> 8n;
+        }
+        const key = bytes.join(",");
+        if (this.floats.has(key)) {
+            return this.floats.get(key);
         }
 
         let labelIndex = this.floats.size;
         let labelName = "_float_" + labelIndex;
-        this.floats.set(value, labelName);
+        this.floats.set(key, labelName);
 
         // 添加到数据标签
         this.dataLabels.push({ type: "label", name: labelName });

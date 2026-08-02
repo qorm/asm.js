@@ -1,6 +1,6 @@
 # asm.js test262 conformance report
 
-_Generated 2026-08-01T17:51:13.126Z — target macos-arm64_
+_Generated 2026-08-01T21:03:16.690Z — target macos-arm64_
 
 ## Headline
 
@@ -125,4 +125,4 @@ mkdir -p .test262-corpus && tar xzf /tmp/t262.tgz -C .test262-corpus --strip-com
 node tests/test262/run.mjs --stride 5 --jobs 8 --target macos-arm64
 ```
 
-_Run wall-clock: 431.6s._
+_Run wall-clock: 417.5s._

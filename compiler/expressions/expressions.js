@@ -287,8 +287,8 @@ export const ExpressionCompiler = {
                 this.vm.store(VReg.FP, objPtrOff, VReg.RET);
                 // Set prototype: load String.prototype singleton
                 this.emitStringProtoObject(); // RET = boxed String.prototype (0x7FFD-tagged)
-                this.vm.load(VReg.V0, VReg.FP, objPtrOff);
-                this.vm.store(VReg.V0, 16, VReg.RET); // obj.__proto__ = String.prototype
+                this.vm.load(VReg.V1, VReg.FP, objPtrOff);
+                this.vm.store(VReg.V1, 16, VReg.RET); // obj.__proto__ = String.prototype
                 // Store __value property
                 this.vm.load(VReg.A0, VReg.FP, objPtrOff);
                 this.vm.load(VReg.A2, VReg.FP, strValOff);

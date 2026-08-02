@@ -1032,15 +1032,15 @@ export class AllocatorGenerator {
 
         // ---- grow 重定位兜底:段整体写哨兵,退回单块 bump(极罕见)----
         vm.label("_alloc_small_relocated");
-        vm.movImm64(VReg.V0, BigInt(SPAN_SIZE));
-        vm.add(VReg.V0, VReg.V0, VReg.V6); // req
-        vm.subImm(VReg.V0, VReg.V0, HEADER_SIZE);
-        vm.shlImm(VReg.V0, VReg.V0, SIZE_SHIFT);
+        vm.movImm64(VReg.V2, BigInt(SPAN_SIZE));
+        vm.add(VReg.V2, VReg.V2, VReg.V6); // req
+        vm.subImm(VReg.V2, VReg.V2, HEADER_SIZE);
+        vm.shlImm(VReg.V2, VReg.V2, SIZE_SHIFT);
         vm.movImm(VReg.V3, SPAN_SENTINEL_CLASS << CLASS_SHIFT);
-        vm.or(VReg.V0, VReg.V0, VReg.V3);
-        vm.store(VReg.RET, 0, VReg.V0);
-        vm.movImm(VReg.V0, 0);
-        vm.store(VReg.RET, HDR_NEXT, VReg.V0);
+        vm.or(VReg.V2, VReg.V2, VReg.V3);
+        vm.store(VReg.RET, 0, VReg.V2);
+        vm.movImm(VReg.V2, 0);
+        vm.store(VReg.RET, HDR_NEXT, VReg.V2);
         vm.mov(VReg.A0, VReg.S3);
         vm.call("_bump_alloc");
         vm.cmpImm(VReg.RET, 0);
@@ -1398,8 +1398,8 @@ export class AllocatorGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
         // ---- 重定位兜底(28GB 堆下不可达):RET=实际基址,aligned=ceil64k(RET),无 gap 哨兵/pagemap
         vm.label("_mcr_reloc");
-        vm.movImm64(VReg.V0, BigInt(SPAN_SIZE - 1));
-        vm.add(VReg.V1, VReg.RET, VReg.V0);
+        vm.movImm64(VReg.V2, BigInt(SPAN_SIZE - 1)); // (x64 V2==A2 无活值;V0≡RET 会盖掉实际基址)
+        vm.add(VReg.V1, VReg.RET, VReg.V2);
         vm.movImm64(VReg.V0, 0xffffffffffff0000n);
         vm.and(VReg.S3, VReg.V1, VReg.V0); // S3 = aligned(from actual base)
         vm.jmp("_mcr_setcur");
@@ -3847,8 +3847,8 @@ export class AllocatorGenerator {
         vm.movImm64(VReg.A4, 0xffffffffffffffffn);
         vm.movImm(VReg.A5, 0);
         vm.syscall(this.getSyscallNum("mmap"));
-        vm.lea(VReg.V0, "_gc_diag_startmap");
-        vm.store(VReg.V0, 0, VReg.RET);
+        vm.lea(VReg.V1, "_gc_diag_startmap");
+        vm.store(VReg.V1, 0, VReg.RET);
         vm.label("_gd_havemap");
         // 清空 startmap [0, used/64 + 余量)
         vm.lea(VReg.V0, "_heap_meta");

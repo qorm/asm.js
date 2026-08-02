@@ -1934,8 +1934,8 @@ export const FunctionCompiler = {
                 this.emitBoxedStringKey("raw", VReg.A1);
                 this.vm.call("_closure_prop_set"); // 侧表:strs.raw = rawArr
                 this.vm.load(VReg.RET, VReg.FP, arStrsOff);
-                this.vm.lea(VReg.V0, siteLabel);
-                this.vm.store(VReg.V0, 0, VReg.RET); // 缓存模板对象(数据根 → 常驻)
+                this.vm.lea(VReg.V1, siteLabel);
+                this.vm.store(VReg.V1, 0, VReg.RET); // 缓存模板对象(数据根 → 常驻)
                 this.vm.label(doneL);
                 return;
             }

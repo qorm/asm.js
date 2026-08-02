@@ -112,8 +112,8 @@ export class ArrayBufferGenerator {
         vm.mov(VReg.S2, VReg.A2); // owner
         vm.movImm(VReg.A0, ARRAY_BUFFER_HEADER); // 仅 32B 头(无 own-data)
         vm.call("_alloc");
-        vm.movImm(VReg.V0, TYPE_ARRAY_BUFFER);
-        vm.store(VReg.RET, 0, VReg.V0);
+        vm.movImm(VReg.V1, TYPE_ARRAY_BUFFER);
+        vm.store(VReg.RET, 0, VReg.V1);
         vm.store(VReg.RET, 8, VReg.S1);   // byteLength
         vm.store(VReg.RET, 16, VReg.S0);  // data_ptr = 别名地址
         vm.store(VReg.RET, 24, VReg.S2);  // owner
@@ -237,8 +237,8 @@ export class ArrayBufferGenerator {
         vm.load(VReg.S3, VReg.V0, 16);
         vm.movImm(VReg.A0, 32);
         vm.call("_alloc");
-        vm.movImm(VReg.V0, TYPE_DATA_VIEW);
-        vm.store(VReg.RET, 0, VReg.V0);
+        vm.movImm(VReg.V1, TYPE_DATA_VIEW);
+        vm.store(VReg.RET, 0, VReg.V1);
         vm.store(VReg.RET, 8, VReg.S3);  // data_ptr
         vm.store(VReg.RET, 16, VReg.S1); // byteOffset
         vm.store(VReg.RET, 24, VReg.S2); // byteLength
@@ -262,13 +262,13 @@ export class ArrayBufferGenerator {
         vm.cmpImm(VReg.A1, 0);
         vm.jlt("_dvg_oob");
         vm.load(VReg.V0, VReg.A0, 24);       // dv.byteLength
-        vm.add(VReg.V1, VReg.A1, VReg.A2);   // byteOffset + size
-        vm.cmp(VReg.V1, VReg.V0);
+        vm.add(VReg.V4, VReg.A1, VReg.A2);   // byteOffset + size(x64 V1≡A3=flags 下方才存,V4≡A5 非本函数实参)
+        vm.cmp(VReg.V4, VReg.V0);
         vm.jgt("_dvg_oob");
         // base = dv.data_ptr@8 + dv.byteOffset@16 + byteOffset
         vm.load(VReg.V0, VReg.A0, 8);
-        vm.load(VReg.V1, VReg.A0, 16);
-        vm.add(VReg.V0, VReg.V0, VReg.V1);
+        vm.load(VReg.V4, VReg.A0, 16);       // (同上:V1≡A3 会毁 flags)
+        vm.add(VReg.V0, VReg.V0, VReg.V4);
         vm.add(VReg.S0, VReg.V0, VReg.A1); // S0 = base
         vm.mov(VReg.S1, VReg.A2);          // size
         vm.mov(VReg.S2, VReg.A3);          // flags
@@ -344,6 +344,12 @@ export class ArrayBufferGenerator {
         const vm = this.vm;
         vm.label("_dataview_set");
         vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        // 实参先落 S 系:x64 上 V1≡A3/V3≡A4/V4≡A5,下方边界检查的 V1 暂存会把
+        // A3(size) 毁掉(F2:非窗口 dv 写静默 no-op 根因);先存再用即免疫。
+        vm.mov(VReg.S1, VReg.A2);          // value(f64 位)
+        vm.mov(VReg.S2, VReg.A3);          // size
+        vm.mov(VReg.S3, VReg.A4);          // flags
+        vm.mov(VReg.S4, VReg.A5);          // le
         // [bounds] 0 <= byteOffset(A1) && byteOffset + size(A3) <= dv.byteLength@24;违则 RangeError
         vm.cmpImm(VReg.A1, 0);
         vm.jlt("_dvs_oob");
@@ -355,10 +361,6 @@ export class ArrayBufferGenerator {
         vm.load(VReg.V1, VReg.A0, 16);
         vm.add(VReg.V0, VReg.V0, VReg.V1);
         vm.add(VReg.S0, VReg.V0, VReg.A1); // base
-        vm.mov(VReg.S1, VReg.A2);          // value(f64 位)
-        vm.mov(VReg.S2, VReg.A3);          // size
-        vm.mov(VReg.S3, VReg.A4);          // flags
-        vm.mov(VReg.S4, VReg.A5);          // le
         // 计算写入位模式 → S5(size 字节,右对齐)
         vm.andImm(VReg.V0, VReg.S3, 2);
         vm.cmpImm(VReg.V0, 0);
@@ -610,10 +612,10 @@ export class TypedArrayGenerator {
         vm.store(VReg.RET, 8, VReg.S3);   // length
         // data_ptr = buffer.data_ptr@16 + byteOffset
         vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
-        vm.and(VReg.V0, VReg.S1, VReg.V1); // 裸 buffer 指针
-        vm.load(VReg.V0, VReg.V0, 16);     // buffer.data_ptr
-        vm.add(VReg.V0, VReg.V0, VReg.S2); // + byteOffset
-        vm.store(VReg.RET, 16, VReg.V0);   // data_ptr
+        vm.and(VReg.V2, VReg.S1, VReg.V1); // 裸 buffer 指针
+        vm.load(VReg.V2, VReg.V2, 16);     // buffer.data_ptr
+        vm.add(VReg.V2, VReg.V2, VReg.S2); // + byteOffset
+        vm.store(VReg.RET, 16, VReg.V2);   // data_ptr
         vm.store(VReg.RET, 24, VReg.S1);   // buffer(GC 根)
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 16);
         vm.label("_tav_oob");
@@ -689,9 +691,9 @@ export class TypedArrayGenerator {
         vm.shl(VReg.V1, VReg.S1, 1);                        // index*2
         vm.add(VReg.V1, VReg.S0, VReg.V1);
         vm.loadByte(VReg.RET, VReg.V1, TYPED_ARRAY_HEADER);
-        vm.loadByte(VReg.V0, VReg.V1, TYPED_ARRAY_HEADER + 1);
-        vm.shl(VReg.V0, VReg.V0, 8);
-        vm.or(VReg.RET, VReg.RET, VReg.V0);
+        vm.loadByte(VReg.V2, VReg.V1, TYPED_ARRAY_HEADER + 1); // (x64 V2==A2 无活值;V0≡RET 会盖掉低字节累加器)
+        vm.shl(VReg.V2, VReg.V2, 8);
+        vm.or(VReg.RET, VReg.RET, VReg.V2);
         vm.cmpImm(VReg.S2, TYPE_INT16_ARRAY);
         vm.jne("_ta_get_int_to_f64");
         vm.shl(VReg.RET, VReg.RET, 48);                     // Int16 符号扩展
@@ -703,12 +705,12 @@ export class TypedArrayGenerator {
         vm.shl(VReg.V1, VReg.S1, 2);                        // index*4
         vm.add(VReg.V1, VReg.S0, VReg.V1);
         vm.loadByte(VReg.RET, VReg.V1, TYPED_ARRAY_HEADER);
-        vm.loadByte(VReg.V0, VReg.V1, TYPED_ARRAY_HEADER + 1);
-        vm.shl(VReg.V0, VReg.V0, 8); vm.or(VReg.RET, VReg.RET, VReg.V0);
-        vm.loadByte(VReg.V0, VReg.V1, TYPED_ARRAY_HEADER + 2);
-        vm.shl(VReg.V0, VReg.V0, 16); vm.or(VReg.RET, VReg.RET, VReg.V0);
-        vm.loadByte(VReg.V0, VReg.V1, TYPED_ARRAY_HEADER + 3);
-        vm.shl(VReg.V0, VReg.V0, 24); vm.or(VReg.RET, VReg.RET, VReg.V0);
+        vm.loadByte(VReg.V2, VReg.V1, TYPED_ARRAY_HEADER + 1); // (x64 V2==A2 无活值;V0≡RET 会盖掉低字节累加器)
+        vm.shl(VReg.V2, VReg.V2, 8); vm.or(VReg.RET, VReg.RET, VReg.V2);
+        vm.loadByte(VReg.V2, VReg.V1, TYPED_ARRAY_HEADER + 2);
+        vm.shl(VReg.V2, VReg.V2, 16); vm.or(VReg.RET, VReg.RET, VReg.V2);
+        vm.loadByte(VReg.V2, VReg.V1, TYPED_ARRAY_HEADER + 3);
+        vm.shl(VReg.V2, VReg.V2, 24); vm.or(VReg.RET, VReg.RET, VReg.V2);
         vm.cmpImm(VReg.S2, TYPE_INT32_ARRAY);
         vm.jne("_ta_get_int_to_f64");
         vm.shl(VReg.RET, VReg.RET, 32);                     // Int32 符号扩展
@@ -726,12 +728,12 @@ export class TypedArrayGenerator {
         vm.shl(VReg.V1, VReg.S1, 2);
         vm.add(VReg.V1, VReg.S0, VReg.V1);
         vm.loadByte(VReg.RET, VReg.V1, TYPED_ARRAY_HEADER);
-        vm.loadByte(VReg.V0, VReg.V1, TYPED_ARRAY_HEADER + 1);
-        vm.shl(VReg.V0, VReg.V0, 8); vm.or(VReg.RET, VReg.RET, VReg.V0);
-        vm.loadByte(VReg.V0, VReg.V1, TYPED_ARRAY_HEADER + 2);
-        vm.shl(VReg.V0, VReg.V0, 16); vm.or(VReg.RET, VReg.RET, VReg.V0);
-        vm.loadByte(VReg.V0, VReg.V1, TYPED_ARRAY_HEADER + 3);
-        vm.shl(VReg.V0, VReg.V0, 24); vm.or(VReg.RET, VReg.RET, VReg.V0);
+        vm.loadByte(VReg.V2, VReg.V1, TYPED_ARRAY_HEADER + 1); // (x64 V2==A2 无活值;V0≡RET 会盖掉位组装累加器)
+        vm.shl(VReg.V2, VReg.V2, 8); vm.or(VReg.RET, VReg.RET, VReg.V2);
+        vm.loadByte(VReg.V2, VReg.V1, TYPED_ARRAY_HEADER + 2);
+        vm.shl(VReg.V2, VReg.V2, 16); vm.or(VReg.RET, VReg.RET, VReg.V2);
+        vm.loadByte(VReg.V2, VReg.V1, TYPED_ARRAY_HEADER + 3);
+        vm.shl(VReg.V2, VReg.V2, 24); vm.or(VReg.RET, VReg.RET, VReg.V2);
         vm.fmovToFloatSingle(0, VReg.RET); // 位模式 -> s0 单精度
         vm.fcvts2d(0, 0);                  // f32 -> f64
         vm.fmovToInt(VReg.RET, 0);
@@ -1227,8 +1229,8 @@ export class TypedArrayGenerator {
         const MASK = 0x0000ffffffffffffn;
         vm.label("_ta_fill");
         vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
-        vm.movImm64(VReg.V1, MASK);
-        vm.and(VReg.S0, VReg.A0, VReg.V1); // 裸 ta
+        vm.movImm64(VReg.V4, MASK); // (x64 V1≡A3=end 会毁实参;V4≡A5 非本函数实参)
+        vm.and(VReg.S0, VReg.A0, VReg.V4); // 裸 ta
         vm.mov(VReg.S1, VReg.A1);          // val(装箱)
         vm.mov(VReg.S2, VReg.A2);          // start
         vm.mov(VReg.S3, VReg.A3);          // end
@@ -1255,8 +1257,8 @@ export class TypedArrayGenerator {
         const MASK = 0x0000ffffffffffffn;
         vm.label("_ta_copywithin");
         vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
-        vm.movImm64(VReg.V1, MASK);
-        vm.and(VReg.S0, VReg.A0, VReg.V1); // 裸 ta
+        vm.movImm64(VReg.V4, MASK); // (x64 V1≡A3=end 会毁实参;V4≡A5 非本函数实参)
+        vm.and(VReg.S0, VReg.A0, VReg.V4); // 裸 ta
         vm.mov(VReg.S1, VReg.A1);          // target
         vm.mov(VReg.S2, VReg.A2);          // start
         vm.mov(VReg.S3, VReg.A3);          // end
@@ -1827,8 +1829,8 @@ export class TypedArrayGenerator {
         vm.or(VReg.A1, VReg.A1, VReg.V1);
         vm.mov(VReg.A0, VReg.S3);
         vm.call("_object_get");               // RET = obj.length(boxed)
-        vm.movImm64(VReg.V0, JS_UNDEFINED);
-        vm.cmp(VReg.RET, VReg.V0);
+        vm.movImm64(VReg.V2, JS_UNDEFINED);   // (x64 V2==A2 无活值;V0≡RET 会盖掉 length)
+        vm.cmp(VReg.RET, VReg.V2);
         vm.jeq("_tact_len0");                 // 无 length(如 iterable 对象)→ 宽容空构造
         vm.mov(VReg.A0, VReg.RET);
         vm.call("_syscall_arg");
@@ -1944,10 +1946,10 @@ export class TypedArrayGenerator {
         vm.jne("_gcp_done");
         vm.call("_object_new");
         vm.call("_box_obj_r");                // RET = boxed 对象
-        vm.lea(VReg.V0, "_ctor_proto_tab");
+        vm.lea(VReg.V2, "_ctor_proto_tab");
         vm.shlImm(VReg.V1, VReg.S1, 3);
-        vm.add(VReg.V0, VReg.V0, VReg.V1);
-        vm.store(VReg.V0, 0, VReg.RET);       // 缓存单例
+        vm.add(VReg.V2, VReg.V2, VReg.V1);
+        vm.store(VReg.V2, 0, VReg.RET);       // 缓存单例
         vm.cmpImm(VReg.S0, AB_PSEUDO);
         vm.jeq("_gcp_done");                  // ArrayBuffer.prototype 保持空对象
         vm.mov(VReg.S1, VReg.RET);            // proto(boxed)

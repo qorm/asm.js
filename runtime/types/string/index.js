@@ -1600,15 +1600,15 @@ export class StringGenerator {
         vm.movImm64(VReg.V0, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.A1, VReg.V0);
         vm.call("_call_toprimitive");
-        vm.shrImm(VReg.V0, VReg.RET, 48);
-        vm.cmpImm(VReg.V0, 0x7FFD);        // 仍是对象 → 无 toPrimitive,回退
+        vm.shrImm(VReg.V2, VReg.RET, 48); // (x64 V2==A2 无活值;V0≡RET 会盖掉原始值结果)
+        vm.cmpImm(VReg.V2, 0x7FFD);        // 仍是对象 → 无 toPrimitive,回退
         vm.jne("_js_toprim_done");
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_object_user_valueof");   // A0 仍是对象
         vm.cmpImm(VReg.RET, 0);
         vm.jeq("_js_toprim_try_tostr");
-        vm.shrImm(VReg.V0, VReg.RET, 48);
-        vm.cmpImm(VReg.V0, 0x7FFD);        // valueOf 结果又是对象?
+        vm.shrImm(VReg.V2, VReg.RET, 48); // (x64 V2==A2 无活值;V0≡RET 会盖掉原始值结果)
+        vm.cmpImm(VReg.V2, 0x7FFD);        // valueOf 结果又是对象?
         vm.jne("_js_toprim_done");         // 原始值 → 用
         vm.label("_js_toprim_try_tostr");
         // toString 步:委托 _valueToStr —— 覆盖 Error("name: message")、有用户 toString、

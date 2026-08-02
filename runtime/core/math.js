@@ -113,7 +113,7 @@ export class MathGenerator {
         vm.mov(VReg.A0, VReg.S1); vm.call("_math_kernel_sin"); vm.jmp("_msin_s");
         vm.label("_msin_c"); vm.mov(VReg.A0, VReg.S1); vm.call("_math_kernel_cos");
         vm.label("_msin_s");
-        vm.andImm(VReg.V0, VReg.S0, 2); vm.cmpImm(VReg.V0, 0); vm.jeq("_msin_d");
+        vm.andImm(VReg.V2, VReg.S0, 2); vm.cmpImm(VReg.V2, 0); vm.jeq("_msin_d"); // (x64 V2==A2 无活值;V0≡RET 会盖掉 kernel 结果)
         vm.fmovToFloat(0, VReg.RET); vm.fneg(0,0); vm.fmovToInt(VReg.RET,0);
         vm.label("_msin_d");
         vm.epilogue([VReg.S0, VReg.S1], 0);
@@ -129,7 +129,7 @@ export class MathGenerator {
         vm.mov(VReg.A0, VReg.S1); vm.call("_math_kernel_cos"); vm.jmp("_mcos_g");
         vm.label("_mcos_s"); vm.mov(VReg.A0, VReg.S1); vm.call("_math_kernel_sin");
         vm.label("_mcos_g");
-        vm.addImm(VReg.V0, VReg.S0, 1); vm.andImm(VReg.V0, VReg.V0, 2); vm.cmpImm(VReg.V0, 0); vm.jeq("_mcos_d");
+        vm.addImm(VReg.V2, VReg.S0, 1); vm.andImm(VReg.V2, VReg.V2, 2); vm.cmpImm(VReg.V2, 0); vm.jeq("_mcos_d"); // (x64 V2==A2 无活值;V0≡RET 会盖掉 kernel 结果)
         vm.fmovToFloat(0, VReg.RET); vm.fneg(0,0); vm.fmovToInt(VReg.RET,0);
         vm.label("_mcos_d");
         vm.epilogue([VReg.S0, VReg.S1], 0);
@@ -257,7 +257,7 @@ export class MathGenerator {
         vm.fmovToFloat(0, VReg.S0); vm.fmovToFloat(1, VReg.S1); vm.fdiv(0, 0, 1);
         vm.fmovToInt(VReg.A0, 0); vm.call("_math_atan");   // RET = atan(y/x)
         // x>0 → a;x<0 → a±π(y>=0 加,y<0 减)
-        vm.shrImm(VReg.V0, VReg.S1, 63); vm.cmpImm(VReg.V0, 0); vm.jeq("_matan2_done"); // x>0
+        vm.shrImm(VReg.V2, VReg.S1, 63); vm.cmpImm(VReg.V2, 0); vm.jeq("_matan2_done"); // x>0(x64 V2==A2 无活值;V0≡RET 会盖掉 atan 结果)
         vm.fmovToFloat(0, VReg.RET);
         K(0x400921fb54442d18n, 1);                    // π
         vm.shrImm(VReg.V0, VReg.S0, 63); vm.cmpImm(VReg.V0, 0); vm.jne("_matan2_sub");
@@ -322,12 +322,12 @@ export class MathGenerator {
         // 打印成 "1")。若 log 结果是 NaN(指数全 1 且尾数非零)直接返归一 NaN,跳过 *0.5;
         // ±Inf(尾数 0,来自 atanh(±1))仍走 *0.5(Inf*0.5=Inf,atanh(1)=Inf/atanh(-1)=-Inf)。
         vm.movImm64(VReg.V1, 0x7FF0000000000000n);
-        vm.and(VReg.V0, VReg.RET, VReg.V1);
-        vm.cmp(VReg.V0, VReg.V1);
+        vm.and(VReg.V2, VReg.RET, VReg.V1); // (x64 V2==A2 无活值;V0≡RET 会盖掉 log 结果)
+        vm.cmp(VReg.V2, VReg.V1);
         vm.jne("_matanh_scale");
         vm.movImm64(VReg.V1, 0x000FFFFFFFFFFFFFn);
-        vm.and(VReg.V0, VReg.RET, VReg.V1);
-        vm.cmpImm(VReg.V0, 0);
+        vm.and(VReg.V2, VReg.RET, VReg.V1);
+        vm.cmpImm(VReg.V2, 0);
         vm.jeq("_matanh_scale");
         vm.movImm64(VReg.RET, 0x7FF0000000000001n); // NaN → 归一直接返
         vm.epilogue([], 0);
@@ -683,12 +683,12 @@ export class MathGenerator {
         // 定义域非有限:_math_log 对 x==0 返 -Inf、x<0/NaN 返可打印 NaN。NaN 若走后续 *1/ln10
         // 会冲成 int0 别名(打印错),故提前拦截:NaN → 归一直接返;±Inf → 仅乘不吸附(保号)。
         vm.movImm64(VReg.V1, 0x7FF0000000000000n);
-        vm.and(VReg.V0, VReg.RET, VReg.V1);
-        vm.cmp(VReg.V0, VReg.V1);
+        vm.and(VReg.V2, VReg.RET, VReg.V1); // (x64 V2==A2 无活值;V0≡RET 会盖掉 log 结果)
+        vm.cmp(VReg.V2, VReg.V1);
         vm.jne("_mlog10_finite");
         vm.movImm64(VReg.V1, 0x000FFFFFFFFFFFFFn);
-        vm.and(VReg.V0, VReg.RET, VReg.V1);
-        vm.cmpImm(VReg.V0, 0);
+        vm.and(VReg.V2, VReg.RET, VReg.V1);
+        vm.cmpImm(VReg.V2, 0);
         vm.jeq("_mlog10_inf");
         vm.movImm64(VReg.RET, 0x7FF0000000000001n);   // NaN → 归一
         vm.epilogue([VReg.S0], 0);

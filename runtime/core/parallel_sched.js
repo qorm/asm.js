@@ -593,8 +593,8 @@ export class ParallelSchedGenerator {
         vm.movImm(VReg.A0, ALLOC_NODE);
         vm.call("_alloc");                 // RET = 节点用户区(经 per-P mcache)
         vm.store(VReg.RET, 0, VReg.S1);    // node.next = head
-        vm.addImm(VReg.V0, VReg.S0, 1);
-        vm.store(VReg.RET, 8, VReg.V0);    // node.tag = i+1
+        vm.addImm(VReg.V2, VReg.S0, 1);
+        vm.store(VReg.RET, 8, VReg.V2);    // node.tag = i+1
         vm.mov(VReg.S1, VReg.RET);         // head = node
         vm.addImm(VReg.S2, VReg.S2, 1);
         vm.jmp("_mat_build");
@@ -845,10 +845,10 @@ export class ParallelSchedGenerator {
         vm.mul(VReg.V2, VReg.S0, VReg.V1);
         vm.add(VReg.A0, VReg.A0, VReg.V2); // &_p_array[k]
         vm.call("_m_bringup_at");
-        vm.lea(VReg.V0, "_m_handles");
+        vm.lea(VReg.V2, "_m_handles");
         vm.shlImm(VReg.V1, VReg.S0, 3);
-        vm.add(VReg.V0, VReg.V0, VReg.V1);
-        vm.store(VReg.V0, 0, VReg.RET); // _m_handles[k] = 句柄
+        vm.add(VReg.V2, VReg.V2, VReg.V1);
+        vm.store(VReg.V2, 0, VReg.RET); // _m_handles[k] = 句柄
         vm.addImm(VReg.S0, VReg.S0, 1);
         vm.jmp("_mse_loop");
         vm.label("_mse_done");
@@ -1054,8 +1054,8 @@ export class ParallelSchedGenerator {
         vm.movImm(VReg.A0, KEEP_NODE);
         vm.call("_alloc");
         vm.store(VReg.RET, 0, VReg.S1); // node.next = head
-        vm.addImm(VReg.V0, VReg.S0, 1);
-        vm.store(VReg.RET, 8, VReg.V0); // node.tag = j+1
+        vm.addImm(VReg.V2, VReg.S0, 1);
+        vm.store(VReg.RET, 8, VReg.V2); // node.tag = j+1
         vm.mov(VReg.S1, VReg.RET);      // head = node
         vm.addImm(VReg.S0, VReg.S0, 1);
         vm.jmp("_pgs_keep");

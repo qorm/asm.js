@@ -1639,8 +1639,8 @@ export class ArrayGenerator {
         vm.call("_object_get");
         // Symbol.iterator 必须是函数(tag 0x7FFF)才可迭代;miss 返 JS_UNDEFINED(0x7FFB,非 0)
         // → 旧 cmpImm 0 判不出 → 非可迭代对象(如 {length:3})落 _spread_call0(undefined) 崩/挂。
-        vm.shrImm(VReg.V0, VReg.RET, 48);
-        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.shrImm(VReg.V2, VReg.RET, 48); // (x64 V2==A2 无活值;V0≡RET 会盖掉下方待调的迭代 fn)
+        vm.cmpImm(VReg.V2, 0x7FFF);
         vm.jne("_array_spread_done");
         // iter = itfn.call(src)
         vm.mov(VReg.A0, VReg.RET);
@@ -1654,8 +1654,8 @@ export class ArrayGenerator {
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.A1, VReg.V1);
         vm.call("_object_get");
-        vm.shrImm(VReg.V0, VReg.RET, 48);
-        vm.cmpImm(VReg.V0, 0x7FFF); // next 须是函数
+        vm.shrImm(VReg.V2, VReg.RET, 48); // (x64 V2==A2 无活值;V0≡RET 会盖掉下方待调的 next fn)
+        vm.cmpImm(VReg.V2, 0x7FFF); // next 须是函数
         vm.jne("_array_spread_done");
         // res = nextfn.call(iter)
         vm.mov(VReg.A0, VReg.RET);

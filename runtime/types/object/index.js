@@ -210,18 +210,22 @@ export class ObjectGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 16);
 
         // ---------- _shape_transition_get(A0=from, A1=key) -> RET=to | 0 ----------
+        // (当前全仓零调用点——过渡插入由 _shape_node_new 内部自探测处理;按 x64
+        //  语义等价重写防未来重新接线踩雷:V0≡RET 恒 miss、V7≡A1 key 毁损已修。)
         vm.label("_shape_transition_get");
-        vm.prologue(16, []);
+        vm.prologue(16, [VReg.S0]);
+        vm.mov(VReg.S0, VReg.A1);           // key 先落 S0:x64 V7≡A1,下方 entries base 必毁
         vm.lea(VReg.V0, "_shape_transition_root");
         vm.load(VReg.V0, VReg.V0, 0);   // table
-        vm.movImm(VReg.RET, 0);
+        // 先判表再置缺省:x64 V0≡RET≡RAX,旧序 load 表后 movImm(RET,0) 把表清零
+        // 再自比恒真 → 恒返 0(恒 miss,函数体在 x64 不可达)。
         vm.cmpImm(VReg.V0, 0);
-        vm.jeq("_stg_done");            // 无表 → miss
+        vm.jeq("_stg_miss");            // 无表 → miss
         vm.load(VReg.V1, VReg.V0, 0);   // cap
-        vm.addImm(VReg.V7, VReg.V0, 16); // entries base
         // h = (from>>4) ^ (key>>4);idx = h & (cap-1)
         vm.shrImm(VReg.V2, VReg.A0, 4);
-        vm.shrImm(VReg.V3, VReg.A1, 4);
+        vm.shrImm(VReg.V3, VReg.S0, 4);
+        vm.addImm(VReg.V7, VReg.V0, 16); // entries base
         vm.xor(VReg.V2, VReg.V2, VReg.V3);
         vm.subImm(VReg.V4, VReg.V1, 1);
         vm.and(VReg.V2, VReg.V2, VReg.V4);
@@ -237,11 +241,11 @@ export class ObjectGenerator {
         vm.label("_stg_loop");
         vm.load(VReg.V3, VReg.V5, 0);   // e.from
         vm.cmpImm(VReg.V3, 0);
-        vm.jeq("_stg_done");            // 空槽 → miss(RET=0)
+        vm.jeq("_stg_miss");            // 空槽 → miss
         vm.cmp(VReg.V3, VReg.A0);
         vm.jne("_stg_next");
         vm.load(VReg.V3, VReg.V5, 8);   // e.key
-        vm.cmp(VReg.V3, VReg.A1);
+        vm.cmp(VReg.V3, VReg.S0);       // (S0=key;x64 A1 已被 V7 覆盖)
         vm.jne("_stg_next");
         vm.load(VReg.RET, VReg.V5, 16); // e.to — 命中
         vm.jmp("_stg_done");
@@ -251,8 +255,10 @@ export class ObjectGenerator {
         vm.jlt("_stg_loop");
         vm.mov(VReg.V5, VReg.V7);       // 绕回 base
         vm.jmp("_stg_loop");            // 装载因子 <0.7 → 必有空槽终止
+        vm.label("_stg_miss");
+        vm.movImm(VReg.RET, 0);
         vm.label("_stg_done");
-        vm.epilogue([], 16);
+        vm.epilogue([VReg.S0], 16);
 
         // ---------- _shape_transition_put(A0=from, A1=key, A2=to) ----------
         // 插入 (from,key)→to;首调惰性建表(cap 16);装载因子 ≥0.7 翻倍 rehash。
@@ -512,8 +518,8 @@ export class ObjectGenerator {
         vm.movImm(VReg.A0, 24);
         vm.call("_alloc"); // RET = node
         vm.movImm64(VReg.V1, MASK);
-        vm.and(VReg.V0, VReg.S0, VReg.V1);
-        vm.store(VReg.RET, 0, VReg.V0); // key = 裸 fn
+        vm.and(VReg.V2, VReg.S0, VReg.V1);
+        vm.store(VReg.RET, 0, VReg.V2); // key = 裸 fn
         vm.store(VReg.RET, 8, VReg.S1); // props 裸
         vm.lea(VReg.V2, "_closure_props_registry");
         vm.load(VReg.V1, VReg.V2, 0);
@@ -4339,12 +4345,12 @@ export class ObjectGenerator {
         vm.mov(VReg.A1, VReg.S2); // tag
         vm.mov(VReg.A0, VReg.RET);
         vm.call("_strconcat");
+        vm.mov(VReg.A0, VReg.RET);         // 先取走 s1(x64 V0≡RET:下方 mask/tag 写 V0 会盖掉)
         vm.lea(VReg.A1, vm.asm.addString("]"));
         vm.movImm64(VReg.V0, 0x0000ffffffffffffn);
         vm.and(VReg.A1, VReg.A1, VReg.V0);
         vm.movImm64(VReg.V0, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.A1, VReg.V0);
-        vm.mov(VReg.A0, VReg.RET);
         vm.call("_strconcat");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 16);
 
@@ -6354,16 +6360,16 @@ export class ObjectGenerator {
             vm.movImm64(VReg.V1, 0x7ffb000000000000n); // undefined
             vm.cmp(VReg.RET, VReg.V1);
             vm.jeq(skipL);                          // undefined → 视为缺省
-            vm.load(VReg.V0, VReg.SP, 24);
-            vm.orImm(VReg.V0, VReg.V0, presBit);
-            vm.store(VReg.SP, 24, VReg.V0);        // mask |= presBit
+            vm.load(VReg.V2, VReg.SP, 24);         // (x64 V2==A2 无活值;V0≡RET 会盖掉下方待存的解析值)
+            vm.orImm(VReg.V2, VReg.V2, presBit);
+            vm.store(VReg.SP, 24, VReg.V2);        // mask |= presBit
             if (isBool) {
                 vm.mov(VReg.A0, VReg.RET);
                 vm.call("_to_boolean");            // RET 0/1
                 vm.shlImm(VReg.V1, VReg.RET, attrShift);
-                vm.load(VReg.V0, VReg.SP, 32);
-                vm.or(VReg.V0, VReg.V0, VReg.V1);
-                vm.store(VReg.SP, 32, VReg.V0);    // attr |= bit
+                vm.load(VReg.V2, VReg.SP, 32);
+                vm.or(VReg.V2, VReg.V2, VReg.V1);
+                vm.store(VReg.SP, 32, VReg.V2);    // attr |= bit
             } else {
                 vm.store(VReg.SP, slot, VReg.RET); // value/get/set
             }
