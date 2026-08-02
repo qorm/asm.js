@@ -4029,7 +4029,36 @@ export class StringGenerator {
         vm.fcvtzs(VReg.S0, 0); // S0 = (int64)截断(v)
         vm.jmp("_numts_conv_done");
         vm.label("_numts_conv_zero");
+        // [W7-1] NaN/±Inf 特判(此前一律 0 → (NaN).toString(16) 得 "0"、(Infinity).toString()
+        // 得 "0"):仅 high16 ∈ {0x7FF0,0xFFF0}(真 ±Inf/NaN 位型)时特判 —— 尾数非 0 →
+        // "NaN",否则按 bit63 → "Infinity"/"-Infinity"(与 0 参 toString/_floatToString
+        // 口径一致)。0x7FFC 等装箱 tag 族指数虽全 1 但非数字,保持旧 0 路径逐字节不变。
+        vm.shrImm(VReg.V0, VReg.S0, 48);
+        vm.cmpImm(VReg.V0, 0x7FF0);
+        vm.jeq("_numts_special");
+        vm.cmpImm(VReg.V0, 0xFFF0);
+        vm.jeq("_numts_special");
         vm.movImm(VReg.S0, 0);
+        vm.jmp("_numts_conv_done");
+        vm.label("_numts_special");
+        vm.movImm64(VReg.V1, 0x000FFFFFFFFFFFFFn);
+        vm.and(VReg.V1, VReg.S0, VReg.V1); // 尾数(低 52 位)
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_numts_nan");
+        vm.shrImm(VReg.V1, VReg.S0, 63);   // 符号位
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_numts_neginf");
+        vm.lea(VReg.RET, vm.asm.addString("Infinity"));
+        vm.jmp("_numts_special_box");
+        vm.label("_numts_neginf");
+        vm.lea(VReg.RET, vm.asm.addString("-Infinity"));
+        vm.jmp("_numts_special_box");
+        vm.label("_numts_nan");
+        vm.lea(VReg.RET, vm.asm.addString("NaN"));
+        vm.label("_numts_special_box");
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
         vm.label("_numts_conv_done"); // S0 = int 值(64 位)
 
         // radix 钳位:<2 或 >36 → 10
@@ -4096,6 +4125,37 @@ export class StringGenerator {
 
         vm.mov(VReg.S0, VReg.A0); // 值(装箱 int32 或裸 float 位)
         vm.mov(VReg.S1, VReg.A1); // digits
+
+        // [W7-1] NaN/±Inf 特判(此前落截断/scale 路径 → (NaN).toFixed(2) 得 "0.00"、
+        // ±Inf 得垃圾):仅 high16 ∈ {0x7FF0,0xFFF0}(真 ±Inf/NaN 位型)时 —— 尾数非 0 →
+        // "NaN",否则按 bit63 → "Infinity"/"-Infinity"(与 node 一致:(Infinity).toFixed(2)
+        // 得 "Infinity")。装箱 int32/tag 族/普通数全落原路径逐字节不变。
+        vm.shrImm(VReg.V0, VReg.S0, 48);
+        vm.cmpImm(VReg.V0, 0x7FF0);
+        vm.jeq("_numtf_special");
+        vm.cmpImm(VReg.V0, 0xFFF0);
+        vm.jeq("_numtf_special");
+        vm.jmp("_numtf_body");
+        vm.label("_numtf_special");
+        vm.movImm64(VReg.V1, 0x000FFFFFFFFFFFFFn);
+        vm.and(VReg.V1, VReg.S0, VReg.V1); // 尾数(低 52 位)
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_numtf_nan");
+        vm.shrImm(VReg.V1, VReg.S0, 63);   // 符号位
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_numtf_neginf");
+        vm.lea(VReg.RET, vm.asm.addString("Infinity"));
+        vm.jmp("_numtf_special_box");
+        vm.label("_numtf_neginf");
+        vm.lea(VReg.RET, vm.asm.addString("-Infinity"));
+        vm.jmp("_numtf_special_box");
+        vm.label("_numtf_nan");
+        vm.lea(VReg.RET, vm.asm.addString("NaN"));
+        vm.label("_numtf_special_box");
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 0);
+        vm.label("_numtf_body");
 
         // digits 钳位 [0,20]
         vm.cmpImm(VReg.S1, 0);
@@ -4847,9 +4907,108 @@ export class StringGenerator {
         // String.prototype wrapper methods (toString/valueOf for new String() objects)
         this.generateToStringWrapper();
         this.generateValueOf();
+        // [W7-1] Number.prototype 方法值的守卫包装族(_aref_num_*)
+        this.generateNumArefWrappers();
         // 基础操作 (Moved from base.js)
         this.generateRawStrlen();
         this.generateStrLength();
+    }
+
+    // [W7-1] Number.prototype 方法值的 aref 守卫包装(_aref_num_*)。
+    // 物化 Number.prototype 的方法值闭包(24B {magic, _aref_generic, helper})经蹦床把
+    // 动态接收者插到 A0:`Number.prototype.toFixed.call(5,2)` / `var f=(5).toFixed; f(2)`
+    // (this=undefined → 守卫拒)/`(new Number()).valueOf("argument")`(原 SIGSEGV,守卫兜住)。
+    // 守卫判据(数字 = 装箱 int32 0x7FF8 / 裸 float64 / 负 double / denormal;
+    // 拒 = 0x7FF9..0x7FFF tag 族[bool/null/undefined/字符串/对象/数组/函数]与
+    // high16==0 且 ≥ ptrFloor 的裸指针[堆/数据段];denormal(如 Number.MIN_VALUE=0x1)
+    // < ptrFloor 放行)。0x7FFD 包装对象一律拒 —— 本运行时无 Number 包装(new Number
+    // 返回裸数字),记偏差(node 会拆包装)。失败交 _aref_throw_incompat(Map 族同型
+    // 消息 "Method Number.prototype.<m> called on incompatible receiver " + _fmt_receiver;
+    // node 文案 "requires that 'this' be a Number" 不同,记偏差 —— test262 只验 TypeError 类)。
+    // x64 纪律(registers.js 硬规):实参先落 S 系(A0→S0、A1→S1)再用 V1/V2 取
+    // tag/常数 —— 此时 A2/A3 已无活值,V1≡A3/V2≡A2 写安全;全程不写 V0(≡RET≡A0)。
+    generateNumArefWrappers() {
+        const vm = this.vm;
+        const STRTAG = 0x7ffc000000000000n;
+
+        // 守卫头:成功落穿;失败 jmp <tag>_bad。前置:S0 = 接收者(已落)。
+        const guardHead = (tag) => {
+            vm.shrImm(VReg.V1, VReg.S0, 48);      // V1 = high16(A 系已无活值)
+            vm.cmpImm(VReg.V1, 0x7FF8);
+            vm.jeq(tag + "_ok");                  // 装箱 int32
+            vm.cmpImm(VReg.V1, 0x7FF9);
+            vm.jlt(tag + "_raw");
+            vm.cmpImm(VReg.V1, 0x7FFF);
+            vm.jle(tag + "_bad");                 // 0x7FF9..0x7FFF tag 族
+            vm.jmp(tag + "_ok");                  // > 0x7FFF:负 double
+            vm.label(tag + "_raw");
+            vm.cmpImm(VReg.V1, 0);
+            vm.jne(tag + "_ok");                  // 正 double(指数非 0)
+            vm.movImm64(VReg.V2, vm.ptrFloor);    // V2 安全(A2 无活值)
+            vm.cmp(VReg.S0, VReg.V2);
+            vm.jge(tag + "_bad");                 // 裸指针(堆/数据段)→ 非数字
+            vm.label(tag + "_ok");                // denormal/小整数 → 数字
+        };
+        // 失败桩:前缀(装箱)+ 原接收者 → _aref_throw_incompat,不返回。
+        const guardBad = (tag, prefix) => {
+            vm.label(tag + "_bad");
+            vm.mov(VReg.A0, VReg.S0);             // 原接收者
+            vm.lea(VReg.A1, vm.asm.addString(prefix));
+            vm.movImm64(VReg.V1, STRTAG);
+            vm.or(VReg.A1, VReg.A1, VReg.V1);
+            vm.call("_aref_throw_incompat");      // 不返回
+            vm.epilogue([VReg.S0, VReg.S1], 0);   // 理论不达(帧平衡)
+        };
+        // 装箱实参 → 裸 int,缺省(undefined)取 defaultRaw。前置:S1 = 装箱实参。
+        // 经 _to_int32(ToNumber 语义:串 "16"→16、NaN→0,与直调快路 functions.js 同源);
+        // 结果落 A1。defL 标签按 caller 给。
+        const argIntOr = (tag, defaultRaw, goL) => {
+            vm.shrImm(VReg.V1, VReg.S1, 48);
+            vm.cmpImm(VReg.V1, 0x7FFB);           // undefined → 缺省
+            vm.jeq(tag + "_dft");
+            vm.mov(VReg.A0, VReg.S1);
+            vm.call("_to_int32");
+            vm.mov(VReg.A1, VReg.RET);
+            vm.jmp(goL);
+            vm.label(tag + "_dft");
+            vm.movImm(VReg.A1, defaultRaw);
+        };
+
+        // _aref_num_toString(recv, radix?) -> 装箱串。radix 缺省 10。
+        vm.label("_aref_num_toString");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        guardHead("_ants");
+        argIntOr("_ants", 10, "_ants_go");
+        vm.label("_ants_go");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_num_toString");
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        guardBad("_ants", "Method Number.prototype.toString called on incompatible receiver ");
+
+        // _aref_num_toFixed(recv, digits?) -> 装箱串。digits 缺省 0。
+        vm.label("_aref_num_toFixed");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        guardHead("_antf");
+        argIntOr("_antf", 0, "_antf_go");
+        vm.label("_antf_go");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_num_toFixed");
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        guardBad("_antf", "Method Number.prototype.toFixed called on incompatible receiver ");
+
+        // _aref_num_valueOf(recv) -> 数字恒等(多余实参忽略,同 _str_valueOf 镜像)。
+        vm.label("_aref_num_valueOf");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        guardHead("_anv");
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        guardBad("_anv", "Method Number.prototype.valueOf called on incompatible receiver ");
     }
 
     // ========== 基础操作 (Moved from base.js) ==========

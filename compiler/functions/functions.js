@@ -1096,11 +1096,13 @@ export const FunctionCompiler = {
 
         // JSON.stringify/parse → 注入 shim 的导入绑定(compiler/index.js
         // readModuleSource 已为引用 JSON 的模块前置 import)。
+        // [W7-2] 同段追加 rawJSON/isRawJSON(4 名注入模块才有绑定;不含 raw 文本的
+        // 模块本分支永不命中 → 字节不变)。
         if (callee.type === "MemberExpression" && callee.object &&
             callee.object.type === "Identifier" && callee.object.name === "JSON" &&
             callee.property) {
             const jp = callee.property.name || callee.property.value;
-            if (jp === "stringify" || jp === "parse") {
+            if (jp === "stringify" || jp === "parse" || jp === "rawJSON" || jp === "isRawJSON") {
                 this.compileExpression({
                     type: "CallExpression",
                     callee: { type: "Identifier", name: "__JSON_" + jp },
@@ -4120,7 +4122,13 @@ export const FunctionCompiler = {
             // 此前 valueOf 在 HOISTED_DATE_METHODS 里被无条件当 Date 方法派发,对数字接收者
             // 读 Date 字段 → 段错误((42).valueOf() 崩根因)。
             // (记偏差:用户对象覆写的 valueOf 经显式 .valueOf() 调用不触发,返回对象本身。)
-            if (prop.name === "valueOf" && !callee.computed && expr.arguments.length === 0) {
+            // [W7-1-fix] 实参限制放宽(===0 → >=0,特许扩边界单行):valueOf 规范 20.1.3.6
+            // **忽略实参**(node `(5).valueOf("x")===5`、`new Number()).valueOf("argument")` 得 0);
+            // 此前带参(≥1)不命中本分支 → 落下方 Date 方法分派把数字/原始值当 Date 读字段
+            // → SIGSEGV(test262 S15.7.4.4_A1_T02 CRASH)。零参站点条件仍真 → 发射逐字节不变;
+            // 带参站点原行为恒为崩溃/垃圾,无退化面。非 Date 对象分支的 compileMethodCall 本
+            // 就透传 expr.arguments(用户覆写 valueOf 带参调用,与 node 一致)。
+            if (prop.name === "valueOf" && !callee.computed && expr.arguments.length >= 0) {
                 const voIdLbl = this.ctx.newLabel("valof_id");
                 const voIdLbl2 = this.ctx.newLabel("valof_id2");
                 const voEndLbl = this.ctx.newLabel("valof_end");

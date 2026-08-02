@@ -324,6 +324,29 @@ const DATE_INST_METHOD_REF = {
 // 实例侧不受影响:__RE_new 已把 source/flags/global/… 作为**自有数据属性**放在正则
 // 对象上,`re.source` 仍直接读自有属性、根本不经原型(本仓正则对象无原型链)。
 // 故本组纯粹服务反射(gOPD(RegExp.prototype,"global").get 等)。
+// [W7-1] Number.prototype 方法表(gOPN 落位顺序与 Node 全等:
+// constructor,toExponential,toFixed,toPrecision,toString,valueOf,toLocaleString;
+// constructor 最后单独落)。shim=true 条目仅当本单元注入了 __number_shim(源码含
+// .toExponential(/.toPrecision(/.toLocaleString( 文本)时连真 shim 函数,否则占位
+// _aref_num_toString(守卫安全、输出格式记偏差,同 DATE_PROTO_SHIM_METHODS 占位口径)。
+// __NUM_* 经 24B _aref_generic 蹦床收 this 为首参,与 shim 签名 (v, arg) 吻合;
+// 守卫弱(shim 内 Number(v) 强转 → 错误接收者得 "NaN"/"Infinity" 而非 TypeError,记偏差)。
+const NUMBER_PROTO_METHODS = [
+    // [方法名, 运行时 helper/shim 导出名, 规范 length, 是否 shim 门控]
+    ["toExponential", "__NUM_toExponential", 1, true],
+    ["toFixed", "_aref_num_toFixed", 1, false],
+    ["toPrecision", "__NUM_toPrecision", 1, true],
+    ["toString", "_aref_num_toString", 1, false],
+    ["valueOf", "_aref_num_valueOf", 0, false],
+    ["toLocaleString", "__NUM_toLocaleString", 0, true],
+];
+// [W7-1 Number 实例方法值读] 实例成员值读 `(n).m`(n 静态可判数字)覆盖的方法名集合
+// (值恒 true;命中判据 hasOwnProperty,#32 防原型链污染)。发射在 compileMemberExpression
+// 通用兜底前(见该处注);调用位 `(n).m(...)` 走 functions.js 静态快路,不经此。
+const NUMBER_INST_METHOD_REF = {
+    toString: true, toFixed: true, toExponential: true,
+    toPrecision: true, toLocaleString: true, valueOf: true,
+};
 const REGEXP_PROTO_ACCESSORS = [
     ["source", "(?:)"],
     ["flags", ""],
@@ -534,6 +557,8 @@ const IDENT_BUILTIN_NAMES = [
     "this", "undefined", "null", "NaN", "Infinity",
     "Array", "Object", "Function", "process", "globalThis",
     "Boolean", "Number", "String", "Symbol", "JSON", "print",
+    // [W7-3] 裸名物化为真闭包(parse* 与 Number.parse* 同槽;isNaN/isFinite 合成函数)。
+    "parseInt", "parseFloat", "isNaN", "isFinite",
 ];
 // IDENT_KNOWN_GLOBAL_NAMES —— compileIdentifier 之外(成员访问 / 调用静态派发 / 运行时
 // 内建)确实**支持**的全局名。它们兜底也是 0,但功能真实存在,报 "undefined" 会让
@@ -542,10 +567,12 @@ const IDENT_BUILTIN_NAMES = [
 // 表里多列一个名最多是维持现状,少列一个名才会造成回归。
 // (Float16Array / SharedArrayBuffer / Atomics / WeakRef / Intl 等编译器与运行时完全
 //  没有的名故意**不**收录 —— 它们正是本修复要还给 "undefined" 的目标。)
+// (W7-3 起 parseInt/parseFloat/isNaN/isFinite 已上移 IDENT_BUILTIN_NAMES —— 裸名
+//  在 compileIdentifier 物化为真闭包;encodeURI 族四名仍无实现,留此表维持 typeof
+//  "number" 旧口径,要么实现要么除名,另案。)
 const IDENT_KNOWN_GLOBAL_NAMES = [
     "Math", "console", "Date", "RegExp", "Map", "Set", "WeakMap", "WeakSet",
     "Promise", "Reflect", "Proxy", "BigInt", "DataView", "arguments", "eval",
-    "parseInt", "parseFloat", "isNaN", "isFinite",
     "encodeURI", "decodeURI", "encodeURIComponent", "decodeURIComponent",
     "Buffer", "require", "module", "exports", "__dirname", "__filename",
     "setTimeout", "clearTimeout", "setInterval", "clearInterval",
@@ -814,6 +841,14 @@ export const MemberCompiler = {
             (this.ctx.getMainCapturedVar && this.ctx.getMainCapturedVar("JSON")));
     },
 
+    // [W7-3 全局函数一等值] parseInt/parseFloat/isNaN/isFinite 标识符被遮蔽?
+    // 同 stringNameShadowed 守卫组(局部变量 / 函数·类声明 / 主程序捕获全局)。
+    globalFnNameShadowed(name) {
+        return !!((this.ctx.getLocal && this.ctx.getLocal(name)) ||
+            (this.ctx.getFunction && this.ctx.getFunction(name)) ||
+            (this.ctx.getMainCapturedVar && this.ctx.getMainCapturedVar(name)));
+    },
+
     // [JSON 一等值] 本编译单元是否注入了 __json_shim(两个 __JSON_* 导出都有真标签,
     // 与 regexpShimReady 同法)。注入由 readModuleSource 按源码文本触发("JSON.stringify"/
     // "JSON.parse"/"structuredClone");仅引用裸 `JSON` 的模块不触发注入 → 门关闭,
@@ -836,6 +871,39 @@ export const MemberCompiler = {
             if (!this.getFunctionLabel(shim)) return false;
         }
         return true;
+    },
+
+    // [W7-1] 本编译单元是否注入了 __number_shim(三个 __NUM_* 导出全有真标签,
+    // 与 dateShimReady 同法)。门未开时 toExponential/toPrecision/toLocaleString 用
+    // 占位闭包(_aref_num_toString,见 NUMBER_PROTO_METHODS 注)。
+    numberShimReady() {
+        if (!this.ctx || !this.ctx.hasFunction) return false;
+        if (!this.getFunctionLabel) return false;
+        if (!this.getFunctionLabel("__NUM_toExponential")) return false;
+        if (!this.getFunctionLabel("__NUM_toPrecision")) return false;
+        if (!this.getFunctionLabel("__NUM_toLocaleString")) return false;
+        return true;
+    },
+
+    // [W7-1] 静态数字接收者判定(inferObjectType 无 Number 词汇,functions.js 非本项
+    // 授权文件 → 本文件自含):数字字面量 / ±数字字面量 / NaN·Infinity 标识符 /
+    // 裸 int·FP 驻留局部(ctx.isRawIntVar/getFpAccum)。保守:拿不准一律 false
+    // (落通用属性读,与 HEAD 行为逐字节一致)。
+    _isStaticNumberReceiver(expr) {
+        if (!expr) return false;
+        if (expr.type === "Literal" && typeof expr.value === "number") return true;
+        if (expr.type === "NumericLiteral" && typeof expr.value === "number") return true;
+        if (expr.type === "UnaryExpression" && (expr.operator === "-" || expr.operator === "+") &&
+            expr.argument && expr.argument.type === "Literal" &&
+            typeof expr.argument.value === "number") return true;
+        if (expr.type === "Identifier") {
+            if (expr.name === "NaN" || expr.name === "Infinity") return true;
+            if (this.ctx) {
+                if (this.ctx.isRawIntVar && this.ctx.isRawIntVar(expr.name)) return true;
+                if (this.ctx.getFpAccum && this.ctx.getFpAccum(expr.name) > 0) return true;
+            }
+        }
+        return false;
     },
 
     // [W-28] `re.<exec|test|toString>` 值读取的判定 + 发射(命中返 true)。
@@ -1180,7 +1248,8 @@ export const MemberCompiler = {
         // 落位顺序与 Node gOPN 一致)。值经 emitStringStaticRef 的合成函数 memoized 闭包
         // (与静态值读同槽 → String.fromCharCode === gOPD(String,"fromCharCode").value);
         // 落值后经 _closure_prop_set_attr 落 attr,否则 gOPD 误报 enumerable:true。
-        // String.raw 未实现,记偏差。
+        // [W7-2] String.raw 同形第三项(合成 AST 见 _stringRawSynthAst;gOPN 落位顺序
+        // 与 Node 一致:length,name,prototype,fromCharCode,fromCodePoint,raw)。
         const setCtorProp = (name, attr, emitValue) => {
             emitValue();                                   // RET = 值
             vm.mov(VReg.A2, VReg.RET);
@@ -1198,6 +1267,8 @@ export const MemberCompiler = {
             () => this.emitStringStaticRef("fromCharCode"));
         setCtorProp("fromCodePoint", BUILTIN_PROP_ATTR,
             () => this.emitStringStaticRef("fromCodePoint"));
+        setCtorProp("raw", BUILTIN_PROP_ATTR,
+            () => this.emitStringRawRef());
         // RET = 装箱构造器(稳定身份)
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.RET, VReg.V0, 0);
@@ -1277,7 +1348,10 @@ export const MemberCompiler = {
     // 节;落位顺序 parse → stringify,与 Node gOPN 前两项一致),Symbol.toStringTag="JSON"
     // (attr 4:{writable:false,enumerable:false,configurable:true},与 Node 逐对拍)。
     // shim 未注入(仅反射用裸 JSON)时物化为仅 @@toStringTag 的对象(方法无从链接,
-    // 宁缺勿滥,记偏差;typeof/gOPN 之外的反射仍成立)。rawJSON/isRawJSON 未实现,记偏差。
+    // 宁缺勿滥,记偏差;typeof/gOPN 之外的反射仍成立)。
+    // [W7-2] rawJSON/isRawJSON:仅当本单元注入了 4 名 shim(源码含 JSON.rawJSON/
+    // JSON.isRawJSON 文本)才有导出标签可连,落位顺序与 Node gOPN 后两项一致;
+    // 2 名注入或无注入模块无标签可指 → 不物化此二属性(宁缺勿滥,记偏差)。
     emitJSONNamespaceObject() {
         const vm = this.vm;
         const slot = "_nsobj_json";
@@ -1310,6 +1384,11 @@ export const MemberCompiler = {
             };
             emitProp("parse", 2);
             emitProp("stringify", 3);
+            if (this.getFunctionLabel("__JSON_rawJSON") &&
+                this.getFunctionLabel("__JSON_isRawJSON")) {
+                emitProp("rawJSON", 1);
+                emitProp("isRawJSON", 1);
+            }
         }
         // Symbol.toStringTag = "JSON"(attr 4)。well-known 符号单例作键(_object_set
         // 指针比较快路径必中;gOPN/keys 滤 symbol 键,Object.prototype.toString 与
@@ -1435,6 +1514,113 @@ export const MemberCompiler = {
             this._stringStaticSynthAst(propName), propName, 1);
     },
 
+    // [W7-2] String.raw 方法值的合成函数 AST(规范 21.1.2.4,node v25 逐条校准):
+    //   function (cs, ...subs) {
+    //       var r = cs.raw;                    // Get(callSite,"raw");cs nullish →
+    //                                          // 属性读抛 TypeError(null[k] 既有路径,可捕获)
+    //       if (r === undefined || r === null) throw new TypeError("Cannot convert undefined or null to object");
+    //       // cs.raw 属性 miss 在本运行时读出为 0(node 为 undefined → ToObject 抛);
+    //       // 以 hasOwnProperty 复原拒收条件({} → 抛,消息与 node 逐字;{raw:0} 放行)
+    //       if (typeof cs === "object" && cs !== null && !cs.hasOwnProperty("raw")) throw new TypeError("Cannot convert undefined or null to object");
+    //       var len = r.length;                // LengthOfArrayLike 近似
+    //       if (!(len > 0)) return "";         // undefined/NaN/null/<=0 → ""。
+    //       len = len - (len % 1);             // ToInteger 近似(分数截断;"2"→2)
+    //       var out = "";
+    //       for (var i = 0; i < len; i = i + 1) {
+    //           out += r[i];                   // ToString(段):+= 强转同规范
+    //           if (i + 1 < len && i < subs.length) out += subs[i];
+    //           // 替换仅在 i+1 < 段数时插入;i >= 已给替换数 → 空串(规范 e/f 步)
+    //       }
+    //       return out;
+    //   }
+    // this 不敏感(体不读 this)。rest 参 ≤4 替换 + 显式 undefined 截断(emitRestParam
+    // 既有口径,记偏差 —— `String.raw({raw:["a","b"]},undefined)` node 得 "aundefinedb",
+    // 本实现得 "ab")。String 经 isBuiltinOrGlobal 排除、cs/subs 为参数 → 零捕获。
+    _stringRawSynthAst() {
+        const id = (name) => ({ type: "Identifier", name: name });
+        const member = (obj, prop, computed) => ({
+            type: "MemberExpression", object: obj, property: prop,
+            computed: !!computed, optional: false,
+        });
+        const bin = (op, left, right) => ({ type: "BinaryExpression", operator: op, left: left, right: right });
+        const varDecl = (name, init) => ({
+            type: "VariableDeclaration", kind: "var", declarations: [
+                { type: "VariableDeclarator", id: id(name), init: init },
+            ] });
+        const throwTE = () => ({ type: "ThrowStatement", argument: {
+            type: "NewExpression", callee: id("TypeError"),
+            arguments: [{ type: "Literal", value: "Cannot convert undefined or null to object" }] } });
+        return {
+            type: "FunctionExpression",
+            id: null,
+            params: [id("cs"), { type: "SpreadElement", argument: id("subs") }],
+            body: {
+                type: "BlockStatement",
+                body: [
+                    varDecl("r", member(id("cs"), id("raw"))),
+                    { type: "IfStatement",
+                        test: { type: "LogicalExpression", operator: "||",
+                            left: bin("===", id("r"), id("undefined")),
+                            right: bin("===", id("r"), id("null")) },
+                        consequent: throwTE(),
+                        alternate: null },
+                    { type: "IfStatement",
+                        test: { type: "LogicalExpression", operator: "&&",
+                            left: { type: "LogicalExpression", operator: "&&",
+                                left: bin("===", { type: "UnaryExpression", operator: "typeof", prefix: true, argument: id("cs") }, { type: "Literal", value: "object" }),
+                                right: bin("!==", id("cs"), id("null")) },
+                            right: { type: "UnaryExpression", operator: "!", prefix: true,
+                                argument: { type: "CallExpression",
+                                    callee: member(id("cs"), id("hasOwnProperty")),
+                                    arguments: [{ type: "Literal", value: "raw" }],
+                                    optional: false } } },
+                        consequent: throwTE(),
+                        alternate: null },
+                    varDecl("len", member(id("r"), id("length"))),
+                    { type: "IfStatement",
+                        // if (!(len > 0)) return "" —— undefined/NaN/null/<=0 长度
+                        test: { type: "UnaryExpression", operator: "!", prefix: true,
+                            argument: bin(">", id("len"), { type: "Literal", value: 0 }) },
+                        consequent: { type: "ReturnStatement", argument: { type: "Literal", value: "" } },
+                        alternate: null },
+                    { type: "ExpressionStatement", expression: {
+                        type: "AssignmentExpression", operator: "=",
+                        left: id("len"),
+                        right: bin("-", id("len"), bin("%", id("len"), { type: "Literal", value: 1 })) } },
+                    varDecl("out", { type: "Literal", value: "" }),
+                    { type: "ForStatement",
+                        init: varDecl("i", { type: "Literal", value: 0 }),
+                        test: bin("<", id("i"), id("len")),
+                        update: { type: "AssignmentExpression", operator: "=",
+                            left: id("i"),
+                            right: bin("+", id("i"), { type: "Literal", value: 1 }) },
+                        body: { type: "BlockStatement", body: [
+                            { type: "ExpressionStatement", expression: {
+                                type: "AssignmentExpression", operator: "+=",
+                                left: id("out"),
+                                right: member(id("r"), id("i"), true) } },
+                            { type: "IfStatement",
+                                test: { type: "LogicalExpression", operator: "&&",
+                                    left: bin("<", bin("+", id("i"), { type: "Literal", value: 1 }), id("len")),
+                                    right: bin("<", id("i"), member(id("subs"), id("length"))) },
+                                consequent: { type: "ExpressionStatement", expression: {
+                                    type: "AssignmentExpression", operator: "+=",
+                                    left: id("out"),
+                                    right: member(id("subs"), id("i"), true) } },
+                                alternate: null },
+                        ] },
+                    },
+                    { type: "ReturnStatement", argument: id("out") },
+                ],
+            },
+        };
+    },
+
+    // [W7-2] String.raw 方法值(规范 length = 1:仅 callSite 计,rest 不计)。
+    emitStringRawRef() {
+        this.emitSynthStaticRef("string_raw", this._stringRawSynthAst(), "raw", 1);
+    },
+
     // [W3] Number.is* 谓词方法值的合成函数 AST:
     //   function (v) { return Number.isInteger(v); }
     // 调用即 functions.js 的 Number.is* 静态快路(同一内联位逻辑实现,装箱 bool 返回,
@@ -1465,9 +1651,33 @@ export const MemberCompiler = {
             this._numberPredicateSynthAst(propName), propName, 1);
     },
 
+    // [W7-3 全局函数一等值] isNaN/isFinite 方法值的合成函数 AST:
+    //   function (v) { return isNaN(v); }
+    // 调用即 functions.js 的全局 isNaN/isFinite 内联快路(_number_coerce 强转后按位型
+    // 判定 —— 与 Number.isNaN/Number.isFinite **不强转**语义有别;`Number.isNaN === isNaN`
+    // 规范为 false,合成体走同一快路故偏差口径与直调逐字一致)。callee 名经
+    // isBuiltinOrGlobal 排除?否 —— isNaN/isFinite 不在内建名表,但物化分支的遮蔽守卫
+    // (globalFnNameShadowed)保证合成点外层无同名局部/函数 → 零捕获(16B 闭包)。
+    _globalFnSynthAst(callName) {
+        const id = (name) => ({ type: "Identifier", name: name });
+        return {
+            type: "FunctionExpression",
+            id: null,
+            params: [id("v")],
+            body: {
+                type: "BlockStatement",
+                body: [{ type: "ReturnStatement", argument: {
+                    type: "CallExpression",
+                    callee: id(callName),
+                    arguments: [id("v")],
+                    optional: false,
+                } }],
+            },
+        };
+    },
+
     // [W3 Number 一等值] 惰性物化 Number 构造器函数对象到全局槽 _nsobj_number
-    // (数据段 qword,GC 根)。形态逐字镜像 Date 模板但**不建原型**(本波明确不做
-    // Number.prototype 物化/new Number() 包装语义变更):构造器闭包 16B
+    // (数据段 qword,GC 根):构造器闭包 16B
     // {magic, _builtin_number}(裸 Number 作值调用 N(x) → _number_coerce,与既有
     // emitBuiltinFnClosure 同一入口 → `var N=Number; N("42")` 行为不变)、
     // name="Number"/length=1(闭包属性侧表)、own props = 静态方法 ×6(attr 5,
@@ -1475,12 +1685,21 @@ export const MemberCompiler = {
     // 常量 ×8(attr 0,writable/enumerable/configurable 全 false,与 Node gOPD 逐对拍;
     // gOPN 顺序与 Node 一致)。RET = 装箱构造器(稳定身份 → Number===Number 由假变真,
     // typeof Number 保持 "function")。
+    // [W7-1] 升级为**双槽模板**(_nsobj_number + _nsobj_number_proto,逐字镜像
+    // emitStringCtorObject/emitDateCtorObject,一次填两槽、原型侧只从槽读构造器 →
+    // 无编译期递归):Number.prototype 真对象落 6 方法值闭包(NUMBER_PROTO_METHODS,
+    // attr 5,gOPN 落位顺序与 Node 全等)+ constructor 回指(attr 5);
+    // `Number.prototype` 构造器侧表项 attr=0(规范全 false)插在 length 与静态之间
+    // (对齐 Node gOPN 序 length,name,prototype,…)。new Number() 包装语义不变
+    // (仍返裸数字;记档不做,见偏差清单)。
     // Number(x)/new Number(...)/Number.isX(...)/Number.parse*(...)/Number.MAX_* 常量
     // 折叠等静态快路全在 functions.js/expressions.js/下方常量分支先命中 → 字节不变。
     emitNumberCtorObject() {
         const vm = this.vm;
         const ctorSlot = "_nsobj_number";
+        const protoSlot = "_nsobj_number_proto";
         this._reEnsureSlot(ctorSlot);
+        this._reEnsureSlot(protoSlot);
         const doneL = this.ctx.newLabel("nsnum_done");
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.RET, VReg.V0, 0);
@@ -1513,6 +1732,27 @@ export const MemberCompiler = {
         vm.scvtf(0, VReg.A2);
         vm.fmovToInt(VReg.A2, 0);
         vm.call("_closure_prop_set");
+        // [W7-1] 原型对象:方法值闭包(24B {magic, _aref_generic, helper} + 侧表
+        // .name/.length,attr 5)+ constructor 回指。方法值**不绑定**接收者(蹦床
+        // 按调用点 this 传参,与 ES 一致);守卫在 _aref_num_* 包装内(见 string/index.js
+        // generateNumArefWrappers 注)。constructor **先落**(gOPN 落位顺序与 Node
+        // 全等:constructor 在首 —— 既有 String/Date 原型 constructor 在尾为既有偏差,
+        // 本原型新建取 Node 序)。
+        vm.call("_object_new");
+        vm.call("_box_obj_r");
+        vm.lea(VReg.V1, protoSlot);
+        vm.store(VReg.V1, 0, VReg.RET);
+        // prototype.constructor = Number(从槽读,已就绪 → 不回调本函数)
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        this._reSetProtoProp(protoSlot, "constructor", BUILTIN_PROP_ATTR);
+        const shimReady = this.numberShimReady();
+        for (let i = 0; i < NUMBER_PROTO_METHODS.length; i = i + 1) {
+            const m = NUMBER_PROTO_METHODS[i];
+            const helper = m[3] ? (shimReady ? this.getFunctionLabel(m[1]) : "_aref_num_toString") : m[1];
+            this.emitBuiltinMethodRefClosureMeta(helper, m[0], m[2]); // RET = 方法值闭包
+            this._reSetProtoProp(protoSlot, m[0], BUILTIN_PROP_ATTR);
+        }
         // 静态方法/常量作构造器闭包属性(Date 模板 setCtorProp:先 _closure_prop_set
         // 落值,再 _closure_prop_set_attr 落 attr —— 顺序不可反,attr=0 的常量若先落
         // attr 则写值被拒;不落 attr 则 gOPD 误报 enumerable:true)。
@@ -1529,6 +1769,12 @@ export const MemberCompiler = {
             vm.movImm(VReg.A2, attr);
             vm.call("_closure_prop_set_attr");
         };
+        // [W7-1] Number.prototype = 原型对象(闭包属性侧表;规范 attrs 全 false → attr 0;
+        // 落位在 length 与静态之间,对齐 Node gOPN 序)
+        setCtorProp("prototype", BUILTIN_CONST_ATTR, () => {
+            vm.lea(VReg.V1, protoSlot);
+            vm.load(VReg.RET, VReg.V1, 0);
+        });
         // 谓词族:合成函数闭包(体内即 Number.is* 静态快路,与调用位同一实现);
         // 与静态值读同槽 → Number.isInteger === gOPD(Number,"isInteger").value。
         const preds = ["isFinite", "isInteger", "isNaN", "isSafeInteger"];
@@ -1563,6 +1809,23 @@ export const MemberCompiler = {
         }
         // RET = 装箱构造器(稳定身份)
         vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.label(doneL);
+    },
+
+    // [W7-1] `Number.prototype` 值读:原型槽已填则直接用,否则整体物化(构造器路径
+    // 一次填两槽)。RET = 装箱原型对象。
+    emitNumberProtoObject() {
+        const vm = this.vm;
+        const protoSlot = "_nsobj_number_proto";
+        this._reEnsureSlot(protoSlot);
+        const doneL = this.ctx.newLabel("nsnumproto_done");
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne(doneL);
+        this.emitNumberCtorObject(); // 填两槽(RET = 构造器,下面重载原型)
+        vm.lea(VReg.V0, protoSlot);
         vm.load(VReg.RET, VReg.V0, 0);
         vm.label(doneL);
     },
@@ -2198,6 +2461,35 @@ export const MemberCompiler = {
         // 遮蔽守卫同 String(局部 Number 退回词法解析)。
         if (name === "Number" && !this.numberNameShadowed()) {
             this.emitNumberCtorObject();
+            return;
+        }
+        // [W7-3 全局函数一等值] 裸 `parseInt`/`parseFloat`(反射位)→ memoized 直连
+        // 闭包,**与 Number.parse* 同槽**("number_parse*",见下方静态值读分支)→
+        // `Number.parseInt === parseInt` 恒等链免费成立;name/length 由
+        // BUILTIN_REF_ARITY 既有条目(2/1)经函数元数据反射。parseInt(...)/parseFloat(...)
+        // 调用快路(functions.js 按名拦截)先于本路径命中 → 字节不变。遮蔽守卫同 Number。
+        if (name === "parseInt" && !this.globalFnNameShadowed("parseInt")) {
+            this.emitMemoizedBuiltinRef("number_parseInt", "_js_parseInt", "parseInt");
+            return;
+        }
+        if (name === "parseFloat" && !this.globalFnNameShadowed("parseFloat")) {
+            this.emitMemoizedBuiltinRef("number_parseFloat", "_js_parseFloat", "parseFloat");
+            return;
+        }
+        // [W7-3] 裸 `isNaN`/`isFinite`(反射位)→ 合成函数 memoized 闭包(体内即
+        // functions.js 同一内联快路,带 ToNumber 强转 —— 与 Number.isNaN/Number.isFinite
+        // 不强转语义有别;`Number.isNaN === isNaN` 规范为 false,不同槽键自然成立)。
+        // isNaN(...)/isFinite(...) 调用快路先于本路径命中 → 字节不变。
+        // encodeURI/decodeURI/encodeURIComponent/decodeURIComponent **刻意不收**:四名
+        // 无实现(compileIdentifier 兜底 0),物化只会把"读值得 0"变成"可调用得垃圾"
+        // —— 要么实现、要么从 IDENT_KNOWN_GLOBAL_NAMES 除名,另案记档。
+        // globalThis.parseInt 仍 undefined(globalThis 对象不挂这些键,既有偏差,不在本项)。
+        if (name === "isNaN" && !this.globalFnNameShadowed("isNaN")) {
+            this.emitSynthStaticRef("global_isNaN", this._globalFnSynthAst("isNaN"), "isNaN", 1);
+            return;
+        }
+        if (name === "isFinite" && !this.globalFnNameShadowed("isFinite")) {
+            this.emitSynthStaticRef("global_isFinite", this._globalFnSynthAst("isFinite"), "isFinite", 1);
             return;
         }
         // [W-29] 裸 `String`(反射位):惰性物化真函数对象(带 .prototype/.name/.length)
@@ -2935,11 +3227,18 @@ export const MemberCompiler = {
             // String.fromCharCode === gOPD(String,"fromCharCode").value;typeof "function"、
             // 可存变量/传回调)。调用位 functions.js 静态快路先命中 → 字节不变;
             // 用户遮蔽(局部 String 等)退回通用路径。显式 === 链而非 {} 查表(#32)。
+            // [W7-2] String.raw 作值读取同槽(调用形态经物化 own prop 工作,无静态
+            // 调用快路 —— tagged 模板由解析期脱糖覆盖,脱糖先命中字节不变)。
             if (expr.object && expr.object.type === "Identifier" &&
-                expr.object.name === "String" && !this.stringNameShadowed() &&
-                (propName === "fromCharCode" || propName === "fromCodePoint")) {
-                this.emitStringStaticRef(propName);
-                return;
+                expr.object.name === "String" && !this.stringNameShadowed()) {
+                if (propName === "fromCharCode" || propName === "fromCodePoint") {
+                    this.emitStringStaticRef(propName);
+                    return;
+                }
+                if (propName === "raw") {
+                    this.emitStringRawRef();
+                    return;
+                }
             }
 
             // [W3 Number 一等值] Number.is*/parse* 静态作值读取 → memoized 闭包
@@ -2971,6 +3270,16 @@ export const MemberCompiler = {
                 (propName === "stringify" || propName === "parse") &&
                 this.jsonShimReady()) {
                 this.emitJSONMethodRef(propName, propName === "stringify" ? 3 : 2);
+                return;
+            }
+            // [W7-2] JSON.rawJSON/JSON.isRawJSON 作值读取 → 同形直连闭包(length 均 1)。
+            // 门:本单元 4 名注入(源码含 raw 族文本 → 注入恒触发)。不含 raw 文本的
+            // 模块本分支永不命中 → 字节不变。
+            if (expr.object && expr.object.type === "Identifier" &&
+                expr.object.name === "JSON" && !this.jsonNameShadowed() &&
+                (propName === "rawJSON" || propName === "isRawJSON") &&
+                this.getFunctionLabel("__JSON_" + propName)) {
+                this.emitJSONMethodRef(propName, 1);
                 return;
             }
 
@@ -3036,6 +3345,14 @@ export const MemberCompiler = {
             if (propName === "prototype" && expr.object.type === "Identifier" &&
                 expr.object.name === "Date" && !this.dateNameShadowed()) {
                 this.emitDateProtoObject();
+                return;
+            }
+
+            // [W7-1] `Number.prototype` → 惰性物化的单例原型对象(6 方法值闭包 + constructor)。
+            // propName 严格限定 "prototype" 且接收者是未遮蔽的裸 `Number` → 其它接收者字节不变。
+            if (propName === "prototype" && expr.object.type === "Identifier" &&
+                expr.object.name === "Number" && !this.numberNameShadowed()) {
+                this.emitNumberProtoObject();
                 return;
             }
 
@@ -3334,6 +3651,54 @@ export const MemberCompiler = {
                         this.emitBuiltinMethodRefClosureMeta(strefHelper, propName, _sh[1]);
                     }
                     this.vm.label(endL);
+                    return;
+                }
+
+                // [W7-1 Number 实例方法值读] 静态数字接收者 `(n).m`(m ∈
+                // NUMBER_INST_METHOD_REF,n 经 _isStaticNumberReceiver 判)作**值读取**
+                // (非调用)→ 运行时按值形态判别(与 _aref_num_* 守卫同判据):
+                // 是数字 → _object_get 读物化原型单例上的方法值闭包(与 `Number.prototype.m`
+                // 值读同槽 → `(5).toFixed === Number.prototype.toFixed` 恒等 true,
+                // .name/.length 随闭包属性侧表);非数字(推断偶误/用户同名属性对象)→
+                // 退回通用属性读(语义同此前,emitObjectGetIC)。调用位 `(n).m(...)` 走
+                // functions.js 静态快路,不经此 → 快路字节不变。tag 取 V1(避 x64
+                // V0≡RET 别名,同上方 W5a 注);裸指针只比 ptrFloor 不解引用。
+                // [#32] 表命中用 hasOwnProperty。
+                if (Object.prototype.hasOwnProperty.call(NUMBER_INST_METHOD_REF, propName) &&
+                    this._isStaticNumberReceiver(expr.object)) {
+                    const nmId = this.nextLabelId();
+                    const nmEndL = this.ctx.newLabel("nmref_end");
+                    const nmFbL = this.ctx.newLabel("nmref_fallback");
+                    const nmNumL = this.ctx.newLabel("nmref_num");
+                    const nmRawL = this.ctx.newLabel("nmref_raw");
+                    const nmRecvSlot = this.ctx.allocLocal(`__nmref_recv_${nmId}`);
+                    this.compileExpression(expr.object);          // RET = 接收者
+                    this.vm.store(VReg.FP, nmRecvSlot, VReg.RET);
+                    this.vm.load(VReg.V1, VReg.FP, nmRecvSlot);
+                    this.vm.shrImm(VReg.V1, VReg.V1, 48);         // V1 = high16(x64 安全)
+                    this.vm.cmpImm(VReg.V1, 0x7FF8);
+                    this.vm.jeq(nmNumL);                           // 装箱 int32 → 数字
+                    this.vm.cmpImm(VReg.V1, 0x7FF9);
+                    this.vm.jlt(nmRawL);
+                    this.vm.cmpImm(VReg.V1, 0x7FFF);
+                    this.vm.jle(nmFbL);                            // tag 族 → 通用读
+                    this.vm.jmp(nmNumL);                           // 负 double → 数字
+                    this.vm.label(nmRawL);
+                    this.vm.cmpImm(VReg.V1, 0);
+                    this.vm.jne(nmNumL);                           // 正 double → 数字
+                    this.vm.movImm64(VReg.V1, this.vm.ptrFloor);
+                    this.vm.cmp(VReg.RET, VReg.V1);
+                    this.vm.jge(nmFbL);                            // 裸指针 → 通用读
+                    this.vm.label(nmNumL);
+                    this.emitNumberProtoObject();                  // RET = 装箱原型
+                    this.vm.mov(VReg.A0, VReg.RET);
+                    this.emitBoxedStringKey(propName, VReg.A1);
+                    this.vm.call("_object_get");                   // RET = 同槽方法值闭包
+                    this.vm.jmp(nmEndL);
+                    this.vm.label(nmFbL);
+                    this.vm.load(VReg.RET, VReg.FP, nmRecvSlot);
+                    this.emitObjectGetIC(propName);
+                    this.vm.label(nmEndL);
                     return;
                 }
 

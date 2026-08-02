@@ -83,6 +83,12 @@ let __js_replacer = null;
 let __js_proplist = null;
 let __js_gap = "";
 
+// [W7-2] rawJSON 内部品牌登记表(模块级平行数组 + indexOf 身份判;gen1 §1 无
+// Map/WeakMap;登记表根随模块常驻,rawJSON 对象不回收 —— 单线程模型接受,记偏差)。
+// 前置声明:__jsonSer(上方)运行期引用,模块级 let 须与既有 __js_* 同区。
+let __js_rawjson_objs = [];
+let __js_rawjson_texts = [];
+
 // obj 是否自有键 k(缺失键读出为数字 0 而非 undefined,故不能靠 obj[k]===undefined
 // 判定;须遍历自有键比对。k 来自用户白名单 → 全程 typeof 守卫,不触原型链 [#32])。
 function __jsonHasKey(obj, k) {
@@ -95,6 +101,12 @@ function __jsonHasKey(obj, k) {
 // 序列化"已定型"的值(已过 toJSON/replacer),返回串或 undefined(表示跳过/顶层空)。
 function __jsonSer(value, indent, depth) {
     if (depth > 200) return '"[Deep]"'; // 循环引用/超深兜底(node 抛 TypeError,此处降级)
+    // [W7-2] rawJSON 直通:toJSON/replacer **之后**(__jsonPropV 已先处理 → 规范次序
+    // 天然正确),按内部品牌(模块级登记表)判,raw 文本原样嵌入(不引号、不转义)。
+    if (value !== null && typeof value === "object") {
+        const __ri = __js_rawjson_objs.indexOf(value);
+        if (__ri !== -1) return __js_rawjson_texts[__ri];
+    }
     const t = typeof value;
     if (t === "number") {
         // 非有限数(NaN/±Infinity)在 JSON 里一律 null(规范 SerializeJSONProperty)。
@@ -260,7 +272,9 @@ export function __JSON_stringify(v, replacer, space) {
 // ---------------- parse ----------------
 
 function __jsonErr(msg) {
-    throw new Error("JSON.parse: " + msg);
+    // [W7-2] JSON.parse 的错误品牌是 SyntaxError(node v25 逐对拍;此前 Error 记偏差)。
+    // 消息文本与 V8 逐条格式不同(位置/列号口径),仍记偏差,仅品牌(name/instanceof)对拍。
+    throw new SyntaxError("JSON.parse: " + msg);
 }
 
 // 解析器状态经参数/返回值传递:parse 内函数返回 [value, nextPos] 需要多返回——
@@ -467,4 +481,111 @@ export function __JSON_parse(text, reviver) {
         return __jpInternalize(root, "", v, reviver);
     }
     return v;
+}
+
+// ---------------- rawJSON / isRawJSON(W7-2) ----------------
+//
+// node v25 实测语义(校准探针逐条核对):JSON.rawJSON(text) 只接受 **JSON 原始值**——
+// strict JSON number(`-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?`)、
+// "true"/"false"/"null"、合法 JSON 串字面量(双引号、合法转义、无裸控制符);
+// 空串 / 首尾空白 / 对象或数组 / 尾部垃圾一律 SyntaxError;Symbol 参 TypeError
+// (ToString 拒)。返回对象:Object.create(null) 原型、gOPD(rawJSON) 形状
+// {writable:false, enumerable:true, configurable:false}(defineProperty 落位,与 node
+// 逐对拍)。**记偏差**:Object.isFrozen/isExtensible 无冻结位(本运行时 freeze 不落地),
+// rawJSON 对象经登记表常驻(模块级平行数组根,不回收 —— 单线程编译/运行模型接受)。
+// 内部品牌:模块级**平行数组登记表** + indexOf 身份判(gen1 §1:无 Map/WeakMap);
+// 手工伪造 {rawJSON:"123"} 不在表 → isRawJSON false(与 node 一致)。
+// (数组本体在文件头 __js_replacer 旁声明 —— __jsonSer 运行期引用,避免模块级 let
+//  前向引用。)
+
+function __jsonRawHex(c) {
+    return (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70);
+}
+
+// 校验 rawJSON 文本(非法一律 SyntaxError;消息文本与 V8 逐条格式不同,记偏差,
+// 仅品牌对拍 —— 与 __jsonErr 同一口径)。手写扫描(gen1 §1 禁正则)。
+function __jsonRawCheck(s) {
+    const n = s.length;
+    if (n === 0) throw new SyntaxError("Invalid value for JSON.rawJSON");
+    const c0 = s.charCodeAt(0);
+    if (c0 === 34) { // " —— JSON 串字面量,闭引号必须恰在末尾
+        let i = 1;
+        while (i < n) {
+            const c = s.charCodeAt(i);
+            if (c === 34) {
+                if (i === n - 1) return;
+                throw new SyntaxError("Invalid value for JSON.rawJSON");
+            }
+            if (c === 92) { // 转义
+                i = i + 1;
+                if (i >= n) break;
+                const e = s.charCodeAt(i);
+                if (e === 34 || e === 92 || e === 47 || e === 98 || e === 102 ||
+                    e === 110 || e === 114 || e === 116) {
+                    i = i + 1;
+                    continue;
+                }
+                if (e === 117) { // \uXXXX
+                    if (i + 4 >= n) throw new SyntaxError("Invalid value for JSON.rawJSON");
+                    for (let k = 1; k <= 4; k = k + 1) {
+                        if (!__jsonRawHex(s.charCodeAt(i + k))) {
+                            throw new SyntaxError("Invalid value for JSON.rawJSON");
+                        }
+                    }
+                    i = i + 5;
+                    continue;
+                }
+                throw new SyntaxError("Invalid value for JSON.rawJSON");
+            }
+            if (c < 32) throw new SyntaxError("Invalid value for JSON.rawJSON"); // 裸控制符
+            i = i + 1;
+        }
+        throw new SyntaxError("Invalid value for JSON.rawJSON"); // 未终止
+    }
+    if (c0 === 116) { if (s === "true") return; throw new SyntaxError("Invalid value for JSON.rawJSON"); }
+    if (c0 === 102) { if (s === "false") return; throw new SyntaxError("Invalid value for JSON.rawJSON"); }
+    if (c0 === 110) { if (s === "null") return; throw new SyntaxError("Invalid value for JSON.rawJSON"); }
+    // strict JSON number,整串:-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?
+    let i = 0;
+    if (c0 === 45) { i = 1; if (i >= n) throw new SyntaxError("Invalid value for JSON.rawJSON"); }
+    const d0 = s.charCodeAt(i);
+    if (d0 === 48) {
+        i = i + 1; // 前导 0 后不得再跟数字(01 非法,由下方 i!==n 兜底)
+    } else if (d0 >= 49 && d0 <= 57) {
+        i = i + 1;
+        while (i < n && s.charCodeAt(i) >= 48 && s.charCodeAt(i) <= 57) i = i + 1;
+    } else {
+        throw new SyntaxError("Invalid value for JSON.rawJSON");
+    }
+    if (i < n && s.charCodeAt(i) === 46) { // 小数:至少 1 位
+        i = i + 1;
+        const f0 = i;
+        while (i < n && s.charCodeAt(i) >= 48 && s.charCodeAt(i) <= 57) i = i + 1;
+        if (i === f0) throw new SyntaxError("Invalid value for JSON.rawJSON");
+    }
+    if (i < n && (s.charCodeAt(i) === 101 || s.charCodeAt(i) === 69)) { // 指数:至少 1 位
+        i = i + 1;
+        if (i < n && (s.charCodeAt(i) === 43 || s.charCodeAt(i) === 45)) i = i + 1;
+        const e0 = i;
+        while (i < n && s.charCodeAt(i) >= 48 && s.charCodeAt(i) <= 57) i = i + 1;
+        if (i === e0) throw new SyntaxError("Invalid value for JSON.rawJSON");
+    }
+    if (i !== n) throw new SyntaxError("Invalid value for JSON.rawJSON");
+}
+
+export function __JSON_rawJSON(text) {
+    if (typeof text === "symbol") throw new TypeError("Cannot convert a Symbol value to a string");
+    const s = "" + text;
+    __jsonRawCheck(s);
+    const o = Object.create(null);
+    // gOPD 形状与 node 逐对拍:{writable:false, enumerable:true, configurable:false}
+    Object.defineProperty(o, "rawJSON", { value: s, writable: false, enumerable: true, configurable: false });
+    __js_rawjson_objs.push(o);
+    __js_rawjson_texts.push(s);
+    return o;
+}
+
+export function __JSON_isRawJSON(o) {
+    if (o === null || (typeof o !== "object" && typeof o !== "function")) return false;
+    return __js_rawjson_objs.indexOf(o) !== -1;
 }

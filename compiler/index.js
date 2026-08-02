@@ -496,9 +496,14 @@ export class Compiler {
         if (!shimMeta) return;
         const strSym = this.getFunctionSymbolForModule(shimMeta, "__JSON_stringify");
         const parseSym = this.getFunctionSymbolForModule(shimMeta, "__JSON_parse");
+        // [W7-2] raw 族两导出同机理登记;仅被 JSON.rawJSON/JSON.isRawJSON dispatch 的
+        // 调用点查阅,不含 raw 文本的模块别名永不被查 → 零码差(与下方注释同一论证)。
+        const rawSym = this.getFunctionSymbolForModule(shimMeta, "__JSON_rawJSON");
+        const isRawSym = this.getFunctionSymbolForModule(shimMeta, "__JSON_isRawJSON");
         // shim 导出的两个函数必须已在 collectFunctions 登记(否则别名指向空 → getFunction
         // 守卫判假,退化为原行为,不至误发)。
         if (!this.ctx.functions[strSym] || !this.ctx.functions[parseSym]) return;
+        if (!this.ctx.functions[rawSym] || !this.ctx.functions[isRawSym]) return;
         for (const moduleAst of this._moduleOrder) {
             const meta = this.getModuleMeta(moduleAst);
             if (meta === shimMeta) continue;
@@ -516,6 +521,12 @@ export class Compiler {
             }
             if (!meta.functionAliases["__JSON_parse"]) {
                 meta.functionAliases["__JSON_parse"] = parseSym;
+            }
+            if (!meta.functionAliases["__JSON_rawJSON"]) {
+                meta.functionAliases["__JSON_rawJSON"] = rawSym;
+            }
+            if (!meta.functionAliases["__JSON_isRawJSON"]) {
+                meta.functionAliases["__JSON_isRawJSON"] = isRawSym;
             }
         }
     }
@@ -1471,10 +1482,18 @@ export class Compiler {
         // 这些 __JSON_* 调用是 codegen 合成的、源码里无 "JSON.*" 文本 → 不会触发下面的
         // 注入,shim 缺失时合成调用静默失效(返回原对象别名,非深拷贝)。故把
         // "structuredClone" 也作为 JSON shim 的注入触发词。
+        // [W7-2] 追加触发词 JSON.rawJSON/JSON.isRawJSON;含 raw 族文本的模块改注 4 名
+        // import,否则维持原 2 名 —— 既有触发模块注入文本逐字不变(字节中性;全仓无
+        // rawJSON 文本,grep 实证零命中)。
         if (filePath.indexOf("__json_shim.js") === -1 &&
             (src.indexOf("JSON.stringify") !== -1 || src.indexOf("JSON.parse") !== -1 ||
+             src.indexOf("JSON.rawJSON") !== -1 || src.indexOf("JSON.isRawJSON") !== -1 ||
              src.indexOf("structuredClone") !== -1)) {
-            const inj = 'import { __JSON_stringify, __JSON_parse } from "__json_shim";\n';
+            const hasRaw = src.indexOf("JSON.rawJSON") !== -1 ||
+                src.indexOf("JSON.isRawJSON") !== -1;
+            const inj = hasRaw
+                ? 'import { __JSON_stringify, __JSON_parse, __JSON_rawJSON, __JSON_isRawJSON } from "__json_shim";\n'
+                : 'import { __JSON_stringify, __JSON_parse } from "__json_shim";\n';
             src = injectShimImport(src, inj);
         }
         // [批次D RegExp shim 注入] 源码含正则字面量或 RegExp 构造调用文本时,前置

@@ -1,6 +1,6 @@
 {
-  "generated": "2026-08-01T21:03:16.693Z",
-  "runnerSha": "0785498cdcc8f4b179793ddbb2ec392e015d092b",
+  "generated": "2026-08-02T11:03:18.602Z",
+  "runnerSha": "d1475ef2168e9bec74c61595c1aa28881d5c71a6",
   "corpusPin": "9e61c12835c5e4a3bdba93850427e6742c4f64c4",
   "config": {
     "corpus": ".test262-corpus",
@@ -46,12 +46,12 @@
   "eligible": 32310,
   "run": 6462,
   "totals": {
-    "PASS": 3087,
-    "FAIL": 3144,
+    "PASS": 3112,
+    "FAIL": 3120,
     "COMPILE_FAIL": 69,
-    "CRASH": 162
+    "CRASH": 161
   },
-  "passRatePct": 47.77,
+  "passRatePct": 48.16,
   "byArea": {
     "built-ins/Array": {
       "PASS": 299,
@@ -66,8 +66,8 @@
       "CRASH": 0
     },
     "built-ins/JSON": {
-      "PASS": 10,
-      "FAIL": 23,
+      "PASS": 19,
+      "FAIL": 14,
       "COMPILE_FAIL": 0,
       "CRASH": 0
     },
@@ -84,14 +84,14 @@
       "CRASH": 0
     },
     "built-ins/Number": {
-      "PASS": 30,
-      "FAIL": 37,
+      "PASS": 41,
+      "FAIL": 27,
       "COMPILE_FAIL": 0,
-      "CRASH": 1
+      "CRASH": 0
     },
     "built-ins/Object": {
-      "PASS": 399,
-      "FAIL": 272,
+      "PASS": 401,
+      "FAIL": 270,
       "COMPILE_FAIL": 0,
       "CRASH": 11
     },
@@ -114,8 +114,8 @@
       "CRASH": 8
     },
     "built-ins/String": {
-      "PASS": 95,
-      "FAIL": 147,
+      "PASS": 97,
+      "FAIL": 145,
       "COMPILE_FAIL": 1,
       "CRASH": 1
     },
@@ -132,8 +132,8 @@
       "CRASH": 3
     },
     "language/expressions": {
-      "PASS": 1036,
-      "FAIL": 878,
+      "PASS": 1037,
+      "FAIL": 877,
       "COMPILE_FAIL": 30,
       "CRASH": 61
     },
@@ -147,7 +147,7 @@
   "topFailPatterns": [
     {
       "pattern": "FAIL: assertion mismatch (Test262Error / wrong value)",
-      "count": 1801
+      "count": 1783
     },
     {
       "pattern": "FAIL: async ($DONE not signalled / promise rejected)",
@@ -155,7 +155,7 @@
     },
     {
       "pattern": "FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)",
-      "count": 359
+      "count": 353
     },
     {
       "pattern": "FAIL: negative test wrong outcome (phase=parse)",
@@ -167,7 +167,7 @@
     },
     {
       "pattern": "CRASH: run signal SIGSEGV",
-      "count": 112
+      "count": 111
     },
     {
       "pattern": "FAIL: array contents mismatch (compareArray)",
