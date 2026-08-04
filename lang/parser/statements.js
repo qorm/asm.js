@@ -210,13 +210,17 @@ export const StatementParser = {
         if (isGenerator) this.fnGenDepth++;
         if (isAsync) this.fnAsyncDepth++;
         // [Wave 8] 函数边界:字段初始化器上下文在函数声明内复位,返回前须恢复。
+        // [L2-④] _inFormalParams 同理:嵌套函数内 await/yield 合法,边界复位。
         const prevInFieldInit = this._inFieldInit;
+        const prevInFormal = this._inFormalParams;
         this._inFieldInit = false;
+        this._inFormalParams = false;
         let params = this.parseFunctionParams();
         if (!this.expectPeek(TokenType.LBRACE)) {
             if (isGenerator) this.fnGenDepth--;
             if (isAsync) this.fnAsyncDepth--;
             this._inFieldInit = prevInFieldInit;
+            this._inFormalParams = prevInFormal;
             return null;
         }
         // [test262 S1] strict 探测:"use strict" 指令 → strict 深度 + 回溯形参校验
@@ -228,6 +232,7 @@ export const StatementParser = {
         if (isGenerator) this.fnGenDepth--;
         if (isAsync) this.fnAsyncDepth--;
         this._inFieldInit = prevInFieldInit;
+        this._inFormalParams = prevInFormal;
         return new AST.FunctionDeclaration(id, params, body, isAsync, isGenerator);
     },
 
@@ -362,9 +367,12 @@ export const StatementParser = {
     },
 
     parseFunctionParams() {
+        const prevInFormal = this._inFormalParams;
+        this._inFormalParams = true;
         let params = [];
         if (this.peekTokenIs(TokenType.RPAREN)) {
             this.nextToken();
+            this._inFormalParams = prevInFormal;
             return params;
         }
         this.nextToken();
@@ -387,7 +395,8 @@ export const StatementParser = {
             }
             this.pushFunctionParam(params, nextParam);
         }
-        if (!this.expectPeek(TokenType.RPAREN)) return null;
+        if (!this.expectPeek(TokenType.RPAREN)) { this._inFormalParams = prevInFormal; return null; }
+        this._inFormalParams = prevInFormal;
         return params;
     },
 

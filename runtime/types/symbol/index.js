@@ -21,7 +21,9 @@ import { VReg } from "../../../vm/registers.js";
 const TYPE_SYMBOL = 61;
 
 // 众所周知符号（占位属性：唯一 symbol 值挂在 Symbol 上，不接迭代协议）
-export const WELLKNOWN_SYMBOLS = ["iterator", "asyncIterator", "hasInstance", "toPrimitive", "toStringTag"];
+export const WELLKNOWN_SYMBOLS = ["iterator", "asyncIterator", "hasInstance",
+    "isConcatSpreadable", "match", "matchAll", "replace", "search",
+    "species", "split", "toPrimitive", "toStringTag", "unscopables"];
 
 export class SymbolGenerator {
     constructor(vm) {

@@ -3592,8 +3592,12 @@ export const MemberCompiler = {
             if (expr.object.type === "Identifier" && expr.object.name === "Symbol" &&
                 !this.ctx.getLocal("Symbol") &&
                 (propName === "iterator" || propName === "asyncIterator" ||
-                 propName === "hasInstance" || propName === "toPrimitive" ||
-                 propName === "toStringTag")) {
+                 propName === "hasInstance" || propName === "isConcatSpreadable" ||
+                 propName === "match" || propName === "matchAll" ||
+                 propName === "replace" || propName === "search" ||
+                 propName === "species" || propName === "split" ||
+                 propName === "toPrimitive" || propName === "toStringTag" ||
+                 propName === "unscopables")) {
                 this.vm.lea(VReg.A0, "_symwk_" + propName);
                 const wkDescLabel = this.asm.addString("Symbol." + propName);
                 this.vm.lea(VReg.A1, wkDescLabel);

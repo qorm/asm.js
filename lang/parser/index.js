@@ -39,6 +39,9 @@ export class Parser {
         // [Wave 8] 字段初始化器上下文(ContainsArguments/ContainsSuperCall):字段 init 解析时置真,
         // 穿透箭头(继承)但遇函数表达式/声明边界复位(新作用域自有 arguments/home object)。
         this._inFieldInit = false;
+        // [L2-④] 形参解析中:async 函数(含 async-gen)形参含 await 表达式是早期错误;
+        // generator 形参含 yield 表达式是早期错误。嵌套函数边界须复位此标志。
+        this._inFormalParams = false;
         // [Wave 8 续] tagged 模板深度:tag`…` / String.raw`…` 不校验转义序列(raw 原样保留),
         // 裸模板(未 tagged)校验非法转义(legacy 八进制/坏 \u \x)。
         this._taggedTemplate = 0;

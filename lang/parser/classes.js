@@ -20,7 +20,15 @@ export const ClassParser = {
             anonymous = true;
         } else if (this.curTokenIsIdentifier()) {
             this.checkReservedBinding(this.curToken.literal);   // [test262 早期错误 A] 类名保留字
-            id = new AST.Identifier(this.curToken.literal);
+            // [L2-④] 类体隐式 strict:类名不可用 strict 保留字(Early Errors 12.1.1)
+            // classDepth 此时尚未递增,故在此直查(ES 规范的 strict reserved words)。
+            const cn = this.curToken.literal;
+            if (cn === "let" || cn === "static" || cn === "yield" ||
+                cn === "implements" || cn === "interface" || cn === "package" ||
+                cn === "private" || cn === "protected" || cn === "public") {
+                this.errors.push("Cannot use reserved word '" + cn + "' as a class name");
+            }
+            id = new AST.Identifier(cn);
         } else {
             return null;
         }
@@ -247,6 +255,13 @@ export const ClassParser = {
         const prevInFieldInit = this._inFieldInit;
         this._inFieldInit = false;
         let params = this.parseFunctionParams();
+        // [L2-④] getter 不得有形参,setter 必须恰 1 个非 rest 形参
+        if (kind === "get" && params.length > 0) {
+            this.errors.push("getter must not have formal parameters");
+        }
+        if (kind === "set" && params.length !== 1) {
+            this.errors.push("setter must have exactly one formal parameter");
+        }
         if (!this.expectPeek(TokenType.LBRACE)) {
             if (isGenerator) this.fnGenDepth--;
             if (isAsyncMethod) this.fnAsyncDepth--;
