@@ -1,6 +1,6 @@
 {
-  "generated": "2026-08-04T15:22:29.385Z",
-  "runnerSha": "b0a85bdf3089fd20e1f39c8d91d56af72f25c483",
+  "generated": "2026-08-04T17:34:31.572Z",
+  "runnerSha": "83b920b940e1930acd8b3f9a1c5670954d4c7081",
   "corpusPin": "9e61c12835c5e4a3bdba93850427e6742c4f64c4",
   "config": {
     "corpus": ".test262-corpus",
@@ -47,12 +47,12 @@
   "eligible": 32221,
   "run": 6445,
   "totals": {
-    "PASS": 3800,
-    "FAIL": 2429,
+    "PASS": 3802,
+    "FAIL": 2428,
     "COMPILE_FAIL": 66,
-    "CRASH": 150
+    "CRASH": 149
   },
-  "passRatePct": 58.96,
+  "passRatePct": 58.99,
   "byArea": {
     "built-ins/Array": {
       "PASS": 332,
@@ -115,8 +115,8 @@
       "CRASH": 15
     },
     "built-ins/String": {
-      "PASS": 84,
-      "FAIL": 152,
+      "PASS": 86,
+      "FAIL": 150,
       "COMPILE_FAIL": 2,
       "CRASH": 6
     },
@@ -140,9 +140,9 @@
     },
     "language/statements": {
       "PASS": 1162,
-      "FAIL": 591,
+      "FAIL": 592,
       "COMPILE_FAIL": 26,
-      "CRASH": 44
+      "CRASH": 43
     }
   },
   "topFailPatterns": [
@@ -152,7 +152,7 @@
     },
     {
       "pattern": "FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)",
-      "count": 301
+      "count": 300
     },
     {
       "pattern": "FAIL: async ($DONE not signalled / promise rejected)",
@@ -168,7 +168,7 @@
     },
     {
       "pattern": "CRASH: run signal SIGSEGV",
-      "count": 98
+      "count": 97
     },
     {
       "pattern": "FAIL: array contents mismatch (compareArray)",
