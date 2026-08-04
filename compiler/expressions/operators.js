@@ -892,6 +892,47 @@ export const OperatorCompiler = {
             return;
         }
 
+        // [底层A W-A2] `x instanceof Object` 内联短路。Object 匹配多形态(规范 OrdinaryHasInstance
+        // 对构造器为 Object 恒真于任何对象/数组/函数;运行时 _instanceof 的 A1==2 →
+        // _iof_chk_obj 判别:tag 0x7FFD/0x7FFE/0x7FFF true、tag==0 且 [heap_base,heap_ptr) 内
+        // 裸堆指针 true、其余 false)。单字节 biWantType 装不下 → 独立语法分支逐字镜像
+        // _iof_chk_obj。裸 `Object` 已一等化为真闭包,若不经此走泛型 _instanceof 会把
+        // 闭包当 classinfo 塌 false。Object 被用户遮蔽时退回通用路径(编译 RHS 局部)。
+        if (op === "instanceof" && expr.right && expr.right.type === "Identifier" &&
+            expr.right.name === "Object" && !this.objectNameShadowed()) {
+            const oiT = this.ctx.newLabel("oinst_t");
+            const oiF = this.ctx.newLabel("oinst_f");
+            const oiEnd = this.ctx.newLabel("oinst_end");
+            compileOperandAsJSValue(expr.left);
+            this.vm.mov(VReg.V0, VReg.RET);               // V0 = 左值(后续 load 不毁它)
+            this.vm.shrImm(VReg.V1, VReg.V0, 48);         // V1 = tag(high16)
+            this.vm.cmpImm(VReg.V1, 0x7FFD);              // 装箱对象
+            this.vm.jeq(oiT);
+            this.vm.cmpImm(VReg.V1, 0x7FFE);              // 数组
+            this.vm.jeq(oiT);
+            this.vm.cmpImm(VReg.V1, 0x7FFF);              // 函数值(函数亦是对象)
+            this.vm.jeq(oiT);
+            this.vm.cmpImm(VReg.V1, 0);                   // 非裸指针(含真数/null) → false
+            this.vm.jne(oiF);
+            this.vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+            this.vm.and(VReg.V2, VReg.V0, VReg.V1);       // 裸指针候选
+            this.vm.lea(VReg.V1, "_heap_base");
+            this.vm.load(VReg.V1, VReg.V1, 0);
+            this.vm.cmp(VReg.V2, VReg.V1);
+            this.vm.jlt(oiF);
+            this.vm.lea(VReg.V1, "_heap_ptr");
+            this.vm.load(VReg.V1, VReg.V1, 0);
+            this.vm.cmp(VReg.V2, VReg.V1);
+            this.vm.jge(oiF);
+            this.vm.label(oiT);
+            this.vm.movImm64(VReg.RET, 0x7ff9000000000001n); // was lea+load _js const
+            this.vm.jmp(oiEnd);
+            this.vm.label(oiF);
+            this.vm.movImm64(VReg.RET, 0x7ff9000000000000n); // was lea+load _js const
+            this.vm.label(oiEnd);
+            return;
+        }
+
         // [#66 Phase1b] 内建 instanceof:Date/Map/Set/Promise —— 编译期内联
         // tag 字节比较。实例低 48 位掩出裸指针候选,守 [heap_base,heap_ptr) 再读
         // [ptr+0] 低字节 == 目标 TYPE。兼容 0x7FFD 装箱(Date/Promise)与裸
@@ -903,7 +944,9 @@ export const OperatorCompiler = {
         let biWantType = 0;
         if (op === "instanceof" && expr.right && expr.right.type === "Identifier") {
             const bn = expr.right.name;
-            if (bn === "Date") biWantType = 7;
+            if (bn === "Array") biWantType = 1;   // [底层A] 数组块 type 字节=1;裸 Array 已一等化,
+                                                  // 内联短路避免把真闭包当 classinfo 走 _iof_user。
+            else if (bn === "Date") biWantType = 7;
             else if (bn === "Map") biWantType = 4;
             else if (bn === "Set") biWantType = 5;
             else if (bn === "Promise") biWantType = 11;
@@ -950,17 +993,21 @@ export const OperatorCompiler = {
 
         // [#69/#66] x instanceof F,F 为普通函数声明:F 作值是闭包 {0xc105,label}
         // (非 classinfo),泛型 _instanceof 塌 false。改沿实例 __proto__ 链比对 F 的
-        // prototype(new F 惰性建、存 _funcproto_<sym>),委托运行时 _instanceof_proto。
+        // prototype,委托运行时 _instanceof_proto。
+        // [W-B B2] prototype 经闭包属性侧表 _closure_prop_get 解析 —— 与 `F.prototype` 读
+        // 和 `new F()` 的 __proto__ 同源(同一对象),`F.prototype` 重赋值后 `f instanceof F`
+        // 按 ES 语义随链变化(此前读 _funcproto_ 槽,与 `F.prototype` 读脱节)。
         if (op === "instanceof" && expr.right && expr.right.type === "Identifier") {
             const rDecl = this.ctx.getFunction ? this.ctx.getFunction(expr.right.name) : null;
             if (rDecl && rDecl.type === "FunctionDeclaration") {
                 const sym = (this.ctx.getFunctionSymbol && this.ctx.getFunctionSymbol(expr.right.name)) ||
                     expr.right.name;
-                const protoLabel = this.ensureFuncProtoSlot(sym);
                 compileOperandAsJSValue(expr.left); // RET = 实例
-                this.vm.mov(VReg.A0, VReg.RET);
-                this.vm.lea(VReg.A1, protoLabel);
-                this.vm.load(VReg.A1, VReg.A1, 0); // A1 = F.prototype(裸,无则 0)
+                this.vm.mov(VReg.S0, VReg.RET);     // S0 = 实例(emitUserFuncProtoRef 毁 A0)
+                this.emitUserFuncProtoRef(expr.right.name, sym); // RET = 裸 F.prototype
+                // 先取 A1 = RET(x64 RET≡A0≡V0≡RAX:先 mov A0 会覆写 RET → 顺序不可反)
+                this.vm.mov(VReg.A1, VReg.RET);     // A1 = F.prototype(裸,未建 → 0)
+                this.vm.mov(VReg.A0, VReg.S0);      // A0 = 实例
                 this.vm.call("_instanceof_proto");
                 return;
             }

@@ -917,32 +917,60 @@ export const ExpressionCompiler = {
         return label;
     },
 
-    // [#69] 普通函数 new F(args):建对象→__proto__=F.prototype(惰性建,存
-    // _funcproto_<sym>)→以对象为 this 跑函数体(形参 A0.. / this 在 A5)→显式返回
-    // 对象则覆盖,否则返回该对象。不动 class 路径(compileUserClassNew,this 在 A0)。
+    // [W-B B2] 用户函数 F.prototype 解析(惰性,与 `F.prototype` 属性读返回**同一**对象)。
+    // 发射:确保 _funcclosure_<sym> memoized 闭包(与 compileIdentifier 函数声明作值同法,
+    // 稳定身份 `F===F`),调 _closure_prop_get(fn,"prototype") → 运行时 _cpg_miss 惰性建
+    // prototype 对象并回填 fn.prototype 闭包属性 → RET = 裸 prototype(未建/undefined → 0)。
+    // 于是 `new F()`、`F.prototype.x` 读、`f instanceof F` 三路统一到同一 prototype 对象。
+    // S0 保持(调用方持有实例);S1 作 scratch。
+    emitUserFuncProtoRef(funcName, symbol) {
+        const funcLabel = this.getFunctionLabel(funcName);
+        const slotLabel = this.ensureFuncClosureSlot(symbol);
+        const haveCloL = this.ctx.newLabel("fnproto_clo_have");
+        // 1. 确保 memoized 闭包 → RET = 装箱 fn
+        this.vm.lea(VReg.V0, slotLabel);
+        this.vm.load(VReg.RET, VReg.V0, 0);
+        this.vm.cmpImm(VReg.RET, 0);
+        this.vm.jne(haveCloL);
+        this.vm.movImm(VReg.A0, 16);
+        this.vm.call("_alloc");
+        this.vm.mov(VReg.S1, VReg.RET);
+        this.vm.movImm(VReg.V1, 0xc105); // CLOSURE_MAGIC
+        this.vm.store(VReg.S1, 0, VReg.V1);
+        this.vm.lea(VReg.V1, funcLabel);
+        this.vm.store(VReg.S1, 8, VReg.V1);
+        this.vm.mov(VReg.A0, VReg.S1);
+        this.vm.call("_js_box_function"); // RET = 装箱
+        this.vm.lea(VReg.V1, slotLabel);
+        this.vm.store(VReg.V1, 0, VReg.RET);
+        this.vm.label(haveCloL);
+        // 2. F.prototype = _closure_prop_get(fn, "prototype")
+        this.vm.mov(VReg.A0, VReg.RET);
+        this.emitBoxedStringKey("prototype", VReg.A1);
+        this.vm.call("_closure_prop_get"); // RET = 装箱 proto / undefined
+        // 3. 脱壳 → 裸 prototype(undefined 脱壳得 0)
+        this.vm.emitMaskLoad(VReg.V1);
+        this.vm.andMaskReg(VReg.RET, VReg.RET, VReg.V1);
+    },
+
+    // [#69] 普通函数 new F(args):建对象→__proto__=F.prototype(惰性,经闭包属性侧表,
+    // 与 `F.prototype` 读同一对象)→以对象为 this 跑函数体(形参 A0.. / this 在 A5)→
+    // 显式返回对象则覆盖,否则返回该对象。不动 class 路径(compileUserClassNew,this 在 A0)。
     compilePlainFunctionNew(funcName, args, funcNode) {
         const funcLabel = this.getFunctionLabel(funcName);
         if (!funcLabel) { this.vm.movImm(VReg.RET, 0); return; }
         const symbol = (this.ctx.getFunctionSymbol && this.ctx.getFunctionSymbol(funcName)) || funcName;
-        const protoLabel = this.ensureFuncProtoSlot(symbol);
 
         // 1. 新实例对象(裸;S0 callee-saved,跨调用与参数求值存活)
         this.vm.call("_object_new");
         this.vm.mov(VReg.S0, VReg.RET);
 
-        // 2. 惰性建/读 F.prototype(裸),挂实例 __proto__ 槽(@16)。裸指针存储,
-        //    __proto__ 链与 _instanceof 皆按裸指针解读(同 class props[1].val)。
-        const haveProto = this.ctx.newLabel("fnproto_have");
-        this.vm.lea(VReg.S1, protoLabel);
-        this.vm.load(VReg.V0, VReg.S1, 0);
-        this.vm.cmpImm(VReg.V0, 0);
-        this.vm.jne(haveProto);
-        this.vm.call("_object_new");
-        this.vm.lea(VReg.S1, protoLabel);
-        this.vm.store(VReg.S1, 0, VReg.RET);
-        this.vm.mov(VReg.V0, VReg.RET);
-        this.vm.label(haveProto);
-        this.vm.store(VReg.S0, 16, VReg.V0);
+        // 2. __proto__ = F.prototype(惰性,经闭包属性侧表 _closure_prop_get → 与
+        //    `F.prototype` 属性读返回**同一**对象,`F.prototype.x=1; (new F()).x` 成立;
+        //    且 `F.prototype.constructor` 由 _cpg_miss 落 → `(new F()).constructor===F`)。
+        //    裸指针存储,__proto__ 链按裸指针解读(同 class props[1].val)。
+        this.emitUserFuncProtoRef(funcName, symbol); // RET = 裸 F.prototype(S1 scratch)
+        this.vm.store(VReg.S0, 16, VReg.RET);
 
         // 3. 备参:形参 A0..A4、this 在 A5(见 index.js [#36])。展开实参走专用
         //    helper(运行时按数组长度装 A0..A4);否则逐个求值压栈,再逆序弹回

@@ -612,6 +612,24 @@ export class CoroutineGenerator {
         vm.load(VReg.V1, VReg.S1, 8);
         vm.cmpImm(VReg.V1, CORO_STATUS_COMPLETED);
         vm.jne("_agn_return_p"); // SUSPENDED:yield 已 resolve 或 await pending → 直接返回 P
+        // [async generator unwind] 体未捕获异常(throw / await-reject 经 returnLabel 完成
+        // 协程,pending 保留)→ reject 本次 next() 的 P,而非 resolve {value, done}。
+        vm.lea(VReg.V0, "_exception_pending");
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_agn_completed_ok");
+        vm.lea(VReg.V0, "_exception_value");
+        vm.load(VReg.A1, VReg.V0, 0); // 拒因
+        vm.mov(VReg.A0, VReg.S3);     // P
+        vm.call("_promise_reject");
+        vm.lea(VReg.V0, "_exception_pending");
+        vm.movImm(VReg.V1, 0);
+        vm.store(VReg.V0, 0, VReg.V1); // 清 pending(已作为拒因交给 Promise)
+        vm.movImm(VReg.V1, 0);
+        vm.store(VReg.S1, 88, VReg.V1); // 清 +88
+        vm.mov(VReg.RET, VReg.S3);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+        vm.label("_agn_completed_ok");
         // 完成:若 +88 仍非 0(无收尾 yield),resolve P {value:+72, done:true}
         vm.load(VReg.V1, VReg.S1, 88);
         vm.cmpImm(VReg.V1, 0);

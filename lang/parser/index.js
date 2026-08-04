@@ -36,6 +36,12 @@ export class Parser {
         // [test262 S1] 程序级 strict:脚本首条 "use strict" 指令 → 顶层 strict(供 delete 裸变量
         // 等早期错误判定;函数级 strict 仍由 fnStrictDepth 跟踪)。parseProgram 起始探测。
         this.programStrict = false;
+        // [Wave 8] 字段初始化器上下文(ContainsArguments/ContainsSuperCall):字段 init 解析时置真,
+        // 穿透箭头(继承)但遇函数表达式/声明边界复位(新作用域自有 arguments/home object)。
+        this._inFieldInit = false;
+        // [Wave 8 续] tagged 模板深度:tag`…` / String.raw`…` 不校验转义序列(raw 原样保留),
+        // 裸模板(未 tagged)校验非法转义(legacy 八进制/坏 \u \x)。
+        this._taggedTemplate = 0;
 
         this.prefixParseFns = {};
         this.infixParseFns = {};

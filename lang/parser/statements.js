@@ -209,10 +209,14 @@ export const StatementParser = {
         // [test262 S1] 进入生成器/异步深度:覆盖形参 + 体内 var 绑定的 yield/await 早期错误校验
         if (isGenerator) this.fnGenDepth++;
         if (isAsync) this.fnAsyncDepth++;
+        // [Wave 8] 函数边界:字段初始化器上下文在函数声明内复位,返回前须恢复。
+        const prevInFieldInit = this._inFieldInit;
+        this._inFieldInit = false;
         let params = this.parseFunctionParams();
         if (!this.expectPeek(TokenType.LBRACE)) {
             if (isGenerator) this.fnGenDepth--;
             if (isAsync) this.fnAsyncDepth--;
+            this._inFieldInit = prevInFieldInit;
             return null;
         }
         // [test262 S1] strict 探测:"use strict" 指令 → strict 深度 + 回溯形参校验
@@ -223,6 +227,7 @@ export const StatementParser = {
         if (isStrict) this.fnStrictDepth--;
         if (isGenerator) this.fnGenDepth--;
         if (isAsync) this.fnAsyncDepth--;
+        this._inFieldInit = prevInFieldInit;
         return new AST.FunctionDeclaration(id, params, body, isAsync, isGenerator);
     },
 

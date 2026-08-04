@@ -855,6 +855,8 @@ export class SubscriptGenerator {
         vm.jeq("_js_length_array_raw");
         vm.cmpImm(VReg.V0, 2); // TYPE_OBJECT：裸对象指针，读 "length" 属性
         vm.jeq("_js_length_object");
+        vm.cmpImm(VReg.V0, 3); // TYPE_CLOSURE/FUNCTION(含 classinfo):读 "length" 属性
+        vm.jeq("_js_length_object");
         vm.cmpImm(VReg.V0, 0x40); // TypedArray 类型区间 [0x40, 0x70]
         vm.jlt("_js_length_str");
         vm.cmpImm(VReg.V0, 0x70);

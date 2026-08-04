@@ -2,11 +2,16 @@
 // 编译函数表达式、闭包、函数体
 
 import { VReg } from "../../vm/index.js";
-import { analyzeCapturedVariables, analyzeSharedVariables, analyzeDirectEvalBoxedVars } from "../../lang/analysis/closure.js";
+import { analyzeCapturedVariables, analyzeSharedVariables, analyzeDirectEvalBoxedVars, collectLocalDeclarations } from "../../lang/analysis/closure.js";
 import { ASYNC_CLOSURE_MAGIC, isAsyncFunction, isGeneratorFunction } from "../async/index.js";
 
 // 闭包魔数 - 用于区分普通函数指针和闭包对象
 const CLOSURE_MAGIC = 0xc105;
+
+// [L2-②] 未初始化绑定哨兵 —— 与 compiler/index.js 的 UNINITIALIZED_BINDING_SENTINEL、
+// compiler/functions/statements.js 的 TDZ_SENTINEL 三处必须逐位一致(emitUninitializedBindingGuard
+// 比对它;前向引用共享局部预建的 box 初值也用它,使声明前经闭包读到 box 时报 TDZ 而非垃圾)。
+const TDZ_SENTINEL = 0x7ff70000deadbeefn;
 
 // 闭包编译方法混入
 export const ClosureCompiler = {
@@ -261,20 +266,11 @@ export const ClosureCompiler = {
             // [函数元数据] func.label 即闭包 func_ptr(见 compileFunctionExpression 存 +8)。
             // 登记函数种类(async/generator),供 Object.prototype.toString 品牌区分。
             this.registerFuncMeta(func.label, func.expr);
-            // [批次D] 生成器函数表达式：标签处先落 stub（建协程+生成器对象后即返回），
-            // 真正函数体在 <label>_gbody，由 _coroutine_entry 首次 resume 时进入。
-            if (isGeneratorFunction(func.expr) && !isAsyncFunction(func.expr)) {
-                this.emitGeneratorStub(func.label + "_gbody", true);
-            } else if (isGeneratorFunction(func.expr) && isAsyncFunction(func.expr)) {
-                // async function*：async 生成器 stub(构造器 _async_generator_new)
-                this.emitAsyncGeneratorStub(func.label + "_gbody", true);
-            } else if (isAsyncFunction(func.expr)) {
-                // async 函数/方法(表达式):标签处落 async stub(建协程+Promise 返回),真体在
-                // _gbody。闭包用 CLOSURE_MAGIC(见下),故 compileClosureCall/compileMethodCall
-                // 的普通闭包路径都会调到本 stub(方法调用经 A5 传 this → CORO_THIS),统一。
-                this.emitAsyncMethodStub(func.label + "_gbody", true);
-            }
-            // 恢复定义处的模块上下文，使函数体内 namespace/import 标识符正确解析
+            // 恢复定义处的模块上下文,使**stub 与函数体**都能正确解析 namespace/import 标识符。
+            // 此前只包住 compileFunctionBody:stub(emitGeneratorStub)里 [L2-②] eager 默认值
+            // 探针的安全判定(isUnresolvableIdentifier)需见模块顶层局部(顶层 `var iter`),
+            // 否则把已声明的名误判为 unresolvable → 探针求值错抛 ReferenceError。
+            // (顶层函数声明走 compileFunction,本就持模块 ctx,不受此影响。)
             const savedModuleAst = this._currentModuleAst;
             const savedMCV = this.ctx.mainCapturedVars;
             const savedFA = this.ctx.functionAliases;
@@ -283,6 +279,19 @@ export const ClosureCompiler = {
             if (func.mainCapturedVars) this.ctx.mainCapturedVars = func.mainCapturedVars;
             if (func.functionAliases) this.ctx.functionAliases = func.functionAliases;
             if (func.sourcePath) this.sourcePath = func.sourcePath;
+            // [批次D] 生成器函数表达式：标签处先落 stub（建协程+生成器对象后即返回），
+            // 真正函数体在 <label>_gbody，由 _coroutine_entry 首次 resume 时进入。
+            if (isGeneratorFunction(func.expr) && !isAsyncFunction(func.expr)) {
+                this.emitGeneratorStub(func.label + "_gbody", true, undefined, func.captured);
+            } else if (isGeneratorFunction(func.expr) && isAsyncFunction(func.expr)) {
+                // async function*：async 生成器 stub(构造器 _async_generator_new)
+                this.emitAsyncGeneratorStub(func.label + "_gbody", true, func.captured);
+            } else if (isAsyncFunction(func.expr)) {
+                // async 函数/方法(表达式):标签处落 async stub(建协程+Promise 返回),真体在
+                // _gbody。闭包用 CLOSURE_MAGIC(见下),故 compileClosureCall/compileMethodCall
+                // 的普通闭包路径都会调到本 stub(方法调用经 A5 传 this → CORO_THIS),统一。
+                this.emitAsyncMethodStub(func.label + "_gbody", true);
+            }
             this.compileFunctionBody(func.expr, func.captured);
             this._currentModuleAst = savedModuleAst;
             this.ctx.mainCapturedVars = savedMCV;
@@ -361,6 +370,13 @@ export const ClosureCompiler = {
         // 注意：先保存参数，再处理闭包捕获变量，避免寄存器冲突
         const paramOffsets = [];
         const patternParams = [];
+        // [L2-③ TDZ] 参数名收集(前序):默认值评估期自引用/后向引用须抛 ReferenceError
+        const tdzParamNames = [];
+        for (let i = 0; i < params.length && i < 6; i++) {
+            const tp = params[i];
+            if (tp.type === "Identifier") tdzParamNames.push(tp.name);
+            else if (tp.type === "AssignmentPattern" && tp.left && tp.left.type === "Identifier") tdzParamNames.push(tp.left.name);
+        }
         for (let i = 0; i < params.length && i < 6; i++) {
             const p = params[i];
             let paramName = null;
@@ -390,6 +406,9 @@ export const ClosureCompiler = {
             paramOffsets.push({ name: paramName, offset: offset, argReg: vm.getArgReg(i) });
             vm.store(VReg.FP, offset, vm.getArgReg(i));
             if (defaultExpr) {
+                // [L2-③ TDZ] 默认值表达式求值前,当前及之后所有形参名入 tdzParams
+                if (!this.ctx.tdzParams) this.ctx.tdzParams = new Set();
+                for (let j = i; j < tdzParamNames.length; j++) this.ctx.tdzParams.add(tdzParamNames[j]);
                 // 实参为 undefined 时取默认值（默认表达式可引用前序参数，已入槽）
                 // x64: V1/V2 别名 RCX/RDX = A3/A2，会踩掉尚未入槽的后续实参；
                 // 改用 V5/V6(R10/R11)。arm64 保持 V1/V2，产物逐字节不变。
@@ -403,6 +422,8 @@ export const ClosureCompiler = {
                 this.compileExpression(defaultExpr);
                 vm.store(VReg.FP, offset, VReg.RET);
                 vm.label(skip);
+                // 当前形参默认值评估完毕,从 TDZ 移除
+                if (paramName) this.ctx.tdzParams.delete(paramName);
             }
         }
 
@@ -459,6 +480,30 @@ export const ClosureCompiler = {
         // [#47] 解构参数:所有实参已落栈,此处安全解构到局部。
         for (let i = 0; i < patternParams.length; i++) {
             this.emitParamDestructure(patternParams[i].pat, patternParams[i].slot, patternParams[i].dflt);
+        }
+
+        // [L2-②] 前向引用共享局部预绑定:函数体内声明、且被嵌套闭包捕获的局部
+        // (analyzeSharedVariables 已并入 innerBoxedVars),若闭包在声明**之前**创建
+        // (`const onEvent=()=>onError; const onError=…`,事件发射器 once 包装等),须在
+        // 函数入口先把槽分配好并预建 box(初值=TDZ 哨兵),使早期闭包捕获到同一个 box。
+        // 此前仅预分配失败 → 闭包捕获不到该名 → 体里读它落 compileIdentifier 兜底 0
+        // (自 L2-② 起抛 ReferenceError,直接崩事件回调)。顶层共享变量走 mainCapturedVars
+        // 全局 box(_main 序言已预建),不受此影响;这里只补**局部**共享变量的同名缺口。
+        this.ctx.preboxedVars = new Set();
+        if (innerBoxedVars && innerBoxedVars.size > 0) {
+            const bodyLocals = {};
+            collectLocalDeclarations(expr.body, bodyLocals);
+            for (const nm in bodyLocals) {
+                if (!Object.prototype.hasOwnProperty.call(bodyLocals, nm)) continue;
+                if (!innerBoxedVars.has(nm)) continue;
+                if (this.ctx.getLocal(nm)) continue; // 参数/已捕获外层变量
+                const off = this.ctx.allocLocal(nm);
+                vm.call("_box_alloc");
+                vm.movImm64(VReg.V1, TDZ_SENTINEL);
+                vm.store(VReg.RET, 0, VReg.V1);
+                vm.store(VReg.FP, off, VReg.RET);
+                this.ctx.preboxedVars.add(nm);
+            }
         }
 
         // 编译函数体

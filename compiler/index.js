@@ -16,7 +16,7 @@ import { execSync, execFileSync } from "child_process";
 
 // 语言前端
 import { Lexer, Parser } from "../lang/index.js";
-import { analyzeCapturedVariables, analyzeSharedVariables, analyzeTopLevelSharedVariables, analyzeDirectEvalBoxedVars } from "../lang/analysis/closure.js";
+import { analyzeCapturedVariables, analyzeSharedVariables, analyzeTopLevelSharedVariables, analyzeDirectEvalBoxedVars, collectLocalDeclarations } from "../lang/analysis/closure.js";
 import { renameBlockScopedBindings } from "../lang/analysis/blockscope.js";
 
 // 虚拟机和汇编器
@@ -2965,6 +2965,8 @@ export class Compiler {
         this.ctx._ipIndex = null;
         this.ctx.inAsyncGenerator = isAsyncGen;
         if (isGenerator) {
+            // 顶层函数声明无闭包捕获 → capturedNames=null(eager 探针不排除名,但其默认值
+            // 引用模块顶层 var 走 mainCapturedVars 解析,safeFn 已排除)。
             this.emitGeneratorStub(funcLabel + "_gbody", false);
         } else if (isAsyncGen) {
             // 顶层 async function*：async 生成器 stub
@@ -2984,6 +2986,17 @@ export class Compiler {
         // _generator_next/_generator_throw 在调用方栈上传播。
         this.ctx.inCoroBody = _isCoroBody;
 
+        // async 顶层函数声明:未捕获异常须 reject 关联 Promise(而非 _throw_unwind/退出)。
+        // 与 closures.js compileFunctionBody 的闭包路径同构:throw/await-reject 在无更内层
+        // try 时跳 asyncDeclRejectLabel → emitAsyncRejectFromException。save/restore 保护
+        // 外层上下文。async generator(isAsyncGen)走生成器返回流,不设此落点。
+        const prevDeclExcLabel = this.ctx.exceptionLabel;
+        let asyncDeclRejectLabel = null;
+        if (isAsync && !isAsyncGen) {
+            asyncDeclRejectLabel = this.ctx.newLabel("async_decl_reject");
+            this.ctx.exceptionLabel = asyncDeclRejectLabel;
+        }
+
         // [#49] `arguments` 对象(数组近似):顶层函数声明同样支持。生成器体经协程栈
         // 由 stub/_gbody 迂回进入,入口约定不同,此路径不建(非门禁用例);其余在具名
         // 参数绑定前构造(emitArgumentsArray 内部存临时槽并末尾恢复 A0..A4)。
@@ -3001,6 +3014,13 @@ export class Compiler {
 
         const paramOffsets = [];
         const patternParams = [];
+        // [L2-③ TDZ] 参数名收集(前序):默认值评估期自引用/后向引用须抛 ReferenceError
+        const tdzParamNames = [];
+        for (let i = 0; i < params.length && i < 6; i++) {
+            const p = params[i];
+            if (p.type === "Identifier") tdzParamNames.push(p.name);
+            else if (p.type === "AssignmentPattern" && p.left && p.left.type === "Identifier") tdzParamNames.push(p.left.name);
+        }
         for (let i = 0; i < params.length && i < 6; i++) {
             const param = params[i];
             let paramName = null;
@@ -3030,6 +3050,10 @@ export class Compiler {
             paramOffsets.push({ name: paramName, offset: offset });
             vm.store(VReg.FP, offset, vm.getArgReg(i));
             if (defaultExpr) {
+                // [L2-③ TDZ] 默认值表达式求值前,当前及之后所有形参名入 tdzParams:
+                // 自引用(x=x)/后向引用(x=y,y=1)→compileIdentifier 以 ReferenceError 守卫
+                if (!this.ctx.tdzParams) this.ctx.tdzParams = new Set();
+                for (let j = i; j < tdzParamNames.length; j++) this.ctx.tdzParams.add(tdzParamNames[j]);
                 // x64: V1/V2 别名 RCX/RDX = A3/A2，此检查会踩掉尚未入槽的后续实参
                 // （带默认值的 3+ 参函数丢参 → gen1 编译器行为分歧）；改用 V5/V6(R10/R11)。
                 // arm64 保持 V1/V2，产物逐字节不变。
@@ -3043,6 +3067,8 @@ export class Compiler {
                 this.compileExpression(defaultExpr);
                 vm.store(VReg.FP, offset, VReg.RET);
                 vm.label(skip);
+                // 当前形参默认值评估完毕,从 TDZ 移除
+                if (paramName) this.ctx.tdzParams.delete(paramName);
             }
         }
 
@@ -3071,6 +3097,27 @@ export class Compiler {
             this.emitParamDestructure(patternParams[i].pat, patternParams[i].slot, patternParams[i].dflt);
         }
 
+        // [L2-②] 前向引用共享局部预绑定:与 closures.js compileFunctionBody 同构 —— 函数体
+        // 内声明、被嵌套闭包捕获的局部,若闭包先于声明创建(`const onEvent=()=>onError;`),
+        // 在入口预分配槽 + 预建 box(初值=TDZ 哨兵),使早期闭包捕获同一 box。同步点必须
+        // 在编译任何语句之前(事件发射器 once 包装等依赖此)。顶层声明函数专用入口。
+        this.ctx.preboxedVars = new Set();
+        if (boxedVars && boxedVars.size > 0) {
+            const bodyLocals = {};
+            collectLocalDeclarations(func.body, bodyLocals);
+            for (const nm in bodyLocals) {
+                if (!Object.prototype.hasOwnProperty.call(bodyLocals, nm)) continue;
+                if (!boxedVars.has(nm)) continue;
+                if (this.ctx.getLocal(nm)) continue; // 参数/已捕获外层变量
+                const off = this.ctx.allocLocal(nm);
+                vm.call("_box_alloc");
+                vm.movImm64(VReg.V1, UNINITIALIZED_BINDING_SENTINEL);
+                vm.store(VReg.RET, 0, VReg.V1);
+                vm.store(VReg.FP, off, VReg.RET);
+                this.ctx.preboxedVars.add(nm);
+            }
+        }
+
         if (func.body) {
             if (func.body.type === "BlockStatement") {
                 for (const stmt of func.body.body) {
@@ -3087,11 +3134,17 @@ export class Compiler {
         vm.label(returnLabel);
         if (isAsync && !isAsyncGen) {
             this.emitAsyncResolveAndReturnFromRet();
+            // 未捕获异常落点:reject 关联 Promise(只在 return/resolve 路径 epilogue 之后,
+            // 经跳转到达)。与 closures.js 闭包路径同构。
+            vm.label(asyncDeclRejectLabel);
+            this.emitAsyncRejectFromException();
+            vm.endRecord(); // [P1] async 未开录,安全 no-op
         } else {
             // 普通/生成器/async-gen:epilogue(协程体经 _coroutine_entry → _coroutine_return)
             vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 8192);
         vm.endRecord(); // [P1]
         }
+        this.ctx.exceptionLabel = prevDeclExcLabel;
         this.ctx.inAsyncGenerator = false;
 
         // If this function is exported, store its address into the captured var box

@@ -120,6 +120,7 @@ export class SymbolGenerator {
         vm.cmp(VReg.S0, VReg.V1);
         vm.jae("_is_symbol_no");
         vm.load(VReg.V1, VReg.S0, 0);
+        vm.andImm(VReg.V1, VReg.V1, 0xff); // type 低字节(高字节可含标志位)
         vm.cmpImm(VReg.V1, TYPE_SYMBOL);
         vm.jne("_is_symbol_no");
         vm.movImm(VReg.RET, 1);

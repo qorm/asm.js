@@ -713,6 +713,21 @@ export class ArrayGenerator {
     }
 
     // 创建指定大小的数组
+    // [底层A] _array_ctor_call - 裸 `Array` 作值调用(如 `var A=Array; A(3)`)。
+    // 规范:Array(...) 无 new 合法(数字=长度/元素表)。本入口保守抛 "requires 'new'"
+    // (同 Map/Set 模式)——`Array(...)`/`new Array(...)` 语法快路先命中不经此;值路径
+    // 调用属边缘用例,列偏差。
+    generateArrayCtorCall() {
+        const vm = this.vm;
+        vm.label("_array_ctor_call");
+        vm.prologue(16, [VReg.S0]);
+        vm.lea(VReg.A0, vm.asm.addString("Constructor Array requires 'new'"));
+        vm.call("_js_box_string");      // RET = 装箱堆串
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_throw_type_error");   // 不返回
+        vm.epilogue([VReg.S0], 16);     // 理论不达
+    }
+
     // _array_new_with_size(size) -> array (裸数组头指针)
     // 数组布局: [type(8), length(8), capacity(8), data_ptr(8)] + 独立 data 区
     generateArrayNewWithSize() {
@@ -2978,6 +2993,7 @@ export class ArrayGenerator {
         this.generateArrayIncludes();
         this.generateArraySlice();
         this.generateArrayNewWithSize();
+        this.generateArrayCtorCall();
         this.generateArrayWith();
         this.generateArrayToString();
         this.generateArrayConcat();

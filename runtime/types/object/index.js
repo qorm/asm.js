@@ -90,6 +90,7 @@ export class ObjectGenerator {
     }
 
     generate() {
+        this.generateObjectProtoEnsure(); // [W-B] 单例 Object.prototype 惰性物化(数据槽先登记)
         this.generateObjectNew();
         this.generateProxyNew();
         this.generateProxyTrapFn();
@@ -124,6 +125,7 @@ export class ObjectGenerator {
         this.generateHasOwnProperty();
         this.generateObjectToString();
         this.generateObjectValueOf();
+        this.generateObjectCtorCall(); // [底层A W-A2] 裸 Object 值调用守卫(requires 'new')
         this.generateGetPrototypeOf();
         this.generateIsPrototypeOf();
         this.generateSetPrototypeOf();
@@ -1078,17 +1080,26 @@ export class ObjectGenerator {
     // 创建新对象
     // _object_new() -> obj (raw pointer)
     // _object_new_sized(bytes) -> obj (raw pointer)  按需容量（编译期已知属性数时用）
+    // _object_new_raw() -> obj (raw pointer)  __proto__ 恒 0(内部专用:Object.prototype 自身)
+    //
+    // [W-B] 原型链链接。_object_new/_object_new_sized 把新对象的 __proto__ 链到**单例**
+    // Object.prototype——与 `Object.prototype` 属性读返回的对象是同一个(槽
+    // _nsobj_object_proto,首次访问由 _object_proto_ensure 惰性建、填 ctor 闭包
+    // _nsobj_object)。S2 = 链接标志(1=链 Object.prototype,0=保持 null)。_alloc 保 S0-S3,
+    // 故 S2 跨 _alloc 存活。Object.prototype 自身经 _object_new_raw 建(__proto__=0,防自环);
+    // Object.create(null) 由 _object_create 在 new 之后**覆写** __proto__=0,语义不受影响。
     generateObjectNew() {
         const vm = this.vm;
 
         vm.label("_object_new");
-        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
         // 默认初始容量 8（属性区可自动增长，无需大固定块）
         vm.movImm(VReg.S1, 8);
+        vm.movImm(VReg.S2, 1); // 链接 Object.prototype
         vm.jmp("_object_new_do");
 
         vm.label("_object_new_sized");
-        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
         // A0 = 请求字节数（旧头 24 + 每属性 16）。换算成初始容量，下限 4。
         vm.subImm(VReg.S1, VReg.A0, 24);
         vm.cmpImm(VReg.S1, 64);
@@ -1096,6 +1107,14 @@ export class ObjectGenerator {
         vm.movImm(VReg.S1, 64);
         vm.label("_object_new_sized_cap");
         vm.shrImm(VReg.S1, VReg.S1, 4); // /16 -> 初始容量
+        vm.movImm(VReg.S2, 1); // 链接 Object.prototype
+        vm.jmp("_object_new_do");
+
+        vm.label("_object_new_raw");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.movImm(VReg.S1, 8);
+        vm.movImm(VReg.S2, 0); // 不链接(__proto__ = 0)
+        vm.jmp("_object_new_do");
 
         vm.label("_object_new_do");
         // 分配对象头（56 字节：type/count/proto/capacity/props_ptr/flags_ptr/shape_ptr）
@@ -1123,8 +1142,155 @@ export class ObjectGenerator {
         // [A1] shape_ptr@48 = 0(无形状;形状 IC 未启用,占位字段,逐字节等价旧语义)。
         vm.store(VReg.S0, OBJECT_SHAPE_OFFSET, VReg.V0);
 
+        // [W-B] 链接单例 Object.prototype(仅 S2 != 0)。_object_proto_ensure 首次建并
+        // 存槽;后续直接读槽。S0/S1/S2 跨其存活(prologue 保 S0-S3)。
+        vm.cmpImm(VReg.S2, 0);
+        vm.jeq("_object_new_nolink");
+        vm.call("_object_proto_ensure"); // RET = 装箱 Object.prototype
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V0, VReg.RET, VReg.V1); // V0 = 裸 proto
+        vm.store(VReg.S0, 16, VReg.V0);
+        vm.label("_object_new_nolink");
         vm.mov(VReg.RET, VReg.S0);
-        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+    }
+
+    // [W-B] 单例 Object.prototype 惰性物化 + ctor 闭包。
+    // _object_proto_ensure() -> boxed Object.prototype(0x7FFD)。无参;保 S0/S1/S2/S3。
+    // 首次调用(首个 _object_new)建:
+    //   - _nsobj_object_proto:普通对象(__proto__=0,经 _object_new_raw 防自环),属性 =
+    //     5 个方法值闭包({magic,_aref_generic,helper},挂 .name/.length) + constructor
+    //     = 下方 ctor 闭包(与 W-A2 的 OBJECT_PROTO_METHODS 逐字同 helper 同 attr 5)。
+    //   - _nsobj_object:构造器闭包 {magic, _object_ctor_call}(使 `({}).constructor ===
+    //     Object` 恒等——编译器 W-A2 物化读到这两个槽,直接复用,不再新建)。
+    // 两者都在数据段 → GC 保守扫描即根;且与 W-A2 `Object.prototype` 属性读返回同一对象。
+    generateObjectProtoEnsure() {
+        const vm = this.vm;
+        // 数据槽(_reEnsureSlot 同款命名;编译器侧 _reEnsureSlot 看到已登记即跳过)。
+        vm.asm.addDataLabel("_nsobj_object_proto");
+        vm.asm.addDataQword(0);
+        vm.asm.addDataLabel("_nsobj_object");
+        vm.asm.addDataQword(0);
+
+        vm.label("_object_proto_ensure");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.lea(VReg.V0, "_nsobj_object_proto");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_ope_done"); // 已建 → 直接返槽值
+        // 1. proto = _object_new_raw(__proto__=0)。S0 = 裸 proto。
+        vm.call("_object_new_raw");
+        vm.mov(VReg.S0, VReg.RET);
+        // 2. 装箱 + 存槽。
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V0, VReg.S0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+        vm.or(VReg.V0, VReg.V0, VReg.V1);
+        vm.lea(VReg.V1, "_nsobj_object_proto");
+        vm.store(VReg.V1, 0, VReg.V0);
+        // 3. ctor 闭包 {magic, _object_ctor_call};S1 = 裸 closure;S2 = 装箱 ctor。
+        vm.movImm(VReg.A0, 16);
+        vm.call("_alloc");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.movImm(VReg.V1, 0xc105); // CLOSURE_MAGIC
+        vm.store(VReg.S1, 0, VReg.V1);
+        vm.lea(VReg.V1, "_object_ctor_call");
+        vm.store(VReg.S1, 8, VReg.V1);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_js_box_function"); // RET = 装箱 ctor
+        vm.lea(VReg.V1, "_nsobj_object");
+        vm.store(VReg.V1, 0, VReg.RET);
+        vm.mov(VReg.S2, VReg.RET);
+        // 4. proto 方法落位(与 W-A2 OBJECT_PROTO_METHODS 同 helper 同 arity)。
+        //    每方法:24B 闭包 {0xc105, _aref_generic, helper} + .name/.length + proto
+        //    属性(attr 5)。S3 = 装箱方法闭包(跨 call 保;各 helper 均保 S0-S3)。
+        const emitProtoMethod = (mname, helperLabel, arity) => {
+            vm.movImm(VReg.A0, 24);
+            vm.call("_alloc");
+            vm.mov(VReg.S3, VReg.RET);
+            vm.movImm(VReg.V1, 0xc105);
+            vm.store(VReg.S3, 0, VReg.V1);
+            vm.lea(VReg.V1, "_aref_generic");
+            vm.store(VReg.S3, 8, VReg.V1);
+            vm.lea(VReg.V1, helperLabel);
+            vm.store(VReg.S3, 16, VReg.V1);
+            vm.mov(VReg.A0, VReg.S3);
+            vm.call("_js_box_function"); // RET = 装箱闭包
+            vm.mov(VReg.S3, VReg.RET);
+            // .name = mname
+            vm.mov(VReg.A0, VReg.S3);
+            vm.lea(VReg.A1, vm.asm.addString("name"));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+            vm.or(VReg.A1, VReg.A1, VReg.V1);
+            vm.lea(VReg.A2, vm.asm.addString(mname));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+            vm.or(VReg.A2, VReg.A2, VReg.V1);
+            vm.call("_closure_prop_set");
+            // .length = arity
+            vm.mov(VReg.A0, VReg.S3);
+            vm.lea(VReg.A1, vm.asm.addString("length"));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+            vm.or(VReg.A1, VReg.A1, VReg.V1);
+            vm.movImm(VReg.A2, arity);
+            vm.scvtf(0, VReg.A2);
+            vm.fmovToInt(VReg.A2, 0);
+            vm.call("_closure_prop_set");
+            // proto[mname] = 装箱闭包
+            vm.mov(VReg.A0, VReg.S0); // 裸 proto
+            vm.lea(VReg.A1, vm.asm.addString(mname));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+            vm.or(VReg.A1, VReg.A1, VReg.V1);
+            vm.mov(VReg.A2, VReg.S3);
+            vm.call("_object_set");
+            // attr 5(writable|configurable,enumerable 关,规范 17 节)
+            vm.mov(VReg.A0, VReg.S0);
+            vm.lea(VReg.A1, vm.asm.addString(mname));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+            vm.or(VReg.A1, VReg.A1, VReg.V1);
+            vm.movImm(VReg.A2, 5);
+            vm.call("_object_set_prop_attr");
+        };
+        emitProtoMethod("hasOwnProperty", "_aref_obj_hasOwn", 1);
+        emitProtoMethod("valueOf", "_aref_obj_valueOf", 0);
+        emitProtoMethod("toString", "_object_proto_toString", 0);
+        emitProtoMethod("isPrototypeOf", "_is_prototype_of", 1);
+        emitProtoMethod("propertyIsEnumerable", "_object_propertyIsEnumerable", 1);
+        // 5. proto.constructor = ctor(装箱)
+        vm.mov(VReg.A0, VReg.S0);
+        vm.lea(VReg.A1, vm.asm.addString("constructor"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_object_set");
+        // 6. ctor 闭包属性:name/length/prototype(W-A2 完整物化前先给最小反射面;
+        //    编译器 W-A2 物化时会幂等重落并追加静态方法)
+        vm.mov(VReg.A0, VReg.S2);
+        vm.lea(VReg.A1, vm.asm.addString("name"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.lea(VReg.A2, vm.asm.addString("Object"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A2, VReg.A2, VReg.V1);
+        vm.call("_closure_prop_set");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.lea(VReg.A1, vm.asm.addString("length"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.movImm(VReg.A2, 1);
+        vm.scvtf(0, VReg.A2);
+        vm.fmovToInt(VReg.A2, 0);
+        vm.call("_closure_prop_set");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.lea(VReg.A1, vm.asm.addString("prototype"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.lea(VReg.V0, "_nsobj_object_proto");
+        vm.load(VReg.A2, VReg.V0, 0); // 装箱 proto
+        vm.call("_closure_prop_set");
+        vm.label("_ope_done");
+        vm.lea(VReg.V0, "_nsobj_object_proto");
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
     }
 
     // 对象获取属性
@@ -2570,7 +2736,10 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.V1, TYPE_PROXY); // Proxy:冷分支调 handler.deleteProperty
         vm.jeq("_odel_proxy");
         vm.cmpImm(VReg.V1, TYPE_OBJECT);
+        vm.jeq("_odel_do");
+        vm.cmpImm(VReg.V1, 3); // TYPE_CLOSURE (classinfo; layout==TYPE_OBJECT, type@0=3)
         vm.jne("_odel_maybe_fn");
+        vm.label("_odel_do");
 
         vm.load(VReg.S2, VReg.S0, 8); // count
         vm.movImm(VReg.S3, 0); // idx
@@ -5378,6 +5547,7 @@ export class ObjectGenerator {
         // 子类) === 父类` 按指针相等成立;typeof 对裸指针读 type@0==3 得 "function"。
         // 普通原型对象则按对象标记(0x7FFD)。S1(裸输入)此后不再用,借作临时。
         vm.load(VReg.S1, VReg.RET, 0); // type@0
+        vm.andImm(VReg.S1, VReg.S1, 0xff); // type 低字节(高字节可含标志位)
         vm.cmpImm(VReg.S1, 3);
         vm.jeq("_object_getPrototypeOf_fn");
         // 将裸指针标记为 JS 对象 (0x7FFD)
@@ -5503,6 +5673,22 @@ export class ObjectGenerator {
         vm.prologue(0, []);
         vm.mov(VReg.RET, VReg.A0);
         vm.epilogue([], 0);
+    }
+
+    // [底层A W-A2] _object_ctor_call - 裸 `Object` 作值调用(如 `var O=Object; O(x)`)。
+    // 规范:Object(...) 无 new 合法(返回 ToObject(x) 包装)。本入口保守抛 "requires 'new'"
+    // (同 Array/Map/Set 模式)——`new Object(...)` 的静态特判(compileNewExpression case
+    // "Object" → 空对象)与 `Object.method(...)` 静态改派先于值路径命中不经此;值路径
+    // 调用属边缘用例,列偏差(ToObject 包装未实现)。
+    generateObjectCtorCall() {
+        const vm = this.vm;
+        vm.label("_object_ctor_call");
+        vm.prologue(16, [VReg.S0]);
+        vm.lea(VReg.A0, vm.asm.addString("Constructor Object requires 'new'"));
+        vm.call("_js_box_string");      // RET = 装箱堆串
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_throw_type_error");   // 不返回
+        vm.epilogue([VReg.S0], 16);     // 理论不达
     }
 
     // [#61 P1] 扩展标志辅助:A0(boxed 接收者)脱壳 → V0=裸对象指针,并守卫
@@ -5925,9 +6111,11 @@ export class ObjectGenerator {
         vm.lea(VReg.V1, "_heap_ptr"); vm.load(VReg.V1, VReg.V1, 0);
         vm.cmp(VReg.A0, VReg.V1); vm.jae("_isc_no");
         vm.load(VReg.V1, VReg.A0, 0);
-        vm.cmpImm(VReg.V1, 3); vm.jeq("_isc_yes");
-        vm.cmpImm(VReg.V1, 0xc105); vm.jeq("_isc_yes");
-        vm.cmpImm(VReg.V1, 0xa51c); vm.jeq("_isc_yes");
+        vm.mov(VReg.V0, VReg.V1);           // 副本用于低字节 type 检查
+        vm.andImm(VReg.V0, VReg.V0, 0xff);   // type 低字节(高字节可含标志位)
+        vm.cmpImm(VReg.V0, 3); vm.jeq("_isc_yes");
+        vm.cmpImm(VReg.V1, 0xc105); vm.jeq("_isc_yes"); // CLOSURE_MAGIC(全值)
+        vm.cmpImm(VReg.V1, 0xa51c); vm.jeq("_isc_yes"); // GEN_MAGIC(全值)
         vm.label("_isc_no");
         vm.movImm(VReg.RET, 0);
         vm.epilogue([], 0);

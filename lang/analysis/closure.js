@@ -295,6 +295,22 @@ export function analyzeSharedVariables(func) {
             return; // 不继续深入嵌套函数
         }
 
+        // [L2-③] 类声明:字段初始化器是表达式(非函数),其引用的外层变量需单独收集
+        if (node.type === "ClassDeclaration" || node.type === "ClassExpression") {
+            const classBody = node.body && node.body.body ? node.body.body : (node.body || []);
+            for (const member of classBody) {
+                if (member.type === "PropertyDefinition" && member.value) {
+                    const refs = {};
+                    collectReferencedVariables(member.value, refs);
+                    for (const name in refs) {
+                        if (Object.prototype.hasOwnProperty.call(localVars, name)) {
+                            sharedVars.add(name);
+                        }
+                    }
+                }
+            }
+        }
+
         for (const key in node) {
             if (key === "type" || key === "loc" || key === "range") continue;
             const child = node[key];

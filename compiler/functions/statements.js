@@ -127,6 +127,20 @@ export const StatementCompiler = {
         this.emitThrowValue(VReg.RET);
     },
 
+    // [L2-②] 抛真正的 ReferenceError 对象(复用 `new ReferenceError(msg)` 构造路径,
+    // 与 emitThrowTypeError 同构)。用于:读取 unresolvable 标识符 / 解构默认值求值
+    // 命中 unresolvable 引用 —— 规范 GetValue 对 unresolvable reference 抛
+    // ReferenceError;`catch(e)` 里 `e instanceof ReferenceError` 须成立,故不能用
+    // _throw_type_error 原语(那抛 TypeError,`assert.throws(ReferenceError,…)` 判负)。
+    emitThrowReferenceError(message = "is not defined") {
+        this.compileExpression({
+            type: "NewExpression",
+            callee: { type: "Identifier", name: "ReferenceError" },
+            arguments: [{ type: "Literal", value: message }],
+        });
+        this.emitThrowValue(VReg.RET);
+    },
+
     // 编译语句
     compileStatement(stmt) {
         switch (stmt.type) {
@@ -386,6 +400,10 @@ export const StatementCompiler = {
                         // 全局捕获变量：复用在 _main 入口处预分配的 box
                         this.vm.lea(VReg.V2, globalLabel);
                         this.vm.load(VReg.RET, VReg.V2, 0);
+                    } else if (this.ctx.preboxedVars && this.ctx.preboxedVars.has(name)) {
+                        // [L2-②] 前向引用共享局部:box 已在函数入口预建(compileFunctionBody),
+                        // 直接复用既有 box(早期创建的闭包已捕获同一 box 指针)。
+                        this.vm.load(VReg.RET, VReg.FP, offset);
                     } else {
                         // 局部捕获变量：正常分配 box
                         this.vm.call("_box_alloc");
@@ -581,20 +599,29 @@ export const StatementCompiler = {
         // 数组(0x7FFE)/字符串(0x7FFC)/数字/bool(高16 非上述)不动,避免非指针值被
         // _array_spread_into 当指针解引崩。非可迭代对象 spread 得空数组(_array_spread_into
         // 函数-tag 守卫,不挂)。
+        const els = pattern.elements || [];
         {
+            const els0 = els.length === 0;
             const iterSpreadL = this.ctx.newLabel("destr_iter_spread");
             const iterSpreadBoxed = this.ctx.newLabel("destr_iter_spread_boxed");
             const iterSkipL = this.ctx.newLabel("destr_iter_skip");
             const iterableOkL = this.ctx.newLabel("destr_iterable_ok");
+            const iterPrimThrow = this.ctx.newLabel("destr_iter_prim_throw");
             this.vm.load(VReg.V0, VReg.FP, srcSlot);
             this.vm.shrImm(VReg.V1, VReg.V0, 48);
             this.vm.cmpImm(VReg.V1, 0x7FFD);
             this.vm.jeq(iterSpreadBoxed);    // 装箱对象 → 先检可迭代性,再展开
+            this.vm.cmpImm(VReg.V1, 0x7FFE);
+            this.vm.jeq(iterSkipL);          // 数组(可下标读)
+            this.vm.cmpImm(VReg.V1, 0x7FFC);
+            this.vm.jeq(iterSkipL);          // 字符串(可 charAt 读)
             this.vm.cmpImm(VReg.V1, 0);
-            this.vm.jne(iterSkipL);          // 非未装箱堆指针 → 不动
+            this.vm.jne(iterPrimThrow);      // [L2-②] 数字/bool/symbol/null/undefined 等
+            // 非指针值不可迭代:规范 array pattern 的源必须是 iterable,`[a]=5`/`[,]=true`
+            // 须抛 TypeError(此前静默下标读 → 得 undefined,`array-elision-val-*` 等判负)。
             this.vm.movImm64(VReg.V1, this.os === "wasi" ? 0x8000000n : 0x100200000n);
             this.vm.cmp(VReg.V0, VReg.V1);
-            this.vm.jlt(iterSkipL);          // 小于堆区下界(小整数/浮点位)→ 不动
+            this.vm.jlt(iterPrimThrow);      // 小于堆区下界(小整数/浮点位)→ 非指针,抛
             // 未装箱堆指针:类型字节 TYPE_ARRAY(1) 的裸数组(如 Map 展开产的 [k,v] 对)不 spread,
             // 走既有下标路径——否则 `[[k,v]]=map` 内层对裸数组对再 spread → 空/崩。
             this.vm.loadByte(VReg.V1, VReg.V0, 0);
@@ -602,7 +629,18 @@ export const StatementCompiler = {
             this.vm.jeq(iterSkipL);
             // 未装箱堆指针(Set/Map/生成器等)直接展开,runtime _array_spread_into 按
             // type 字节分派(Set/Map 链表遍历;生成器走 Symbol.iterator 协议)。
-            this.vm.jmp(iterSpreadL);
+            // [空 pattern `[]`] 只验可迭代、不消费迭代器(规范 ArrayBindingPattern:[] →
+            // 不调用 IteratorStep;V8 对不可迭代源仍抛 TypeError)。生成器/Set/Map 裸指针
+            // 按构造即可迭代 → 直接跳过展开,保持迭代器未被推进。
+            if (els0) {
+                this.vm.jmp(iterSkipL);
+            } else {
+                this.vm.jmp(iterSpreadL);
+            }
+            // [L2-②] 非指针/非数组/非字符串源(数字/bool/symbol/null/undefined 等)→ 非可迭代
+            // 源,抛 TypeError(与装箱对象非可迭代同一守卫,规范一致)。
+            this.vm.label(iterPrimThrow);
+            this.emitThrowTypeError("Cannot destructure non-iterable value");
             // [Cluster 7] 装箱对象可迭代性守卫:ES 规范要求 destructuring array pattern
             // 的源是可迭代对象;非可迭代源(如 plain `{}`)须抛 TypeError。
             this.vm.label(iterSpreadBoxed);
@@ -614,6 +652,8 @@ export const StatementCompiler = {
             this.vm.jeq(iterableOkL);
             this.emitThrowTypeError("Cannot destructure non-iterable value");
             this.vm.label(iterableOkL);
+            // 空 pattern:只验可迭代(上方 Symbol.iterator 检查),不展开不消费。
+            if (els0) this.vm.jmp(iterSkipL);
             this.vm.label(iterSpreadL);
             this.vm.movImm(VReg.A0, 0);
             this.vm.call("_array_new_with_size");
@@ -624,7 +664,6 @@ export const StatementCompiler = {
             this.vm.store(VReg.FP, srcSlot, VReg.RET);
             this.vm.label(iterSkipL);
         }
-        const els = pattern.elements || [];
         for (let ei = 0; ei < els.length; ei++) {
             const el = els[ei];
             if (!el) continue;
@@ -1766,6 +1805,7 @@ export const StatementCompiler = {
             this.vm.cmp(VReg.RET, VReg.V1);
             this.vm.jae(endLabel);
             this.vm.load(VReg.V1, VReg.RET, 0);
+            this.vm.andImm(VReg.V1, VReg.V1, 0xff); // type 低字节(高字节可含标志位)
             this.vm.cmpImm(VReg.V1, 3); // TYPE_FUNCTION → classinfo
             this.vm.jne(endLabel);
             this.vm.jmp(objPathLabel);
@@ -2395,6 +2435,14 @@ export const StatementCompiler = {
                 this.vm.call("_tag_str_a1");
                 this.vm.mov(VReg.A2, VReg.V1);
                 this.vm.call("_object_define");
+            } else {
+                // [L2-③] 无初始化器的字段须在实例上建 own 属性,值=undefined
+                this.vm.load(VReg.A0, VReg.FP, thisOffset);
+                this.vm.lea(VReg.A1, this.addStringConstant(fieldName));
+                this.vm.call("_tag_str_a1");
+                this.vm.lea(VReg.A2, "_js_undefined");
+                this.vm.load(VReg.A2, VReg.A2, 0);
+                this.vm.call("_object_define");
             }
         }
 
@@ -2591,10 +2639,11 @@ export const StatementCompiler = {
         this.vm.label(constructorLabel);
         // [W-27] 构造器入函数元数据侧表(code_ptr=构造器标签):类值经变量/形参传递后
         // `K.name`/`K.length`/gOPD(K,"length") 只能靠运行期反射(编译期静态解析点见
-        // members.js _fnNameLength)。名 = 类名;arity = 声明的构造器形参(无声明 → 0)。
+        // members.js _fnNameLength)。名 = 类名(匿名类表达式为 "");arity = 声明的构造器形参(无声明 → 0)。
+        const ctorMetaName = (typeof className === "string" && className.indexOf("__classexpr") === 0) ? "" : className;
         this.registerFuncMeta(constructorLabel,
             hasDeclaredCtor ? constructor.value : { type: "FunctionExpression", params: [] },
-            className);
+            ctorMetaName);
         this.vm.beginRecord(); // [P1]
         this.vm.prologue(8192, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
 
@@ -2609,6 +2658,8 @@ export const StatementCompiler = {
         this.ctx.localOffset = 0;
         this.ctx.inClass = true;
         this.ctx.className = className;
+        // BUG-3(字段初始化器外层作用域捕获)确认为既有局限,需闭包基础设施深化。
+        // 保留清理后的类上下文设置,不设 boxedVars(HEAD 行为)。
         // 标识符父类:superClass=父名(名字快路径)。表达式父类:无名字,置本类名(仅使
         // super.prop 的真值守卫通过);实际父类经 superClassExpr/superInfoLabel 从全局解析。
         this.ctx.superClass = superClass ? (superIsExpr ? className : superClass.name) : null;
@@ -2860,6 +2911,53 @@ export const StatementCompiler = {
         this.vm.movImm(VReg.A2, 5); // writable+configurable, not enumerable
         this.vm.call("_object_set_prop_attr");
 
+        // [L2-③] classinfo 上定义 .name / .length 属性。C.prototype.constructor 存的是
+        // classinfo(S0),_object_define 存储为裸指针值;其 .name/.length 读经
+        // _object_get 查找,若无则 undefined——此前 C.prototype.constructor.name 恒 undefined。
+        // 编译期 _fnNameLength 只能解析标识符(如 C.name)的静态路径,成员链
+        // C.prototype.constructor.name 不可静态知,故须在 classinfo 上落真实属性。
+        // 规范:name/length 均为 {writable:false,enumerable:false,configurable:true}。
+        // attr=4:configurable, not writable, not enumerable.
+        // [L2-③] 构造器 arity = 首个默认/剩余形参之前的形参个数(与 _fnArity / _fnNameLength 同算法)
+        let ctorArity = 0;
+        if (constructor && constructor.value) {
+            const params = constructor.value.params || [];
+            for (let i = 0; i < params.length; i++) {
+                const t = params[i] ? params[i].type : null;
+                if (t === "AssignmentPattern" || t === "SpreadElement" || t === "RestElement") break;
+                ctorArity++;
+            }
+        }
+        // classinfo.name:先装箱类名字符串(_js_box_string 用 A0 入参),再设 _object_define 的 A0/A1。
+        // 此前 A0=classinfo 时调 _js_box_string → 把 classinfo 当字符串指针传参 → 产垃圾值。
+        // [L2-③] 匿名类表达式 parser 赋合成名 __classexprN,规范 name 应为 ""。
+        const classNameForMeta = (typeof className === "string" && className.indexOf("__classexpr") === 0) ? "" : className;
+        this.vm.lea(VReg.A0, this.addStringConstant(classNameForMeta));
+        this.vm.call("_js_box_string");         // RET = boxed class name string
+        this.vm.mov(VReg.A2, VReg.RET);         // A2 = boxed name (S0 callee-saved, 跨 call 存活)
+        this.vm.mov(VReg.A0, VReg.S0);          // A0 = classinfo
+        this.vm.lea(VReg.A1, this.addStringConstant("name"));
+        this.vm.call("_tag_str_a1");            // A1 = boxed "name" key
+        this.vm.call("_object_define");         // define(classinfo, "name", boxed_name)
+        this.vm.mov(VReg.A0, VReg.S0);
+        this.vm.lea(VReg.A1, this.addStringConstant("name"));
+        this.vm.call("_tag_str_a1");
+        this.vm.movImm(VReg.A2, 4); // configurable, not writable, not enumerable
+        this.vm.call("_object_set_prop_attr");
+        // classinfo.length
+        this.vm.mov(VReg.A0, VReg.S0);
+        this.vm.lea(VReg.A1, this.addStringConstant("length"));
+        this.vm.call("_tag_str_a1");
+        this.vm.movImm(VReg.A2, ctorArity);
+        this.vm.scvtf(0, VReg.A2);
+        this.vm.fmovToInt(VReg.A2, 0); // canonical float64 number
+        this.vm.call("_object_define");
+        this.vm.mov(VReg.A0, VReg.S0);
+        this.vm.lea(VReg.A1, this.addStringConstant("length"));
+        this.vm.call("_tag_str_a1");
+        this.vm.movImm(VReg.A2, 4); // configurable, not writable, not enumerable
+        this.vm.call("_object_set_prop_attr");
+
         // [shape v2 · T2a] 原型赋形:运行时构建带键形状描述符(TYPE_SHAPE_DESC 堆块),
         // 键表 = prototype props 键列快照(运行时序即真序,含 constructor)。描述符根经
         // proto.shape@48 挂住(保守扫描覆盖);引擎 RX 片段无数据段写,安全。此后猴子
@@ -2980,6 +3078,14 @@ export const StatementCompiler = {
                 // [A3.5-fix] 键装箱(0x7FFC 驻留)
                 this.vm.call("_tag_str_a1");
                 this.vm.mov(VReg.A2, VReg.V1);
+                this.vm.call("_object_define");
+            } else {
+                // [L2-③] 无初始化器的静态字段须在类对象上建 own 属性,值=undefined
+                this.vm.mov(VReg.A0, VReg.S0);
+                this.vm.lea(VReg.A1, this.addStringConstant(fieldName));
+                this.vm.call("_tag_str_a1");
+                this.vm.lea(VReg.A2, "_js_undefined");
+                this.vm.load(VReg.A2, VReg.A2, 0);
                 this.vm.call("_object_define");
             }
         }
@@ -3271,13 +3377,28 @@ export const StatementCompiler = {
 
         this.vm.label(methodLabel);
         // [W-27] 方法入函数元数据侧表:`K.prototype.m.name` / `.length` 的接收者是运行期
-        // 取出的函数值(原型链读),编译期静态解析点覆盖不到。只收**普通具名方法**:
-        //   - 访问器(get/set)规范名是 "get x"/"set x",本表只存裸名 → 宁缺勿错,跳过;
-        //   - 计算键 `[k](){}` 与 well-known symbol 方法的规范名同样特殊(`[Symbol.iterator]`),
-        //     且 methodName 是 label 用的近似名 → 跳过。
-        if ((!method.kind || method.kind === "method") && !method.computed &&
-            method.key && (method.key.type === "Identifier" || method.key.type === "Literal")) {
-            this.registerFuncMeta(methodLabel, method.value, methodName);
+        // 取出的函数值(原型链读),编译期静态解析点覆盖不到。
+        // [L2-③] 扩展覆盖:访问器(get/set)按规范名 "get x"/"set x" 登记,length=0/1;
+        // 计算键与 well-known symbol 仍跳过(名非静态)。
+        if (method.key &&
+            (method.key.type === "Identifier" || method.key.type === "Literal" ||
+             method.key.type === "StringLiteral" || method.key.type === "NumericLiteral")) {
+            // [L2-③] 覆盖计算键中的字面量键: `["computed"](){}`/`[1](){}` 名称编译期已知
+            // (静态字符串/数字键),同样入函数元数据侧表供 `.name`/`.length` 反射。
+            // 变量/表达式计算键(名非静态)仍跳过,留运行期侧表路径。
+            let metaName = typeof methodName === "number" ? String(methodName) : methodName;
+            if (method.kind === "get") metaName = "get " + metaName;
+            else if (method.kind === "set") metaName = "set " + metaName;
+            if (metaName) {
+                // 访问器 length:getter=0,setter=1;普通方法 = fnArity(method.value)
+                let metaArityExpr = method.value;
+                if (method.kind === "get") {
+                    metaArityExpr = { type: "FunctionExpression", params: [] };
+                } else if (method.kind === "set") {
+                    metaArityExpr = { type: "FunctionExpression", params: [{ type: "Identifier", name: "v" }] };
+                }
+                this.registerFuncMeta(methodLabel, metaArityExpr, metaName);
+            }
         }
         // [批次D] 生成器/async 生成器方法(`*g(){}` / `async *g(){}`)。此前类方法路径**完全
         // 不识别**生成器:方法体被当普通函数直编,体内 yield 直接 `_coroutine_yield` 在主栈上
@@ -3317,8 +3438,8 @@ export const StatementCompiler = {
         // savedCtx 共享的集合。
         const methodBoxedVars = analyzeSharedVariables(method.value);
         for (const _n of analyzeDirectEvalBoxedVars(method.value)) methodBoxedVars.add(_n);
-        if (this.ctx.boxedVars) {
-            for (const _n of this.ctx.boxedVars) methodBoxedVars.add(_n);
+        if (savedCtx.boxedVars) {
+            for (const _n of savedCtx.boxedVars) methodBoxedVars.add(_n);
         }
         this.ctx.boxedVars = methodBoxedVars;
         this.ctx.inClass = true;

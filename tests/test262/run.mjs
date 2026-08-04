@@ -103,6 +103,9 @@ const UNSUPPORTED_FEATURES = new Set([
   "explicit-resource-management",
   "iterator-sequencing",
   "uint8array-base64",
+  // Stage-2/3 proposals not implemented: keyed promise combinators
+  // (Promise.allKeyed / allSettledKeyed / raceKeyed / anyKeyed).
+  "await-dictionary",
 ]);
 
 // Dirs excluded wholesale regardless of selection (internationalization &

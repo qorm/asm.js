@@ -459,6 +459,7 @@ export class JSValueGenerator {
         vm.cmp(VReg.S0, VReg.V1);
         vm.jae("_js_typeof_notclass");
         vm.load(VReg.V1, VReg.S0, 0);
+        vm.andImm(VReg.V1, VReg.V1, 0xff); // type 低字节(高字节可含标志位如 shape/materialize)
         vm.cmpImm(VReg.V1, 3); // TYPE_CLOSURE
         vm.jeq("_js_typeof_function");
         // [bug1] 其余落在堆范围内的「裸」指针（Map=4/Set=5 等未 NaN-box 的堆对象，
@@ -778,7 +779,9 @@ export class JSValueGenerator {
         vm.cmp(VReg.S0, VReg.V2);
         vm.jge("_iof_false");
         vm.load(VReg.V1, VReg.S0, 0);
-        vm.cmpImm(VReg.V1, 3); // TYPE_CLOSURE / classinfo
+        vm.mov(VReg.V0, VReg.V1);           // 副本用于低字节 type 检查
+        vm.andImm(VReg.V0, VReg.V0, 0xff);   // type 低字节(高字节可含标志位)
+        vm.cmpImm(VReg.V0, 3); // TYPE_CLOSURE / classinfo
         vm.jeq("_iof_true");
         vm.cmpImm(VReg.V1, 0xc105); // CLOSURE_MAGIC(裸闭包)
         vm.jeq("_iof_true");

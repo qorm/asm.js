@@ -89,7 +89,20 @@ export const AssignmentCompiler = {
             // 检查是否是主程序被捕获的变量（从全局位置访问）
             const globalLabel = this.ctx.getMainCapturedVar(name);
 
-            if (!offset && !globalLabel) return;
+            if (!offset && !globalLabel) {
+                // [L2-②] 对**真正未解析**的标识符赋值 → 抛 ReferenceError。此前静默 no-op
+                // (sloppy 全局创建不支持,strict 该抛未抛),令 dstr 赋值测试
+                // `[unresolvable] = []`/`{x: unresolvable} = {}`(onlyStrict)判负。判别复用
+                // typeof 的 isUnresolvableIdentifier:内建/已知全局(console/Buffer/…)不算,
+                // 维持原 no-op;仅对编译期完全解析不到的名抛。规范:strict 下对 unresolvable
+                // reference 赋值抛 ReferenceError;sloppy 创建全局(本编译器不支持,抛 ReferenceError
+                // 亦比静默丢弃更可见,记偏差)。复合赋值(+= 等)同样先读再写 → 读即抛,正确。
+                if (this.isUnresolvableIdentifier &&
+                    this.isUnresolvableIdentifier({ type: "Identifier", name: name })) {
+                    this.emitThrowReferenceError(name + " is not defined");
+                }
+                return;
+            }
 
             const op = expr.operator;
             const isBoxed = this.ctx.boxedVars && this.ctx.boxedVars.has(name);

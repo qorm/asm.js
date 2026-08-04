@@ -5129,6 +5129,12 @@ export const FunctionCompiler = {
         const seen = new Set();
         const isAnonFn = (n) => !!n && typeof n === "object" && !n.id &&
             (n.type === "FunctionExpression" || n.type === "ArrowFunctionExpression");
+        // [L2-③] 匿名类表达式 parser 赋合成名 __classexprN,规范 NamedEvaluation
+        // 应取绑定名/赋值目标名/属性名而非合成名。
+        const isAnonClassExpr = (n) => !!n && typeof n === "object" &&
+            n.type === "ClassDeclaration" && n.id && typeof n.id.name === "string" &&
+            n.id.name.indexOf("__classexpr") === 0;
+        const isAnonCallable = (n) => isAnonFn(n) || isAnonClassExpr(n);
         const keyName = (k, computed) => {
             if (computed || !k || typeof k !== "object") return null;
             if (k.type === "Identifier") return k.name;
@@ -5165,12 +5171,12 @@ export const FunctionCompiler = {
                     hints.set(node.right, node.left.name);
                 }
             } else if (t === "Property") {
-                if ((!node.kind || node.kind === "init") && isAnonFn(node.value)) {
+                if ((!node.kind || node.kind === "init") && isAnonCallable(node.value)) {
                     const kn = keyName(node.key, node.computed);
                     if (kn !== null) hints.set(node.value, kn);
                 }
             } else if (t === "MethodDefinition") {
-                if ((!node.kind || node.kind === "method") && isAnonFn(node.value)) {
+                if ((!node.kind || node.kind === "method") && isAnonCallable(node.value)) {
                     const kn = keyName(node.key, node.computed);
                     if (kn !== null) hints.set(node.value, kn);
                 }

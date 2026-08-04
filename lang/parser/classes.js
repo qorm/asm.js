@@ -52,9 +52,20 @@ export const ClassParser = {
     parseClassBody() {
         let body = [];
         this.classDepth = this.classDepth + 1; // #x 访问仅类体内合法
+        const depth = this.classDepth;
         // [test262 早期错误 E] 私有名查重栈:嵌套类各有独立 ClassBody 作用域,进体压新表、出体弹出。
+        // [W-P9 未绑定私有名] 并行维护「各层私有名表」与「本顶层类子树全部私有名引用」:
+        // 每个类体把自己的名表登记到 _privateNamesByDepth[depth];引用按所在层深度记录到
+        // _privateRefs。待最外层类体(depth===1)收尾统一校验:depth i 的引用须在 names[1..i]
+        // 中(声明顺序无关,Node 对拍 `class C { m(){ class B { n(){ this.#x } } } #x; }` 合法)。
+        // 顶层类之间互不干扰:每次 depth===1 进入重置两张表。
+        if (depth === 1) {
+            this._privateNamesByDepth = {};
+            this._privateRefs = [];
+        }
         const prevPrivateNames = this._curPrivateNames;
-        this._curPrivateNames = [];
+        this._privateNamesByDepth[depth] = [];
+        this._curPrivateNames = this._privateNamesByDepth[depth];
         this.nextToken();
         while (!this.curTokenIs(TokenType.RBRACE) && !this.curTokenIs(TokenType.EOF)) {
             // 类体内可选/杂散分号 `class C { ; method(){}; }`:跳过,不当成员解析。
@@ -69,9 +80,45 @@ export const ClassParser = {
             this.nextToken();
         }
         this._checkDuplicatePrivateNames(this._curPrivateNames);
+        if (depth === 1) {
+            this._validatePrivateRefs();
+        }
         this._curPrivateNames = prevPrivateNames;
         this.classDepth = this.classDepth - 1;
         return body;
+    },
+
+    // [W-P9] 记录一条私有名引用(所在类体深度),供最外层类体收尾统一校验。
+    _recordPrivateRef(name) {
+        if (this.classDepth > 0) {
+            if (!this._privateRefs) this._privateRefs = [];
+            this._privateRefs.push({ name: name, depth: this.classDepth, line: this.curToken.line });
+        }
+    },
+
+    // [W-P9] 未绑定私有名早期错误:depth i 处引用的私有名必须在本层或任一外层声明
+    // (声明顺序无关)。Node 对拍:`class C { m(){ this.#x } }` 拒;`class A { #x; m(){
+    // class B { n(){ this.#x } } } }` 收。零误拒:仅在确定无任何外层声明时记错。
+    _validatePrivateRefs() {
+        const refs = this._privateRefs || [];
+        for (let i = 0; i < refs.length; i++) {
+            const ref = refs[i];
+            let found = false;
+            for (let d = 1; d <= ref.depth; d++) {
+                const names = this._privateNamesByDepth[d];
+                if (names) {
+                    for (let j = 0; j < names.length; j++) {
+                        if (names[j].name === ref.name) { found = true; break; }
+                    }
+                }
+                if (found) break;
+            }
+            if (!found) {
+                this.errors.push(
+                    `Private field '${ref.name}' must be declared in an enclosing class (line ${ref.line})`
+                );
+            }
+        }
     },
 
     // [test262 早期错误 E] 同一 ClassBody 内私有名不得重复绑定,唯一例外是同名 get+set 各一。
@@ -145,7 +192,8 @@ export const ClassParser = {
 
         // 检查是否是私有成员
         if (this.curTokenIs(TokenType.HASH) || (this.curToken.literal && this.curToken.literal.startsWith("#"))) {
-            return this.parsePrivateFieldOrMethod(isStatic, kind);
+            // [W-P9] 私有 async 方法 `async #m(){}`:把 async 修饰符传下去。
+            return this.parsePrivateFieldOrMethod(isStatic, kind, false, isAsyncMethod);
         }
 
         // [test262 早期错误 F] 记录方法是否以访问器(get/set)声明:下面的 constructor 判定会
@@ -168,6 +216,13 @@ export const ClassParser = {
             this.nextToken();
         }
 
+        // [W-P9 解析缺口修复] 私有生成器/异步生成器方法 `*#m(){}` / `async *#m(){}`:
+        // 此前 `*` 先行消费、私有名被当公共方法名解析,`#m` 从不进 _curPrivateNames,
+        // 导致后续未绑定私有名检查对这类声明误拒。此处补路由到 parsePrivateFieldOrMethod。
+        if (this.curTokenIs(TokenType.HASH) || (this.curToken.literal && this.curToken.literal.startsWith("#"))) {
+            return this.parsePrivateFieldOrMethod(isStatic, kind, isGenerator, isAsyncMethod);
+        }
+
         let key = new AST.Identifier(this.curToken.literal);
         let computed = false;
 
@@ -188,10 +243,14 @@ export const ClassParser = {
         // [test262 S1] 类方法生成器/异步深度:覆盖形参 + 体内 var 的 yield/await 早期错误校验
         if (isGenerator) this.fnGenDepth++;
         if (isAsyncMethod) this.fnAsyncDepth++;
+        // [Wave 8] 方法边界:方法有自有 arguments 与 home object(super 合法),复位字段上下文。
+        const prevInFieldInit = this._inFieldInit;
+        this._inFieldInit = false;
         let params = this.parseFunctionParams();
         if (!this.expectPeek(TokenType.LBRACE)) {
             if (isGenerator) this.fnGenDepth--;
             if (isAsyncMethod) this.fnAsyncDepth--;
+            this._inFieldInit = prevInFieldInit;
             return null;
         }
         // [test262 S1] strict 探测(显式 "use strict" 指令)
@@ -204,6 +263,7 @@ export const ClassParser = {
         if (isStrict) this.fnStrictDepth--;
         if (isGenerator) this.fnGenDepth--;
         if (isAsyncMethod) this.fnAsyncDepth--;
+        this._inFieldInit = prevInFieldInit;
         let value = new AST.FunctionExpression(null, params, methodBody, isAsyncMethod, isGenerator);
         value.generator = isGenerator;
         value.async = isAsyncMethod;
@@ -252,13 +312,18 @@ export const ClassParser = {
         if (this.peekTokenIs(TokenType.ASSIGN)) {
             this.nextToken();
             this.nextToken();
+            // [Wave 8] 字段初始化器上下文:ContainsArguments/ContainsSuperCall 早期错误
+            // (穿透箭头、函数边界复位)。嵌套类字段各自置真,互不串扰。
+            const prevInFieldInit = this._inFieldInit;
+            this._inFieldInit = true;
             init = this.parseExpression(Precedence.ASSIGN - 1);
+            this._inFieldInit = prevInFieldInit;
         }
         if (this.peekTokenIs(TokenType.SEMICOLON)) this.nextToken();
         return new AST.PropertyDefinition(key, init, computed, isStatic);
     },
 
-    parsePrivateFieldOrMethod(isStatic, kind = "method") {
+    parsePrivateFieldOrMethod(isStatic, kind = "method", isGenerator = false, isAsyncMethod = false) {
         // 获取私有名称。词法上 `#x`(# 紧邻名字)合成单个 IDENT("#x");`# x`(# 与名字间有
         // 空白/换行)则产出裸 HASH token + 独立标识符。ES 要求 # 紧邻 IdentifierName,故见到
         // 裸 HASH 必为早期错误(此前会静默把 `# x` 当两个成员编译)。
@@ -291,10 +356,26 @@ export const ClassParser = {
         // 检查是否是方法 (有括号)
         if (this.peekTokenIs(TokenType.LPAREN)) {
             this.nextToken();
+            // [Wave 8] 私有方法同属方法边界:复位字段初始化器上下文。
+            // [W-P9] 私有生成器/异步方法同样计入 yield/await 深度(与公共方法路径一致)。
+            const prevInFieldInit = this._inFieldInit;
+            this._inFieldInit = false;
+            if (isGenerator) this.fnGenDepth++;
+            if (isAsyncMethod) this.fnAsyncDepth++;
             let params = this.parseFunctionParams();
-            if (!this.expectPeek(TokenType.LBRACE)) return null;
+            if (!this.expectPeek(TokenType.LBRACE)) {
+                if (isGenerator) this.fnGenDepth--;
+                if (isAsyncMethod) this.fnAsyncDepth--;
+                this._inFieldInit = prevInFieldInit;
+                return null;
+            }
             let methodBody = this.parseBlockStatement();
-            let value = new AST.FunctionExpression(null, params, methodBody, false);
+            if (isGenerator) this.fnGenDepth--;
+            if (isAsyncMethod) this.fnAsyncDepth--;
+            this._inFieldInit = prevInFieldInit;
+            let value = new AST.FunctionExpression(null, params, methodBody, isAsyncMethod, isGenerator);
+            value.generator = isGenerator;
+            value.async = isAsyncMethod;
             return new AST.MethodDefinition(key, value, kind, isStatic, false);
         }
 
@@ -303,7 +384,11 @@ export const ClassParser = {
         if (this.peekTokenIs(TokenType.ASSIGN)) {
             this.nextToken();
             this.nextToken();
+            // [Wave 8] 私有字段初始化器同样受 ContainsArguments/ContainsSuperCall 约束。
+            const prevInFieldInit = this._inFieldInit;
+            this._inFieldInit = true;
             init = this.parseExpression(Precedence.ASSIGN - 1);
+            this._inFieldInit = prevInFieldInit;
         }
         if (this.peekTokenIs(TokenType.SEMICOLON)) this.nextToken();
         return new AST.PropertyDefinition(key, init, false, isStatic);

@@ -420,7 +420,7 @@ const BUILTIN_REF_ARITY = {
     math_pow: 2, math_atan2: 2,
     object_keys: 1, object_values: 1, object_entries: 1,
     object_getOwnPropertyNames: 1, object_getOwnPropertyDescriptor: 2,
-    object_create: 2, object_freeze: 1,
+    object_create: 2, object_freeze: 1, object_assign: 1,
     date_now: 0, date_parse: 1, date_utc: 7,
     array_isArray: 1,
     fnproto_call: 1, fnproto_apply: 2,
@@ -501,6 +501,78 @@ const ERR_CTOR_NAMES = [
 // 子类化(class X extends Map)、forEach 的 thisArg、实例级方法值读(m.get 作值
 // 仍走通用属性读 → undefined,Map 对象无原型链)、Promise.try(无单 helper)、
 // WeakMap/WeakSet 构造器对象(构造快路仍可用,裸标识符仍兜底)。
+// [底层A Array 一等值] Array.prototype 方法值表(_agen_* 泛型 helper,_apHelpers 快路同源,
+// 供 emitArrayCtorObject 物化原型)。缺 reverse/shift/pop/unshift/sort/splice/toString 等——
+// 运行时无 _agen_* 包装,列为后续增量。
+const ARRAY_PROTO_METHODS = [
+    ["forEach", "_agen_forEach", 1],
+    ["map", "_agen_map", 1],
+    ["filter", "_agen_filter", 1],
+    ["some", "_agen_some", 1],
+    ["every", "_agen_every", 1],
+    ["reduce", "_agen_reduce", 1],
+    ["reduceRight", "_agen_reduceRight", 1],
+    ["indexOf", "_agen_indexOf", 1],
+    ["lastIndexOf", "_agen_lastIndexOf", 1],
+    ["includes", "_agen_includes", 1],
+    ["join", "_agen_join", 1],
+    ["slice", "_agen_slice", 2],
+    ["at", "_agen_at", 1],
+    ["find", "_agen_find", 1],
+    ["findIndex", "_agen_findIndex", 1],
+    ["flatMap", "_agen_flatMap", 1],
+    ["flat", "_agen_flat", 0],
+    ["fill", "_agen_fill", 1],
+    ["copyWithin", "_agen_copyWithin", 2],
+    ["concat", "_agen_concat", 1],
+    ["values", "_agen_values", 0],
+    ["keys", "_agen_keys", 0],
+    ["entries", "_agen_entries", 0],
+    ["push", "_fpg_arr_push", 1],
+];
+const ARRAY_STATIC_METHODS = [
+    ["isArray", "_isarray_ref", 1],
+];
+// [底层A W-A2 Object 一等值] Object.prototype 方法值表(_aref_generic 蹦床 helper 同源,
+// 供 emitObjectCtorObject 物化原型)。标签与既有 `Object.prototype.<m>` 值读取分派
+// (members.js 的 _opHelpers)逐字一致 —— 都是经 _aref_generic 安全调用的真 helper:
+//   hasOwnProperty → _aref_obj_hasOwn(归一 _object_has 裸 0/1 为装箱布尔)
+//   valueOf        → _aref_obj_valueOf(恒等)
+//   toString       → _object_proto_toString(品牌串 [object Tag],返回装箱堆串;不能用
+//                   _object_toString —— 它返裸数据指针,作值调用会解引用野指针)
+//   isPrototypeOf  → _is_prototype_of(装箱布尔)
+//   propertyIsEnumerable → _object_propertyIsEnumerable(装箱布尔)
+// 刻意缺 toLocaleString:运行时无干净首类包装(经 __date_shim/__number_shim 才有,Object
+// 无独立 helper)——缺方法值优于崩溃,列偏差。
+const OBJECT_PROTO_METHODS = [
+    ["hasOwnProperty", "_aref_obj_hasOwn", 1],
+    ["valueOf", "_aref_obj_valueOf", 0],
+    ["toString", "_object_proto_toString", 0],
+    ["isPrototypeOf", "_is_prototype_of", 1],
+    ["propertyIsEnumerable", "_object_propertyIsEnumerable", 1],
+];
+// [底层A W-A2 Object 一等值] Object 静态方法值表(直连既有运行时 helper,A0=首参装箱值
+// → RET=装箱结果;与 NamespaceStaticRef.Object / BUILTIN_REF_ARITY 的 object_* 槽同步)。
+// 仅收有**干净首类 ABI** 且已入 BUILTIN_REF_ARITY(登记 .length 元数据)者:
+//   keys/getOwnPropertyNames → 键数组;values/entries → 值/键值对数组
+//   getOwnPropertyDescriptor → 描述符或 undefined
+//   create(proto) → 新对象(第二参描述符仅静态调用位支持,值路径忽略,记偏差)
+//   freeze(obj) → obj;assign(target, source) → target(多 source 值调用仅拷首个,记偏差)
+// 刻意不收 defineProperty:运行时 _object_define_property 是 6 参打包 ABI
+// (obj,key,value,get,set,packed),非 (obj,key,desc) 首类形状 —— 缺值优于崩,列偏差。
+// 亦不收 seal/preventExtensions/isFrozen/isSealed/isExtensible/getPrototypeOf/
+// setPrototypeOf/getOwnPropertySymbols/is/groupBy:helper 存在但未入 BUILTIN_REF_ARITY,
+// 无 .length 元数据,且不在 NamespaceStaticRef.Object(值读取现状 undefined),留增量。
+const OBJECT_STATIC_METHODS = [
+    ["keys", "_object_keys", 1],
+    ["values", "_object_values", 1],
+    ["entries", "_object_entries", 1],
+    ["getOwnPropertyNames", "_object_gopn", 1],
+    ["getOwnPropertyDescriptor", "_object_getOwnPropertyDescriptor", 2],
+    ["create", "_object_create", 2],
+    ["freeze", "_object_freeze", 1],
+    ["assign", "_object_assign", 1],
+];
 const MAP_PROTO_METHODS = [
     // [方法名, 守卫壳标签(品牌检查后尾调裸 helper,见 runtime/types/map/index.js), 规范 length]
     ["get", "_aref_map_get", 1],
@@ -832,6 +904,21 @@ export const MemberCompiler = {
         return !!((this.ctx.getLocal && this.ctx.getLocal("Number")) ||
             (this.ctx.getFunction && this.ctx.getFunction("Number")) ||
             (this.ctx.getMainCapturedVar && this.ctx.getMainCapturedVar("Number")));
+    },
+
+    // [底层A] `Array` 标识符被遮蔽?同 numberNameShadowed 守卫组。
+    arrayNameShadowed() {
+        return !!((this.ctx.getLocal && this.ctx.getLocal("Array")) ||
+            (this.ctx.getFunction && this.ctx.getFunction("Array")) ||
+            (this.ctx.getMainCapturedVar && this.ctx.getMainCapturedVar("Array")));
+    },
+
+    // [底层A W-A2] `Object` 标识符被遮蔽?同 numberNameShadowed 守卫组(局部变量 /
+    // 函数·类声明 / 主程序捕获全局)。遮蔽时退回词法解析,裸 Object 不物化构造器。
+    objectNameShadowed() {
+        return !!((this.ctx.getLocal && this.ctx.getLocal("Object")) ||
+            (this.ctx.getFunction && this.ctx.getFunction("Object")) ||
+            (this.ctx.getMainCapturedVar && this.ctx.getMainCapturedVar("Object")));
     },
 
     // [JSON 一等值] `JSON` 标识符被遮蔽?同 stringNameShadowed 守卫组。
@@ -2141,6 +2228,167 @@ export const MemberCompiler = {
             statics: MAP_STATIC_METHODS,
         });
     },
+    // [底层A Array 一等值] 裸 `Array`(反射位)→ 惰性物化真构造器闭包 + 原型对象(方法值经
+    // _agen_* 泛型 helper,与 Array.prototype.<m> 快路同源)+ isArray 静态。typeof "function"、
+    // Array.prototype 可达、Array===Array 恒等。instanceof Array 走 operators.js 泛型
+    // _instanceof(右值现为真闭包,沿实例 __proto__ 链比对——数组实例 __proto__ 暂不链
+    // 数组原型,仍 false,与改造前一致;真值链修正随缺陷 B)。`Array(...)`/`new Array(...)`/
+    // Array.isArray(...) 快路先命中,不经此 → 字节不变。
+    emitArrayCtorObject() {
+        this.emitCollectionCtorObject({
+            name: "Array", length: 1, ctorFn: "_array_ctor_call",
+            ctorSlot: "_nsobj_array", protoSlot: "_nsobj_array_proto",
+            methods: ARRAY_PROTO_METHODS, sizeGetter: null,
+            statics: ARRAY_STATIC_METHODS,
+        });
+    },
+    // [底层A] `Array.prototype` 值读:原型槽已填则直接用,否则整体物化。
+    emitArrayProtoObject() {
+        const vm = this.vm;
+        const protoSlot = "_nsobj_array_proto";
+        this._reEnsureSlot(protoSlot);
+        const doneL = this.ctx.newLabel("nsarrproto_done");
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne(doneL);
+        this.emitArrayCtorObject();
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.label(doneL);
+    },
+    // [底层A W-A2 Object 一等值] 裸 `Object`(反射位)→ 惰性物化真构造器闭包 + 原型对象
+    // (方法值经 _aref_obj_*/_object_proto_toString/_is_prototype_of/_object_propertyIsEnumerable
+    // 安全 helper,静态经 OBJECT_STATIC_METHODS 直连)。typeof "function"、Object.prototype
+    // 可达、Object===Object 恒等。instanceof Object 走 operators.js 内联(tag 判别)。
+    // `Object(...)`/`new Object(...)`/`Object.method(...)` 快路先命中,不经此 → 字节不变。
+    //
+    // [W-B B1] 单例 Object.prototype 调和:运行时 `_object_new` 首次调用已把 **同一个**
+    // Object.prototype(经 _object_proto_ensure)填进 _nsobj_object_proto、把 ctor 闭包填进
+    // _nsobj_object —— 因为 `({}).toString`/`({}).constructor===Object` 在**任何** Object
+    // 标识符求值前就得成立,而运行时 `_object_new` 无法回调编译器物化。此处做**补全**而非
+    // 重建:复用已填 ctor/proto,仅幂等落 name/length/constructor/静态方法/prototype 闭包
+    // 属性。_nsobj_object_ready 标志区分「运行时最小建」与「编译器完整物化」——否则每次裸
+    // Object 求值都重建静态方法、identity 漂移。proto 用 _object_new_raw(__proto__=0)建,
+    // 防自环(绝不能 __proto__ = Object.prototype 自身)。
+    emitObjectCtorObject() {
+        const vm = this.vm;
+        const ctorSlot = "_nsobj_object";
+        const protoSlot = "_nsobj_object_proto";
+        const readySlot = "_nsobj_object_ready";
+        this._reEnsureSlot(ctorSlot);
+        this._reEnsureSlot(protoSlot);
+        this._reEnsureSlot(readySlot);
+        const ctorReloadL = this.ctx.newLabel("nsobj_ctor_reload");
+        const ctorHaveL = this.ctx.newLabel("nsobj_ctor_have");
+        const protoHaveL = this.ctx.newLabel("nsobj_proto_have");
+        // ready 门:已完整物化 → 直接重载 ctor 返回(每次裸 Object 求值都过此,热但极简)
+        vm.lea(VReg.V0, readySlot);
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne(ctorReloadL);
+        // ctor 闭包 16B {magic, _object_ctor_call}:运行时已建则复用,否则新建。
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne(ctorHaveL);
+        vm.movImm(VReg.A0, 16);
+        vm.call("_alloc");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.movImm(VReg.V1, 0xc105); // CLOSURE_MAGIC
+        vm.store(VReg.S0, 0, VReg.V1);
+        vm.lea(VReg.V1, "_object_ctor_call");
+        vm.store(VReg.S0, 8, VReg.V1);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_js_box_function");
+        vm.lea(VReg.V1, ctorSlot);
+        vm.store(VReg.V1, 0, VReg.RET); // 先存槽:后续每步从槽重载(跨 call 安全)
+        vm.label(ctorHaveL);
+        // X.name / X.length(闭包属性侧表;幂等)
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("name", VReg.A1);
+        vm.lea(VReg.A2, this.asm.addString("Object"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A2, VReg.A2, VReg.V1);
+        vm.call("_closure_prop_set");
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("length", VReg.A1);
+        vm.movImm(VReg.A2, 1);
+        vm.scvtf(0, VReg.A2);
+        vm.fmovToInt(VReg.A2, 0);
+        vm.call("_closure_prop_set");
+        // 原型对象:复用已填(运行时 _object_proto_ensure 建、含方法+constructor)或新建
+        // (_object_new_raw,__proto__=0 防自环)。方法与 attr 仅新建时落位(运行时建的
+        // 与 OBJECT_PROTO_METHODS 同 helper 同 attr,重落会换闭包 → identity 漂移)。
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne(protoHaveL);
+        vm.call("_object_new_raw");
+        vm.call("_box_obj_r");
+        vm.lea(VReg.V1, protoSlot);
+        vm.store(VReg.V1, 0, VReg.RET);
+        for (let i = 0; i < OBJECT_PROTO_METHODS.length; i = i + 1) {
+            const m = OBJECT_PROTO_METHODS[i];
+            this.emitBuiltinMethodRefClosureMeta(m[1], m[0], m[2]); // RET = 方法值
+            this._reSetProtoProp(protoSlot, m[0], BUILTIN_PROP_ATTR);
+        }
+        vm.label(protoHaveL);
+        // prototype.constructor = Object(幂等;从槽读,不回调本函数)
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        this._reSetProtoProp(protoSlot, "constructor", BUILTIN_PROP_ATTR);
+        // 静态方法作构造器闭包属性(attr 5;值经 emitMemoizedBuiltinRef,与 `Object.keys`
+        // 值读同槽 → Object.keys === gOPD(Object,"keys").value)。幂等。
+        const setCtorProp = (name, attr, emitValue) => {
+            emitValue();                                   // RET = 值
+            vm.mov(VReg.A2, VReg.RET);
+            vm.lea(VReg.V0, ctorSlot);
+            vm.load(VReg.A0, VReg.V0, 0);
+            this.emitBoxedStringKey(name, VReg.A1);
+            vm.call("_closure_prop_set");
+            vm.lea(VReg.V0, ctorSlot);
+            vm.load(VReg.A0, VReg.V0, 0);
+            this.emitBoxedStringKey(name, VReg.A1);
+            vm.movImm(VReg.A2, attr);
+            vm.call("_closure_prop_set_attr");
+        };
+        for (let i = 0; i < OBJECT_STATIC_METHODS.length; i = i + 1) {
+            const s = OBJECT_STATIC_METHODS[i];
+            setCtorProp(s[0], BUILTIN_PROP_ATTR,
+                () => this.emitMemoizedBuiltinRef("object_" + s[0], s[1], s[0]));
+        }
+        // Object.prototype = 原型对象(闭包属性侧表;规范 attrs 全 false → attr 0)
+        setCtorProp("prototype", BUILTIN_CONST_ATTR, () => {
+            vm.lea(VReg.V0, protoSlot);
+            vm.load(VReg.RET, VReg.V0, 0);
+        });
+        // ready 置位(仅编译器完整物化后)
+        vm.lea(VReg.V0, readySlot);
+        vm.movImm(VReg.V1, 1);
+        vm.store(VReg.V0, 0, VReg.V1);
+        vm.label(ctorReloadL);
+        // RET = 装箱构造器(稳定身份)
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+    },
+    // [底层A W-A2] `Object.prototype` 值读:原型槽已填则直接用,否则整体物化。
+    emitObjectProtoObject() {
+        const vm = this.vm;
+        const protoSlot = "_nsobj_object_proto";
+        this._reEnsureSlot(protoSlot);
+        const doneL = this.ctx.newLabel("nsobjproto_done");
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne(doneL);
+        this.emitObjectCtorObject();
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.label(doneL);
+    },
     emitSetCtorObject() {
         this.emitCollectionCtorObject({
             name: "Set", length: 0, ctorFn: "_set_ctor_call",
@@ -2421,12 +2669,17 @@ export const MemberCompiler = {
         }
 
         // 检查是否是内置构造函数（用于 instanceof）
-        if (name === "Array") {
-            this.vm.movImm(VReg.RET, 1); // Array 构造函数标识 = 1
+        // [底层A] Array 一等值:裸 `Array` 发真构造器函数(instanceof Array 走 operators.js
+        // 泛型 _instanceof,右值现为真闭包;instanceof 内联快路不受影响)。
+        if (name === "Array" && !this.arrayNameShadowed()) {
+            this.emitArrayCtorObject();
             return;
         }
-        if (name === "Object") {
-            this.vm.movImm(VReg.RET, 2); // Object 构造函数标识 = 2
+        // [底层A W-A2 Object 一等值] 裸 `Object`(反射位)→ 惰性物化真构造器函数
+        // (与 Array 同形)。旧哨兵 2 被移除:instanceof Object 改由 operators.js 内联
+        // tag 判别(原走泛型 _instanceof 的 A1==2 → _iof_chk_obj)。遮蔽守卫同 Array。
+        if (name === "Object" && !this.objectNameShadowed()) {
+            this.emitObjectCtorObject();
             return;
         }
         // [bug8] 裸 Function 构造器哨兵 = 3(用于 `x instanceof Function`)。
@@ -2576,6 +2829,12 @@ export const MemberCompiler = {
         }
 
         const offset = this.ctx.getLocal(name);
+        // [L2-③ TDZ] 默认参数自引用(x=x)/后向引用(x=y,y=1):
+        // 形参名在默认值评估期记入 tdzParams,此处以 ReferenceError 守卫
+        if (offset && this.ctx.tdzParams && this.ctx.tdzParams.has(name)) {
+            this.emitThrowReferenceError(name + " is not defined");
+            return;
+        }
         const globalLabel = this.ctx.getMainCapturedVar(name);
         const hasFunc = this.ctx.hasFunction(name);
         if (offset) {
@@ -2671,7 +2930,23 @@ export const MemberCompiler = {
                 this.vm.lea(VReg.V1, "_print_wrapper");
                 this.vm.store(VReg.RET, 8, VReg.V1);
             } else {
-                this.vm.movImm(VReg.RET, 0);
+                // [L2-②] 未解析的裸标识符读取 → 抛真 ReferenceError。
+                // 此前兜底发裸 0:GetValue(Reference) 对 unresolvable reference 本应
+                // 抛 ReferenceError,却被静默读成 0 —— `u;` 不再抛、解构默认值命中
+                // unresolvable 名得 0,令 ~160 个 dstr 测试 "Expected a ReferenceError"
+                // (assert.throws 捕获不到)。typeof 位已在 operators.js 单独拦截返回
+                // "undefined"(规范唯一不抛的上下文),不达此处。
+                // 内建名(IDENT_BUILTIN_NAMES)与已知全局(IDENT_KNOWN_GLOBAL_NAMES:
+                // eval/console/Buffer/require/…,运行时确实支持或编译器另有快路)全部
+                // 在上方 return,故这里只对真正 unresolvable 的名抛 —— 不误伤功能全局。
+                // 消息与 Node 对齐:"<name> is not defined"(ReferenceError 构造器会
+                // 把 message 拼进 name/message)。
+                if (this.isUnresolvableIdentifier &&
+                    this.isUnresolvableIdentifier({ type: "Identifier", name: name })) {
+                    this.emitThrowReferenceError(name + " is not defined");
+                } else {
+                    this.vm.movImm(VReg.RET, 0);
+                }
             }
         }
     },
@@ -2701,10 +2976,10 @@ export const MemberCompiler = {
             const init = (this.ctx.varInitExprs && this.ctx.varInitExprs[nm]) || null;
             if (init && (init.type === "ArrowFunctionExpression" ||
                 init.type === "FunctionExpression" || init.type === "ClassExpression" ||
-                // [ext] parser 对匿名 class 表达式产出 ClassDeclaration 节点(含合成名)
-                // var C = class {} → init.type === "ClassDeclaration"
-                (init.type === "ClassDeclaration" && init.id && init.id.name &&
-                 init.id.name.indexOf("__classexpr") === 0))) {
+                // [ext] parser 对 class 表达式产出 ClassDeclaration 节点。匿名 class 带合成名
+                // __classexprN；具名 class 表达式(class MyClass{}) 带真实 id。getFunction 已
+                // 处理 ClassDeclaration 声明,varInitExprs 里的 ClassDeclaration 必为表达式。
+                init.type === "ClassDeclaration")) {
                 return { node: init, fallbackName: nm };
             }
             return null;
@@ -3096,7 +3371,14 @@ export const MemberCompiler = {
                 };
                 const _oph = _opHelpers[propName];
                 if (Array.isArray(_oph)) {
-                    this.emitBuiltinMethodRefClosureMeta(_oph[0], propName, _oph[1]);
+                    // [W-B B1] 从单例 Object.prototype 对象读方法值(而非新建闭包):
+                    // 使 `Object.prototype.hasOwnProperty === ({}).hasOwnProperty`(二者
+                    // 都经同一 proto 对象解析)与跨次读恒等成立。槽未物化时
+                    // emitObjectProtoObject 整体物化(含 proto 方法),返回即用之。
+                    this.emitObjectProtoObject();   // RET = 装箱 Object.prototype
+                    this.vm.mov(VReg.A0, VReg.RET);
+                    this.emitBoxedStringKey(propName, VReg.A1);
+                    this.vm.call("_object_get");
                     return;
                 }
             }

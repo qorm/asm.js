@@ -2,6 +2,7 @@
 // 编译 async 函数和 await 表达式
 
 import { VReg } from "../../vm/index.js";
+import { collectPatternNames } from "../../lang/analysis/closure.js";
 
 // async 函数魔数 - 标记为异步闭包
 export const ASYNC_CLOSURE_MAGIC = 0xa51c;
@@ -52,6 +53,12 @@ export const AsyncCompiler = {
         vm.pop(VReg.RET);
         if (this.ctx.exceptionLabel) {
             vm.jmp(this.ctx.exceptionLabel);
+        } else if (this.ctx.inCoroBody && this.ctx.returnLabel) {
+            // [gen/async-gen unwind] 协程体内 await 到 reject 且无本地 try:完成协程
+            // (pending 保留),由 _generator_next/_async_generator_next 在调用方栈上传播
+            // (生成器 → reject 该次 next() Promise;async generator → reject)。与
+            // emitYieldValue / emitAsyncYieldValue 的裸 throw 同构。
+            vm.jmp(this.ctx.returnLabel);
         } else {
             this.emitUnhandledExceptionExit();
         }
@@ -59,6 +66,7 @@ export const AsyncCompiler = {
         vm.pop(VReg.RET);
         vm.label(awaitDone);
     },
+
 
     // [批次D] 编译 yield 表达式（只出现在生成器体内，体运行在协程栈上）
     // 协议：把 yield 值写入当前协程 result 槽(coro+72) → _coroutine_yield 挂起；
@@ -76,9 +84,38 @@ export const AsyncCompiler = {
         } else {
             vm.movImm64(VReg.RET, 0x7ffb000000000000n); // was lea+load _js const
         }
-        // async generator 体内 yield:resolve 当前 next() Promise 再挂起(见 emitAsyncYieldValue)。
-        // 普通生成器保持原路径(逐字节不变)。
         if (this.ctx.inAsyncGenerator) {
+            // [async generator] AsyncGeneratorYield:先 Await(yield 值)再产出。
+            // `yield Promise.reject(e)` 须使该次 next() Promise reject(e)(而非把 Promise
+            // 当值产出)。await 只对 Promise 施加(非 Promise 值原样返回)。reject → 异常
+            // 传播:体内有 try 走其 catch,无则完成协程(pending 保留)由 _async_generator_next
+            // reject 本次 next() 的 Promise。
+            const yieldDone = this.ctx.newLabel("ayieldval_done");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.push(VReg.RET);
+            vm.call("_is_promise");     // RET = 1 若为 Promise
+            vm.cmpImm(VReg.RET, 0);
+            vm.pop(VReg.RET);           // RET = yield 值(还原)
+            vm.jeq(yieldDone);          // 非 Promise → 值即产出值
+            vm.mov(VReg.A0, VReg.RET);
+            vm.call("_promise_await");
+            const yieldExcLabel = this.ctx.newLabel("ayieldval_no_exc");
+            vm.push(VReg.RET);
+            vm.lea(VReg.V0, "_exception_pending");
+            vm.load(VReg.V1, VReg.V0, 0);
+            vm.cmpImm(VReg.V1, 0);
+            vm.jeq(yieldExcLabel);
+            vm.pop(VReg.RET);
+            if (this.ctx.exceptionLabel) {
+                vm.jmp(this.ctx.exceptionLabel);
+            } else if (this.ctx.inCoroBody && this.ctx.returnLabel) {
+                vm.jmp(this.ctx.returnLabel);
+            } else {
+                this.emitUnhandledExceptionExit();
+            }
+            vm.label(yieldExcLabel);
+            vm.pop(VReg.RET);
+            vm.label(yieldDone);
             this.emitAsyncYieldValue();
         } else {
             this.emitYieldValue(); // 挂起 RET；恢复后 RET = next(v)/throw 注入值
@@ -184,7 +221,13 @@ export const AsyncCompiler = {
     //  数组快路(tag 0x7ffe)按下标遍历,表达式值 = undefined(同 node)。
     //  通用路:obj[Symbol.iterator]().next() 循环(生成器自迭代;普通迭代器对象命中)。
     //  偏差:next(v) 恒以 undefined 调用(不转发外层 next 传入值)。
+    //  [async generator] async gen 体内 yield* 走异步迭代协议(Symbol.asyncIterator 优先,
+    //  缺失则回退同步迭代器,复用 for-await-of 的脱糖风格),每轮 next() 结果 await 化。
     compileYieldStar(expr) {
+        if (this.ctx.inAsyncGenerator) {
+            this.compileYieldStarAsync(expr);
+            return;
+        }
         const vm = this.vm;
 
         const iterableTemp = this.ctx.allocLocal(`__ys_iterable_${this.nextLabelId()}`);
@@ -284,6 +327,90 @@ export const AsyncCompiler = {
         // RET = yield* 表达式值
     },
 
+    // [async generator] async gen 体内 yield* 的异步迭代协议实现。
+    // 脱糖成合成 AST 复用现有 方法调用/await/while/yield 编译器(同 for-await-of 的
+    // compileForAwaitDispatch 风格)。GetIterator(value, async) 语义:
+    //   __am = __src[Symbol.asyncIterator]
+    //   if (typeof __am === "function") { __it = __am.call(__src) }        // async 迭代器
+    //   else if (__am === null || typeof __am === "undefined") {
+    //     __it = __src[Symbol.iterator]()   // CreateAsyncFromSyncIterator:同步 next() 经 await 归一化
+    //   } else { throw new TypeError }      // GetMethod:非 callable 非 null/undefined → TypeError
+    //   while (true) {
+    //     __r = await __it.next()
+    //     if (__r.done) { __val = __r.value; break; }
+    //     yield __r.value
+    //   }
+    //   RET = __val
+    // yield 经 compileYieldExpression → inAsyncGenerator 走 emitAsyncYieldValue,
+    // resolve 当前挂起的 next() Promise{value,done:false} 再挂起。
+    compileYieldStarAsync(expr) {
+        const vm = this.vm;
+        const id = this.nextLabelId();
+        const srcName = `__ysa_src_${id}`;
+        const amName = `__ysa_am_${id}`;
+        const itName = `__ysa_it_${id}`;
+        const resName = `__ysa_res_${id}`;
+        const valName = `__ysa_val_${id}`;
+        const idn = (n) => ({ type: "Identifier", name: n });
+        const member = (o, p, computed) => ({ type: "MemberExpression", object: o, property: p, computed: !!computed });
+        const symAsyncIter = () => member(idn("Symbol"), idn("asyncIterator"), false);
+        const symIter = () => member(idn("Symbol"), idn("iterator"), false);
+        const asyncIterRef = member(idn(srcName), symAsyncIter(), true);
+        const getIt = (symKey) => ({ type: "CallExpression", callee: member(idn(srcName), symKey(), true), arguments: [] });
+        const typeofIs = (val, s) => ({ type: "BinaryExpression", operator: "===", left: { type: "UnaryExpression", operator: "typeof", argument: val }, right: { type: "StringLiteral", value: s } });
+        // 循环体:while(true){ __r=await __it.next(); if(__r.done){__val=__r.value;break;} yield __r.value }
+        const loopBody = { type: "WhileStatement", test: { type: "BooleanLiteral", value: true }, body: { type: "BlockStatement", body: [
+            { type: "VariableDeclaration", kind: "const", declarations: [{ type: "VariableDeclarator", id: idn(resName), init: { type: "AwaitExpression", argument: { type: "CallExpression", callee: member(idn(itName), idn("next"), false), arguments: [] } } }] },
+            { type: "IfStatement",
+              test: member(idn(resName), idn("done"), false),
+              consequent: { type: "BlockStatement", body: [
+                  { type: "ExpressionStatement", expression: { type: "AssignmentExpression", operator: "=", left: idn(valName), right: member(idn(resName), idn("value"), false) } },
+                  { type: "BreakStatement" },
+              ] },
+              alternate: null },
+            { type: "ExpressionStatement", expression: { type: "YieldExpression", delegate: false, argument: member(idn(resName), idn("value"), false) } },
+        ] } };
+        // async 迭代器优先(null/undefined → 同步迭代器回退;其余非 callable → TypeError)。
+        // 调用形态 src[Symbol.asyncIterator]()(成员调用,this=src)与 for-await-of 的
+        // compileForAwaitDispatch 同构;typeof 分派已读过一次 getter,此分支再读一次
+        // —— 与 for-await-of 的既有双读行为一致(test262 不计数该 getter)。
+        const asyncBlock = { type: "BlockStatement", body: [
+            { type: "VariableDeclaration", kind: "const", declarations: [{ type: "VariableDeclarator", id: idn(itName), init: { type: "CallExpression", callee: member(idn(srcName), symAsyncIter(), true), arguments: [] } }] },
+            loopBody,
+        ] };
+        const syncBlock = { type: "BlockStatement", body: [
+            { type: "VariableDeclaration", kind: "const", declarations: [{ type: "VariableDeclarator", id: idn(itName), init: getIt(symIter) }] },
+            loopBody,
+        ] };
+        const typeErrorBlock = { type: "BlockStatement", body: [
+            { type: "ThrowStatement", argument: { type: "NewExpression", callee: { type: "Identifier", name: "TypeError" }, arguments: [{ type: "Literal", value: "obj[Symbol.asyncIterator] is not a function" }] } },
+        ] };
+        const dispatch = { type: "BlockStatement", body: [
+            { type: "VariableDeclaration", kind: "const", declarations: [{ type: "VariableDeclarator", id: idn(srcName), init: expr.argument }] },
+            { type: "VariableDeclaration", kind: "const", declarations: [{ type: "VariableDeclarator", id: idn(amName), init: asyncIterRef }] },
+            { type: "VariableDeclaration", kind: "let", declarations: [{ type: "VariableDeclarator", id: idn(valName), init: idn("undefined") }] },
+            { type: "IfStatement",
+              test: typeofIs(idn(amName), "function"),
+              consequent: asyncBlock,
+              alternate: { type: "BlockStatement", body: [
+                  { type: "IfStatement",
+                    test: { type: "BinaryExpression", operator: "===", left: idn(amName), right: { type: "Literal", value: null } },
+                    consequent: syncBlock,
+                    alternate: { type: "BlockStatement", body: [
+                        { type: "IfStatement",
+                          test: typeofIs(idn(amName), "undefined"),
+                          consequent: syncBlock,
+                          alternate: typeErrorBlock },
+                    ] } },
+              ] } },
+        ] };
+        this.compileStatement(dispatch);
+        // RET = __val(yield* 表达式值 = 被委托者 return 值)
+        const valOff = this.ctx.getLocal(valName);
+        if (valOff) vm.load(VReg.RET, VReg.FP, valOff);
+        else vm.movImm64(VReg.RET, 0x7ffb000000000000n);
+    },
+
     // [批次D] 生成器函数 stub：函数标签处不执行体，改为创建协程+生成器对象。
     // 进入时寄存器状态与普通函数调用一致：A0..=实参(A0=p0,A1=p1..A4=p4)、S0=闭包指针
     // (闭包路径)或 0/垃圾、A5=this。
@@ -292,19 +419,36 @@ export const AsyncCompiler = {
     // 的 call(而非旧的尾跳)——语义等价(生成器函数正常返回 genobj 给调用者)。
     // 紧随其后落 bodyLabel，调用方继续在该点编译真正的函数体(经 _coroutine_entry 进入)。
     // async generator：stub 与生成器同构,仅构造器换成 _async_generator_new。
-    emitAsyncGeneratorStub(bodyLabel, hasClosure) {
-        this.emitGeneratorStub(bodyLabel, hasClosure, "_async_generator_new");
+    emitAsyncGeneratorStub(bodyLabel, hasClosure, capturedNames) {
+        this.emitGeneratorStub(bodyLabel, hasClosure, "_async_generator_new", capturedNames);
     },
 
-    emitGeneratorStub(bodyLabel, hasClosure, ctorFn) {
+    emitGeneratorStub(bodyLabel, hasClosure, ctorFn, capturedNames) {
         const vm = this.vm;
         if (!ctorFn) ctorFn = "_generator_new"; // 缺省=同步生成器(既有调用点字节不变)
-        vm.prologue(0, [VReg.S3]); // 存 FP/LR + S3(用于跨 _generator_new 保住 A5=this)
+        // 栈尺寸 0→8192:[L2-②] eager 默认值探针(emitGenStubDefaultProbes)要在本帧
+        // 分配临时槽;无解构参数的生成器探针零发射,多余栈空间仅浪费不入栈 —— 指令/字节
+        // 只在含探针的生成器上变化。S3 仍用于跨 _generator_new 保住 A5=this。
+        vm.prologue(8192, [VReg.S3]);
         // [FDI 提前] 解构参数守卫:规范里 FunctionDeclarationInstantiation 在**调用时**跑,
         // 故 `function* g({}){}` 的 `g(null)` 同步抛 TypeError,而非先返回生成器对象、把抛
         // 推迟到首次 .next()。见 emitGenStubParamGuards:只提前「可抛的那一步」,无解构参数
         // 的生成器一条指令都不多发(既有产物字节不变)。
         this.emitGenStubParamGuards(bodyLabel);
+        // [L2-②] eager 参数默认值探针:把 A0-A4 实参先落临时槽,再按解构 pattern 的
+        // 「读元素/属性 + 判 undefined → 求默认值」顺序提前走一遍。只对**安全默认值**
+        // (仅引用未解析名或常量)生效;命中 unresolvable 默认值 → 调用时抛 ReferenceError
+        // (规范 FunctionDeclarationInstantiation 在 [[Call]] 阶段求默认值,`g([undefined])`
+        // 对 `[a=unresolvable]` 须同步抛)。成功路径只把外层默认值写回临时槽、不绑定——
+        // 体内惰性绑定照旧,数组/字符串/对象源可重迭代,无观测副作用。
+        const eagerSlots = this.emitGenStubEagerDefaults(bodyLabel, capturedNames);
+        if (eagerSlots) {
+            // 探针结果回填 A0-A4:简单标识符参数的默认值已求好(体见非 undefined 即跳过
+            // 默认,天然避免双重求值);解构参数的外层默认值已写回,体内再解构同一值。
+            for (let i = 0; i < eagerSlots.length; i++) {
+                vm.load(vm.getArgReg(i), VReg.FP, eagerSlots[i]);
+            }
+        }
         vm.mov(VReg.S3, VReg.A5);  // S3 = this(A5);callee-saved,survives _generator_new
         // 先把 2-5 号实参压栈(4 个=32B,16 对齐),随后覆盖 A0/A1/A2 供 _generator_new
         vm.push(VReg.A1);
@@ -332,8 +476,252 @@ export const AsyncCompiler = {
         vm.store(VReg.V6, 120, VReg.A2);
         vm.store(VReg.V6, 128, VReg.A3);
         vm.store(VReg.V6, 136, VReg.A4);
-        vm.epilogue([VReg.S3], 0); // ret：返回 genobj；恢复 S3
+        // 栈尺寸须与 prologue(8192) 配对(epilogue 用 stackSize 恢复 SP;0 会令 SP 停在
+        // 帧中段 → ret 从错误地址取返回地址 → 调用生成器函数即崩)。
+        vm.epilogue([VReg.S3], 8192); // ret：返回 genobj；恢复 S3
         vm.label(bodyLabel);
+    },
+
+    // [L2-②] 生成器/async-gen 参数默认值 eager 探针入口:在 stub 入口把 A0-A4 实参落临时
+    // 槽,再对每个解构/默认形参跑默认值探针。返回临时槽偏移数组(与形参一一对应),或
+    // null(无探针可发/无解构参数)。临时槽只在 stub 帧内使用,调用方随后回填寄存器。
+    emitGenStubEagerDefaults(bodyLabel, capturedNames) {
+        const params = this._genStubParams(bodyLabel);
+        if (!params || params.length === 0) return null;
+        // 保存/恢复 ctx 栈状态:探针在 stub 帧内分配临时槽,不得污染外层(生成器定义处)
+        // 的 locals/stackOffset —— 外层函数后续语句的槽位分配必须不受影响。
+        const savedStackOffset = this.ctx.stackOffset;
+        const savedLocals = this.ctx.locals;
+        const savedBoxed = this.ctx.boxedVars;
+        const savedVarTypes = this.ctx.varTypes;
+        const savedCtx = this.ctx;
+        this.ctx.stackOffset = 0;
+        this.ctx.locals = {};
+        this.ctx.boxedVars = new Set();
+        this.ctx.varTypes = {};
+        const vm = this.vm;
+        const n = Math.min(params.length, 5);
+        // 收集本函数全部形参绑定名:默认值若引用**同函数其它形参**(`[b=a]` 引用前参 a),
+        // 探针帧里没绑 a → 求值会错抛 ReferenceError。这些名一律视为不可探针安全。
+        const boundNames = {};
+        for (let i = 0; i < params.length; i++) {
+            collectPatternNames(params[i], boundNames);
+        }
+        // 闭包捕获名同样不可探针安全:生成器体经 S0 闭包捕获它们(如 `function make(){
+        // const v=42; return function*([a=v]){…} }`),探针帧没有闭包捕获 → 把 v 误判为
+        // unresolvable → 错抛 ReferenceError(零误拒违规)。顶层声明/类方法无捕获 → 空数组。
+        if (capturedNames) {
+            for (let i = 0; i < capturedNames.length; i++) {
+                const cn = capturedNames[i];
+                if (cn && typeof cn === "string") boundNames[cn] = true;
+            }
+        }
+        // 安全判定须用**外层原 ctx**(生成器定义处作用域):重置后的探针帧 locals 为空,
+        // 会把顶层 var/外层局部误判为 unresolvable → 探针求值错抛。safeFn 判定时临时切回
+        // 原 ctx(编译期调用,仅影响本方法内的解析,不发指令)。
+        const safeFn = (e) => {
+            const c = this.ctx;
+            this.ctx = savedCtx;
+            let r;
+            try { r = this._isEagerProbeSafe(e, boundNames); }
+            finally { this.ctx = c; }
+            return r;
+        };
+        const slots = [];
+        for (let i = 0; i < n; i++) {
+            const off = this.ctx.allocLocal(`__stubarg_${i}`);
+            vm.store(VReg.FP, off, vm.getArgReg(i));
+            slots.push(off);
+        }
+        for (let i = 0; i < n; i++) {
+            const p = params[i];
+            if (!p) continue;
+            let pat = p, dflt = null;
+            if (p.type === "AssignmentPattern") {
+                // 外层默认值:undefined → 求默认值(若安全),结果写回槽供内层探针/回填用
+                dflt = p.right;
+                pat = p.left;
+                if (dflt && safeFn(dflt)) {
+                    const skip = this.ctx.newLabel("stub_odflt_skip");
+                    const chkReg = vm.backend.name === "x64" ? VReg.V5 : VReg.V1;
+                    const undReg = vm.backend.name === "x64" ? VReg.V6 : VReg.V2;
+                    vm.load(chkReg, VReg.FP, slots[i]);
+                    vm.movImm64(undReg, 0x7ffb000000000000n); // JS_UNDEFINED
+                    vm.cmp(chkReg, undReg);
+                    vm.jne(skip);
+                    this.compileExpression(dflt);
+                    vm.store(VReg.FP, slots[i], VReg.RET);
+                    vm.label(skip);
+                }
+            } else if (p.type === "SpreadElement" || p.type === "RestElement") {
+                continue; // rest 参数不探针(收集逻辑在体内,无默认值)
+            }
+            if (pat && (pat.type === "ObjectPattern" || pat.type === "ArrayPattern")) {
+                this.emitGenStubDefaultProbes(pat, slots[i], boundNames, safeFn);
+            }
+        }
+        this.ctx.stackOffset = savedStackOffset;
+        this.ctx.locals = savedLocals;
+        this.ctx.boxedVars = savedBoxed;
+        this.ctx.varTypes = savedVarTypes;
+        return slots;
+    },
+
+    // [L2-②] 递归默认值探针:按 pattern 的读取顺序,对每个带默认值(且默认值安全)的绑定位
+    // 发「读源值 → 判 undefined → 求默认值」序列。源是数组/字符串/对象(可重读)时才探针,
+    // 自定义迭代器/未装箱对象跳过 —— 探针用下标/属性读不消费迭代器,自定义迭代器须留给
+    // 体内惰性绑定(重复消费会错值,零误拒)。嵌套 pattern 递归(临时槽落本 stub 帧)。
+    emitGenStubDefaultProbes(pattern, srcSlot, boundNames, safeFn) {
+        const vm = this.vm;
+        if (!pattern) return;
+        if (pattern.type === "ObjectPattern") {
+            const props = pattern.properties || [];
+            for (const p of props) {
+                if (!p || p.type === "SpreadElement" || p.type === "RestElement") continue;
+                let target = p.value, dflt = null;
+                if (p.value && p.value.type === "AssignmentPattern") {
+                    target = p.value.left;
+                    dflt = p.value.right;
+                }
+                // 无默认值且无嵌套 pattern → 无可探针内容,整条跳过(免多余 tag 检查)
+                const hasInner = target && (target.type === "ObjectPattern" || target.type === "ArrayPattern");
+                if (!(dflt && safeFn(dflt)) && !hasInner) continue;
+                // 计算键 prop:键表达式可能引用外层变量/有副作用,探针帧求值不可靠 → 跳过
+                // (缺该 prop 的默认值提前触发,但绝不误抛;失败用例均用静态键)
+                if (p.computed) continue;
+                // 源必须是装箱对象才探针(对象解构读属性;数组/字符串不是对象,跳过)
+                const okL = this.ctx.newLabel("stub_obj_ok");
+                const skipL = this.ctx.newLabel("stub_obj_skip");
+                vm.load(VReg.V0, VReg.FP, srcSlot);
+                vm.shrImm(VReg.V1, VReg.V0, 48);
+                vm.cmpImm(VReg.V1, 0x7FFD);
+                vm.jeq(okL);
+                vm.jmp(skipL);
+                vm.label(okL);
+                const keyName = p.key && (p.key.name || p.key.value);
+                if (!keyName) { vm.jmp(skipL); continue; }
+                vm.load(VReg.A0, VReg.FP, srcSlot);
+                this.emitBoxedStringKey(keyName, VReg.A1);
+                vm.call("_object_get");
+                if (dflt && safeFn(dflt)) {
+                    const dfltL = this.ctx.newLabel("stub_dflt");
+                    const doneL = this.ctx.newLabel("stub_done");
+                    vm.cmpImm(VReg.RET, 0);
+                    vm.jeq(dfltL);
+                    vm.shrImm(VReg.V1, VReg.RET, 48);
+                    vm.cmpImm(VReg.V1, 0x7FFB); // tagged undefined
+                    vm.jeq(dfltL);
+                    vm.jmp(doneL);
+                    vm.label(dfltL);
+                    this.compileExpression(dflt); // 未解析名 → ReferenceError
+                    vm.label(doneL);
+                }
+                if (target && (target.type === "ObjectPattern" || target.type === "ArrayPattern")) {
+                    const subOff = this.ctx.allocLocal(`__stubsub_${this.nextLabelId()}`);
+                    vm.store(VReg.FP, subOff, VReg.RET);
+                    this.emitGenStubDefaultProbes(target, subOff, boundNames, safeFn);
+                }
+                vm.label(skipL);
+            }
+            return;
+        }
+        if (pattern.type === "ArrayPattern") {
+            const els = pattern.elements || [];
+            // 先统计是否有可探针内容;无 → 整条跳过(免多余 tag 检查/下标读)
+            let hasProbe = false;
+            for (let ei = 0; ei < els.length; ei++) {
+                const el = els[ei];
+                if (!el || el.type === "SpreadElement" || el.type === "RestElement") continue;
+                const target = el.type === "AssignmentPattern" ? el.left : el;
+                const dflt = el.type === "AssignmentPattern" ? el.right : null;
+                if (dflt && safeFn(dflt)) { hasProbe = true; break; }
+                if (target && (target.type === "ObjectPattern" || target.type === "ArrayPattern")) { hasProbe = true; break; }
+            }
+            if (!hasProbe) return;
+            // 源必须是数组/字符串才探针(下标读;自定义迭代器跳过)
+            const okL = this.ctx.newLabel("stub_ary_ok");
+            const skipL = this.ctx.newLabel("stub_ary_skip");
+            vm.load(VReg.V0, VReg.FP, srcSlot);
+            vm.shrImm(VReg.V1, VReg.V0, 48);
+            vm.cmpImm(VReg.V1, 0x7FFE); // array
+            vm.jeq(okL);
+            vm.cmpImm(VReg.V1, 0x7FFC); // string
+            vm.jeq(okL);
+            vm.jmp(skipL);
+            vm.label(okL);
+            for (let ei = 0; ei < els.length; ei++) {
+                const el = els[ei];
+                if (!el) continue;
+                if (el.type === "SpreadElement" || el.type === "RestElement") continue;
+                let target = el, dflt = null;
+                if (el.type === "AssignmentPattern") {
+                    target = el.left;
+                    dflt = el.right;
+                }
+                vm.load(VReg.A0, VReg.FP, srcSlot);
+                vm.movImm(VReg.A1, ei);
+                vm.call("_subscript_get");
+                if (dflt && safeFn(dflt)) {
+                    const dfltL = this.ctx.newLabel("stub_dflt");
+                    const doneL = this.ctx.newLabel("stub_done");
+                    vm.cmpImm(VReg.RET, 0);
+                    vm.jeq(dfltL);
+                    vm.shrImm(VReg.V1, VReg.RET, 48);
+                    vm.cmpImm(VReg.V1, 0x7FFB);
+                    vm.jeq(dfltL);
+                    vm.jmp(doneL);
+                    vm.label(dfltL);
+                    this.compileExpression(dflt);
+                    vm.label(doneL);
+                }
+                if (target && (target.type === "ObjectPattern" || target.type === "ArrayPattern")) {
+                    const subOff = this.ctx.allocLocal(`__stubsub_${this.nextLabelId()}`);
+                    vm.store(VReg.FP, subOff, VReg.RET);
+                    this.emitGenStubDefaultProbes(target, subOff, boundNames, safeFn);
+                }
+            }
+            vm.label(skipL);
+            return;
+        }
+        // 其它形参形态(Identifier / 其它)无内层默认值,不探针
+    },
+
+    // [L2-②] 默认值表达式是否可安全地 eager 探针求值:表达式里**所有**标识符要么是
+    // 未解析名(compileIdentifier 将抛 ReferenceError,正是要提前触发的错误),要么是
+    // 内建常量字面量(undefined/null/NaN/Infinity,编译期即可求值,双重求值无副作用)。
+    // 保守优先:任何引用可解析名(局部/参数/捕获的外层变量/函数)的默认值都返回 false
+    // —— 探针求值它们会读到错误的值(探针帧无闭包捕获),宁可不探针(体内惰性绑定正确),
+    // 绝不错抛/错值(零误拒)。
+    _isEagerProbeSafe(expr, boundNames) {
+        if (!expr) return true;
+        if (expr.type === "Identifier") {
+            if (expr.name === "undefined" || expr.name === "null" ||
+                expr.name === "NaN" || expr.name === "Infinity") return true;
+            // 同函数形参名:探针帧没绑它们 → 求值会错抛,不可探针
+            if (boundNames && Object.prototype.hasOwnProperty.call(boundNames, expr.name)) return false;
+            if (this.isUnresolvableIdentifier && this.isUnresolvableIdentifier(expr)) return true;
+            return false;
+        }
+        if (expr.type === "Literal" || expr.type === "NumericLiteral" ||
+            expr.type === "StringLiteral" || expr.type === "BooleanLiteral" ||
+            expr.type === "RegExpLiteral" || expr.type === "NullLiteral") return true;
+        for (const k in expr) {
+            if (k === "type" || k === "loc" || k === "range" || k === "start" || k === "end") continue;
+            // 对象字面量的非计算键不是引用
+            if (expr.type === "Property" && k === "key" && !expr.computed) continue;
+            if (expr.type === "MemberExpression" && k === "property" && !expr.computed) continue;
+            const v = expr[k];
+            if (v && typeof v === "object") {
+                if (Array.isArray(v)) {
+                    for (let i = 0; i < v.length; i++) {
+                        if (!this._isEagerProbeSafe(v[i], boundNames)) return false;
+                    }
+                } else {
+                    if (!this._isEagerProbeSafe(v, boundNames)) return false;
+                }
+            }
+        }
+        return true;
     },
 
     // [FDI 提前·发射] 在生成器 stub 入口(建协程/生成器对象之前)发解构参数的 null/undefined

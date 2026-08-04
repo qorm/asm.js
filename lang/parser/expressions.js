@@ -4,6 +4,7 @@
 import { TokenType } from "../lexer/token.js";
 import * as AST from "./ast.js";
 import { Precedence } from "./precedence.js";
+import { validateRegexLiteral } from "./regexp-validate.js";
 
 // 表达式解析混入
 export const ExpressionParser = {
@@ -51,6 +52,24 @@ export const ExpressionParser = {
 
     parseIdentifier() {
         const ident = new AST.Identifier(this.curToken.literal);
+        // [W-P9] 裸私有名引用(`#x in o` 品牌检查等;词法已把 `#x` 合并为单个 IDENT)。
+        // 收集进引用表供类体收尾校验;类体外(classDepth===0)留既有缺口不处理。
+        if (this.classDepth > 0 && this.curToken.literal && this.curToken.literal.charAt(0) === "#") {
+            this._recordPrivateRef(this.curToken.literal);
+        }
+        // [Wave 8] 字段初始化器 ContainsArguments:init 上下文(穿透箭头)内 `arguments`
+        // 标识符引用是早期错误(函数边界已复位 _inFieldInit)。
+        if (this._inFieldInit && this.curToken.literal === "arguments") {
+            this.errors.push(`'arguments' is not allowed in class field initializer at line ${this.curToken.line}`);
+        }
+        // [Wave 8] yield/await 作标识符引用(仅转义形态 yield/await 落此路径;未转义
+        // 走 YIELD/AWAIT 记号)在生成器/异步函数内是早期错误。绑定位由 checkYieldAwaitBinding 覆盖。
+        if (this.fnGenDepth > 0 && this.curToken.literal === "yield") {
+            this.errors.push("Cannot use 'yield' as an identifier in a generator");
+        }
+        if (this.fnAsyncDepth > 0 && this.curToken.literal === "await") {
+            this.errors.push("Cannot use 'await' as an identifier in an async function");
+        }
         // 检查是否是无括号单参数箭头函数: x => expr
         if (this.peekTokenIs(TokenType.ARROW)) {
             this.nextToken(); // 消费 =>
@@ -166,6 +185,12 @@ export const ExpressionParser = {
         }
         const pattern = raw.substring(1, lastSlash);
         const flags = raw.substring(lastSlash + 1);
+        // [Wave 8] 解析时早期错误校验:非法 flags、u/v 模式下 \p{}/\P{} 属性转义结构/名称、
+        // 量词花括号、类内 \p{} 作范围端点等 → 记 SyntaxError(与 Node 对拍,零误拒见台账)。
+        const regexErr = validateRegexLiteral(pattern, flags);
+        if (regexErr !== null) {
+            this.errors.push("SyntaxError: " + regexErr + " in regular expression at line " + this.curToken.line + ":" + this.curToken.column);
+        }
         return new AST.RegexLiteral(pattern, flags, raw);
     },
 
@@ -179,11 +204,14 @@ export const ExpressionParser = {
     // String.raw`...` 特化:脱糖为 raw quasi 与表达式的字符串拼接,不依赖数组 .raw,可用。
     parseTaggedTemplate(tag) {
         let tpl;
+        // [Wave 8 续] tagged 模板不校验转义:tag`\9` / String.raw`\9` raw 原样合法。
+        this._taggedTemplate = this._taggedTemplate + 1;
         if (this.curToken.type === TokenType.TEMPLATE_STRING) {
             tpl = this.parseTemplateLiteral();
         } else {
             tpl = this.parseTemplateLiteralWithExpressions();
         }
+        this._taggedTemplate = this._taggedTemplate - 1;
         if (!tpl) return null;
         const quasis = tpl.quasis || [];
         const exprs = tpl.expressions || [];
@@ -223,6 +251,11 @@ export const ExpressionParser = {
     },
 
     parseTemplateLiteral() {
+        // [Wave 8 续] 裸模板非法转义校验(tagged 已跳过;tag`\9` 合法)。
+        if (this._taggedTemplate === 0) {
+            const tplErr = this._validateTemplateRaw(this.curToken.templateRaw);
+            if (tplErr !== null) this.errors.push(tplErr + " at line " + this.curToken.line);
+        }
         let quasi = {
             type: "TemplateElement",
             value: { raw: this.curToken.literal, cooked: this.curToken.literal, rawText: this.curToken.templateRaw },
@@ -231,10 +264,67 @@ export const ExpressionParser = {
         return new AST.TemplateLiteral([quasi], []);
     },
 
+    // [Wave 8 续] 裸模板转义序列校验(Node 对拍):\8/\9、\1-\7、\0 后随数字(legacy 八进制)、
+    // 坏 \uXXXX/\u{…}/\xHH 一律 SyntaxError;tagged 模板跳过(parseTaggedTemplate 置深度)。
+    // 返回错误消息或 null。
+    _validateTemplateRaw(raw) {
+        if (!raw) return null;
+        const n = raw.length;
+        for (let i = 0; i < n; i++) {
+            if (raw.charAt(i) !== "\\") continue;
+            const c = raw.charAt(i + 1);
+            if (c === "u") {
+                if (raw.charAt(i + 2) === "{") {
+                    let j = i + 3;
+                    let any = false;
+                    while (j < n && raw.charAt(j) !== "}") {
+                        if (!this._isHexDigit(raw.charAt(j))) return "Invalid Unicode escape sequence in template literal";
+                        any = true;
+                        j = j + 1;
+                    }
+                    if (!any || j >= n) return "Invalid Unicode escape sequence in template literal";
+                    i = j;
+                } else {
+                    for (let k = 1; k <= 4; k++) {
+                        if (!this._isHexDigit(raw.charAt(i + 1 + k))) return "Invalid Unicode escape sequence in template literal";
+                    }
+                    i = i + 5;
+                }
+            } else if (c === "x") {
+                for (let k = 1; k <= 2; k++) {
+                    if (!this._isHexDigit(raw.charAt(i + 1 + k))) return "Invalid hex escape sequence in template literal";
+                }
+                i = i + 3;
+            } else if (c >= "0" && c <= "9") {
+                if (c === "8" || c === "9") return "Invalid octal escape sequence in template literal";
+                if (c === "0") {
+                    if (this._isDigitChar(raw.charAt(i + 2))) return "Invalid octal escape sequence in template literal";
+                    i = i + 1;
+                } else {
+                    return "Invalid octal escape sequence in template literal";
+                }
+            } else {
+                i = i + 1;   // \n \\ \' 等合法转义
+            }
+        }
+        return null;
+    },
+    _isHexDigit(c) {
+        return (c >= "0" && c <= "9") || (c >= "a" && c <= "f") || (c >= "A" && c <= "F");
+    },
+    _isDigitChar(c) {
+        return c >= "0" && c <= "9";
+    },
+
     parseTemplateLiteralWithExpressions() {
         let quasis = [];
         let expressions = [];
 
+        // [Wave 8 续] 裸模板非法转义校验(tagged 已跳过)。
+        if (this._taggedTemplate === 0) {
+            const tplErr = this._validateTemplateRaw(this.curToken.templateRaw);
+            if (tplErr !== null) this.errors.push(tplErr + " at line " + this.curToken.line);
+        }
         let firstQuasi = {
             type: "TemplateElement",
             value: { raw: this.curToken.literal, cooked: this.curToken.literal, rawText: this.curToken.templateRaw },
@@ -257,6 +347,11 @@ export const ExpressionParser = {
                 value: { raw: this.curToken.literal, cooked: this.curToken.literal, rawText: this.curToken.templateRaw },
                 tail: this.curToken.type === TokenType.TEMPLATE_TAIL,
             };
+            // [Wave 8 续] 中段/尾段 quasi 同样校验(tagged 已跳过)。
+            if (this._taggedTemplate === 0) {
+                const qErr = this._validateTemplateRaw(this.curToken.templateRaw);
+                if (qErr !== null) this.errors.push(qErr + " at line " + this.curToken.line);
+            }
             quasis.push(quasi);
 
             if (this.curToken.type === TokenType.TEMPLATE_TAIL) {
@@ -293,6 +388,19 @@ export const ExpressionParser = {
         if (operator === "delete" && arg && arg.type === "Identifier" && this.inStrictMode()) {
             this.errors.push(`Delete of an unqualified identifier in strict mode at line ${opLine}:${opColumn}`);
         }
+        // [Wave 8] `delete` 私有名成员引用(最终访问是 .#name)恒为早期错误,与声明与否无关:
+        // delete o.#x / delete (g()).#m / delete this.#m。`delete o.#x.y`/`delete o.#x[0]`/
+        // `delete this.#m()` 的操作数最终属性非私有名,仍合法(Node 对拍)。
+        if (operator === "delete" && arg && arg.type === "MemberExpression" &&
+            arg.property && arg.property.type === "PrivateIdentifier") {
+            this.errors.push(`Private fields can not be deleted at line ${opLine}:${opColumn}`);
+        }
+        // [Wave 8] yield 不是 UnaryExpression:生成器内 `void yield`/`typeof yield`/`!yield`/
+        // `delete yield` 等一元操作数位是早期错误(Node 对拍)。await 是 UnaryExpression(`void await x`
+        // 合法),不入此查。
+        if (this.fnGenDepth > 0 && arg && arg.type === "YieldExpression") {
+            this.errors.push(`'yield' cannot be used as the operand of '${operator}' in a generator at line ${opLine}:${opColumn}`);
+        }
         return new AST.UnaryExpression(operator, arg, true);
     },
 
@@ -310,6 +418,10 @@ export const ExpressionParser = {
         let operator = this.curToken.literal;
         this.nextToken();
         const arg = this.parseExpression(Precedence.PREFIX);
+        // [Wave 8] 生成器内 `++yield`/`--yield`:yield 不能作自增自减操作数。
+        if (this.fnGenDepth > 0 && arg && arg.type === "YieldExpression") {
+            this.errors.push(`'yield' cannot be used as the operand of '${operator}' in a generator`);
+        }
         this.checkAssignmentTarget(arg, false);   // [test262 S1] ++/-- 左值校验(不允许模式)
         return new AST.UpdateExpression(operator, arg, true);
     },
@@ -949,8 +1061,18 @@ export const ExpressionParser = {
                 properties.push(new AST.Property(key, val, "init", computed, true));
             } else if (this.peekTokenIs(TokenType.LPAREN)) {
                 this.nextToken();
+                // [Wave 8] 对象方法亦为函数/生成器/异步边界:置生成器/异步深度与复位字段上下文。
+                if (isGenMethod) this.fnGenDepth++;
+                if (isAsyncMethod) this.fnAsyncDepth++;
+                const prevInFieldInitM = this._inFieldInit;
+                this._inFieldInit = false;
                 let params = this.parseFunctionParams();
-                if (!this.expectPeek(TokenType.LBRACE)) return null;
+                if (!this.expectPeek(TokenType.LBRACE)) {
+                    if (isGenMethod) this.fnGenDepth--;
+                    if (isAsyncMethod) this.fnAsyncDepth--;
+                    this._inFieldInit = prevInFieldInitM;
+                    return null;
+                }
                 // [test262 早期错误 B] 对象字面量方法(含 get/set/async/generator 简写)带显式
                 // "use strict" 指令时,形参必须是简单形参列表。cur=`{`,peek=体首 token。
                 let isStrict = this.peekUseStrictDirective();
@@ -958,6 +1080,9 @@ export const ExpressionParser = {
                 this.checkInheritedStrictParams(params, isStrict);   // [test262 早期错误 C] 继承 strict 重参
                 let body = this.parseBlockStatement();
                 if (isStrict) this.fnStrictDepth--;
+                if (isGenMethod) this.fnGenDepth--;
+                if (isAsyncMethod) this.fnAsyncDepth--;
+                this._inFieldInit = prevInFieldInitM;
                 {
                     const mfn = new AST.FunctionExpression(null, params, body, isAsyncMethod, isGenMethod);
                     mfn.async = isAsyncMethod;
@@ -1000,6 +1125,10 @@ export const ExpressionParser = {
         }
         // [test262 S1] 生成器深度:yield 作绑定名在此函数体内是早期错误(所有返回路径须配对减)
         if (isGenerator) this.fnGenDepth++;
+        // [Wave 8] 函数边界:字段初始化器上下文在函数表达式内复位(自有 arguments / 无
+        // home object),所有返回路径须恢复,故每处 return 前配对。
+        const prevInFieldInit = this._inFieldInit;
+        this._inFieldInit = false;
         // 命名函数表达式 function g(...) {}:先看名字。此前先 expectPeek(LPAREN),命名
         // 形式(peek=IDENT)会误 push "expected (" 假错误——虽随后正确解析,残留错误仍致
         // "Syntax errors" 编译失败(named function expression COMPILE_FAIL 根因)。
@@ -1007,26 +1136,28 @@ export const ExpressionParser = {
             this.nextToken();
             this.checkReservedBinding(this.curToken.literal);   // [test262 早期错误 A] 函数名保留字
             let id = new AST.Identifier(this.curToken.literal);
-            if (!this.expectPeek(TokenType.LPAREN)) { if (isGenerator) this.fnGenDepth--; return null; }
+            if (!this.expectPeek(TokenType.LPAREN)) { if (isGenerator) this.fnGenDepth--; this._inFieldInit = prevInFieldInit; return null; }
             let params = this.parseFunctionParams();
-            if (!this.expectPeek(TokenType.LBRACE)) { if (isGenerator) this.fnGenDepth--; return null; }
+            if (!this.expectPeek(TokenType.LBRACE)) { if (isGenerator) this.fnGenDepth--; this._inFieldInit = prevInFieldInit; return null; }
             let isStrict = this.peekUseStrictDirective();
             if (isStrict) { this.fnStrictDepth++; this.checkStrictParams(params); }
             this.checkInheritedStrictParams(params, isStrict);   // [test262 早期错误 C] 继承 strict 重参
             let body = this.parseBlockStatement();
             if (isStrict) this.fnStrictDepth--;
             if (isGenerator) this.fnGenDepth--;
+            this._inFieldInit = prevInFieldInit;
             return new AST.FunctionExpression(id, params, body, isAsync, isGenerator);
         }
-        if (!this.expectPeek(TokenType.LPAREN)) { if (isGenerator) this.fnGenDepth--; return null; }
+        if (!this.expectPeek(TokenType.LPAREN)) { if (isGenerator) this.fnGenDepth--; this._inFieldInit = prevInFieldInit; return null; }
         let params = this.parseFunctionParams();
-        if (!this.expectPeek(TokenType.LBRACE)) { if (isGenerator) this.fnGenDepth--; return null; }
+        if (!this.expectPeek(TokenType.LBRACE)) { if (isGenerator) this.fnGenDepth--; this._inFieldInit = prevInFieldInit; return null; }
         let isStrict = this.peekUseStrictDirective();
         if (isStrict) { this.fnStrictDepth++; this.checkStrictParams(params); }
         this.checkInheritedStrictParams(params, isStrict);   // [test262 早期错误 C] 继承 strict 重参
         let body = this.parseBlockStatement();
         if (isStrict) this.fnStrictDepth--;
         if (isGenerator) this.fnGenDepth--;
+        this._inFieldInit = prevInFieldInit;
         return new AST.FunctionExpression(null, params, body, isAsync, isGenerator);
     },
 
@@ -1070,6 +1201,11 @@ export const ExpressionParser = {
     },
 
     parseSuperExpression() {
+        // [Wave 8] 字段初始化器 ContainsSuperCall:init 上下文(穿透箭头)内 `super(...)`
+        // 是早期错误;`super.prop` 属性访问合法(Node 对拍)。函数边界已复位 _inFieldInit。
+        if (this._inFieldInit && this.peekTokenIs(TokenType.LPAREN)) {
+            this.errors.push(`super() is not allowed in a class field initializer at line ${this.curToken.line}`);
+        }
         return new AST.SuperExpression();
     },
 
@@ -1150,6 +1286,8 @@ export const ExpressionParser = {
                 );
                 return null;
             }
+            // [W-P9] 记录私有名引用,供类体收尾统一做未绑定检查。
+            this._recordPrivateRef(name);
             return new AST.MemberExpression(object, new AST.PrivateIdentifier(name), false, false);
         }
         return new AST.MemberExpression(object, new AST.Identifier(this.curToken.literal), false, false);
