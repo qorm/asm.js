@@ -479,6 +479,19 @@ export const BuiltinMethodCompiler = {
                 }
                 return true;
 
+            case "search":
+                // str.search(regexp) → index or -1._str_search 内检测 RegExp/string 分派
+                if (args.length > 0) {
+                    this.compileExpression(args[0]);
+                    this.vm.mov(VReg.A1, VReg.RET);
+                } else {
+                    this.vm.lea(VReg.A1, "_str_empty");
+                }
+                this.vm.pop(VReg.A0);
+                this.vm.call("_str_search");
+                this.boxIntAsNumber(VReg.RET); // 装箱裸 int→JS Number
+                return true;
+
             case "split":
                 // str.split() —— 无分隔符(或 undefined):返回 [str](整串单元素),
                 // **非**逐字符切(那是 split("") 的语义)。此前无参落 _str_empty → 误逐字符切。

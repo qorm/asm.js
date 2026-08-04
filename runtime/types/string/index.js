@@ -5105,7 +5105,7 @@ export class StringGenerator {
         vm.mov(VReg.A0, VReg.S0); // this string
         vm.mov(VReg.A1, VReg.S1); // arg (indexOf 自行 ToString)
         vm.movImm(VReg.A2, 0);    // fromIndex = 0
-        vm.call("_str_indexOf");
+        vm.call("_str_indexOf");  // RET = 裸 int(index or -1),同 indexOf
         vm.label("_sr_done");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
     }
