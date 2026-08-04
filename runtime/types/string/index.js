@@ -4308,6 +4308,31 @@ export class StringGenerator {
         vm.movImm64(VReg.V1, 0x7ffb000000000000n);
         vm.cmp(VReg.S1, VReg.V1);
         vm.jeq("_split_undef_sep");
+        // [L3] RegExp separator:高16=0,堆内,type@0==TYPE_REGEXP(8)→委托 _regexp_split
+        {
+            const splitReNot = "_split_re_not";
+            vm.shrImm(VReg.V1, VReg.S1, 48);
+            vm.cmpImm(VReg.V1, 0);
+            vm.jne(splitReNot);
+            vm.cmpImm(VReg.S1, 0);
+            vm.jeq(splitReNot);
+            vm.lea(VReg.V1, "_heap_base"); vm.load(VReg.V1, VReg.V1, 0);
+            vm.cmp(VReg.S1, VReg.V1); vm.jb(splitReNot);
+            vm.lea(VReg.V1, "_heap_ptr"); vm.load(VReg.V1, VReg.V1, 0);
+            vm.cmp(VReg.S1, VReg.V1); vm.jae(splitReNot);
+            vm.loadByte(VReg.V1, VReg.S1, 0);
+            vm.cmpImm(VReg.V1, 8); // TYPE_REGEXP
+            vm.jne(splitReNot);
+            // 提取 str content 指针(调用 _getStrContent)
+            vm.mov(VReg.A0, VReg.S0);
+            vm.call("_getStrContent");
+            vm.mov(VReg.A1, VReg.RET); // A1 = str_ptr
+            vm.mov(VReg.A0, VReg.S1); // A0 = re_ptr
+            vm.movImm64(VReg.A2, 0xffffffffn); // large limit
+            vm.call("_regexp_split");
+            vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 96);
+            vm.label(splitReNot);
+        }
         // 其余非串 separator 走 ToString(split(null) → "null"、split(1) → "1")
         this._emitArgStrInline(VReg.S1, "_split_sep");
 
@@ -4903,6 +4928,7 @@ export class StringGenerator {
         this.generateAt();
         this.generateConcat();
         this.generateSplit();
+        this.generateStrSearch(); // [L3]
         this.generateSubstringRaw();
         // String.prototype wrapper methods (toString/valueOf for new String() objects)
         this.generateToStringWrapper();
@@ -5041,5 +5067,46 @@ export class StringGenerator {
         const vm = this.vm;
         vm.label("_str_length");
         vm.jmp("_strlen");
+    }
+
+    // _str_search(str_boxed, regexp_or_str) → 裸整数 index (未匹配 = -1)
+    // A0 = 装箱字符串(this)
+    // A1 = 装箱参数(RegExp 或 字符串)
+    generateStrSearch() {
+        const vm = this.vm;
+        vm.label("_str_search");
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        this._emitThisStringCheck("search");
+        vm.mov(VReg.S0, VReg.A0); // str
+        vm.mov(VReg.S1, VReg.A1); // arg
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_getStrContent");
+        vm.mov(VReg.S2, VReg.RET); // S2 = str_ptr
+        // [L3] RegExp 检测:高16=0,堆内,type@0==8 → _regexp_search
+        const srNotRe = "_sr_not_re";
+        vm.shrImm(VReg.V1, VReg.S1, 48);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne(srNotRe);
+        vm.cmpImm(VReg.S1, 0);
+        vm.jeq(srNotRe);
+        vm.lea(VReg.V1, "_heap_base"); vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.S1, VReg.V1); vm.jb(srNotRe);
+        vm.lea(VReg.V1, "_heap_ptr"); vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.S1, VReg.V1); vm.jae(srNotRe);
+        vm.loadByte(VReg.V1, VReg.S1, 0);
+        vm.cmpImm(VReg.V1, 8); // TYPE_REGEXP
+        vm.jne(srNotRe);
+        vm.mov(VReg.A0, VReg.S1); // re_ptr
+        vm.mov(VReg.A1, VReg.S2); // str_ptr
+        vm.call("_regexp_search");
+        vm.jmp("_sr_done");
+        vm.label(srNotRe);
+        // 非 RegExp:委托 _str_indexOf(this, arg, 0)
+        vm.mov(VReg.A0, VReg.S0); // this string
+        vm.mov(VReg.A1, VReg.S1); // arg (indexOf 自行 ToString)
+        vm.movImm(VReg.A2, 0);    // fromIndex = 0
+        vm.call("_str_indexOf");
+        vm.label("_sr_done");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
     }
 }

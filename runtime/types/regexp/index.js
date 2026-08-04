@@ -218,5 +218,84 @@ export class RegExpGenerator {
         vm.label(copyDone);
         vm.mov(VReg.RET, VReg.A0); // 返回 dest
         vm.epilogue([VReg.S0, VReg.S1], 16);
+
+        // _regexp_search(regexp_raw, string_ptr) → match index or -1
+        // A0 = RegExp 对象原始指针
+        // A1 = 输入字符串裸指针
+        // 返回: 裸整数(匹配位置,未匹配=-1)
+        vm.label("_regexp_search");
+        vm.prologue(16, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.load(VReg.A1, VReg.S0, 8); // regexp.pattern
+        vm.call("_strstr");           // RET = match ptr 或 0
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_res_found");
+        vm.movImm(VReg.RET, -1); // not found
+        vm.jmp("_res_ret");
+        vm.label("_res_found");
+        vm.sub(VReg.RET, VReg.RET, VReg.S1); // offset = matchPtr - strPtr
+        vm.label("_res_ret");
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+
+        // _regexp_split(re_ptr, str_ptr, limit_boxed) → 装箱数组
+        // A0 = RegExp 对象原始指针
+        // A1 = 输入字符串裸指针
+        // A2 = limit(装箱 JSNumber)
+        vm.label("_regexp_split");
+        vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
+        vm.mov(VReg.S0, VReg.A0); // re_ptr
+        vm.mov(VReg.S1, VReg.A1); // str_ptr
+        // 结果数组
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.mov(VReg.S2, VReg.RET); // S2 = 装箱结果数组
+        // 当前偏移 S3 = 0
+        vm.movImm(VReg.S3, 0);
+        // pattern 在 re_ptr+8; load once
+        vm.load(VReg.S4, VReg.S0, 8); // S4 = pattern 指针
+        const reSpLoop = "_respl_loop_v2";
+        const reSpDone = "_respl_done_v2";
+        const reSpPush = "_respl_push_v2";
+        vm.label(reSpLoop);
+        // 从当前偏移开始搜索: _strstr(strPtr + S3, pattern)
+        vm.mov(VReg.A0, VReg.S1);
+        vm.add(VReg.A0, VReg.A0, VReg.S3); // A0 = strPtr + offset
+        vm.mov(VReg.A1, VReg.S4);          // pattern
+        vm.call("_strstr");
+        vm.mov(VReg.V0, VReg.RET);         // V0 = match ptr or 0
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq(reSpPush);                  // no more matches → push remainder
+        // 切段 str.substr(S3, matchPtr - (strPtr + S3))
+        vm.sub(VReg.A2, VReg.V0, VReg.S1); // A2 = match absolute offset
+        vm.sub(VReg.A2, VReg.A2, VReg.S3); // A2 = len = matchOffset - currentOffset
+        vm.push(VReg.A2);                  // save len
+        vm.mov(VReg.A0, VReg.S1);          // str base
+        vm.mov(VReg.A1, VReg.S3);          // start offset
+        vm.pop(VReg.A2);                   // restore len
+        vm.call("_str_substring_raw");
+        vm.mov(VReg.A1, VReg.RET);         // 装箱段
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_array_push");
+        // 跳过匹配文本: S3 = matchOffset + patternLen
+        vm.mov(VReg.A0, VReg.S4);
+        vm.call("_strlen");               // pattern len
+        vm.sub(VReg.S3, VReg.V0, VReg.S1); // S3 = matchPtr - strPtr (= matchOffset)
+        vm.add(VReg.S3, VReg.S3, VReg.RET); // S3 = matchOffset + patternLen
+        vm.jmp(reSpLoop);
+        // push 最后一段
+        vm.label(reSpPush);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_strlen");               // total len
+        vm.mov(VReg.A1, VReg.S3);          // offset
+        vm.sub(VReg.A2, VReg.RET, VReg.S1); // len = total - offset
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_str_substring_raw");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_array_push");
+        vm.label(reSpDone);
+        vm.mov(VReg.RET, VReg.S2);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
     }
 }

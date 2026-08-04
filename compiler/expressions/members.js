@@ -65,6 +65,7 @@ const ArefMethodRef = {
         charCodeAt: ["_str_charCodeAt", 1], // Batch 2c:自归一化下标+装箱结果,直连
         // Batch 2b:经 wrapper 转裸 int 下标/fromIndex
         charAt: ["_aref_str_charAt", 1],
+        search: ["_str_search", 1],     // [L3]
         indexOf: ["_aref_str_indexOf", 1],
     },
 };
@@ -220,6 +221,7 @@ const STRING_PROTO_METHODS = [
     ["concat", "_strconcat", 1],
     ["padStart", "_str_padStart", 1], // 规范 length = 1(maxLength;fillString 为可选第二参不计)
     ["padEnd", "_str_padEnd", 1],     // 同 padStart
+    ["search", "_str_search", 1],     // [L3] 规范 length = 1(regexp)
     ["split", "_str_split", 2],       // 规范 length = 2(separator, limit)
     ["localeCompare", "_str_localeCompare", 1],
     ["indexOf", "_aref_str_indexOf", 1], // aref wrapper:boxed fromIndex→raw int
