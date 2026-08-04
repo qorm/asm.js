@@ -1,6 +1,6 @@
 {
-  "generated": "2026-08-04T17:34:31.572Z",
-  "runnerSha": "83b920b940e1930acd8b3f9a1c5670954d4c7081",
+  "generated": "2026-08-04T20:20:52.922Z",
+  "runnerSha": "cdc383a167319a78cb461ff2953bb185f43796fa",
   "corpusPin": "9e61c12835c5e4a3bdba93850427e6742c4f64c4",
   "config": {
     "corpus": ".test262-corpus",
@@ -47,12 +47,12 @@
   "eligible": 32221,
   "run": 6445,
   "totals": {
-    "PASS": 3802,
-    "FAIL": 2428,
+    "PASS": 3803,
+    "FAIL": 2423,
     "COMPILE_FAIL": 66,
-    "CRASH": 149
+    "CRASH": 153
   },
-  "passRatePct": 58.99,
+  "passRatePct": 59.01,
   "byArea": {
     "built-ins/Array": {
       "PASS": 332,
@@ -115,8 +115,8 @@
       "CRASH": 15
     },
     "built-ins/String": {
-      "PASS": 86,
-      "FAIL": 150,
+      "PASS": 87,
+      "FAIL": 149,
       "COMPILE_FAIL": 2,
       "CRASH": 6
     },
@@ -134,21 +134,21 @@
     },
     "language/expressions": {
       "PASS": 1317,
-      "FAIL": 632,
+      "FAIL": 630,
       "COMPILE_FAIL": 24,
-      "CRASH": 32
+      "CRASH": 34
     },
     "language/statements": {
       "PASS": 1162,
-      "FAIL": 592,
+      "FAIL": 590,
       "COMPILE_FAIL": 26,
-      "CRASH": 43
+      "CRASH": 45
     }
   },
   "topFailPatterns": [
     {
       "pattern": "FAIL: assertion mismatch (Test262Error / wrong value)",
-      "count": 1542
+      "count": 1537
     },
     {
       "pattern": "FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)",
@@ -168,7 +168,7 @@
     },
     {
       "pattern": "CRASH: run signal SIGSEGV",
-      "count": 97
+      "count": 101
     },
     {
       "pattern": "FAIL: array contents mismatch (compareArray)",

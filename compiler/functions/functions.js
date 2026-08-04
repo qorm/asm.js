@@ -20,7 +20,7 @@ const CLOSURE_MAGIC = 0xc105;
 // 方法分派用的方法名表：**必须模块级只建一次**。原先是每次编译方法调用都在函数内重建这些
 // 数组字面量——自举编译整个编译器有约十万次方法调用 × 每次重建约十个数组 → 累积数十 GB 瞬时
 // 分配（gen1 无 GC 不回收）→ OOM 跑不出 gen2。提到模块级后每个只分配一次。
-const HOISTED_STRING_METHODS = ["toUpperCase", "toLowerCase", "charAt", "charCodeAt", "codePointAt", "trim", "slice", "substring", "substr", "indexOf", "concat", "includes", "startsWith", "endsWith", "lastIndexOf", "at", "repeat", "padStart", "padEnd", "search", "match", "split", "trimStart", "trimEnd", "trimLeft", "trimRight", "replace", "replaceAll", "normalize", "localeCompare"];
+const HOISTED_STRING_METHODS = ["toUpperCase", "toLowerCase", "charAt", "charCodeAt", "codePointAt", "trim", "slice", "substring", "substr", "indexOf", "concat", "includes", "startsWith", "endsWith", "lastIndexOf", "at", "repeat", "padStart", "padEnd", "search", "split", "trimStart", "trimEnd", "trimLeft", "trimRight", "replace", "replaceAll", "normalize", "localeCompare"];
 const HOISTED_ARRAY_METHODS = ["push", "pop", "shift", "unshift", "length", "at", "slice", "indexOf", "includes", "forEach", "map", "filter", "flatMap", "reduce", "reduceRight", "join", "reverse", "concat", "find", "findIndex", "findLast", "findLastIndex", "toSorted", "toReversed", "toSpliced", "with", "some", "every", "fill", "flat", "keys", "values", "entries", "sort", "splice", "lastIndexOf", "copyWithin"];
 const HOISTED_ARRAY_ONLY_METHODS = ["push", "pop", "shift", "unshift", "forEach", "map", "filter", "flatMap", "reduce", "reduceRight", "join", "reverse", "find", "findIndex", "findLast", "findLastIndex", "toSorted", "toReversed", "toSpliced", "with", "some", "every", "fill", "flat", "keys", "values", "entries", "sort", "splice", "copyWithin"];
 const HOISTED_AMBIGUOUS_ARR_STR = ["slice", "at", "indexOf", "includes", "concat", "lastIndexOf"];
@@ -4344,6 +4344,12 @@ export const FunctionCompiler = {
             if (objType === "String") {
                 const stringMethods = HOISTED_STRING_METHODS;
                 if (stringMethods.includes(prop.name)) {
+                    if (this.compileStringMethod(obj, prop.name, expr.arguments)) {
+                        return;
+                    }
+                }
+                // [L3] match/replace 未入 HOISTED(避 assert.match 冲突),在此特判
+                if (prop.name === "match" || prop.name === "replace") {
                     if (this.compileStringMethod(obj, prop.name, expr.arguments)) {
                         return;
                     }

@@ -4929,6 +4929,7 @@ export class StringGenerator {
         this.generateConcat();
         this.generateSplit();
         this.generateStrSearch(); // [L3]
+        this.generateStrMatch();  // [L3]
         this.generateSubstringRaw();
         // String.prototype wrapper methods (toString/valueOf for new String() objects)
         this.generateToStringWrapper();
@@ -5108,5 +5109,36 @@ export class StringGenerator {
         vm.call("_str_indexOf");  // RET = 裸 int(index or -1),同 indexOf
         vm.label("_sr_done");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
+    }
+
+    generateStrMatch() {
+        const vm = this.vm;
+        vm.label("_str_match");
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2]);
+        this._emitThisStringCheck("match");
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        // 调 _str_indexOf(this, arg, 0)
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.movImm(VReg.A2, 0);
+        vm.call("_str_indexOf");
+        // 判 >=0 → 命中
+        vm.cmpImm(VReg.RET, 0);
+        vm.jlt("_sm_null_v2");
+        // 建 [receiver] 数组
+        vm.movImm(VReg.A0, 1);
+        vm.call("_array_new_with_size");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.movImm(VReg.A1, 0);
+        vm.mov(VReg.A2, VReg.S0);
+        vm.call("_array_set");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_box_arr_r");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
+        vm.label("_sm_null_v2");
+        vm.movImm(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
     }
 }
