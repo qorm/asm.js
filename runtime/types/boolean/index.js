@@ -8,7 +8,16 @@ export class BooleanGenerator {
         this.vm = vm;
     }
 
+    generateDataSlots() {
+        const asm = this.vm.asm;
+        asm.addDataLabel("_nsobj_boolean");
+        asm.addDataQword(0);
+        asm.addDataLabel("_nsobj_boolean_proto");
+        asm.addDataQword(0);
+    }
+
     generate() {
+        this.generateDataSlots();
         this.generateBooleanNew();
         this.generateBooleanToString();
         this.generateBooleanValueOf();
@@ -36,7 +45,10 @@ export class BooleanGenerator {
         vm.call("_object_new"); // RET = raw obj ptr
         vm.mov(VReg.S1, VReg.RET); // S1 = raw obj ptr
 
-        // Step 3: proto set by caller (compiler), leave as 0 here
+        // Step 3: set proto from global slot (always present from generateDataSlots)
+        vm.lea(VReg.V3, "_nsobj_boolean_proto");
+        vm.load(VReg.V3, VReg.V3, 0); // V3 = boxed proto (0 if not yet materialized)
+        vm.store(VReg.S1, 16, VReg.V3); // obj.__proto__ = prototype
 
         // Step 4: store __boolean_value
         vm.mov(VReg.A0, VReg.S1);

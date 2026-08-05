@@ -257,16 +257,48 @@ export const ExpressionCompiler = {
 
             case "Boolean": {
                 // new Boolean(x) -> Boolean wrapper object
-                // _boolean_new handles ToBoolean + wrapper creation
+                // Inline creation matching String case pattern.
+                // Step 1: convert argument to boolean
                 if (args.length > 0) {
                     this.compileExpression(args[0]);
                 } else {
                     this.vm.movImm64(VReg.RET, 0x7FF9000000000002n);
                 }
                 this.vm.mov(VReg.A0, VReg.RET);
-                // Ensure proto slot exists in data section
+                this.vm.call("_to_boolean");
+                const bnewF = this.ctx.newLabel("_bnew_false");
+                const bnewD = this.ctx.newLabel("_bnew_done");
+                this.vm.cmpImm(VReg.RET, 0);
+                this.vm.jeq(bnewF);
+                this.vm.movImm64(VReg.RET, 0x7FF9000000000001n);
+                this.vm.jmp(bnewD);
+                this.vm.label(bnewF);
+                this.vm.movImm64(VReg.RET, 0x7FF9000000000002n);
+                this.vm.label(bnewD);
+                // RET = boxed boolean. Save to FP slot before calls.
+                const bValOff = this.ctx.allocLocal(`__bnew_val_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, bValOff, VReg.RET);
+                // Step 2: create wrapper object
+                this.vm.call("_object_new");
+                const bObjOff = this.ctx.allocLocal(`__bnew_obj_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, bObjOff, VReg.RET);
+                // Step 3: set proto from global slot (may be 0 if not yet materialized)
                 this._reEnsureSlot("_nsobj_boolean_proto");
-                this.vm.call("_boolean_new");
+                this.vm.lea(VReg.V0, "_nsobj_boolean_proto");
+                this.vm.load(VReg.V0, VReg.V0, 0);
+                this.vm.load(VReg.V1, VReg.FP, bObjOff);
+                this.vm.store(VReg.V1, 16, VReg.V0);
+                // Step 4: store __boolean_value
+                const bkLabel = this.asm.addString("__boolean_value");
+                this.vm.load(VReg.A0, VReg.FP, bObjOff);
+                this.vm.lea(VReg.A1, bkLabel);
+                this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+                this.vm.or(VReg.A1, VReg.A1, VReg.V1);
+                this.vm.load(VReg.A2, VReg.FP, bValOff);
+                this.vm.call("_object_set");
+                // Step 5: box and return
+                this.vm.load(VReg.A0, VReg.FP, bObjOff);
+                this.vm.call("_box_obj_r");
                 break;
             }
 
