@@ -531,6 +531,10 @@ export const BuiltinMethodCompiler = {
                 } else {
                     this.vm.lea(VReg.A1, "_str_empty");
                 }
+                const _ss = this.ctx.allocLocal("__ss");
+                this.vm.store(VReg.FP, _ss, VReg.A1);
+                this.emitArrayCtorObject();
+                this.vm.load(VReg.A1, VReg.FP, _ss);
                 this.vm.pop(VReg.A0);
                 this.vm.call("_str_split"); // RET = boxed 数组
                 if (args.length >= 2) {

@@ -296,6 +296,34 @@ export class RegExpGenerator {
         vm.call("_array_push");
         vm.label(reSpDone);
         vm.mov(VReg.RET, VReg.S2);
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.RET, VReg.RET, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffe000000000000n);
+        vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.mov(VReg.S3, VReg.RET);
+        vm.lea(VReg.V1, "_nsobj_array");
+        vm.load(VReg.V2, VReg.V1, 0);
+        vm.cmpImm(VReg.V2, 0);
+        vm.jne("_respl_ctor_ready");
+        vm.movImm(VReg.A0, 16);
+        vm.call("_alloc");
+        vm.movImm(VReg.V3, 0xc105);
+        vm.store(VReg.RET, 0, VReg.V3);
+        vm.lea(VReg.V3, "_array_ctor_call");
+        vm.store(VReg.RET, 8, VReg.V3);
+        vm.emitMaskLoad(VReg.V3);
+        vm.andMaskReg(VReg.V2, VReg.RET, VReg.V3);
+        vm.movImm64(VReg.V3, 0x7fff000000000000n);
+        vm.or(VReg.V2, VReg.V2, VReg.V3);
+        vm.store(VReg.V1, 0, VReg.V2);
+        vm.label("_respl_ctor_ready");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.lea(VReg.A1, this.vm.asm.addString("constructor"));
+        vm.movImm64(VReg.V3, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V3);
+        vm.mov(VReg.A2, VReg.V2);
+        vm.call("_object_set");
+        vm.mov(VReg.RET, VReg.S3);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
     }
 }

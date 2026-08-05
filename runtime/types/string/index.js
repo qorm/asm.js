@@ -4371,7 +4371,9 @@ export class StringGenerator {
     // _str_split(str, separator) -> 数组
     generateSplit() {
         const vm = this.vm;
-
+        { const dl = vm.asm.dataLabels || []; let f = false;
+          for (let i = 0; i < dl.length; i++) { if (dl[i].name === "_nsobj_array") { f = true; break; } }
+          if (!f) { vm.asm.addDataLabel("_nsobj_array"); vm.asm.addDataQword(0); } }
         vm.label("_str_split");
         vm.prologue(96, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
         this._emitThisStringCheck("split");
@@ -4479,7 +4481,7 @@ export class StringGenerator {
         vm.andMaskReg(VReg.RET, VReg.RET, VReg.V1);
         vm.movImm64(VReg.V1, 0x7ffe000000000000n);
         vm.or(VReg.RET, VReg.RET, VReg.V1);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 96);
+        vm.jmp("_split_ret");
 
         // [W-25] separator === undefined:[整串]
         vm.label("_split_undef_sep");
@@ -4490,7 +4492,7 @@ export class StringGenerator {
         vm.andMaskReg(VReg.RET, VReg.RET, VReg.V1);
         vm.movImm64(VReg.V1, 0x7ffe000000000000n);
         vm.or(VReg.RET, VReg.RET, VReg.V1);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 96);
+        vm.jmp("_split_ret");
 
         vm.label("_split_empty_sep");
         // 空分隔符：每字符一个元素。S1(装箱 sep 不再需要)复用为 str 长度。
@@ -4516,6 +4518,33 @@ export class StringGenerator {
         vm.andMaskReg(VReg.RET, VReg.S3, VReg.V1);
         vm.movImm64(VReg.V1, 0x7ffe000000000000n);
         vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.jmp("_split_ret");
+
+        vm.label("_split_ret");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.lea(VReg.V1, "_nsobj_array");
+        vm.load(VReg.V2, VReg.V1, 0);
+        vm.cmpImm(VReg.V2, 0);
+        vm.jne("_split_ctor_ready");
+        vm.movImm(VReg.A0, 16);
+        vm.call("_alloc");
+        vm.movImm(VReg.V3, 0xc105);
+        vm.store(VReg.RET, 0, VReg.V3);
+        vm.lea(VReg.V3, "_array_ctor_call");
+        vm.store(VReg.RET, 8, VReg.V3);
+        vm.emitMaskLoad(VReg.V3);
+        vm.andMaskReg(VReg.V2, VReg.RET, VReg.V3);
+        vm.movImm64(VReg.V3, 0x7fff000000000000n);
+        vm.or(VReg.V2, VReg.V2, VReg.V3);
+        vm.store(VReg.V1, 0, VReg.V2);
+        vm.label("_split_ctor_ready");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.lea(VReg.A1, this.vm.asm.addString("constructor"));
+        vm.movImm64(VReg.V3, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V3);
+        vm.mov(VReg.A2, VReg.V2);
+        vm.call("_object_set");
+        vm.mov(VReg.RET, VReg.S0);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 96);
     }
 
