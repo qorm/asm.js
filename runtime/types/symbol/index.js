@@ -39,6 +39,7 @@ export class SymbolGenerator {
         this.generateSymbolKeyFor();
         this.generateSymbolWellknown();
         this.generateSymbolValueOf();
+        this.generateSymbolDescription();
     }
 
     // 数据段槽：注册表链表头 + well-known 槽。
@@ -289,6 +290,60 @@ export class SymbolGenerator {
 
         vm.label("_svo_typeerr");
         vm.lea(VReg.A0, vm.asm.addString("Symbol.prototype.valueOf called on incompatible receiver"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+    }
+
+    // _symbol_description(this) -> boxed description string or undefined
+    generateSymbolDescription() {
+        const vm = this.vm;
+        vm.label("_symbol_description");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+
+        // Check if Symbol primitive (raw pointer, high16==0)
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_sdesc_check");
+        // Check if Symbol wrapper (0x7FFD)
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jne("_sdesc_typeerr");
+
+        // Wrapper: extract symbol from __value
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.S0, VReg.A0, VReg.V1);
+        vm.loadByte(VReg.V0, VReg.S0, 0);
+        vm.cmpImm(VReg.V0, TYPE_SYMBOL);
+        vm.jne("_sdesc_typeerr");
+        vm.load(VReg.S0, VReg.S0, 8); // desc ptr
+        vm.jmp("_sdesc_emit");
+
+        // Symbol primitive: verify and extract desc
+        vm.label("_sdesc_check");
+        vm.mov(VReg.S0, VReg.A0);
+        vm.call("_is_symbol");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_sdesc_typeerr");
+        vm.load(VReg.S0, VReg.S0, 8); // desc ptr at sym+8
+
+        // Emit description string or undefined
+        vm.label("_sdesc_emit");
+        vm.cmpImm(VReg.S0, 0);
+        vm.jeq("_sdesc_undef");
+        // Box the description string pointer
+        vm.mov(VReg.RET, VReg.S0);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+
+        vm.label("_sdesc_undef");
+        vm.movImm64(VReg.RET, 0x7ffb000000000000n); // undefined
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+
+        vm.label("_sdesc_typeerr");
+        vm.lea(VReg.A0, vm.asm.addString("Symbol.prototype.description called on incompatible receiver"));
         vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
         vm.and(VReg.A0, VReg.A0, VReg.V1);
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);

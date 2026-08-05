@@ -1506,6 +1506,19 @@ export const MemberCompiler = {
         vm.lea(VReg.V0, protoSlot);
         vm.load(VReg.A2, VReg.V0, 0);
         vm.call("_closure_prop_set");
+        // Boolean.prototype[Symbol.toStringTag] = "Boolean"
+        vm.lea(VReg.A0, "_symwk_toStringTag");
+        vm.lea(VReg.A1, this.asm.addString("Symbol.toStringTag"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_symbol_wellknown"); // RET = Symbol.toStringTag
+        vm.mov(VReg.A1, VReg.RET); // A1 = symbol key
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.A0, VReg.V0, 0); // A0 = boxed Boolean.prototype
+        vm.lea(VReg.A2, this.asm.addString("Boolean"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A2, VReg.A2, VReg.V1); // A2 = boxed "Boolean"
+        vm.call("_object_set");
         // RET = 装箱构造器
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.RET, VReg.V0, 0);
