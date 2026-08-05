@@ -1,67 +1,74 @@
 {
-  "generated": "2026-08-05T12:01:00.689Z",
-  "runnerSha": "3546499e5db72ece416d98d3dfbaec86a16fac67",
+  "generated": "2026-08-05T16:34:14.085Z",
+  "runnerSha": "718862919566ffa005604d87d9bd7a9c4e57e2da",
   "corpusPin": "9e61c12835c5e4a3bdba93850427e6742c4f64c4",
   "config": {
     "corpus": ".test262-corpus",
     "target": "macos-arm64",
     "dirs": [
-      "built-ins/Symbol"
+      "built-ins/String"
     ],
-    "stride": 1,
+    "stride": 3,
     "max": 0,
     "jobs": 4
   },
-  "discovered": 98,
+  "discovered": 1223,
   "excluded": {
     "module": 0,
-    "feature": 21,
+    "feature": 3,
     "dir": 0
   },
   "excludedFeatureCounts": {
-    "cross-realm": 19,
-    "explicit-resource-management": 2
+    "cross-realm": 3
   },
-  "eligible": 77,
-  "run": 77,
+  "eligible": 1220,
+  "run": 407,
   "totals": {
-    "PASS": 33,
-    "FAIL": 41,
-    "COMPILE_FAIL": 1,
-    "CRASH": 2
+    "PASS": 194,
+    "FAIL": 198,
+    "COMPILE_FAIL": 3,
+    "CRASH": 12
   },
-  "passRatePct": 42.86,
+  "passRatePct": 47.67,
   "byArea": {
-    "built-ins/Symbol": {
-      "PASS": 33,
-      "FAIL": 41,
-      "COMPILE_FAIL": 1,
-      "CRASH": 2
+    "built-ins/String": {
+      "PASS": 194,
+      "FAIL": 198,
+      "COMPILE_FAIL": 3,
+      "CRASH": 12
     }
   },
   "topFailPatterns": [
     {
       "pattern": "FAIL: assertion mismatch (Test262Error / wrong value)",
-      "count": 22
-    },
-    {
-      "pattern": "FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)",
-      "count": 15
+      "count": 167
     },
     {
       "pattern": "FAIL: constructor-ness reflection (isConstructor / not-a-constructor)",
-      "count": 4
+      "count": 18
     },
     {
       "pattern": "CRASH: run signal SIGSEGV",
-      "count": 1
+      "count": 9
     },
     {
-      "pattern": "CRASH: run signal SIGBUS",
-      "count": 1
+      "pattern": "FAIL: array contents mismatch (compareArray)",
+      "count": 7
+    },
+    {
+      "pattern": "FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)",
+      "count": 6
     },
     {
       "pattern": "COMPILE_FAIL: asm.js could not compile (unsupported syntax / parser gap)",
+      "count": 3
+    },
+    {
+      "pattern": "CRASH: run signal SIGBUS",
+      "count": 2
+    },
+    {
+      "pattern": "CRASH: run timeout",
       "count": 1
     }
   ]

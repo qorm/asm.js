@@ -1,59 +1,73 @@
 # asm.js test262 conformance report
 
-_Generated 2026-08-05T12:01:00.688Z — target macos-arm64_
+_Generated 2026-08-05T16:34:14.084Z — target macos-arm64_
 
 ## Headline
 
-**asm.js passes 33 / 77 = 42.86% of the run test262 subset**
+**asm.js passes 194 / 407 = 47.67% of the run test262 subset**
 (selected `language/` + core `built-ins/`), one variant per test.
 
-Of 98 discovered test files in the selected dirs, 21 were excluded up front (module=0, unsupported-feature=21, intl/staging-dir=0); 77 were eligible; 77 were actually run.
+Of 1223 discovered test files in the selected dirs, 3 were excluded up front (module=0, unsupported-feature=3, intl/staging-dir=0); 1220 were eligible; 407 were actually run (deterministic stride=3).
 
 ## Overall breakdown
 
 | class | count | % of run |
 |-------|------:|---------:|
-| PASS         | 33 | 42.86 |
-| FAIL         | 41 | 53.25 |
-| COMPILE_FAIL | 1 | 1.30 |
-| CRASH        | 2 | 2.60 |
-| **run**      | **77** | 100 |
+| PASS         | 194 | 47.67 |
+| FAIL         | 198 | 48.65 |
+| COMPILE_FAIL | 3 | 0.74 |
+| CRASH        | 12 | 2.95 |
+| **run**      | **407** | 100 |
 
 ## By area
 
 | area | run | PASS | FAIL | COMPILE_FAIL | CRASH | pass% |
 |------|----:|-----:|-----:|-------------:|------:|------:|
-| built-ins/Symbol | 77 | 33 | 41 | 1 | 2 | 42.9 |
+| built-ins/String | 407 | 194 | 198 | 3 | 12 | 47.7 |
 
 ## Excluded categories (counted, not scored)
 
 - **module flag** (ES modules as test262 expects): 0
-- **unsupported feature** (structurally out of scope, see UNSUPPORTED_FEATURES): 21
+- **unsupported feature** (structurally out of scope, see UNSUPPORTED_FEATURES): 3
 - **intl402/ + staging/ dirs**: 0
 
 Excluded-by-feature detail:
 
-- `cross-realm`: 19
-- `explicit-resource-management`: 2
+- `cross-realm`: 3
 
 ## Top failing patterns (FAIL / COMPILE_FAIL / CRASH detail strings)
 
-- **22×** FAIL: assertion mismatch (Test262Error / wrong value)
-- **15×** FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)
-- **4×** FAIL: constructor-ness reflection (isConstructor / not-a-constructor)
-- **1×** CRASH: run signal SIGSEGV
-- **1×** CRASH: run signal SIGBUS
-- **1×** COMPILE_FAIL: asm.js could not compile (unsupported syntax / parser gap)
+- **167×** FAIL: assertion mismatch (Test262Error / wrong value)
+- **18×** FAIL: constructor-ness reflection (isConstructor / not-a-constructor)
+- **9×** CRASH: run signal SIGSEGV
+- **7×** FAIL: array contents mismatch (compareArray)
+- **6×** FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)
+- **3×** COMPILE_FAIL: asm.js could not compile (unsupported syntax / parser gap)
+- **2×** CRASH: run signal SIGBUS
+- **1×** CRASH: run timeout
 
 ## Failures correlated with features (top tags among failing tests)
 
-- `Symbol`: 29
-- `Symbol.toPrimitive`: 8
-- `Symbol.prototype.description`: 5
-- `Reflect.construct`: 4
-- `arrow-function`: 4
-- `Symbol.species`: 2
-- `Symbol.toStringTag`: 1
+- `Reflect.construct`: 18
+- `arrow-function`: 17
+- `Symbol.toPrimitive`: 12
+- `string-trimming`: 12
+- `Symbol`: 11
+- `String.prototype.replaceAll`: 7
+- `Symbol.matchAll`: 6
+- `String.prototype.trimEnd`: 6
+- `Symbol.match`: 5
+- `String.prototype.matchAll`: 5
+- `Symbol.replace`: 5
+- `String.prototype.trimStart`: 5
+- `String.prototype.endsWith`: 4
+- `String.prototype.includes`: 3
+- `String.prototype.toWellFormed`: 3
+- `String.fromCodePoint`: 2
+- `Symbol.iterator`: 2
+- `computed-property-names`: 2
+- `String.prototype.isWellFormed`: 2
+- `regexp-v-flag`: 2
 
 ## Methodology / reproducibility
 
@@ -82,7 +96,7 @@ Excluded-by-feature detail:
 curl -sL -o /tmp/t262.tgz https://github.com/tc39/test262/archive/9e61c12835c5e4a3bdba93850427e6742c4f64c4.tar.gz
 mkdir -p .test262-corpus && tar xzf /tmp/t262.tgz -C .test262-corpus --strip-components=1
 # 2. run the harness
-node tests/test262/run.mjs --jobs 4 --target macos-arm64
+node tests/test262/run.mjs --stride 3 --jobs 4 --target macos-arm64
 ```
 
-_Run wall-clock: 5.6s._
+_Run wall-clock: 34.6s._

@@ -187,9 +187,15 @@ function __re_uniMatch(ti, neg, ic, cp) {
 
 // 就地解 UTF-8:返回 cp * 8 + 字节数(打包,免多返回值)。非法/截断序列按
 // 单字节字面处理(与引擎其余部分"字节串"的宽容姿态一致)。
+// 续字节(0x80-0xBF)返回高偏移哨兵:防止 0xA0 在 UTF-8 续字节位置误匹配
+// NBSP,进而误匹配 \s(如 U+180E 编码 E1 A0 8E 中 A0 字节会被当空格)。
 function __re_cpAt(s, pos, n) {
     var c = s.charCodeAt(pos);
-    if (c < 192) return c * 8 + 1;
+    // ASCII (0x00-0x7F):合法 1 字节码点
+    if (c < 128) return c * 8 + 1;
+    // 续字节(0x80-0xBF):不能作为合法序列首字节,返回超高哨兵码点
+    // (0x200000+c),远大于 0x10FFFF,绝不命中 \s/\d/\w/\p{...} 任何判据
+    if (c < 192) return (c + 2097152) * 8 + 1;
     if (c >= 240) {
         if (pos + 3 >= n) return c * 8 + 1;
         var a1 = s.charCodeAt(pos + 1);
@@ -671,7 +677,9 @@ function __re_parseAtom(st) {
         var e = __re_parseEscape(st, false);
         if (e === null) return null;
         if (e.t === 1) {
-            return { k: "cls", neg: false, items: [{ t: 1, c: e.c, lo: 0, hi: 0 }], cp: false, fi: st.mi };
+            // 类简写(\d\w\s\D\W\S)必须按**码点**匹配(非 ASCII 字符的 UTF-8 续字节
+            // 会误匹配简写判据——例如 U+180E 的 UTF-8 续字节 0xA0 会撞 NBSP)。
+            return { k: "cls", neg: false, items: [{ t: 1, c: e.c, lo: 0, hi: 0 }], cp: true, fi: st.mi };
         }
         if (e.t === 5) {
             return { k: "up", ti: e.ti, neg: e.neg, fi: st.mi };

@@ -160,34 +160,23 @@ export const BuiltinMethodCompiler = {
                 // str.substring(start[, end]) —— substring 语义:负→0、start>end 交换
                 // (≠ slice)。_str_substring(A0=boxed str, A1=start, A2=end) 内部
                 // getStrContent + clamp[0,len] + swap。接收者(装箱串)在栈顶,勿提前
-                // getStrContent(_str_substring 自行处理)。此前与 slice 共用 _str_slice
-                // 致 `"hello".substring(3,1)` 返 "" 而非交换后 "el"。
+                // getStrContent(_str_substring 自行处理)。
+                // [W-25] 参数不预转 _to_int32:保留 Infinity/NaN 原值传给运行时,
+                // _str_substring 内部用 _number_coerce + ToIntegerOrInfinity 语义处理。
                 if (args.length > 0) {
                     this.compileExpression(args[0]);
-                    if (this.vm.backend.name === "x64") this.vm.mov(VReg.A0, VReg.RET);
-                    this.vm.call("_to_int32");
-                    this.vm.movImm64(VReg.V1, 0xFFFFFFFFn);
-                    this.vm.and(VReg.RET, VReg.RET, VReg.V1);
-                    this.vm.movImm64(VReg.V1, 0x7FF8000000000000n);
-                    this.vm.or(VReg.RET, VReg.RET, VReg.V1);
-                    this.vm.push(VReg.RET); // start(boxed),压在接收者之上
+                    this.vm.push(VReg.RET); // start(raw JSValue: NaN/Inf 保留原 float bits)
                 } else {
                     this.vm.movImm64(VReg.V1, 0x7FF8000000000000n); // 0(boxed)
                     this.vm.push(VReg.V1);
                 }
                 if (args.length > 1) {
                     this.compileExpression(args[1]);
-                    if (this.vm.backend.name === "x64") this.vm.mov(VReg.A0, VReg.RET);
-                    this.vm.call("_to_int32");
-                    this.vm.movImm64(VReg.V1, 0xFFFFFFFFn);
-                    this.vm.and(VReg.RET, VReg.RET, VReg.V1);
-                    this.vm.movImm64(VReg.V1, 0x7FF8000000000000n);
-                    this.vm.or(VReg.RET, VReg.RET, VReg.V1);
-                    this.vm.mov(VReg.A2, VReg.RET);
+                    this.vm.mov(VReg.A2, VReg.RET); // end(raw JSValue)
                 } else {
                     this.vm.movImm64(VReg.A2, 0x7ffb000000000000n); // JS_UNDEFINED
                 }
-                this.vm.pop(VReg.A1); // start
+                this.vm.pop(VReg.A1); // start(raw JSValue)
                 this.vm.pop(VReg.A0); // 接收者(装箱串,未 getStrContent)
                 this.vm.call("_str_substring");
                 return true;
