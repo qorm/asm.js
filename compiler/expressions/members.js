@@ -1602,6 +1602,36 @@ export const MemberCompiler = {
             vm.movImm(VReg.A2, 0);
             vm.call("_closure_prop_set_attr");
         }
+        // Symbol.for / Symbol.keyFor as static method properties
+        const setSymProp = (name, helperLabel, arity) => {
+            this.emitBuiltinMethodRefClosure(helperLabel);
+            vm.mov(VReg.S0, VReg.RET);
+            vm.mov(VReg.A0, VReg.S0);
+            this.emitBoxedStringKey("name", VReg.A1);
+            vm.lea(VReg.A2, this.asm.addString(name));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+            vm.or(VReg.A2, VReg.A2, VReg.V1);
+            vm.call("_closure_prop_set");
+            vm.mov(VReg.A0, VReg.S0);
+            this.emitBoxedStringKey("length", VReg.A1);
+            vm.movImm(VReg.A2, arity);
+            vm.scvtf(0, VReg.A2);
+            vm.fmovToInt(VReg.A2, 0);
+            vm.call("_closure_prop_set");
+            vm.mov(VReg.A2, VReg.S0);
+            vm.lea(VReg.V0, ctorSlot);
+            vm.load(VReg.A0, VReg.V0, 0);
+            this.emitBoxedStringKey(name, VReg.A1);
+            vm.call("_closure_prop_set");
+            vm.lea(VReg.V0, ctorSlot);
+            vm.load(VReg.A0, VReg.V0, 0);
+            this.emitBoxedStringKey(name, VReg.A1);
+            vm.movImm(VReg.A2, BUILTIN_PROP_ATTR);
+            vm.call("_closure_prop_set_attr");
+        };
+        setSymProp("for", "_symbol_for", 1);
+        setSymProp("keyFor", "_symbol_keyfor", 1);
+
         // RET = 装箱构造器
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.RET, VReg.V0, 0);
