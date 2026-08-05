@@ -2494,6 +2494,29 @@ export class ArrayGenerator {
         vm.mov(VReg.A1, VReg.S0);
         vm.call("_aref_arr_at");
         vm.epilogue([VReg.S0], 0);
+
+        // Simple wrapper generators for methods that take 0 args + receiver
+        const agen0 = (label, target) => {
+            vm.label(label);
+            vm.prologue(0, [VReg.S0]);
+            vm.call("_agen_norm");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.call(target);
+            vm.epilogue([VReg.S0], 0);
+        };
+        // 1 arg + receiver
+        const agen1 = (label, target) => {
+            vm.label(label);
+            vm.prologue(0, [VReg.S0]);
+            vm.mov(VReg.S0, VReg.A1);
+            vm.call("_agen_norm");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.mov(VReg.A1, VReg.S0);
+            vm.call(target);
+            vm.epilogue([VReg.S0], 0);
+        };
+        agen0("_agen_pop", "_array_pop");
+        agen0("_agen_reverse", "_array_reverse");
     }
 
     // [I3] 内建数组方法一等值(方法值读取)的运行时 helper。全部 _aref_generic-safe:

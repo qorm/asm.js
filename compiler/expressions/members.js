@@ -546,6 +546,8 @@ const ARRAY_PROTO_METHODS = [
     ["keys", "_agen_keys", 0],
     ["entries", "_agen_entries", 0],
     ["push", "_fpg_arr_push", 1],
+    ["pop", "_agen_pop", 0],
+    ["reverse", "_agen_reverse", 0],
 ];
 const ARRAY_STATIC_METHODS = [
     ["isArray", "_isarray_ref", 1],
