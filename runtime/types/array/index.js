@@ -2516,6 +2516,7 @@ export class ArrayGenerator {
             vm.epilogue([VReg.S0], 0);
         };
         agen0("_agen_pop", "_array_pop");
+        agen0("_agen_shift", "_array_shift");
         agen0("_agen_reverse", "_array_reverse");
     }
 
