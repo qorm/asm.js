@@ -134,34 +134,38 @@ export const FunctionCompiler = {
 
     // 编译函数参数 - 先全部压栈，再统一弹出到参数寄存器
     // 这是因为 VReg.RET 和 VReg.A0 都映射到同一个物理寄存器 (X0/RAX)
-    compileCallArguments(args) {
+    compileCallArguments(args, isMethodCall) {
         // 含扩展实参 f(...a) / f(x, ...a)：真实参数个数编译期未知，
-        // 走"构建实参数组 + 取前 6 个装入 A0..A5"路径（受既有 6 参寄存器上限约束）。
+        // 走"构建实参数组 + 取前 N 个装入 A0..AN"路(受 6 参寄存器上限约束)。
+        // 方法调用时 A5 预留为 receiver(this),argLimit 切为 5。
+        const argLimit = isMethodCall ? 5 : 6;
         for (let i = 0; i < args.length; i++) {
             if (args[i] && args[i].type === "SpreadElement") {
-                this.compileCallArgumentsWithSpread(args);
+                this.compileCallArgumentsWithSpread(args, argLimit);
                 return;
             }
         }
 
-        const argCount = Math.min(args.length, 6);
+        // 无 spread 但实参超寄存器数:走 spread 路径构建实参数组+溢出栈传参
+        if (args.length > argLimit) {
+            this.compileCallArgumentsWithSpread(args, argLimit);
+            return;
+        }
 
-        // [#56/A3] ES 要求实参左到右求值(可观察副作用序:g(f(1),f(2),f(3)))。
-        // 原实现从右往左编译压栈(i:argCount-1→0)→副作用反序。改为左到右求值压栈,
-        // 栈顶为最后一个实参,再逆序弹出到 A0..A5 —— 最终寄存器落位不变、指令条数不变,
-        // 仅求值/压栈顺序左到右。
+        const argCount = args.length;
+
+        // [#56-A3] ES 要求实参左到右求值(可观察副作用序:g(f(1),f(2),f(3)))。
+        // 左到右求值压栈 → 栈顶为最后一个实参 → 逆序弹出到 A0..AN。
         for (let i = 0; i < argCount; i++) {
             this.compileExpression(args[i]);
             this.vm.push(VReg.RET);
         }
 
-        // 栈顶是最后一个实参,逆序弹出到参数寄存器(A0=arg0 在栈底)
         for (let i = argCount - 1; i >= 0; i--) {
             this.vm.pop(this.vm.getArgReg(i));
         }
-        // 未提供的形参寄存器清为 JS_UNDEFINED（否则是上次调用的残留值，
-        // 导致缺参 typeof 错乱 / Boolean(缺参) 拿到垃圾）。A5 保留给方法 this
-        for (let i = argCount; i < 5; i++) {
+        // 未提供的形参寄存器清为 JS_UNDEFINED。
+        for (let i = argCount; i < argLimit; i++) {
             this.vm.lea(this.vm.getArgReg(i), "_js_undefined");
             this.vm.load(this.vm.getArgReg(i), this.vm.getArgReg(i), 0);
         }
@@ -188,35 +192,36 @@ export const FunctionCompiler = {
     // 装入 A0..A5（越界的填 JS_UNDEFINED）。受既有 6 参寄存器约定约束：
     // 超过 6 个实参会被截断（与非扩展路径 Math.min(args.length,6) 一致）。
     // 方法调用会在此之后用 A5 覆盖成 this（见 compileMethodCall），语义一致。
-    compileCallArgumentsWithSpread(args) {
-        // RET = 全部实参组成的 boxed 数组（调用实参与数组元素的扩展语义相同）
+    compileCallArgumentsWithSpread(args, argLimit) {
+        if (argLimit === undefined) argLimit = 6;
+        // RET = 全部实参组成的 boxed 数组（调用时调用实参与数组元素的扩散语义相同）
         this.compileArrayExpressionWithSpread(args);
         const argsArrOff = this.ctx.allocLocal(`__callsp_arr_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, argsArrOff, VReg.RET);
         this.vm.mov(VReg.A0, VReg.RET);
-        this.vm.call("_array_length");            // RET = 整数长度
+        this.vm.call("_array_length");            // RET = 整数组长度
         const lenOff = this.ctx.allocLocal(`__callsp_len_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, lenOff, VReg.RET);
 
-        // 逆序算出 arg[5..0] 压栈；每个 = (i < len) ? arr[i] : undefined
-        for (let i = 5; i >= 0; i--) {
+        // 逆序算出 arg[argLimit-1..0] 压栈；每个 = (i < len) ? arr[i] : 未定义
+        for (let i = argLimit - 1; i >= 0; i--) {
             const id = this.nextLabelId();
             const undefL = `_callsp_undef_${id}`;
             const doneL = `_callsp_done_${id}`;
             this.vm.load(VReg.V0, VReg.FP, lenOff);
             this.vm.cmpImm(VReg.V0, i);
-            this.vm.jle(undefL);                  // len <= i → 无此实参
+            this.vm.jle(undefL);                  // 长度 <= i → 无此实参
             this.vm.load(VReg.A0, VReg.FP, argsArrOff);
             this.vm.movImm(VReg.A1, i);
-            this.vm.call("_array_get");           // RET = arr[i]
+            this.vm.call("_array_get");                // RET = arr[i]
             this.vm.jmp(doneL);
             this.vm.label(undefL);
-            this.vm.movImm64(VReg.RET, 0x7ffb000000000000n); // was lea+load _js const
+            this.vm.movImm64(VReg.RET, 0x7ffb000000000000n); // lea+load _js undef
             this.vm.label(doneL);
             this.vm.push(VReg.RET);
         }
-        // 依次弹出到 A0..A5（栈顶是 arg0）
-        for (let i = 0; i < 6; i++) {
+        // 依次弹出到 A0..A(argLimit-1) (栈顶是 arg0)
+        for (let i = 0; i < argLimit; i++) {
             this.vm.pop(this.vm.getArgReg(i));
         }
         // [argc ABI] spread 路径:实参个数为运行时数组长度(裸整数,消费方自行按寄存器上限截断)
@@ -552,8 +557,8 @@ export const FunctionCompiler = {
         vm.push(thisReg);
         vm.push(funcReg);
 
-        // 编译参数
-        this.compileCallArguments(args);
+        // 编译参数(A5 预留为 receiver,实参上限 5)
+        this.compileCallArguments(args, true);
 
         // 恢复函数指针和 this
         vm.pop(VReg.S0); // 函数指针/闭包
@@ -667,7 +672,7 @@ export const FunctionCompiler = {
         const thisSlot = this.ctx.allocLocal(`__dv_this_${this.nextLabelId()}`);
         this.compileExpression(obj);
         this.vm.store(VReg.FP, thisSlot, VReg.RET);
-        this.compileCallArguments(args);
+        this.compileCallArguments(args, true);
         this.vm.load(VReg.A5, VReg.FP, thisSlot);
         this.vm.movImm(VReg.S0, 0);
         this.vm.call(label);

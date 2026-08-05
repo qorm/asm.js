@@ -1,0 +1,5 @@
+{
+  "description": "Object method call with 6 arguments passes all args correctly (A5 receiver vs arg5 conflict)",
+  "knownFailure": "ABI limit: method calls 5 args + receiver (A0-A4=args, A5=this). 6th arg requires ABI extension.",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "6args ok", "exitCode": 0 }
+}
