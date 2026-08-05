@@ -120,18 +120,23 @@ const NamespaceStaticRef = {
         clz32: "_math_clz32",
     },
     Object: {
-        // 直连 helper(A0=boxed obj → RET=boxed array):调用位同约定(functions.js)。
         keys: "_object_keys",
         values: "_object_values",
         entries: "_object_entries",
-        getOwnPropertyNames: "_object_gopn", // 对象路径委托 _object_keys;array/string 额外含 "length"
-        // [test262 propertyHelper] 反射三件套(同约定:A0=首参装箱值 → RET=装箱结果)。
-        // propertyHelper.js 头部把它们捕获成局部变量后全程经变量调用,故必须可作值读取。
-        // defineProperty 不收:无通用运行时 helper(编译期把描述符对象字面量静态分解,
-        // 运行时描述符只有 _object_defineProperty_proxy 走陷阱路径)——记偏差。
-        getOwnPropertyDescriptor: "_object_getOwnPropertyDescriptor", // (obj, key) → 描述符/undefined
-        create: "_object_create",   // (proto) → 新对象(第二参描述符仅静态调用位支持)
-        freeze: "_object_freeze",   // (obj) → obj
+        getOwnPropertyNames: "_object_gopn",
+        getOwnPropertyDescriptor: "_object_getOwnPropertyDescriptor",
+        create: "_object_create",
+        freeze: "_object_freeze",
+        seal: "_object_seal",
+        preventExtensions: "_object_preventExtensions",
+        isFrozen: "_object_isFrozen",
+        isSealed: "_object_isSealed",
+        isExtensible: "_object_isExtensible",
+        getPrototypeOf: "_object_getPrototypeOf",
+        setPrototypeOf: "_object_setPrototypeOf",
+        getOwnPropertySymbols: "_object_getOwnPropertySymbols",
+        groupBy: "_object_groupBy",
+        hasOwn: "_aref_obj_hasOwn",
     },
     Date: {
         now: "_date_now", // 0 参 → canonical number
@@ -437,7 +442,12 @@ const BUILTIN_REF_ARITY = {
     math_pow: 2, math_atan2: 2,
     object_keys: 1, object_values: 1, object_entries: 1,
     object_getOwnPropertyNames: 1, object_getOwnPropertyDescriptor: 2,
-    object_create: 2, object_freeze: 1, object_assign: 1,
+    object_create: 2, object_freeze: 1, object_assign: 2,
+    object_seal: 1, object_preventExtensions: 1,
+    object_isFrozen: 1, object_isSealed: 1, object_isExtensible: 1,
+    object_getPrototypeOf: 1, object_setPrototypeOf: 2,
+    object_getOwnPropertySymbols: 1,
+    object_groupBy: 2, object_hasOwn: 2,
     date_now: 0, date_parse: 1, date_utc: 7,
     array_isArray: 1,
     fnproto_call: 1, fnproto_apply: 2,
@@ -591,7 +601,17 @@ const OBJECT_STATIC_METHODS = [
     ["getOwnPropertyDescriptor", "_object_getOwnPropertyDescriptor", 2],
     ["create", "_object_create", 2],
     ["freeze", "_object_freeze", 1],
-    ["assign", "_object_assign", 1],
+    ["assign", "_object_assign", 2],
+    ["seal", "_object_seal", 1],
+    ["preventExtensions", "_object_preventExtensions", 1],
+    ["isFrozen", "_object_isFrozen", 1],
+    ["isSealed", "_object_isSealed", 1],
+    ["isExtensible", "_object_isExtensible", 1],
+    ["getPrototypeOf", "_object_getPrototypeOf", 1],
+    ["setPrototypeOf", "_object_setPrototypeOf", 2],
+    ["getOwnPropertySymbols", "_object_getOwnPropertySymbols", 1],
+    ["groupBy", "_object_groupBy", 2],
+    ["hasOwn", "_aref_obj_hasOwn", 2],
 ];
 const MAP_PROTO_METHODS = [
     // [方法名, 守卫壳标签(品牌检查后尾调裸 helper,见 runtime/types/map/index.js), 规范 length]
