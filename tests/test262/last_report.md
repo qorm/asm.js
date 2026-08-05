@@ -1,6 +1,6 @@
 # asm.js test262 conformance report
 
-_Generated 2026-08-05T16:42:27.770Z — target macos-arm64_
+_Generated 2026-08-05T16:45:19.162Z — target macos-arm64_
 
 ## Headline
 
@@ -14,16 +14,16 @@ Of 1223 discovered test files in the selected dirs, 3 were excluded up front (mo
 | class | count | % of run |
 |-------|------:|---------:|
 | PASS         | 205 | 50.37 |
-| FAIL         | 188 | 46.19 |
+| FAIL         | 187 | 45.95 |
 | COMPILE_FAIL | 3 | 0.74 |
-| CRASH        | 11 | 2.70 |
+| CRASH        | 12 | 2.95 |
 | **run**      | **407** | 100 |
 
 ## By area
 
 | area | run | PASS | FAIL | COMPILE_FAIL | CRASH | pass% |
 |------|----:|-----:|-----:|-------------:|------:|------:|
-| built-ins/String | 407 | 205 | 188 | 3 | 11 | 50.4 |
+| built-ins/String | 407 | 205 | 187 | 3 | 12 | 50.4 |
 
 ## Excluded categories (counted, not scored)
 
@@ -37,13 +37,13 @@ Excluded-by-feature detail:
 
 ## Top failing patterns (FAIL / COMPILE_FAIL / CRASH detail strings)
 
-- **157×** FAIL: assertion mismatch (Test262Error / wrong value)
+- **156×** FAIL: assertion mismatch (Test262Error / wrong value)
 - **18×** FAIL: constructor-ness reflection (isConstructor / not-a-constructor)
 - **9×** CRASH: run signal SIGSEGV
 - **7×** FAIL: array contents mismatch (compareArray)
 - **6×** FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)
 - **3×** COMPILE_FAIL: asm.js could not compile (unsupported syntax / parser gap)
-- **1×** CRASH: run signal SIGBUS
+- **2×** CRASH: run signal SIGBUS
 - **1×** CRASH: run timeout
 
 ## Failures correlated with features (top tags among failing tests)
@@ -99,4 +99,4 @@ mkdir -p .test262-corpus && tar xzf /tmp/t262.tgz -C .test262-corpus --strip-com
 node tests/test262/run.mjs --stride 3 --jobs 4 --target macos-arm64
 ```
 
-_Run wall-clock: 34.1s._
+_Run wall-clock: 34.2s._

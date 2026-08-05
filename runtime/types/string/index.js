@@ -104,20 +104,23 @@ export class StringGenerator {
         vm.jmp(okLabel);
         // 0x7FFD extraction:尝试 __value(仅 String 包装器有效)
         // 若返回非字符串,回退到 _valueToStr。
+        // 注意:调用函数前须将 boxed obj 存至栈,因 _object_get/_tag_key_a1
+        // 会破坏 V0-V4(调用者保存寄存器)。
         vm.label(extractLabel);
-        vm.mov(VReg.V0, VReg.A0);         // V0 = boxed obj
-        vm.mov(VReg.A0, VReg.V0);
+        vm.push(VReg.A0);                 // 保存 boxed obj 到栈
+        vm.mov(VReg.A0, VReg.A0);         // A0 = boxed obj (for _object_get)
         vm.lea(VReg.A1, vm.asm.addString("__value"));
         vm.call("_tag_key_a1");
         vm.call("_object_get");           // RET = __value or undefined
+        vm.pop(VReg.V1);                  // V1 = original boxed obj (从栈恢复)
         // 检查 RET 是否为装箱字符串(0x7FFC)
-        vm.shrImm(VReg.V1, VReg.RET, 48);
-        vm.cmpImm(VReg.V1, 0x7FFC);
+        vm.shrImm(VReg.V0, VReg.RET, 48);
+        vm.cmpImm(VReg.V0, 0x7FFC);
         vm.jne("_thiscoerce_fallback_" + methodName); // 非字符串→_valueToStr
         vm.mov(VReg.A0, VReg.RET);        // A0 = extracted string
         vm.jmp(okLabel);
         vm.label("_thiscoerce_fallback_" + methodName);
-        vm.mov(VReg.A0, VReg.V0);         // A0 = 原 boxed obj,投 _valueToStr
+        vm.mov(VReg.A0, VReg.V1);         // A0 = 原 boxed obj(from stack),投 _valueToStr
         vm.jmp(forceLabel);
         vm.label(okLabel);
     }
