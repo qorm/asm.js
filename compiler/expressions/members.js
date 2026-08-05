@@ -1571,6 +1571,19 @@ export const MemberCompiler = {
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.RET, VReg.V0, 0);
         this._reSetProtoProp(protoSlot, "constructor", BUILTIN_PROP_ATTR);
+        // Symbol.prototype[Symbol.toStringTag] = "Symbol"
+        vm.lea(VReg.A0, "_symwk_toStringTag");
+        vm.lea(VReg.A1, this.asm.addString("Symbol.toStringTag"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_symbol_wellknown"); // RET = Symbol.toStringTag raw ptr
+        vm.mov(VReg.A1, VReg.RET); // A1 = symbol key
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.A0, VReg.V0, 0); // A0 = boxed prototype
+        vm.lea(VReg.A2, this.asm.addString("Symbol"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A2, VReg.A2, VReg.V1); // A2 = boxed "Symbol"
+        vm.call("_object_set");
         // Symbol.prototype = 原型对象
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.A0, VReg.V0, 0);
