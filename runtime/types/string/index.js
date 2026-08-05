@@ -3345,18 +3345,63 @@ export class StringGenerator {
         vm.call("_strlen");
         vm.mov(VReg.S3, VReg.RET); // S3 = len
 
-        // 规范化参数
-        vm.mov(VReg.A0, VReg.A1);
-        vm.call("_to_int32");
-        vm.mov(VReg.S1, VReg.RET); // S1 = start
+        // 规范化 start(需 ToIntegerOrInfinity 语义:Infinity 不归零)
+        // _to_int32 将 +Inf/-Inf 归零,破坏 substring(NaN,Infinity) 语义;
+        // 改用 _number_coerce 取 float64 位,特判 Infinity: +Inf→len, -Inf→0。
+        // 先保存 end 参数 —— _number_coerce 可能修改 A2(调用者保存寄存器)。
+        vm.mov(VReg.S4, VReg.A2);            // 保存 end 参数
+        vm.mov(VReg.A0, VReg.A1);            // A0 = start arg
+        vm.call("_number_coerce");           // RET = raw float64 bits
+        // 指数全 1(0x7FF)=NaN/Inf:移位取指数并掩码
+        vm.shrImm(VReg.V0, VReg.RET, 52);
+        vm.andImm(VReg.V0, VReg.V0, 0x7FF);
+        vm.cmpImm(VReg.V0, 0x7FF);
+        vm.jne("_substring_s_finite");
+        // NaN(尾数!=0) → 0; +/-Inf(尾数==0):检符号位
+        vm.movImm64(VReg.V0, 0x000fffffffffffffn);
+        vm.and(VReg.V0, VReg.RET, VReg.V0);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_substring_s_zero");          // NaN → 0
+        vm.shrImm(VReg.V0, VReg.RET, 63);     // 符号位
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_substring_s_zero");          // -Inf → 0
+        // +Inf → len(S3):钳位后即为全长
+        vm.mov(VReg.S1, VReg.S3);
+        vm.jmp("_substring_s_done");
+        vm.label("_substring_s_zero");
+        vm.movImm(VReg.S1, 0);
+        vm.jmp("_substring_s_done");
+        vm.label("_substring_s_finite");
+        vm.fmovToFloat(0, VReg.RET);
+        vm.fcvtzs(VReg.S1, 0);               // trunc → int64
+        vm.label("_substring_s_done");
 
+        // 恢复 end 参数并规范化 end(同样 ToIntegerOrInfinity 语义)
+        vm.mov(VReg.A2, VReg.S4);            // 恢复 end 参数
         vm.movImm64(VReg.V0, 0x7ffb000000000000n); // JS_UNDEFINED
         vm.cmp(VReg.A2, VReg.V0);
         vm.jeq("_substring_end_is_len");
-        
         vm.mov(VReg.A0, VReg.A2);
-        vm.call("_to_int32");
-        vm.mov(VReg.S2, VReg.RET); // S2 = end
+        vm.call("_number_coerce");
+        vm.shrImm(VReg.V0, VReg.RET, 52);
+        vm.andImm(VReg.V0, VReg.V0, 0x7FF);
+        vm.cmpImm(VReg.V0, 0x7FF);
+        vm.jne("_substring_e_finite");
+        vm.movImm64(VReg.V0, 0x000fffffffffffffn);
+        vm.and(VReg.V0, VReg.RET, VReg.V0);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_substring_e_zero");
+        vm.shrImm(VReg.V0, VReg.RET, 63);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_substring_e_zero");
+        vm.mov(VReg.S2, VReg.S3);            // +Inf → len
+        vm.jmp("_substring_calc_start");
+        vm.label("_substring_e_zero");
+        vm.movImm(VReg.S2, 0);
+        vm.jmp("_substring_calc_start");
+        vm.label("_substring_e_finite");
+        vm.fmovToFloat(0, VReg.RET);
+        vm.fcvtzs(VReg.S2, 0);
         vm.jmp("_substring_calc_start");
 
         vm.label("_substring_end_is_len");
