@@ -71,14 +71,14 @@ export class BooleanGenerator {
         vm.label("_boolean_toString");
         vm.prologue(0, [VReg.S0, VReg.S1]);
 
-        // Brand check: this must be 0x7FFD-tagged (object wrapper)
+        // Brand check: this must be 0x7FFD-tagged (object wrapper) or 0x7FF9 (primitive)
         vm.shrImm(VReg.V0, VReg.A0, 48);
         vm.cmpImm(VReg.V0, 0x7FFD);
         vm.jeq("_bts_obj");
-        // Also accept 0x7FF9 (primitive boolean) for Boolean.prototype.toString.call(true)
         vm.cmpImm(VReg.V0, 0x7FF9);
         vm.jeq("_bts_bool");
-        // TypeError
+        // TypeError: incompatible receiver
+        vm.label("_bts_typeerr");
         vm.lea(VReg.A0, vm.asm.addString("Boolean.prototype.toString called on incompatible receiver"));
         vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
         vm.and(VReg.A0, VReg.A0, VReg.V1);
@@ -86,12 +86,16 @@ export class BooleanGenerator {
         vm.or(VReg.A0, VReg.A0, VReg.V1);
         vm.call("_throw_type_error");
 
-        // Object wrapper: extract __boolean_value
+        // Object wrapper: extract __boolean_value + brand verify
         vm.label("_bts_obj");
         vm.lea(VReg.A1, vm.asm.addString("__boolean_value"));
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.A1, VReg.V1);
-        vm.call("_object_get"); // RET = boolean value (0x7FF9)
+        vm.call("_object_get"); // RET = value
+        // Brand check: must be boolean (0x7FF9)
+        vm.shrImm(VReg.V0, VReg.RET, 48);
+        vm.cmpImm(VReg.V0, 0x7FF9);
+        vm.jne("_bts_typeerr");
         vm.mov(VReg.S0, VReg.RET);
         vm.jmp("_bts_print");
 
@@ -129,6 +133,7 @@ export class BooleanGenerator {
         vm.jeq("_bvo_obj");
         vm.cmpImm(VReg.V0, 0x7FF9);
         vm.jeq("_bvo_bool");
+        vm.label("_bvo_typeerr");
         vm.lea(VReg.A0, vm.asm.addString("Boolean.prototype.valueOf called on incompatible receiver"));
         vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
         vm.and(VReg.A0, VReg.A0, VReg.V1);
@@ -140,7 +145,11 @@ export class BooleanGenerator {
         vm.lea(VReg.A1, vm.asm.addString("__boolean_value"));
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.A1, VReg.V1);
-        vm.call("_object_get"); // RET = boolean value
+        vm.call("_object_get"); // RET = value
+        // Brand check: must be boolean
+        vm.shrImm(VReg.V0, VReg.RET, 48);
+        vm.cmpImm(VReg.V0, 0x7FF9);
+        vm.jne("_bvo_typeerr");
         vm.jmp("_bvo_end");
 
         vm.label("_bvo_bool");

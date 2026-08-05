@@ -1451,11 +1451,19 @@ export const MemberCompiler = {
         vm.scvtf(0, VReg.A2);
         vm.fmovToInt(VReg.A2, 0);
         vm.call("_closure_prop_set");
-        // 原型对象
+        // 原型对象: Boolean.prototype 自身是 false 布尔包装对象(规范 20.3.3)
         vm.call("_object_new");
         vm.call("_box_obj_r");
         vm.lea(VReg.V1, protoSlot);
         vm.store(VReg.V1, 0, VReg.RET);
+        // 在原型对象上存 __boolean_value = false(使 Boolean.prototype.toString() 返回 "false")
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        vm.lea(VReg.A1, this.asm.addString("__boolean_value"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.movImm64(VReg.A2, 0x7FF9000000000000n); // false
+        vm.call("_object_set");
         // 原型属性落位
         for (let i = 0; i < BOOLEAN_PROTO_METHODS.length; i++) {
             const m = BOOLEAN_PROTO_METHODS[i];
