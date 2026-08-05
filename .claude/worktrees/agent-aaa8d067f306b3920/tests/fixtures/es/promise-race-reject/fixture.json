@@ -1,0 +1,10 @@
+{
+  "description": "Promise.race should reject from the first already-settled rejected element",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "bad",
+    "exitCode": 0
+  }
+}

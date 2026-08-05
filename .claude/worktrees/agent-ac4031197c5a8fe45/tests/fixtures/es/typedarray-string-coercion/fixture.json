@@ -1,0 +1,10 @@
+{
+  "description": "TypedArray string coercion (String/concat/template/.toString) yields comma-joined elements, not garbage float",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "1,2,3\n1,2,3\n1,2,3\n1,2,3\n1.5,2.5\n1.5,2.5\n[]",
+    "exitCode": 0
+  }
+}

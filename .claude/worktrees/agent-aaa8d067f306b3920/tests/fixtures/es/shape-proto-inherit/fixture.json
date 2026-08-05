@@ -1,0 +1,7 @@
+{
+  "description": "shape v2 T2a prototype shaping: inherit",
+  "expect": {
+    "stdout": "B a-shared b c\nB a-shared b\ntrue true",
+    "exitCode": 0
+  }
+}

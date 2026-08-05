@@ -1,0 +1,4 @@
+{
+  "description": "Array.prototype.shift removes and returns the first element (mutating); empty array returns undefined",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "1\n2,3,4\n2 3,4\nundefined\nx y", "exitCode": 0 }
+}

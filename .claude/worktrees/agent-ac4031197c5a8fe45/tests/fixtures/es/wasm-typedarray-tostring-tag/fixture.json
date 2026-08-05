@@ -1,0 +1,5 @@
+{
+  "description": "Object.prototype.toString brands TypedArray/ArrayBuffer/DataView/Promise/BigInt/Symbol correctly under wasm32-wasi (short-circuit before the toStringTag probe that segfaults native / mislabels or traps wasm; BigInt/Symbol ruled out first to avoid value-byte collisions)",
+  "expect": { "parse": true, "compile": true, "run": false },
+  "expectWasm": { "parse": true, "compile": true, "run": true, "stdout": "[object Int8Array]\n[object Uint8Array]\n[object Uint8ClampedArray]\n[object Int16Array]\n[object Uint16Array]\n[object Int32Array]\n[object Uint32Array]\n[object Float32Array]\n[object Float64Array]\n[object ArrayBuffer]\n[object DataView]\n[object Promise]\n[object BigInt]\n[object BigInt]\n[object BigInt]\n[object Symbol]", "exitCode": 0 }
+}

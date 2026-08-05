@@ -1,0 +1,7 @@
+{
+  "description": "L4 string in-place concat: NUL transparency on in-place path",
+  "expect": {
+    "stdout": "9 0 98 98\n4 0",
+    "exitCode": 0
+  }
+}

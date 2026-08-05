@@ -1,0 +1,10 @@
+{
+  "description": "JSON.stringify should be callable from the standard global JSON object",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "1",
+    "exitCode": 0
+  }
+}

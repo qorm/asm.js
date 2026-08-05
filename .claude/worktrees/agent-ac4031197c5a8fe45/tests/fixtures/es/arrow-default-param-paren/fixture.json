@@ -1,0 +1,4 @@
+{
+  "description": "parenthesized arrow params with defaults: (a=7)=>, (a=1,b=2)=> (first param default)",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "7 5\n3 12 30\n10 101", "exitCode": 0 }
+}

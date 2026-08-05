@@ -1,0 +1,10 @@
+{
+  "description": "bare package imports should resolve against local node_modules",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "00x",
+    "exitCode": 0
+  }
+}

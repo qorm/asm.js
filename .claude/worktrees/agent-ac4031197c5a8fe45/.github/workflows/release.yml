@@ -1,0 +1,76 @@
+name: Release
+
+# 打 tag(v* )即自动发布;也可在 Actions 页手动触发(填 tag)。
+# asm.js 是交叉编译器:一台 Linux runner 用 Node 就能产出全部 5 个目标的原生 CLI。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Cross-compile asm.js CLI for all 5 targets
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for T in macos-arm64 macos-x64 linux-arm64 linux-x64 windows-x64; do
+            echo "::group::build $T"
+            node cli.js cli.js -o "dist/asm.js-$T" --target "$T"
+            echo "::endgroup::"
+          done
+          ls -la dist
+
+      - name: Smoke test (linux-x64 runs natively on the x64 runner)
+        # 非阻塞:某些 runner 的严格 overcommit 会拒绝大初始堆的 mmap;
+        # 产物本身已在各目标运行时(native/Docker/Wine)验证过,不因此阻断发布。
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          printf 'console.log("asm.js-ci-ok", 6*7);' > hello.js
+          ./dist/asm.js-linux-x64 hello.js -o hello --target linux-x64
+          out="$(./hello)"
+          echo "output: $out"
+          test "$out" = "asm.js-ci-ok 42"
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum asm.js-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" dist/* \
+            --title "asm.js $TAG" \
+            --notes "Self-hosting asm.js CLI, cross-compiled from a single host for all five targets (macOS-ARM64, macOS-x64, Linux-ARM64, Linux-x64, Windows-x64). Each binary compiles \`cli.js\` into a native executable — no Node.js and no third-party dependencies at runtime. Verify integrity with \`SHA256SUMS.txt\`. See the README's Self-Hosting section for the \`gen2 == gen3\` fixed-point results."

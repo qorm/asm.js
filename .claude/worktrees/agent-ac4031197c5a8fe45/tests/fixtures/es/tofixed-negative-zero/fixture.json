@@ -1,0 +1,4 @@
+{
+  "description": "Number.prototype.toFixed on -0 yields \"0.00\" (spec sign check is x<0, and -0<0 is false), while genuinely negative values that round to zero (-0.4, -0.001) keep the leading \"-\"",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "0.00\n0\n-0\n-0\n0.00\n-3.14\n-2", "exitCode": 0 }
+}

@@ -1,0 +1,5 @@
+{
+  "expect": {
+    "stdout": "la1 true\nla2 false\nla3 true\nla4 10\nla5 true false\nla6 a-1b-2\nbr1 true false\nbr2 ll\nbr3 [a][b][c]\nbr4 true false\nbr5 abcdcdab\nng1 2026 07\nng2 2026 07\nng3 smith john\nng4 true\nng5 true false\nds1 true false\nds2 3\nds3 XXX\nds4 true\nlb1 100\nlb2 false true\nlb3 1,234,567\nlb4 true false\nsy1 12 2\nsy2 true 0\nsy3 false true\nma1 a1:a1 b2:b2 c3:c3 \nma2 3\nma3 2026/07 2027/08 \nrf1 a[1]b[2]\nrf2 smith john\nrf3 ab@1c\nrf4 heLLo\nrf5 a1 b2\nrf6 AABB\ncx1 11/07/2026\ncx2 host"
+  }
+}

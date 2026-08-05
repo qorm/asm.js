@@ -1,0 +1,13 @@
+console.log(-0);
+console.log(0);
+console.log(-0 + "");
+console.log(String(-0));
+console.log((-0).toString());
+console.log(`${-0}`);
+console.log(JSON.stringify(-0));
+console.log([1, -0, 2]);
+console.log({ x: -0, y: 0 });
+console.log(0 === -0);
+console.log(Math.round(-0.3));
+console.log(-5 * 0);
+console.log(1 / Math.round(-0.3));

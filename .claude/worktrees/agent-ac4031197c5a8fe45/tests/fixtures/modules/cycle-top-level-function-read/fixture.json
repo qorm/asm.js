@@ -1,0 +1,11 @@
+{
+  "description": "cyclic modules should expose function exports to top-level readers during initialization",
+  "entry": "a.js",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "function\nfunction",
+    "exitCode": 0
+  }
+}

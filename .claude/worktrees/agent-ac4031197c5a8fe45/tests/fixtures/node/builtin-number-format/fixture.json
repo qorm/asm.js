@@ -1,0 +1,8 @@
+{
+  "description": "Number.prototype.toExponential/toPrecision via number shim, matching node",
+  "expect": {
+    "parse": true, "compile": true, "run": true,
+    "stdout": "1.23e+2\n123.5\n1.234e-4\n0.00012\n1.2e+5\n2.55e+2\n1.0e+3\n0.00\n5e+0\n-42.5\n9.8765e+8\n0.5",
+    "exitCode": 0
+  }
+}

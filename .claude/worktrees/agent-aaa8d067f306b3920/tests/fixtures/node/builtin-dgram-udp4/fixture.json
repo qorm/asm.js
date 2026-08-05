@@ -1,0 +1,10 @@
+{
+  "description": "node:dgram minimal real UDP/IPv4: in-process loopback datagram send (sendto) + receive ('message' via recvfrom on the shared net poll pump), exposing payload Buffer and sender rinfo (address/family/size)",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "sent ok\nrecv hello-udp\nfrom 127.0.0.1 IPv4 size=9",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "the `in` operator is symbol-identity-aware: a symbol key present in an object returns true (own-only)",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true true false\ntrue false\ntrue",
+    "exitCode": 0
+  }
+}

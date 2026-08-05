@@ -1,0 +1,11 @@
+{
+  "description": "Error objects should expose name/message/cause and stringify consistently",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "Error\nboom\nError: boom\nError: boom\ntrue\n",
+    "stderr": "",
+    "exitCode": 0
+  }
+}

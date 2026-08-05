@@ -1,0 +1,11 @@
+{
+  "description": "root module participates in a cycle and calls an imported function",
+  "entry": "a.js",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "2",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "node:crypto AES-CTR (128/256) + AES-GCM (128/256) createCipheriv/createDecipheriv -- CTR keystream, GHASH auth tag (getAuthTag/setAuthTag/setAAD), round-trip + tamper detection, byte-for-byte vs Node",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ctr128: 11a0f053b6f0a10d42cdac57d4346fe62cca34e2778cf3c9347a33bea5fbcc43e942ad351ede72ba0758ae2c2dcef4311a74253287b3df7ba3\nctr256: a205c57ccd686ab1f655ba91655beef5cc4a24390d742b33a8d00584bf884a3daae2415e8da6eaaea44112f092fd34a75c4a5fb06b2bfa7e3c\nctr128-rt: OK\nctr256-rt: OK\ngcm256-ct: 2f8cbe7356ad958e98e5d0d5175186e01c2648e1e31c6eefd9740792efa5676ef55e7fcfae32dba5dab57960e23aee29902bb4780fca556dd1\ngcm256-tag: 9522fa30bc09f1a6bdc6a604267670c2\ngcm256-rt: OK\ngcm128-ct: 3f0e590fc89c249dafda5d3229f2ba78d31ba96f8c2334c448a8be4aca10c8f7faae35ebc1bb736ad4a59610104a1f59fe82c2f050f7cf7693\ngcm128-tag: b7185485a408f0eb09cac0b147935582\ngcm256-aad-tag: d505fb5a965e54d1bb37ee85ed1b1a0f\ngcm256-aad-rt: OK\ngcm256-tamper: THROWS\nhas-ctr: true\nhas-gcm: true",
+    "exitCode": 0
+  }
+}

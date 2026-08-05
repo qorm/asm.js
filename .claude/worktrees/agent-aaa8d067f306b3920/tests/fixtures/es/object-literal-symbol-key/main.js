@@ -1,0 +1,10 @@
+let s = Symbol("k");
+let o1 = {[s]: 2};
+console.log(o1[s]);
+let o2 = {[s]: 3, a: 4};
+console.log(o2[s], o2.a);
+let s2 = Symbol("m");
+let o3 = {[s2]: "val", normal: 42};
+console.log(o3[s2], o3.normal);
+let k = "dyn";
+console.log({[k]: 1, [`${k}2`]: 2}.dyn2);

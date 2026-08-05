@@ -1,0 +1,8 @@
+{
+  "description": "node:crypto createHash deterministic digest (hex width per algorithm, stable, update chaining)",
+  "expect": {
+    "parse": true, "compile": true, "run": true,
+    "stdout": "64\ntrue\nfalse\n32\n40\n128\ntrue",
+    "exitCode": 0
+  }
+}

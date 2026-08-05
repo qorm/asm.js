@@ -1,0 +1,10 @@
+{
+  "description": "arrow with object rest in a destructuring param whose rest name shadows an outer let var binds rest correctly",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "{\"m\":2,\"n\":3}",
+    "exitCode": 0
+  }
+}

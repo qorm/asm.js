@@ -1,0 +1,10 @@
+{
+  "description": "Stage A: array reduce/reduceRight method references (seed + no-seed) via 4-arg runtime callback invoker",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "function function\n10\n10\nabc\n2,4,6\ncba\n-2\n24",
+    "exitCode": 0
+  }
+}

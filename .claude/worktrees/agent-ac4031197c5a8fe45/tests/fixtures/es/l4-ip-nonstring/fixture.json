@@ -1,0 +1,7 @@
+{
+  "description": "L4 string in-place concat: nonstring",
+  "expect": {
+    "stdout": "5xy\n6",
+    "exitCode": 0
+  }
+}

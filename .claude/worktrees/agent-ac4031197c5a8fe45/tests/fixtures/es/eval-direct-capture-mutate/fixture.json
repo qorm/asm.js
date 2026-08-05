@@ -1,0 +1,10 @@
+{
+  "description": "Direct eval() mutating a captured array/object in-place (member-set o.k=v / new prop / push / pop / shift / unshift / splice / subscript write) with the mutation visible after eval returns, plus closures created inside eval reading a captured caller var (map/reduce over addition). Object identity is preserved on copy-in so mutations propagate through the shared heap; the engine registers the tag/validate/array-mutator/box-array runtime symbols the fragments reference. Round-2 engine follow-ups #1 (read case) and #2. Matches Node.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "9\n5\n1,2,3\n1,2,3\n2\n1,2\n2,3\n1,2,3\n1,4\n9,2\n2|5,6\n11,12,13\n106",
+    "exitCode": 0
+  }
+}

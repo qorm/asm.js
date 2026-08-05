@@ -1,0 +1,10 @@
+{
+  "description": "destructuring param captured by an inner closure returns the param value (regression guard for capture-analysis fix)",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "77",
+    "exitCode": 0
+  }
+}

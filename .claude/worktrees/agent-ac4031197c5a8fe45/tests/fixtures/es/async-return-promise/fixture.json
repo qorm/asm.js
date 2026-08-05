@@ -1,0 +1,10 @@
+{
+  "description": "async functions should return Promise objects that remain chainable via then",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "object\n9",
+    "exitCode": 0
+  }
+}

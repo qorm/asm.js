@@ -1,0 +1,10 @@
+{
+  "description": "node:zlib real DEFLATE/INFLATE + zlib/gzip containers: raw/zlib/gzip round-trips, actual compression (shrink), header magic bytes, crc32 checksums, binary-data gzip round-trip",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true\ntrue\ntrue\n120,156\ntrue\n31,139,8\n352441c2\nd4a1185\ntrue",
+    "exitCode": 0
+  }
+}

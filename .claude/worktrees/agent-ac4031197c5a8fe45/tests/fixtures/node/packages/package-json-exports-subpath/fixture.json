@@ -1,0 +1,10 @@
+{
+  "description": "package exports subpaths should resolve exact export mappings",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "entry-ok\nfeature-ok",
+    "exitCode": 0
+  }
+}

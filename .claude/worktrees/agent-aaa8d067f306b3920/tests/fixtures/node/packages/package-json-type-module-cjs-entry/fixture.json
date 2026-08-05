@@ -1,0 +1,10 @@
+{
+  "description": "package.json type=module should still treat .cjs entrypoints as CommonJS and bridge them into ESM imports",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "42\n42\ncjs\n42\nfalse\ntrue",
+    "exitCode": 0
+  }
+}

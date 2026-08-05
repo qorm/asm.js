@@ -1,0 +1,10 @@
+{
+  "description": "computed null[k]/undefined[k] throws a catchable TypeError instead of segfaulting",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true Cannot read properties of null (reading 'x')\ntrue Cannot read properties of undefined (reading 'x')\nTypeError\n20\n5",
+    "exitCode": 0
+  }
+}

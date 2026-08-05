@@ -1,0 +1,10 @@
+{
+  "description": "package exports root string should resolve package entry",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "root-ok",
+    "exitCode": 0
+  }
+}

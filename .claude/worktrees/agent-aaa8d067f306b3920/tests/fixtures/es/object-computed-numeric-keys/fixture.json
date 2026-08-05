@@ -1,0 +1,10 @@
+{
+  "description": "[#39] computed numeric keys normalize to strings: o[1] === o[\"1\"], no slot collapse",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "0 10 40\n20\n30\nnum\nstr\n5 string 0\ntrue false\n4\nhalf 2.5",
+    "exitCode": 0
+  }
+}

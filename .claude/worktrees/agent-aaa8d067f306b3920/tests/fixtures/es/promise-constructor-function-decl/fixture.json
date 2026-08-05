@@ -1,0 +1,10 @@
+{
+  "description": "new Promise(executor) should support function declaration executors in the synchronous subset",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "11",
+    "exitCode": 0
+  }
+}

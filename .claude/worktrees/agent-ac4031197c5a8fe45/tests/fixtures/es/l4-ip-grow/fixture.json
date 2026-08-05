@@ -1,0 +1,7 @@
+{
+  "description": "L4 string in-place concat: grow",
+  "expect": {
+    "stdout": "1000 120 120\n1005 seed-yz yzyz",
+    "exitCode": 0
+  }
+}

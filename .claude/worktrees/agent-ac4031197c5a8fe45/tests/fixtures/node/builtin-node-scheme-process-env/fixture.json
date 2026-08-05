@@ -1,0 +1,13 @@
+{
+  "description": "node:process should expose env as an object and see injected runtime variables",
+  "env": {
+    "ASMJS_FIXTURE_TOKEN": "present"
+  },
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "object\npresent",
+    "exitCode": 0
+  }
+}

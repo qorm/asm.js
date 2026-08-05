@@ -1,0 +1,10 @@
+{
+  "description": "namespace re-export should observe the final live value",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "object\n1",
+    "exitCode": 0
+  }
+}

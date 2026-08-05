@@ -1,0 +1,10 @@
+{
+  "description": "Dynamic + should choose string concatenation for unknown strings and numeric addition for unknown numbers",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "00x\n3",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,4 @@
+{
+  "description": "class object enumeration excludes internal slots (__ctor__/prototype) and methods: Object.keys/values/entries and for-in over a class yield only static data fields; JSON.stringify(class) is undefined; regular objects keep function-valued props",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "bar,baz\n42,x\nbar=42,baz=x\nbar,baz\nundefined\na,greet,b", "exitCode": 0 }
+}

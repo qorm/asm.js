@@ -1,0 +1,70 @@
+{
+  "generated": "2026-07-26T08:09:24.658Z",
+  "config": {
+    "corpus": "/Users/dmy/work/jsbin/.test262-corpus",
+    "target": "macos-arm64",
+    "dirs": [
+      "built-ins/Array"
+    ],
+    "stride": 5,
+    "max": 0,
+    "jobs": 4
+  },
+  "discovered": 3081,
+  "excluded": {
+    "module": 0,
+    "feature": 111,
+    "dir": 0
+  },
+  "excludedFeatureCounts": {
+    "cross-realm": 16,
+    "Array.fromAsync": 95
+  },
+  "eligible": 2970,
+  "run": 594,
+  "totals": {
+    "PASS": 243,
+    "FAIL": 220,
+    "COMPILE_FAIL": 0,
+    "CRASH": 131
+  },
+  "passRatePct": 40.91,
+  "byArea": {
+    "built-ins/Array": {
+      "PASS": 243,
+      "FAIL": 220,
+      "COMPILE_FAIL": 0,
+      "CRASH": 131
+    }
+  },
+  "topFailPatterns": [
+    {
+      "pattern": "FAIL: assertion mismatch (Test262Error / wrong value)",
+      "count": 161
+    },
+    {
+      "pattern": "CRASH: run signal SIGSEGV",
+      "count": 124
+    },
+    {
+      "pattern": "FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)",
+      "count": 32
+    },
+    {
+      "pattern": "FAIL: array contents mismatch (compareArray)",
+      "count": 21
+    },
+    {
+      "pattern": "FAIL: constructor-ness reflection (isConstructor / not-a-constructor)",
+      "count": 6
+    },
+    {
+      "pattern": "CRASH: run signal SIGBUS",
+      "count": 4
+    },
+    {
+      "pattern": "CRASH: run timeout",
+      "count": 3
+    }
+  ]
+}

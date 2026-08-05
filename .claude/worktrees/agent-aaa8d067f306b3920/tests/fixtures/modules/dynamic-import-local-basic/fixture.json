@@ -1,0 +1,11 @@
+{
+  "description": "dynamic import should resolve a local ESM module as a namespace object",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "7\n9",
+    "stderr": "",
+    "exitCode": 0
+  }
+}

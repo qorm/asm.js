@@ -1,0 +1,10 @@
+var log = [];
+var p = new Proxy({}, { deleteProperty(t, k) { log.push(k); return true; } });
+console.log(delete p.foo, delete p["bar"]);
+console.log(log.join(","));
+var target = { a: 1, b: 2 };
+var pf = new Proxy(target, {});
+console.log(delete pf.a);
+console.log(target.a, target.b);
+var p2 = new Proxy({}, { deleteProperty(t, k) { return false; } });
+console.log(delete p2.x);

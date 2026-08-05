@@ -1,0 +1,62 @@
+{
+  "generated": "2026-07-26T07:58:20.292Z",
+  "config": {
+    "corpus": "/Users/dmy/work/jsbin/.test262-corpus",
+    "target": "macos-arm64",
+    "dirs": [
+      "built-ins/Object"
+    ],
+    "stride": 5,
+    "max": 0,
+    "jobs": 4
+  },
+  "discovered": 3411,
+  "excluded": {
+    "module": 0,
+    "feature": 2,
+    "dir": 0
+  },
+  "excludedFeatureCounts": {
+    "cross-realm": 1,
+    "SharedArrayBuffer": 1
+  },
+  "eligible": 3409,
+  "run": 682,
+  "totals": {
+    "PASS": 143,
+    "FAIL": 481,
+    "COMPILE_FAIL": 0,
+    "CRASH": 58
+  },
+  "passRatePct": 20.97,
+  "byArea": {
+    "built-ins/Object": {
+      "PASS": 143,
+      "FAIL": 481,
+      "COMPILE_FAIL": 0,
+      "CRASH": 58
+    }
+  },
+  "topFailPatterns": [
+    {
+      "pattern": "FAIL: assertion mismatch (Test262Error / wrong value)",
+      "count": 321
+    },
+    {
+      "pattern": "FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)",
+      "count": 151
+    },
+    {
+      "pattern": "CRASH: run signal SIGSEGV",
+      "count": 58
+    },
+    {
+      "pattern": "FAIL: array contents mismatch (compareArray)",
+      "count": 6
+    },
+    {
+      "pattern": "FAIL: constructor-ness reflection (isConstructor / not-a-constructor)",
+      "count": 3
+    }
+  ]
+}

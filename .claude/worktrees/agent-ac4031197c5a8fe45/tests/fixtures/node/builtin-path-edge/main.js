@@ -1,0 +1,15 @@
+import path from "node:path";
+console.log(path.basename("/foo/bar/"));
+console.log(path.dirname("/foo/bar/"));
+console.log(path.dirname("/foo"));
+console.log(path.dirname("foo"));
+console.log(path.basename("/"));
+console.log(path.normalize("a/b/../../.."));
+console.log(path.normalize("../../a"));
+console.log(path.normalize("/a//b/../c/./d"));
+console.log(path.extname(".bashrc"));
+console.log(path.extname("a.b.c"));
+console.log(path.join("a/", "/b"));
+console.log(path.join("/a", "..", "b"));
+const p = path.parse("/a/b/c.txt");
+console.log(p.root + "|" + p.dir + "|" + p.base + "|" + p.ext + "|" + p.name);

@@ -1,0 +1,1 @@
+{ "description": "user function/class .name and .length: declarations, arrows, named/anon fn expressions, object methods, classes, default/rest arity", "expect": { "parse": true, "compile": true, "run": true, "stdout": "foo 2\nbar 0\nbaz 1\nmyName 3\nm 2\narw 1\nC 0\nD 3\n1\n1", "exitCode": 0 } }

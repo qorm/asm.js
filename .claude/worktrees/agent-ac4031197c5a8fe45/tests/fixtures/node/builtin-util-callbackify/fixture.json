@@ -1,0 +1,4 @@
+{
+  "description": "node:util callbackify converts a promise-returning fn to callback style",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "function\na:true:42\nb:10\nc:boom", "exitCode": 0 }
+}

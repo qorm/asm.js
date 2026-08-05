@@ -1,0 +1,10 @@
+{
+  "description": "arrow with nested destructuring param whose inner name shadows an outer let var binds the inner param",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "42",
+    "exitCode": 0
+  }
+}

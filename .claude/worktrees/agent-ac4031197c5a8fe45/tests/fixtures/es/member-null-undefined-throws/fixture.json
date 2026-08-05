@@ -1,0 +1,4 @@
+{
+  "description": "Reading a property of null/undefined throws a catchable TypeError with the Node-shaped message (Cannot read properties of null/undefined (reading 'x')) via a centralized _object_get_ic guard; missing props on real objects/strings/arrays still return undefined without throwing.",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "true TypeError Cannot read properties of null (reading 'foo')\ntrue TypeError Cannot read properties of undefined (reading 'bar')\nCannot read properties of null (reading 'baz')\n1 undefined\n3 undefined\n2 undefined\ndone", "exitCode": 0 }
+}

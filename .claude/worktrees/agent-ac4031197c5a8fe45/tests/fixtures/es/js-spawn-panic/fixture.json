@@ -1,0 +1,10 @@
+{
+  "description": "[dialect] uncaught throw in js-spawned coroutine panics: message + exit 1 (golden)",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "main-ran\npanic: uncaught exception in spawned coroutine:Error: die",
+    "exitCode": 1
+  }
+}

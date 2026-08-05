@@ -1,0 +1,10 @@
+{
+  "description": "Computed-key destructuring assignment ({ [k]: target } = obj) evaluates the key at runtime; works with multiple keys, member targets, and rest",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "single garply\nmulti 10 20\nmember 99\nwithrest 1 2 3 undefined",
+    "exitCode": 0
+  }
+}

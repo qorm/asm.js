@@ -1,0 +1,8 @@
+{
+  "description": "node:string_decoder StringDecoder write/end (Buffer + string), end() dispatch works via instance-property workaround",
+  "expect": {
+    "parse": true, "compile": true, "run": true,
+    "stdout": "hello\n[]\nworld\nabc\nend:[Z]",
+    "exitCode": 0
+  }
+}

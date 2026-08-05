@@ -1,0 +1,4 @@
+{
+  "description": "Map/Set keys use SameValueZero: -0 is normalized to +0 on insert, so forEach/iteration/get yield +0 (1/key === +Infinity). No duplicate +0/-0 entry. NaN and normal number keys unaffected.",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "true\nInfinity\nfoo true\nfoo true\ntrue\ntrue true\nInfinity\n1 b\nn five neg 3", "exitCode": 0 }
+}

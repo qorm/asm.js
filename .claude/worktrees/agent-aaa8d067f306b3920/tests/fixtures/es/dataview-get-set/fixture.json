@@ -1,0 +1,4 @@
+{
+  "description": "DataView get/set Int8..Float64 with endianness over an ArrayBuffer, plus DataView<->TypedArray shared-memory (native little-endian)",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "12345678 78563412\n200 -5 251\n-1000\n50000\n3.14159\n1.5\n12345\n999", "exitCode": 0 }
+}

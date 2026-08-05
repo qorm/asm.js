@@ -1,0 +1,4 @@
+{
+  "description": "node:querystring unescape does not convert + (only parse does)",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "100%+sure\na+b\n{\"a\":\"b c\"}\n{\"x\":\" y\"}\n✓\na%20b%2Bc", "exitCode": 0 }
+}

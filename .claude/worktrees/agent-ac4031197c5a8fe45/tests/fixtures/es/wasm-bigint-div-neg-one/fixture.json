@@ -1,0 +1,4 @@
+{
+  "description": "BigInt division by -1 wraps like arm64 sdiv instead of trapping under wasm i64.div_s",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "-10n\n10n\n0n\n-9223372036854775807n\n9223372036854775807n\n-42n -1000000n", "exitCode": 0 }
+}

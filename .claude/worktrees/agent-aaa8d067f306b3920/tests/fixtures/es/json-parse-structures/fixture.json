@@ -1,0 +1,10 @@
+{
+  "description": "JSON.parse should handle nested object and array structures",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "1\ntrue\nnull\nx\n2",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "Symbol should exist as a standard global function",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "function",
+    "exitCode": 0
+  }
+}

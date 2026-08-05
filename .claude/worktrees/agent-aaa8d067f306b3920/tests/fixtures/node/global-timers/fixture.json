@@ -1,0 +1,4 @@
+{
+  "description": "bare global setTimeout/clearTimeout/queueMicrotask fire without importing node:timers (one-shot; delay ignored)",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "sync done\nmicrotask fired\ntimeout fired", "exitCode": 0 }
+}

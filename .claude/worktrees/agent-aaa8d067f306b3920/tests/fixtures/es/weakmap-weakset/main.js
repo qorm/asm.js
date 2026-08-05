@@ -1,0 +1,10 @@
+const wm = new WeakMap();
+const k = {};
+wm.set(k, 42);
+console.log(wm.get(k), wm.has(k), wm.has({}));
+wm.delete(k);
+console.log(wm.has(k));
+const ws = new WeakSet();
+const o = {};
+ws.add(o);
+console.log(ws.has(o), ws.has({}));

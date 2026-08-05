@@ -1,0 +1,10 @@
+{
+  "description": "String replace/replaceAll expand $-patterns in the replacement: $$ -> $, $& -> match, $` -> preceding, $' -> following",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "$\nhhi\nc[c]t\nc[t]t\n$$$\n[a]X[a]X[a]\nUSD1\na..b",
+    "exitCode": 0
+  }
+}

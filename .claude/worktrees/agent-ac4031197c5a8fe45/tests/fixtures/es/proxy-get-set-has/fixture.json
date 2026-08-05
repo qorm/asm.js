@@ -1,0 +1,10 @@
+{
+  "description": "Proxy get/set/has traps (minimal slice): new Proxy(target,handler) intercepts property read/write and the in operator via handler.get/set/has; forwards to target when a trap is absent; typeof proxy is object. Gated on a distinct type byte so normal-object access is byte-unchanged (gen1==gen2==gen3).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "got:foo got:bar\n10 undefined\n10 20\n99 99\ntrue false\ntrue false\nobject g:m,s:n",
+    "exitCode": 0
+  }
+}

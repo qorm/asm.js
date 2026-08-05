@@ -1,0 +1,10 @@
+{
+  "description": "new Promise(executor) should resolve local alias chains in the synchronous executor subset",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "17",
+    "exitCode": 0
+  }
+}

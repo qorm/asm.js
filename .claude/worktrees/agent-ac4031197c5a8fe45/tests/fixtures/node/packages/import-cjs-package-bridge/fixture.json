@@ -1,0 +1,10 @@
+{
+  "description": "ESM imports should be able to consume CommonJS packages from node_modules",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "5\n5\npkg\n5\nfalse\ntrue",
+    "exitCode": 0
+  }
+}

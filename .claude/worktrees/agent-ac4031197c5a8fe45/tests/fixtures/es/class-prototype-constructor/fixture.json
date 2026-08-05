@@ -1,0 +1,10 @@
+{
+  "description": "Class prototype has a constructor property pointing back to the class; instances resolve .constructor through the prototype chain (including subclasses)",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "proto true\ninst true\nbody 1 9\ntypeof function\ndproto true\ndinst true\ndinherit 9 1 2",
+    "exitCode": 0
+  }
+}

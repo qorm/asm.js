@@ -1,0 +1,10 @@
+{
+  "description": "Direct eval() where a closure created inside the eval writes back a captured caller-local scalar (forEach/reduce/map callbacks run synchronously during the eval). Engine round-3 milestone: copy-in reboxes any caller local captured by a fragment-internal closure into a shared heap box (mirroring the normal compiler's rebox-on-capture), so closure writes reach the box and copy-out reads the box back into the caller slot. Covers int/string accumulators, two captured vars, nested arrows, and escaping read closures. Matches Node.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "6\n10\n106\n11,12,13\nabc\n30/3\n10\n7",
+    "exitCode": 0
+  }
+}

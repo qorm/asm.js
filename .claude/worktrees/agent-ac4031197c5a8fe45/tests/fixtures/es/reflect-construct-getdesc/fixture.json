@@ -1,0 +1,4 @@
+{
+  "description": "Reflect.construct (class) and Reflect.getOwnPropertyDescriptor, plus existing apply/ownKeys",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "5 9 true\n42 true true\ntrue\n5\n[\"a\",\"b\"]", "exitCode": 0 }
+}

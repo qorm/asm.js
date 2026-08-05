@@ -1,0 +1,10 @@
+{
+  "description": "float shortest-round-trip _floatToString (Dragon4): matches V8/node Number::toString across integers, fractions, exponential (>=1e21 or <1e-6), large/small, -0/Inf/NaN, and all string paths (String/toString/+/template/JSON/array/object inspect/join)",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "0.30000000000000004\n0.3333333333333333\n0.1 0.2 0.3\n1.5 2.25 3.14159\n1234.5 12345.678\n1e+21 100000000000000000000 1e+22\n0.000001 1e-7 0.000001\n123456789012345680000\n9007199254740992 9007199254740992\n1.7976931348623157e+308\n-3.5 -0.0001 -0\nInfinity -Infinity NaN\n0.30000000000000004 0.3333333333333333 1e+21\n0.1/1e-7/1e+21\n[0.1,0.3333333333333333,1e+21,1.5e+300,-2.5]\n[ 0.1, 0.2, 1e+21 ] { a: 0.3333333333333333, b: 2.25 }\n1.1,2.2",
+    "exitCode": 0
+  }
+}

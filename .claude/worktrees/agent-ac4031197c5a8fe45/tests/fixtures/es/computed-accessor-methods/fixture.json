@@ -1,0 +1,10 @@
+{
+  "description": "computed accessor methods get [expr]()/set [expr](v) in classes and object literals",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "class-get 20\nclass-set 14\nclass-static 42\nclass-setonly 12\nobj-get 1\nobj-set 51\nobj-getonly 99\nplain 5 8",
+    "exitCode": 0
+  }
+}

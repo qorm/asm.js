@@ -1,0 +1,4 @@
+{
+  "description": "Array.prototype.toSpliced (ES2023): non-destructive splice, original array unchanged, returns new array",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "1,2,3,4,5 | 1,9,8,4,5\n1,7,2,3\n1,2\n1,2,9", "exitCode": 0 }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "Proxy descriptor traps: getOwnPropertyDescriptor (result completed with defaults; undefined -> undefined), defineProperty, ownKeys (drives getOwnPropertyNames/Reflect.ownKeys), getPrototypeOf, preventExtensions. Each routes through the handler trap else forwards to target. Normal objects unaffected. Invariant enforcement deferred.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "foo true false false\nundefined\n5\ntrue,foo,5\na,b,c\nk1,k2\nx,y\ntrue\ntrue\n9 false false",
+    "exitCode": 0
+  }
+}

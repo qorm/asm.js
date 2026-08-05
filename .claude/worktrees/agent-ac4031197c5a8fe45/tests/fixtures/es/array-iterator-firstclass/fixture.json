@@ -1,0 +1,4 @@
+{
+  "description": "Array values()/keys()/entries()/[Symbol.iterator]() return a real first-class iterator object with a stateful next() returning {value,done}, self-iterable via Symbol.iterator (for-of/spread/Array.from all still work). Built like a generator object: a next closure holding target/index/kind state plus a Symbol.iterator closure returning this.",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "object function\n{\"value\":10,\"done\":false}\n{\"value\":20,\"done\":false}\n{\"value\":30,\"done\":false}\n{\"done\":true}\n{\"value\":0,\"done\":false} {\"value\":1,\"done\":false}\n[0,10]\n{\"value\":10,\"done\":false}\n10,20,30\n0,1,2\n[[0,10],[1,20],[2,30]]\n60\n0,1,2\n60", "exitCode": 0 }
+}

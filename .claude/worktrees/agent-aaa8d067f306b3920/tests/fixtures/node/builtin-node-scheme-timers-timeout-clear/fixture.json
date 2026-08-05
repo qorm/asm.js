@@ -1,0 +1,11 @@
+{
+  "description": "node:timers clearTimeout should cancel a queued timeout",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "sync",
+    "stderr": "",
+    "exitCode": 0
+  }
+}

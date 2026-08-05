@@ -1,0 +1,10 @@
+{
+  "description": "console.log renders TypedArrays as Type(len) [ elems ] (top-level/nested/multi-arg, matches node); Promise print no longer segfaults",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "Uint8Array(3) [ 1, 2, 3 ]\nInt32Array(2) [ 5, 6 ]\nFloat64Array(2) [ 1.5, 2.5 ]\nUint8Array(0) []\nx Uint8Array(3) [ 1, 2, 3 ] y\n[ Uint8Array(2) [ 9, 8 ] ]\nobject true",
+    "exitCode": 0
+  }
+}

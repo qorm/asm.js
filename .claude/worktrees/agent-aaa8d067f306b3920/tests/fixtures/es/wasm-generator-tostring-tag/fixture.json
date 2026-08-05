@@ -1,0 +1,5 @@
+{
+  "description": "Object.prototype.toString brands Generator/AsyncGenerator objects correctly under wasm32-wasi by probing the internal __gen_coro slot (reliable discriminator; no distinct type byte); async distinguished via Symbol.asyncIterator. Plain objects and custom async-iterables are NOT mislabelled. native returns the current (incorrect) [object Object] so runs compile-only.",
+  "expect": { "parse": true, "compile": true, "run": false },
+  "expectWasm": { "parse": true, "compile": true, "run": true, "stdout": "[object Generator]\n[object AsyncGenerator]\n[object Object]\n[object Object]", "exitCode": 0 }
+}

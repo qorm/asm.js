@@ -1,0 +1,4 @@
+{
+  "description": "node:assert ok/equal/strictEqual/deepEqual/throws basics",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "true\ntrue\ntrue\nok", "exitCode": 0 }
+}

@@ -1,0 +1,12 @@
+console.log((123.456).toExponential(2));
+console.log((123.456).toPrecision(4));
+console.log((0.0001234).toExponential(3));
+console.log((0.0001234).toPrecision(2));
+console.log((123456).toPrecision(2));
+console.log((255).toExponential());
+console.log((1000).toPrecision(2));
+console.log((0).toPrecision(3));
+console.log((5).toExponential(0));
+console.log((-42.5).toPrecision(3));
+console.log((987654321).toExponential(4));
+console.log((0.5).toPrecision(1));

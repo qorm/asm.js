@@ -1,0 +1,10 @@
+{
+  "description": "require(esm) should evaluate the ESM module before CommonJS reads its namespace during a mixed cycle",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "1",
+    "exitCode": 0
+  }
+}

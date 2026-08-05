@@ -1,0 +1,10 @@
+{
+  "description": "strict equality for primitive values should remain correct",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true\ntrue\nfalse",
+    "exitCode": 0
+  }
+}

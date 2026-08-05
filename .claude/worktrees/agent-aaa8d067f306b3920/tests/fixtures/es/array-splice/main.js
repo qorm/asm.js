@@ -1,0 +1,13 @@
+const a = [1, 2, 3, 4, 5];
+const r = a.splice(1, 2, 9, 8);
+console.log(a.join(","), "|", r.join(","));
+const b = [1, 2, 3, 4];
+console.log(b.splice(1, 2).join(","), "|", b.join(","));
+const c = [1, 2, 3];
+c.splice(1, 0, 7, 8);
+console.log(c.join(","));
+const d = [1, 2, 3, 4, 5];
+console.log(d.splice(2).join(","), "|", d.join(","));
+const e = [1, 2, 3];
+e.splice(-1, 1, 9);
+console.log(e.join(","));

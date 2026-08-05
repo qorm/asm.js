@@ -1,0 +1,4 @@
+{
+  "description": "node:events EventEmitter.defaultMaxListeners + prependListener ordering",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "10\n10\npre,post", "exitCode": 0 }
+}

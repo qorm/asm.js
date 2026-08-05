@@ -1,0 +1,10 @@
+{
+  "description": "failing CommonJS cycles should cache the initialization error and not rerun on re-require",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "b-init a\nfirst boom\nsecond boom\nafter",
+    "exitCode": 0
+  }
+}

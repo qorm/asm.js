@@ -1,0 +1,4 @@
+{
+  "description": "bug8: function/arrow/class value instanceof Function and Object; primitives false; through params",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "true true\ntrue true\ntrue true\nfalse false\ntrue true\ntrue true", "exitCode": 0 }
+}

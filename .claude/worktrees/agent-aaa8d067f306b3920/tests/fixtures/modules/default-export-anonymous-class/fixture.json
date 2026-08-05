@@ -1,0 +1,10 @@
+{
+  "description": "anonymous default-exported classes should compile and import correctly",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "function\n9",
+    "exitCode": 0
+  }
+}

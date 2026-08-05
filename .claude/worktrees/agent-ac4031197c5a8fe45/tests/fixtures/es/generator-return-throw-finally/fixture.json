@@ -1,0 +1,10 @@
+{
+  "description": "gen.return()/gen.throw() run finally blocks; exceptions re-propagate; yield-in-finally",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ret fin 42 true\nnested in,out\nprestart none 7 true true\nyfin f false 9 true\nthr fin,caught:boom\nnat fin,caught:nat\ncat c:x false\nnotry caught:y\nmain caught:m\nreg 3 true\nforof fin,fin 3",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "CommonJS require should resolve static template literal specifiers",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "44",
+    "exitCode": 0
+  }
+}

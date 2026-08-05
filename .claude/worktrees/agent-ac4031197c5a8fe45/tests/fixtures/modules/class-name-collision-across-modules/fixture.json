@@ -1,0 +1,10 @@
+{
+  "description": "two modules with the same top-level class name (Server) must not share/overwrite each other's local labels",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "NET\nHTTP",
+    "exitCode": 0
+  }
+}

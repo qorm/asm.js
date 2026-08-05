@@ -1,0 +1,8 @@
+{
+  "description": "node:assert AssertionError code=ERR_ASSERTION, match/doesNotMatch, throws with RegExp, ifError, assert.strict",
+  "expect": {
+    "parse": true, "compile": true, "run": true,
+    "stdout": "se ERR_ASSERTION\ndse ERR_ASSERTION\nmatch-ok\ndnm-ok\nm-fail ERR_ASSERTION\nthrows-regex-ok\nthrows-mismatch ERR_ASSERTION\niferror ifError got unwanted exception: bad\ndone",
+    "exitCode": 0
+  }
+}

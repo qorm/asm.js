@@ -1,0 +1,9 @@
+{
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "3\nrejected\na\nfulfilled\nb\nfulfilled\n3",
+    "exitCode": 0
+  }
+}

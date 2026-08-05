@@ -1,0 +1,10 @@
+{
+  "description": "for await over a true async iterable (object with Symbol.asyncIterator): drives the async-iterator protocol (it=obj[Symbol.asyncIterator](); loop {value,done}=await it.next()), with runtime fallback to the Phase-1 sync-iterable-wrapping path when Symbol.asyncIterator is absent. Also exercises the object-literal-method this-binding fix (this.i inside a factory-returned iterator).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "async 0\nasync 1\nasync 2\ngen 0\ngen 10\ngen 20\np1 100\np1 200\npair 1 a\npair 2 b",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,4 @@
+{
+  "description": "callback thisArg (2nd arg) binds the callback's this for array forEach/map/filter/some/every/find/findIndex and Map/Set forEach; arrow/no-thisArg unaffected",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "60\n10,20\n3,4\ntrue\ntrue\n2\n1\na10\n30\n2,4,6", "exitCode": 0 }
+}

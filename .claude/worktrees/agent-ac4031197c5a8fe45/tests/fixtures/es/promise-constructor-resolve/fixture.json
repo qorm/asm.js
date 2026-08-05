@@ -1,0 +1,10 @@
+{
+  "description": "new Promise(executor) should invoke executor and resolve through then()",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "7",
+    "exitCode": 0
+  }
+}

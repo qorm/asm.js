@@ -1,0 +1,10 @@
+{
+  "description": "Proxy apply/construct traps: argsArray via argc ABI, thisArg, newTarget, forward, typeof",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "apply 3:1|2|3\napplyz 0:\napplyu 3:undefined\nthis T\nfwd 42\ntf function\nto object\ncons 2 7+8 true\nconsspread 3\nconsfwd 21 true\nget G:foo",
+    "exitCode": 0
+  }
+}

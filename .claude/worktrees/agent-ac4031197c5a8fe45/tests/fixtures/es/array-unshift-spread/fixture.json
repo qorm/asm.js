@@ -1,0 +1,1 @@
+{ "description": "Array.prototype.unshift with spread args (...items), including mixed spread and correct new-length return", "expect": { "parse": true, "compile": true, "run": true, "stdout": "3 1,2,3\n1 9\n0,1,2,3,5\n1,2,3,4\nx-y-z", "exitCode": 0 } }

@@ -1,0 +1,10 @@
+{
+  "description": "class C extends (arbitrary expression): value-based superclass with super()/super.m()/fields/instanceof",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ternary-true A\nternary-false B\ncall-super D3-A\nmember ns.g\nclassexpr v5\nsuper-fields 21 42 true\nmixin log+v5",
+    "exitCode": 0
+  }
+}

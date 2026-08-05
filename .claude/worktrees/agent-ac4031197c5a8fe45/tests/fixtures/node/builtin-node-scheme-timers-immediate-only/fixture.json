@@ -1,0 +1,11 @@
+{
+  "description": "node:timers setImmediate should defer a callback once",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "sync\nimmediate",
+    "stderr": "",
+    "exitCode": 0
+  }
+}

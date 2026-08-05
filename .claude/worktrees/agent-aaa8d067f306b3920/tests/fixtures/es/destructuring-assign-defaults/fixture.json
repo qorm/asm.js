@@ -1,0 +1,10 @@
+{
+  "description": "destructuring assignment (non-declaration) with defaults, nested patterns, and rest",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "a 1\nb 7\ncde 3 2 5\nxy 11 20\narr 8 99\nrest 1 2,3,4\narr2 3 4",
+    "exitCode": 0
+  }
+}

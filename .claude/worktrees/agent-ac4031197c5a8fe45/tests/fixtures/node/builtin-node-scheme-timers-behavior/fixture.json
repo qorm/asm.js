@@ -1,0 +1,10 @@
+{
+  "description": "node:timers should defer setImmediate/setTimeout(0) callbacks and allow clearTimeout to cancel queued work",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "sync\nimmediate\ntimeout2",
+    "exitCode": 0
+  }
+}

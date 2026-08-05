@@ -1,0 +1,10 @@
+{
+  "description": "Date toUTCString/toGMTString return 'Www, DD Mon YYYY HH:MM:SS GMT' (UTC), toDateString returns 'Www Mon DD YYYY'; weekday computed correctly",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "Tue, 15 Jun 2021 12:30:45 GMT\nTue, 15 Jun 2021 12:30:45 GMT\nSat, 05 Jun 2021 03:07:09 GMT\nFri, 31 Dec 1999 23:59:59 GMT\nTue Jun 15 2021\nSat Jun 05 2021\nMon, 14 Jun 2021 00:00:00 GMT\nTue, 15 Jun 2021 00:00:00 GMT\nWed, 16 Jun 2021 00:00:00 GMT\nThu, 17 Jun 2021 00:00:00 GMT\nFri, 18 Jun 2021 00:00:00 GMT\nSat, 19 Jun 2021 00:00:00 GMT\nSun, 20 Jun 2021 00:00:00 GMT",
+    "exitCode": 0
+  }
+}

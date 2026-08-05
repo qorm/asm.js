@@ -1,0 +1,10 @@
+{
+  "description": "CommonJS require should resolve builtin modules",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "object\nfunction",
+    "exitCode": 0
+  }
+}

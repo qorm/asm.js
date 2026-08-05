@@ -1,0 +1,10 @@
+{
+  "description": "for await (x of iterable) over a sync iterable / array of promises (Phase 1): parses (previously a syntax error), desugars to a sync for-of that awaits each element, reusing existing await + for-of. Covers break/continue, destructuring, Set, mixed promise/non-promise, and rejection-to-catch. True async iterables (Symbol.asyncIterator / async generators) deferred to the coroutine-core pass.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "1\n2\n3\n10\n20\n30\nsum 4\n1 a\n2 b\nset 7\nset 8\n100,200,300\ngot 1\ncaught boom",
+    "exitCode": 0
+  }
+}

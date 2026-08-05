@@ -1,0 +1,10 @@
+{
+  "description": "bug1: typeof Map/Set instance is 'object' (raw heap pointer tag fix)",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "object\nobject\nobject\nobject\ntrue\ntrue",
+    "exitCode": 0
+  }
+}

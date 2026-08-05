@@ -1,0 +1,10 @@
+{
+  "description": "top-level functions should read class bindings after module initialization",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "9",
+    "exitCode": 0
+  }
+}

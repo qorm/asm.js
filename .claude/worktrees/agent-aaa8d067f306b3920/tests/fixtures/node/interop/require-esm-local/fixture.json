@@ -1,0 +1,10 @@
+{
+  "description": "CommonJS require should be able to consume local ESM modules as namespace objects",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "42\n7\ntrue",
+    "exitCode": 0
+  }
+}

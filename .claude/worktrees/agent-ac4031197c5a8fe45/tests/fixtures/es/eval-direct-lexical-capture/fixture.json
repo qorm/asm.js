@@ -1,0 +1,10 @@
+{
+  "description": "Direct eval() lexical-scope capture: a direct `eval(str)` call inside a function reads and mutates the caller's local variables (compiler serializes the enclosing frame's name->slot layout, passes the live FP into the engine; the fragment copies caller slots in at entry and back out before return). Covers write, read (completion value), multi-var, parameter capture, post-eval use of the mutation, string capture, var-declared-in-eval not clobbering a captured read, and eval nested in a block. Matches Node's direct-eval semantics.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "20\n8\n15:5\n109\n8\njohn\n5,2,3\n1\n42",
+    "exitCode": 0
+  }
+}

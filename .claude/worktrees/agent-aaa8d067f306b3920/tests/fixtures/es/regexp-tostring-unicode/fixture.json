@@ -1,0 +1,10 @@
+{
+  "description": "RegExp toString returns /source/flags (via re.toString() and String(re)), and the .unicode flag property reflects the u flag",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "/abc/gi\n/x/g\n/hello/\n/\\d+/m\ntrue false false\ngimsuy true\nid=/test/i",
+    "exitCode": 0
+  }
+}

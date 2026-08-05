@@ -1,0 +1,4 @@
+{
+  "description": "global isNaN/isFinite coerce (ToNumber) then test: isNaN('abc')=true, isFinite('42')=true",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "true false true false false\ntrue false false true", "exitCode": 0 }
+}

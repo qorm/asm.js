@@ -1,0 +1,8 @@
+{
+  "description": "node:buffer base64/hex encode(padding)+decode, slice/subarray default end",
+  "expect": {
+    "parse": true, "compile": true, "run": true,
+    "stdout": "aGVsbG8gd29ybGQ=\nhello\nhello\nworld\nhello\nworld\nYWI=\nYWJj\n240",
+    "exitCode": 0
+  }
+}

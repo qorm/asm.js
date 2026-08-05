@@ -1,0 +1,10 @@
+{
+  "description": "Promise.all should resolve arrays of plain values and already-fulfilled promises",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "1\n2\n3",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "zlib streaming classes createGzip/createGunzip/createDeflate/createInflate on top of the sync codecs: write+end emits 'data'/'end', multi-write, deflate!=gzip framing, and pipe() into a writable sink with round-trip verification",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "gzip-roundtrip: OK\ndeflate-roundtrip: OK\ndeflate-is-gzip: no\npipe-chunks: 1 done: yes\npipe-verify: OK",
+    "exitCode": 0
+  }
+}

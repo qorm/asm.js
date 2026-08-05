@@ -1,0 +1,8 @@
+{
+  "description": "node:child_process spawn (stdout stream + 'exit' code) and exec (callback stdout + non-zero error surfaced)",
+  "expect": {
+    "parse": true, "compile": true, "run": true,
+    "stdout": "spawn:one two three code:0\nexec:x-y-z err:n\nfail-err:y",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,4 @@
+{
+  "description": "bug2: promise reactions queued inside a setTimeout callback are drained by the event loop",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "main\ntimer\ntimer-end\nthen: resolved\nchain: 2", "exitCode": 0 }
+}

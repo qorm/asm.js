@@ -1,0 +1,10 @@
+{
+  "description": "new on a runtime function value (parameter/variable) uses ES5 constructor semantics (fresh object, this=A5, explicit object return overrides); Proxy construct with no trap forwards to plain-function targets; class values through variables also work; static new paths unchanged.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "1\n1\n7\n9\n5\n1\n3\n1 6",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "description": "node:events depth: prependOnceListener ordering, unhandled 'error' throws, removeListener via once wrapper, standalone once() Promise, getEventListeners",
+  "expect": {
+    "parse": true, "compile": true, "run": true,
+    "stdout": "b,a,a\nthrew boom\nz count 0\nlisteners 1\nonce 1,2",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,4 @@
+{
+  "description": "Design A: multiple typed views + DataView over one ArrayBuffer share bytes; windowed view byteOffset; .buffer is the real backing buffer",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "4 3 2 1\n2147483647\n1000\n1000\n8 2\n12345\ntrue true true\n0 8", "exitCode": 0 }
+}

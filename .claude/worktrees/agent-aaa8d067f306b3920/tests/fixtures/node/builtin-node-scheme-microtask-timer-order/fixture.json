@@ -1,0 +1,9 @@
+{
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "sync\nafter\nmicro\nimmediate\ntimeout",
+    "exitCode": 0
+  }
+}

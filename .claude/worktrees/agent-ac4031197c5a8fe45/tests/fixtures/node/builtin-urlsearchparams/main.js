@@ -1,0 +1,14 @@
+import { URLSearchParams } from "node:url";
+const sp = new URLSearchParams("a=1&b=2&a=3");
+console.log(sp.getAll("a").join(","));
+sp.set("a", "9");
+sp.append("c", "x y");
+console.log(sp.toString());
+sp.delete("b");
+console.log(sp.size);
+sp.sort();
+console.log(sp.toString());
+console.log([...sp.keys()].join(","));
+console.log(sp.entries().length);
+console.log(new URLSearchParams({x: "1", y: "2"}).toString());
+console.log(new URLSearchParams([["k", "v"], ["m", "n"]]).toString());

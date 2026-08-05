@@ -1,0 +1,8 @@
+{
+  "description": "unknown node: builtin specifiers should fail during resolution instead of silently compiling",
+  "expect": {
+    "parse": true,
+    "compile": false,
+    "run": false
+  }
+}

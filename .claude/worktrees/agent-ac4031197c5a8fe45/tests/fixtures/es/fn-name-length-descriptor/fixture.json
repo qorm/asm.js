@@ -1,0 +1,10 @@
+{
+  "description": "getOwnPropertyDescriptor on a user function name/length yields the spec descriptor (value/writable:false/enumerable:false/configurable:true); defineProperty overrides of name/length are visible on later reads (closure-props side table consulted before the static reified value).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "f false false true\n2 true\n1\ncustom\nplain 3",
+    "exitCode": 0
+  }
+}

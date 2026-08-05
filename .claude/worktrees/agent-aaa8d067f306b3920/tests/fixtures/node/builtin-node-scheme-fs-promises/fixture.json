@@ -1,0 +1,10 @@
+{
+  "description": "node:fs/promises should resolve and support basic writeFile/readFile round-tripping",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "function\nfunction\nfixture-ok",
+    "exitCode": 0
+  }
+}

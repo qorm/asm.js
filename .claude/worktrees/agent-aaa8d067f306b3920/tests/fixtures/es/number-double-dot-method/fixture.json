@@ -1,0 +1,10 @@
+{
+  "description": "double-dot number method call (255..toString(16)) lexes the first dot as a trailing decimal point and the second as member access",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ff\n1010\n1000\n42.00\n255 255.5",
+    "exitCode": 0
+  }
+}

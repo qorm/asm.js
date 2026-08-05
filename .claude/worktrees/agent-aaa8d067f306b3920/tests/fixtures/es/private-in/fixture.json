@@ -1,0 +1,4 @@
+{
+  "description": "ES2022 #x in obj: private field/method presence check (brand check); regular in unaffected",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "true false\ntrue false\ntrue false", "exitCode": 0 }
+}

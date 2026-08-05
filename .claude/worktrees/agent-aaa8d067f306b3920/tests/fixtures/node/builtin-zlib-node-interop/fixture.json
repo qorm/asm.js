@@ -1,0 +1,10 @@
+{
+  "description": "node:zlib decodes buffers produced by Node's reference zlib: dynamic-Huffman gzip/zlib/raw, a stored (level 0) block, unzip container auto-detection, and matching crc32",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true\ntrue\ntrue\ntrue\ntrue\ntrue\n6f6059d5",
+    "exitCode": 0
+  }
+}

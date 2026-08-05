@@ -1,0 +1,10 @@
+{
+  "description": "async try/catch/finally should run the finalizer after a rejected await is caught",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "caught bad\nfinally\nend",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "String.prototype.split honors the full multi-char separator, not just its first char",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "a|b|c\na|b|c\n|a\n2\nno\nh|e|l|l|o\na|b|c",
+    "exitCode": 0
+  }
+}

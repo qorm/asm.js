@@ -1,0 +1,10 @@
+{
+  "description": "trailing comma in named export list `export { a, b, }` must parse and compile",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "6",
+    "exitCode": 0
+  }
+}

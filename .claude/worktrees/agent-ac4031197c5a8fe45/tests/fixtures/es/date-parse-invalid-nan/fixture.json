@@ -1,0 +1,4 @@
+{
+  "description": "Date.parse / new Date(string) returns NaN for unparseable input (non-aliased NaN, so isNaN is true); valid ISO strings still parse",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "true\ntrue\ntrue\n1623715200000\n1623760245000", "exitCode": 0 }
+}

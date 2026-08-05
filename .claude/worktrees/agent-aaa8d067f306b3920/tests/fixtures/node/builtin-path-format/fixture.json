@@ -1,0 +1,4 @@
+{
+  "description": "node:path format builds dir/sep/base from dir|root + base|name+ext",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "/a/b/f.txt\n/a/b/f.txt\n/file.js\nnoext\nonly.js", "exitCode": 0 }
+}

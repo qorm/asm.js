@@ -1,0 +1,4 @@
+{
+  "description": "method/closure call dispatch (via consolidated _validate_callable): normal calls work; calling a non-function throws (caught)",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "hi x\n42\n2,3,4\ncaught1\ncaught2", "exitCode": 0 }
+}

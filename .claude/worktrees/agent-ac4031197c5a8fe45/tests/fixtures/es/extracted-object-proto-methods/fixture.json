@@ -1,0 +1,10 @@
+{
+  "description": "Object.prototype methods extracted as values: t.call(x)/apply/typeof/pass-as-callback; isPrototypeOf arm64 mask fix",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "[object Array] [object Object] [object String] [object Number]\nhop true false\nvalueOf true\npie true false\nipo true false\nipo-direct true\nipo-class true\ntypeof function\napply [object Array]\ncb [object Array]\ndirect [object Array] true\nslice [1,2,3]",
+    "exitCode": 0
+  }
+}

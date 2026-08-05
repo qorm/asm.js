@@ -1,0 +1,10 @@
+{
+  "description": "dynamic import should fulfill asynchronously after surrounding synchronous code",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "sync\nafter\nloaded\n7",
+    "exitCode": 0
+  }
+}

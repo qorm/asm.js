@@ -1,0 +1,8 @@
+{
+  "description": "node:stream object-mode Readable.from(array) plus a Duplex with independent readable/writable sides",
+  "expect": {
+    "parse": true, "compile": true, "run": true,
+    "stdout": "objmode:1,2,3\nduplex-write:W1,W2\nduplex-read:R1,R2",
+    "exitCode": 0
+  }
+}

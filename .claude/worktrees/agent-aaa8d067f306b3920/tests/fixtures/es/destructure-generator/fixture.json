@@ -1,0 +1,10 @@
+{
+  "description": "array-destructuring a generator uses the iterator protocol",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "1\n2",
+    "exitCode": 0
+  }
+}

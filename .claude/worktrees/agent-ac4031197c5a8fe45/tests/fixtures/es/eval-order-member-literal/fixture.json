@@ -1,0 +1,10 @@
+{
+  "description": "ES evaluation order: member assignment evaluates object -> key -> value strictly left-to-right (reads too); computed object-literal properties evaluate key (incl. ToPropertyKey/toString) before value; compound assignment (o().v += x, a[i++] += v) evaluates the member base and computed key exactly once. Pure-operand sites (identifiers/this/literals) keep their original codegen byte-identical.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "o,k,v\no1,k1,k2\n9 o,k\n10\n2\na,1,b,2 1 2\nts,v 5\no 6\no 15\n15,20 1\n[[1,2],[13,4]] 24",
+    "exitCode": 0
+  }
+}

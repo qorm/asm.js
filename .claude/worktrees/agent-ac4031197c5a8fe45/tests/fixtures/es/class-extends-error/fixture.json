@@ -1,0 +1,4 @@
+{
+  "description": "class extends Error/TypeError/AggregateError: super(msg[,{cause}]) sets message/cause/instanceof, no segfault",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "true true MyErr boom\ntrue true TypeError bad E123\nroot Caused wrap\ntrue multi 2\ncatch caught true", "exitCode": 0 }
+}

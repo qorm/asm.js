@@ -1,0 +1,10 @@
+{
+  "description": "JSON.parse should handle basic scalar JSON values",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "1\nx\ntrue\nfalse",
+    "exitCode": 0
+  }
+}

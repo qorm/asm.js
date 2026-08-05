@@ -1,0 +1,10 @@
+{
+  "description": "node:crypto real SHA-256/SHA-1/MD5 hashes + HMAC (hex/base64, chained update, empty, long input)",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\na9993e364706816aba3e25717850c26c9cd0d89d\n900150983cd24fb0d6963f7d28e17f72\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\nba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\nungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=\n5031fe3d989c6d1537a013fa6e739da23463fdaec3b70137d828e36ace221bd0\n5112055c05f944f85755efc5cd8970e194e9f45b\n9d5c73ef85594d34ec4438b7c97e51d8\n8a9eeb29b20c994c4ba92ab776d1b7aa62245dae9ca6519c41ee429fba7ed106",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "Function declarations exported via export list should be initialized before top-level object construction",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "direct-ok\ncall-ok",
+    "exitCode": 0
+  }
+}

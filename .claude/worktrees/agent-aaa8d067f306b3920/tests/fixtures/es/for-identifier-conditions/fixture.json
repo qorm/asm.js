@@ -1,0 +1,10 @@
+{
+  "description": "for loop conditions must use current identifier values, not initializer constants",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "10\n4",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "modules should keep same-named function exports isolated by module namespace",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "a\nb",
+    "exitCode": 0
+  }
+}

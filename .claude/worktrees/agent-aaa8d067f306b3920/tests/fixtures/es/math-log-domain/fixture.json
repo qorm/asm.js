@@ -1,0 +1,4 @@
+{
+  "description": "Math log-family domain handling: log/log2/log10/log1p/acosh/atanh return NaN or -Infinity for out-of-domain inputs (negative, zero, |x|>=1 for atanh, x<1 for acosh) instead of garbage; NaN uses a printable pattern; positive-value identities unaffected",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "NaN -Infinity NaN\nNaN -Infinity\nNaN -Infinity\n-Infinity NaN\nNaN NaN NaN 0\nNaN NaN Infinity -Infinity\ntrue true true", "exitCode": 0 }
+}

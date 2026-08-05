@@ -1,0 +1,4 @@
+{
+  "description": "computed-key subscript get/set works on class objects (classinfo is TYPE_FUNCTION but a property container): Class[Symbol.x], Class[symbolVar]=v, Class[dynamicStringKey]",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "function\ntrue false\n42\n7 7\n100\n1\n1 1", "exitCode": 0 }
+}

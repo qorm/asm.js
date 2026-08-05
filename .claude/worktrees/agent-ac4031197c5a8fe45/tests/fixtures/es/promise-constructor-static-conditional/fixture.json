@@ -1,0 +1,10 @@
+{
+  "description": "new Promise(executor) should support statically decidable conditional executor bindings",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "23",
+    "exitCode": 0
+  }
+}

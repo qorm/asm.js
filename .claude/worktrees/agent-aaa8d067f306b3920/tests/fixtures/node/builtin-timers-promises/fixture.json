@@ -1,0 +1,4 @@
+{
+  "description": "node:timers/promises setTimeout/setImmediate resolve their value for await",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "start\ndelayed\nimmediate\nend", "exitCode": 0 }
+}

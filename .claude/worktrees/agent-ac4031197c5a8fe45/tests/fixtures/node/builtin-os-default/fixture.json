@@ -1,0 +1,10 @@
+{
+  "description": "default import of a builtin runtime module exposes callable methods",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "function\nstring",
+    "exitCode": 0
+  }
+}

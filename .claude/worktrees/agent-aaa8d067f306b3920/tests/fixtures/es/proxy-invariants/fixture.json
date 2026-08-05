@@ -1,0 +1,10 @@
+{
+  "description": "Object.getOwnPropertyDescriptors skips keys whose (proxy trap) descriptor is undefined; basic Proxy invariant enforcement throws when trap results are inconsistent with target state (preventExtensions vs extensible target; gOPD hiding a non-configurable target prop; defineProperty adding to a non-extensible target or declaring non-configurable without a matching target prop). Valid trap uses do not throw.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true\n1 2 true\ntrue\nobject\ntrue\nundefined\ntrue\ntrue\nok",
+    "exitCode": 0
+  }
+}

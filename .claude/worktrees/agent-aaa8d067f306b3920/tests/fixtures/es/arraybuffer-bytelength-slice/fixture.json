@@ -1,0 +1,4 @@
+{
+  "description": "ArrayBuffer.byteLength and .slice(start?, end?) dispatch (start=0/end=byteLength defaults); result is an ArrayBuffer",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "16\n8\n8\n16\n100", "exitCode": 0 }
+}

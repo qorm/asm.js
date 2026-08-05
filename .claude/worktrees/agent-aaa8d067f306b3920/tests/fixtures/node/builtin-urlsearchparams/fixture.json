@@ -1,0 +1,4 @@
+{
+  "description": "node:url URLSearchParams sort/size/entries + object/array init",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "1,3\na=9&b=2&c=x+y\n2\na=9&c=x+y\na,c\n2\nx=1&y=2\nk=v&m=n", "exitCode": 0 }
+}

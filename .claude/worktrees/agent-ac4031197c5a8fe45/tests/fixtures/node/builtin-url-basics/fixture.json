@@ -1,0 +1,4 @@
+{
+  "description": "node:url URL parsing (protocol/host/port/origin/searchParams) and URLSearchParams",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "https:\nexample.com\nexample.com:8080\n8080\n/path\nhttps://example.com:8080\n1,2\n1,3\ntrue,false\na=X&b=2&c=9", "exitCode": 0 }
+}

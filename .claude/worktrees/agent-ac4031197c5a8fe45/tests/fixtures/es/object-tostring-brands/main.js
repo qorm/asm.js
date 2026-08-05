@@ -1,0 +1,13 @@
+var O = Object.prototype.toString;
+console.log(O.call(new Uint8Array([1])));
+console.log(O.call(new Int32Array([1])));
+console.log(O.call(new Float64Array([1])));
+console.log(O.call(new ArrayBuffer(4)));
+console.log(O.call(new DataView(new ArrayBuffer(4))));
+console.log(O.call(10n));
+console.log(O.call(Symbol("x")));
+console.log(O.call(Promise.resolve(1)));
+console.log(O.call({}));
+console.log(O.call([1]));
+console.log(O.call(new Map()));
+console.log("end");

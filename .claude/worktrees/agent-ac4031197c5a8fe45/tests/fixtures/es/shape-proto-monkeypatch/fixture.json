@@ -1,0 +1,7 @@
+{
+  "description": "shape v2 T2a prototype shaping: monkeypatch",
+  "expect": {
+    "stdout": "old\nadded old\n42",
+    "exitCode": 0
+  }
+}

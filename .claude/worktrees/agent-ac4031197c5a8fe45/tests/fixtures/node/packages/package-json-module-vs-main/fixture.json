@@ -1,0 +1,10 @@
+{
+  "description": "package main/module field ordering should differ between import and require",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "module-field\nmain-field",
+    "exitCode": 0
+  }
+}

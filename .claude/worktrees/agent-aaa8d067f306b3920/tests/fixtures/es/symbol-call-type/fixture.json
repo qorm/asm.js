@@ -1,0 +1,10 @@
+{
+  "description": "Symbol() should eventually produce a real symbol value",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "symbol",
+    "exitCode": 0
+  }
+}

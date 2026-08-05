@@ -1,0 +1,8 @@
+{
+  "description": "node:fs existsSync/mkdirSync(+recursive)/writeFileSync/readFileSync/unlinkSync/rmdirSync roundtrip (macOS carry-flag syscall fix)",
+  "expect": {
+    "parse": true, "compile": true, "run": true,
+    "stdout": "false\ntrue\ntrue\nhello fs\ntrue\nfalse\nfalse",
+    "exitCode": 0
+  }
+}

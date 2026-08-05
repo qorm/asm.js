@@ -1,0 +1,10 @@
+{
+  "description": "queueMicrotask should defer a callback until after the current turn",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "sync\nafter\nmicro",
+    "exitCode": 0
+  }
+}

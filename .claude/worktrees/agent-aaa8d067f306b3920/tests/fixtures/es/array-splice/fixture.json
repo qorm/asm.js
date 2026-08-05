@@ -1,0 +1,4 @@
+{
+  "description": "Array.prototype.splice: replace/delete/insert/omit-count/negative-start, returns removed (in place)",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "1,9,8,4,5 | 2,3\n2,3 | 1,4\n1,7,8,2,3\n3,4,5 | 1,2\n1,2,9", "exitCode": 0 }
+}

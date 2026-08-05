@@ -1,0 +1,4 @@
+{
+  "description": "instanceof consults a constructor's [Symbol.hasInstance] method (class static or object literal) when present, and falls back to the normal prototype-chain check otherwise",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "true false false\ntrue false\ntrue true false\ntrue true\nsymbol", "exitCode": 0 }
+}

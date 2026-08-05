@@ -1,0 +1,10 @@
+{
+  "description": "for-in skips non-enumerable properties",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "a,b",
+    "exitCode": 0
+  }
+}

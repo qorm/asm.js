@@ -1,0 +1,11 @@
+{
+  "description": "module graphs larger than 32 entries should still resolve and initialize correctly",
+  "entry": "m0.js",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "32",
+    "exitCode": 0
+  }
+}

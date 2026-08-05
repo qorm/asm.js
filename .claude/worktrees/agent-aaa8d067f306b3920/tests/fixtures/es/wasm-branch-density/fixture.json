@@ -1,0 +1,10 @@
+{
+  "description": "conditional-branch density: signed/float/NaN compares + labeled break/continue + tight numeric loops; guards the wasm32 `set pc; <cmp>; br_if` lowering (no if/end wrapper) against regression. Output is identical native vs wasm.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "big,mid,zero,mid,big,big\nlo mid hi nan\n0,1,10,11,20,21\n2930\n9 true",
+    "exitCode": 0
+  }
+}

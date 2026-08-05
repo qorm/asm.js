@@ -1,0 +1,10 @@
+{
+  "description": "array-destructuring a Set uses the iterator protocol",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "7\n8",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,4 @@
+{
+  "description": "Array.prototype.unshift prepends and returns new length (mutating, with growth)",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "3\n2,3,4\n4 1,2,3,4\n5,4,3,2,1,0", "exitCode": 0 }
+}

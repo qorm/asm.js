@@ -1,0 +1,11 @@
+{
+  "description": "cyclic const import should still preserve TDZ semantics",
+  "entry": "a.js",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ReferenceError: Cannot access 'a' before initialization",
+    "exitCode": 1
+  }
+}

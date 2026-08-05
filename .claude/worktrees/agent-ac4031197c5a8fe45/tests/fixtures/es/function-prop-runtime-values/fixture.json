@@ -1,0 +1,1 @@
+{"description": "fn.x on runtime function values (alias, call result, param, array element) via _object_get/_object_set 0x7FFF routing to the closure props side-table", "expect": {"parse": true, "compile": true, "run": true, "stdout": "alias 1 1\nfactory 9\nparam true\nelem 0", "exitCode": 0}}

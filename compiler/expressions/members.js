@@ -1494,7 +1494,77 @@ export const MemberCompiler = {
         vm.label(doneL);
     },
 
-    // ── [W3] JSON 命名空间 / String·Number 静态族 一等值物化 ─────────────────────
+    // [Symbol 一等值] Symbol 构造函数 + well-known symbols 物化
+    emitSymbolCtorObject() {
+        const vm = this.vm;
+        const ctorSlot = "_nsobj_symbol";
+        this._reEnsureSlot(ctorSlot);
+        const doneL = this.ctx.newLabel("nssym_done");
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne(doneL);
+        // 构造器闭包 16B {magic, _symbol_new}
+        vm.movImm(VReg.A0, 16);
+        vm.call("_alloc");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.movImm(VReg.V1, 0xc105); // CLOSURE_MAGIC
+        vm.store(VReg.S0, 0, VReg.V1);
+        vm.lea(VReg.V1, "_symbol_new");
+        vm.store(VReg.S0, 8, VReg.V1);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_js_box_function");
+        vm.lea(VReg.V1, ctorSlot);
+        vm.store(VReg.V1, 0, VReg.RET);
+        // Symbol.name / Symbol.length (length = 0)
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("name", VReg.A1);
+        vm.lea(VReg.A2, this.asm.addString("Symbol"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A2, VReg.A2, VReg.V1);
+        vm.call("_closure_prop_set");
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("length", VReg.A1);
+        vm.movImm(VReg.A2, 0);
+        vm.scvtf(0, VReg.A2);
+        vm.fmovToInt(VReg.A2, 0);
+        vm.call("_closure_prop_set");
+        // Well-known symbols as own properties (writable:false, enumerable:false, configurable:false)
+        const WK_SYMBOLS = ["asyncIterator", "hasInstance", "isConcatSpreadable",
+            "iterator", "match", "matchAll", "replace", "search",
+            "species", "split", "toPrimitive", "toStringTag", "unscopables"];
+        for (let i = 0; i < WK_SYMBOLS.length; i++) {
+            const name = WK_SYMBOLS[i];
+            const slot = "_symwk_" + name;
+            this._reEnsureSlot(slot);
+            // Call _symbol_wellknown to get/create the symbol
+            vm.lea(VReg.A0, slot);
+            vm.lea(VReg.A1, this.asm.addString("Symbol." + name));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+            vm.or(VReg.A1, VReg.A1, VReg.V1);
+            vm.call("_symbol_wellknown"); // RET = raw symbol pointer
+            // Box as 0x7FFF function tag (symbols are special values)
+            // Symbols are stored as raw pointers; for property values they need boxing
+            // _symbol_wellknown returns raw pointer, store as-is
+            vm.mov(VReg.A2, VReg.RET);
+            vm.lea(VReg.V0, ctorSlot);
+            vm.load(VReg.A0, VReg.V0, 0);
+            this.emitBoxedStringKey(name, VReg.A1);
+            vm.call("_closure_prop_set");
+            // Set attr: non-writable, non-enumerable, non-configurable
+            vm.lea(VReg.V0, ctorSlot);
+            vm.load(VReg.A0, VReg.V0, 0);
+            this.emitBoxedStringKey(name, VReg.A1);
+            vm.movImm(VReg.A2, 0);
+            vm.call("_closure_prop_set_attr");
+        }
+        // RET = 装箱构造器
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.label(doneL);
+    },
     // 三项全部复用既有模板且**零新增运行时 helper**:JSON 方法值直连 shim 导出函数
     // (与调用快路同一函数),String.fromCharCode/fromCodePoint 与 Number.is* 谓词的方法值
     // 经 compileFunctionExpression 现场编译合成函数(体内走同一静态快路,偏差口径自动
@@ -2896,8 +2966,11 @@ export const MemberCompiler = {
             this.emitPromiseCtorObject();
             return;
         }
-        // Symbol 一等值(批次D):typeof Symbol === "function"、可传递后调用
-        if (name === "Symbol") { this.emitBuiltinFnClosure("_symbol_new"); return; }
+        // [Symbol 一等值] Symbol 构造函数 + well-known symbols
+        if (name === "Symbol") {
+            this.emitSymbolCtorObject();
+            return;
+        }
         // [Error 构造器一等值] 裸 TypeError/RangeError/... 作值 → memoized 闭包(.name 就绪、
         // 可传递、`===` 稳定、typeof "function")。用户局部/函数遮蔽同名时退回词法解析。
         if (ERR_CTOR_NAMES.indexOf(name) >= 0 &&

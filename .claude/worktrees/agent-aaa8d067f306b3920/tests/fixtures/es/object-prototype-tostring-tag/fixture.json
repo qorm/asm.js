@@ -1,0 +1,10 @@
+{
+  "description": "Object.prototype.toString.call(x) returns the correct [object Tag] brand for all built-in types and honors a string Symbol.toStringTag",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "[object Array]\n[object Object]\n[object Null]\n[object Undefined]\n[object Number]\n[object String]\n[object Boolean]\n[object Date]\n[object RegExp]\n[object Function]\n[object Error]\n[object Map]\n[object Set]\n[object Custom]",
+    "exitCode": 0
+  }
+}

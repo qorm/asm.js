@@ -1,0 +1,10 @@
+{
+  "description": "Stage A Batch 3: array map/filter method references via runtime callback invoker",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "function function\n2,4,6\n0:10,1:20\n2,4\n101,102\n30,40",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "for-of that exits early via break calls the iterator return() method (IteratorClose); normal completion does not close; array/Set/string fast paths and iterators without a return method are unaffected; nested breaks each close.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true\n1 false\nno-return-ok\n1 1 a\n2",
+    "exitCode": 0
+  }
+}

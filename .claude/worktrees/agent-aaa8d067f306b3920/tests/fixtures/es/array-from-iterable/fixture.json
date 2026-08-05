@@ -1,0 +1,10 @@
+{
+  "description": "Array.from over non-array iterables (generator/Set/string) with optional mapFn, previously segfaulted",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "1,2,3\n2,4,6\n5,6,7\na,b,c\n9,8",
+    "exitCode": 0
+  }
+}

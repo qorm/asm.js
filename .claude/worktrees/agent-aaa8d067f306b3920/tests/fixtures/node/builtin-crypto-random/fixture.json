@@ -1,0 +1,8 @@
+{
+  "description": "node:crypto randomBytes/randomUUID(v4)/randomInt via kernel entropy (getentropy/getrandom), no Math.random dependency",
+  "expect": {
+    "parse": true, "compile": true, "run": true,
+    "stdout": "16\ntrue\n36\n4\n----\ntrue\ntrue\n64",
+    "exitCode": 0
+  }
+}

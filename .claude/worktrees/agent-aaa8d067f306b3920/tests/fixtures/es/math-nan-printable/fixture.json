@@ -1,0 +1,4 @@
+{
+  "description": "Math functions returning a hardware NaN (out-of-domain sqrt/asin/acos/pow, NaN inputs, no-arg calls) print \"NaN\" not \"0\"/\"1\"; the qNaN 0x7FF8... aliases boxed integers, so results are normalized to the printable NaN pattern; finite results are unchanged",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "NaN NaN\nNaN NaN NaN\nNaN\nNaN NaN NaN NaN\nNaN NaN NaN\nNaN NaN\n4 1024 5", "exitCode": 0 }
+}

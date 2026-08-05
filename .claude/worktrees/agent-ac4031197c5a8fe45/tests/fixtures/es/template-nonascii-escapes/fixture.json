@@ -1,0 +1,1 @@
+{ "description": "template literal hex/unicode/surrogate escapes cook to UTF-8; raw non-ASCII passthrough; String.raw preserves raw text including invalid hex escapes", "expect": { "parse": true, "compile": true, "run": true, "stdout": "accent é\nbmp 你\nastral 😀\nsurr 😀\nraw 你好 café 🎉\ninterp 你7好\nC:\\temp\\x A\\n keep\n\\xe9 你 \\u{1F600}", "exitCode": 0 } }

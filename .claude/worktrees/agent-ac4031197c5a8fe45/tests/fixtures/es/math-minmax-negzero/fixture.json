@@ -1,0 +1,4 @@
+{
+  "description": "Math.min/max honor negative zero per spec (min prefers -0, max prefers +0) even though fcmp treats -0==+0; verified via 1/result sign; ordinary and NaN-propagating cases unaffected",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "-Infinity Infinity\n-Infinity Infinity\n-Infinity Infinity\n-Infinity true\n1 3 -5\nNaN NaN", "exitCode": 0 }
+}

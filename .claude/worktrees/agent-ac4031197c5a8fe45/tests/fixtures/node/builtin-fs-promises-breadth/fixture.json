@@ -1,0 +1,8 @@
+{
+  "description": "node:fs/promises breadth: mkdir/writeFile/readFile/unlink/rmdir",
+  "expect": {
+    "parse": true, "compile": true, "run": true,
+    "stdout": "promise data\ntrue\nok",
+    "exitCode": 0
+  }
+}

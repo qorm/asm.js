@@ -1,0 +1,10 @@
+{
+  "description": "class-body [Symbol.iterator]/[Symbol.asyncIterator] dispatched by for-of/spread/for-await; [Symbol.hasInstance] unaffected",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "of 0\nof 1\nof 2\nspread 0,1,2\nhasit function\ninst true false\nawait 10\nawait 11\nawait 12",
+    "exitCode": 0
+  }
+}

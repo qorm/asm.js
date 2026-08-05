@@ -1,0 +1,7 @@
+{
+  "description": "L4 string in-place concat: accum",
+  "expect": {
+    "stdout": "200 abab abab\n51 x01234 789\n110 v0,v1 v29,\nqABCDEFGHIJ",
+    "exitCode": 0
+  }
+}

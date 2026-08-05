@@ -1,0 +1,10 @@
+{
+  "description": "Object.keys/values/entries and JSON.stringify skip non-enumerable properties",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "a,b\n1,2\n[[\"a\",1],[\"b\",2]]\n{\"a\":1,\"b\":2}\n99",
+    "exitCode": 0
+  }
+}

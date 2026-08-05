@@ -1,0 +1,10 @@
+{
+  "description": "async methods (class + object-literal) return Promises: await/then/reject/this",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "classm 107\nclassthis 41\nclasscatch boom\nobjn 42\nobjadd 7\nobjthen 2",
+    "exitCode": 0
+  }
+}

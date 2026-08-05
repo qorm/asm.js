@@ -1,0 +1,10 @@
+{
+  "description": "arithmetic on a non-numeric string yields NaN (not a boxed-int alias); numeric strings and pure-numeric arithmetic unaffected",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "NaN\nNaN\nNaN\nNaN\ntrue\n11 7 2\n2 15 2",
+    "exitCode": 0
+  }
+}

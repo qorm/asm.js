@@ -1,0 +1,10 @@
+{
+  "description": "String.raw tagged template: raw quasi text + expression substitution (cooked path unchanged)",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "a\\nb\nC:\\temp\\x\nv=3!\n\\tX\\r\n\"a\\\\nb\"\np\nq|r",
+    "exitCode": 0
+  }
+}

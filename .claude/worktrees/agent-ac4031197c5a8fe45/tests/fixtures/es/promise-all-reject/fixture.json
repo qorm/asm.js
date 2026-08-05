@@ -1,0 +1,10 @@
+{
+  "description": "Promise.all should reject when any already-settled input promise is rejected",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "boom",
+    "exitCode": 0
+  }
+}

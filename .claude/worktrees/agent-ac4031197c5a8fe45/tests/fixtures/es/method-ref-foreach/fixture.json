@@ -1,0 +1,10 @@
+{
+  "description": "Stage A Batch 3: array forEach method reference driven by a runtime callback invoker",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "function\n6\n0:10/2,1:20/2\n101,102",
+    "exitCode": 0
+  }
+}

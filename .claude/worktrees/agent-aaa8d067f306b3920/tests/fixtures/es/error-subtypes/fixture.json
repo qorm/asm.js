@@ -1,0 +1,11 @@
+{
+  "description": "ReferenceError and TypeError constructors should preserve subtype names",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ReferenceError\nmissing\nReferenceError: missing\nTypeError\nbad\nTypeError: bad\n",
+    "stderr": "",
+    "exitCode": 0
+  }
+}

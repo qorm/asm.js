@@ -1,0 +1,12 @@
+import crypto from "node:crypto";
+console.log(crypto.createHash("sha256").update("abc").digest("hex"));
+console.log(crypto.createHash("sha1").update("abc").digest("hex"));
+console.log(crypto.createHash("md5").update("abc").digest("hex"));
+console.log(crypto.createHash("sha256").update("").digest("hex"));
+console.log(crypto.createHash("sha256").update("a").update("bc").digest("hex"));
+console.log(crypto.createHash("sha256").update("abc").digest("base64"));
+console.log(crypto.createHmac("sha256", "key").update("data").digest("hex"));
+console.log(crypto.createHmac("sha1", "secret").update("hello").digest("hex"));
+console.log(crypto.createHmac("md5", "key").update("data").digest("hex"));
+const long = "The quick brown fox jumps over the lazy dog. ".repeat(5);
+console.log(crypto.createHash("sha256").update(long).digest("hex"));

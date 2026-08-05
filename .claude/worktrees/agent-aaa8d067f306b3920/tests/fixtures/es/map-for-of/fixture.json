@@ -1,0 +1,4 @@
+{
+  "description": "for-of over a Map iterates [key,value] entries (whole entry and destructured)",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "a 1\nb 2\na=1\nb=2\n3", "exitCode": 0 }
+}

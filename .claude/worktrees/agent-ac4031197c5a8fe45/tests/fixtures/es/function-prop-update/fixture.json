@@ -1,0 +1,1 @@
+{"description": "fn.x++ / fn.x-- / compound assignment on function custom properties route through the closure props side-table", "expect": {"parse": true, "compile": true, "run": true, "stdout": "42\n42\n43\n44\n43\n50\n60\n5", "exitCode": 0}}

@@ -1,0 +1,8 @@
+{
+  "description": "node:os userInfo/networkInterfaces/endianness/machine/version/availableParallelism",
+  "expect": {
+    "parse": true, "compile": true, "run": true,
+    "stdout": "string number string\nobject true 127.0.0.1\nLE\nstring string\ntrue",
+    "exitCode": 0
+  }
+}

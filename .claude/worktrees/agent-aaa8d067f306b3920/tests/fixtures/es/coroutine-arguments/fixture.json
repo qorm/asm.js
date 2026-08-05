@@ -1,0 +1,10 @@
+{
+  "description": "arguments object in generator/async bodies with correct argc",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "gen 3 20\ngenundef 3\ngenclosure 2\ngenparams 7 2\nasync 2:undefined\nasyncz 0\nagen 3",
+    "exitCode": 0
+  }
+}

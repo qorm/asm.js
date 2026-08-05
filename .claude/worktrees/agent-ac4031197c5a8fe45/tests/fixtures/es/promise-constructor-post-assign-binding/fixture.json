@@ -1,0 +1,10 @@
+{
+  "description": "new Promise(executor) should support bindings assigned to a function value before construction",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "19",
+    "exitCode": 0
+  }
+}

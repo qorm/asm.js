@@ -1,0 +1,8 @@
+{
+  "description": "require('node:X') interop matches import: path.sep property preserved, events returns the newable class, fs stays an object",
+  "expect": {
+    "parse": true, "compile": true, "run": true,
+    "stdout": "/\na/b\ny.js\nfunction\nfired:7\nobject\nfunction\ntrue",
+    "exitCode": 0
+  }
+}

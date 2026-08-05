@@ -1,0 +1,10 @@
+{
+  "description": "[dialect] js stays an ordinary identifier outside spawn position (node-diffed)",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "a 6\nb 6\nc 7\nd 101\ne 9",
+    "exitCode": 0
+  }
+}

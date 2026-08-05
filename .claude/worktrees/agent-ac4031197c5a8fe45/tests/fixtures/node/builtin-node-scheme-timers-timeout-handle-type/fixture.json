@@ -1,0 +1,11 @@
+{
+  "description": "node:timers setTimeout should return a usable handle value",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "sync\nobject",
+    "stderr": "",
+    "exitCode": 0
+  }
+}

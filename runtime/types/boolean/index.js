@@ -36,10 +36,7 @@ export class BooleanGenerator {
         vm.call("_object_new"); // RET = raw obj ptr
         vm.mov(VReg.S1, VReg.RET); // S1 = raw obj ptr
 
-        // Step 3: set proto from global slot (read-only, slot filled by emitBooleanCtorObject)
-        vm.lea(VReg.V0, "_nsobj_boolean_proto");
-        vm.load(VReg.V0, VReg.V0, 0); // V0 = boxed proto (may be 0)
-        vm.store(VReg.S1, 16, VReg.V0); // obj.__proto__ = proto (0 ok)
+        // Step 3: proto set by caller (compiler), leave as 0 here
 
         // Step 4: store __boolean_value
         vm.mov(VReg.A0, VReg.S1);

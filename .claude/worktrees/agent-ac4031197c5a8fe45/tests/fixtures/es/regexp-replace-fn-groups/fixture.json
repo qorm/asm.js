@@ -1,0 +1,1 @@
+{"description": "regexp: regexp-replace-fn-groups", "expect": {"parse": true, "compile": true, "run": true, "stdout": "2024/01\n012\nbac\nx1y2", "exitCode": 0}}

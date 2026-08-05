@@ -1,0 +1,10 @@
+{
+  "description": "derived-class field initializers run after super() and can read super-set state",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "b 10\nd 11\norder super,field\ndefault-ctor 10\nprivate 107\nchain 101 102\nbase 3 4 4",
+    "exitCode": 0
+  }
+}

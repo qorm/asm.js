@@ -1,0 +1,4 @@
+{
+  "description": "structuredClone deep-clones nested arrays/objects (JSON shim reaches the synthesized calls)",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "3 99\n4 77\nfalse false {\"a\":[1,2,{\"b\":99}],\"c\":{\"d\":[77,5]}}", "exitCode": 0 }
+}

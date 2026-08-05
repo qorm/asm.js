@@ -1,0 +1,10 @@
+{
+  "description": "node:process should resolve to an object-like runtime shim with core entry points",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "object\nfunction\nfunction\nstring",
+    "exitCode": 0
+  }
+}

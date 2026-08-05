@@ -1,0 +1,10 @@
+{
+  "description": "computed symbol key in an object literal ({[sym]: v}) is readable via obj[sym], consistent with obj[sym]=v assignment; string computed keys unaffected",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "2\n3 4\nval 42\n2",
+    "exitCode": 0
+  }
+}

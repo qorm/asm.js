@@ -1,0 +1,4 @@
+{
+  "description": "Map/Set use SameValueZero for keys: NaN equals NaN (get/has/dedup), normal keys unaffected",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "nv true 1\nnv2 1\ntrue 1\n1 three false 2\n3", "exitCode": 0 }
+}

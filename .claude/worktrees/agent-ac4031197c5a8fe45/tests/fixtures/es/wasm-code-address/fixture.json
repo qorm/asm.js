@@ -1,0 +1,10 @@
+{
+  "description": "code-address (a64) constants: function pointers in closures, higher-order dispatch through function values, deep/mutual recursion (call return addresses), dispatch tables. On wasm32 these emit i64.const CODE_BASE+labelIdx (lea) and return-address constants, now narrowed from 10-byte to 5-byte sleb (all wasm32 addresses < 2^32 fit). Guards that narrowing. Output identical native vs wasm.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ops 7 12 6\nhof 2,4,6,8,10,12,14,16 2,4,6,8 36\nclosure 13\nrecur 6765 125250\nparity true false\ntable 24",
+    "exitCode": 0
+  }
+}

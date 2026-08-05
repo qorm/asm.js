@@ -1,0 +1,10 @@
+{
+  "description": "arrow functions should support default parameters in parenthesized parameter lists",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "7\n5",
+    "exitCode": 0
+  }
+}

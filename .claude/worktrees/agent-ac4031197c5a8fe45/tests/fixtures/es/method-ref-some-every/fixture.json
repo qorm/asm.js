@@ -1,0 +1,10 @@
+{
+  "description": "Stage A Batch 3: array some/every method references (short-circuit) via runtime callback invoker",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true\nfalse\ntrue\nfalse\ntrue\ntrue",
+    "exitCode": 0
+  }
+}

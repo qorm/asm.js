@@ -1,0 +1,10 @@
+{
+  "description": "for statements with empty init/test/update sections: for(;;), for(a;;c), for(;test;)",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "3\n6\n5\n3",
+    "exitCode": 0
+  }
+}

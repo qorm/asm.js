@@ -1,0 +1,5 @@
+{
+  "expect": {
+    "stdout": "t1 true\nt2 false\nt3 true\nt4 false\nt5 true\nt6 true\nc1 false\nc2 true\nc3 true\nc4 true false\nc5 true false\nc6 true false\nc7 true false\nc8 true false\nq1 aaa 1\nq2 aaa\nq3 <a>\nq4 <a><b>\nq5 b 0\nq6 false true\ng1 aabbb aa bbb 1\ng2 ababab 1\ng3 a a true\ng4 abc ab c\ng5 true\ng6 2026 07 10\ng7 aaab aa\nf1 true\nf2 ABCdef\nf3 true 2\nf4 true\nx1 1 1 2\nx2 22 4 6\nx3 333 8 11\nx4 true 0\nm1 1,22,333 3\nm2 1 1 1\nm3 true\nr1 hello there world\nr2 f00 b00\nr3 smith john\nr4 a[1] b[22]\nr5 baanaanaa\nr6 abc\nr7 price: $30\nd1 Bbb,B\nd2 b+ gi true\nd3 true false\ne1 true false\ne2 true true\ne3 true\ne4 true"
+  }
+}

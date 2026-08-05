@@ -1,0 +1,10 @@
+{
+  "description": "Date toLocaleString/toLocaleDateString/toLocaleTimeString produce en-US default format (M/D/YYYY, H:MM:SS AM/PM) via the date shim",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "6/15/2021, 2:30:45 PM\n6/15/2021\n2:30:45 PM\n1/5/2021, 9:05:03 AM\n12:00:00 AM\n12:00:00 PM\n7/4/1999\n12/25/2022, 11:59:59 PM",
+    "exitCode": 0
+  }
+}

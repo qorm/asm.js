@@ -1,0 +1,4 @@
+{
+  "description": "NaN literal !== itself (=== and == both false); non-NaN strict-equal unaffected",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "false\ntrue\nfalse\ntrue true true true\nfalse false false", "exitCode": 0 }
+}

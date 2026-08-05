@@ -1,0 +1,10 @@
+{
+  "description": "Stage A: built-in array/string method references as first-class values",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "XYZ\nhi\n1,4",
+    "exitCode": 0
+  }
+}

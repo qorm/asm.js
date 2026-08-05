@@ -1,0 +1,10 @@
+{
+  "description": "TypedArray non-mutating copy methods toReversed/toSorted/with return a same-type copy and leave the original unchanged (with supports negative index)",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "rev 3 2 1 orig 1 2 3\nsort 1 2 3 orig 3 1 2\nwith 10 99 30 orig 10 20 30\nwneg 9.5 orig 3.5",
+    "exitCode": 0
+  }
+}

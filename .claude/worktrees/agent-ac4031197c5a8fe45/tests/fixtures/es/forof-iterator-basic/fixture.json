@@ -1,0 +1,10 @@
+{
+  "description": "for...of with custom Symbol.iterator",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "0\n1\n2",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "[dialect] js f(x) spawn: immediate arg evaluation, FIFO scheduling, method this, async spawn (golden output; node cannot parse)",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "main 3\nmain-end\np 1 2\np 3 0\nT 9\nasync 7",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "Direct eval() creating a closure that ESCAPES the eval, after which the caller mutates the captured local; the escaped closure and the caller share one cell (Engine round-4 milestone). Fix: a function containing a direct eval upgrades ALL copy-in-eligible locals to a heap box (analyzeDirectEvalBoxedVars), the call site tags them ':b', and fragment copy-in reuses the caller's box (copy-out no-op). Covers escaping read/write closures, later caller writes, captured params, two vars, a var also captured by a real closure, nested functions, and arrows. Matches Node.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "20\n3\n105\n10,20\n7/6/7\n100/200\n50/50\n42\n9",
+    "exitCode": 0
+  }
+}

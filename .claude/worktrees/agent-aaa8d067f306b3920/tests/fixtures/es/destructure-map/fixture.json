@@ -1,0 +1,10 @@
+{
+  "description": "array-destructuring a Map yields [key, value] entries",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "x\n1\ny\n2",
+    "exitCode": 0
+  }
+}

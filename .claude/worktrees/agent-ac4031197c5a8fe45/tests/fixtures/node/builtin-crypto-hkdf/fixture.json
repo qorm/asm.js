@@ -1,0 +1,10 @@
+{
+  "description": "node:crypto hkdfSync (RFC 5869) Extract+Expand over HMAC -- SHA-256 (RFC A.1/A.3 vectors), SHA-512, SHA-1 multi-round expand; byte-for-byte vs Node",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "a1: 3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865\na3: 8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8\ns512: 25eaed02489ebe1fddea3d3c8f822a8d5c851ea020aa77edf8888f089325cc5224e288580ab7a2c0e44f26827de5cd9f4864e8562b15b2829c98b866f0473a6e\ns1: 176a39aa541d8d31f22778ab1f50d24eb327ae31b50e50da1d29dffee2cd9debacd83446c1b41ace",
+    "exitCode": 0
+  }
+}

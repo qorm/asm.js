@@ -1,0 +1,10 @@
+{
+  "description": "new Promise(executor) should invoke inline reject and propagate through catch()",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "bad",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "node:crypto AES-128/256-CBC createCipheriv/createDecipheriv (PKCS7 pad, setAutoPadding, round-trip + Node interop) + HMAC-based pbkdf2Sync + getCiphers/randomFillSync",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "aes128: 552aa0ba5a71c3e942fb2fca990f00321d9e2852ac29ce24f881d1d9d73b947a386dbbc66a4f0b867e602ae91008dfb8\naes256: 67517c5c04787471a136be51f0662155cf6a886ec5b6c9c15bc17558f2263a04cd31c52006e3ce8fa0ef4ad92a937b9b\nrt128: OK\nrt256: OK\naes128-16: 972c674c492135df615544f4f029f426b1eb41f64635681a074d39d9490f3896\naes128-nopad: 972c674c492135df615544f4f029f426\npbkdf2-sha256: 632c2812e46d4604102ba7618e9d6d7d2f8128f6266b4a03264d2a0460b7dcb3\npbkdf2-sha1: 8595d7aea0e7c952a35af9a838cc6b393449307c\nciphers: aes-128-cbc,aes-192-cbc,aes-256-cbc,aes-128-ctr,aes-192-ctr,aes-256-ctr,aes-128-gcm,aes-192-gcm,aes-256-gcm\nrandfill-len: 8",
+    "exitCode": 0
+  }
+}

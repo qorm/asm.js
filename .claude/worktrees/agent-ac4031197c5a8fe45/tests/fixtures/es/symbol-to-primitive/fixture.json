@@ -1,0 +1,4 @@
+{
+  "description": "Symbol.toPrimitive is invoked during object-to-primitive coercion with the correct hint (number for +/*/-, string for template/String, default for +''/==); valueOf/toString fallback preserved when absent",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "10\n20\n9\nS\nS\nD\ntrue\n42 42 43\n8 str 14", "exitCode": 0 }
+}

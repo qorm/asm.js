@@ -1,0 +1,11 @@
+const m = new Map();
+m.set(NaN, "nv");
+console.log(m.get(NaN), m.has(NaN), m.size);
+m.set(NaN, "nv2");
+console.log(m.get(NaN), m.size);
+const s = new Set();
+s.add(NaN); s.add(NaN);
+console.log(s.has(NaN), s.size);
+const m2 = new Map([["a", 1], [3, "three"]]);
+console.log(m2.get("a"), m2.get(3), m2.has("z"), m2.size);
+console.log(new Set([1, 2, 2, "x", "x"]).size);

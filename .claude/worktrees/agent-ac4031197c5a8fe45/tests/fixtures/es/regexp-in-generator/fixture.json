@@ -1,0 +1,5 @@
+{
+  "expect": {
+    "stdout": "g1 1,22,333\ng2 A,B,C\ng3 1|22|333\ng4 1-2,3-4\nf1 user/host\nr1 1-2\nr2 [a1@0][b2@2]\nr3 smith john\nm1 <a@1><b@2><c@3>\na1 3 2 1"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "for await over an async generator with internal awaits (drain/ordering) + manual next-chain",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "forawait sum 15\nm 1 false\nm 11 false\nm 3 false\nm undefined true",
+    "exitCode": 0
+  }
+}

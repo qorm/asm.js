@@ -1,0 +1,8 @@
+{
+  "description": "node:stream Transform (_transform/_flush) via pipe, then a Readable.from -> PassThrough -> Writable pipeline()",
+  "expect": {
+    "parse": true, "compile": true, "run": true,
+    "stdout": "transform:ABCD!\npipeline:xyz",
+    "exitCode": 0
+  }
+}

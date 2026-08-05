@@ -1,0 +1,10 @@
+{
+  "description": "new Promise(executor) should support direct factory calls that return an executor parameter",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "37",
+    "exitCode": 0
+  }
+}

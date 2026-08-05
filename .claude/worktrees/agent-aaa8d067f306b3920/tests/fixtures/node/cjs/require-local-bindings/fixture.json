@@ -1,0 +1,10 @@
+{
+  "description": "CommonJS local files should support module.exports, exports.*, __filename and __dirname",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "42\nok\nstring\nstring",
+    "exitCode": 0
+  }
+}

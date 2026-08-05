@@ -1,0 +1,10 @@
+{
+  "description": "JSON.parse should return the runtime null value for null input",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "null",
+    "exitCode": 0
+  }
+}

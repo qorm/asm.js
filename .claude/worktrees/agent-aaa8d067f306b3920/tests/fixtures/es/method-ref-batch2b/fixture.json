@@ -1,0 +1,10 @@
+{
+  "description": "Stage A Batch 2b: array at/indexOf + string charAt/indexOf refs via raw-int-arg wrappers",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "function function\n30\n10\n1\n-1\n3\ne\n2\n3\n-1",
+    "exitCode": 0
+  }
+}

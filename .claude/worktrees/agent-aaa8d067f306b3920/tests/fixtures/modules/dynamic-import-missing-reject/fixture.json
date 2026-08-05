@@ -1,0 +1,10 @@
+{
+  "description": "dynamic import should reject asynchronously when the target cannot be resolved by the current implementation",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "before\nafter\n./missing.js",
+    "exitCode": 0
+  }
+}

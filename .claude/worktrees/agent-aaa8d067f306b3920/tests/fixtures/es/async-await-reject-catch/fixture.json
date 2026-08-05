@@ -1,0 +1,10 @@
+{
+  "description": "await on rejected promises should route into the surrounding async try/catch",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "bad",
+    "exitCode": 0
+  }
+}

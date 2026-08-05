@@ -1,0 +1,10 @@
+{
+  "description": "TDZ: reading a let before its declaration in the same block exits with ReferenceError naming the variable",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "1\nbefore\nReferenceError: Cannot access 'x' before initialization",
+    "exitCode": 1
+  }
+}

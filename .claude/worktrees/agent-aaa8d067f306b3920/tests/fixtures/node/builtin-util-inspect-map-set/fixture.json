@@ -1,0 +1,10 @@
+{
+  "description": "node:util.inspect for Map/Set (with size and nesting), Date ISO, and mixed containers",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "Map(2) { 'a' => 1, 'b' => 2 }\nSet(3) { 1, 2, 3 }\nMap(0) {}\nSet(0) {}\n1970-01-01T00:00:00.000Z\n{ items: Set(1) { 'x' }, when: 1970-01-01T00:00:00.000Z }\n[ 1, 'two', true, null ]\nMap(1) { 'nested' => { a: [ 1, 2 ] } }",
+    "exitCode": 0
+  }
+}

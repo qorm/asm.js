@@ -1,0 +1,10 @@
+console.log(typeof [].indexOf, typeof "".charAt);
+console.log([10, 20, 30].at.call([10, 20, 30], -1));
+console.log([10, 20, 30].at.call([10, 20, 30]));
+console.log([10, 20, 30].indexOf.call([10, 20, 30], 20));
+console.log([10, 20, 30].indexOf.call([10, 20, 30], 99));
+console.log([1, 2, 1, 2].indexOf.call([1, 2, 1, 2], 2, 2));
+console.log("hello".charAt.call("hello", 1));
+console.log("hello".indexOf.call("hello", "l"));
+console.log("hello".indexOf.call("hello", "l", 3));
+console.log("hello".indexOf.apply("hello", ["z"]));

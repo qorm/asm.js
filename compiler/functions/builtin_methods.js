@@ -27,16 +27,16 @@ export const BuiltinMethodCompiler = {
         this.vm.push(VReg.RET); // 保存原始字符串
 
         switch (method) {
+            case "toLocaleUpperCase":
+                // str.toLocaleUpperCase() - asm.js no locale support, alias to toUpperCase
             case "toUpperCase":
-                // str.toUpperCase() - 返回新字符串
-                // 直接传递字符串给 _str_toUpperCase，它会处理 unboxing
                 this.vm.pop(VReg.A0);
                 this.vm.call("_str_toUpperCase");
                 return true;
 
+            case "toLocaleLowerCase":
+                // str.toLocaleLowerCase() - asm.js no locale support, alias to toLowerCase
             case "toLowerCase":
-                // str.toLowerCase() - 返回新字符串
-                // 直接传递字符串给 _str_toLowerCase，它会处理 unboxing
                 this.vm.pop(VReg.A0);
                 this.vm.call("_str_toLowerCase");
                 return true;
@@ -69,9 +69,19 @@ export const BuiltinMethodCompiler = {
                 return true;
 
             case "codePointAt":
-                // str.codePointAt(index):ASCII/BMP 与 charCodeAt 等价(asm.js UTF-8
-                // 字节语义下,astral 码点索引本属深水,不追)。此前无 case → default 崩溃。
-                // 别名到 charCodeAt(同接收者/索引处理),把崩溃变 ASCII 正确。
+                // str.codePointAt(index): use dedicated runtime for proper surrogate pair
+                // handling. Previously aliased to charCodeAt; now uses _str_codepoint_at.
+                if (args.length > 0) {
+                    this.compileExpression(args[0]);
+                    this.vm.fmovToFloat(0, VReg.RET);
+                    this.vm.fcvtzs(VReg.A1, 0);
+                } else {
+                    this.vm.movImm(VReg.A1, 0);
+                }
+                this.vm.pop(VReg.A0);
+                this.vm.call("_str_codepoint_at");
+                return true;
+
             case "charCodeAt":
                 // str.charCodeAt(index) - 返回字符编码
                 if (args.length > 0) {

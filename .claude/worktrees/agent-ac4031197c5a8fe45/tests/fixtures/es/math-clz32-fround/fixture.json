@@ -1,0 +1,8 @@
+{
+  "description": "Math.clz32/fround (exact-display values) + sign/trunc/cbrt/hypot/log2/log10",
+  "expect": {
+    "parse": true, "compile": true, "run": true,
+    "stdout": "31 30 32 0 12\n1.5 0.5 2.25 -3.5 0 100\n1 -1 0\n4 -4\n3 5\n3 3",
+    "exitCode": 0
+  }
+}

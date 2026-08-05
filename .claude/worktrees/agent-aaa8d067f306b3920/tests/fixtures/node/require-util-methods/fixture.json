@@ -1,0 +1,4 @@
+{
+  "description": "require('util') exposes format/inspect/isDeepStrictEqual/types/promisify at top level (not nested in a namespace)",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "a-5-{\"k\":1}\n{ a: 1, b: [ 2, 3 ] }\ntrue\ntrue\nfunction function", "exitCode": 0 }
+}

@@ -1,0 +1,1 @@
+{ "description": "bare global btoa / atob base64 (no import) via implicit-global injection", "expect": { "parse": true, "compile": true, "run": true, "stdout": "SGVsbG8sIFdvcmxkIQ==\nHello, World!\nZm9v Zm8= Zg==\nfoo fo f\nround-trip 123!", "exitCode": 0 } }

@@ -1,0 +1,10 @@
+{
+  "description": "Buffer.concat static method dispatches to the Buffer shim instead of colliding with the array/string .concat method hoisting. The `Buffer` identifier receiver infers as unknown and `concat` is in HOISTED_AMBIGUOUS_ARR_STR/HOISTED_STRING_METHODS, so it was mis-routed to String.concat and returned an empty buffer; now it falls through to the generic object-method path like Buffer.from/alloc.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "5 1,2,3,4,5\n3 1,2,3\n0",
+    "exitCode": 0
+  }
+}

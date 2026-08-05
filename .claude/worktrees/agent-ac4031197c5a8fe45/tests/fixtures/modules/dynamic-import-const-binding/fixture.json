@@ -1,0 +1,10 @@
+{
+  "description": "dynamic import should resolve top-level const string specifiers",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "55",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "logical/compound/plain assignment usable as a call argument and sub-expression",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "r1 5\nr2 5\nr3 42\nr4 3\nr5 7\nr6 10\nfinal 5 3 42",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "Stage A Batch 2c: array slice (INT_MAX end default) + string charCodeAt method references",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "function function\n2,3\n3,4\n1,2,3\n4,5\n2,3\n65\n67",
+    "exitCode": 0
+  }
+}

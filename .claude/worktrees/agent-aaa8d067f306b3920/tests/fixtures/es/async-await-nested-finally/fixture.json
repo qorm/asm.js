@@ -1,0 +1,9 @@
+{
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "inner-finally\ncaught bad\nouter-finally",
+    "exitCode": 0
+  }
+}

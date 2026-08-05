@@ -1,0 +1,10 @@
+{
+  "description": "node:process should expose a richer process.versions object",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "20.0.0\n11.3.0\n108\n8",
+    "exitCode": 0
+  }
+}

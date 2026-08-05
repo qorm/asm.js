@@ -1,0 +1,10 @@
+{
+  "description": "package exports wildcard subpaths should resolve pattern targets",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "alpha-ok",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "CommonJS cycles should expose partially initialized exports without infinite recursion",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "b\na\nno",
+    "exitCode": 0
+  }
+}

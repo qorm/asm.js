@@ -1,0 +1,4 @@
+{
+  "description": "console.log/inspect prints negative zero as -0 (node semantics) at top level and inside arrays/objects; String/toString/template/JSON.stringify keep \"0\"; the -0 value itself round-trips (1/Math.round(-0.3) = -Infinity)",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "-0\n0\n0\n0\n0\n0\n0\n[ 1, -0, 2 ]\n{ x: -0, y: 0 }\ntrue\n-0\n-0\n-Infinity", "exitCode": 0 }
+}

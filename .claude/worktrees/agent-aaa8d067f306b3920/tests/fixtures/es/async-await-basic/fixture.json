@@ -1,0 +1,10 @@
+{
+  "description": "async functions should await fulfilled promises and resume with the resolved value",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "7",
+    "exitCode": 0
+  }
+}

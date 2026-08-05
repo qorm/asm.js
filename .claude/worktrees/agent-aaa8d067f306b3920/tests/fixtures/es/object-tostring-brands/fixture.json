@@ -1,0 +1,10 @@
+{
+  "description": "Object.prototype.toString.call brands TypedArray/ArrayBuffer/DataView/BigInt/Symbol/Promise on native (no segfault)",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "[object Uint8Array]\n[object Int32Array]\n[object Float64Array]\n[object ArrayBuffer]\n[object DataView]\n[object BigInt]\n[object Symbol]\n[object Promise]\n[object Object]\n[object Array]\n[object Map]\nend",
+    "exitCode": 0
+  }
+}

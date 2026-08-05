@@ -1,0 +1,10 @@
+{
+  "description": "String concatenation preserves embedded NUL bytes: _strconcat copies by length (_memcpy len1/len2) instead of NUL-terminated _strcpy/_strcat, so bytes after a \\x00 survive (e.g. crypto counters/binary data). Fixes content corruption where 'A\\0B'+'C\\0D' truncated to 'AC'.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "6\n65,0,66,67,0,68\n5 65 0 66 120 121\n5",
+    "exitCode": 0
+  }
+}

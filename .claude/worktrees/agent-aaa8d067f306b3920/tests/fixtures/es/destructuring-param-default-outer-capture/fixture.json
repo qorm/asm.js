@@ -1,0 +1,10 @@
+{
+  "description": "a destructuring param default value that references an outer variable captures that variable (object, array, and nested-closure forms)",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "111 5\n7 9\n42",
+    "exitCode": 0
+  }
+}

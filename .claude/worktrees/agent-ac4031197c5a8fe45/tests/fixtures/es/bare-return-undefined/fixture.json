@@ -1,0 +1,10 @@
+{
+  "description": "A bare `return` (no argument) before a closing brace must not swallow the following statement, and its value (like a natural fall-off-the-end) must be real undefined, not int 0. Previously the parser advanced past `return` onto the block's closing `}` (eating the next statement; object/class method bodies COMPILE_FAILed), and the codegen default was movImm(RET,0) instead of tagged undefined.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "after-f\n9 undefined\nundefined\nundefined undefined\nafter-method\nundefined undefined\nundefined undefined\n42",
+    "exitCode": 0
+  }
+}

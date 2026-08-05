@@ -1,0 +1,4 @@
+{
+  "description": "static computed-key fields with a symbol key (well-known like Symbol.toStringTag or a plain Symbol) are stored under the symbol; string/number computed keys unaffected",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "Tag\n88\n5 9\n1 1", "exitCode": 0 }
+}

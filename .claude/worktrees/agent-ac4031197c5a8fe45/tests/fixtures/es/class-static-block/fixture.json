@@ -1,0 +1,10 @@
+{
+  "description": "class static block should parse, compile and run",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "1",
+    "exitCode": 0
+  }
+}

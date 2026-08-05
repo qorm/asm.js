@@ -1,0 +1,10 @@
+{
+  "description": "function expression with destructuring param shadowing outer let vars binds the params correctly",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "99",
+    "exitCode": 0
+  }
+}

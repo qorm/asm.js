@@ -1,0 +1,8 @@
+{
+  "description": "package.json type=commonjs should reject .js files that use ESM import/export syntax",
+  "expect": {
+    "parse": true,
+    "compile": false,
+    "run": false
+  }
+}

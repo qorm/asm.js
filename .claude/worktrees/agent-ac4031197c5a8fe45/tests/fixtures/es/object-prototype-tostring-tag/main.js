@@ -1,0 +1,14 @@
+console.log(Object.prototype.toString.call([]));
+console.log(Object.prototype.toString.call({}));
+console.log(Object.prototype.toString.call(null));
+console.log(Object.prototype.toString.call(undefined));
+console.log(Object.prototype.toString.call(3));
+console.log(Object.prototype.toString.call("s"));
+console.log(Object.prototype.toString.call(true));
+console.log(Object.prototype.toString.call(new Date()));
+console.log(Object.prototype.toString.call(/x/));
+console.log(Object.prototype.toString.call(function () {}));
+console.log(Object.prototype.toString.call(new Error()));
+console.log(Object.prototype.toString.call(new Map()));
+console.log(Object.prototype.toString.call(new Set()));
+console.log(Object.prototype.toString.call({ [Symbol.toStringTag]: "Custom" }));

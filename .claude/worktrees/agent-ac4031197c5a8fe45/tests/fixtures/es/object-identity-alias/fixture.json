@@ -1,0 +1,10 @@
+{
+  "description": "object aliases should compare strictly equal and share mutation",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true\n1",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "description": "node:path edge cases: trailing-slash basename/dirname, leading-.. normalize, extname, parse, join slash-collapse",
+  "expect": {
+    "parse": true, "compile": true, "run": true,
+    "stdout": "bar\n/foo\n/\n.\n\n..\n../../a\n/a/c/d\n\n.c\na/b\n/b\n/|/a/b|c.txt|.txt|c",
+    "exitCode": 0
+  }
+}

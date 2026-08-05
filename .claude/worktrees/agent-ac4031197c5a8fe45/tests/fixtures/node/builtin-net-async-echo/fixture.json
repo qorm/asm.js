@@ -1,0 +1,10 @@
+{
+  "description": "node:net event-driven async TCP over loopback: server.on('connection') + socket.on('data'/'end') fire on their own via the poll readiness pump wired into the event loop; client half-closes with end() and reads the reply. 事件按发生顺序收集、全部结束后按固定顺序打印——跨 fd 的到达次序是固有竞态(非被测语义),断言四类异步事件均真实触发且内容正确",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "server recv ping\nserver end\nclient recv reply:ping\nclient end",
+    "exitCode": 0
+  }
+}

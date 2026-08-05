@@ -1,0 +1,9 @@
+{
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "leaf-init\n7\n7",
+    "exitCode": 0
+  }
+}

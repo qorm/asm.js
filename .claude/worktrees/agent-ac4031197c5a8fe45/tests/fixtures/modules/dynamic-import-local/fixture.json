@@ -1,0 +1,10 @@
+{
+  "description": "dynamic import should resolve a local module and expose its namespace through a Promise",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "42",
+    "exitCode": 0
+  }
+}

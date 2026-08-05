@@ -1,0 +1,10 @@
+{
+  "description": "node:path core APIs (join/dirname/basename/extname/normalize/isAbsolute/relative/sep/parse)",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "a/b/c\n/a/b\nc.js\nc\n.js\na/c\ntrue\nfalse\n../c/d\n/\nc.js .js c",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "Object.is distinguishes -0 from 0 (SameValue), keeps NaN===NaN true, and treats distinct objects as not-same",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "false\nfalse\ntrue\ntrue\ntrue\ntrue\nfalse\nfalse",
+    "exitCode": 0
+  }
+}

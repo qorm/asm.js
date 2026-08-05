@@ -1,0 +1,7 @@
+{
+  "description": "shape v2 T2a prototype shaping: computedkey",
+  "expect": {
+    "stdout": "computed normal",
+    "exitCode": 0
+  }
+}

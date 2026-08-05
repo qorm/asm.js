@@ -1,0 +1,4 @@
+{
+  "description": "node:buffer Buffer.alloc(size, fill) applies numeric/string fill",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "AAA\nabab\n000000\n0\n5", "exitCode": 0 }
+}

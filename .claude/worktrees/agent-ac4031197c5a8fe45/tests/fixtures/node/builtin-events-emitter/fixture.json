@@ -1,0 +1,8 @@
+{
+  "description": "node:events EventEmitter on/emit/once/off/listenerCount/eventNames",
+  "expect": {
+    "parse": true, "compile": true, "run": true,
+    "stdout": "a:1,2\n1\n0\na:1,2\n1\n0",
+    "exitCode": 0
+  }
+}

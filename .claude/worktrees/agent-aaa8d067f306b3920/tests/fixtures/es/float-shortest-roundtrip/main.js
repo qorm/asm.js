@@ -1,0 +1,17 @@
+console.log(0.1 + 0.2);
+console.log(1 / 3);
+console.log(0.1, 0.2, 0.3);
+console.log(1.5, 2.25, 3.14159);
+console.log(1234.5, 12345.678);
+console.log(1e21, 1e20, 1e22);
+console.log(1e-6, 1e-7, 0.000001);
+console.log(123456789012345680000);
+console.log(9007199254740992, 9007199254740993);
+console.log(1.7976931348623157e308);
+console.log(-3.5, -0.0001, -0);
+console.log(1 / 0, -1 / 0, 0 / 0);
+console.log(String(0.1 + 0.2), (1 / 3).toString(), "" + 1e21);
+console.log(`${0.1}/${1e-7}/${1e21}`);
+console.log(JSON.stringify([0.1, 1 / 3, 1e21, 1.5e300, -2.5]));
+console.log([0.1, 0.2, 1e21], { a: 1 / 3, b: 2.25 });
+console.log([1.1, 2.2].join(","));

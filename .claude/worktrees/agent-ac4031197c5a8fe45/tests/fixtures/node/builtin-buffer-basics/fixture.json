@@ -1,0 +1,8 @@
+{
+  "description": "node:buffer core APIs (from/length/toString/isBuffer/byteLength/alloc/slice/read-write)",
+  "expect": {
+    "parse": true, "compile": true, "run": true,
+    "stdout": "5\nhello\ntrue\nfalse\n5\n4\nhi\nel\n65",
+    "exitCode": 0
+  }
+}

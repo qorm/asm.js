@@ -1,0 +1,10 @@
+{
+  "description": "Logical compound assignment on a member with accessors (o.x ||= / &&= / ??=) must short-circuit the store: on the no-op condition the setter is NOT invoked, matching node's accessor observability. Previously desugared to o.x = (o.x OP rhs) which always stored (invoked the setter). Plain data props, computed keys (evaluated once), and array elements still work.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "0\n0\n0\n1 7\n1 8\n1 4\n5\n7\n1\n9 1\n3 6",
+    "exitCode": 0
+  }
+}

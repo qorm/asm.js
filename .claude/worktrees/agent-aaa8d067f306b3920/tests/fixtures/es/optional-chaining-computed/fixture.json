@@ -1,0 +1,11 @@
+{
+  "description": "[#72] optional chaining with computed index a?.[i]: read, short-circuit, no index side-effect",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "10\n30\n20\nundefined\nundefined\ncalled=0\n42\n",
+    "stderr": "",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "description": "node:timers setInterval runs until clearInterval, interleaving with setImmediate",
+  "expect": {
+    "parse": true, "compile": true, "run": true,
+    "stdout": "interval:1,2,3 then:immediate",
+    "exitCode": 0
+  }
+}

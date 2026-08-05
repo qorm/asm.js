@@ -1,0 +1,4 @@
+{
+  "description": "node:util format trailing args, inspect single-line, isDeepStrictEqual, promisify",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "hi there num 42\nno fmt extra\nx=5 { a: 1 }\n{ a: 1, b: 'hi' }\n[ 1, 2, 3 ]\ntrue\nfalse\npromisified:50", "exitCode": 0 }
+}

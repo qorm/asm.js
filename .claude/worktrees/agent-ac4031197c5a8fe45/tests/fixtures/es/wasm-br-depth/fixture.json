@@ -1,0 +1,10 @@
+{
+  "description": "large in-function branch depth: a 150-case switch + 60-arm else-if chain + labeled nested loops produce many labels/branches within single functions, driving wasm32 br/br_if depth immediates >127 (requiring the full 2 bytes of the narrowed adaptive br-depth pad). Guards that lowering. Output identical native vs wasm.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "switch 7258\ngrades 30 g0 g29\nnested 3888",
+    "exitCode": 0
+  }
+}

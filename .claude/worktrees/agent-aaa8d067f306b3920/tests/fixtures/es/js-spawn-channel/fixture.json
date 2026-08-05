@@ -1,0 +1,10 @@
+{
+  "description": "[dialect] Channel: rendezvous ping-pong, buffered, close-drain; concurrent groups interleave deterministically (golden, verified stable across runs)",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "main-end\nsend 1\nrecv 1\nsent-a\nsent-b\ngot a\ngot b\ngot c\nsend 2\nsend 3\nsent-c\nw1 true undefined\nw2 true undefined\nrecv 2\nrecv 3\nconsumer-done",
+    "exitCode": 0
+  }
+}

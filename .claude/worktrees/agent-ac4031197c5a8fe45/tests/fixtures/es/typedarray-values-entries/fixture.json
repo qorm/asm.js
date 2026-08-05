@@ -1,0 +1,4 @@
+{
+  "description": "TypedArray values()/entries()/keys() iterate the elements (converting via _ta_to_array) — works for direct receivers and unknown-static (closure) receivers",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "10,20,30\n[[0,10],[1,20],[2,30]]\n0,1,2\n60\n10,20,30\n[[0,10],[1,20],[2,30]]\n1,2,3 [[0,1],[1,2],[2,3]]", "exitCode": 0 }
+}

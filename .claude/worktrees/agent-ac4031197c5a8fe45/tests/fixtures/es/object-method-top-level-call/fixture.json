@@ -1,0 +1,10 @@
+{
+  "description": "object methods should be able to call top-level helpers and forward their arguments",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "method\nforward function\ndone",
+    "exitCode": 0
+  }
+}

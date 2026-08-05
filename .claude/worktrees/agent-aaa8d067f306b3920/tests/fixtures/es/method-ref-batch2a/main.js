@@ -1,0 +1,10 @@
+var a = [1, 2, 3, 4];
+a.reverse.call(a);
+console.log(a.join(","));
+console.log(typeof [].reverse);
+console.log("hello".slice.call("hello", 1, 3));
+console.log("hello".slice.call("hello", -2));
+console.log("hello".substring.call("hello", 1, 3));
+console.log("hi".at.call("hi", -1));
+console.log("hello".includes.call("hello", "ell"));
+console.log("hello".includes.apply("hello", ["z"]));

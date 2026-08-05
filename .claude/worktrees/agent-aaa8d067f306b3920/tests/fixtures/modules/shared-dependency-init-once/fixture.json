@@ -1,0 +1,10 @@
+{
+  "description": "shared dependencies should only execute their top-level body once",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "counter-init\n1\n1",
+    "exitCode": 0
+  }
+}

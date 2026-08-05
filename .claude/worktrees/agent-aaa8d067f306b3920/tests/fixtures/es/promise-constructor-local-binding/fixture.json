@@ -1,0 +1,10 @@
+{
+  "description": "new Promise(executor) should support local function-valued bindings in the synchronous subset",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "13",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "async arrow with 3 args threads all arguments through the coroutine",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "10",
+    "exitCode": 0
+  }
+}

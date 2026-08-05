@@ -1,0 +1,10 @@
+{
+  "description": "node:buffer toJSON, base64url decode/encode, writeUIntLE/BE + readUIntLE/BE + signed IntLE, values/keys/entries iterators",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "{\"type\":\"Buffer\",\"data\":[1,2,3]}\nhello\naGkgd29ybGQ\n123456\nabcdef\n-1000\n9,8,7\n0,1,2\n0:5,1:6\nabc",
+    "exitCode": 0
+  }
+}

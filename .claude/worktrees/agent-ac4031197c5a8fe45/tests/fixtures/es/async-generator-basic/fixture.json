@@ -1,0 +1,10 @@
+{
+  "description": "async generator: yield + await in one coroutine body, .next() returns Promise<{value,done}>, next(v) injection",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "1 false\n11 false\n3 false\n500 false\nundefined true",
+    "exitCode": 0
+  }
+}

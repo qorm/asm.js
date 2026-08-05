@@ -1,0 +1,4 @@
+{
+  "description": "node:querystring parse/stringify with encoding and repeated keys",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "1,2,hello\nx=1&y=two\na b\nq=a%20b\ntrue:1,2", "exitCode": 0 }
+}

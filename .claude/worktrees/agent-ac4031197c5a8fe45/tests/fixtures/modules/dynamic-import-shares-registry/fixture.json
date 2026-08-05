@@ -1,0 +1,10 @@
+{
+  "description": "dynamic import should reuse existing module registry/init state instead of reinitializing the module",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "counter-init\n1\n1",
+    "exitCode": 0
+  }
+}

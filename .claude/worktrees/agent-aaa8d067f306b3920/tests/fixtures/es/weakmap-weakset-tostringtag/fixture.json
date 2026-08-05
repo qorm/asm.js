@@ -1,0 +1,4 @@
+{
+  "description": "WeakMap/WeakSet get [object WeakMap]/[object WeakSet] via a header weakness bit set at construction (distinct from Map/Set which share the type byte); collection operations still route through Map/Set.",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "[object WeakMap]\n[object WeakSet]\n[object Map]\n[object Set]\n7 true\ntrue false\n[object Map] 1 1", "exitCode": 0 }
+}

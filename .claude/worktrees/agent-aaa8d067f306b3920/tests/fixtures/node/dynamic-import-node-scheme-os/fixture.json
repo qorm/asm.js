@@ -1,0 +1,17 @@
+{
+  "description": "dynamic import should resolve node: builtin modules and expose their namespace through a Promise. Under wasm32-wasi os.platform() honestly reports wasi (baked constant), so expectWasm asserts that by-design output.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "darwin\nobject",
+    "exitCode": 0
+  },
+  "expectWasm": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "wasi\nobject",
+    "exitCode": 0
+  }
+}

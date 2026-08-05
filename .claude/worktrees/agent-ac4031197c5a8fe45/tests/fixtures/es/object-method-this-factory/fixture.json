@@ -1,0 +1,10 @@
+{
+  "description": "Object-literal shorthand methods created inside a function bind this dynamically to the receiver (not the enclosing lexical this). Previously such methods captured the outer this like arrows, so factory-returned objects (incl. hand-rolled iterators) got a wrong/stale this. Arrow this-capture is preserved.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "1 2 1\n9\n102\n5\n77",
+    "exitCode": 0
+  }
+}

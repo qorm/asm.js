@@ -1,0 +1,10 @@
+{
+  "description": "symbol keys are excluded from Object.keys/values/entries, for-in, and JSON.stringify (they belong to getOwnPropertySymbols); string keys unaffected",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "a,b\n2\n1,3\na=1,b=3\na,b\n{\"a\":1,\"b\":3}\na,b,c",
+    "exitCode": 0
+  }
+}

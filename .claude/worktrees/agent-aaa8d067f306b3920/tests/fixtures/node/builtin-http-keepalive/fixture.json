@@ -1,0 +1,10 @@
+{
+  "description": "http keep-alive Agent connection pooling: sequential requests reuse one pooled TCP socket (fd identity + reused/created counters), larger body, concurrent Connection: close connections, clean process exit",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "seq1: status=200 n=1 path=/s1 blen=5\nseq2: status=200 n=2 path=/s2 blen=3000\nseq3: status=200 n=3 path=/s3 blen=3\nreused=2 created=1\npooledOneSocket=true\nconcurrent status=200\nconcurrent status=200\nconcurrent status=200",
+    "exitCode": 0
+  }
+}

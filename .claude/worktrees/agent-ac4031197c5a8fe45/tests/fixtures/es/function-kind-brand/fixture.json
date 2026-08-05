@@ -1,0 +1,10 @@
+{
+  "description": "Object.prototype.toString brands generator/async/async-generator function values (both expression and declaration forms) via the code-ptr metadata side table",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "[object Function]\n[object GeneratorFunction]\n[object AsyncFunction]\n[object AsyncGeneratorFunction]\n[object AsyncFunction]\n[object GeneratorFunction]\n[object AsyncFunction]\n[object AsyncGeneratorFunction]",
+    "exitCode": 0
+  }
+}

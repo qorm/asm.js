@@ -1,0 +1,10 @@
+{
+  "description": "require(builtin) returns the default export (module.exports), not the * namespace: require(\"events\") is the EventEmitter constructor (new EE() works) and require(\"util\").format is callable. Self-host guard is tests/selfhost/probes/require-builtin-default.js (g1-compiled).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "42\na-5-{\"x\":1}\nfunction",
+    "exitCode": 0
+  }
+}

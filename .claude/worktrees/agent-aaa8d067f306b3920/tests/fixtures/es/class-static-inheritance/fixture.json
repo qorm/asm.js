@@ -1,0 +1,10 @@
+{
+  "description": "static methods/props inherit across extends; getPrototypeOf(Sub)===Super",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "static-method A.make\nstatic-prop A-tag\nown-static B.own\ndeep-method A.make\ndeep-own B.own\noverride D.make\nproto1 true\nproto2 true\nproto-typeof function\ninstance hi\nexpr-static A.make",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,1 @@
+{ "description": "child_process.execSync/spawnSync: stdout capture (Buffer + encoding), non-zero exit throws with .status, spawnSync args + status", "expect": { "parse": true, "compile": true, "run": true, "stdout": "\"hi\\n\"\na-b-c\nthrew status 7\nspawn 0 \"one two\\n\"", "exitCode": 0 } }

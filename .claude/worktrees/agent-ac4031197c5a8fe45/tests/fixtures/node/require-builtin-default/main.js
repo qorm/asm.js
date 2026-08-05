@@ -1,0 +1,10 @@
+const EE = require("events");
+const e = new EE();
+let sum = 0;
+e.on("add", (n) => { sum += n; });
+e.emit("add", 10);
+e.emit("add", 32);
+console.log(sum);
+const util = require("util");
+console.log(util.format("%s-%d-%j", "a", 5, { x: 1 }));
+console.log(typeof util.format);

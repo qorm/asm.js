@@ -1,0 +1,11 @@
+let s = Symbol("k"), s2 = Symbol("m");
+let o = {}; o.a = 1; o[s] = 2; o.b = 3; o[s2] = 4;
+console.log(Object.keys(o).join(","));
+console.log(Object.keys(o).length);
+console.log(Object.values(o).join(","));
+console.log(Object.entries(o).map(e => e[0] + "=" + e[1]).join(","));
+let forin = [];
+for (let k in o) forin.push(k);
+console.log(forin.join(","));
+console.log(JSON.stringify(o));
+console.log(Object.keys({ a: 1, b: 2, c: 3 }).join(","));

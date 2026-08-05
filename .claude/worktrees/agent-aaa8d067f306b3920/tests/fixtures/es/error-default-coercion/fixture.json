@@ -1,0 +1,4 @@
+{
+  "description": "Error objects coerce to 'name: message' in the default-hint path (obj + '' / '' + obj), matching String(err) and template coercion",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "Error: boom\nError: boom\nTypeError: t\nRangeError: r!\nError: boom / Error: x", "exitCode": 0 }
+}

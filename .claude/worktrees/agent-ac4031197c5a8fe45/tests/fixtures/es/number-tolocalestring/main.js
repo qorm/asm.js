@@ -1,0 +1,11 @@
+console.log((1234567.89).toLocaleString());
+console.log((1234).toLocaleString());
+console.log((1234.5678).toLocaleString());
+console.log((1000000).toLocaleString());
+console.log((-1234.5).toLocaleString());
+console.log((0.5).toLocaleString());
+console.log((0).toLocaleString());
+console.log((999.9995).toLocaleString());
+console.log((1234567890123).toLocaleString());
+const price = 45678.912;
+console.log(price.toLocaleString());

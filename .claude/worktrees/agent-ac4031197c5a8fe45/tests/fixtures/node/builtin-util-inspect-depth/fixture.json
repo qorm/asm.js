@@ -1,0 +1,8 @@
+{
+  "description": "node:util inspect honors options.depth, isArray, format %s inspects objects",
+  "expect": {
+    "parse": true, "compile": true, "run": true,
+    "stdout": "{ a: 1, b: [Object] }\n{ a: 1, b: { c: 2 } }\n{ a: { b: { c: [Object] } } }\n[ 1, [ 2, [Array] ] ]\ntrue false\nobj: { a: 1 }",
+    "exitCode": 0
+  }
+}

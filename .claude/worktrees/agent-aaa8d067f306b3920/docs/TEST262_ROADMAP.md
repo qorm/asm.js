@@ -1,0 +1,180 @@
+# test262 完整支持路线图 — 从 22.25% 到完整一致
+
+> 日期:2026-07-23 · 状态:**规划稿** · 当前:**22.25%**(1438/6462,stride-5 子集)
+> 参考:[Yuku](https://github.com/yuku-toolchain/yuku)(zig 规范一致 parser/工具链)、[Kiesel](https://codeberg.org/kiesel-js/kiesel)(zig 引擎,[20→25% devlog](https://linus.dev/posts/kiesel-devlog-1/))、[LibJS test262 仪表盘](https://serenityos.github.io/libjs-website/test262/)、[test262.fyi](https://test262.fyi/)
+> 关联:plan.md S1/S4、docs/SHAPE_IC_DESIGN.md、记忆 test262-s1-progress
+
+---
+
+## 1. 目标与范围
+
+**目标**:在 test262 可运行子集上达到**完整一致**(对标成熟引擎 90%+)。
+
+**范围界定**(诚实):我们的 test262 数字基于**选定子集**——`language/{expressions,statements}` + 13 个核心 `built-ins/`(Array/Object/String/Number/Math/JSON/Map/Set/TypedArray/RegExp/Promise/Boolean/Symbol),stride=5 抽样 6462 项。**排除**:intl402(国际化,小引擎通常不做)、staging(提案)、dynamic-import/SharedArrayBuffer/decorators 等特性门(1383 项)。"完整支持" = 在此 in-scope 子集上 90%+,而非全量 ~48000 项。
+
+**当前分类**(5024 失败 / 6462):
+| 状态 | 数 | 性质 |
+|---|---|---|
+| FAIL | 4435 | 能编译运行但断言失败(语义缺口) |
+| CRASH | 485 | SIGSEGV/SIGBUS/timeout(多为非泛型内建) |
+| COMPILE_FAIL | 104 | parser 缺口 |
+
+---
+
+## 2. 参考项目方法论(可迁移)
+
+**Yuku**(规范一致 parser/工具链,zig,866★):
+- **test262 驱动**:以 test262 为语法一致性 oracle,AST 精确匹配 Oxc/ESTree。
+- **parser 是地基**:先把语法层做到规范一致(含**早期错误 early errors**、Unicode 标识符、负向解析测试),再谈其余。其 parser→analyzer(作用域/符号/跨文件链接)→codegen 分层,各层经规范验证。
+- **启示**:COMPILE_FAIL + 负向解析测试(我们 517 个 `__negative__`)正是 Yuku 的强项域——parser 规范一致是通往高通过率的**第一道门**。
+
+**Kiesel**(zig 全引擎):4 个月 600 提交从 20%→25%;自建 test262 harness;**按根因归类失败、按依赖序修地基**(先对象模型/内建,后特性)。
+
+**LibJS**(SerenityOS C++):**公开 conformance 仪表盘**(test262.fyi 每日跑多引擎);**逐内建系统化一致**;per-feature 期望清单(标记已知失败、追踪回归)。~60%+ 经年累积。
+
+**共性方法论(本规划采纳)**:
+1. **test262 作 oracle**(非手写测试),通过率是硬指标。
+2. **公开追踪仪表盘** + per-feature 期望清单(回归防护)。
+3. **按根因/特性归类,按依赖序修**——地基(对象模型/强转/函数/错误)先于特性。
+4. **parser 完整性是闸门**(编译不过无从运行)。
+
+---
+
+## 3. 缺口全景(特性级,实测)
+
+按 test262 特性标签归类失败(一个用例可带多标签,有重叠):
+
+| 特性簇 | 失败数 | FAIL/CRASH/COMPILE | 依赖地基 |
+|---|---|---|---|
+| **核心语义(无特性标签)** | **1637** | 1353/253/31 | 对象模型/强转/相等/错误——**一切的根** |
+| destructuring-binding | 949 | 880/38/31 | 迭代+属性访问+默认值 |
+| async-iteration | 774 | 724/27/23 | Symbol.asyncIterator+生成器+async |
+| class | 765 | 730/28/7 | 函数构造+原型+私有字段 |
+| generators | 637 | 599/24/14 | Symbol.iterator+函数 |
+| **负向测试(__negative__)** | **517** | 517/0/0 | **早期错误(parser+runtime)** |
+| class-fields-public | 366 | 346/16/4 | class |
+| default-parameters | 326 | 304/12/10 | 函数+强转 |
+| Symbol.iterator | 325 | 250/73/2 | Symbol+对象模型 |
+| class-methods-private | 271 | 264/4/3 | class+私有品牌 |
+| TypedArray | 261 | 203/58/0 | 对象模型+缓冲 |
+| class-static-methods-private | 245 | 240/1/4 | class |
+| class-fields-private | 189 | 180/8/1 | class |
+| regexp-unicode-property-escapes | 133 | 133/0/0 | RegExp 引擎 |
+| BigInt | 119 | 107/12/0 | 数值塔 |
+| Symbol.asyncIterator | 112 | 106/6/0 | async-iteration |
+| object-rest | 76 | 72/4/0 | 解构+枚举序 |
+| Proxy / Reflect.construct | 26 / 51 | — | 元编程陷阱 |
+
+**结论**:最大两块是**核心语义(1637,地基不足)**与**负向测试(517,早期错误)**;特性簇(destructuring/class/generators/async ~3100)都**建立在地基之上**。修地基撬动面最大。
+
+---
+
+## 4. 架构地基(一切特性的前提)
+
+test262 高通过率的真正瓶颈不是特性,是**底层语义机制**。以下六块是 1637 核心失败 + 全部特性簇的共同前提:
+
+1. **规范对象模型**:属性描述符 `{value,writable,get,set,enumerable,configurable}`;`[[Get]]/[[Set]]/[[DefineOwnProperty]]/[[Delete]]/[[HasProperty]]` 内部方法;原型链遍历;**枚举序**(整数键升序 → 字符串键插入序 → Symbol 键);普通对象 vs 异质对象(array/string/arguments 的 length/索引 exotic 行为)。**当前:对象即字典,无描述符/无标准内部方法/枚举序为插入序——这是最大架构缺口。**
+2. **类型强转**:`ToPrimitive(hint)`(valueOf/toString 顺序)、`ToNumber`/`ToString`/`ToBoolean`/`ToPropertyKey`/`ToLength`/`ToIntegerOrInfinity`/`ToObject`。当前零散在各 helper,无统一规范路径。
+3. **相等与比较**:`SameValue`/`SameValueZero`/抽象相等 `==`(含对象→原语)/严格 `===`/关系 `<,>,<=,>=`(字符串词典序)。
+4. **函数对象**:`[[Call]]`/`[[Construct]]`、`.length`/`.name`、`bind` 绑定函数、闭包、`new.target`、rest/default 参数、this 绑定规则。**当前:函数非一等对象(.length/.name/bind 缺),构造器语义不全。**
+5. **错误处理**:Error/TypeError/RangeError/ReferenceError/SyntaxError 正确构造与 `instanceof`;throw/try/catch/finally;`error.cause`;**早期错误**(parser 在解析期抛 SyntaxError——517 负向测试)。**当前:运行时 helper 难以抛异常(异常帧契约 #38),负向测试大面积失败。**
+6. **泛型内建**:数组方法对**任何类数组 this** 工作(读 length + 逐索引 `[[Get]]`)。**当前:数组方法假设真数组(0x7FFE),非数组 this 即 SIGSEGV——485 CRASH 的首因(~136 Array)。**
+
+---
+
+## 5. 分阶段路线图
+
+> 产量为**估算**(基于缺口归类,实测校准);工作量为人/会话量级。每阶段过 bootstrap-gate(gen1==gen2==gen3 + fixtures + test262 只升)。
+
+### S1 — parser 完整性 + 易修 CRASH(22.25% → 28%,**进行中**)
+- **参考 Yuku**:parser 规范一致。剩余 COMPILE_FAIL(104→~0):计算属性/ASI/转义边界。
+- **负向解析测试**(517 的一部分):parser 对非法语法**正确抛 SyntaxError**(早期错误相位)。当前 parser 过于宽松(接受非法),负向测试判负。
+- **首批 CRASH**:数组方法泛型第一刀(转 this→真数组前置,只读方法)。
+- 已落地:Unicode 标识符/for-of 左值/rest 模式/elision/解构 getter(+110)。
+- **产量**:+~370。**工作量**:中。
+
+### S2 — 对象模型 + 强转 + 错误地基(28% → 40%)
+- **属性描述符 + [[DefineOwnProperty]]**:Object.defineProperty/getOwnPropertyDescriptor/freeze/seal/preventExtensions/isExtensible;描述符反射(528 property-descriptor 失败)。
+- **泛型数组方法(完整)**:所有数组方法对类数组 this 工作(消灭 ~136 Array CRASH + 相关)。
+- **类型强转统一**:ToPrimitive(hint)/抽象相等边界/关系比较。
+- **错误处理**:规范错误类型 + instanceof + 运行时抛异常机制(解 #38 契约)。
+- **函数 .length/.name + bind**。
+- **撬动**:核心语义 1637 的大部分。
+- **产量**:+~780。**工作量**:大(架构)。**依赖**:S1。
+
+### S3 — 类 + 迭代 + Symbol(40% → 55%)
+- **完整 class**:字段(public/private)、静态、方法、计算键、extends/super、私有品牌(#)。(class 簇 ~1100)
+- **Symbol + well-known**:Symbol.iterator/toPrimitive/toStringTag/species/match/replace/split。(Symbol 簇 ~500)
+- **迭代协议**:for-of、内建 Symbol.iterator。(Symbol.iterator 325)
+- **生成器**:function*、yield、生成器协议。(generators 637)
+- **解构完整**:绑定/赋值解构、默认值、rest、计算键。(destructuring 949)
+- **产量**:+~970。**工作量**:大。**依赖**:S2(对象模型+函数)。
+
+### S4 — async + 内建穷尽 + TypedArray(55% → 70%)
+- **async/await + 异步迭代**:async functions、for-await、异步生成器。(async-iteration 774 + async-functions 95)
+- **Promise 完整**:组合子(allSettled/any/race)、species。
+- **TypedArray 完整**(261)+ resizable ArrayBuffer(57)。
+- **RegExp 高级**:unicode property escapes(133)、v-flag、modifiers。
+- **内建方法规范边界穷尽**:String/Number/Math/Object 逐方法对齐 spec。
+- **产量**:+~970。**工作量**:大。**依赖**:S3(迭代+Symbol)。
+
+### S5 — Proxy/Reflect + BigInt + strict(70% → 85%)
+- **Proxy**(全陷阱 + revocable)+ **Reflect**(Reflect.construct 51)。
+- **BigInt**(119)+ 混合运算。
+- **strict mode** 语义(横切:只读赋值抛错、删除不可配置抛错、this 严格等)。
+- **Date/JSON** 边界。
+- **产量**:+~970。**工作量**:大。**依赖**:S2(对象模型)。
+
+### S6 — 模块 + annexB + 长尾(85% → 95%+)
+- **ES 模块**:import/export、动态 import(当前特性门排除,需解锁)。
+- **annexB**:legacy web 兼容(__proto__、String.substr 等)。
+- **长尾边界**:剩余 corner case。
+- **产量**:+~650。**工作量**:大。**依赖**:S1-S5。
+
+---
+
+## 6. 一致性基础设施(贯穿)
+
+1. **harness 增强**(现有 `tests/test262/run.mjs`):
+   - 完整 frontmatter 解析(flags/includes/features/negative)。
+   - **per-test 期望清单**(仿 LibJS):`tests/test262/expectations.json` 标记已知失败,检测**回归**(新失败报警)+ **进展**(已知失败转 PASS 提示移除)。
+   - 负向测试精确相位校验(parse vs runtime,当前仅粗校)。
+2. **conformance 仪表盘**(仿 test262.fyi/LibJS):按特性/目录的通过率趋势,每周复盘(plan.md 已定周日复盘)。
+3. **差分探测**(已验证有效):对新增内建做 vs-node 差分,抓静默值 bug(见 es-compat-table-testing 记忆)。
+4. **CI 集成**(S4 plan.md 已列):test262 跑入 CI,通过率只升门禁。
+
+---
+
+## 7. 独特约束与风险
+
+### 🔴 自举字节定点(asm.js 独有,Kiesel/LibJS/Yuku 皆无)
+asm.js **自举 + gen1==gen2==gen3 字节一致**。每个一致性修复(尤其改 codegen/运行时/内建)都必须保持定点。这是**比非自举引擎慢得多**的根本原因:
+- 改编译器源码 → 自编译产物变 → 须验证新链收敛(布局敏感,见 layout-position-nondeterminism)。
+- **缓解**:① 每修过 bootstrap-gate;② 大批量用"定点迁移"机制(plan.md S5:受控打破一步再收敛);③ 运行时 helper 优先于编译器 codegen 改动(helper 改不触发布局);④ 增量小步,忌大重构。
+
+### 其他风险
+| 风险 | 对策 |
+|---|---|
+| 值 bug 转化低(单修非唯一阻塞,解构 getter 实测 +0) | 优先 CRASH(干净翻转)+ 地基(撬动面大),非逐点值 bug |
+| 架构改动破坏定点 | 运行时优先;每阶段过门;定点迁移机制 |
+| 对象模型重构波及自编译 | 分阶段、增量、双轨(新路径 + legacy 回退) |
+| 性能 vs 一致(AOT 模型) | 一致性优先,性能用形状 IC/解箱补偿(支柱①②) |
+| 配额/会话量限制 | 阶段化,每阶段独立可交付;仪表盘追踪跨会话进展 |
+
+---
+
+## 8. 成功指标
+
+- **通过率**:S1 ≥28% → S2 ≥40% → S3 ≥55% → S4 ≥70% → S5 ≥85% → S6 ≥95%(in-scope 子集)。
+- **每阶段**:bootstrap-gate 全绿(gen1==gen2==gen3 + fixtures + test262 只升)。
+- **回归零**:expectations.json 无新增已知失败。
+- **诚实记录**:每阶段实测产量 vs 估算,校准后续(本会话已确立:估算 ~200+ 的解构 getter 实测 +0——产量须实测,不凭归类)。
+
+---
+
+## 9. 下一步(本会话之后)
+
+**S1 收尾**(达 28%):① 负向解析测试(parser 早期错误,参考 Yuku)② 数组方法泛型第一刀(消灭 Array CRASH)。
+**S2 启动**(地基):属性描述符 + [[DefineOwnProperty]] + 泛型数组方法完整 + 错误抛出机制——这是撬动 1637 核心失败的最高杠杆,也是后续全部特性的前提。
+
+> **总判断**:test262 完整支持是**多阶段架构工程**(非逐 bug 修补),核心在**对象模型 + 强转 + 函数 + 错误**四块地基,而非特性堆叠。asm.js 的自举定点约束使其比 Kiesel/LibJS 慢一个量级,须以"运行时优先 + 增量过门 + 定点迁移"纪律推进。Yuku 启示 parser 层可快速达标(test262 驱动),地基层须持久战。

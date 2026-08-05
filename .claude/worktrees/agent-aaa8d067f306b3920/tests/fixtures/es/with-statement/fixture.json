@@ -1,0 +1,10 @@
+{
+  "description": "with(obj) statement: identifier read/assignment/update/method-call inside the block resolve against obj first (its properties shadow lexical scope), falling back to lexical when absent. Gated so code without with is byte-unchanged.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "30 110\n5\n42\nhi 7\n7\n7 8 7\n101",
+    "exitCode": 0
+  }
+}

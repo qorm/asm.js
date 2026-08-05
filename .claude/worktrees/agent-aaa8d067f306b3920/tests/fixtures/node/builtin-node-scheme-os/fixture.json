@@ -1,0 +1,10 @@
+{
+  "description": "node: builtin specifiers should resolve to the matching runtime shim",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "object",
+    "exitCode": 0
+  }
+}

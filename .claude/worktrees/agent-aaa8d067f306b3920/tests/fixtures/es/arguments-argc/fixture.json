@@ -1,0 +1,10 @@
+{
+  "description": "arguments.length correct with real undefined args; no stale argc across apply/call/spread/bind/method/new",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "mid 3\ntrail 2\nallundef 2\nzero 0\nvals 1,undefined,3\nseq1 3 1 2\nseq2 4 0\nseq3 1 0 2\nseq4 3 1\nseq5 3 2 1\nseq6 4 1\nseq7 3\ncb 3\nred 4",
+    "exitCode": 0
+  }
+}

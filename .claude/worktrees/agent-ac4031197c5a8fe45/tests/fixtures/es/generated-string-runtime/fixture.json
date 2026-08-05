@@ -1,0 +1,10 @@
+{
+  "description": "Runtime-generated strings should print and support charAt/index/charCodeAt like literal strings",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "1\n1\n1\n1\n1\n49",
+    "exitCode": 0
+  }
+}

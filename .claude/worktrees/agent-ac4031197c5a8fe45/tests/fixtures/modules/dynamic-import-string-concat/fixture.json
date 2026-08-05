@@ -1,0 +1,10 @@
+{
+  "description": "dynamic import should resolve static string concatenation specifiers",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "12",
+    "exitCode": 0
+  }
+}

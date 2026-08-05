@@ -1,0 +1,10 @@
+{
+  "description": "for...of with simple array (array index path)",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "10\n20\n30",
+    "exitCode": 0
+  }
+}

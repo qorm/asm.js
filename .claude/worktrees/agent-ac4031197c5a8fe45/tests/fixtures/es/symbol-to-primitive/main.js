@@ -1,0 +1,12 @@
+let d = { [Symbol.toPrimitive](hint) { return hint === "number" ? 10 : hint === "string" ? "S" : "D"; } };
+console.log(+d);
+console.log(d * 2);
+console.log(d - 1);
+console.log(`${d}`);
+console.log(String(d));
+console.log(d + "");
+console.log(d == "D");
+let n = { [Symbol.toPrimitive]() { return 42; } };
+console.log(+n, `${n}`, n + 1);
+let a = { valueOf() { return 7; }, toString() { return "str"; } };
+console.log(a + 1, `${a}`, a * 2);

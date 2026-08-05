@@ -1,0 +1,5 @@
+{
+  "description": "node:os platform reports darwin (not internal macos), arch/type/EOL/endianness. Under wasm32-wasi platform/arch are honestly reported as wasi/wasm32 (process.platform/arch are compile-time baked constants, not host-queryable via the shim), so expectWasm asserts that by-design output.",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "darwin\narm64\nDarwin\ntrue\nLE", "exitCode": 0 },
+  "expectWasm": { "parse": true, "compile": true, "run": true, "stdout": "wasi\nwasm32\nDarwin\ntrue\nLE", "exitCode": 0 }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "calling non-functions should throw a catchable TypeError instead of crashing",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "caught-call\ncaught-member",
+    "exitCode": 0
+  }
+}

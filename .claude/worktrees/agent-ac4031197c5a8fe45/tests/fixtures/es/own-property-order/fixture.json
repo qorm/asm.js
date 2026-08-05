@@ -1,0 +1,10 @@
+{
+  "description": "ES [[OwnPropertyKeys]] enumeration order: integer-index keys ascending first, then string keys in insertion order, across Object.keys/values/entries/getOwnPropertyNames/for-in/JSON.stringify/Object.assign. Canonical-index edge cases (leading zero, negative, >=2^32-1) stay as string keys. Adversarial: defineProperty integer keys and delete+re-add re-sort. Pure string-keyed objects keep insertion order.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "1,2,b,a\n1,2,b,a\none,two,B,A\n[[\"1\",4],[\"2\",2],[\"b\",1],[\"a\",3]]\n{\"1\":4,\"2\":2,\"b\":1,\"a\":3}\n1,2,b,a\n1,2,b,a\n1,2,01,-1,4294967295,x\n0,1,b\n0,1,2,a\nbanana,apple,cherry",
+    "exitCode": 0
+  }
+}

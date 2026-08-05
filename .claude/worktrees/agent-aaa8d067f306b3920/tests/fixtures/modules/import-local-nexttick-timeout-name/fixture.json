@@ -1,0 +1,11 @@
+{
+  "description": "imported local module should be able to expose a setTimeout-like helper",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "sync\ntimeout",
+    "stderr": "",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "CommonJS require should return the same cached exports object on repeated loads",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true\n1\n1",
+    "exitCode": 0
+  }
+}

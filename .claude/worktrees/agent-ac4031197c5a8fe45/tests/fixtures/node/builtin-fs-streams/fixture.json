@@ -1,0 +1,8 @@
+{
+  "description": "node:fs createWriteStream/createReadStream real data flow + appendFileSync append semantics",
+  "expect": {
+    "parse": true, "compile": true, "run": true,
+    "stdout": "content:alpha beta gamma\nappended:alpha beta gamma!",
+    "exitCode": 0
+  }
+}

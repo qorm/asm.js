@@ -1,0 +1,4 @@
+{
+  "description": "bug3: class method named end/return/proto not mis-dispatched to constructor structural labels",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "W\nE\nR\nP", "exitCode": 0 }
+}

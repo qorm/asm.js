@@ -1,0 +1,1 @@
+{"description": "custom-tag .raw via array props side-table + per-site template object caching", "expect": {"parse": true, "compile": true, "run": true, "stdout": "a\nb raw:a\\nb vals:\nx|y|z raw:x|y|z vals:1,2\n\"p\\tq\" \"p\\\\tq\"\nfirst SAME\nfalse\na\\nb 2", "exitCode": 0}}

@@ -1,0 +1,4 @@
+{
+  "description": "Array.from(x, mapFn, thisArg) binds the 3rd arg as mapFn's this across all input kinds (array-like, generator, array, string, Set, typed array). Also materializes non-array iterables before mapping so generator+mapFn no longer yields an empty array.",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "food0,bard1\nfood0,bard1,bald2\n11,21\na-0,b-1\n10,20\n103,104\n1,2,3\n0,1,2", "exitCode": 0 }
+}

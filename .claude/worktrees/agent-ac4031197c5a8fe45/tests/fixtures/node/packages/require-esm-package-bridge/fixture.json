@@ -1,0 +1,10 @@
+{
+  "description": "CommonJS require should be able to consume ESM packages from node_modules as namespace objects",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "11\n3",
+    "exitCode": 0
+  }
+}

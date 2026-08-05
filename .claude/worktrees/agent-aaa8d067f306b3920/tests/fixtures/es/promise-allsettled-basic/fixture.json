@@ -1,0 +1,10 @@
+{
+  "description": "Promise.allSettled should return status objects for settled promises and plain values",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "fulfilled\n1\nrejected\nerr\nfulfilled\n3",
+    "exitCode": 0
+  }
+}

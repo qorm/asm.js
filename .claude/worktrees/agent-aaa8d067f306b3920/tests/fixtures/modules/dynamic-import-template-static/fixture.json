@@ -1,0 +1,10 @@
+{
+  "description": "dynamic import should resolve static template literal specifiers",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "21",
+    "exitCode": 0
+  }
+}

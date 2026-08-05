@@ -1,0 +1,10 @@
+{
+  "description": "memory-access offset folding: object/array/string/typed-array reads+writes at many static offsets, plus heap-header (negative-offset) paths via typeof/string concat. Guards the wasm32 load/store lowering that folds non-negative offsets into the memarg immediate (and keeps the i64.add path for negative offsets). Output identical native vs wasm.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "1 2 3 4 5 6 7 8\nnums 55\nnested 42 deep 7\ntyped 10,20,30,40 sum 100\nab-cd-ef xyz\ntypes number string boolean object function undefined\nbytes 255 0 128\nfields ok",
+    "exitCode": 0
+  }
+}

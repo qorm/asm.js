@@ -1,0 +1,15 @@
+import { Buffer } from "node:buffer";
+console.log(JSON.stringify(Buffer.from([1,2,3]).toJSON()));
+console.log(Buffer.from("aGVsbG8", "base64url").toString());
+console.log(Buffer.from("hi world").toString("base64url"));
+const w = Buffer.alloc(8);
+w.writeUIntLE(0x123456, 0, 3);
+console.log(w.readUIntLE(0,3).toString(16));
+w.writeUIntBE(0xABCDEF, 3, 3);
+console.log(w.readUIntBE(3,3).toString(16));
+w.writeIntLE(-1000, 0, 2);
+console.log(w.readIntLE(0,2));
+const it = []; for (const x of Buffer.from([9,8,7]).values()) it.push(x); console.log(it.join(","));
+const ks = []; for (const k of Buffer.from([9,8,7]).keys()) ks.push(k); console.log(ks.join(","));
+const es = []; for (const [i,v] of Buffer.from([5,6]).entries()) es.push(i+":"+v); console.log(es.join(","));
+console.log(Buffer.from("abc").toString("latin1"));

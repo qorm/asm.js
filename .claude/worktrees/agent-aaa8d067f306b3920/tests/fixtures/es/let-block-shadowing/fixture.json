@@ -1,0 +1,10 @@
+{
+  "description": "let/const block scoping: shadowing across if/for/while/switch blocks, restore after block",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "2\n3\n2\n1\n10\n5\n100\n101\n1\n2\n1\n3\n99\n1\n7\na!b!\n42\n1",
+    "exitCode": 0
+  }
+}

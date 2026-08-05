@@ -1,0 +1,1 @@
+{"description": "regexp: regexp-inline-modifiers", "expect": {"parse": true, "compile": true, "run": true, "stdout": "true\ntrue false\ntrue false\ntrue false\nfalse true\nX", "exitCode": 0}}

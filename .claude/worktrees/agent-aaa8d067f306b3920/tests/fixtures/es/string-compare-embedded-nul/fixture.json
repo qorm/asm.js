@@ -1,0 +1,10 @@
+{
+  "description": "String comparison is NUL-transparent: _strcmp compares by length (min(len1,len2) bytes then length) instead of stopping at the first \\x00. 'A\\0B' === 'A\\0C' is false (they differ at index 2), relational ordering and Array.sort account for bytes after an embedded NUL.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "false true true\ntrue false\ntrue false\n3,3,2,3\nfalse false",
+    "exitCode": 0
+  }
+}

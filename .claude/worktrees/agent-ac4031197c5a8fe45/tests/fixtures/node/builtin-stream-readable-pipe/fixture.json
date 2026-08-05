@@ -1,0 +1,8 @@
+{
+  "description": "node:stream Readable custom _read + pipe() to Writable, and read()/'readable' paused consumption",
+  "expect": {
+    "parse": true, "compile": true, "run": true,
+    "stdout": "piped:hello world\nread:ab",
+    "exitCode": 0
+  }
+}

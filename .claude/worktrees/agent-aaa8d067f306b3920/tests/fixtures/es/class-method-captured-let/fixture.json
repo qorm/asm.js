@@ -1,0 +1,10 @@
+{
+  "description": "let/param captured and mutated by sibling closures in a class method is shared (boxed), even with this/self also captured",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "2 2 t\n13 13",
+    "exitCode": 0
+  }
+}

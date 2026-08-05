@@ -1,0 +1,10 @@
+{
+  "description": "node:net real TCP over raw socket syscalls: isIP/isIPv4/isIPv6 classification, and a single-process loopback exchange (createServer/listen ephemeral port via getsockname, connect, write, accept, read both directions, close)",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "4\n6\n0\ntrue\ntrue\ntrue\nping from client\npong from server\nfalse",
+    "exitCode": 0
+  }
+}

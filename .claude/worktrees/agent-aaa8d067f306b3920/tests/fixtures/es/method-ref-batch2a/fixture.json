@@ -1,0 +1,10 @@
+{
+  "description": "Stage A Batch 2a: array reverse + string slice/substring/at/includes method references",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "4,3,2,1\nfunction\nel\nlo\nel\ni\ntrue\nfalse",
+    "exitCode": 0
+  }
+}

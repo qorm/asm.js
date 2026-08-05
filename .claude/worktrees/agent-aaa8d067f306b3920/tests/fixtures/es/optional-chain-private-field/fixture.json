@@ -1,0 +1,10 @@
+{
+  "description": "Optional chaining onto a private field (o?.#x) reads the private slot when the receiver is non-null and short-circuits to undefined otherwise",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "optthis 42\noptnull true\noptpub 7\ndefault 42\ndefaultnull true",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,4 @@
+{
+  "description": "WeakMap/WeakSet basic ops (set/get/has/delete/add) route to Map/Set; previously crashed",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "42 true false\nfalse\ntrue false", "exitCode": 0 }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "try/finally should execute the finalizer on the normal path",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "body\nfinally\nend",
+    "exitCode": 0
+  }
+}

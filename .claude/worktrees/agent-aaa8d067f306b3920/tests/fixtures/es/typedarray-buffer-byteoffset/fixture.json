@@ -1,0 +1,4 @@
+{
+  "description": "TypedArray.buffer (a byteLength-correct ArrayBuffer aliasing the data) and .byteOffset (0 for full views)",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "12\n0\n12\n5 0\n16 0", "exitCode": 0 }
+}

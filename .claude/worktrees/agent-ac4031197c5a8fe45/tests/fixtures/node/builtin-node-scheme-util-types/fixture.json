@@ -1,0 +1,10 @@
+{
+  "description": "node:util should expose a stable util.types object with callable predicate entries",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "object\nfunction\nfunction\nfunction\nfunction\nfunction\nfunction\nfunction",
+    "exitCode": 0
+  }
+}

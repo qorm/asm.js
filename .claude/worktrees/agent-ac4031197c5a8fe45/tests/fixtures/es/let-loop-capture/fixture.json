@@ -1,0 +1,10 @@
+{
+  "description": "for(let/const) per-iteration bindings when captured by closures (classic [0,1,2] test; for-of/for-in included)",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "0,1,2\na,b,c\np,q\n0:10,1:11,2:12",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "Proxy deleteProperty trap: delete proxy.x / delete proxy[k] routes through handler.deleteProperty(target,key) and coerces the result to boolean; forwards to target when the trap is absent",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true true\nfoo,bar\ntrue\nundefined 2\nfalse",
+    "exitCode": 0
+  }
+}

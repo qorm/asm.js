@@ -1,0 +1,10 @@
+{
+  "description": "console.log of a user-defined method whose name collides with a builtin boolean method (test/has/delete/includes/startsWith/endsWith) prints the actual return value, not a boolean. isBooleanExpression is now gated by receiver type; real RegExp/Array/String/Map/Set boolean methods still render as booleans.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "42 has:x 99 SW\nuser-test\ntrue true true\ntrue false",
+    "exitCode": 0
+  }
+}

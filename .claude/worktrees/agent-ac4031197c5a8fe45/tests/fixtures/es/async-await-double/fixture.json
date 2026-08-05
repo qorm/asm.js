@@ -1,0 +1,10 @@
+{
+  "description": "async functions should support multiple await suspension/resume points",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "3",
+    "exitCode": 0
+  }
+}

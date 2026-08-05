@@ -1,0 +1,10 @@
+{
+  "description": "Proxy enumeration forwards to target (Object.keys/values/entries, for-in, JSON.stringify) when no ownKeys trap; dynamic computed subscript proxy[k] get/set routes through get/set traps (previously fell into the numeric-index path)",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "[\"a\",\"b\",\"c\"]\n[1,2,3]\n[[\"a\",1],[\"b\",2],[\"c\",3]]\n{\"a\":1,\"b\":2,\"c\":3}\na=1,b=2,c=3\n20 20\n5 9",
+    "exitCode": 0
+  }
+}

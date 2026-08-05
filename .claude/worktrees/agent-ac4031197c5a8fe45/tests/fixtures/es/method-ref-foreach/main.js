@@ -1,0 +1,11 @@
+console.log(typeof [].forEach);
+var s = 0;
+[1, 2, 3].forEach.call([1, 2, 3], function (x) { s += x; });
+console.log(s);
+var r = [];
+[10, 20].forEach.call([10, 20], function (x, i, a) { r.push(i + ":" + x + "/" + a.length); });
+console.log(r.join(","));
+var base = 100, out = [];
+var f = [].forEach;
+f.call([1, 2], function (x) { out.push(x + base); });
+console.log(out.join(","));

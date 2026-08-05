@@ -1,0 +1,8 @@
+{
+  "description": "node:url relative resolution against base, dot-segment normalization, pathToFileURL/fileURLToPath",
+  "expect": {
+    "parse": true, "compile": true, "run": true,
+    "stdout": "https://a.com/c\nhttps://h.com/x/y\nhttps://h.com/a/b?q=1\nhttps://h.com/a/x\n/tmp/x.js\nfile:///tmp/x.js",
+    "exitCode": 0
+  }
+}

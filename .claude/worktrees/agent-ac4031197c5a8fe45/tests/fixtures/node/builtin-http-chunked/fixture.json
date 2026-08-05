@@ -1,0 +1,10 @@
+{
+  "description": "node:http HTTP/1.1 chunked transfer-encoding both directions: client streams a chunked request body (multiple write()s), server decodes it; server streams a chunked response (res.write without Content-Length) which the client decodes",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "status 200\nresp-te chunked\nbody recv[aaabbbbc] method=PUT te=chunked",
+    "exitCode": 0
+  }
+}

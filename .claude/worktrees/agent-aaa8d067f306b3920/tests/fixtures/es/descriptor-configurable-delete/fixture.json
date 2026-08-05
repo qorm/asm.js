@@ -1,0 +1,10 @@
+{
+  "description": "configurable:false blocks delete (returns false, property retained); frozen/sealed objects reject delete; preventExtensions still allows deleting existing props; Reflect.preventExtensions/isExtensible. Plain-object delete unaffected (flags_ptr==0 gated).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "false 1 true\ntrue false\nfalse 1\nfalse 2\ntrue false\ntrue n\ntrue\ntrue false\ntrue",
+    "exitCode": 0
+  }
+}

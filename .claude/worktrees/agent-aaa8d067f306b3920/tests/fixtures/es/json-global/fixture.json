@@ -1,0 +1,10 @@
+{
+  "description": "JSON should exist as a standard global object",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "object",
+    "exitCode": 0
+  }
+}

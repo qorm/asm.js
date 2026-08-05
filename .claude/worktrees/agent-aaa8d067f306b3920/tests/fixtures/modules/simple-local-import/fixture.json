@@ -1,0 +1,10 @@
+{
+  "description": "basic local module import still works under the shared runner",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "42",
+    "exitCode": 0
+  }
+}

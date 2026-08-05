@@ -1,0 +1,10 @@
+{
+  "description": "fn.name resolves for runtime function values via the code-ptr metadata side table (declarations, named function expressions), with defineProperty overrides still taking priority",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "[foo]\n[foo]\n[baz]\n[anon]\n[renamed]",
+    "exitCode": 0
+  }
+}

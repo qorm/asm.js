@@ -1,0 +1,11 @@
+{
+  "description": "[#69] ES5 function constructors: this binding, multi-field, return-object override, instanceof",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "3 4 7\ntrue\n0\n50\n7\ntrue false\n",
+    "stderr": "",
+    "exitCode": 0
+  }
+}

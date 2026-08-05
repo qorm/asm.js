@@ -1,0 +1,10 @@
+{
+  "description": "Object.getOwnPropertySymbols returns the object's symbol keys (by identity), the complement of Object.keys",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "2\nSymbol(k) Symbol(m)\ntrue true\n0\n1\n2,4",
+    "exitCode": 0
+  }
+}

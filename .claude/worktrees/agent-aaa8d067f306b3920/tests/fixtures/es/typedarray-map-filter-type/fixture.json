@@ -1,0 +1,4 @@
+{
+  "description": "TypedArray.map/filter return a same-type typed array; x instanceof <TypedArray> works; plain arrays unaffected",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "[ 2, 4, 6 ] true 3\n[ 10, 15, 20 ] true 3\ntrue false\nfalse 2", "exitCode": 0 }
+}

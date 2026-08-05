@@ -1,0 +1,10 @@
+{
+  "description": "node:timers clearImmediate should cancel queued immediate callbacks",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "sync\nafter",
+    "exitCode": 0
+  }
+}

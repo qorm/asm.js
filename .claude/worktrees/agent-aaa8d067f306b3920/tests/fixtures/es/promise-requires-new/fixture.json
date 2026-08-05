@@ -1,0 +1,10 @@
+{
+  "description": "Promise called without new throws a TypeError while `new Promise` and static Promise.resolve/.then continue to work",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "nonew threw:true\nresolved 42\nstatic 7",
+    "exitCode": 0
+  }
+}

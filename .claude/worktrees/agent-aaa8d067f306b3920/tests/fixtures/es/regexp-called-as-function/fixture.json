@@ -1,0 +1,10 @@
+{
+  "description": "RegExp(pattern, flags) called as a function (no new) is equivalent to new RegExp: properties, test/match, and toString all work",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "false y i true\ntrue true\nabc gi\n42\npre\n/t/",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "ESM default import should receive CommonJS module.exports function values",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "7",
+    "exitCode": 0
+  }
+}

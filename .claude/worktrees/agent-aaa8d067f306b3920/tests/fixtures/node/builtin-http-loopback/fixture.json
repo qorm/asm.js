@@ -1,0 +1,10 @@
+{
+  "description": "node:http minimal real HTTP/1.1 over the async net layer: in-process loopback POST request/response exercising request line, request/response headers (Content-Type, X-Method), and request+response bodies via http.createServer/http.request over event-driven sockets",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "status 200\ncontent-type text/plain\nx-method POST\nbody hello /echo [payload]",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,4 @@
+{
+  "description": "Uint8ClampedArray saturates to [0,255] (not wrap) on both construction and assignment; Uint8Array still wraps",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "255 0 100 255 0 255 0\n255 0 128\n44 251", "exitCode": 0 }
+}

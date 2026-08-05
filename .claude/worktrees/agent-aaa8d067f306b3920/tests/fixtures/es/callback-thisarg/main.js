@@ -1,0 +1,16 @@
+const ctx = { m: 10, sum: 0 };
+[1, 2, 3].forEach(function (x) { this.sum += x * this.m; }, ctx);
+console.log(ctx.sum);
+console.log([1, 2].map(function (x) { return x * this.m; }, ctx).join(","));
+console.log([1, 2, 3, 4].filter(function (x) { return x > this.m / 5; }, ctx).join(","));
+console.log([1, 2, 3].some(function (x) { return x === this.m / 5; }, ctx));
+console.log([3, 4, 5].every(function (x) { return x >= this.m / 5; }, ctx));
+console.log([1, 2, 3].find(function (x) { return x === this.m / 5; }, ctx));
+console.log([1, 2, 3].findIndex(function (x) { return x === this.m / 5; }, ctx));
+let mout = [];
+new Map([["a", 1]]).forEach(function (v, k) { mout.push(k + v * this.m); }, ctx);
+console.log(mout.join(","));
+let sout = 0;
+new Set([1, 2]).forEach(function (x) { sout += x * this.m; }, ctx);
+console.log(sout);
+console.log([1, 2, 3].map((x) => x * 2).join(","));

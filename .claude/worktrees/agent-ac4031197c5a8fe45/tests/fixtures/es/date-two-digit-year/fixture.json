@@ -1,0 +1,4 @@
+{
+  "description": "Date component constructor maps a 2-digit year (0..99) to 1900..1999 per ES MakeDate; years >= 100 are literal",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "1995\n1900\n1999\n100\n2021", "exitCode": 0 }
+}

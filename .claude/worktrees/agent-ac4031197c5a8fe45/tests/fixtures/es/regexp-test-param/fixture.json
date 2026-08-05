@@ -1,0 +1,4 @@
+{
+  "description": "bug4: RegExp .test/.exec on a value with unknown static type (param) routed via __isRegExp runtime guard; user object .test still works",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "true\nfalse\ntrue\nell|e|ll\nuser:Z", "exitCode": 0 }
+}

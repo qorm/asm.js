@@ -1,0 +1,10 @@
+{
+  "description": "Callable Proxies work as array-method callbacks (map/forEach/filter/reduce) via _validate_callable trampoline synthesis in the callback dispatchers; function subscript keys (symbol/computed string) read/write the closure-props side table; Set/array/class-static subscripts unaffected.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "2,4,6\n10,20\n7,8\n2,3\n6\n9 T T 1 1\n2 true 9 3",
+    "exitCode": 0
+  }
+}

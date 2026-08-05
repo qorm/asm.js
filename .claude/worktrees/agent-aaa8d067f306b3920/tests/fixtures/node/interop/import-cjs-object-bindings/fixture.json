@@ -1,0 +1,10 @@
+{
+  "description": "ESM imports should be able to consume CommonJS object exports via default, named and namespace bindings",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "42\n42\nok\n42\nfalse\ntrue",
+    "exitCode": 0
+  }
+}

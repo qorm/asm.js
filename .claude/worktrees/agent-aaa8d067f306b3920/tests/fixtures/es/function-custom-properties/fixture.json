@@ -1,0 +1,1 @@
+{"description": "custom function properties (fn.x=1) via closure side-table + stable function-declaration identity", "expect": {"parse": true, "compile": true, "run": true, "stdout": "2 undefined\n1\ntrue\ntrue\nhi 42\nm fe 2", "exitCode": 0}}

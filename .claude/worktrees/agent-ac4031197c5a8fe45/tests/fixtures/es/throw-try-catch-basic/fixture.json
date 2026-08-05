@@ -1,0 +1,10 @@
+{
+  "description": "throw statements should be catchable within the same function via try/catch",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "before\ncaught x\nend",
+    "exitCode": 0
+  }
+}

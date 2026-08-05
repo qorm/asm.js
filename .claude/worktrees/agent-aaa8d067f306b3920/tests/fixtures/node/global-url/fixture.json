@@ -1,0 +1,1 @@
+{ "description": "bare global URL / URLSearchParams (no import) via implicit-global injection", "expect": { "parse": true, "compile": true, "run": true, "stdout": "https: host.com 8080\n/a/b ?x=1&y=2 #frag\n1 2\n1 two a=1&b=two", "exitCode": 0 } }

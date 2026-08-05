@@ -1,0 +1,11 @@
+{
+  "description": "imported local module should be able to expose a setImmediate-like helper",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "sync\nimmediate",
+    "stderr": "",
+    "exitCode": 0
+  }
+}

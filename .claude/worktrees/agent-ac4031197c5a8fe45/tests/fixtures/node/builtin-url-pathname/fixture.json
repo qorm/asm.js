@@ -1,0 +1,4 @@
+{
+  "description": "node:url pathname defaults to / when absent",
+  "expect": { "parse": true, "compile": true, "run": true, "stdout": "/\n/p\nhttps://h.com", "exitCode": 0 }
+}

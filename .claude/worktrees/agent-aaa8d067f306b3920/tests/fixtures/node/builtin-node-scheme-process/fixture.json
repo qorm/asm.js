@@ -1,0 +1,10 @@
+{
+  "description": "node:process should resolve to the runtime shim and nextTick should schedule a deferred callback",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "object\nfunction\nsync 0\ntick 1",
+    "exitCode": 0
+  }
+}

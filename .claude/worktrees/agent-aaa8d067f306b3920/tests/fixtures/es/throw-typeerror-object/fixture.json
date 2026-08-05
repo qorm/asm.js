@@ -1,0 +1,10 @@
+{
+  "description": "Engine-synthesized TypeErrors (destructuring null/undefined, class/Map/Set called without new) are real TypeError objects: instanceof, name, message all work",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "desnull true/TypeError\ndesundef true/TypeError\nclassnonew true/TypeError\nmapnonew true/TypeError\nsetnonew true/TypeError\nmsgcheck true",
+    "exitCode": 0
+  }
+}

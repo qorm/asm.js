@@ -1,0 +1,7 @@
+{
+  "description": "shape v2 T2a prototype shaping: basic",
+  "expect": {
+    "stdout": "1 2\nfunction\ntrue\ntrue",
+    "exitCode": 0
+  }
+}
