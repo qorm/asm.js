@@ -1,6 +1,6 @@
 {
-  "generated": "2026-08-04T20:20:52.922Z",
-  "runnerSha": "cdc383a167319a78cb461ff2953bb185f43796fa",
+  "generated": "2026-08-05T10:20:46.759Z",
+  "runnerSha": "fd879e70e35b4874bb25ef55a6df8c356f945984",
   "corpusPin": "9e61c12835c5e4a3bdba93850427e6742c4f64c4",
   "config": {
     "corpus": ".test262-corpus",
@@ -168,7 +168,7 @@
     },
     {
       "pattern": "CRASH: run signal SIGSEGV",
-      "count": 101
+      "count": 102
     },
     {
       "pattern": "FAIL: array contents mismatch (compareArray)",
@@ -188,7 +188,7 @@
     },
     {
       "pattern": "CRASH: run signal SIGBUS",
-      "count": 15
+      "count": 14
     }
   ]
 }
