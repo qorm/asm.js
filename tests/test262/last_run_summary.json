@@ -1,6 +1,6 @@
 {
-  "generated": "2026-08-05T16:38:05.335Z",
-  "runnerSha": "cc2bbb95f75341d9d7460a20d061303ccb2bebc6",
+  "generated": "2026-08-05T16:42:27.771Z",
+  "runnerSha": "313c83c07e72abbd4d27e832cb96cdd2bbff4374",
   "corpusPin": "9e61c12835c5e4a3bdba93850427e6742c4f64c4",
   "config": {
     "corpus": ".test262-corpus",
@@ -24,24 +24,24 @@
   "eligible": 1220,
   "run": 407,
   "totals": {
-    "PASS": 195,
-    "FAIL": 197,
+    "PASS": 205,
+    "FAIL": 188,
     "COMPILE_FAIL": 3,
-    "CRASH": 12
+    "CRASH": 11
   },
-  "passRatePct": 47.91,
+  "passRatePct": 50.37,
   "byArea": {
     "built-ins/String": {
-      "PASS": 195,
-      "FAIL": 197,
+      "PASS": 205,
+      "FAIL": 188,
       "COMPILE_FAIL": 3,
-      "CRASH": 12
+      "CRASH": 11
     }
   },
   "topFailPatterns": [
     {
       "pattern": "FAIL: assertion mismatch (Test262Error / wrong value)",
-      "count": 166
+      "count": 157
     },
     {
       "pattern": "FAIL: constructor-ness reflection (isConstructor / not-a-constructor)",
@@ -65,7 +65,7 @@
     },
     {
       "pattern": "CRASH: run signal SIGBUS",
-      "count": 2
+      "count": 1
     },
     {
       "pattern": "CRASH: run timeout",

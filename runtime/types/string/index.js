@@ -89,25 +89,36 @@ export class StringGenerator {
         const vm = this.vm;
         const okLabel = "_thiscoerce_ok_" + methodName;
         const extractLabel = "_thiscoerce_extract_" + methodName;
+        const forceLabel = "_thiscoerce_force_" + methodName;
         vm.shrImm(VReg.V0, VReg.A0, 48);
         vm.cmpImm(VReg.V0, 0x7FFC);  // boxed string
         vm.jeq(okLabel);
-        vm.cmpImm(VReg.V0, 0x7FFD);  // boxed wrapper object (new String(...))
+        vm.cmpImm(VReg.V0, 0x7FFD);  // boxed wrapper object
         vm.jeq(extractLabel);
         vm.cmpImm(VReg.V0, 0);       // raw pointer (compiler static dispatch)
         vm.jeq(okLabel);
         // 非字符串/非指针接收者:调用 _valueToStr 强制转为装箱字符串
+        vm.label(forceLabel);
         vm.call("_valueToStr");           // A0 = JSValue → RET = 装箱字符串
         vm.mov(VReg.A0, VReg.RET);
         vm.jmp(okLabel);
-        // 0x7FFD extraction
+        // 0x7FFD extraction:尝试 __value(仅 String 包装器有效)
+        // 若返回非字符串,回退到 _valueToStr。
         vm.label(extractLabel);
-        vm.mov(VReg.V0, VReg.A0);
+        vm.mov(VReg.V0, VReg.A0);         // V0 = boxed obj
         vm.mov(VReg.A0, VReg.V0);
         vm.lea(VReg.A1, vm.asm.addString("__value"));
         vm.call("_tag_key_a1");
-        vm.call("_object_get");
-        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_object_get");           // RET = __value or undefined
+        // 检查 RET 是否为装箱字符串(0x7FFC)
+        vm.shrImm(VReg.V1, VReg.RET, 48);
+        vm.cmpImm(VReg.V1, 0x7FFC);
+        vm.jne("_thiscoerce_fallback_" + methodName); // 非字符串→_valueToStr
+        vm.mov(VReg.A0, VReg.RET);        // A0 = extracted string
+        vm.jmp(okLabel);
+        vm.label("_thiscoerce_fallback_" + methodName);
+        vm.mov(VReg.A0, VReg.V0);         // A0 = 原 boxed obj,投 _valueToStr
+        vm.jmp(forceLabel);
         vm.label(okLabel);
     }
 
