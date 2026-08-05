@@ -38,6 +38,7 @@ export class SymbolGenerator {
         this.generateSymbolFor();
         this.generateSymbolKeyFor();
         this.generateSymbolWellknown();
+        this.generateSymbolValueOf();
     }
 
     // 数据段槽：注册表链表头 + well-known 槽。
@@ -249,5 +250,49 @@ export class SymbolGenerator {
         vm.store(VReg.S0, 0, VReg.RET);
         vm.label("_symbol_wellknown_done");
         vm.epilogue([VReg.S0], 0);
+    }
+
+    // _symbol_valueOf(this) -> raw symbol pointer
+    // Returns the [[SymbolData]] internal slot value.
+    // Throws TypeError if this is not a Symbol or Symbol wrapper.
+    generateSymbolValueOf() {
+        const vm = this.vm;
+        vm.label("_symbol_valueOf");
+        vm.prologue(0, [VReg.S0]);
+
+        // Check if this is a Symbol primitive (raw heap pointer, high16==0)
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_svo_check_symbol");
+        // Check if this is a Symbol wrapper (0x7FFD object)
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jne("_svo_typeerr");
+
+        // 0x7FFD object: verify it's a Symbol wrapper by checking type byte
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.S0, VReg.A0, VReg.V1); // S0 = raw ptr
+        vm.loadByte(VReg.V0, VReg.S0, 0);
+        vm.cmpImm(VReg.V0, TYPE_SYMBOL); // TYPE_SYMBOL = 9?
+        vm.jne("_svo_typeerr");
+        // Extract symbol pointer from wrapper
+        vm.load(VReg.RET, VReg.S0, 8); // symbol ptr at +8
+        vm.epilogue([VReg.S0], 0);
+
+        // Raw pointer: verify it's a valid Symbol
+        vm.label("_svo_check_symbol");
+        vm.mov(VReg.S0, VReg.A0);
+        vm.call("_is_symbol"); // RET = 0 or 1
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_svo_typeerr");
+        vm.mov(VReg.RET, VReg.S0); // return original symbol
+        vm.epilogue([VReg.S0], 0);
+
+        vm.label("_svo_typeerr");
+        vm.lea(VReg.A0, vm.asm.addString("Symbol.prototype.valueOf called on incompatible receiver"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
     }
 }

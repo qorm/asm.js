@@ -1494,11 +1494,13 @@ export const MemberCompiler = {
         vm.label(doneL);
     },
 
-    // [Symbol 一等值] Symbol 构造函数 + well-known symbols 物化
+    // [Symbol 一等值] Symbol 构造函数 + well-known symbols + prototype 物化
     emitSymbolCtorObject() {
         const vm = this.vm;
         const ctorSlot = "_nsobj_symbol";
+        const protoSlot = "_nsobj_symbol_proto";
         this._reEnsureSlot(ctorSlot);
+        this._reEnsureSlot(protoSlot);
         const doneL = this.ctx.newLabel("nssym_done");
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.RET, VReg.V0, 0);
@@ -1508,7 +1510,7 @@ export const MemberCompiler = {
         vm.movImm(VReg.A0, 16);
         vm.call("_alloc");
         vm.mov(VReg.S0, VReg.RET);
-        vm.movImm(VReg.V1, 0xc105); // CLOSURE_MAGIC
+        vm.movImm(VReg.V1, 0xc105);
         vm.store(VReg.S0, 0, VReg.V1);
         vm.lea(VReg.V1, "_symbol_new");
         vm.store(VReg.S0, 8, VReg.V1);
@@ -1516,7 +1518,7 @@ export const MemberCompiler = {
         vm.call("_js_box_function");
         vm.lea(VReg.V1, ctorSlot);
         vm.store(VReg.V1, 0, VReg.RET);
-        // Symbol.name / Symbol.length (length = 0)
+        // Symbol.name / Symbol.length
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.A0, VReg.V0, 0);
         this.emitBoxedStringKey("name", VReg.A1);
@@ -1531,7 +1533,44 @@ export const MemberCompiler = {
         vm.scvtf(0, VReg.A2);
         vm.fmovToInt(VReg.A2, 0);
         vm.call("_closure_prop_set");
-        // Well-known symbols as own properties (writable:false, enumerable:false, configurable:false)
+        // Prototype object
+        vm.call("_object_new");
+        vm.call("_box_obj_r");
+        vm.lea(VReg.V1, protoSlot);
+        vm.store(VReg.V1, 0, VReg.RET);
+        // Prototype methods: toString, valueOf
+        const SYM_PROTO = [["toString", "_symbol_to_string", 0], ["valueOf", "_symbol_valueOf", 0]];
+        for (let i = 0; i < SYM_PROTO.length; i++) {
+            const m = SYM_PROTO[i];
+            this.emitBuiltinMethodRefClosure(m[1]);
+            vm.mov(VReg.S0, VReg.RET);
+            vm.mov(VReg.A0, VReg.S0);
+            this.emitBoxedStringKey("name", VReg.A1);
+            vm.lea(VReg.A2, this.asm.addString(m[0]));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+            vm.or(VReg.A2, VReg.A2, VReg.V1);
+            vm.call("_closure_prop_set");
+            vm.mov(VReg.A0, VReg.S0);
+            this.emitBoxedStringKey("length", VReg.A1);
+            vm.movImm(VReg.A2, m[2]);
+            vm.scvtf(0, VReg.A2);
+            vm.fmovToInt(VReg.A2, 0);
+            vm.call("_closure_prop_set");
+            vm.mov(VReg.RET, VReg.S0);
+            this._reSetProtoProp(protoSlot, m[0], BUILTIN_PROP_ATTR);
+        }
+        // prototype.constructor = Symbol
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        this._reSetProtoProp(protoSlot, "constructor", BUILTIN_PROP_ATTR);
+        // Symbol.prototype = 原型对象
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("prototype", VReg.A1);
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.A2, VReg.V0, 0);
+        vm.call("_closure_prop_set");
+        // Well-known symbols as own properties
         const WK_SYMBOLS = ["asyncIterator", "hasInstance", "isConcatSpreadable",
             "iterator", "match", "matchAll", "replace", "search",
             "species", "split", "toPrimitive", "toStringTag", "unscopables"];
@@ -1539,21 +1578,16 @@ export const MemberCompiler = {
             const name = WK_SYMBOLS[i];
             const slot = "_symwk_" + name;
             this._reEnsureSlot(slot);
-            // Call _symbol_wellknown to get/create the symbol
             vm.lea(VReg.A0, slot);
             vm.lea(VReg.A1, this.asm.addString("Symbol." + name));
             vm.movImm64(VReg.V1, 0x7ffc000000000000n);
             vm.or(VReg.A1, VReg.A1, VReg.V1);
-            vm.call("_symbol_wellknown"); // RET = raw symbol pointer
-            // Box as 0x7FFF function tag (symbols are special values)
-            // Symbols are stored as raw pointers; for property values they need boxing
-            // _symbol_wellknown returns raw pointer, store as-is
+            vm.call("_symbol_wellknown");
             vm.mov(VReg.A2, VReg.RET);
             vm.lea(VReg.V0, ctorSlot);
             vm.load(VReg.A0, VReg.V0, 0);
             this.emitBoxedStringKey(name, VReg.A1);
             vm.call("_closure_prop_set");
-            // Set attr: non-writable, non-enumerable, non-configurable
             vm.lea(VReg.V0, ctorSlot);
             vm.load(VReg.A0, VReg.V0, 0);
             this.emitBoxedStringKey(name, VReg.A1);
