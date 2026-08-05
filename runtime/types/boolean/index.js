@@ -35,10 +35,10 @@ export class BooleanGenerator {
         vm.call("_to_boolean"); // RET = 0 (falsy) or non-zero (truthy)
         vm.cmpImm(VReg.RET, 0);
         vm.jeq("_bnew_false_val");
-        vm.movImm64(VReg.S0, 0x7FF9000000000001n); // S0 = true
+        vm.movImm64(VReg.S0, 0x7FF9000000000001n); // true
         vm.jmp("_bnew_have_val");
         vm.label("_bnew_false_val");
-        vm.movImm64(VReg.S0, 0x7FF9000000000002n); // S0 = false
+        vm.movImm64(VReg.S0, 0x7FF9000000000000n); // false
         vm.label("_bnew_have_val");
 
         // Step 2: create wrapper object
@@ -101,7 +101,7 @@ export class BooleanGenerator {
 
         // Check boolean value
         vm.label("_bts_print");
-        vm.movImm64(VReg.V1, 0x7FF9000000000002n); // false
+        vm.movImm64(VReg.V1, 0x7FF9000000000000n); // false
         vm.cmp(VReg.S0, VReg.V1);
         vm.jeq("_bts_false");
         vm.lea(VReg.RET, vm.asm.addString("true"));

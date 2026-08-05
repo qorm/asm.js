@@ -2469,24 +2469,14 @@ export const FunctionCompiler = {
                 if (arg) {
                     this.compileExpression(arg);
                     // 对于 Number()，调用 _number_coerce 进行转换
-                    // _number_coerce 正确处理 boolean, null, undefined, string, number
                     if (callee.name === "Number") {
                         this.vm.mov(VReg.A0, VReg.RET);
                         this.vm.call("_number_coerce");
                     }
-                    // 对于 Boolean()，调用 _to_boolean 并映射为 JS bool
+                    // 对于 Boolean()，调用 _builtin_boolean（运行时正确编码 JS bool）
                     else if (callee.name === "Boolean") {
                         this.vm.mov(VReg.A0, VReg.RET);
-                        this.vm.call("_to_boolean"); // RET = 0/1
-                        const bfLabel = this.ctx.newLabel("boolean_false");
-                        const beLabel = this.ctx.newLabel("boolean_end");
-                        this.vm.cmpImm(VReg.RET, 0);
-                        this.vm.jeq(bfLabel);
-                        this.vm.movImm64(VReg.RET, 0x7FF9000000000001n); // true
-                        this.vm.jmp(beLabel);
-                        this.vm.label(bfLabel);
-                        this.vm.movImm64(VReg.RET, 0x7FF9000000000002n); // false
-                        this.vm.label(beLabel);
+                        this.vm.call("_builtin_boolean");
                     }
                     // 对于 String()，调用 _valueToStr 进行转换
                     // _valueToStr 智能检测类型并转换为字符串
@@ -2548,7 +2538,9 @@ export const FunctionCompiler = {
                     if (callee.name === "Number") {
                         this.vm.movImm(VReg.RET, 0); // Number() 返回 0
                     } else if (callee.name === "Boolean") {
-                        this.vm.movImm64(VReg.RET, 0x7FF9000000000002n); // Boolean() 返回 false
+                        // Boolean() → false. Use runtime to ensure correct JS bool encoding.
+                        this.vm.movImm(VReg.A0, 0);
+                        this.vm.call("_builtin_boolean");
                     } else {
                         // String()
                         this.vm.lea(VReg.RET, "_str_empty");
