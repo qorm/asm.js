@@ -18,7 +18,7 @@ cd "$(dirname "$0")/.."
 
 # Exact expected fixture manifest count under tests/fixtures (ratchet: bump
 # only when new fixtures genuinely land; never lower it).
-BASELINE_FIXTURES=385
+BASELINE_FIXTURES=386
 LOCK=".git/bootstrap-gate.lock"
 
 while ! mkdir "$LOCK" 2>/dev/null; do
