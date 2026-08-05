@@ -82,6 +82,35 @@ export class StringGenerator {
         vm.label(okLabel);
     }
 
+    // _emitThisToString(methodName) —— 与 _emitThisStringCheck 同形,但对非字符串接收者
+    // 调用 _valueToStr 强制转换为字符串,而非抛 TypeError。供 trim/trimStart/trimEnd
+    // 等 ES 要求先 ToString(this) 的方法使用。
+    _emitThisToString(methodName) {
+        const vm = this.vm;
+        const okLabel = "_thiscoerce_ok_" + methodName;
+        const extractLabel = "_thiscoerce_extract_" + methodName;
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFC);  // boxed string
+        vm.jeq(okLabel);
+        vm.cmpImm(VReg.V0, 0x7FFD);  // boxed wrapper object (new String(...))
+        vm.jeq(extractLabel);
+        vm.cmpImm(VReg.V0, 0);       // raw pointer (compiler static dispatch)
+        vm.jeq(okLabel);
+        // 非字符串/非指针接收者:调用 _valueToStr 强制转为装箱字符串
+        vm.call("_valueToStr");           // A0 = JSValue → RET = 装箱字符串
+        vm.mov(VReg.A0, VReg.RET);
+        vm.jmp(okLabel);
+        // 0x7FFD extraction
+        vm.label(extractLabel);
+        vm.mov(VReg.V0, VReg.A0);
+        vm.mov(VReg.A0, VReg.V0);
+        vm.lea(VReg.A1, vm.asm.addString("__value"));
+        vm.call("_tag_key_a1");
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.label(okLabel);
+    }
+
     // 生成字符串长度函数
     // _strlen(str) -> length
     generateStrlen() {
@@ -2957,7 +2986,7 @@ export class StringGenerator {
         vm.label("_str_trim");
         // 使用 6 个保存寄存器: S0=str, S1=len, S2=start, S3=end/newLen后为result, S4=newLen, S5=index
         vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
-        this._emitThisStringCheck("trim");
+        this._emitThisToString("trim");
 
         vm.mov(VReg.S0, VReg.A0); // S0 = 源字符串
 
@@ -3060,7 +3089,7 @@ export class StringGenerator {
 
         vm.label("_str_trimStart");
         vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
-        this._emitThisStringCheck("trimStart");
+        this._emitThisToString("trimStart");
 
         vm.mov(VReg.S0, VReg.A0);
         vm.mov(VReg.A0, VReg.S0);
@@ -3121,7 +3150,7 @@ export class StringGenerator {
 
         vm.label("_str_trimEnd");
         vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
-        this._emitThisStringCheck("trimEnd");
+        this._emitThisToString("trimEnd");
 
         vm.mov(VReg.S0, VReg.A0);
         vm.mov(VReg.A0, VReg.S0);

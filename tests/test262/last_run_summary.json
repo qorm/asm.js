@@ -1,6 +1,6 @@
 {
-  "generated": "2026-08-05T16:34:14.085Z",
-  "runnerSha": "718862919566ffa005604d87d9bd7a9c4e57e2da",
+  "generated": "2026-08-05T16:38:05.335Z",
+  "runnerSha": "cc2bbb95f75341d9d7460a20d061303ccb2bebc6",
   "corpusPin": "9e61c12835c5e4a3bdba93850427e6742c4f64c4",
   "config": {
     "corpus": ".test262-corpus",
@@ -24,16 +24,16 @@
   "eligible": 1220,
   "run": 407,
   "totals": {
-    "PASS": 194,
-    "FAIL": 198,
+    "PASS": 195,
+    "FAIL": 197,
     "COMPILE_FAIL": 3,
     "CRASH": 12
   },
-  "passRatePct": 47.67,
+  "passRatePct": 47.91,
   "byArea": {
     "built-ins/String": {
-      "PASS": 194,
-      "FAIL": 198,
+      "PASS": 195,
+      "FAIL": 197,
       "COMPILE_FAIL": 3,
       "CRASH": 12
     }
@@ -41,7 +41,7 @@
   "topFailPatterns": [
     {
       "pattern": "FAIL: assertion mismatch (Test262Error / wrong value)",
-      "count": 167
+      "count": 166
     },
     {
       "pattern": "FAIL: constructor-ness reflection (isConstructor / not-a-constructor)",

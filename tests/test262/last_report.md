@@ -1,10 +1,10 @@
 # asm.js test262 conformance report
 
-_Generated 2026-08-05T16:34:14.084Z — target macos-arm64_
+_Generated 2026-08-05T16:38:05.334Z — target macos-arm64_
 
 ## Headline
 
-**asm.js passes 194 / 407 = 47.67% of the run test262 subset**
+**asm.js passes 195 / 407 = 47.91% of the run test262 subset**
 (selected `language/` + core `built-ins/`), one variant per test.
 
 Of 1223 discovered test files in the selected dirs, 3 were excluded up front (module=0, unsupported-feature=3, intl/staging-dir=0); 1220 were eligible; 407 were actually run (deterministic stride=3).
@@ -13,8 +13,8 @@ Of 1223 discovered test files in the selected dirs, 3 were excluded up front (mo
 
 | class | count | % of run |
 |-------|------:|---------:|
-| PASS         | 194 | 47.67 |
-| FAIL         | 198 | 48.65 |
+| PASS         | 195 | 47.91 |
+| FAIL         | 197 | 48.40 |
 | COMPILE_FAIL | 3 | 0.74 |
 | CRASH        | 12 | 2.95 |
 | **run**      | **407** | 100 |
@@ -23,7 +23,7 @@ Of 1223 discovered test files in the selected dirs, 3 were excluded up front (mo
 
 | area | run | PASS | FAIL | COMPILE_FAIL | CRASH | pass% |
 |------|----:|-----:|-----:|-------------:|------:|------:|
-| built-ins/String | 407 | 194 | 198 | 3 | 12 | 47.7 |
+| built-ins/String | 407 | 195 | 197 | 3 | 12 | 47.9 |
 
 ## Excluded categories (counted, not scored)
 
@@ -37,7 +37,7 @@ Excluded-by-feature detail:
 
 ## Top failing patterns (FAIL / COMPILE_FAIL / CRASH detail strings)
 
-- **167×** FAIL: assertion mismatch (Test262Error / wrong value)
+- **166×** FAIL: assertion mismatch (Test262Error / wrong value)
 - **18×** FAIL: constructor-ness reflection (isConstructor / not-a-constructor)
 - **9×** CRASH: run signal SIGSEGV
 - **7×** FAIL: array contents mismatch (compareArray)
@@ -99,4 +99,4 @@ mkdir -p .test262-corpus && tar xzf /tmp/t262.tgz -C .test262-corpus --strip-com
 node tests/test262/run.mjs --stride 3 --jobs 4 --target macos-arm64
 ```
 
-_Run wall-clock: 34.6s._
+_Run wall-clock: 34.7s._

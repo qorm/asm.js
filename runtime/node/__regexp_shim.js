@@ -443,6 +443,7 @@ function __re_parseClass(st) {
     }
     var items = [];
     var hasProp = false; // 含 \p{…} 项 → 整个类改按码点(而非字节)匹配
+    var hasEsc = false;  // 含 \d\w\s\D\W\S 类简写 → 同需码点匹配(UTF-8 续字节会误判)
     while (st.i < st.n && st.p.charAt(st.i) !== "]") {
         var lo = -1;
         var loEsc = null; // 非 null:左端是"类转义"(\d\w\s 或 \p{…}),不能当区间端点
@@ -477,10 +478,10 @@ function __re_parseClass(st) {
                 // 类转义不得作区间端点:u/v 模式是语法错([\p{Hex}-￿]);
                 // 非 u 模式按 AnnexB 拆成 左项、'-'、右项(既有宽容行为,勿回退)。
                 if (st.uni) return __re_fail(st, "Invalid character class");
-                if (loEsc !== null) items.push(loEsc);
+                if (loEsc !== null) { items.push(loEsc); if (loEsc.t === 1) hasEsc = true; }
                 else items.push({ t: 0, c: "", lo: lo, hi: lo });
                 items.push({ t: 0, c: "", lo: 45, hi: 45 });
-                if (hiEsc !== null) items.push(hiEsc);
+                if (hiEsc !== null) { items.push(hiEsc); if (hiEsc.t === 1) hasEsc = true; }
                 else items.push({ t: 0, c: "", lo: hi, hi: hi });
                 continue;
             }
@@ -490,6 +491,7 @@ function __re_parseClass(st) {
             items.push({ t: 0, c: "", lo: lo, hi: hi });
         } else if (loEsc !== null) {
             items.push(loEsc);
+            if (loEsc.t === 1) hasEsc = true;
         } else {
             items.push({ t: 0, c: "", lo: lo, hi: lo });
         }
@@ -498,7 +500,7 @@ function __re_parseClass(st) {
         return __re_fail(st, "Unterminated character class"); // 未闭合的 [
     }
     st.i = st.i + 1; // 跳过 ']'
-    return { k: "cls", neg: neg, items: items, cp: hasProp };
+    return { k: "cls", neg: neg, items: items, cp: hasProp || hasEsc };
 }
 
 // 尝试解析 {n} {n,} {n,m}。成功返回 {min,max,end};形式不合法返回 null
