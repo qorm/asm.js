@@ -204,7 +204,6 @@ const REGEXP_PROTO_HELPER = {
 //
 // 属性描述符:writable:true, enumerable:false, configurable:true (规范 21.1.3 方法)
 const STRING_PROTO_METHODS = [
-    // [方法名, 运行时 helper 标签, 规范 length]
     ["toUpperCase", "_str_toUpperCase", 0],
     ["toLowerCase", "_str_toLowerCase", 0],
     ["trim", "_str_trim", 0],
@@ -220,16 +219,23 @@ const STRING_PROTO_METHODS = [
     ["endsWith", "_str_endsWith", 1],
     ["repeat", "_str_repeat", 1],
     ["concat", "_strconcat", 1],
-    ["padStart", "_str_padStart", 1], // 规范 length = 1(maxLength;fillString 为可选第二参不计)
-    ["padEnd", "_str_padEnd", 1],     // 同 padStart
-    ["match", "_str_match", 1],       // [L3]
-    ["search", "_str_search", 1],     // [L3] 规范 length = 1(regexp)
-    ["split", "_str_split", 2],       // 规范 length = 2(separator, limit)
+    ["padStart", "_str_padStart", 1],
+    ["padEnd", "_str_padEnd", 1],
+    ["match", "_str_match", 1],
+    ["search", "_str_search", 1],
+    ["split", "_str_split", 2],
     ["localeCompare", "_str_localeCompare", 1],
-    ["indexOf", "_aref_str_indexOf", 1], // aref wrapper:boxed fromIndex→raw int
-    ["toString", "_str_toString_wrapper", 0], // returns this.__value (primitive string)
-    ["valueOf", "_str_valueOf", 0],           // returns this.__value (primitive string)
-    ["constructor", null, 1],             // 最后落位:从构造器槽读
+    ["indexOf", "_aref_str_indexOf", 1],
+    ["toString", "_str_toString_wrapper", 0],
+    ["valueOf", "_str_valueOf", 0],
+    ["constructor", null, 1],
+];
+
+// [Boolean 一等值] Boolean.prototype 物化
+const BOOLEAN_PROTO_METHODS = [
+    ["toString", "_boolean_toString", 0],
+    ["valueOf", "_boolean_valueOf", 0],
+    ["constructor", null, 1],
 ];
 
 // ── [Date 一等值] Date.prototype 物化(反射用真对象)─────────────────────────────
@@ -888,6 +894,13 @@ export const MemberCompiler = {
             (this.ctx.getMainCapturedVar && this.ctx.getMainCapturedVar("String")));
     },
 
+    // [Boolean 一等值] `Boolean` 标识符被遮蔽?
+    booleanNameShadowed() {
+        return !!((this.ctx.getLocal && this.ctx.getLocal("Boolean")) ||
+            (this.ctx.getFunction && this.ctx.getFunction("Boolean")) ||
+            (this.ctx.getMainCapturedVar && this.ctx.getMainCapturedVar("Boolean")));
+    },
+
     // [Date 一等值] `Date` 标识符被遮蔽?同 stringNameShadowed 守卫组。
     dateNameShadowed() {
         return !!((this.ctx.getLocal && this.ctx.getLocal("Date")) ||
@@ -1379,6 +1392,104 @@ export const MemberCompiler = {
         vm.jne(doneL);
         this.emitStringCtorObject(); // 填两槽(RET = 构造器,下面重载原型)
         vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.label(doneL);
+    },
+
+    // [Boolean 一等值] Boolean.prototype 值读
+    emitBooleanProtoObject() {
+        const vm = this.vm;
+        const protoSlot = "_nsobj_boolean_proto";
+        this._reEnsureSlot(protoSlot);
+        const doneL = this.ctx.newLabel("nsboolproto_done");
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne(doneL);
+        this.emitBooleanCtorObject();
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.label(doneL);
+    },
+
+    // [Boolean 一等值] Boolean 构造函数 + Boolean.prototype 物化
+    emitBooleanCtorObject() {
+        const vm = this.vm;
+        const ctorSlot = "_nsobj_boolean";
+        const protoSlot = "_nsobj_boolean_proto";
+        this._reEnsureSlot(ctorSlot);
+        this._reEnsureSlot(protoSlot);
+        const doneL = this.ctx.newLabel("nsbool_done");
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne(doneL);
+        // 构造器闭包 16B {magic, _builtin_boolean}
+        vm.movImm(VReg.A0, 16);
+        vm.call("_alloc");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.movImm(VReg.V1, 0xc105); // CLOSURE_MAGIC
+        vm.store(VReg.S0, 0, VReg.V1);
+        vm.lea(VReg.V1, "_builtin_boolean");
+        vm.store(VReg.S0, 8, VReg.V1);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_js_box_function");
+        vm.lea(VReg.V1, ctorSlot);
+        vm.store(VReg.V1, 0, VReg.RET);
+        // Boolean.name / Boolean.length
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("name", VReg.A1);
+        vm.lea(VReg.A2, this.asm.addString("Boolean"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A2, VReg.A2, VReg.V1);
+        vm.call("_closure_prop_set");
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("length", VReg.A1);
+        vm.movImm(VReg.A2, 1);
+        vm.scvtf(0, VReg.A2);
+        vm.fmovToInt(VReg.A2, 0);
+        vm.call("_closure_prop_set");
+        // 原型对象
+        vm.call("_object_new");
+        vm.call("_box_obj_r");
+        vm.lea(VReg.V1, protoSlot);
+        vm.store(VReg.V1, 0, VReg.RET);
+        // 原型属性落位
+        for (let i = 0; i < BOOLEAN_PROTO_METHODS.length; i++) {
+            const m = BOOLEAN_PROTO_METHODS[i];
+            if (m[1] === null) continue;
+            this.emitBuiltinMethodRefClosure(m[1]);
+            vm.mov(VReg.S0, VReg.RET);
+            vm.mov(VReg.A0, VReg.S0);
+            this.emitBoxedStringKey("name", VReg.A1);
+            vm.lea(VReg.A2, this.asm.addString(m[0]));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+            vm.or(VReg.A2, VReg.A2, VReg.V1);
+            vm.call("_closure_prop_set");
+            vm.mov(VReg.A0, VReg.S0);
+            this.emitBoxedStringKey("length", VReg.A1);
+            vm.movImm(VReg.A2, m[2]);
+            vm.scvtf(0, VReg.A2);
+            vm.fmovToInt(VReg.A2, 0);
+            vm.call("_closure_prop_set");
+            vm.mov(VReg.RET, VReg.S0);
+            this._reSetProtoProp(protoSlot, m[0], BUILTIN_PROP_ATTR);
+        }
+        // prototype.constructor = Boolean
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        this._reSetProtoProp(protoSlot, "constructor", BUILTIN_PROP_ATTR);
+        // Boolean.prototype = 原型对象
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("prototype", VReg.A1);
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.A2, VReg.V0, 0);
+        vm.call("_closure_prop_set");
+        // RET = 装箱构造器
+        vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.RET, VReg.V0, 0);
         vm.label(doneL);
     },
@@ -2709,7 +2820,11 @@ export const MemberCompiler = {
             this.vm.call("_box_obj_r"); // box->helper
             return;
         }
-        if (name === "Boolean") { this.emitBuiltinFnClosure("_builtin_boolean"); return; }
+        // [Boolean 一等值] 惰性物化 Boolean 构造器 + Boolean.prototype
+        if (name === "Boolean" && !this.booleanNameShadowed()) {
+            this.emitBooleanCtorObject();
+            return;
+        }
         // [W3 Number 一等值] 裸 `Number`(反射位):惰性物化真构造器函数对象(带
         // .name/.length、6 静态方法值、8 常量)→ typeof "function"(不变)、Number===Number
         // 由假变真、gOPN/gOPD(Number,…) 成立。作值调用 `var N=Number; N(x)` 命中同一
@@ -3627,6 +3742,13 @@ export const MemberCompiler = {
             if (propName === "prototype" && expr.object.type === "Identifier" &&
                 expr.object.name === "String" && !this.stringNameShadowed()) {
                 this.emitStringProtoObject();
+                return;
+            }
+
+            // [Boolean 一等值] `Boolean.prototype` → 惰性物化的单例原型对象
+            if (propName === "prototype" && expr.object.type === "Identifier" &&
+                expr.object.name === "Boolean" && !this.booleanNameShadowed()) {
+                this.emitBooleanProtoObject();
                 return;
             }
 

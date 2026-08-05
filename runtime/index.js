@@ -25,6 +25,7 @@ export { MapGenerator } from "./types/map/index.js";
 export { SetGenerator } from "./types/set/index.js";
 export { DateGenerator } from "./types/date/index.js";
 export { RegExpGenerator } from "./types/regexp/index.js";
+export { BooleanGenerator } from "./types/boolean/index.js";
 
 // 运算符
 export { TypeofGenerator } from "./operators/typeof.js";
@@ -46,6 +47,7 @@ import { MapGenerator } from "./types/map/index.js";
 import { SetGenerator } from "./types/set/index.js";
 import { DateGenerator } from "./types/date/index.js";
 import { RegExpGenerator } from "./types/regexp/index.js";
+import { BooleanGenerator } from "./types/boolean/index.js";
 import { PrintGenerator } from "./core/print.js";
 import { SubscriptGenerator } from "./core/subscript.js";
 import { TypeofGenerator } from "./operators/typeof.js";
@@ -82,6 +84,7 @@ export class RuntimeGenerator {
         this.setGen = new SetGenerator(vm);
         this.dateGen = new DateGenerator(vm);
         this.regexpGen = new RegExpGenerator(vm);
+        this.booleanGen = new BooleanGenerator(vm);
         // 核心生成器
         this.jsvalueGen = new JSValueGenerator(vm, ctx);
         this.printGen = new PrintGenerator(vm);
@@ -116,6 +119,7 @@ export class RuntimeGenerator {
         this.setGen.generate();
         this.dateGen.generate();
         this.regexpGen.generate();
+        this.booleanGen.generate();
         // 核心
         this.jsvalueGen.generate();
         this.printGen.generate();

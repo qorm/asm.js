@@ -255,6 +255,21 @@ export const ExpressionCompiler = {
                 }
                 break;
 
+            case "Boolean": {
+                // new Boolean(x) -> Boolean wrapper object
+                // _boolean_new handles ToBoolean + wrapper creation
+                if (args.length > 0) {
+                    this.compileExpression(args[0]);
+                } else {
+                    this.vm.movImm64(VReg.RET, 0x7FF9000000000002n);
+                }
+                this.vm.mov(VReg.A0, VReg.RET);
+                // Ensure proto slot exists in data section
+                this._reEnsureSlot("_nsobj_boolean_proto");
+                this.vm.call("_boolean_new");
+                break;
+            }
+
             case "Float":
             case "Number":
                 // new Float(value) / new Number(value) - 返回 IEEE 754 值 (Float64)
