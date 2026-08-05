@@ -205,7 +205,9 @@ const REGEXP_PROTO_HELPER = {
 // 属性描述符:writable:true, enumerable:false, configurable:true (规范 21.1.3 方法)
 const STRING_PROTO_METHODS = [
     ["toUpperCase", "_str_toUpperCase", 0],
+    ["toLocaleUpperCase", "_str_toUpperCase", 0],
     ["toLowerCase", "_str_toLowerCase", 0],
+    ["toLocaleLowerCase", "_str_toLowerCase", 0],
     ["trim", "_str_trim", 0],
     ["trimStart", "_str_trimStart", 0],
     ["trimEnd", "_str_trimEnd", 0],
