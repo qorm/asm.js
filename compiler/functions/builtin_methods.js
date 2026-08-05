@@ -22,9 +22,11 @@ export const BuiltinMethodCompiler = {
     // 编译 String 方法调用
     // str.toUpperCase(), str.toLowerCase(), str.charAt(i), str.trim() 等
     compileStringMethod(obj, method, args) {
-        // 先编译字符串表达式
+        // 编译接收者并归一化为装箱字符串(处理 String wrapper 对象)
         this.compileExpression(obj);
-        this.vm.push(VReg.RET); // 保存原始字符串
+        this.vm.mov(VReg.A0, VReg.RET);
+        this.vm.call("_valueToStr"); // RET = boxed string (handles 0x7FFD wrappers)
+        this.vm.push(VReg.RET); // 保存归一化后的字符串
 
         switch (method) {
             case "toLocaleUpperCase":
