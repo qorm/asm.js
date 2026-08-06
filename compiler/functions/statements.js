@@ -740,17 +740,35 @@ export const StatementCompiler = {
         } else if (dflt.type === "ClassExpression" || dflt.type === "ClassDeclaration") {
             const rawId = (dflt.id && dflt.id.name) || "";
             isAnon = !rawId || rawId.indexOf("__classexpr") === 0;
+            // ES SetFunctionName: class { static name() {} } 已有显式 name 静态方法,
+            // SetFunctionName 不覆盖(规范 IsSimpleParameterList 路径仍按 hasOwnProperty
+            // 守卫跳过)。此处 AST 级预判:存在 static name 方法 → 跳过。
+            if (isAnon && dflt.body && Array.isArray(dflt.body)) {
+                for (const m of dflt.body) {
+                    if (m && m.static && m.key && (m.key.name === "name" || m.key.value === "name")) {
+                        isAnon = false;
+                        break;
+                    }
+                }
+            }
         }
         if (!isAnon) return;
         const vm = this.vm;
+        // 保存函数/类值到临时槽;后续 _js_box_string / emitBoxedStringKey 均毁 A0
         const tmpSlot = this.ctx.allocLocal(`__destrfnname_${this.nextLabelId()}`);
         vm.store(VReg.FP, tmpSlot, VReg.RET);
-        vm.mov(VReg.A0, VReg.RET);
+        // A2 = boxed 绑定名串(同 compileClassDeclaration 的 classNameForMeta 装箱路径)
+        vm.lea(VReg.A0, this.asm.addString(bindingName));
+        vm.call("_js_box_string");
+        vm.mov(VReg.A2, VReg.RET);
+        // A1 = boxed "name" 键
         this.emitBoxedStringKey("name", VReg.A1);
-        vm.lea(VReg.A2, this.asm.addString(bindingName));
-        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
-        vm.or(VReg.A2, VReg.A2, VReg.V1);
-        vm.call("_closure_prop_set");
+        // A0 = 函数/类对象(从临时槽恢复;emitBoxedStringKey 用 A0 调 addString,已毁)
+        vm.load(VReg.A0, VReg.FP, tmpSlot);
+        // _object_define 可写 classinfo 对象属性表(_closure_prop_set 只写闭包侧表,
+        // classinfo 的 .name 经 _object_get 查找 → 达不到 → cls.name 仍为空串)
+        vm.call("_object_define");
+        // 恢复 RET 为函数/类值
         vm.load(VReg.RET, VReg.FP, tmpSlot);
     },
 
