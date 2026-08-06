@@ -106,6 +106,10 @@ export const SYM_IDS = {
     // 数组结果装箱(map/filter/slice 等返新数组:RET=(RET&PAYLOAD)|ARRAY_TAG)。
     // eval 内数组方法闭包(`[1,2].map(v=>v+1)`)收尾装箱新数组。
     _box_arr_r: 112,
+    // for-of IteratorClose(提前 break/error 时调 iterator.return())
+    _iterator_close: 113,
+    // box_obj_r: RET = (RET & PAYLOAD) | OBJECT_TAG(装箱为 JS 对象)
+    _box_obj_r: 114,
 };
 
 // 宿主可变数据全局:引用它们须运行时取宿主地址(不可内联常量)。见 compileFragment

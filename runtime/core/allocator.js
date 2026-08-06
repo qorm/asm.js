@@ -2543,6 +2543,9 @@ export class AllocatorGenerator {
             "_array_concat",
             // 数组结果装箱(eval 内数组方法闭包收尾装箱新数组)。
             "_box_arr_r",
+            // for-of IteratorClose(提前 break/error 时调 iterator.return())
+            "_iterator_close",
+            "_box_obj_r",
         ];
         vm.label("_engine_symaddr");
         vm.prologue(0, []);
