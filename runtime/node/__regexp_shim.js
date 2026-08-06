@@ -1377,6 +1377,17 @@ export function __RE_new(pattern, flags) {
     if (re.__bad && re.__err !== "") {
         throw new SyntaxError("Invalid regular expression: /" + src + "/: " + re.__err);
     }
+    // Symbol methods on the instance: each regex carries its own Symbol.match,
+    // Symbol.replace, etc. as own properties. These use `this`-based wrappers
+    // that match compileMethodCall's calling convention (this in A5, args in A0+).
+    // Without these, re[Symbol.match](str) would try to look up the Symbol method
+    // through the prototype chain, which fails because regex instances have
+    // Object.prototype (not RegExp.prototype) as their __proto__.
+    re[Symbol.match] = __RE_sym_match_direct;
+    re[Symbol.replace] = __RE_sym_replace_direct;
+    re[Symbol.split] = __RE_sym_split_direct;
+    re[Symbol.search] = __RE_sym_search_direct;
+    re[Symbol.matchAll] = __RE_sym_matchAll_direct;
     return re;
 }
 
@@ -1887,4 +1898,66 @@ export function __RE_split(str, re, limit) {
     }
     out.push(str.slice(last));
     return out;
+}
+
+// ── Symbol method trampolines ─────────────────────────────────────────
+// The _aref_generic trampoline puts `this` (A5) into A0 and shifts user
+// args up by one slot. However, __RE_match(str, re), __RE_search(str, re),
+// __RE_split(str, re, limit), __RE_replace(str, re, repl), and
+// __RE_matchAll(str, re) all expect the string as the first argument --
+// opposite to the (this=regex, args...) order from _aref_generic.
+//
+// These wrappers accept (re, str, ...) matching the _aref_generic convention
+// and internally swap the arguments, so that:
+//   RegExp.prototype[Symbol.match](str)
+//   re[Symbol.replace](str, repl)
+//   etc.
+// work correctly through the _aref_generic + helper trampoline chain.
+
+export function __RE_sym_match(re, str) {
+    return __RE_match(str, re);
+}
+
+export function __RE_sym_search(re, str) {
+    return __RE_search(str, re);
+}
+
+export function __RE_sym_split(re, str, limit) {
+    return __RE_split(str, re, limit);
+}
+
+export function __RE_sym_replace(re, str, repl) {
+    return __RE_replace(str, re, repl);
+}
+
+export function __RE_sym_matchAll(re, str) {
+    return __RE_matchAll(str, re);
+}
+
+// ── Direct-instance Symbol method wrappers ────────────────────────────
+// When a method is stored directly on a regex instance (not via _aref_generic
+// closure on the prototype) and called as re[Symbol.match](str), the compiler's
+// compileMethodCall sets `this` in A5 (receiver) and user args in A0-A4.
+// These wrappers accept `this` as the regex instance and the string as the
+// first argument, matching compileMethodCall's calling convention.
+// They are set on each regex instance in __RE_new via re[Symbol.xxx] = helper.
+
+function __RE_sym_match_direct(str) {
+    return __RE_match(str, this);
+}
+
+function __RE_sym_search_direct(str) {
+    return __RE_search(str, this);
+}
+
+function __RE_sym_split_direct(str, limit) {
+    return __RE_split(str, this, limit);
+}
+
+function __RE_sym_replace_direct(str, repl) {
+    return __RE_replace(str, this, repl);
+}
+
+function __RE_sym_matchAll_direct(str) {
+    return __RE_matchAll(str, this);
 }
