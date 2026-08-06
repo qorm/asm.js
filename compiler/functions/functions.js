@@ -628,19 +628,20 @@ export const FunctionCompiler = {
                 return { arm64: "ARM64Backend", x64: "X64Backend", wasm32: "WasmBackend" }[this.arch] || null;
             }
             const dv = this._devirtClasses[ownerClass];
-            return dv && dv.fieldTypes[fname] ? dv.fieldTypes[fname] : null;
+            return dv && Object.prototype.hasOwnProperty.call(dv.fieldTypes, fname) ? dv.fieldTypes[fname] : null;
         }
         return null;
     },
 
     // 沿继承链解析实例方法(最派生优先,深度上限 20);返回方法标签或 null。
     _devirtResolve(className, methodName) {
+        const hop = Object.prototype.hasOwnProperty;
         let cur = className;
         let depth = 0;
         while (cur && depth < 20) {
             const dv = this._devirtClasses[cur];
             if (!dv) return null;
-            if (dv.methods[methodName]) return dv.methods[methodName];
+            if (hop.call(dv.methods, methodName) && dv.methods[methodName]) return dv.methods[methodName];
             cur = dv.superName;
             depth = depth + 1;
         }
@@ -650,12 +651,13 @@ export const FunctionCompiler = {
     // 推断类的已注册子类(递归)若覆写同名方法则 true——接收者可能是子类实例,
     // 直编基类标签会错调,拒去虚拟化。
     _devirtSubclassOverrides(className, methodName) {
+        const hop = Object.prototype.hasOwnProperty;
         const dv = this._devirtClasses[className];
         if (!dv) return true;
         for (let i = 0; i < dv.subClasses.length; i++) {
             const sdv = this._devirtClasses[dv.subClasses[i]];
             // 预登记表方法值为 null(标签发射期才补)——须按键存在性判定,不能用真值
-            if (sdv && sdv.methods[methodName] !== undefined) return true;
+            if (sdv && hop.call(sdv.methods, methodName)) return true;
             if (sdv && this._devirtSubclassOverrides(dv.subClasses[i], methodName)) return true;
         }
         return false;
