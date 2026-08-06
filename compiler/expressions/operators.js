@@ -372,11 +372,13 @@ export const OperatorCompiler = {
                 leftType === Type.BIGINT || rightType === Type.BIGINT ||
                 leftType === Type.ARRAY || rightType === Type.ARRAY ||
                 leftType === Type.OBJECT || rightType === Type.OBJECT) {
+                // [fix-stack-corrupt] 使用 FP 槽保存左值,避免 push/pop 异常路径栈失衡
                 this.compileExpression(expr.left);
-                this.vm.push(VReg.RET);
+                const tmpSlot = this.ctx.allocLocal("__tmp_add_left");
+                this.vm.store(VReg.FP, tmpSlot, VReg.RET);
                 this.compileExpression(expr.right);
                 this.vm.mov(VReg.A1, VReg.RET);
-                this.vm.pop(VReg.A0);
+                this.vm.load(VReg.A0, VReg.FP, tmpSlot);
                 this.vm.call("_js_add");
                 return;
             }
@@ -1137,13 +1139,14 @@ export const OperatorCompiler = {
         const mightBeNaN = !(numTy(inferType(expr.left, this.ctx)) &&
                              numTy(inferType(expr.right, this.ctx)));
 
-        // 先计算右操作数，保存到栈
+        // [fix-stack-corrupt] 使用 FP 槽保存右值,避免 push/pop 异常路径栈失衡
         compileOperandAsFloat(expr.right);
-        this.vm.push(VReg.RET);
+        const floatTmpSlot = this.ctx.allocLocal("__tmp_float_right");
+        this.vm.store(VReg.FP, floatTmpSlot, VReg.RET);
 
         // 计算左操作数
         compileOperandAsFloat(expr.left);
-        this.vm.pop(VReg.V1);
+        this.vm.load(VReg.V1, VReg.FP, floatTmpSlot);
 
         // 对于算术运算，使用浮点指令
         if (isArithOp) {

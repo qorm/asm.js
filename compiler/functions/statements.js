@@ -2397,6 +2397,12 @@ export const StatementCompiler = {
             // 无限回到自己);本地 jmp 到达时幂等
             this.emitExcCtxRestore(excFrameOff);
 
+            // [fix-stack-corrupt] 本地 jmp exceptionLabel 未恢复 SP:
+            // try 块内 push 未配 pop 就抛异常(如二元表达式求值) → SP 偏移
+            // → 函数返回时读错返回地址 → SIGBUS。从异常帧快照恢复 SP。
+            this.vm.load(VReg.V2, VReg.FP, excFrameOff + 16);
+            this.vm.mov(VReg.SP, VReg.V2);
+
             this.vm.lea(VReg.V0, "_exception_pending");
             this.vm.movImm(VReg.V1, 0);
             this.vm.store(VReg.V0, 0, VReg.V1);
@@ -2435,6 +2441,10 @@ export const StatementCompiler = {
             this.vm.label(finallyExcLabel);
             // [#38] 弹帧(unwind 到达时链头仍指向本帧;本地 jmp 到达时幂等)
             this.emitExcCtxRestore(excFrameOff);
+
+            // [fix-stack-corrupt] 恢复 SP(同 catchLabel)
+            this.vm.load(VReg.V2, VReg.FP, excFrameOff + 16);
+            this.vm.mov(VReg.SP, VReg.V2);
 
             // [#async-finally] 暂存 _exception_pending/exception_value 到 FP 槽并清 pending,
             // 防止 finally 块内的 await 误读残留异常(如 try { await reject() } finally { ... })。
