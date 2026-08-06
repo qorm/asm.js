@@ -232,30 +232,66 @@ export const BuiltinArrayMethodCompiler = {
                 break;
             case "slice":
                 // arr.slice(start, end?)
-                // 注意：start 和 end 应该是整数索引
+                // [species] check this.constructor[Symbol.species]; propagate errors
+                {
+                const _ssFb = this.ctx.newLabel("sl_spec_fb");
+                const _ssEnd = this.ctx.newLabel("sl_spec_done");
+                const _ssRecv = this.ctx.allocLocal(`__sl_spec_r_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, _ssRecv, VReg.RET);
+                this.vm.mov(VReg.A0, VReg.RET);
+                this.vm.call("_array_species_check");
+                this.vm.cmpImm(VReg.RET, 0);
+                this.vm.jne(_ssFb);
+                // fast path: default species
+                this.vm.load(VReg.RET, VReg.FP, _ssRecv);
                 this.vm.push(VReg.RET);
                 if (args.length >= 1) {
                     this.compileExpressionAsInt(args[0]);
-                    this.vm.mov(VReg.A1, VReg.RET); // start (int)
+                    this.vm.mov(VReg.A1, VReg.RET);
                 } else {
                     this.vm.movImm(VReg.A1, 0);
                 }
                 if (args.length >= 2) {
                     this.vm.push(VReg.A1);
                     this.compileExpressionAsInt(args[1]);
-                    this.vm.mov(VReg.A2, VReg.RET); // end (int)
+                    this.vm.mov(VReg.A2, VReg.RET);
                     this.vm.pop(VReg.A1);
                 } else {
-                    this.vm.movImm(VReg.A2, 2147483647); // -1 表示到末尾
+                    this.vm.movImm(VReg.A2, 2147483647);
                 }
                 this.vm.pop(VReg.A0);
-                // unbox JSValue 得到裸指针
                 this.vm.call("_js_unbox");
                 this.vm.mov(VReg.A0, VReg.RET);
                 this.vm.call("_array_slice");
-                // 装箱返回值为 JSValue 数组
-                // JSValue = (ptr & 0x0000ffffffffffff) | 0x7ffe000000000000
-                this.vm.call("_box_arr_r"); // box->helper
+                this.vm.call("_box_arr_r");
+                this.vm.jmp(_ssEnd);
+                // fallback: non-default species
+                this.vm.label(_ssFb);
+                this.vm.load(VReg.A0, VReg.FP, _ssRecv);
+                if (args.length >= 2) {
+                    this.compileExpression(args[0]);
+                    this.vm.mov(VReg.A1, VReg.RET);
+                    this.vm.push(VReg.A1);
+                    this.compileExpression(args[1]);
+                    this.vm.mov(VReg.A2, VReg.RET);
+                    this.vm.pop(VReg.A1);
+                } else if (args.length >= 1) {
+                    this.compileExpression(args[0]);
+                    this.vm.mov(VReg.A1, VReg.RET);
+                    this.vm.movImm(VReg.A2, 2147483647);
+                    this.vm.scvtf(0, VReg.A2);
+                    this.vm.fmovToInt(VReg.A2, 0);
+                } else {
+                    this.vm.movImm(VReg.A1, 0);
+                    this.vm.scvtf(0, VReg.A1);
+                    this.vm.fmovToInt(VReg.A1, 0);
+                    this.vm.movImm(VReg.A2, 2147483647);
+                    this.vm.scvtf(0, VReg.A2);
+                    this.vm.fmovToInt(VReg.A2, 0);
+                }
+                this.vm.call("_agen_slice");
+                this.vm.label(_ssEnd);
+                }
                 break;
             case "indexOf":
                 // arr.indexOf(value, fromIndex?)

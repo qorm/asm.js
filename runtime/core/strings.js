@@ -28,6 +28,7 @@ export const RUNTIME_STRINGS = {
     comma: { label: "_str_comma", value: ", " },
     commaOnly: { label: "_str_comma_only", value: "," },
     lengthProp: { label: "_str_length_prop", value: "length" },
+    constructorProp: { label: "_str_constructor_prop", value: "constructor" },
     quote: { label: "_str_quote", value: "'" },
 
     // typeof 运算符返回值

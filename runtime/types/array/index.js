@@ -3042,6 +3042,7 @@ export class ArrayGenerator {
         this.generateArrayIteratorNext();
         this.generateArrayLikeCopy();
         this.generateGetThis();
+        this.generateArraySpeciesCheck();
     }
 
     // 一等数组迭代器(`arr.values()`/`.keys()`/`.entries()`/`arr[Symbol.iterator]()`)。
@@ -3293,4 +3294,46 @@ export class ArrayGenerator {
         vm.epilogue([], 0);
     }
 
+
+    // _array_species_check(A0=recv boxed) -> 0 (default) / 1 (non-default species)
+    generateArraySpeciesCheck() {
+        const vm = this.vm;
+        vm.label("_array_species_check");
+        vm.prologue(32, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.lea(VReg.A1, "_str_constructor_prop");
+        vm.movImm64(VReg.V0, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V0);
+        vm.call("_object_get");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.shrImm(VReg.V0, VReg.S1, 48);
+        vm.cmpImm(VReg.V0, 0x7FFA);
+        vm.jeq("_asc_default");
+        vm.cmpImm(VReg.V0, 0x7FFB);
+        vm.jeq("_asc_default");
+        vm.cmpImm(VReg.S1, 0);
+        vm.jeq("_asc_default");
+        vm.lea(VReg.A0, "_symwk_species");
+        vm.lea(VReg.A1, vm.asm.addString("Symbol.species"));
+        vm.movImm64(VReg.V0, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V0);
+        vm.call("_symbol_wellknown");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.movImm64(VReg.V0, 0x7ffd000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V0);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_object_get");
+        vm.shrImm(VReg.V0, VReg.RET, 48);
+        vm.cmpImm(VReg.V0, 0x7FFA);
+        vm.jeq("_asc_default");
+        vm.cmpImm(VReg.V0, 0x7FFB);
+        vm.jeq("_asc_default");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_asc_default");
+        vm.movImm(VReg.RET, 1);
+        vm.epilogue([VReg.S0, VReg.S1], 32);
+        vm.label("_asc_default");
+        vm.movImm(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1], 32);
+    }
 }
