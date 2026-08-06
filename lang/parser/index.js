@@ -114,6 +114,14 @@ export class Parser {
         this.prefixParseFns[TokenType.AS] = () => new AST.Identifier(this.curToken.literal);
         this.prefixParseFns[TokenType.OF] = () => new AST.Identifier(this.curToken.literal);
         this.prefixParseFns[TokenType.EXTENDS] = () => new AST.Identifier(this.curToken.literal);
+        // [test262 ASI] sloppy-mode `let` as expression identifier
+        this.prefixParseFns[TokenType.LET] = () => {
+            if (this.inStrictMode()) {
+                this.errors.push("Unexpected token 'let' in strict mode");
+                return null;
+            }
+            return new AST.Identifier(this.curToken.literal);
+        };
         this.prefixParseFns[TokenType.TEMPLATE_MIDDLE] = () => {
             this.errors.push(`unexpected TEMPLATE_MIDDLE at ${this.curToken.line}:${this.curToken.column}`);
             return null;

@@ -106,6 +106,9 @@ const UNSUPPORTED_FEATURES = new Set([
   // Stage-2/3 proposals not implemented: keyed promise combinators
   // (Promise.allKeyed / allSettledKeyed / raceKeyed / anyKeyed).
   "await-dictionary",
+  // BigInt: arbitrary-precision integers (BigInt64Array, BigUint64Array, 2n literals, etc.)
+  // are not implemented in asm.js.
+  "BigInt",
 ]);
 
 // Dirs excluded wholesale regardless of selection (internationalization &

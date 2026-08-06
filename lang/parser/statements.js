@@ -60,6 +60,13 @@ export const StatementParser = {
             // for 循环头的 `;` 由 parseForStatement 单独消费,不经此路径。
             return new AST.EmptyStatement();
         } else if (this.curTokenIs(TokenType.LET) || this.curTokenIs(TokenType.CONST) || this.curTokenIs(TokenType.VAR) || this.curTokenIs(TokenType.INT_TYPE)) {
+            // [test262 ASI] sloppy-mode `let` followed by any token on a new line is ASI:
+            // `let` becomes an expression identifier, not a declaration keyword.
+            // Covers: `L: let\\n{}`, `for(;;) let\\nx=1`, `if(x) let\\nx=1`, `with(o) let\\nx=1`.
+            if (this.curTokenIs(TokenType.LET) && !this.inStrictMode() &&
+                this.peekToken.line !== this.curToken.line) {
+                return this.parseExpressionStatement();
+            }
             const decl = this.parseVariableDeclaration();
             // [test262 S1 早期错误] 语句级 const 必须带初值(for-of/in 的 const 无初值合法,
             // 走 parseForStatement 直调 parseVariableDeclaration,不经此路径,无误拒)。
