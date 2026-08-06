@@ -53,7 +53,10 @@ export const ClassParser = {
             }
             if (!this.expectPeek(TokenType.LBRACE)) return null;
         }
+        const prevClassHasSuper = this._classHasSuper;
+        this._classHasSuper = superClass !== null;
         let body = this.parseClassBody();
+        this._classHasSuper = prevClassHasSuper;
         return new AST.ClassDeclaration(id, superClass, body);
     },
 
@@ -86,6 +89,20 @@ export const ClassParser = {
                 body.push(member);
             }
             this.nextToken();
+        }
+        // [test262 早期错误] 重复构造器:一个 ClassBody 最多一个 ConstructorMethod
+        // (非 static、名为 "constructor" 的 MethodDefinition,不含 static constructor 方法)。
+        {
+            let ctorCount = 0;
+            for (let i = 0; i < body.length; i++) {
+                const m = body[i];
+                if (m && m.type === "MethodDefinition" && m.kind === "constructor" && !m.static) {
+                    ctorCount++;
+                }
+            }
+            if (ctorCount > 1) {
+                this.errors.push("A class may only have one constructor");
+            }
         }
         this._checkDuplicatePrivateNames(this._curPrivateNames);
         if (depth === 1) {
@@ -163,7 +180,10 @@ export const ClassParser = {
             this.nextToken();
             // [ES2022] 静态初始化块 static { ... }:static 后紧跟 `{`(非方法名/字段)。
             if (this.curTokenIs(TokenType.LBRACE)) {
+                // [test262 早期错误] static {} 内 new.target 合法:fnDepth 供上下文校验
+                this.fnDepth++;
                 const block = this.parseBlockStatement();
+                this.fnDepth--;
                 return new AST.StaticBlock(block ? block.body : []);
             }
         }
@@ -248,6 +268,8 @@ export const ClassParser = {
             return this.parseClassField(isStatic, false, key, computed);
         }
         this.nextToken(); // curToken = `(`
+        // [test262 S1] 类方法体开始:供 new.target 上下文校验
+        this.fnDepth++;
         // [test262 S1] 类方法生成器/异步深度:覆盖形参 + 体内 var 的 yield/await 早期错误校验
         if (isGenerator) this.fnGenDepth++;
         if (isAsyncMethod) this.fnAsyncDepth++;
@@ -268,6 +290,7 @@ export const ClassParser = {
             this.errors.push("setter must have exactly one formal parameter");
         }
         if (!this.expectPeek(TokenType.LBRACE)) {
+            this.fnDepth--;
             if (isGenerator) this.fnGenDepth--;
             if (isAsyncMethod) this.fnAsyncDepth--;
             this._immediateGen = prevImmediateGen;
@@ -281,10 +304,17 @@ export const ClassParser = {
         // [test262 早期错误 C] 类体隐式 strict(classDepth>0):方法形参不可重名/eval/arguments,
         // 即使方法体无自有 "use strict" 指令。
         this.checkInheritedStrictParams(params, isStrict);
+        // [test262 早期错误] super() 调用只能在派生 class 的 constructor 内
+        const prevInDerivedCtor = this._inDerivedConstructor;
+        if (kind === "constructor" && !isStatic && this._classHasSuper) {
+            this._inDerivedConstructor = true;
+        }
         let methodBody = this.parseBlockStatement();
+        this._inDerivedConstructor = prevInDerivedCtor;
         if (isStrict) this.fnStrictDepth--;
         if (isGenerator) this.fnGenDepth--;
         if (isAsyncMethod) this.fnAsyncDepth--;
+        this.fnDepth--;
         this._immediateGen = prevImmediateGen;
         this._immediateAsync = prevImmediateAsync;
         this._inFieldInit = prevInFieldInit;
@@ -384,6 +414,8 @@ export const ClassParser = {
             // [W-P9] 私有生成器/异步方法同样计入 yield/await 深度(与公共方法路径一致)。
             const prevInFieldInit = this._inFieldInit;
             this._inFieldInit = false;
+            // [test262 早期错误] 私有方法内 new.target 合法:fnDepth 供上下文校验
+            this.fnDepth++;
             if (isGenerator) this.fnGenDepth++;
             if (isAsyncMethod) this.fnAsyncDepth++;
             // 紧邻包围函数生成器/异步标志
@@ -393,6 +425,7 @@ export const ClassParser = {
             this._immediateAsync = isAsyncMethod;
             let params = this.parseFunctionParams();
             if (!this.expectPeek(TokenType.LBRACE)) {
+                this.fnDepth--;
                 if (isGenerator) this.fnGenDepth--;
                 if (isAsyncMethod) this.fnAsyncDepth--;
                 this._immediateGen = prevImmediateGenP;
@@ -403,6 +436,7 @@ export const ClassParser = {
             let methodBody = this.parseBlockStatement();
             if (isGenerator) this.fnGenDepth--;
             if (isAsyncMethod) this.fnAsyncDepth--;
+            this.fnDepth--;
             this._immediateGen = prevImmediateGenP;
             this._immediateAsync = prevImmediateAsyncP;
             this._inFieldInit = prevInFieldInit;

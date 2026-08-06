@@ -20,6 +20,9 @@ export class Parser {
         this.errors = [];
         // 类体嵌套深度：#x 私有成员访问仅在类体内合法（>0），类外 obj.#x 报语法错
         this.classDepth = 0;
+        // [test262 S1] 函数嵌套深度(任意函数:声明/表达式/箭头/类方法):供 new.target/super 等
+        // 元属性上下文校验。函数入口 +1、出口 -1。
+        this.fnDepth = 0;
         // [test262 S1] 生成器/异步函数嵌套深度:yield/await 作绑定标识符(形参/var 名)仅在相应
         // 函数体内是早期错误(作 yield/await 表达式合法)。函数入口 +1、出口 -1。
         this.fnGenDepth = 0;
@@ -50,6 +53,11 @@ export class Parser {
         // [Wave 8 续] tagged 模板深度:tag`…` / String.raw`…` 不校验转义序列(raw 原样保留),
         // 裸模板(未 tagged)校验非法转义(legacy 八进制/坏 \u \x)。
         this._taggedTemplate = 0;
+        // [test262 标签重复] 函数内 label 集(按函数域隔离:进入/离开函数时保存/恢复)
+        this._usedLabels = new Set();
+        // [test262 早期错误] 循环/switch 深度:break/continue 必须位于对应上下文中。
+        this.loopDepth = 0;
+        this.switchDepth = 0;
 
         this.prefixParseFns = {};
         this.infixParseFns = {};

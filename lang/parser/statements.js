@@ -146,7 +146,13 @@ export const StatementParser = {
     },
 
     parseLabeledStatement() {
-        let label = new AST.Identifier(this.curToken.literal);
+        // [test262 标签重复] 同函数内不得有同名 label(SyntaxError)。
+        const name = this.curToken.literal;
+        if (this._usedLabels.has(name)) {
+            this.errors.push("Label '" + name + "' has already been declared");
+        }
+        this._usedLabels.add(name);
+        let label = new AST.Identifier(name);
         this.nextToken(); // 越过标识符，当前为 ':'
         this.nextToken(); // 越过 ':'，当前为被标注语句的首 token
         let body = this.parseStatement();
@@ -227,8 +233,11 @@ export const StatementParser = {
         const prevInFormal = this._inFormalParams;
         this._inFieldInit = false;
         this._inFormalParams = false;
+        // [test262 S1] 函数体开始:供 new.target 上下文校验
+        this.fnDepth++;
         let params = this.parseFunctionParams();
         if (!this.expectPeek(TokenType.LBRACE)) {
+            this.fnDepth--;
             if (isGenerator) this.fnGenDepth--;
             if (isAsync) this.fnAsyncDepth--;
             this._immediateGen = prevImmediateGen;
@@ -241,10 +250,15 @@ export const StatementParser = {
         let isStrict = this.peekUseStrictDirective();
         if (isStrict) { this.fnStrictDepth++; this.checkStrictParams(params); }
         this.checkInheritedStrictParams(params, isStrict);   // [test262 早期错误 C] 继承 strict 重参
+        // [test262 标签重复] 标签按函数作用域隔离:保存外层集、入体前换新集
+        const prevLabels = this._usedLabels;
+        this._usedLabels = new Set();
         let body = this.parseBlockStatement();
+        this._usedLabels = prevLabels;
         if (isStrict) this.fnStrictDepth--;
         if (isGenerator) this.fnGenDepth--;
         if (isAsync) this.fnAsyncDepth--;
+        this.fnDepth--;
         this._immediateGen = prevImmediateGen;
         this._immediateAsync = prevImmediateAsync;
         this._inFieldInit = prevInFieldInit;
@@ -570,7 +584,9 @@ export const StatementParser = {
                 let right = this.parseExpression(Precedence.LOWEST);
                 if (!this.expectPeek(TokenType.RPAREN)) return null;
                 this.nextToken();
+                this.loopDepth++;
                 let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
+                this.loopDepth--;
                 return new AST.ForInStatement(init, right, body);
             }
             init = this.parseVariableDeclaration();
@@ -580,7 +596,9 @@ export const StatementParser = {
                 let right = this.parseExpression(Precedence.LOWEST);
                 if (!this.expectPeek(TokenType.RPAREN)) return null;
                 this.nextToken();
+                this.loopDepth++;
                 let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
+                this.loopDepth--;
                 return new AST.ForInStatement(init, right, body);
             }
             if (this.peekTokenIs(TokenType.OF)) {
@@ -589,7 +607,9 @@ export const StatementParser = {
                 let right = this.parseExpression(Precedence.LOWEST);
                 if (!this.expectPeek(TokenType.RPAREN)) return null;
                 this.nextToken();
+                this.loopDepth++;
                 let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
+                this.loopDepth--;
                 return new AST.ForOfStatement(init, right, body, isAwait);
             }
         } else if (!this.curTokenIs(TokenType.SEMICOLON)) {
@@ -606,7 +626,9 @@ export const StatementParser = {
                 let right = this.parseExpression(Precedence.LOWEST);
                 if (!this.expectPeek(TokenType.RPAREN)) return null;
                 this.nextToken();
+                this.loopDepth++;
                 let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
+                this.loopDepth--;
                 return new AST.ForOfStatement(init, right, body, isAwait);
             }
             if (init && init.type === "BinaryExpression" && init.operator === "in" &&
@@ -618,7 +640,9 @@ export const StatementParser = {
                 this.checkPatternTargets(left);   // [test262 S1] 同 for-of:头部左值只拒逗号序列
                 if (!this.expectPeek(TokenType.RPAREN)) return null;   // 移到 )
                 this.nextToken();   // 移到 body
+                this.loopDepth++;
                 let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
+                this.loopDepth--;
                 return new AST.ForInStatement(left, right, body);
             }
         }
@@ -647,7 +671,9 @@ export const StatementParser = {
             if (!this.expectPeek(TokenType.RPAREN)) return null;
         }
         this.nextToken();
+        this.loopDepth++;
         let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
+        this.loopDepth--;
         return new AST.ForStatement(init, test, update, body);
     },
 
@@ -657,12 +683,18 @@ export const StatementParser = {
         let test = this.parseExpression(Precedence.LOWEST);
         if (!this.expectPeek(TokenType.RPAREN)) return null;
         this.nextToken();
+        this.loopDepth++;
         let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
+        this.loopDepth--;
         return new AST.WhileStatement(test, body);
     },
 
     parseWithStatement() {
         // `with` 是保留字,词法当 IDENT;语句首 `with (` 唯一解为 with 语句(非调用)。
+        // [test262 早期错误] strict 模式下 with 语句是 SyntaxError。
+        if (this.inStrictMode()) {
+            this.errors.push("'with' statement is not allowed in strict mode");
+        }
         if (!this.expectPeek(TokenType.LPAREN)) return null;
         this.nextToken();
         let object = this.parseExpression(Precedence.LOWEST);
@@ -674,7 +706,9 @@ export const StatementParser = {
 
     parseDoWhileStatement() {
         this.nextToken();
+        this.loopDepth++;
         let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
+        this.loopDepth--;
         if (!this.expectPeek(TokenType.WHILE)) return null;
         if (!this.expectPeek(TokenType.LPAREN)) return null;
         this.nextToken();
@@ -690,6 +724,7 @@ export const StatementParser = {
         let discriminant = this.parseExpression(Precedence.LOWEST);
         if (!this.expectPeek(TokenType.RPAREN)) return null;
         if (!this.expectPeek(TokenType.LBRACE)) return null;
+        this.switchDepth++;
         let cases = [];
         this.nextToken();
         while (!this.curTokenIs(TokenType.RBRACE) && !this.curTokenIs(TokenType.EOF)) {
@@ -711,6 +746,7 @@ export const StatementParser = {
             }
             cases.push(new AST.SwitchCase(test, consequent));
         }
+        this.switchDepth--;
         return new AST.SwitchStatement(discriminant, cases);
     },
 
@@ -719,6 +755,11 @@ export const StatementParser = {
         if (this.peekTokenIs(TokenType.IDENT)) {
             this.nextToken();
             label = new AST.Identifier(this.curToken.literal);
+        } else {
+            // [test262 早期错误] break(无标签)必须在循环或 switch 内部。
+            if (this.loopDepth === 0 && this.switchDepth === 0) {
+                this.errors.push("Illegal break statement");
+            }
         }
         if (this.peekTokenIs(TokenType.SEMICOLON)) this.nextToken();
         return new AST.BreakStatement(label);
@@ -729,6 +770,11 @@ export const StatementParser = {
         if (this.peekTokenIs(TokenType.IDENT)) {
             this.nextToken();
             label = new AST.Identifier(this.curToken.literal);
+        } else {
+            // [test262 早期错误] continue(无标签)必须在循环内部(switch 内不可)。
+            if (this.loopDepth === 0) {
+                this.errors.push("Illegal continue statement");
+            }
         }
         if (this.peekTokenIs(TokenType.SEMICOLON)) this.nextToken();
         return new AST.ContinueStatement(label);

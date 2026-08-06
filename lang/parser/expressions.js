@@ -86,6 +86,14 @@ export const ExpressionParser = {
             (raw.charAt(1) === "x" || raw.charAt(1) === "X" ||
              raw.charAt(1) === "o" || raw.charAt(1) === "O" ||
              raw.charAt(1) === "b" || raw.charAt(1) === "B");
+        // [test262 早期错误] strict 模式下 legacy 八进制字面量(0 后跟 0-7)是 SyntaxError。
+        // 0x/0b/0o 的显式进制和 0.5/0e5 的浮点不受此限;08/09 亦不受(ES 规范)。
+        if (this.inStrictMode() && !isRadix &&
+            !raw.includes(".") && !raw.includes("e") && !raw.includes("E") &&
+            raw.length > 1 && raw.charAt(0) === "0" &&
+            raw.charAt(1) >= "0" && raw.charAt(1) <= "7") {
+            this.errors.push("Octal literals are not allowed in strict mode");
+        }
         if (!isRadix && (raw.includes(".") || raw.includes("e") || raw.includes("E"))) {
             return new AST.Literal(parseFloat(raw), raw);
         } else {
@@ -516,6 +524,11 @@ export const ExpressionParser = {
             this.errors.push("Invalid destructuring assignment target");
             return;
         }
+        // 合法的模式目标:Identifier(绑定名)、MemberExpression(仅赋值上下文)、
+        // AssignmentPattern(默认值)、嵌套 pattern、SpreadElement。
+        if (t === "Identifier" || t === "MemberExpression" || t === "AssignmentPattern") {
+            return;
+        }
         if (t === "ArrayExpression" || t === "ArrayPattern") {
             const els = node.elements;
             if (!els) return;
@@ -535,6 +548,8 @@ export const ExpressionParser = {
         }
         if (t === "SpreadElement") { this.checkPatternTargets(node.argument); return; }
         if (t === "AssignmentExpression" || t === "AssignmentPattern") { this.checkPatternTargets(node.left); return; }
+        // Literal/ThisExpression/SuperExpression/CallExpression 等永不可作模式目标
+        this.errors.push("Invalid destructuring assignment target");
     },
 
     parseAssignmentExpression(left) {
@@ -678,6 +693,10 @@ export const ExpressionParser = {
 
     parseArrowFunctionBody(params) {
         this.nextToken();
+        // [test262 S1] 箭头函数体开始:供 new.target 上下文校验
+        this.fnDepth++;
+        const prevLabelsArrow = this._usedLabels;
+        this._usedLabels = new Set();
         let body,
             isExpression = false;
         if (this.curTokenIs(TokenType.LBRACE)) {
@@ -701,6 +720,8 @@ export const ExpressionParser = {
             body = this.parseExpression(Precedence.COMMA);
             isExpression = true;
         }
+        this.fnDepth--;
+        this._usedLabels = prevLabelsArrow;
         return new AST.ArrowFunctionExpression(params, body, false, isExpression);
     },
 
@@ -1138,6 +1159,8 @@ export const ExpressionParser = {
             isGenerator = true;
             this.nextToken();
         }
+        // [test262 S1] 函数体开始:供 new.target 上下文校验
+        this.fnDepth++;
         // [test262 S1] 生成器深度:yield 作绑定名在此函数体内是早期错误(所有返回路径须配对减)
         if (isGenerator) this.fnGenDepth++;
         // 紧邻包围函数生成器标志(function expression 永不是 async,async 由 parseAsyncExpression 管)
@@ -1157,29 +1180,37 @@ export const ExpressionParser = {
             this.nextToken();
             this.checkReservedBinding(this.curToken.literal);   // [test262 早期错误 A] 函数名保留字
             let id = new AST.Identifier(this.curToken.literal);
-            if (!this.expectPeek(TokenType.LPAREN)) { if (isGenerator) this.fnGenDepth--; this._immediateGen = prevImmediateGen; this._inFieldInit = prevInFieldInit; this._inFormalParams = prevInFormalFE; return null; }
+            if (!this.expectPeek(TokenType.LPAREN)) { this.fnDepth--; if (isGenerator) this.fnGenDepth--; this._immediateGen = prevImmediateGen; this._inFieldInit = prevInFieldInit; this._inFormalParams = prevInFormalFE; return null; }
             let params = this.parseFunctionParams();
-            if (!this.expectPeek(TokenType.LBRACE)) { if (isGenerator) this.fnGenDepth--; this._immediateGen = prevImmediateGen; this._inFieldInit = prevInFieldInit; this._inFormalParams = prevInFormalFE; return null; }
+            if (!this.expectPeek(TokenType.LBRACE)) { this.fnDepth--; if (isGenerator) this.fnGenDepth--; this._immediateGen = prevImmediateGen; this._inFieldInit = prevInFieldInit; this._inFormalParams = prevInFormalFE; return null; }
             let isStrict = this.peekUseStrictDirective();
             if (isStrict) { this.fnStrictDepth++; this.checkStrictParams(params); }
             this.checkInheritedStrictParams(params, isStrict);   // [test262 早期错误 C] 继承 strict 重参
+            const prevLabelsFE1 = this._usedLabels;
+            this._usedLabels = new Set();
             let body = this.parseBlockStatement();
+            this._usedLabels = prevLabelsFE1;
             if (isStrict) this.fnStrictDepth--;
             if (isGenerator) this.fnGenDepth--;
+            this.fnDepth--;
             this._immediateGen = prevImmediateGen;
             this._inFieldInit = prevInFieldInit;
             this._inFormalParams = prevInFormalFE;
             return new AST.FunctionExpression(id, params, body, isAsync, isGenerator);
         }
-        if (!this.expectPeek(TokenType.LPAREN)) { if (isGenerator) this.fnGenDepth--; this._immediateGen = prevImmediateGen; this._inFieldInit = prevInFieldInit; this._inFormalParams = prevInFormalFE; return null; }
+        if (!this.expectPeek(TokenType.LPAREN)) { this.fnDepth--; if (isGenerator) this.fnGenDepth--; this._immediateGen = prevImmediateGen; this._inFieldInit = prevInFieldInit; this._inFormalParams = prevInFormalFE; return null; }
         let params = this.parseFunctionParams();
-        if (!this.expectPeek(TokenType.LBRACE)) { if (isGenerator) this.fnGenDepth--; this._immediateGen = prevImmediateGen; this._inFieldInit = prevInFieldInit; this._inFormalParams = prevInFormalFE; return null; }
+        if (!this.expectPeek(TokenType.LBRACE)) { this.fnDepth--; if (isGenerator) this.fnGenDepth--; this._immediateGen = prevImmediateGen; this._inFieldInit = prevInFieldInit; this._inFormalParams = prevInFormalFE; return null; }
         let isStrict = this.peekUseStrictDirective();
         if (isStrict) { this.fnStrictDepth++; this.checkStrictParams(params); }
         this.checkInheritedStrictParams(params, isStrict);   // [test262 早期错误 C] 继承 strict 重参
+        const prevLabelsFE2 = this._usedLabels;
+        this._usedLabels = new Set();
         let body = this.parseBlockStatement();
+        this._usedLabels = prevLabelsFE2;
         if (isStrict) this.fnStrictDepth--;
         if (isGenerator) this.fnGenDepth--;
+        this.fnDepth--;
         this._immediateGen = prevImmediateGen;
         this._inFieldInit = prevInFieldInit;
         this._inFormalParams = prevInFormalFE;
@@ -1233,6 +1264,12 @@ export const ExpressionParser = {
     },
 
     parseSuperExpression() {
+        // [test262 早期错误] super 只能在类体或对象字面量方法中使用;其他位置(classDepth===0
+        // 且非对象方法上下文)为语法错误。类体隐式 strict(classDepth>0)内 super 合法。
+        // 对象字面量方法内 super.prop 也合法,但当前编译器暂不支持(仅类方法放行)。
+        if (this.classDepth === 0) {
+            this.errors.push(`'super' keyword is only valid inside a class method or constructor at line ${this.curToken.line}:${this.curToken.column}`);
+        }
         // [Wave 8] 字段初始化器 ContainsSuperCall:init 上下文(穿透箭头)内 `super(...)`
         // 是早期错误;`super.prop` 属性访问合法(Node 对拍)。函数边界已复位 _inFieldInit。
         if (this._inFieldInit && this.peekTokenIs(TokenType.LPAREN)) {
@@ -1254,6 +1291,11 @@ export const ExpressionParser = {
             this.nextToken(); // 到 .
             if (!this.expectPeek(TokenType.IDENT)) return null;
             let property = new AST.Identifier(this.curToken.literal); // "target"
+            // [test262 早期错误] new.target 只能在函数体内出现;全局代码/类外部非法。
+            // 类方法内合法(方法体解析时 fnDepth>0)。
+            if (this.fnDepth === 0) {
+                this.errors.push(`'new.target' is only valid inside a function body at line ${this.curToken.line}:${this.curToken.column}`);
+            }
             return new AST.MetaProperty(meta, property);
         }
         this.nextToken();
@@ -1271,6 +1313,10 @@ export const ExpressionParser = {
     },
 
     parseCallExpression(callee) {
+        // [test262 早期错误] super() 调用只能在派生 class 的 constructor 内
+        if (callee && callee.type === "SuperExpression" && !this._inDerivedConstructor) {
+            this.errors.push(`super() is only valid in a derived class constructor at line ${this.curToken.line}:${this.curToken.column}`);
+        }
         return new AST.CallExpression(callee, this.parseCallArguments());
     },
 
@@ -1305,6 +1351,17 @@ export const ExpressionParser = {
 
     parseMemberExpression(object) {
         this.nextToken();
+        // [test262 早期错误] `.` 后必须为 IdentifierName(标识符或关键字),字符串/数字等非法。
+        // 合法的 IdentifierName token:IDENT 及所有关键字类型;非法的:STRING/INT/FLOAT/REGEX/
+        // 模板字面量及 ILLEGAL。
+        if (this.curTokenIs(TokenType.STRING) || this.curTokenIs(TokenType.INT) ||
+            this.curTokenIs(TokenType.FLOAT) || this.curTokenIs(TokenType.BIGINT) ||
+            this.curTokenIs(TokenType.REGEX) || this.curTokenIs(TokenType.TEMPLATE_STRING) ||
+            this.curTokenIs(TokenType.TEMPLATE_HEAD) || this.curTokenIs(TokenType.TEMPLATE_TAIL) ||
+            this.curTokenIs(TokenType.TEMPLATE_MIDDLE)) {
+            this.errors.push(`Invalid token after '.' — expected identifier name at line ${this.curToken.line}:${this.curToken.column}`);
+            return null;
+        }
         // 支持私有字段访问 obj.#field（仅类体内合法，类外是语法错误）
         if (this.curTokenIs(TokenType.HASH) || (this.curToken.literal && this.curToken.literal.startsWith("#"))) {
             let name = this.curToken.literal;
