@@ -146,9 +146,9 @@ export const StatementParser = {
     },
 
     parseLabeledStatement() {
-        // [test262 标签重复] 同函数内不得有同名 label(SyntaxError)。
+        // [test262 标签重复] 同函数内不得有同名 label,但 Annex B 允许 sloppy 下重复。
         const name = this.curToken.literal;
-        if (this._usedLabels.has(name)) {
+        if (this.inStrictMode() && this._usedLabels.has(name)) {
             this.errors.push("Label '" + name + "' has already been declared");
         }
         this._usedLabels.add(name);
@@ -375,7 +375,7 @@ export const StatementParser = {
     checkStrictParamNames(params) {
         const names = [];
         for (const p of (params || [])) this.collectParamNames(p, names);
-        const seen = {};
+        const seen = Object.create(null);
         for (const n of names) {
             if (n === "eval" || n === "arguments") {
                 this.errors.push("Cannot use '" + n + "' as a parameter name in strict mode");
@@ -439,7 +439,7 @@ export const StatementParser = {
             if (simple) return;
             const names = [];
             for (const p of params) this.collectParamNames(p, names);
-            const seen = {};
+            const seen = Object.create(null);
             for (const n of names) {
                 if (seen[n]) this.errors.push("Duplicate parameter name '" + n + "' not allowed in function with default parameter values");
                 seen[n] = true;
