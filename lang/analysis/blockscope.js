@@ -330,6 +330,73 @@ function bsWalkSwitch(node, st) {
         const cons = cases[i].consequent || [];
         for (let j = 0; j < cons.length; j++) all.push(cons[j]);
     }
+    // [test262 S1] switch 块内重复词法声明早期错误检查:
+    // SwitchStatement : switch ( Expression ) CaseBlock 中,
+    //   (a) LexicallyDeclaredNames(CaseBlock) 不得含重复项;
+    //   (b) LexicallyDeclaredNames(CaseBlock) 与 VarDeclaredNames(CaseBlock) 不得有交集。
+    (function checkSwitchRedecl() {
+        const lexNames = {}; // let/const/class/function/async/gen/async-gen 声明
+        const varNames = {}; // var 声明
+        function collect(n) {
+            if (!n || typeof n !== "object") return;
+            if (Array.isArray(n)) { for (let i = 0; i < n.length; i++) collect(n[i]); return; }
+            if (n.type === "FunctionDeclaration" || n.type === "ClassDeclaration") {
+                if (n.id && n.id.type === "Identifier" && bsRenameable(n.id.name)) {
+                    const nm = n.id.name;
+                    // 函数/类声明计入词法声明集,若与已有词法声明重复 → SyntaxError (a)
+                    if (lexNames[nm]) {
+                        throw new Error("SyntaxError: Identifier '" + nm + "' has already been declared");
+                    }
+                    lexNames[nm] = 1;
+                    // 函数声明同时也产生 var 级绑定:若该名已在 var 集先登记 → 冲突 (b)
+                    if (varNames[nm]) {
+                        throw new Error("SyntaxError: Identifier '" + nm + "' has already been declared");
+                    }
+                }
+                return;
+            }
+            if (n.type === "VariableDeclaration") {
+                const kind = n.kind;
+                const isLex = (kind === "let" || kind === "const");
+                const isVar = (kind === "var");
+                if (!isLex && !isVar) return;
+                const decls = n.declarations || [];
+                for (let i = 0; i < decls.length; i++) {
+                    const ids = [];
+                    bsPatternIdents(decls[i].id, ids);
+                    for (let k = 0; k < ids.length; k++) {
+                        const nm = ids[k].name;
+                        if (!bsRenameable(nm)) continue;
+                        if (isLex) {
+                            // 词法声明:与已有词法声明重复 → SyntaxError (a)
+                            if (lexNames[nm]) {
+                                throw new Error("SyntaxError: Identifier '" + nm + "' has already been declared");
+                            }
+                            // 词法声明与已有 var 声明冲突 → SyntaxError (b)
+                            if (varNames[nm]) {
+                                throw new Error("SyntaxError: Identifier '" + nm + "' has already been declared");
+                            }
+                            lexNames[nm] = 1;
+                        } else {
+                            // var 声明:记入 var 集,若该名已在词法集先登记 → 冲突 (b)
+                            if (lexNames[nm]) {
+                                throw new Error("SyntaxError: Identifier '" + nm + "' has already been declared");
+                            }
+                            varNames[nm] = 1;
+                        }
+                    }
+                }
+                return;
+            }
+            // 不递归深入嵌套块:规范 LexicallyDeclaredNames/VarDeclaredNames 仅含直辖声明
+            if (n.type === "BlockStatement" || n.type === "SwitchStatement" ||
+                n.type === "ForStatement" || n.type === "ForInStatement" || n.type === "ForOfStatement" ||
+                n.type === "WhileStatement" || n.type === "DoWhileStatement" ||
+                n.type === "IfStatement" || n.type === "TryStatement") return;
+            for (const k in n) { const v = n[k]; if (v && typeof v === "object") collect(v); }
+        }
+        collect(all);
+    })();
     bsPrescanLets(node, all, st, frame);
     for (let i = 0; i < cases.length; i++) {
         if (cases[i].test) bsWalkExpr(cases[i].test, st);

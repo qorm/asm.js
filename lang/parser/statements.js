@@ -413,6 +413,24 @@ export const StatementParser = {
         }
         if (!this.expectPeek(TokenType.RPAREN)) { this._inFormalParams = prevInFormal; return null; }
         this._inFormalParams = prevInFormal;
+        // [test262 S1] 非简单形参表(含默认值/解构/rest)中遇重名 → SyntaxError(无论 strict)。
+        // 规范: FormalParameters 当 IsSimpleParameterList 为 false 时,BoundNames 不得含重复项。
+        // 只在 strict 态的 checkInheritedStrictParams 已覆盖简单形参表 strict 重名,此处补 non-simple。
+        (() => {
+            let simple = true;
+            for (const p of params) {
+                if (!p) continue;
+                if (p.type !== "Identifier") { simple = false; break; }
+            }
+            if (simple) return;
+            const names = [];
+            for (const p of params) this.collectParamNames(p, names);
+            const seen = {};
+            for (const n of names) {
+                if (seen[n]) this.errors.push("Duplicate parameter name '" + n + "' not allowed in function with default parameter values");
+                seen[n] = true;
+            }
+        })();
         return params;
     },
 

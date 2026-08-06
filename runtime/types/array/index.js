@@ -1683,6 +1683,10 @@ export class ArrayGenerator {
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.A1, VReg.V1);
         vm.call("_object_get");
+        // [test262 S1] getter 解包:res.done 可能是访问器属性
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_maybe_getter");
         vm.mov(VReg.A0, VReg.RET);
         vm.call("_to_boolean");
         vm.cmpImm(VReg.RET, 0);
@@ -1693,6 +1697,10 @@ export class ArrayGenerator {
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.A1, VReg.V1);
         vm.call("_object_get");
+        // [test262 S1] getter 解包:res.value 可能是访问器属性(如 IteratorValue 的 getter 抛错)
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_maybe_getter");
         vm.mov(VReg.A1, VReg.RET);
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_array_push");
