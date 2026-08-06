@@ -2312,6 +2312,29 @@ export const BuiltinArrayMethodCompiler = {
         const arrOffset = this.ctx.allocLocal(`__rredr_arr_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, arrOffset, VReg.RET);
 
+        // 编译回调（移到 tag guard 前）
+        this.compileExpression(callbackExpr);
+        const cbOffset = this.ctx.allocLocal(`__rredr_cb_${this.nextLabelId()}`);
+        this.vm.store(VReg.FP, cbOffset, VReg.RET);
+
+        // 求值初始值（如提供，存 slot 供 tag guard 和 fallback 共用）
+        const rinitOff = this.ctx.allocLocal(`__rredr_init_${this.nextLabelId()}`);
+        if (initialValueExpr) {
+            this.compileExpression(initialValueExpr);
+            this.vm.store(VReg.FP, rinitOff, VReg.RET);
+        } else {
+            this.vm.movImm64(VReg.RET, 0x7ffb000000000000n);
+            this.vm.store(VReg.FP, rinitOff, VReg.RET);
+        }
+
+        // tag guard: 非真数组(0x7FFE)时走 _agen_reduceRight 安全包装
+        const rrFallbackLbl = this.ctx.newLabel("rredr_fallback");
+        const rrDoneLbl = this.ctx.newLabel("rredr_done");
+        this.vm.load(VReg.V0, VReg.FP, arrOffset);
+        this.vm.shrImm(VReg.V0, VReg.V0, 48);
+        this.vm.cmpImm(VReg.V0, 0x7FFE);
+        this.vm.jne(rrFallbackLbl);
+
         // len = _array_length(arr)
         this.vm.load(VReg.A0, VReg.FP, arrOffset);
         this.vm.call("_array_length");
@@ -2322,7 +2345,7 @@ export const BuiltinArrayMethodCompiler = {
         const accOffset = this.ctx.allocLocal(`__rredr_acc_${this.nextLabelId()}`);
         const idxOffset = this.ctx.allocLocal(`__rredr_idx_${this.nextLabelId()}`);
         if (initialValueExpr) {
-            this.compileExpression(initialValueExpr);
+            this.vm.load(VReg.RET, VReg.FP, rinitOff);
             this.vm.store(VReg.FP, accOffset, VReg.RET);
             // idx = len - 1
             this.vm.load(VReg.V0, VReg.FP, lenOffset);
@@ -2341,11 +2364,6 @@ export const BuiltinArrayMethodCompiler = {
             this.vm.subImm(VReg.V0, VReg.V0, 1);
             this.vm.store(VReg.FP, idxOffset, VReg.V0);
         }
-
-        // 回调
-        this.compileExpression(callbackExpr);
-        const cbOffset = this.ctx.allocLocal(`__rredr_cb_${this.nextLabelId()}`);
-        this.vm.store(VReg.FP, cbOffset, VReg.RET);
 
         const elemOffset = this.ctx.allocLocal(`__rredr_elem_${this.nextLabelId()}`);
         const loopLabel = this.ctx.newLabel("rredr_loop");
@@ -2383,5 +2401,15 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.label(endLabel);
 
         this.vm.load(VReg.RET, VReg.FP, accOffset);
+        this.vm.jmp(rrDoneLbl);
+
+        // fallback: 非真数组 → _agen_reduceRight(recv, cb, init)
+        this.vm.label(rrFallbackLbl);
+        this.vm.load(VReg.A0, VReg.FP, arrOffset); // recv
+        this.vm.load(VReg.A1, VReg.FP, cbOffset);  // cb
+        this.vm.load(VReg.A2, VReg.FP, rinitOff);  // seed (undefined if no initialValue)
+        this.vm.call("_agen_reduceRight");
+
+        this.vm.label(rrDoneLbl);
     },
 };
