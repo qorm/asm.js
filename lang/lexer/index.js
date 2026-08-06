@@ -307,7 +307,7 @@ export class Lexer {
         let result = "";
         this.readChar(); // 跳过开始引号
 
-        while (this.ch !== quote && this.ch !== "\0") {
+        while (this.ch !== quote && !(this.position >= this.input.length)) {
             if (this.ch === "\\") {
                 this.readChar();
                 if (this.ch === "n") {
@@ -472,6 +472,12 @@ export class Lexer {
         return code >= 48 && code <= 57;
     }
 
+    _savePosition() {
+        return { pos: this.position, rpos: this.readPosition, ch: this.ch, line: this.line, column: this.column };
+    }
+    _restorePosition(s) {
+        this.position = s.pos; this.readPosition = s.rpos; this.ch = s.ch; this.line = s.line; this.column = s.column;
+    }
     // 判断是否为十六进制数字
     isHexDigit(ch) {
         let code = ch.charCodeAt(0);
@@ -603,6 +609,17 @@ export class Lexer {
             // 尝试区分除法和正则表达式
             // 启发式逻辑：如果前一个 token 是运算符、左括号或开始标记，则可能是正则
             if (this.canNextBeRegExp()) {
+                if (this.lastTokenType === TokenType.RBRACE) {
+                    let saved = this._savePosition();
+                    tok = this.readRegexLiteral();
+                    if (tok.type === TokenType.ILLEGAL) {
+                        this._restorePosition(saved);
+                        tok = newToken(TokenType.SLASH, "/", startLine, startColumn);
+                        this.readChar();
+                        return tok;
+                    }
+                    return tok;
+                }
                 tok = this.readRegexLiteral();
                 return tok;
             }

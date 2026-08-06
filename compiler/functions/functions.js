@@ -1568,6 +1568,26 @@ export const FunctionCompiler = {
             return;
         }
 
+        // super[expr](...args) computed method call
+        if (callee.type === "MemberExpression" && callee.object &&
+            callee.object.type === "SuperExpression" && callee.computed) {
+            const prop = callee.property;
+            let keyName = null;
+            if ((prop.type === "Literal" || prop.type === "StringLiteral") && typeof prop.value !== "object")
+                keyName = String(prop.value);
+            const thisOffset = this.ctx.getLocal("__this");
+            this.emitLoadSuperClassInfo(VReg.S1);
+            if (!this.ctx.inStaticMethod) { this.vm.load(VReg.S1, VReg.S1, 32); this.vm.load(VReg.S1, VReg.S1, 24); }
+            this.vm.emitMaskLoad(VReg.V1); this.vm.andMaskReg(VReg.A0, VReg.S1, VReg.V1);
+            this.vm.movImm64(VReg.V1, 0x7ffd000000000000n); this.vm.or(VReg.A0, VReg.A0, VReg.V1);
+            if (keyName !== null) { this.emitBoxedStringKey(keyName, VReg.A1); this.vm.call("_object_get"); }
+            else { this.compileExpression(prop); this.vm.mov(VReg.A1, VReg.RET); this.vm.call("_object_get"); }
+            this.vm.mov(VReg.V6, VReg.RET);
+            if (thisOffset) this.vm.load(VReg.V5, VReg.FP, thisOffset); else this.vm.movImm(VReg.V5, 0);
+            this.compileMethodCall(VReg.V6, VReg.V5, expr.arguments);
+            return;
+        }
+
         // super.method(...args) : 调用父类方法，this = 当前 __this。
         // 实例方法:方法在父类 prototype;**静态方法**:方法直接在父类对象上(静态成员键无
         // "static_" 前缀,与实例键同名但存于类对象),故 super.m() 从父类对象本身取。

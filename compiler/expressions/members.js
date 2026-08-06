@@ -3598,6 +3598,23 @@ export const MemberCompiler = {
             this.vm.label(endLabel);
             return;
         }
+        if (expr.computed && expr.object && expr.object.type === "SuperExpression" && this.ctx.superClass) {
+            const prop = expr.property;
+            let keyName = null;
+            if ((prop.type === "Literal" || prop.type === "StringLiteral") && typeof prop.value !== "object")
+                keyName = String(prop.value);
+            const thisOffset = this.ctx.getLocal("__this");
+            this.emitLoadSuperClassInfo(VReg.S1);
+            if (!this.ctx.inStaticMethod) { this.vm.load(VReg.S1, VReg.S1, 32); this.vm.load(VReg.S1, VReg.S1, 24); }
+            this.vm.emitMaskLoad(VReg.V1); this.vm.andMaskReg(VReg.A0, VReg.S1, VReg.V1);
+            this.vm.movImm64(VReg.V1, 0x7ffd000000000000n); this.vm.or(VReg.A0, VReg.A0, VReg.V1);
+            if (keyName !== null) { this.emitBoxedStringKey(keyName, VReg.A1); this.vm.call("_object_get"); }
+            else { this.compileExpression(prop); this.vm.mov(VReg.A1, VReg.RET); this.vm.call("_object_get"); }
+            this.vm.mov(VReg.A0, VReg.RET);
+            if (thisOffset) this.vm.load(VReg.A1, VReg.FP, thisOffset); else this.vm.movImm(VReg.A1, 0);
+            this.vm.call("_maybe_getter");
+            return;
+        }
         if (expr.computed) {
             // computed 中的 Identifier 是变量（obj[i]），不是属性名——
             // 只有字符串字面量 obj["k"] / Symbol.iterator 才是静态键

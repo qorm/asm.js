@@ -713,6 +713,8 @@ export const StatementParser = {
         // curToken 是 update 末 token,expectPeek 移到 `)`。同 test 段,否则空 update 段崩。
         if (!this.curTokenIs(TokenType.RPAREN)) {
             if (!this.expectPeek(TokenType.RPAREN)) return null;
+        } else if (this.peekTokenIs(TokenType.RPAREN)) {
+            this.nextToken();
         }
         this.nextToken();
         this.loopDepth++;
