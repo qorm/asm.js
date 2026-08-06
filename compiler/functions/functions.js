@@ -5185,22 +5185,34 @@ export const FunctionCompiler = {
             }
             const t = node.type;
             if (t === "VariableDeclarator") {
-                if (node.id && node.id.type === "Identifier" && isAnonFn(node.init)) {
-                    hints.set(node.init, node.id.name);
+                if (node.id && node.id.type === "Identifier" && isAnonCallable(node.init)) {
+                    const nm = node.id.name;
+                    const blkCut = nm.indexOf("$blk$");
+                    const unmangled = blkCut !== -1 ? nm.slice(0, blkCut) : nm;
+                    hints.set(node.init, unmangled);
                 }
             } else if (t === "AssignmentExpression") {
                 // [ext] 扩展至逻辑赋值运算符(??=/&&=/||=)
                 const isLogicalAssign = node.operator === "??=" ||
                     node.operator === "&&=" || node.operator === "||=";
                 if ((node.operator === "=" || isLogicalAssign) &&
-                    node.left && node.left.type === "Identifier" && isAnonFn(node.right)) {
-                    hints.set(node.right, node.left.name);
+                    node.left && node.left.type === "Identifier" && isAnonCallable(node.right)) {
+                    const nm = node.left.name;
+                    const blkCut = nm.indexOf("$blk$");
+                    const unmangled = blkCut !== -1 ? nm.slice(0, blkCut) : nm;
+                    hints.set(node.right, unmangled);
                 }
             } else if (t === "AssignmentPattern") {
                 // [ext] 解构默认值: {arrow = ()=>{}} 中 AssignmentPattern
-                // left 是绑定标识符,right 是函数/箭头 → name = 绑定标识符名
-                if (node.left && node.left.type === "Identifier" && isAnonFn(node.right)) {
-                    hints.set(node.right, node.left.name);
+                // left 是绑定标识符,right 是函数/箭头/匿名类 → name = 绑定标识符名。
+                // [W-24 fix] 块级 let/const 绑定被 renameBlockScopedBindings 改名为
+                // name$blk$N,函数名须用原名(去 $blk$N 后缀)——否则 fn.name 得
+                // "fn$blk$4" 非规范 "fn"。
+                if (node.left && node.left.type === "Identifier" && isAnonCallable(node.right)) {
+                    const nm = node.left.name;
+                    const blkCut = nm.indexOf("$blk$");
+                    const unmangled = blkCut !== -1 ? nm.slice(0, blkCut) : nm;
+                    hints.set(node.right, unmangled);
                 }
             } else if (t === "Property") {
                 if ((!node.kind || node.kind === "init") && isAnonCallable(node.value)) {

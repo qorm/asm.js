@@ -790,6 +790,13 @@ export const StatementCompiler = {
             }
             return { type: "ArrayPattern", elements: outEls };
         }
+        // [W-24 fix] AssignmentExpression 在对象属性值位(如 `{ x: a = 42 }`)与数组元素
+        // 位(`[a = 42]`)均应重解释为 AssignmentPattern。此前仅 ArrayExpression 分支处理,
+        // 对象属性位走此处直返 AssignmentExpression → emitDestructurePattern 误把整个
+        // AssignmentExpression 当 targetNode → 默认值失效(=undefined)。
+        if (node.type === "AssignmentExpression" && node.operator === "=") {
+            return { type: "AssignmentPattern", left: this.reinterpretAsPattern(node.left), right: node.right };
+        }
         // AssignmentPattern(如对象简写默认 {a=1} 的 value,或数组元素默认):
         // left 可能仍是 Object/ArrayExpression(嵌套解构默认),需递归重解释;right(默认值)原样。
         if (node.type === "AssignmentPattern") {
@@ -1669,13 +1676,24 @@ export const StatementCompiler = {
         this.vm.jmp(loopLabel);
         this.vm.label(notMapLabel);
 
+        // [iterator-protocol] ES GetIterator §7.4.1:若 obj[Symbol.iterator] 缺失或非
+        // callable 则抛 TypeError。此前静默跳 endLabel → 零迭代(批量 test262 判负)。
+        // _object_get 对未找到属性返回 undefined(0x7FFB),非裸 0;compileMethodCall 内部
+        // _validate_callable 会验证可调用性。此处仅提前拦截明显的不可迭代值(null/undefined),
+        // 精确到 null/undefined 让 try/catch `e instanceof TypeError` 成立(此前漏掉)。
         this.vm.load(VReg.A0, VReg.FP, iterableTempOffset);
         this.emitBoxedStringKey("Symbol.iterator", VReg.A1);
         this.vm.call("_object_get");
-        this.vm.cmpImm(VReg.RET, 0);
-        this.vm.jeq(endLabel);
-
+        const notIterableLabel = this.ctx.newLabel("forof_not_iterable");
+        // 保存 RET 供 compileMethodCall 使用(须在 shrImm 前:x64 V0==RET==RAX)
         this.vm.mov(VReg.V6, VReg.RET);
+        this.vm.shrImm(VReg.V0, VReg.RET, 48);
+        // 未找到属性 → undefined(0x7FFB) / null(0x7FFA) → 不可迭代 → TypeError
+        this.vm.cmpImm(VReg.V0, 0x7ffb);
+        this.vm.jeq(notIterableLabel);
+        this.vm.cmpImm(VReg.V0, 0x7ffa);
+        this.vm.jeq(notIterableLabel);
+
         this.vm.load(VReg.V5, VReg.FP, iterableTempOffset);
         this.compileMethodCall(VReg.V6, VReg.V5, []);
         this.vm.store(VReg.FP, iteratorTempOffset, VReg.RET);
@@ -1725,6 +1743,11 @@ export const StatementCompiler = {
         this.vm.jeq(endLabel);
         this.vm.load(VReg.A0, VReg.FP, iterCloseOffset);
         this.vm.call("_iterator_close");
+        this.vm.jmp(endLabel); // 跳过下方的 notIterableLabel(TypeError 路径)
+
+        // [iterator-protocol] 不可迭代值(TypeError):上面的 Symbol.iterator 检查不通过→跳此。
+        this.vm.label(notIterableLabel);
+        this.emitThrowTypeError("obj is not iterable");
 
         this.vm.label(endLabel);
 

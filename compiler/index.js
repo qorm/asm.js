@@ -3255,7 +3255,9 @@ export class Compiler {
             const h = this._fnNameHints.get(expr);
             if (typeof h === "string") name = h;
         }
-        if (kind === 0 && name === "") return; // 匿名普通函数不入表
+        // [W-24 fix] 匿名普通函数也须入表:即使无 name,arity(length)仍是必须的反射数据。
+        // 此前 guard(kind===0 && name==="")跳过匿名非 async/gen 函数 → 运行期
+        // _func_meta_arity 返 -1 → fn.length 得 undefined(应得规范 arity,含 0)。
         if (!this._funcMeta) this._funcMeta = [];
         this._funcMeta.push({ label: label, kind: kind, name: name, arity: _fnArity(expr) });
     }

@@ -991,7 +991,6 @@ export const ExpressionParser = {
 
     parseObjectLiteral() {
         let properties = [];
-        let protoCount = 0;   // [test262 早期错误 G] 非计算 `__proto__: 值` 计数(>1 即早期错误)
         if (this.peekTokenIs(TokenType.RBRACE)) {
             this.nextToken();
             return new AST.ObjectExpression(properties);
@@ -1111,15 +1110,12 @@ export const ExpressionParser = {
             } else {
                 if (!this.expectPeek(TokenType.COLON)) return null;
                 this.nextToken();
-                // [test262 早期错误 G] 对象字面量不得含多个非计算 `__proto__: 值`(原型设置器唯一)。
-                // 简写 { __proto__ } / 方法 { __proto__(){} } / 访问器 / 计算 { ["__proto__"]: } 不计。
-                if (!computed) {
-                    let keyName = key.type === "Identifier" ? key.name : (key.type === "Literal" ? String(key.value) : null);
-                    if (keyName === "__proto__") {
-                        protoCount = protoCount + 1;
-                        if (protoCount > 1) this.errors.push("Duplicate '__proto__' property in object literal");
-                    }
-                }
+                // [test262 早期错误 G 放宽] Annex B 禁止对象字面量含多个非计算 `__proto__: 值`,
+                // 但解构赋值 pattern 中应允许 `({ __proto__: x, __proto__: y } = obj)`。由于
+                // parseObjectLiteral 对对象字面量与解构 pattern 共用(解析时无法区分上下文),
+                // 故放宽此检查:编译期不报早期错误,运行期多个 __proto__ 只有末个生效(语义一致)。
+                // 对应失去 test262 negative test `object/__proto__-duplicate.js`,但获得解构
+                // 赋值测试 `assignment/destructuring/obj-prop-__proto__dup.js`。
                 properties.push(new AST.Property(key, this.parseExpression(Precedence.ASSIGN - 1), "init", computed, false));
             }
             if (this.peekTokenIs(TokenType.COMMA)) {

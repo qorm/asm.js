@@ -3477,6 +3477,11 @@ export const MemberCompiler = {
     //   obj.method(obj 为 const 绑定的对象字面量)→ 该属性的函数值。
     // 返回 { node, fallbackName } 或 null。
     _resolveFnNode(objExpr) {
+        // [W-24 fix] 直接函数/箭头表达式节点:(fn).length / (()=>{}).name 等 inline 形态
+        if (objExpr.type === "FunctionExpression" || objExpr.type === "ArrowFunctionExpression") {
+            const ownName = (objExpr.id && objExpr.id.name) || "";
+            return { node: objExpr, fallbackName: ownName };
+        }
         if (objExpr.type === "Identifier") {
             const nm = objExpr.name;
             const decl = this.ctx.getFunction ? this.ctx.getFunction(nm) : null;
@@ -4239,13 +4244,15 @@ export const MemberCompiler = {
                 }
             }
 
-            // 用户函数/类的 .name / .length 反射(编译期已知,静态解析访问点)。仅当接收者标识符
-            // 静态解析到函数声明/类/const 绑定的箭头·函数表达式·类表达式时触发;数组/对象/字符串
-            // 等其它接收者的 .length/.name 走下方通用路径 → 普通函数值 codegen 逐字节不变。
+            // 用户函数/类的 .name / .length 反射(编译期已知,静态解析访问点)。
+            // [W-24 fix] 新增 ArrowFunctionExpression/FunctionExpression 直接接收者:inline
+            // 函数表达式如 `(([a,b]) => {}).length` 的 object 即函数节点自身,此前被漏过 →
+            // 落运行时 _closure_prop_get → 匿名函数未入元数据表 → undefined(应得规范 arity)。
             // asm.js 函数是闭包/裸函数指针、无属性容器,故 fn.name/fn.length 用访问点静态解析,
             // 不改闭包表示;运行时传递的函数值(参数/成员链)不静态可知则回落(undefined/通用)。
             if ((propName === "name" || propName === "length") && expr.object &&
-                (expr.object.type === "Identifier" || expr.object.type === "MemberExpression")) {
+                (expr.object.type === "Identifier" || expr.object.type === "MemberExpression" ||
+                 expr.object.type === "FunctionExpression" || expr.object.type === "ArrowFunctionExpression")) {
                 const _fm = this._fnNameLength(expr.object);
                 if (_fm) {
                     // [t671] 先查闭包属性侧表:defineProperty(fn,"length"/"name",{value})
