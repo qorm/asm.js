@@ -129,6 +129,7 @@ export class ObjectGenerator {
         this.generateGetPrototypeOf();
         this.generateIsPrototypeOf();
         this.generateSetPrototypeOf();
+        this.generateProtoAccessor(); // [__proto__] getter/setter on Object.prototype
         this.generateObjectFreeze();
         this.generateObjectSeal();
         this.generateObjectPreventExtensions();
@@ -1255,6 +1256,35 @@ export class ObjectGenerator {
         emitProtoMethod("toString", "_object_proto_toString", 0);
         emitProtoMethod("isPrototypeOf", "_is_prototype_of", 1);
         emitProtoMethod("propertyIsEnumerable", "_object_propertyIsEnumerable", 1);
+        // [__proto__] accessor property: {get,set,enumerable:false,configurable:true}
+        // TYPE_GETTER block (24B) stored as own property on Object.prototype.
+        // _object_define bypasses setter dispatch so the block is stored as raw data;
+        // subsequent reads/writes will trigger _maybe_getter / _object_set_acc_dispatch.
+        {
+            vm.movImm(VReg.A0, 24);
+            vm.call("_alloc");             // RET = raw 24B block
+            vm.mov(VReg.V1, VReg.RET);     // V1 = TYPE_GETTER block pointer (must preserve S0-S3)
+            vm.movImm(VReg.V0, 60);        // TYPE_GETTER
+            vm.store(VReg.V1, 0, VReg.V0); // type@0 = 60
+            vm.lea(VReg.V0, "_object_proto_getter");
+            vm.store(VReg.V1, 8, VReg.V0); // getter@8
+            vm.lea(VReg.V0, "_object_proto_setter");
+            vm.store(VReg.V1, 16, VReg.V0);// setter@16
+            // proto["__proto__"] = TYPE_GETTER block (define 语义)
+            vm.mov(VReg.A0, VReg.S0);      // A0 = raw proto
+            vm.lea(VReg.A1, vm.asm.addString("__proto__"));
+            vm.movImm64(VReg.V0, 0x7ffc000000000000n);
+            vm.or(VReg.A1, VReg.A1, VReg.V0);// A1 = boxed "__proto__" key
+            vm.mov(VReg.A2, VReg.V1);      // A2 = TYPE_GETTER block (raw, will be stored as-is)
+            vm.call("_object_define");     // Define (not set) to avoid triggering accessor dispatch
+            // attr 4 = configurable, non-enumerable (__proto__ is not enumerable)
+            vm.mov(VReg.A0, VReg.S0);      // A0 = raw proto
+            vm.lea(VReg.A1, vm.asm.addString("__proto__"));
+            vm.movImm64(VReg.V0, 0x7ffc000000000000n);
+            vm.or(VReg.A1, VReg.A1, VReg.V0);
+            vm.movImm(VReg.A2, 4);         // ATTR_CONFIGURABLE
+            vm.call("_object_set_prop_attr");
+        }
         // 5. proto.constructor = ctor(装箱)
         vm.mov(VReg.A0, VReg.S0);
         vm.lea(VReg.A1, vm.asm.addString("constructor"));
@@ -1693,15 +1723,29 @@ export class ObjectGenerator {
     generateArefObjHelpers() {
         const vm = this.vm;
         vm.label("_aref_obj_hasOwn");
-        vm.prologue(0, []);
+        vm.prologue(16, []);
+        // ES 19.1.3.1: ToObject(this). null/undefined this → TypeError.
+        // hasOwn 自身(同 Object.hasOwn 半平台)仅自有判;null/undefined 抛。
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFA);
+        vm.jeq("_aref_oho_throw");
+        vm.cmpImm(VReg.V0, 0x7FFB);
+        vm.jeq("_aref_oho_throw");
         vm.call("_object_has"); // A0=obj, A1=key 透传;RET=裸 0/1
         vm.cmpImm(VReg.RET, 0);
         vm.jeq("_aref_oho_false");
         vm.movImm64(VReg.RET, 0x7ff9000000000001n);
-        vm.epilogue([], 0);
+        vm.epilogue([], 16);
         vm.label("_aref_oho_false");
         vm.movImm64(VReg.RET, 0x7ff9000000000000n);
-        vm.epilogue([], 0);
+        vm.epilogue([], 16);
+        vm.label("_aref_oho_throw");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot convert undefined or null to object"));
+        vm.movImm64(VReg.V0, 0x0000ffffffffffffn); vm.and(VReg.A0, VReg.A0, VReg.V0);
+        vm.movImm64(VReg.V0, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V0);
+        vm.call("_throw_type_error"); // 不返回
+        vm.movImm64(VReg.RET, 0x7ff9000000000000n); // 理论不达:返回 false 作哨兵
+        vm.epilogue([], 16);
 
         vm.label("_aref_obj_valueOf");
         vm.mov(VReg.RET, VReg.A0); // 恒等(叶子,无调用,LR 保持)
@@ -5459,12 +5503,35 @@ export class ObjectGenerator {
         vm.label("_object_create");
         vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2]);
 
-        vm.mov(VReg.S0, VReg.A0); // proto
-        
+        vm.mov(VReg.S0, VReg.A0); // proto (boxed)
+
+        // Type check: proto must be null or an object (ES 19.1.2.2 step 1).
+        // null (0x7FFA) → valid (Object.create(null))
+        // undefined (0x7FFB) → TypeError
+        // number/bool/string/symbol → TypeError
+        vm.shrImm(VReg.V1, VReg.S0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFA);        // null tag
+        vm.jeq("_object_create_null");
+        vm.cmpImm(VReg.V1, 0x7FFD);        // Object tag
+        vm.jeq("_object_create_obj");
+        vm.cmpImm(VReg.V1, 0);             // raw heap pointer (internal callers)
+        vm.jeq("_object_create_obj");
+        // Not null and not object → TypeError
+        vm.lea(VReg.A0, vm.asm.addString("Object prototype may only be an Object or null"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error"); // 不返回
+
+        vm.label("_object_create_null");
+        vm.movImm(VReg.S0, 0);             // proto = 0 (null)
+        vm.jmp("_object_create_do");
+
+        vm.label("_object_create_obj");
         // 指针脱壳 (使用 S2 作为临时，保存到栈后不再使用)
         vm.emitMaskLoad(VReg.S2);
         vm.andMaskReg(VReg.S0, VReg.S0, VReg.S2);
 
+        vm.label("_object_create_do");
         // 创建新对象
         vm.call("_object_new");
         vm.mov(VReg.S1, VReg.RET);
@@ -5589,7 +5656,11 @@ export class ObjectGenerator {
     generateIsPrototypeOf() {
         const vm = this.vm;
         vm.label("_is_prototype_of");
-        vm.prologue(0, [VReg.S0]);
+        vm.prologue(16, [VReg.S0]);
+        // ES 19.1.3.2: ToObject(this). null/undefined this → TypeError.
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFA); vm.jeq("_ipo_throw_nullish");
+        vm.cmpImm(VReg.V0, 0x7FFB); vm.jeq("_ipo_throw_nullish");
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.S0, VReg.A0, VReg.V1); // S0 = proto 裸指针
         vm.shrImm(VReg.V0, VReg.A1, 48);   // x tag
@@ -5613,11 +5684,18 @@ export class ObjectGenerator {
         vm.label("_ipo_true");
         vm.lea(VReg.RET, "_js_true");
         vm.load(VReg.RET, VReg.RET, 0);
-        vm.epilogue([VReg.S0], 0);
+        vm.epilogue([VReg.S0], 16);
         vm.label("_ipo_false");
         vm.lea(VReg.RET, "_js_false");
         vm.load(VReg.RET, VReg.RET, 0);
-        vm.epilogue([VReg.S0], 0);
+        vm.epilogue([VReg.S0], 16);
+
+        vm.label("_ipo_throw_nullish");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot convert undefined or null to object"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error"); // 不返回
+        vm.epilogue([VReg.S0], 16); // 理论不达
     }
 
     // Object.setPrototypeOf(obj, proto) -> obj
@@ -5627,6 +5705,27 @@ export class ObjectGenerator {
         vm.label("_object_setPrototypeOf");
         vm.prologue(0, []);
 
+        // Type check: proto must be null or an object (ES 19.1.2.17 step 2).
+        // A0=obj (boxed), A1=proto (boxed).
+        vm.shrImm(VReg.V0, VReg.A1, 48);
+        vm.cmpImm(VReg.V0, 0x7FFA);        // null → ok
+        vm.jeq("_ospo_type_ok");
+        vm.cmpImm(VReg.V0, 0x7FFB);        // undefined → treat as null
+        vm.jeq("_ospo_null");
+        vm.cmpImm(VReg.V0, 0x7FFD);        // Object → ok
+        vm.jeq("_ospo_type_ok");
+        vm.cmpImm(VReg.V0, 0);             // raw heap pointer → ok
+        vm.jeq("_ospo_type_ok");
+        // proto not an object and not null → TypeError
+        vm.lea(VReg.A0, vm.asm.addString("Object prototype may only be an Object or null"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error"); // 不返回
+
+        vm.label("_ospo_null");
+        vm.movImm64(VReg.A1, 0x7ffa000000000000n); // replace with tagged null
+
+        vm.label("_ospo_type_ok");
         // [#66] A0/A1 皆为装箱值(0x7FFD 对象 / tagged null)。必须脱壳后再 store:
         // 直接 store(A0,16,..) 会写到装箱地址(高位含 tag)→ 野地址 SIGSEGV。
         // tagged null/undefined 的低48位 payload 为 0 → 裸 proto=0(null 原型)。
@@ -5653,6 +5752,107 @@ export class ObjectGenerator {
         vm.label("_object_setPrototypeOf_done");
         vm.mov(VReg.RET, VReg.A0); // 返回原始装箱 obj
         vm.epilogue([], 0);
+    }
+
+    // [__proto__] Object.prototype.__proto__ getter/setter
+    // getter: called by _maybe_getter with A0/A5 = boxed this (receiver), argc=0.
+    // setter: called by _object_set_acc_dispatch with A0=newValue(boxed), A5=boxed this.
+    generateProtoAccessor() {
+        const vm = this.vm;
+
+        // _object_proto_getter: reads this.__proto__ and returns it boxed (0x7FFD or null).
+        vm.label("_object_proto_getter");
+        vm.prologue(16, [VReg.S0]);
+        vm.mov(VReg.S0, VReg.A0);        // S0 = boxed this
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V0, VReg.S0, VReg.V1); // V0 = raw obj
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_proto_getter_null");
+        // Safety: check the raw pointer is in heap range
+        vm.lea(VReg.V1, "_heap_base");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jlt("_proto_getter_null");
+        vm.lea(VReg.V1, "_heap_ptr");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jge("_proto_getter_null");
+        vm.load(VReg.RET, VReg.V0, 16);  // RET = __proto__ raw pointer
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_proto_getter_null");
+        // Check if __proto__ is a classinfo (TYPE_FUNCTION=3)
+        vm.load(VReg.V1, VReg.RET, 0);
+        vm.andImm(VReg.V1, VReg.V1, 0xff);
+        vm.cmpImm(VReg.V1, 3);
+        vm.jeq("_proto_getter_fn");
+        // Box as regular object (0x7FFD)
+        vm.orImm(VReg.RET, VReg.RET, 0x7ffd000000000000);
+        vm.epilogue([VReg.S0], 16);
+        vm.label("_proto_getter_fn");
+        // Classinfo raw pointer: return as-is (consistent with _object_getPrototypeOf)
+        vm.epilogue([VReg.S0], 16);
+        vm.label("_proto_getter_null");
+        vm.lea(VReg.RET, "_js_null");
+        vm.load(VReg.RET, VReg.RET, 0);
+        vm.epilogue([VReg.S0], 16);
+
+        // _object_proto_setter: sets this.__proto__ = newValue.
+        // A0 = new proto value (boxed JSValue), A5 = boxed this (receiver).
+        vm.label("_object_proto_setter");
+        vm.prologue(16, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A5);        // S0 = boxed this
+        vm.mov(VReg.S1, VReg.A0);        // S1 = new proto value (boxed)
+        // Type check: new proto must be null or object (ES B.2.2.1.2 step 2).
+        // Non-object/non-null → silently return undefined (NOT throw, unlike setPrototypeOf).
+        vm.shrImm(VReg.V0, VReg.S1, 48);
+        vm.cmpImm(VReg.V0, 0x7FFA);      // null
+        vm.jeq("_proto_setter_ok");
+        vm.cmpImm(VReg.V0, 0x7FFB);      // undefined → silently return
+        vm.jeq("_proto_setter_done");
+        vm.cmpImm(VReg.V0, 0x7FFD);      // Object
+        vm.jeq("_proto_setter_ok");
+        vm.cmpImm(VReg.V0, 0);           // raw heap pointer
+        vm.jeq("_proto_setter_ok");
+        // Non-object/non-null: silently return undefined (spec step 2)
+        vm.jmp("_proto_setter_done");
+
+        vm.label("_proto_setter_ok");
+        // Debox both
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V0, VReg.S0, VReg.V1); // V0 = raw this
+        vm.andMaskReg(VReg.V2, VReg.S1, VReg.V1); // V2 = raw proto (null/undefined → 0)
+        // Safety: check raw this is in heap range
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_proto_setter_done");
+        vm.lea(VReg.V1, "_heap_base");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jlt("_proto_setter_done");
+        vm.lea(VReg.V1, "_heap_ptr");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jge("_proto_setter_done");
+        // Non-extensible check: byte1 & EXT_NONEXT → TypeError
+        vm.loadByte(VReg.V1, VReg.V0, 1);
+        vm.movImm(VReg.V3, 8);           // EXT_NONEXT bit
+        vm.and(VReg.V1, VReg.V1, VReg.V3);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_proto_setter_nonext");
+        // Store __proto__
+        vm.store(VReg.V0, 16, VReg.V2);
+        vm.label("_proto_setter_done");
+        vm.mov(VReg.RET, VReg.S1);       // Return new proto value
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+
+        vm.label("_proto_setter_nonext");
+        vm.lea(VReg.A0, vm.asm.addString("#<Object> is not extensible"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error"); // 不返回
+        vm.epilogue([VReg.S0, VReg.S1], 16); // 理论不达
+
+        // Register __str_proto_key = "__proto__" for key reuse
+        vm.asm.registerRuntimeString("_str_proto_key", "__proto__");
     }
 
     // obj.toString() -> "[object Object]"
