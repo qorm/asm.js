@@ -483,8 +483,8 @@ export class Lexer {
         return t === tt.ASSIGN || t === tt.PLUS || t === tt.MINUS || t === tt.ASTERISK ||
                t === tt.SLASH || t === tt.PERCENT || t === tt.BANG || t === tt.COMMA ||
                t === tt.SEMICOLON || t === tt.COLON || t === tt.LPAREN || t === tt.LBRACKET ||
-               t === tt.LBRACE || t === tt.QUESTION || t === tt.AND || t === tt.OR ||
-               t === tt.RETURN || t === tt.IF || t === tt.ELSE || t === tt.DO ||
+               t === tt.LBRACE || t === tt.RBRACE || t === tt.QUESTION || t === tt.AND || t === tt.OR ||
+               t === tt.RETURN || t === tt.YIELD || t === tt.IF || t === tt.ELSE || t === tt.DO ||
                t === tt.WHILE || t === tt.FOR || t === tt.IN || t === tt.OF ||
                t === tt.TYPEOF || t === tt.VOID || t === tt.THROW || t === tt.DELETE ||
                t === tt.CASE || t === tt.DEFAULT || t === tt.STRICT_EQ || t === tt.STRICT_NOT_EQ ||
@@ -518,7 +518,7 @@ export class Lexer {
             this.readChar(); // 跳过结束的 /
             // 读取标志
             let flags = "";
-            while (this.isLetter(this.ch) || this.isDigit(this.ch)) {
+            while ((this.ch >= "a" && this.ch <= "z") || (this.ch >= "A" && this.ch <= "Z") || (this.ch >= "0" && this.ch <= "9")) {
                 flags += this.ch;
                 this.readChar();
             }
@@ -733,6 +733,16 @@ export class Lexer {
                 this.readChar();
                 this.readChar();
                 tok = newToken(TokenType.SPREAD, "...", startLine, startColumn);
+            } else if (this.isDigit(this.peekChar())) {
+                // `.8` / `.8e3` — leading-decimal numeric literal (DecimalLiteral ::
+                // . DecimalDigits ExponentPart_opt). readNumber handles the rest.
+                let num = this.readNumber();
+                let type = TokenType.FLOAT;
+                if (num.endsWith("n")) {
+                    type = TokenType.BIGINT;
+                    num = num.slice(0, -1);
+                }
+                return newToken(type, num, startLine, startColumn);
             } else {
                 tok = newToken(TokenType.DOT, ".", startLine, startColumn);
             }
