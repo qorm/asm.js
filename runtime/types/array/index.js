@@ -3043,6 +3043,8 @@ export class ArrayGenerator {
         this.generateArrayLikeCopy();
         this.generateGetThis();
         this.generateArraySpeciesCheck();
+        this.generateIsConcatSpreadable();
+        this.generateConcatAppendItem();
     }
 
     // 一等数组迭代器(`arr.values()`/`.keys()`/`.entries()`/`arr[Symbol.iterator]()`)。
@@ -3335,5 +3337,120 @@ export class ArrayGenerator {
         vm.label("_asc_default");
         vm.movImm(VReg.RET, 0);
         vm.epilogue([VReg.S0, VReg.S1], 32);
+    }
+
+    // _is_concat_spreadable(A0=O boxed) -> 0/1 (not spreadable / spreadable)
+    // Implements IsConcatSpreadable(O):
+    //   1. If Type(O) is not Object, return false.
+    //   2. Let spreadable be Get(O, @@isConcatSpreadable).
+    //   3. If spreadable is not undefined, return ToBoolean(spreadable).
+    //   4. Return IsArray(O) (tag 0x7FFE).
+    generateIsConcatSpreadable() {
+        const vm = this.vm;
+
+        vm.label("_is_concat_spreadable");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+
+        // Step 1: Type(O) is not Object → false (primitives: number/boolean/string/null/undefined)
+        vm.mov(VReg.S0, VReg.A0);
+        vm.shrImm(VReg.V0, VReg.S0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFD); vm.jeq("_icsp_obj");
+        vm.cmpImm(VReg.V0, 0x7FFE); vm.jeq("_icsp_obj");
+        vm.cmpImm(VReg.V0, 0x7FFF); vm.jeq("_icsp_obj");
+        vm.cmpImm(VReg.V0, 0x7FF9); vm.jeq("_icsp_obj"); // Number/Boolean wrapper
+        vm.cmpImm(VReg.V0, 0x7FFC); vm.jeq("_icsp_obj"); // String object
+        vm.cmpImm(VReg.V0, 0); vm.jne("_icsp_false");    // bare pointer
+        vm.cmpImm(VReg.S0, 0); vm.jeq("_icsp_false");
+        vm.jmp("_icsp_obj");
+
+        // Step 2: spreadable = Get(O, @@isConcatSpreadable)
+        vm.label("_icsp_obj");
+        vm.lea(VReg.A0, "_symwk_isConcatSpreadable");
+        vm.lea(VReg.A1, vm.asm.addString("Symbol.isConcatSpreadable"));
+        vm.movImm64(VReg.V0, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V0);
+        vm.call("_symbol_wellknown");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.movImm64(VReg.V0, 0x7ffd000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V0);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_get");           // RET = O[@@isConcatSpreadable]
+
+        // Step 3: If spreadable is not undefined, return ToBoolean(spreadable)
+        vm.movImm64(VReg.V1, 0x7ffb000000000000n); // undefined
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_icsp_isarray");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_boolean");
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+
+        // Step 4: Return IsArray(O) → check tag 0x7FFE
+        vm.label("_icsp_isarray");
+        vm.shrImm(VReg.V0, VReg.S0, 48);
+        vm.movImm(VReg.RET, 0);
+        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jne("_icsp_done");
+        vm.movImm(VReg.RET, 1);
+        vm.label("_icsp_done");
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+
+        vm.label("_icsp_false");
+        vm.movImm(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+    }
+
+    // _concat_append_item(acc, item) -> newAcc
+    // Appends item to accumulator respecting IsConcatSpreadable.
+    // If !IsConcatSpreadable(item): push item as single element.
+    // If IsConcatSpreadable(item): spread elements via _subscript_get.
+    generateConcatAppendItem() {
+        const vm = this.vm;
+
+        vm.label("_concat_append_item");
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+
+        vm.mov(VReg.S0, VReg.A0); // acc
+        vm.mov(VReg.S1, VReg.A1); // item
+
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_is_concat_spreadable");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_ccai_one");
+
+        // Spreadable: get length via _object_get(item, "length")
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.V0, "_str_length_prop");
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.V0, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_int32");
+        vm.mov(VReg.S2, VReg.RET);
+
+        vm.movImm(VReg.S3, 0);
+        vm.label("_ccai_loop");
+        vm.cmp(VReg.S3, VReg.S2);
+        vm.jge("_ccai_done");
+
+        vm.mov(VReg.A0, VReg.S1);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_subscript_get");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_push");
+        vm.mov(VReg.S0, VReg.RET);
+
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_ccai_loop");
+
+        vm.label("_ccai_one");
+        vm.mov(VReg.A1, VReg.S1);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_push");
+        vm.mov(VReg.S0, VReg.RET);
+
+        vm.label("_ccai_done");
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
     }
 }

@@ -553,13 +553,19 @@ export const BuiltinArrayMethodCompiler = {
                 }
                 break;
             case "concat": {
-                // arr.concat(a, b, ...) -> 全新数组（不改原数组）。此前 compileArrayMethod
-                // 缺 concat case → 落 default 返回接收者本身、实参被丢弃：
-                // captured.concat(["__this"]) 恒为无操作 → 闭包从不捕获 __this（gen1 自举
-                // 产物里方法内箭头/闭包读不到 this 的根因）。
-                // 建空数组，先并入接收者元素、再依次并入每个实参（数组展开元素、否则单元素
-                // 追加）。用 _array_length + _array_get + _array_push 手写循环，与已验证的
-                // compileArrayExpressionWithSpread 完全同构（不走 _array_concat）。
+                // arr.concat(a, b, ...) -> 全新数组（不改原数组）。
+                // [species] check this.constructor[Symbol.species]
+                const _ccSpecFb = this.ctx.newLabel("cc_spec_fb");
+                const _ccSpecEnd = this.ctx.newLabel("cc_spec_done");
+                const _ccRecvSp = this.ctx.allocLocal(`__cc_spec_r_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, _ccRecvSp, VReg.RET);
+                this.vm.mov(VReg.A0, VReg.RET);
+                this.vm.call("_array_species_check");
+                this.vm.cmpImm(VReg.RET, 0);
+                this.vm.jne(_ccSpecFb);
+
+                // fast path: default species
+                this.vm.load(VReg.RET, VReg.FP, _ccRecvSp);
                 const accOff = this.ctx.allocLocal(`__concat_acc_${this.nextLabelId()}`);
                 const recvOff = this.ctx.allocLocal(`__concat_recv_${this.nextLabelId()}`);
                 this.vm.store(VReg.FP, recvOff, VReg.RET); // 接收者（已在 RET）
@@ -601,22 +607,12 @@ export const BuiltinArrayMethodCompiler = {
                 // 接收者一定是数组
                 spreadArrInto(recvOff);
 
-                // 单个实参并入累加器(数组→展开元素,否则→单元素追加)。argOff = 存实参的 FP 槽。
+                // 单个实参并入累加器。使用 _concat_append_item 处理 IsConcatSpreadable。
                 const concatOneArg = (argOff) => {
-                    const pushLbl = this.ctx.newLabel("concat_push");
-                    const doneLbl = this.ctx.newLabel("concat_argdone");
-                    this.vm.load(VReg.V0, VReg.FP, argOff);
-                    this.vm.shrImm(VReg.V0, VReg.V0, 48);
-                    this.vm.cmpImm(VReg.V0, 0x7ffe); // 实参是数组？
-                    this.vm.jne(pushLbl);
-                    spreadArrInto(argOff);           // 数组：展开元素
-                    this.vm.jmp(doneLbl);
-                    this.vm.label(pushLbl);
-                    this.vm.load(VReg.A1, VReg.FP, argOff); // 非数组：单元素追加
                     this.vm.load(VReg.A0, VReg.FP, accOff);
-                    this.vm.call("_array_push");
+                    this.vm.load(VReg.A1, VReg.FP, argOff);
+                    this.vm.call("_concat_append_item");
                     this.vm.store(VReg.FP, accOff, VReg.RET);
-                    this.vm.label(doneLbl);
                 };
 
                 if (args.some((a) => a && a.type === "SpreadElement")) {
@@ -661,10 +657,21 @@ export const BuiltinArrayMethodCompiler = {
                     }
                 }
                 this.vm.load(VReg.RET, VReg.FP, accOff);
-                // 装箱为 0x7FFE 数组:acc(_array_new_with_size/_array_push 产)可能是裸指针,
-                // 未装箱则 typeof→"number"、JSON.stringify/console.log 误判为对象。数组结构
-                // (length/下标/join)本就工作(那些路径容裸指针),但标签敏感消费者需正确 tag。
                 this.vm.call("_box_arr_r"); // box->helper
+                this.vm.jmp(_ccSpecEnd);
+
+                // fallback: non-default species -> _agen_concat
+                this.vm.label(_ccSpecFb);
+                this.vm.load(VReg.A0, VReg.FP, _ccRecvSp);
+                for (let ci = 0; ci < Math.min(args.length, 4); ci++) {
+                    this.compileExpression(args[ci]);
+                    if (ci === 0) this.vm.mov(VReg.A1, VReg.RET);
+                    else if (ci === 1) this.vm.mov(VReg.A2, VReg.RET);
+                    else if (ci === 2) this.vm.mov(VReg.A3, VReg.RET);
+                    else if (ci === 3) this.vm.mov(VReg.A4, VReg.RET);
+                }
+                this.vm.call("_agen_concat");
+                this.vm.label(_ccSpecEnd);
                 break;
             }
             case "fill":
