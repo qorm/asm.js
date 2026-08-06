@@ -803,13 +803,10 @@ export const StatementParser = {
         if (this.peekTokenIs(TokenType.IDENT)) {
             this.nextToken();
             label = new AST.Identifier(this.curToken.literal);
-            // [test262 早期错误] 带标签的 break 也必须在循环或 switch 内部;
-            // 标签必须引用外层 IterationStatement 或 SwitchStatement。
-            if (this.loopDepth === 0 && this.switchDepth === 0) {
-                this.errors.push("Illegal break statement");
-            }
+            // break label can target any labelled statement (not just loop/switch).
+            // Only flag unlabelled break outside loop/switch as illegal.
         } else {
-            // [test262 早期错误] break(无标签)必须在循环或 switch 内部。
+            // [test262 early error] break (unlabelled) must be inside a loop or switch.
             if (this.loopDepth === 0 && this.switchDepth === 0) {
                 this.errors.push("Illegal break statement");
             }

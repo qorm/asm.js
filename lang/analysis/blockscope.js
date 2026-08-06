@@ -244,11 +244,15 @@ function bsPrescanLets(ownerNode, stmts, st, frame) {
                 if (bsFrameGet(frame, name)) {
                     throw new Error("SyntaxError: Identifier '" + name + "' has already been declared");
                 }
-                // [test262 早期错误] 块级 let/const 不得与同函数内 var 声明重名。
-                for (let si = st.scopes.length - 2; si >= st.fnScopeIdx; si--) {
-                    const outerRec = bsFrameGet(st.scopes[si], name);
-                    if (outerRec && outerRec.d && outerRec.v) {
-                        throw new Error("SyntaxError: Identifier '" + name + "' has already been declared");
+                // [test262 early error] In strict mode only: a block-level let/const
+                // must not shadow a var declared in the same function scope.
+                // In sloppy mode this is allowed (runtime semantics differ).
+                if (st.strict) {
+                    for (let si = st.scopes.length - 2; si >= st.fnScopeIdx; si--) {
+                        const outerRec = bsFrameGet(st.scopes[si], name);
+                        if (outerRec && outerRec.d && outerRec.v) {
+                            throw new Error("SyntaxError: Identifier '" + name + "' has already been declared");
+                        }
                     }
                 }
                 const nn = bsNewName(st, name);
@@ -625,7 +629,9 @@ function bsCheckConstReassign(node, st) {
     const t = node.type;
     if (t === "Identifier") {
         const rec = bsLookup(st, node.name);
-        if (rec && rec.c && rec.d) {
+        // Assignment to const is a SyntaxError only in strict mode.
+        // In sloppy mode it is a runtime TypeError, not an early error.
+        if (rec && rec.c && rec.d && st.strict) {
             throw new Error("SyntaxError: Assignment to constant variable.");
         }
         return;
@@ -658,10 +664,10 @@ function bsCheckConstReassign(node, st) {
 
 // 入口:对整份模块 AST 做一次改名(幂等:打 _blockScoped 标记防重入)。
 // 模块顶层的 let/const 不改名(它们参与导出绑定/_main_captured_ 标签等按名管道)。
-export function renameBlockScopedBindings(ast) {
+export function renameBlockScopedBindings(ast, strict) {
     if (!ast || ast._blockScoped) return ast;
     ast._blockScoped = 1;
-    const st = { c: 0, scopes: [], fnDepth: 0, fnScopeIdx: 0 };
+    const st = { c: 0, scopes: [], fnDepth: 0, fnScopeIdx: 0, strict: !!strict };
     const frame = bsPushFrame(st);
     const body = ast.body || [];
     for (let i = 0; i < body.length; i++) bsCollectStmtNames(body[i], st, frame, 0);

@@ -1299,7 +1299,7 @@ export class Compiler {
         }
         // [批次D] 块级作用域前置改名(let/const shadowing + TDZ 标记):
         // 在闭包分析/编译前跑,使所有按名解析的下游消费者天然一致。
-        renameBlockScopedBindings(ast);
+        renameBlockScopedBindings(ast, parser.inStrictMode());
         return ast;
     }
 

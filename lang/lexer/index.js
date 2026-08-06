@@ -19,8 +19,9 @@ export class Lexer {
         this.readChar();
 
         // 跳过 Shebang (#!)
+        // Hashbang comments are terminated by any LineTerminator: LF, CR, LS, PS.
         if (this.ch === "#" && this.peekChar() === "!") {
-            while (this.ch !== "\n" && this.ch !== "\0") {
+            while (this.ch !== "\n" && this.ch !== "\r" && this.ch !== "\0") {
                 this.readChar();
             }
             this.skipWhitespace();
@@ -388,6 +389,9 @@ export class Lexer {
                     result = result + "`";
                 } else if (this.ch === "$") {
                     result = result + "$";
+                } else if (this.ch === "0") {
+                    // \0 null character escape (cook = NUL, raw = "\\0")
+                    result = result + "\0";
                 } else if (this.ch === "x" || this.ch === "u") {
                     // \xNN / \uNNNN / \u{...} / 代理对 → cook 成 UTF-8 字节;raw 保留原样(String.raw/
                     // tagged)。raw 已含 "\\x"/"\\u"(见上);合法时补消费的字符到 raw。_peekHexEscape
@@ -485,7 +489,7 @@ export class Lexer {
                t === tt.SEMICOLON || t === tt.COLON || t === tt.LPAREN || t === tt.LBRACKET ||
                t === tt.LBRACE || t === tt.RBRACE || t === tt.QUESTION || t === tt.AND || t === tt.OR ||
                t === tt.RETURN || t === tt.YIELD || t === tt.IF || t === tt.ELSE || t === tt.DO ||
-               t === tt.WHILE || t === tt.FOR || t === tt.IN || t === tt.OF ||
+               t === tt.WHILE || t === tt.FOR || t === tt.IN ||
                t === tt.TYPEOF || t === tt.VOID || t === tt.THROW || t === tt.DELETE ||
                t === tt.CASE || t === tt.DEFAULT || t === tt.STRICT_EQ || t === tt.STRICT_NOT_EQ ||
                t === tt.EQ || t === tt.NOT_EQ || t === tt.LT || t === tt.GT ||
