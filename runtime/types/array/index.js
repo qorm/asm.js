@@ -3033,6 +3033,7 @@ export class ArrayGenerator {
         this.generateArrayIterator();
         this.generateArrayIteratorNext();
         this.generateArrayLikeCopy();
+        this.generateGetThis();
     }
 
     // 一等数组迭代器(`arr.values()`/`.keys()`/`.entries()`/`arr[Symbol.iterator]()`)。
@@ -3275,4 +3276,13 @@ export class ArrayGenerator {
         vm.or(VReg.RET, VReg.RET, VReg.V1);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 16);
     }
+    // [底层A] _get_this(): species getter helper - returns this (A5).
+    generateGetThis() {
+        const vm = this.vm;
+        vm.label("_get_this");
+        vm.prologue(0, []);
+        vm.mov(VReg.RET, VReg.A5);
+        vm.epilogue([], 0);
+    }
+
 }

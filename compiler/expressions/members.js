@@ -2667,6 +2667,54 @@ export const MemberCompiler = {
             vm.lea(VReg.V0, protoSlot);
             vm.load(VReg.RET, VReg.V0, 0);
         });
+        if (typeof cfg.speciesTmpSlot === "string") {
+            this._reEnsureSlot(cfg.speciesTmpSlot);
+            this.emitBuiltinFnClosure("_get_this");
+            vm.lea(VReg.V0, cfg.speciesTmpSlot);
+            vm.store(VReg.V0, 0, VReg.RET);
+            vm.lea(VReg.V0, cfg.speciesTmpSlot);
+            vm.load(VReg.A0, VReg.V0, 0);
+            this.emitBoxedStringKey("name", VReg.A1);
+            vm.lea(VReg.A2, this.asm.addString("get [Symbol.species]"));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+            vm.or(VReg.A2, VReg.A2, VReg.V1);
+            vm.call("_closure_prop_set");
+            vm.lea(VReg.V0, cfg.speciesTmpSlot);
+            vm.load(VReg.A0, VReg.V0, 0);
+            this.emitBoxedStringKey("length", VReg.A1);
+            vm.movImm(VReg.A2, 0);
+            vm.scvtf(0, VReg.A2);
+            vm.fmovToInt(VReg.A2, 0);
+            vm.call("_closure_prop_set");
+            vm.movImm(VReg.A0, 24);
+            vm.call("_alloc");
+            vm.mov(VReg.S0, VReg.RET);
+            vm.movImm(VReg.V1, TYPE_GETTER);
+            vm.store(VReg.S0, 0, VReg.V1);
+            vm.lea(VReg.V0, cfg.speciesTmpSlot);
+            vm.load(VReg.V1, VReg.V0, 0);
+            vm.movImm64(VReg.V2, PTR_MASK_BITS);
+            vm.and(VReg.V1, VReg.V1, VReg.V2);
+            vm.store(VReg.S0, 8, VReg.V1);
+            vm.movImm(VReg.V1, 0);
+            vm.store(VReg.S0, 16, VReg.V1);
+            vm.lea(VReg.A0, "_symwk_species");
+            vm.lea(VReg.A1, this.asm.addString("Symbol.species"));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+            vm.or(VReg.A1, VReg.A1, VReg.V1);
+            vm.call("_symbol_wellknown");
+            vm.mov(VReg.S1, VReg.RET);
+            vm.lea(VReg.V0, ctorSlot);
+            vm.load(VReg.A0, VReg.V0, 0);
+            vm.mov(VReg.A1, VReg.S1);
+            vm.mov(VReg.A2, VReg.S0);
+            vm.call("_closure_prop_set");
+            vm.lea(VReg.V0, ctorSlot);
+            vm.load(VReg.A0, VReg.V0, 0);
+            vm.mov(VReg.A1, VReg.S1);
+            vm.movImm(VReg.A2, ACCESSOR_PROP_ATTR);
+            vm.call("_closure_prop_set_attr");
+        }
         // RET = 装箱构造器(稳定身份)
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.RET, VReg.V0, 0);
@@ -2694,6 +2742,7 @@ export const MemberCompiler = {
             ctorSlot: "_nsobj_array", protoSlot: "_nsobj_array_proto",
             methods: ARRAY_PROTO_METHODS, sizeGetter: null,
             statics: ARRAY_STATIC_METHODS,
+            speciesTmpSlot: "_nsobj_array_tmp",
         });
     },
     // [底层A] `Array.prototype` 值读:原型槽已填则直接用,否则整体物化。
