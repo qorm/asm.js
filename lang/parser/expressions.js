@@ -72,6 +72,9 @@ export const ExpressionParser = {
         }
         // 检查是否是无括号单参数箭头函数: x => expr
         if (this.peekTokenIs(TokenType.ARROW)) {
+            // [test262 早期错误 A] 裸箭头形参绑定位校验:strict 保留字/生成器/异步门控。
+            this.checkYieldAwaitBinding(ident.name);
+            this.checkReservedBinding(ident.name);
             this.nextToken(); // 消费 =>
             return this.parseArrowFunctionBody([ident]);
         }
@@ -909,7 +912,13 @@ export const ExpressionParser = {
                 // [test262 早期错误 A] lexical 仅透传给嵌套对象模式;数组绑定位本身无检查(既有缺口)。
                 if (this.curTokenIs(TokenType.LBRACE)) restTarget = this.parseObjectPattern(lexical);
                 else if (this.curTokenIs(TokenType.LBRACKET)) restTarget = this.parseArrayPattern(lexical);
-                else restTarget = new AST.Identifier(this.curToken.literal);
+                else {
+                    // [test262 早期错误 A] 数组 rest 绑定位校验:保留字/strict/yield/await/let 门控。
+                    this.checkYieldAwaitBinding(this.curToken.literal);
+                    this.checkReservedBinding(this.curToken.literal);
+                    this.checkLexicalLetBinding(this.curToken.literal, lexical);
+                    restTarget = new AST.Identifier(this.curToken.literal);
+                }
                 pattern.elements.push(new AST.SpreadElement(restTarget));
                 restSeen = true;   // [test262 S1] rest 必须末位:此后任何元素/空位皆早期错误
                 // [test262 S1] BindingRestElement 不得带初值:`[...x = 1]` / `[...[x] = []]` 皆早期错误。
@@ -927,8 +936,12 @@ export const ExpressionParser = {
                 } else {
                     pattern.elements.push(sub);
                 }
-            } else if (this.curTokenIs(TokenType.IDENT)) {
+            } else if (this.isBindingWordToken(this.curToken)) {
                 if (restSeen) this.errors.push("Rest element must be last element");
+                // [test262 早期错误 A] 数组绑定位校验:保留字/strict/yield/await/let 门控。
+                this.checkYieldAwaitBinding(this.curToken.literal);
+                this.checkReservedBinding(this.curToken.literal);
+                this.checkLexicalLetBinding(this.curToken.literal, lexical);
                 if (this.peekTokenIs(TokenType.ASSIGN)) {
                     // [#34] 默认值 [a = 9, ...]:ASSIGN-1(=COMMA)防吞逗号(同形参)
                     const did = new AST.Identifier(this.curToken.literal);
@@ -1244,6 +1257,7 @@ export const ExpressionParser = {
         if (this.curTokenIs(TokenType.IDENT)) {
             this.fnAsyncDepth++;   // [test262 S1] async x => 单参在异步上下文
             this.checkYieldAwaitBinding(this.curToken.literal);
+            this.checkReservedBinding(this.curToken.literal);
             let param = new AST.Identifier(this.curToken.literal);
             if (this.peekTokenIs(TokenType.ARROW)) {
                 this.nextToken();

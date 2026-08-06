@@ -156,6 +156,7 @@ export const StatementParser = {
         this.nextToken(); // 越过标识符，当前为 ':'
         this.nextToken(); // 越过 ':'，当前为被标注语句的首 token
         let body = this.parseStatement();
+        this.checkStatementBody(body);   // [test262 早期错误] label: const/let/function 声明非法
         return new AST.LabeledStatement(label, body);
     },
 
@@ -541,6 +542,26 @@ export const StatementParser = {
         return stmt;
     },
 
+    // [test262 早期错误] 检查单语句位置不允许的词法/函数声明。
+    // isIfBody: 仅在 if 语句体中 sloppy 普通函数声明按 Annex B 放行;其他位置一律拒。
+    checkStatementBody(stmt, isIfBody = false) {
+        if (!stmt) return;
+        if (stmt.type === "VariableDeclaration") {
+            if (stmt.kind === "let" || stmt.kind === "const") {
+                this.errors.push("Lexical declaration cannot be used in a single-statement context");
+            }
+        } else if (stmt.type === "FunctionDeclaration") {
+            if (this.inStrictMode()) {
+                this.errors.push("Function declaration cannot be used in a single-statement context (strict mode)");
+            } else if (stmt.isAsync || stmt.isGenerator) {
+                this.errors.push("Async function or generator declaration cannot be used in a single-statement context");
+            } else if (!isIfBody) {
+                // Annex B: sloppy regular function decls only allowed as if-statement body or top-level/block
+                this.errors.push("Function declaration cannot be used in a single-statement context");
+            }
+        }
+    },
+
     parseIfStatement() {
         if (!this.expectPeek(TokenType.LPAREN)) return null;
         this.nextToken();
@@ -548,6 +569,7 @@ export const StatementParser = {
         if (!this.expectPeek(TokenType.RPAREN)) return null;
         this.nextToken();
         let consequent = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
+        this.checkStatementBody(consequent, true);   // [test262 早期错误] if-body Annex B 放行 sloppy 普通函数
         let alternate = null;
         if (this.peekTokenIs(TokenType.ELSE)) {
             this.nextToken();
@@ -558,6 +580,7 @@ export const StatementParser = {
                 alternate = this.parseBlockStatement();
             } else {
                 alternate = this.parseStatement();
+                this.checkStatementBody(alternate, true);   // [test262 早期错误] else-body 同 if-body
             }
         }
         return new AST.IfStatement(test, consequent, alternate);
@@ -586,6 +609,7 @@ export const StatementParser = {
                 this.nextToken();
                 this.loopDepth++;
                 let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
+                this.checkStatementBody(body);   // [test262 早期错误] for-body 单语句位
                 this.loopDepth--;
                 return new AST.ForInStatement(init, right, body);
             }
@@ -598,10 +622,20 @@ export const StatementParser = {
                 this.nextToken();
                 this.loopDepth++;
                 let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
+                this.checkStatementBody(body);   // [test262 早期错误] for-body 单语句位
                 this.loopDepth--;
                 return new AST.ForInStatement(init, right, body);
             }
             if (this.peekTokenIs(TokenType.OF)) {
+                // [test262 早期错误] for-await-of 的 ForBinding 不得带初值。
+                if (isAwait && init && init.type === "VariableDeclaration") {
+                    for (const d of init.declarations) {
+                        if (d.init) {
+                            this.errors.push("Initializer is not allowed in for-await-of head's ForBinding position");
+                            break;
+                        }
+                    }
+                }
                 this.nextToken();
                 this.nextToken();
                 let right = this.parseExpression(Precedence.LOWEST);
@@ -609,6 +643,7 @@ export const StatementParser = {
                 this.nextToken();
                 this.loopDepth++;
                 let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
+                this.checkStatementBody(body);   // [test262 早期错误] for-body 单语句位
                 this.loopDepth--;
                 return new AST.ForOfStatement(init, right, body, isAwait);
             }
@@ -628,6 +663,7 @@ export const StatementParser = {
                 this.nextToken();
                 this.loopDepth++;
                 let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
+                this.checkStatementBody(body);   // [test262 早期错误] for-body 单语句位
                 this.loopDepth--;
                 return new AST.ForOfStatement(init, right, body, isAwait);
             }
@@ -642,6 +678,7 @@ export const StatementParser = {
                 this.nextToken();   // 移到 body
                 this.loopDepth++;
                 let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
+                this.checkStatementBody(body);   // [test262 早期错误] for-body 单语句位
                 this.loopDepth--;
                 return new AST.ForInStatement(left, right, body);
             }
@@ -673,6 +710,7 @@ export const StatementParser = {
         this.nextToken();
         this.loopDepth++;
         let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
+        this.checkStatementBody(body);   // [test262 早期错误] while/do-body 单语句位
         this.loopDepth--;
         return new AST.ForStatement(init, test, update, body);
     },
@@ -685,6 +723,7 @@ export const StatementParser = {
         this.nextToken();
         this.loopDepth++;
         let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
+        this.checkStatementBody(body);   // [test262 早期错误] while/do-body 单语句位
         this.loopDepth--;
         return new AST.WhileStatement(test, body);
     },
@@ -701,6 +740,7 @@ export const StatementParser = {
         if (!this.expectPeek(TokenType.RPAREN)) return null;
         this.nextToken();
         let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
+        this.checkStatementBody(body);   // [test262 早期错误] with-body 单语句位
         return new AST.WithStatement(object, body);
     },
 
@@ -708,6 +748,7 @@ export const StatementParser = {
         this.nextToken();
         this.loopDepth++;
         let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
+        this.checkStatementBody(body);   // [test262 早期错误] while/do-body 单语句位
         this.loopDepth--;
         if (!this.expectPeek(TokenType.WHILE)) return null;
         if (!this.expectPeek(TokenType.LPAREN)) return null;
