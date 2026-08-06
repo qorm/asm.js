@@ -1005,6 +1005,7 @@ export const ExpressionParser = {
                 properties.push(new AST.SpreadElement(this.parseExpression(Precedence.ASSIGN - 1)));
                 if (this.peekTokenIs(TokenType.COMMA)) {
                     this.nextToken();
+                    if (this.peekTokenIs(TokenType.RBRACE)) break;
                     this.nextToken();
                 } else {
                     break;
