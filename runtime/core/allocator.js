@@ -2546,6 +2546,8 @@ export class AllocatorGenerator {
             // for-of IteratorClose(提前 break/error 时调 iterator.return())
             "_iterator_close",
             "_box_obj_r",
+            "_object_normalize_order",
+            "_intToStr", "_is_symbol", "_array_spread_into",
         ];
         vm.label("_engine_symaddr");
         vm.prologue(0, []);

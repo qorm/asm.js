@@ -110,6 +110,11 @@ export const SYM_IDS = {
     _iterator_close: 113,
     // box_obj_r: RET = (RET & PAYLOAD) | OBJECT_TAG(装箱为 JS 对象)
     _box_obj_r: 114,
+    // for-in 属性序归一(_object_normalize_order):ES[[OwnPropertyKeys]]整数键升序,供片段
+    // for-in/for-of 迭代器路径使用。与 allocator.js generateEngineSymaddr 严格同序。
+    _object_normalize_order: 115,
+    // for-in 数组索引→字符串键(_intToStr);符号判断(_is_symbol);迭代器展开(_array_spread_into)
+    _intToStr: 116, _is_symbol: 117, _array_spread_into: 118,
 };
 
 // 宿主可变数据全局:引用它们须运行时取宿主地址(不可内联常量)。见 compileFragment
