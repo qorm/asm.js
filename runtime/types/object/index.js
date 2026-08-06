@@ -1748,6 +1748,18 @@ export class ObjectGenerator {
         vm.epilogue([], 16);
 
         vm.label("_aref_obj_valueOf");
+        // [fix] ToObject 语义:null/undefined this → TypeError
+        vm.shrImm(VReg.V1, VReg.A0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFA); // null
+        vm.jeq("_aref_vof_nullish");
+        vm.cmpImm(VReg.V1, 0x7FFB); // undefined
+        vm.jne("_aref_vof_ok");
+        vm.label("_aref_vof_nullish");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot convert undefined or null to object"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error"); // 不返回
+        vm.label("_aref_vof_ok");
         vm.mov(VReg.RET, VReg.A0); // 恒等(叶子,无调用,LR 保持)
         vm.ret();
     }
@@ -3622,9 +3634,21 @@ export class ObjectGenerator {
         vm.mov(VReg.S1, VReg.RET);
         vm.label("_object_has_key_ok");
 
+        // [fix] ToObject 语义:null/undefined target → TypeError(ES 20.1.2.2 step 1)
+        vm.shrImm(VReg.V1, VReg.S0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFA); // null
+        vm.jeq("_object_has_nullish");
+        vm.cmpImm(VReg.V1, 0x7FFB); // undefined
+        vm.jeq("_object_has_nullish");
+        vm.jmp("_object_has_tagchk");
+        vm.label("_object_has_nullish");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot convert undefined or null to object"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error"); // 不返回
         // 类型标签守卫:仅对象(0x7FFD)/数组(0x7FFE)/函数(0x7FFF)/裸堆指针(高16=0)才查属性;
         // 数字/布尔等非容器返回 0(否则脱壳成垃圾地址解引用崩,如 with(非对象) / 误用 hasOwn)。
-        vm.shrImm(VReg.V1, VReg.S0, 48);
+        vm.label("_object_has_tagchk");
         vm.cmpImm(VReg.V1, 0);
         vm.jeq("_object_has_tagok");
         vm.cmpImm(VReg.V1, 0x7FFD);
@@ -7520,10 +7544,23 @@ export class ObjectGenerator {
 
     // obj.propertyIsEnumerable(key) -> js_true/js_false。own 属性的 enumerable 位;
     // 非 own(或非对象)→ false。
+    // [fix] ToObject 语义:null/undefined this → TypeError
     generateObjectPropertyIsEnumerable() {
         const vm = this.vm;
         vm.label("_object_propertyIsEnumerable");
         vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        // [fix] null/undefined this → TypeError(ToObject)
+        vm.shrImm(VReg.V1, VReg.A0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFA); // null
+        vm.jeq("_opie_nullish");
+        vm.cmpImm(VReg.V1, 0x7FFB); // undefined
+        vm.jne("_opie_notnull");
+        vm.label("_opie_nullish");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot convert undefined or null to object"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error"); // 不返回
+        vm.label("_opie_notnull");
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.S0, VReg.A0, VReg.V1); // raw obj
         vm.mov(VReg.S1, VReg.A1); // key boxed
