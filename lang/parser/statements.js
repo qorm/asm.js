@@ -117,9 +117,16 @@ export const StatementParser = {
             // 两个相邻标识符在标准 JS 中不可能合法,语法空间干净;js 在其它位置
             // (const js=1 / js(x) / js.m() / js\nf())仍是普通标识符(上下文关键字,同 async)。
             return this.parseSpawnStatement();
-        } else if (this.curTokenIs(TokenType.IDENT) && this.peekTokenIs(TokenType.COLON)) {
+        } else if ((this.curTokenIs(TokenType.IDENT) ||
+                    (this.curTokenIs(TokenType.YIELD) && !this._immediateGen) ||
+                    (this.curTokenIs(TokenType.AWAIT) && !this._immediateAsync)) &&
+                   this.peekTokenIs(TokenType.COLON)) {
             // 标签语句 `label: stmt`。语句起始位置的 `IDENT :` 唯一解为标签
             // （三元的 `:` 前必有 `?`;对象字面量不能作语句首)。
+            // [test262 parser-edge] 未转义的 yield/await 由词法归为 YIELD/AWAIT 记号,
+            // 非生成器/非异步上下文中可作标识符(包括标签 `yield:`),故一并识别。
+            // 生成器/异步体内 yield/await 是关键词,落 parseExpressionStatement → 前缀
+            // parseYieldExpression/parseAwaitExpression 正确处理,不误进标签路径。
             return this.parseLabeledStatement();
         } else {
             return this.parseExpressionStatement();
@@ -534,7 +541,20 @@ export const StatementParser = {
         if (!this.expectPeek(TokenType.LPAREN)) return null;
         this.nextToken();
         let init = null;
+        // [test262 parser-edge] `for (let in {}) {}` (sloppy): let 后即 in → let 是表达式
+        // 标识符而非声明关键词。LET token 无表达式前缀处理函数,故在此直接分派:
+        // 手动构造 Identifier,消费 in,解析右侧表达式,返回 ForInStatement。
         if (this.curTokenIs(TokenType.LET) || this.curTokenIs(TokenType.CONST) || this.curTokenIs(TokenType.VAR)) {
+            if (this.curTokenIs(TokenType.LET) && this.peekTokenIs(TokenType.IN)) {
+                init = new AST.Identifier("let");
+                this.nextToken(); // 越过 let, cur = IN
+                this.nextToken(); // 越过 in, cur = 右侧表达式首 token
+                let right = this.parseExpression(Precedence.LOWEST);
+                if (!this.expectPeek(TokenType.RPAREN)) return null;
+                this.nextToken();
+                let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
+                return new AST.ForInStatement(init, right, body);
+            }
             init = this.parseVariableDeclaration();
             if (this.peekTokenIs(TokenType.IN)) {
                 this.nextToken();

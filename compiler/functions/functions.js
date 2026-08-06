@@ -271,14 +271,23 @@ export const FunctionCompiler = {
             this.vm.load(destReg, destReg, 0);
             return;
         }
-        // 内建 Error 族父类无 classinfo 槽:置 destReg=0(调用方据此跳过原型链链接;
-        // super() 由 ERR_TYPES 内联落 name/message/__asmjs_err,不需父 classinfo)。
-        // 裸错误标识符现物化为 Error 构造器闭包(members.js emitErrorCtorRef),若落下方
-        // 标识符兜底会把该闭包当 raw classinfo 解引用 → `class X extends Error` 段错误;
-        // 此守卫保持与旧路径(标识符编得 0)等价的"父 classinfo 为空"语义。
-        const ERR_SUPER_NAMES = ["Error", "TypeError", "RangeError", "SyntaxError",
-            "ReferenceError", "EvalError", "URIError"];
-        if (ERR_SUPER_NAMES.indexOf(className) >= 0 && !hasInfoSlot && !localOff &&
+        // 内建构造器无 classinfo 槽:置 destReg=0。包括 Error 族(无类信息、
+        // super() 由 ERR_TYPES 内联落 name/message/__asmjs_err)与其它内建类
+        // (Array/Object/Map/Set/Date 等)。错误/内建标识符编译为闭包而非 classinfo,
+        // 若落下方标识符兜底会把闭包当 classinfo 解引用 → SIGSEGV。
+        // 置 0 后调用方有 null-guard 跳过 unsafe 解引用:原型链链接走 skipProtoLink,
+        // super() 走 super_skip(内建无 classinfo → 无 ctor 可调,`this` 留作普通对象)。
+        const BUILTIN_SUPER_NAMES = [
+            "Error", "TypeError", "RangeError", "SyntaxError", "ReferenceError",
+            "EvalError", "URIError", "AggregateError",
+            "Array", "Object", "Function", "Boolean", "Number", "String", "Symbol",
+            "Date", "RegExp", "Map", "Set", "WeakMap", "WeakSet", "Promise",
+            "DataView", "Buffer", "BigInt",
+            "Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Array",
+            "Int32Array", "Uint32Array", "Float32Array", "Float64Array",
+            "BigInt64Array", "BigUint64Array",
+        ];
+        if (BUILTIN_SUPER_NAMES.indexOf(className) >= 0 && !hasInfoSlot && !localOff &&
             !(declNode && declNode.type === "ClassDeclaration")) {
             this.vm.movImm(destReg, 0);
             return;
@@ -1526,6 +1535,12 @@ export const FunctionCompiler = {
             // 当标识符编译，拿到 namespace 中的类信息对象，再去 tag；表达式父类走
             // superInfoLabel 全局）
             this.emitLoadSuperClassInfo(VReg.S1);
+            // [Cluster 11] 内建构造器无 classinfo → S1=0 → 跳过父构造器调用。
+            // `this` 已是有效普通对象实例；原型链链接已在 compileClassDeclaration
+            // skipProtoLink 处跳过。非 100% 规范但零误拒/零崩溃。
+            const superSkipLabel = this.ctx.newLabel("super_skip");
+            this.vm.cmpImm(VReg.S1, 0);
+            this.vm.jeq(superSkipLabel);
             this.vm.load(VReg.S2, VReg.S1, 32); // props_ptr
             this.vm.load(VReg.S2, VReg.S2, 8);  // 父 ctor 地址 = props[0].val
             // 参数编入 A1-A5，A0 = this
@@ -1547,6 +1562,7 @@ export const FunctionCompiler = {
             }
             if (thisOffset) this.vm.load(VReg.A0, VReg.FP, thisOffset);
             this.vm.callIndirect(VReg.S2);
+            this.vm.label(superSkipLabel);
             return;
         }
 

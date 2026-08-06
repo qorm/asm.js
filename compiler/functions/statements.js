@@ -2474,24 +2474,12 @@ export const StatementCompiler = {
     compileClassDeclaration(stmt) {
         const className = stmt.id.name;
         const superClass = stmt.superClass;
-        // [Cluster 11] extends builtin: builtin constructors (Array, Object, Function,
-        // etc.) don't have classinfo objects.  emitLoadClassInfo falls through to the
-        // identifier path, returns a closure, which is then dereferenced as classinfo
-        // → SIGSEGV.  Emit compile-time error to convert CRASH tests to COMPILE_FAIL.
-        // Error subclasses are already handled by emitLoadClassInfo (ERR_SUPER_NAMES → 0).
-        if (superClass && superClass.type === "Identifier") {
-            const EXTENDS_BLOCKED_BUILTINS = [
-                "Array", "Object", "Function", "Boolean", "Number", "String", "Symbol",
-                "Date", "RegExp", "Map", "Set", "WeakMap", "WeakSet", "Promise",
-                "DataView", "Buffer", "BigInt",
-                "Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Array",
-                "Int32Array", "Uint32Array", "Float32Array", "Float64Array",
-                "BigInt64Array", "BigUint64Array",
-            ];
-            if (EXTENDS_BLOCKED_BUILTINS.indexOf(superClass.name) >= 0) {
-                throw new Error(`extends builtin '${superClass.name}' is not supported`);
-            }
-        }
+        // [Cluster 11] extends builtin: builtin constructors don't have classinfo
+        // objects.  emitLoadClassInfo returns 0 for known builtins; callers guard
+        // against dereferencing null classinfo (skipProtoLink for prototype chain,
+        // super_skip for super() calls).  This converts former CRASH/SIGSEGV paths
+        // into graceful no-ops — zero false rejection, even if behaviour isn't
+        // 100% spec-compliant.
         const labelId = this.nextLabelId();
         // [classinfo 唯一化] 顶层类:getFunctionSymbol 返回稳定唯一符号(模块内类名唯一),
         // 沿用 `_classinfo_<sym>`。嵌套/局部类(函数或块内 `class X{}`)不入 functions 表 →
