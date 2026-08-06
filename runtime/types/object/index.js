@@ -5558,6 +5558,38 @@ export class ObjectGenerator {
     generateGetPrototypeOf() {
         const vm = this.vm;
 
+        // _nsobj_array_proto data slot (lazy, filled by _ensure_array_proto or emitArrayCtorObject).
+        vm.asm.addDataLabel("_nsobj_array_proto");
+        vm.asm.addDataQword(0);
+
+        // _ensure_array_proto: fill _nsobj_array_proto if empty.
+        vm.label("_ensure_array_proto");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.lea(VReg.V0, "_nsobj_array_proto");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_eap_done");
+        vm.movImm(VReg.A0, 56);
+        vm.call("_alloc");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.movImm(VReg.V1, 2); /* TYPE_OBJECT */
+        vm.store(VReg.S2, 0, VReg.V1);
+        vm.movImm(VReg.V1, 0);
+        vm.store(VReg.S2, 8, VReg.V1);
+        vm.store(VReg.S2, 16, VReg.V1);
+        vm.store(VReg.S2, 24, VReg.V1);
+        vm.store(VReg.S2, 32, VReg.V1);
+        vm.store(VReg.S2, 40, VReg.V1);
+        vm.store(VReg.S2, 48, VReg.V1);
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V0, VReg.S2, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+        vm.or(VReg.V0, VReg.V0, VReg.V1);
+        vm.lea(VReg.V1, "_nsobj_array_proto");
+        vm.store(VReg.V1, 0, VReg.V0);
+        vm.label("_eap_done");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+
         vm.label("_object_getPrototypeOf");
         vm.prologue(32, [VReg.S0, VReg.S1]);
 
@@ -5601,6 +5633,10 @@ export class ObjectGenerator {
         vm.loadByte(VReg.V0, VReg.S1, 0);
         vm.cmpImm(VReg.V0, TYPE_PROXY);
         vm.jeq("_gpo_proxy");
+        // Array(type=1) has no __proto__ slot (layout: type@0,length@8,capacity@16,data_ptr@24).
+        // Reading capacity as __proto__ pointer causes SIGSEGV.
+        vm.cmpImm(VReg.V0, 1); /* TYPE_ARRAY */
+        vm.jeq("_gpo_array");
 
         // 加载 __proto__
         vm.load(VReg.RET, VReg.S1, 16); // RET = __proto__ (裸指针)
@@ -5622,6 +5658,15 @@ export class ObjectGenerator {
         vm.epilogue([VReg.S0, VReg.S1], 32);
         vm.label("_object_getPrototypeOf_fn");
         // RET 已是裸 classinfo 指针,原样返回(与类值表示一致)
+        vm.epilogue([VReg.S0, VReg.S1], 32);
+
+        // Array prototype: lazy ensure then return.
+        vm.label("_gpo_array");
+        vm.call("_ensure_array_proto");
+        vm.lea(VReg.V0, "_nsobj_array_proto");
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_object_getPrototypeOf_null");
         vm.epilogue([VReg.S0, VReg.S1], 32);
 
         // 原型为空 → 规范 null 单例(旧实现返裸 0,`gPO(Object.create(null)) === null` 恒假)
