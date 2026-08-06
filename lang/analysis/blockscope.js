@@ -58,9 +58,9 @@ function bsLookup(st, name) {
 
 // 恒等注册:该名字在本帧“可见但不改名”(参数/var/函数顶层 let/函数名/catch 参)
 // —— 用于遮挡外层块的改名映射。
-function bsRegIdentity(st, frame, name) {
+function bsRegIdentity(st, frame, name, isConst, isVar) {
     if (!bsRenameable(name)) return;
-    frame.m[name] = { bs: 1, n: null, d: true, f: st.fnDepth, blk: null, t: 0 };
+    frame.m[name] = { bs: 1, n: null, d: true, f: st.fnDepth, blk: null, t: 0, c: isConst || false, v: isVar || false };
 }
 
 // 收集 pattern 里的绑定 Identifier 节点(顺带拆开 shorthand 的 key/value 共享节点,
@@ -146,11 +146,13 @@ function bsCollectStmtNames(node, st, frame, depth) {
     if (t === "VariableDeclaration") {
         const isLet = node.kind === "let" || node.kind === "const";
         if (!isLet || depth === 0) {
+            const isConstDecl = node.kind === "const";
+            const isVarDecl = node.kind === "var";
             const decls = node.declarations || [];
             for (let i = 0; i < decls.length; i++) {
                 const ids = [];
                 bsPatternIdents(decls[i].id, ids);
-                for (let j = 0; j < ids.length; j++) bsRegIdentity(st, frame, ids[j].name);
+                for (let j = 0; j < ids.length; j++) bsRegIdentity(st, frame, ids[j].name, isConstDecl, isVarDecl);
             }
         }
         return;
@@ -219,7 +221,14 @@ function bsPrescanLets(ownerNode, stmts, st, frame) {
         const s = stmts[i];
         if (!s) continue;
         if (s.type === "FunctionDeclaration" || s.type === "ClassDeclaration") {
-            if (s.id && s.id.type === "Identifier") bsRegIdentity(st, frame, s.id.name);
+            if (s.id && s.id.type === "Identifier") {
+                const name = s.id.name;
+                // [test262 早期错误] 函数/类声明名与同块内的 let/const 声明冲突。
+                if (bsFrameGet(frame, name)) {
+                    throw new Error("SyntaxError: Identifier '" + name + "' has already been declared");
+                }
+                bsRegIdentity(st, frame, name);
+            }
             continue;
         }
         if (s.type !== "VariableDeclaration") continue;
@@ -231,9 +240,19 @@ function bsPrescanLets(ownerNode, stmts, st, frame) {
             for (let k = 0; k < ids.length; k++) {
                 const name = ids[k].name;
                 if (!bsRenameable(name)) continue;
-                if (bsFrameGet(frame, name)) continue; // 同块重复 let:复用首个映射(偏差:不报错)
+                // [test262 早期错误] 同块内重复 let/const 声明应报 SyntaxError。
+                if (bsFrameGet(frame, name)) {
+                    throw new Error("SyntaxError: Identifier '" + name + "' has already been declared");
+                }
+                // [test262 早期错误] 块级 let/const 不得与同函数内 var 声明重名。
+                for (let si = st.scopes.length - 2; si >= st.fnScopeIdx; si--) {
+                    const outerRec = bsFrameGet(st.scopes[si], name);
+                    if (outerRec && outerRec.d && outerRec.v) {
+                        throw new Error("SyntaxError: Identifier '" + name + "' has already been declared");
+                    }
+                }
                 const nn = bsNewName(st, name);
-                frame.m[name] = { bs: 1, n: nn, d: false, f: st.fnDepth, blk: ownerNode, t: 0 };
+                frame.m[name] = { bs: 1, n: nn, d: false, f: st.fnDepth, blk: ownerNode, t: 0, c: s.kind === "const" };
             }
         }
     }
@@ -433,7 +452,9 @@ function bsWalkTry(node, st) {
 
 function bsWalkFunction(fn, st) {
     st.fnDepth = st.fnDepth + 1;
+    const prevFnScopeIdx = st.fnScopeIdx;
     const frame = bsPushFrame(st);
+    st.fnScopeIdx = st.scopes.length - 1;
     if (fn.id && fn.id.type === "Identifier") bsRegIdentity(st, frame, fn.id.name);
     const params = fn.params || [];
     for (let i = 0; i < params.length; i++) {
@@ -460,6 +481,7 @@ function bsWalkFunction(fn, st) {
     }
     bsPopFrame(st);
     st.fnDepth = st.fnDepth - 1;
+    st.fnScopeIdx = prevFnScopeIdx;
 }
 
 function bsWalkClass(cls, st) {
@@ -572,6 +594,19 @@ function bsWalkExpr(node, st) {
         bsWalkExpr(node.value, st);
         return;
     }
+    if (t === "AssignmentExpression") {
+        // [const-reassign] 检查左值是否是对 const 绑定的赋值
+        bsCheckConstReassign(node.left, st);
+        bsWalkExpr(node.left, st);
+        bsWalkExpr(node.right, st);
+        return;
+    }
+    if (t === "UpdateExpression") {
+        // [const-reassign] 检查 ++/-- 的操作数是否是对 const 绑定的赋值
+        bsCheckConstReassign(node.argument, st);
+        bsWalkExpr(node.argument, st);
+        return;
+    }
     if (t === "MetaProperty" || t === "Literal" || t === "RegexLiteral" ||
         t === "ThisExpression" || t === "SuperExpression" || t === "PrivateIdentifier") {
         return;
@@ -584,12 +619,49 @@ function bsWalkExpr(node, st) {
     }
 }
 
+// [const-reassign] 递归检查赋值/更新左值是否引用了 const 绑定(SyntaxError)。
+function bsCheckConstReassign(node, st) {
+    if (!node) return;
+    const t = node.type;
+    if (t === "Identifier") {
+        const rec = bsLookup(st, node.name);
+        if (rec && rec.c && rec.d) {
+            throw new Error("SyntaxError: Assignment to constant variable.");
+        }
+        return;
+    }
+    if (t === "AssignmentPattern") {
+        bsCheckConstReassign(node.left, st);
+        return;
+    }
+    if (t === "ArrayExpression" || t === "ArrayPattern") {
+        const els = node.elements || [];
+        for (let i = 0; i < els.length; i++) bsCheckConstReassign(els[i], st);
+        return;
+    }
+    if (t === "ObjectExpression" || t === "ObjectPattern") {
+        const props = node.properties || [];
+        for (let i = 0; i < props.length; i++) {
+            const p = props[i];
+            if (!p) continue;
+            if (p.type === "SpreadElement") bsCheckConstReassign(p.argument, st);
+            else bsCheckConstReassign(p.value, st);
+        }
+        return;
+    }
+    if (t === "SpreadElement") {
+        bsCheckConstReassign(node.argument, st);
+        return;
+    }
+    // MemberExpression / CallExpression 等不涉及 const 绑定
+}
+
 // 入口:对整份模块 AST 做一次改名(幂等:打 _blockScoped 标记防重入)。
 // 模块顶层的 let/const 不改名(它们参与导出绑定/_main_captured_ 标签等按名管道)。
 export function renameBlockScopedBindings(ast) {
     if (!ast || ast._blockScoped) return ast;
     ast._blockScoped = 1;
-    const st = { c: 0, scopes: [], fnDepth: 0 };
+    const st = { c: 0, scopes: [], fnDepth: 0, fnScopeIdx: 0 };
     const frame = bsPushFrame(st);
     const body = ast.body || [];
     for (let i = 0; i < body.length; i++) bsCollectStmtNames(body[i], st, frame, 0);

@@ -755,6 +755,11 @@ export const StatementParser = {
         if (this.peekTokenIs(TokenType.IDENT)) {
             this.nextToken();
             label = new AST.Identifier(this.curToken.literal);
+            // [test262 早期错误] 带标签的 break 也必须在循环或 switch 内部;
+            // 标签必须引用外层 IterationStatement 或 SwitchStatement。
+            if (this.loopDepth === 0 && this.switchDepth === 0) {
+                this.errors.push("Illegal break statement");
+            }
         } else {
             // [test262 早期错误] break(无标签)必须在循环或 switch 内部。
             if (this.loopDepth === 0 && this.switchDepth === 0) {
@@ -770,6 +775,11 @@ export const StatementParser = {
         if (this.peekTokenIs(TokenType.IDENT)) {
             this.nextToken();
             label = new AST.Identifier(this.curToken.literal);
+            // [test262 早期错误] 带标签的 continue 也必须在循环内部;
+            // 标签必须引用外层 IterationStatement(switch 不可)。
+            if (this.loopDepth === 0) {
+                this.errors.push("Illegal continue statement");
+            }
         } else {
             // [test262 早期错误] continue(无标签)必须在循环内部(switch 内不可)。
             if (this.loopDepth === 0) {
