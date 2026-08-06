@@ -206,9 +206,14 @@ export const StatementParser = {
             id = new AST.Identifier(this.curToken.literal);
         }
         if (!this.expectPeek(TokenType.LPAREN)) return null;
-        // [test262 S1] 进入生成器/异步深度:覆盖形参 + 体内 var 绑定的 yield/await 早期错误校验
+        // [test262 S1] 进入生成器/异步深度:覆盖形参 + 体内 var 的 yield/await 早期错误校验
         if (isGenerator) this.fnGenDepth++;
         if (isAsync) this.fnAsyncDepth++;
+        // 紧邻包围函数生成器/异步标志:yield/await 仅在紧邻函数是 generator/async 时是关键词
+        const prevImmediateGen = this._immediateGen;
+        const prevImmediateAsync = this._immediateAsync;
+        this._immediateGen = isGenerator;
+        this._immediateAsync = isAsync;
         // [Wave 8] 函数边界:字段初始化器上下文在函数声明内复位,返回前须恢复。
         // [L2-④] _inFormalParams 同理:嵌套函数内 await/yield 合法,边界复位。
         const prevInFieldInit = this._inFieldInit;
@@ -219,6 +224,8 @@ export const StatementParser = {
         if (!this.expectPeek(TokenType.LBRACE)) {
             if (isGenerator) this.fnGenDepth--;
             if (isAsync) this.fnAsyncDepth--;
+            this._immediateGen = prevImmediateGen;
+            this._immediateAsync = prevImmediateAsync;
             this._inFieldInit = prevInFieldInit;
             this._inFormalParams = prevInFormal;
             return null;
@@ -231,6 +238,8 @@ export const StatementParser = {
         if (isStrict) this.fnStrictDepth--;
         if (isGenerator) this.fnGenDepth--;
         if (isAsync) this.fnAsyncDepth--;
+        this._immediateGen = prevImmediateGen;
+        this._immediateAsync = prevImmediateAsync;
         this._inFieldInit = prevInFieldInit;
         this._inFormalParams = prevInFormal;
         return new AST.FunctionDeclaration(id, params, body, isAsync, isGenerator);
@@ -239,10 +248,10 @@ export const StatementParser = {
     // [test262 S1] yield/await 作绑定标识符(形参/var 名)在生成器/异步函数内是早期错误
     // (作 yield/await 表达式合法,故只在绑定名校验);strict 下 eval/arguments 不可作绑定名。
     checkYieldAwaitBinding(name) {
-        if (name === "yield" && this.fnGenDepth > 0) {
+        if (name === "yield" && this._immediateGen) {
             this.errors.push("Cannot use 'yield' as a binding name inside a generator");
         }
-        if (name === "await" && this.fnAsyncDepth > 0) {
+        if (name === "await" && this._immediateAsync) {
             this.errors.push("Cannot use 'await' as a binding name inside an async function");
         }
         if (this.fnStrictDepth > 0 && (name === "eval" || name === "arguments")) {

@@ -24,6 +24,11 @@ export class Parser {
         // 函数体内是早期错误(作 yield/await 表达式合法)。函数入口 +1、出口 -1。
         this.fnGenDepth = 0;
         this.fnAsyncDepth = 0;
+        // 紧邻包围函数是否为生成器/异步:yield/await 仅在紧邻函数体是 generator/async 时才是
+        // 关键词;嵌套的非 generator/非 async 函数内,即使外层有 generator/async,yield/await
+        // 仍应作标识符(ES 规范:yield/await 仅在 generator/async 函数**自身**体内是保留词)。
+        this._immediateGen = false;
+        this._immediateAsync = false;
         // [test262 S1] strict 模式深度:函数体首语句为 "use strict" 指令时 +1。strict 下
         // eval/arguments 不可作绑定名、形参不可重名。
         this.fnStrictDepth = 0;

@@ -139,9 +139,33 @@ export class Lexer {
     }
 
     // 跳过空白字符
+    // 注:源码按 latin1(逐字节)读入,多字节 UTF-8 字符会变成多个独立字节。
+    // U+00A0(NBSP)=C2 A0、U+2028(LS)=E2 80 A8、U+2029(PS)=E2 80 A9
+    // 需以字节序列匹配而非单字符比较(单字符仅对 ASCII 空白有效)。
     skipWhitespace() {
-        while (this.ch === " " || this.ch === "\t" || this.ch === "\n" || this.ch === "\r") {
-            this.readChar();
+        while (true) {
+            // 单字节空白:SP TAB LF CR VT FF
+            if (this.ch === " " || this.ch === "\t" || this.ch === "\n" || this.ch === "\r" ||
+                this.ch === "\v" || this.ch === "\f") {
+                this.readChar();
+                continue;
+            }
+            // U+00A0 NO-BREAK SPACE:UTF-8 编码 C2 A0(latin1 下两个独立字节)
+            if (this.ch === "\xC2" && this.peekChar() === "\xA0") {
+                this.readChar();
+                this.readChar();
+                continue;
+            }
+            // U+2028 LINE SEPARATOR  / U+2029 PARAGRAPH SEPARATOR:
+            // UTF-8 编码 E2 80 A8 / E2 80 A9(latin1 下三个独立字节)
+            if (this.ch === "\xE2" && this.peekChar() === "\x80" &&
+                (this.peekCharN(2) === "\xA8" || this.peekCharN(2) === "\xA9")) {
+                this.readChar();
+                this.readChar();
+                this.readChar();
+                continue;
+            }
+            break;
         }
     }
 
@@ -629,7 +653,12 @@ export class Lexer {
                 this.readChar();
                 if (this.peekChar() === ">") {
                     this.readChar();
-                    tok = newToken(TokenType.URSHIFT, ">>>", startLine, startColumn);
+                    if (this.peekChar() === "=") {
+                        this.readChar();
+                        tok = newToken(TokenType.URSHIFT_ASSIGN, ">>>=", startLine, startColumn);
+                    } else {
+                        tok = newToken(TokenType.URSHIFT, ">>>", startLine, startColumn);
+                    }
                 } else if (this.peekChar() === "=") {
                     this.readChar();
                     tok = newToken(TokenType.RSHIFT_ASSIGN, ">>=", startLine, startColumn);

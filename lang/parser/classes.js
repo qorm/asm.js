@@ -251,6 +251,11 @@ export const ClassParser = {
         // [test262 S1] 类方法生成器/异步深度:覆盖形参 + 体内 var 的 yield/await 早期错误校验
         if (isGenerator) this.fnGenDepth++;
         if (isAsyncMethod) this.fnAsyncDepth++;
+        // 紧邻包围函数生成器/异步标志:yield/await 仅在紧邻函数是 generator/async 时是关键词
+        const prevImmediateGen = this._immediateGen;
+        const prevImmediateAsync = this._immediateAsync;
+        this._immediateGen = isGenerator;
+        this._immediateAsync = isAsyncMethod;
         // [Wave 8] 方法边界:方法有自有 arguments 与 home object(super 合法),复位字段上下文。
         const prevInFieldInit = this._inFieldInit;
         this._inFieldInit = false;
@@ -265,6 +270,8 @@ export const ClassParser = {
         if (!this.expectPeek(TokenType.LBRACE)) {
             if (isGenerator) this.fnGenDepth--;
             if (isAsyncMethod) this.fnAsyncDepth--;
+            this._immediateGen = prevImmediateGen;
+            this._immediateAsync = prevImmediateAsync;
             this._inFieldInit = prevInFieldInit;
             return null;
         }
@@ -278,6 +285,8 @@ export const ClassParser = {
         if (isStrict) this.fnStrictDepth--;
         if (isGenerator) this.fnGenDepth--;
         if (isAsyncMethod) this.fnAsyncDepth--;
+        this._immediateGen = prevImmediateGen;
+        this._immediateAsync = prevImmediateAsync;
         this._inFieldInit = prevInFieldInit;
         let value = new AST.FunctionExpression(null, params, methodBody, isAsyncMethod, isGenerator);
         value.generator = isGenerator;
@@ -377,16 +386,25 @@ export const ClassParser = {
             this._inFieldInit = false;
             if (isGenerator) this.fnGenDepth++;
             if (isAsyncMethod) this.fnAsyncDepth++;
+            // 紧邻包围函数生成器/异步标志
+            const prevImmediateGenP = this._immediateGen;
+            const prevImmediateAsyncP = this._immediateAsync;
+            this._immediateGen = isGenerator;
+            this._immediateAsync = isAsyncMethod;
             let params = this.parseFunctionParams();
             if (!this.expectPeek(TokenType.LBRACE)) {
                 if (isGenerator) this.fnGenDepth--;
                 if (isAsyncMethod) this.fnAsyncDepth--;
+                this._immediateGen = prevImmediateGenP;
+                this._immediateAsync = prevImmediateAsyncP;
                 this._inFieldInit = prevInFieldInit;
                 return null;
             }
             let methodBody = this.parseBlockStatement();
             if (isGenerator) this.fnGenDepth--;
             if (isAsyncMethod) this.fnAsyncDepth--;
+            this._immediateGen = prevImmediateGenP;
+            this._immediateAsync = prevImmediateAsyncP;
             this._inFieldInit = prevInFieldInit;
             let value = new AST.FunctionExpression(null, params, methodBody, isAsyncMethod, isGenerator);
             value.generator = isGenerator;

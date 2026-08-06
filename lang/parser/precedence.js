@@ -63,6 +63,7 @@ precedences[TokenType.IN] = Precedence.COMPARE;
 precedences[TokenType.LSHIFT] = Precedence.SHIFT;
 precedences[TokenType.RSHIFT] = Precedence.SHIFT;
 precedences[TokenType.URSHIFT] = Precedence.SHIFT;
+precedences[TokenType.URSHIFT_ASSIGN] = Precedence.ASSIGN;
 precedences[TokenType.PLUS] = Precedence.SUM;
 precedences[TokenType.MINUS] = Precedence.SUM;
 precedences[TokenType.ASTERISK] = Precedence.PRODUCT;

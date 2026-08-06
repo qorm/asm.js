@@ -64,10 +64,10 @@ export const ExpressionParser = {
         }
         // [Wave 8] yield/await 作标识符引用(仅转义形态 yield/await 落此路径;未转义
         // 走 YIELD/AWAIT 记号)在生成器/异步函数内是早期错误。绑定位由 checkYieldAwaitBinding 覆盖。
-        if (this.fnGenDepth > 0 && this.curToken.literal === "yield") {
+        if (this._immediateGen && this.curToken.literal === "yield") {
             this.errors.push("Cannot use 'yield' as an identifier in a generator");
         }
-        if (this.fnAsyncDepth > 0 && this.curToken.literal === "await") {
+        if (this._immediateAsync && this.curToken.literal === "await") {
             this.errors.push("Cannot use 'await' as an identifier in an async function");
         }
         // 检查是否是无括号单参数箭头函数: x => expr
@@ -413,8 +413,8 @@ export const ExpressionParser = {
     parseAwaitExpression() {
         // [L2-④] await 只能在 async 函数(含 async-gen)内出现;非异步上下文(模块顶层/
         // 类体隐式 strict/strict 模式)中 await 是保留字,恒 SyntaxError。
-        if (this.fnAsyncDepth === 0) {
-            this.errors.push("await expression not allowed outside of an async function");
+        if (!this._immediateAsync) {
+            return this.parseIdentifier();
         }
         if (this._inFormalParams && this.fnAsyncDepth > 0) {
             this.errors.push("await expression not allowed in formal parameter of async function");
@@ -1074,12 +1074,19 @@ export const ExpressionParser = {
                 // [Wave 8] 对象方法亦为函数/生成器/异步边界:置生成器/异步深度与复位字段上下文。
                 if (isGenMethod) this.fnGenDepth++;
                 if (isAsyncMethod) this.fnAsyncDepth++;
+                // 紧邻包围函数生成器/异步标志
+                const prevImmediateGenObj = this._immediateGen;
+                const prevImmediateAsyncObj = this._immediateAsync;
+                this._immediateGen = isGenMethod;
+                this._immediateAsync = isAsyncMethod;
                 const prevInFieldInitM = this._inFieldInit;
                 this._inFieldInit = false;
                 let params = this.parseFunctionParams();
                 if (!this.expectPeek(TokenType.LBRACE)) {
                     if (isGenMethod) this.fnGenDepth--;
                     if (isAsyncMethod) this.fnAsyncDepth--;
+                    this._immediateGen = prevImmediateGenObj;
+                    this._immediateAsync = prevImmediateAsyncObj;
                     this._inFieldInit = prevInFieldInitM;
                     return null;
                 }
@@ -1092,6 +1099,8 @@ export const ExpressionParser = {
                 if (isStrict) this.fnStrictDepth--;
                 if (isGenMethod) this.fnGenDepth--;
                 if (isAsyncMethod) this.fnAsyncDepth--;
+                this._immediateGen = prevImmediateGenObj;
+                this._immediateAsync = prevImmediateAsyncObj;
                 this._inFieldInit = prevInFieldInitM;
                 {
                     const mfn = new AST.FunctionExpression(null, params, body, isAsyncMethod, isGenMethod);
@@ -1135,6 +1144,9 @@ export const ExpressionParser = {
         }
         // [test262 S1] 生成器深度:yield 作绑定名在此函数体内是早期错误(所有返回路径须配对减)
         if (isGenerator) this.fnGenDepth++;
+        // 紧邻包围函数生成器标志(function expression 永不是 async,async 由 parseAsyncExpression 管)
+        const prevImmediateGen = this._immediateGen;
+        this._immediateGen = isGenerator;
         // [Wave 8] 函数边界:字段初始化器上下文在函数表达式内复位(自有 arguments / 无
         // home object),所有返回路径须恢复,故每处 return 前配对。
         // [L2-④] _inFormalParams 同理:嵌套函数内 await/yield 在 body 合法。
@@ -1149,28 +1161,30 @@ export const ExpressionParser = {
             this.nextToken();
             this.checkReservedBinding(this.curToken.literal);   // [test262 早期错误 A] 函数名保留字
             let id = new AST.Identifier(this.curToken.literal);
-            if (!this.expectPeek(TokenType.LPAREN)) { if (isGenerator) this.fnGenDepth--; this._inFieldInit = prevInFieldInit; this._inFormalParams = prevInFormalFE; return null; }
+            if (!this.expectPeek(TokenType.LPAREN)) { if (isGenerator) this.fnGenDepth--; this._immediateGen = prevImmediateGen; this._inFieldInit = prevInFieldInit; this._inFormalParams = prevInFormalFE; return null; }
             let params = this.parseFunctionParams();
-            if (!this.expectPeek(TokenType.LBRACE)) { if (isGenerator) this.fnGenDepth--; this._inFieldInit = prevInFieldInit; this._inFormalParams = prevInFormalFE; return null; }
+            if (!this.expectPeek(TokenType.LBRACE)) { if (isGenerator) this.fnGenDepth--; this._immediateGen = prevImmediateGen; this._inFieldInit = prevInFieldInit; this._inFormalParams = prevInFormalFE; return null; }
             let isStrict = this.peekUseStrictDirective();
             if (isStrict) { this.fnStrictDepth++; this.checkStrictParams(params); }
             this.checkInheritedStrictParams(params, isStrict);   // [test262 早期错误 C] 继承 strict 重参
             let body = this.parseBlockStatement();
             if (isStrict) this.fnStrictDepth--;
             if (isGenerator) this.fnGenDepth--;
+            this._immediateGen = prevImmediateGen;
             this._inFieldInit = prevInFieldInit;
             this._inFormalParams = prevInFormalFE;
             return new AST.FunctionExpression(id, params, body, isAsync, isGenerator);
         }
-        if (!this.expectPeek(TokenType.LPAREN)) { if (isGenerator) this.fnGenDepth--; this._inFieldInit = prevInFieldInit; this._inFormalParams = prevInFormalFE; return null; }
+        if (!this.expectPeek(TokenType.LPAREN)) { if (isGenerator) this.fnGenDepth--; this._immediateGen = prevImmediateGen; this._inFieldInit = prevInFieldInit; this._inFormalParams = prevInFormalFE; return null; }
         let params = this.parseFunctionParams();
-        if (!this.expectPeek(TokenType.LBRACE)) { if (isGenerator) this.fnGenDepth--; this._inFieldInit = prevInFieldInit; this._inFormalParams = prevInFormalFE; return null; }
+        if (!this.expectPeek(TokenType.LBRACE)) { if (isGenerator) this.fnGenDepth--; this._immediateGen = prevImmediateGen; this._inFieldInit = prevInFieldInit; this._inFormalParams = prevInFormalFE; return null; }
         let isStrict = this.peekUseStrictDirective();
         if (isStrict) { this.fnStrictDepth++; this.checkStrictParams(params); }
         this.checkInheritedStrictParams(params, isStrict);   // [test262 早期错误 C] 继承 strict 重参
         let body = this.parseBlockStatement();
         if (isStrict) this.fnStrictDepth--;
         if (isGenerator) this.fnGenDepth--;
+        this._immediateGen = prevImmediateGen;
         this._inFieldInit = prevInFieldInit;
         this._inFormalParams = prevInFormalFE;
         return new AST.FunctionExpression(null, params, body, isAsync, isGenerator);
@@ -1178,11 +1192,15 @@ export const ExpressionParser = {
 
     parseAsyncExpression() {
         this.nextToken();
+        // async 函数/箭头:紧邻包围函数是异步函数,await 是关键词。
+        const prevImmediateAsyncExpr = this._immediateAsync;
+        this._immediateAsync = true;
         if (this.curTokenIs(TokenType.FUNCTION)) {
             // [test262 S1] async 深度:await 作绑定名在异步函数内是早期错误
             this.fnAsyncDepth++;
             let func = this.parseFunctionExpression();
             this.fnAsyncDepth--;
+            this._immediateAsync = prevImmediateAsyncExpr;
             if (func !== null) func.isAsync = true;
             return func;
         }
@@ -1190,6 +1208,7 @@ export const ExpressionParser = {
             this.fnAsyncDepth++;   // [test262 S1] async (...) => 形参在异步上下文
             let arrow = this.parseGroupedOrArrow();
             this.fnAsyncDepth--;
+            this._immediateAsync = prevImmediateAsyncExpr;
             if (arrow !== null && arrow.type === "ArrowFunctionExpression") {
                 arrow.isAsync = true;
             }
@@ -1203,11 +1222,13 @@ export const ExpressionParser = {
                 this.nextToken();
                 let arrow = this.parseArrowFunctionBody([param]);
                 this.fnAsyncDepth--;
+                this._immediateAsync = prevImmediateAsyncExpr;
                 arrow.isAsync = true;
                 return arrow;
             }
             this.fnAsyncDepth--;
         }
+        this._immediateAsync = prevImmediateAsyncExpr;
         return null;
     },
 
@@ -1343,9 +1364,8 @@ export const ExpressionParser = {
     parseYieldExpression() {
         // [L2-④] yield 只能在 generator(含 async-gen)内出现;非生成器上下文(类体隐式
         // strict/strict 模式)中 yield 是保留字,恒 SyntaxError。
-        if (this.fnGenDepth === 0) {
-            this.errors.push("yield expression not allowed outside of a generator");
-            // 不回退:即使报错,仍继续解析以收集更多错误,产 null expression
+        if (!this._immediateGen) {
+            return this.parseIdentifier();
         }
         if (this._inFormalParams && this.fnGenDepth > 0) {
             this.errors.push("yield expression not allowed in formal parameter of generator");
