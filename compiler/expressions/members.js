@@ -2608,11 +2608,17 @@ export const MemberCompiler = {
         vm.scvtf(0, VReg.A2);
         vm.fmovToInt(VReg.A2, 0);
         vm.call("_closure_prop_set");
-        // 原型对象
+        // 原型对象:运行时已预填则复用,否则新建
+        const protoReuseL = this.ctx.newLabel("nscoll_proto_reuse");
+        vm.lea(VReg.V1, protoSlot);
+        vm.load(VReg.V0, VReg.V1, 0);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne(protoReuseL);
         vm.call("_object_new");
         vm.call("_box_obj_r");
         vm.lea(VReg.V1, protoSlot);
         vm.store(VReg.V1, 0, VReg.RET);
+        vm.label(protoReuseL);
         // 原型方法落位:_aref_generic 安全 helper 闭包 + 逐闭包 .name/.length + attr 5
         for (let i = 0; i < cfg.methods.length; i = i + 1) {
             const m = cfg.methods[i];
