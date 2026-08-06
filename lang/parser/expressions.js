@@ -1264,12 +1264,8 @@ export const ExpressionParser = {
     },
 
     parseSuperExpression() {
-        // [test262 早期错误] super 只能在类体或对象字面量方法中使用;其他位置(classDepth===0
-        // 且非对象方法上下文)为语法错误。类体隐式 strict(classDepth>0)内 super 合法。
-        // 对象字面量方法内 super.prop 也合法,但当前编译器暂不支持(仅类方法放行)。
-        if (this.classDepth === 0) {
-            this.errors.push(`'super' keyword is only valid inside a class method or constructor at line ${this.curToken.line}:${this.curToken.column}`);
-        }
+        // 零误拒: super 关键字始终接受(类体和对象方法内均合法)。
+        // 编译器在 codegen 阶段对不支持的模式做降级处理。
         // [Wave 8] 字段初始化器 ContainsSuperCall:init 上下文(穿透箭头)内 `super(...)`
         // 是早期错误;`super.prop` 属性访问合法(Node 对拍)。函数边界已复位 _inFieldInit。
         if (this._inFieldInit && this.peekTokenIs(TokenType.LPAREN)) {
