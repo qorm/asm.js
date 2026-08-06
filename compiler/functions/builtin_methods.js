@@ -511,6 +511,7 @@ export const BuiltinMethodCompiler = {
                     const s0id = this.nextLabelId();
                     const s0str = this.ctx.allocLocal(`__split0_str_${s0id}`);
                     const s0arr = this.ctx.allocLocal(`__split0_arr_${s0id}`);
+                    const s0boxed = this.ctx.allocLocal(`__split0_boxed_${s0id}`);
                     this.vm.pop(VReg.RET);                 // 接收者(装箱串)
                     this.vm.store(VReg.FP, s0str, VReg.RET);
                     this.vm.movImm(VReg.A0, 1);
@@ -522,6 +523,17 @@ export const BuiltinMethodCompiler = {
                     this.vm.call("_array_set");
                     this.vm.load(VReg.RET, VReg.FP, s0arr);
                     this.vm.call("_box_arr_r"); // box->helper
+                    // Set constructor on result (mirrors _str_split's _split_ret path)
+                    this.vm.store(VReg.FP, s0boxed, VReg.RET);
+                    this.emitArrayCtorObject();
+                    this.vm.load(VReg.A0, VReg.FP, s0boxed);
+                    this.vm.lea(VReg.A1, this.vm.asm.addString("constructor"));
+                    this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+                    this.vm.or(VReg.A1, VReg.A1, VReg.V1);
+                    this.vm.lea(VReg.V2, "_nsobj_array");
+                    this.vm.load(VReg.A2, VReg.V2, 0);
+                    this.vm.call("_object_set");
+                    this.vm.load(VReg.RET, VReg.FP, s0boxed);
                     return true;
                 }
                 // str.split(separator[, limit]) - 返回数组
@@ -552,6 +564,17 @@ export const BuiltinMethodCompiler = {
                     this.vm.load(VReg.A2, VReg.FP, splitLimSlot);
                     this.vm.call("_array_slice");
                     this.vm.call("_box_arr_r"); // box->helper
+                    // Set constructor on sliced result (mirrors _str_split's _split_ret path)
+                    const splitBoxedSlot = this.ctx.allocLocal(`__split_boxed_${this.nextLabelId()}`);
+                    this.vm.store(VReg.FP, splitBoxedSlot, VReg.RET);
+                    this.vm.load(VReg.A0, VReg.FP, splitBoxedSlot);
+                    this.vm.lea(VReg.A1, this.vm.asm.addString("constructor"));
+                    this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+                    this.vm.or(VReg.A1, VReg.A1, VReg.V1);
+                    this.vm.lea(VReg.V2, "_nsobj_array");
+                    this.vm.load(VReg.A2, VReg.V2, 0);
+                    this.vm.call("_object_set");
+                    this.vm.load(VReg.RET, VReg.FP, splitBoxedSlot);
                 }
                 return true;
 

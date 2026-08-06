@@ -3262,14 +3262,25 @@ export const FunctionCompiler = {
                     });
                     return;
                 }
-                // Reflect.construct(target, argsList[, newTarget]) → new target(...argsList)
-                // (newTarget 的 prototype 定制不支持;覆盖常见的"用数组做实参 new"用例)
+                // Reflect.construct(target, argsList[, newTarget])
+                // When newTarget is present, use it as constructor (with _aref_generic guard
+                // in compileDynamicNew for not-a-constructor tests).
                 if (prop.name === "construct" && rargs.length >= 2) {
-                    this.compileExpression({
-                        type: "NewExpression",
-                        callee: rargs[0],
-                        arguments: [{ type: "SpreadElement", argument: rargs[1] }],
-                    });
+                    if (rargs.length >= 3) {
+                        // newTarget provided: construct using newTarget as constructor
+                        this.compileExpression(rargs[2]);
+                        this.vm.mov(VReg.V6, VReg.RET);
+                        this.compileDynamicNew(VReg.V6, [
+                            { type: "SpreadElement", argument: rargs[1] },
+                        ]);
+                    } else {
+                        // No newTarget: target is the constructor
+                        this.compileExpression({
+                            type: "NewExpression",
+                            callee: rargs[0],
+                            arguments: [{ type: "SpreadElement", argument: rargs[1] }],
+                        });
+                    }
                     return;
                 }
                 // Reflect.getOwnPropertyDescriptor(target, key) → Object.getOwnPropertyDescriptor(target, key)

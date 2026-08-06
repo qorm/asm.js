@@ -387,6 +387,19 @@ const ACCESSOR_PROP_ATTR = 4;
 const TYPE_GETTER = 60;
 const PTR_MASK_BITS = 0x0000ffffffffffffn;
 
+// Symbol-keyed methods on RegExp.prototype (Symbol.match, Symbol.replace, etc.).
+// Each entry: [wellKnownSymbolShortName, shimFunctionExportName, arity].
+// The wellKnownSymbolShortName is the bare name ("match", not "Symbol.match").
+// The shim wrappers __RE_sym_* accept (re, str, ...) to match the _aref_generic
+// trampoline calling convention (this=re placed in A0).
+const REGEXP_PROTO_SYMBOL_METHODS = [
+    ["match", "__RE_sym_match", 1],
+    ["search", "__RE_sym_search", 1],
+    ["split", "__RE_sym_split", 2],
+    ["replace", "__RE_sym_replace", 2],
+    ["matchAll", "__RE_sym_matchAll", 1],
+];
+
 // ── [W-18] Math 命名空间物化(反射用真对象)────────────────────────────────────
 // 此前 `Math` 只是**编译期构造**:调用位 compileMathMethod 静态派发、`Math.floor` 值读
 // 走 NamespaceStaticRef、`Math.PI` 折常量,而**裸 `Math`**(非成员、非调用位)落
@@ -906,6 +919,9 @@ export const MemberCompiler = {
         for (let i = 0; i < REGEXP_PROTO_METHODS.length; i = i + 1) {
             if (!this.getFunctionLabel(REGEXP_PROTO_METHODS[i][1])) return false;
         }
+        for (let i = 0; i < REGEXP_PROTO_SYMBOL_METHODS.length; i = i + 1) {
+            if (!this.getFunctionLabel(REGEXP_PROTO_SYMBOL_METHODS[i][1])) return false;
+        }
         return true;
     },
 
@@ -1217,14 +1233,20 @@ export const MemberCompiler = {
         vm.load(VReg.RET, VReg.V0, 0);
         vm.cmpImm(VReg.RET, 0);
         vm.jne(doneL);
-        // 构造器闭包 16B {magic, __RE_new}:`RegExp("x","g")` / `new RegExp` 经**值**
+        // 构造器闭包 16B {magic, __RE_new 或 0}:`RegExp("x","g")` / `new RegExp` 经**值**
         // 路径调用时命中 __RE_new(pattern, flags),与静态改派同一函数。
+        // shim 未注入时 __RE_new 不存在,存 0 作占位——此时 `RegExp()` 调用会抛。
+        const reNewLabel = this.getFunctionLabel("__RE_new");
         vm.movImm(VReg.A0, 16);
         vm.call("_alloc");
         vm.mov(VReg.S0, VReg.RET);
         vm.movImm(VReg.V1, 0xc105); // CLOSURE_MAGIC
         vm.store(VReg.S0, 0, VReg.V1);
-        vm.lea(VReg.V1, this.getFunctionLabel("__RE_new"));
+        if (reNewLabel) {
+            vm.lea(VReg.V1, reNewLabel);
+        } else {
+            vm.movImm(VReg.V1, 0);
+        }
         vm.store(VReg.S0, 8, VReg.V1);
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_js_box_function");
@@ -1252,8 +1274,10 @@ export const MemberCompiler = {
         vm.store(VReg.V1, 0, VReg.RET);
         // 原型属性落位:先 _object_set 落值,再 _object_set_prop_attr 落 attrs
         // (顺序不可反,同 emitMathNamespaceObject 注)。值先落 RET,再调 _reSetProtoProp。
+        // shim 未注入时跳过方法注册(函数标签不存在)。
         for (let i = 0; i < REGEXP_PROTO_METHODS.length; i = i + 1) {
             const m = REGEXP_PROTO_METHODS[i];
+            if (!this.getFunctionLabel(m[1])) continue;
             this.emitRegExpMethodClosure(m[0], m[1], m[2]); // RET = 方法值
             this._reSetProtoProp(protoSlot, m[0], BUILTIN_PROP_ATTR);
         }
@@ -1261,6 +1285,42 @@ export const MemberCompiler = {
         for (let i = 0; i < REGEXP_PROTO_ACCESSORS.length; i = i + 1) {
             const a = REGEXP_PROTO_ACCESSORS[i];
             this.emitRegExpFlagAccessor(protoSlot, tmpSlot, a[0], a[1]);
+        }
+        // Symbol-keyed methods on RegExp.prototype (Symbol.match, Symbol.replace,
+        // Symbol.split, Symbol.search, Symbol.matchAll). Each method is a data property
+        // keyed by the well-known symbol, matching the ES spec for @@match etc.
+        // Uses emitRegExpMethodClosure (24B {magic, _aref_generic, helper}) which puts
+        // `this` in A0 and shifts user args up -- the __RE_sym_* wrappers accept
+        // (re, str, ...) to match this calling convention.
+        // shim 未注入时跳过(函数标签不存在)。
+        for (let i = 0; i < REGEXP_PROTO_SYMBOL_METHODS.length; i = i + 1) {
+            const sm = REGEXP_PROTO_SYMBOL_METHODS[i];
+            if (!this.getFunctionLabel(sm[1])) continue;
+            // Get the well-known symbol
+            vm.lea(VReg.A0, "_symwk_" + sm[0]);
+            vm.lea(VReg.A1, this.asm.addString("Symbol." + sm[0]));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+            vm.or(VReg.A1, VReg.A1, VReg.V1);
+            vm.call("_symbol_wellknown"); // RET = symbol raw ptr
+            // Save symbol in scratch slot (data segment, persistent across calls)
+            vm.lea(VReg.V0, tmpSlot);
+            vm.store(VReg.V0, 0, VReg.RET);
+            // Create method closure
+            this.emitRegExpMethodClosure(sm[0], sm[1], sm[2]); // RET = method value (boxed closure)
+            // Set property on prototype: _object_set(proto, symKey, methodValue)
+            vm.mov(VReg.A2, VReg.RET);
+            vm.lea(VReg.V0, protoSlot);
+            vm.load(VReg.A0, VReg.V0, 0);
+            vm.lea(VReg.V1, tmpSlot);
+            vm.load(VReg.A1, VReg.V1, 0);
+            vm.call("_object_set");
+            // Set attributes: writable:true, enumerable:false, configurable:true (BUILTIN_PROP_ATTR=5)
+            vm.lea(VReg.V0, protoSlot);
+            vm.load(VReg.A0, VReg.V0, 0);
+            vm.lea(VReg.V1, tmpSlot);
+            vm.load(VReg.A1, VReg.V1, 0);
+            vm.movImm(VReg.A2, BUILTIN_PROP_ATTR);
+            vm.call("_object_set_prop_attr");
         }
         // prototype.constructor = RegExp(从槽读,已就绪 → 不回调 emitRegExpCtorObject)
         vm.lea(VReg.V0, ctorSlot);
@@ -1273,6 +1333,74 @@ export const MemberCompiler = {
         vm.lea(VReg.V0, protoSlot);
         vm.load(VReg.A2, VReg.V0, 0);
         vm.call("_closure_prop_set");
+        // Symbol.species on RegExp constructor: getter accessor that returns `this`.
+        // ES spec: get RegExp[@@species]() returns this. Stored as a TYPE_GETTER block
+        // on the constructor's closure side table; setter=0 (read-only accessor).
+        // Attributes: writable:false (accessor semantics), enumerable:false, configurable:true.
+        (() => {
+            // Build getter closure AST: function() { return this; }
+            const speciesAst = {
+                type: "FunctionExpression",
+                id: null,
+                params: [],
+                body: {
+                    type: "BlockStatement",
+                    body: [{ type: "ReturnStatement", argument: { type: "ThisExpression" } }]
+                }
+            };
+            this.compileFunctionExpression(speciesAst); // RET = getter closure (boxed)
+            // Save getter closure in scratch slot
+            vm.lea(VReg.V0, tmpSlot);
+            vm.store(VReg.V0, 0, VReg.RET);
+            // Set getter name = "get [Symbol.species]"
+            vm.lea(VReg.V0, tmpSlot);
+            vm.load(VReg.A0, VReg.V0, 0);
+            this.emitBoxedStringKey("name", VReg.A1);
+            vm.lea(VReg.A2, this.asm.addString("get [Symbol.species]"));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+            vm.or(VReg.A2, VReg.A2, VReg.V1);
+            vm.call("_closure_prop_set");
+            // Set getter length = 0
+            vm.lea(VReg.V0, tmpSlot);
+            vm.load(VReg.A0, VReg.V0, 0);
+            this.emitBoxedStringKey("length", VReg.A1);
+            vm.movImm(VReg.A2, 0);
+            vm.scvtf(0, VReg.A2);
+            vm.fmovToInt(VReg.A2, 0);
+            vm.call("_closure_prop_set");
+            // Build TYPE_GETTER block: 24B {TYPE_GETTER@0, getter_raw_ptr@8, setter_ptr@16=0}
+            vm.movImm(VReg.A0, 24);
+            vm.call("_alloc");
+            vm.mov(VReg.S0, VReg.RET); // S0 = raw TYPE_GETTER block (persistent in callee-saved reg)
+            vm.movImm(VReg.V1, TYPE_GETTER);
+            vm.store(VReg.S0, 0, VReg.V1);
+            vm.lea(VReg.V0, tmpSlot);
+            vm.load(VReg.V1, VReg.V0, 0); // boxed getter closure
+            vm.movImm64(VReg.V2, PTR_MASK_BITS);
+            vm.and(VReg.V1, VReg.V1, VReg.V2); // raw getter ptr
+            vm.store(VReg.S0, 8, VReg.V1);
+            vm.movImm(VReg.V1, 0);
+            vm.store(VReg.S0, 16, VReg.V1); // setter = 0
+            // Get Symbol.species well-known symbol as key
+            vm.lea(VReg.A0, "_symwk_species");
+            vm.lea(VReg.A1, this.asm.addString("Symbol.species"));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+            vm.or(VReg.A1, VReg.A1, VReg.V1);
+            vm.call("_symbol_wellknown"); // RET = symbol raw ptr
+            vm.mov(VReg.S1, VReg.RET); // S1 = sym key (callee-saved, S0 intact)
+            // Set on constructor: _closure_prop_set(RegExp, symKey, TYPE_GETTER block)
+            vm.lea(VReg.V0, ctorSlot);
+            vm.load(VReg.A0, VReg.V0, 0); // A0 = boxed RegExp constructor
+            vm.mov(VReg.A1, VReg.S1); // A1 = symbol key
+            vm.mov(VReg.A2, VReg.S0); // A2 = TYPE_GETTER block (raw ptr passed as-is)
+            vm.call("_closure_prop_set");
+            // Set attributes: configurable:true, enumerable:false (ACCESSOR_PROP_ATTR=4)
+            vm.lea(VReg.V0, ctorSlot);
+            vm.load(VReg.A0, VReg.V0, 0);
+            vm.mov(VReg.A1, VReg.S1);
+            vm.movImm(VReg.A2, ACCESSOR_PROP_ATTR);
+            vm.call("_closure_prop_set_attr");
+        })();
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.RET, VReg.V0, 0);
         vm.label(doneL);
@@ -2146,6 +2274,19 @@ export const MemberCompiler = {
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.RET, VReg.V0, 0);
         this._reSetProtoProp(protoSlot, "constructor", BUILTIN_PROP_ATTR);
+        // Number.prototype[Symbol.toStringTag] = "Number" (for Object.prototype.toString)
+        vm.lea(VReg.A0, "_symwk_toStringTag");
+        vm.lea(VReg.A1, this.asm.addString("Symbol.toStringTag"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_symbol_wellknown"); // RET = Symbol.toStringTag
+        vm.mov(VReg.A1, VReg.RET); // A1 = symbol key
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.A0, VReg.V0, 0); // A0 = boxed Number.prototype
+        vm.lea(VReg.A2, this.asm.addString("Number"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A2, VReg.A2, VReg.V1); // A2 = boxed "Number"
+        vm.call("_object_set");
         const shimReady = this.numberShimReady();
         for (let i = 0; i < NUMBER_PROTO_METHODS.length; i = i + 1) {
             const m = NUMBER_PROTO_METHODS[i];
@@ -3131,7 +3272,7 @@ export const MemberCompiler = {
         // → typeof "function"、`RegExp.prototype` 可达。RegExp 构造(带/不带 new)
         // 的静态改派(expressions.js / functions.js)都在到达这里之前命中 → 快路字节不变。
         // 门:本编译单元注入了 RegExp shim 模块 且名字未被遮蔽。
-        if (name === "RegExp" && !this.regexpNameShadowed() && this.regexpShimReady()) {
+        if (name === "RegExp" && !this.regexpNameShadowed()) {
             this.emitRegExpCtorObject();
             return;
         }
@@ -3931,8 +4072,7 @@ export const MemberCompiler = {
             // constructor)。放在通用 .name/.length/闭包侧表分支**之前**,但 propName
             // 严格限定 "prototype" 且接收者必须是未遮蔽的裸 `RegExp` → 其它接收者字节不变。
             if (propName === "prototype" && expr.object.type === "Identifier" &&
-                expr.object.name === "RegExp" && !this.regexpNameShadowed() &&
-                this.regexpShimReady()) {
+                expr.object.name === "RegExp" && !this.regexpNameShadowed()) {
                 this.emitRegExpProtoObject();
                 return;
             }

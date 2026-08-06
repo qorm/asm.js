@@ -1886,17 +1886,28 @@ export const ExpressionCompiler = {
             // [TA/AB 构造器闭包] fnptr==_ta_ctor_tramp → _ta_construct 专用转发
             // (无实例语义,RET 即蹦床产的 TA/ArrayBuffer 指针;否则走 _fn_construct_call
             // 会把蹦床返回值丢弃、返回空实例对象)。
-            const notTaCtorL = this.ctx.newLabel("dnew_notta");
+            const dnewNotTa = this.ctx.newLabel("dnew_notta");
             this.vm.load(VReg.V1, VReg.S1, 8);
             this.vm.lea(VReg.V0, "_ta_ctor_tramp");
             this.vm.cmp(VReg.V1, VReg.V0);
-            this.vm.jne(notTaCtorL);
+            this.vm.jne(dnewNotTa);
             this.compileArrayExpressionWithSpread(args);
             this.vm.mov(VReg.A1, VReg.RET);
             this.vm.load(VReg.A0, VReg.FP, dnFnValSlot);
             this.vm.call("_ta_construct");
             this.vm.jmp(dynNewProxyEndL);
-            this.vm.label(notTaCtorL);
+            // [非构造器守卫] built-in method closures (fnptr==_aref_generic) are
+            // not constructable per ES spec. Throw TypeError to fix not-a-constructor tests.
+            this.vm.label(dnewNotTa);
+            const dnewConstructable = this.ctx.newLabel("dnew_constructable");
+            this.vm.lea(VReg.V0, "_aref_generic");
+            this.vm.cmp(VReg.V1, VReg.V0);
+            this.vm.jne(dnewConstructable);
+            this.vm.lea(VReg.A0, this.asm.addString("value is not a constructor"));
+            this.vm.call("_js_box_string");
+            this.vm.mov(VReg.A0, VReg.RET);
+            this.vm.call("_throw_type_error"); // does not return
+            this.vm.label(dnewConstructable);
             this.compileArrayExpressionWithSpread(args); // RET = 实参 boxed 数组
             this.vm.mov(VReg.A1, VReg.RET); // 先取 RET(与 A0 同物理寄存器 X0/RAX!)
             this.vm.load(VReg.A0, VReg.FP, dnFnValSlot);
