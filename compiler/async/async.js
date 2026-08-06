@@ -1046,12 +1046,12 @@ export const AsyncCompiler = {
         // [argc] 实参求值(上方 compileExpression)可能含嵌套调用把 _call_argc 写脏;
         // 在 _coroutine_create 快照前按本调用点实参数回写。
         this.emitSetCallArgc(argc);
-        // 组装 _coroutine_create(A0=func_ptr, A1=首参|0, A2=0)
+        // 组装 _coroutine_create(A0=func_ptr, A1=首参|undefined, A2=0)
         vm.load(VReg.A0, VReg.FP, fpSlot); // func_ptr
         if (argc > 0) {
             vm.load(VReg.A1, VReg.FP, argSlots[0]); // 首参
         } else {
-            vm.movImm(VReg.A1, 0);
+            vm.movImm64(VReg.A1, 0x7ffb000000000000n); // JS_UNDEFINED:无参调用缺省参数应得 undefined
         }
         vm.movImm(VReg.A2, 0);
         vm.call("_coroutine_create");
@@ -1114,6 +1114,17 @@ export const AsyncCompiler = {
     // 由 async 函数体把 ctx.exceptionLabel 指到此块的标签触发。
     emitAsyncRejectFromException() {
         const vm = this.vm;
+
+        // [#async-exc-ctx] 弹出本 async 体的 catch 上下文帧(若安装),
+        // 把 _exc_ctx_top 恢复至入口前的链头。_throw_unwind 到达时已
+        // 从帧恢复 SP/FP/S 寄存器,此处只需弹链。
+        const asyncFrameOff = this.ctx._asyncExcFrameOff;
+        if (asyncFrameOff) {
+            vm.load(VReg.V3, VReg.FP, asyncFrameOff + 0);
+            vm.lea(VReg.V2, "_exc_ctx_top");
+            vm.store(VReg.V2, 0, VReg.V3);
+        }
+
         const skip = this.ctx.newLabel("async_rej_no_promise");
         vm.lea(VReg.V1, "_scheduler_current");
         vm.load(VReg.V1, VReg.V1, 0);      // 当前协程
@@ -1137,6 +1148,20 @@ export const AsyncCompiler = {
     // resolve Promise 后正常 epilogue 返回，由 _coroutine_entry 处理协程结束
     emitAsyncResolveAndReturnFromRet() {
         const vm = this.vm;
+
+        // [#async-exc-ctx] 弹出本 async 体的 catch 上下文帧(若安装)。
+        const asyncFrameOff_resolve = this.ctx._asyncExcFrameOff;
+        if (asyncFrameOff_resolve) {
+            vm.load(VReg.V3, VReg.FP, asyncFrameOff_resolve + 0);
+            vm.lea(VReg.V2, "_exc_ctx_top");
+            vm.store(VReg.V2, 0, VReg.V3);
+        }
+
+        // 清 _exception_pending:finally 块的 return 覆盖任何在途异常
+        // (try { await reject() } finally { return X } / try { throw } finally { return X })
+        vm.lea(VReg.V0, "_exception_pending");
+        vm.movImm(VReg.V1, 0);
+        vm.store(VReg.V0, 0, VReg.V1);
 
         // 保存返回值
         vm.push(VReg.RET);

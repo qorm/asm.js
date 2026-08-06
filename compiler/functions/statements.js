@@ -542,11 +542,13 @@ export const StatementCompiler = {
                     this.vm.call("_maybe_getter");
                 }
                 if (dflt) {
-                    // 缺键(_object_get 返 raw 0)或 tagged undefined → 用默认表达式
+                    // [L2-SameValue] _object_get 已对缺键返回 JS_UNDEFINED(0x7FFB),
+                    // 不再以 raw 0 为哨兵。旧 cmpImm(RET,0) 会误把存储的数字 0.0
+                    // (raw 全零位)判为"缺失"→触发默认表达式→值塌为 undefined,
+                    // 令 ~30 个 dstr 测试 SameValue(undefined,0) 判负。现仅对 tagged
+                    // undefined 触发默认,数值 0 正确绑定。
                     const dfltL = this.ctx.newLabel("odestr_dflt");
                     const doneL = this.ctx.newLabel("odestr_done");
-                    this.vm.cmpImm(VReg.RET, 0);
-                    this.vm.jeq(dfltL);
                     this.vm.shrImm(VReg.V1, VReg.RET, 48);
                     this.vm.cmpImm(VReg.V1, 0x7FFB);
                     this.vm.jeq(dfltL);
@@ -554,6 +556,7 @@ export const StatementCompiler = {
                     this.vm.jmp(doneL);
                     this.vm.label(dfltL);
                     this.compileExpression(dflt);
+                    this._emitDestrSetFnName(dflt, targetNode);
                     this.emitBindTarget(targetNode, mode);
                     this.vm.label(doneL);
                 } else {
@@ -698,10 +701,13 @@ export const StatementCompiler = {
             this.vm.movImm(VReg.A1, ei);
             this.vm.call("_subscript_get");
             if (dflt) {
+                // [L2-SameValue] _subscript_get 已对越界元素返回 JS_UNDEFINED(0x7FFB),
+                // 不再以 raw 0 为哨兵。旧 cmpImm(RET,0) 会误把存储的数字 0.0
+                // (raw 全零位)判为"缺失"→触发默认表达式→值塌为 undefined,
+                // 令 ~30 个 dstr 测试 SameValue(undefined,0) 判负。现仅对 tagged
+                // undefined 触发默认,数值 0 正确绑定。
                 const dfltL = this.ctx.newLabel("destr_dflt");
                 const doneL = this.ctx.newLabel("destr_done");
-                this.vm.cmpImm(VReg.RET, 0);
-                this.vm.jeq(dfltL);
                 this.vm.shrImm(VReg.V1, VReg.RET, 48);
                 this.vm.cmpImm(VReg.V1, 0x7FFB); // tagged undefined
                 this.vm.jeq(dfltL);
@@ -709,6 +715,7 @@ export const StatementCompiler = {
                 this.vm.jmp(doneL);
                 this.vm.label(dfltL);
                 this.compileExpression(dflt);
+                this._emitDestrSetFnName(dflt, targetNode);
                 this.emitBindTarget(targetNode, mode);
                 this.vm.label(doneL);
             } else {
@@ -719,6 +726,34 @@ export const StatementCompiler = {
 
     // [#47/#48] 绑定单个解构目标(约定:当前值已在 RET)。
     // 嵌套 pattern → 先落临时槽再递归;否则按 mode 分派到声明绑定/赋值。
+    // [L2-SameValue fn-name] 解构默认值若为匿名函数/类表达式,按 ES 规范
+    // SetFunctionName 把 .name 设为绑定标识符名。此前缺失 → ~24 个 dstr 测试
+    // `cls.name===""` 而非 `"cls"` (SameValue("","cls") 判负)。
+    _emitDestrSetFnName(dflt, targetNode) {
+        if (!dflt || !targetNode || targetNode.type !== "Identifier" || !targetNode.name) return;
+        const bindingName = targetNode.name;
+        let isAnon = false;
+        if (dflt.type === "ArrowFunctionExpression") {
+            isAnon = true;
+        } else if (dflt.type === "FunctionExpression") {
+            isAnon = !dflt.id || !dflt.id.name;
+        } else if (dflt.type === "ClassExpression" || dflt.type === "ClassDeclaration") {
+            const rawId = (dflt.id && dflt.id.name) || "";
+            isAnon = !rawId || rawId.indexOf("__classexpr") === 0;
+        }
+        if (!isAnon) return;
+        const vm = this.vm;
+        const tmpSlot = this.ctx.allocLocal(`__destrfnname_${this.nextLabelId()}`);
+        vm.store(VReg.FP, tmpSlot, VReg.RET);
+        vm.mov(VReg.A0, VReg.RET);
+        this.emitBoxedStringKey("name", VReg.A1);
+        vm.lea(VReg.A2, this.asm.addString(bindingName));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A2, VReg.A2, VReg.V1);
+        vm.call("_closure_prop_set");
+        vm.load(VReg.RET, VReg.FP, tmpSlot);
+    },
+
     emitBindTarget(targetNode, mode) {
         if (targetNode.type === "ObjectPattern" || targetNode.type === "ArrayPattern") {
             const subSlot = this.ctx.allocLocal(`__destr_${this.nextLabelId()}`);
@@ -2382,8 +2417,34 @@ export const StatementCompiler = {
             this.vm.label(finallyExcLabel);
             // [#38] 弹帧(unwind 到达时链头仍指向本帧;本地 jmp 到达时幂等)
             this.emitExcCtxRestore(excFrameOff);
+
+            // [#async-finally] 暂存 _exception_pending/exception_value 到 FP 槽并清 pending,
+            // 防止 finally 块内的 await 误读残留异常(如 try { await reject() } finally { ... })。
+            // finalizer 若以 return/throw 跳出则不回来;正常走完则恢复异常值继续传播。
+            const finExcPendingSlot = this.ctx.allocLocal("__fin_exc_pending");
+            const finExcValueSlot = this.ctx.allocLocal("__fin_exc_value");
+            this.vm.lea(VReg.V0, "_exception_pending");
+            this.vm.load(VReg.V1, VReg.V0, 0);
+            this.vm.store(VReg.FP, finExcPendingSlot, VReg.V1);
+            this.vm.lea(VReg.V0, "_exception_value");
+            this.vm.load(VReg.V1, VReg.V0, 0);
+            this.vm.store(VReg.FP, finExcValueSlot, VReg.V1);
+            // 清 pending:finally 块内 await/throw 观察不到外部异常
+            this.vm.lea(VReg.V0, "_exception_pending");
+            this.vm.movImm(VReg.V1, 0);
+            this.vm.store(VReg.V0, 0, VReg.V1);
+
             this.ctx.exceptionLabel = savedExceptionLabel;
             this.emitDirectFinalizer(stmt.finalizer);
+
+            // finalizer 正常走完:恢复异常值并传播(returnLabel 路径不会到达这里)
+            this.vm.load(VReg.V1, VReg.FP, finExcPendingSlot);
+            this.vm.lea(VReg.V0, "_exception_pending");
+            this.vm.store(VReg.V0, 0, VReg.V1);
+            this.vm.load(VReg.V1, VReg.FP, finExcValueSlot);
+            this.vm.lea(VReg.V0, "_exception_value");
+            this.vm.store(VReg.V0, 0, VReg.V1);
+
             if (savedExceptionLabel) {
                 this.vm.jmp(savedExceptionLabel);
             } else if (this.ctx.inCoroBody && this.ctx.returnLabel) {
@@ -3469,6 +3530,30 @@ export const StatementCompiler = {
             this.ctx.inAsyncFunction = true;
             asyncMethodRejectLabel = this.ctx.newLabel("async_method_reject");
             this.ctx.exceptionLabel = asyncMethodRejectLabel;
+
+            // [#async-exc-ctx] 为 async 方法体安装 catch 上下文帧。
+            let asyncExcFrameOffMethod = 0;
+            for (let i = 0; i < 10; i++) {
+                asyncExcFrameOffMethod = this.ctx.allocLocal(this.ctx.newLabel("__asyncexcframe"));
+            }
+            this.ctx._asyncExcFrameOff = asyncExcFrameOffMethod;
+            this.vm.lea(VReg.V0, "_exc_ctx_top");
+            this.vm.load(VReg.V1, VReg.V0, 0);
+            this.vm.store(VReg.FP, asyncExcFrameOffMethod + 0, VReg.V1);
+            this.vm.lea(VReg.V1, asyncMethodRejectLabel);
+            this.vm.store(VReg.FP, asyncExcFrameOffMethod + 8, VReg.V1);
+            this.vm.mov(VReg.V1, VReg.SP);
+            this.vm.store(VReg.FP, asyncExcFrameOffMethod + 16, VReg.V1);
+            this.vm.store(VReg.FP, asyncExcFrameOffMethod + 24, VReg.FP);
+            this.vm.store(VReg.FP, asyncExcFrameOffMethod + 32, VReg.S0);
+            this.vm.store(VReg.FP, asyncExcFrameOffMethod + 40, VReg.S1);
+            this.vm.store(VReg.FP, asyncExcFrameOffMethod + 48, VReg.S2);
+            this.vm.store(VReg.FP, asyncExcFrameOffMethod + 56, VReg.S3);
+            this.vm.store(VReg.FP, asyncExcFrameOffMethod + 64, VReg.S4);
+            this.vm.mov(VReg.V1, VReg.S5);
+            this.vm.store(VReg.FP, asyncExcFrameOffMethod + 72, VReg.V1);
+            this.vm.subImm(VReg.V1, VReg.FP, -asyncExcFrameOffMethod);
+            this.vm.store(VReg.V0, 0, VReg.V1);
         }
 
         // 保存 this (A0)

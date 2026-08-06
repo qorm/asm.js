@@ -350,6 +350,32 @@ export const ClosureCompiler = {
         if (isAsync && !isGenerator) {
             asyncRejectLabel = this.ctx.newLabel("async_reject");
             this.ctx.exceptionLabel = asyncRejectLabel;
+
+            // [#async-exc-ctx] 在 _exc_ctx_top 链安装本 async 体的 catch 上下文,
+            // 使嵌套同步代码的 _throw_unwind(默认参数 IIFE 内的 throw 等)能路由到
+            // asyncRejectLabel。frame 布局与 try-catch 帧一致。
+            let asyncExcFrameOff = 0;
+            for (let i = 0; i < 10; i++) {
+                asyncExcFrameOff = this.ctx.allocLocal(this.ctx.newLabel("__asyncexcframe"));
+            }
+            this.ctx._asyncExcFrameOff = asyncExcFrameOff;
+            vm.lea(VReg.V0, "_exc_ctx_top");
+            vm.load(VReg.V1, VReg.V0, 0);
+            vm.store(VReg.FP, asyncExcFrameOff + 0, VReg.V1);
+            vm.lea(VReg.V1, asyncRejectLabel);
+            vm.store(VReg.FP, asyncExcFrameOff + 8, VReg.V1);
+            vm.mov(VReg.V1, VReg.SP);
+            vm.store(VReg.FP, asyncExcFrameOff + 16, VReg.V1);
+            vm.store(VReg.FP, asyncExcFrameOff + 24, VReg.FP);
+            vm.store(VReg.FP, asyncExcFrameOff + 32, VReg.S0);
+            vm.store(VReg.FP, asyncExcFrameOff + 40, VReg.S1);
+            vm.store(VReg.FP, asyncExcFrameOff + 48, VReg.S2);
+            vm.store(VReg.FP, asyncExcFrameOff + 56, VReg.S3);
+            vm.store(VReg.FP, asyncExcFrameOff + 64, VReg.S4);
+            vm.mov(VReg.V1, VReg.S5);
+            vm.store(VReg.FP, asyncExcFrameOff + 72, VReg.V1);
+            vm.subImm(VReg.V1, VReg.FP, -asyncExcFrameOff);
+            vm.store(VReg.V0, 0, VReg.V1);
         }
 
         // [#49] `arguments` 对象(数组近似):仅普通函数(箭头共享外层 arguments,不建)、

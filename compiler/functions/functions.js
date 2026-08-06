@@ -717,12 +717,12 @@ export const FunctionCompiler = {
             argSlots.push(slot);
         }
 
-        // 组装 _coroutine_create(A0=func_ptr, A1=首参|0, A2=closure_ptr)
+        // 组装 _coroutine_create(A0=func_ptr, A1=首参|undefined, A2=closure_ptr)
         vm.load(VReg.A0, VReg.S0, 8); // func_ptr
         if (argc > 0) {
             vm.load(VReg.A1, VReg.FP, argSlots[0]); // 首参
         } else {
-            vm.movImm(VReg.A1, 0);
+            vm.movImm64(VReg.A1, 0x7ffb000000000000n); // JS_UNDEFINED:无参调用缺省参数应得 undefined
         }
         vm.mov(VReg.A2, VReg.S0); // closure_ptr
         vm.call("_coroutine_create");
