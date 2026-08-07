@@ -2548,6 +2548,8 @@ export class AllocatorGenerator {
             "_box_obj_r",
             "_object_normalize_order",
             "_intToStr", "_is_symbol", "_array_spread_into",
+            // 数组 species 协议(concat/slice/map/filter 编译期内联引用)、泛型回退
+            "_array_species_check", "_agen_map", "_agen_filter",
         ];
         vm.label("_engine_symaddr");
         vm.prologue(0, []);

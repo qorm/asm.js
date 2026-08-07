@@ -6464,11 +6464,13 @@ export class ObjectGenerator {
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.S0, VReg.A0, VReg.V1);  // S0 = raw obj
 
-        // 类型字节守卫:仅普通对象(2)/classinfo(3)走强制路;其余(数组/Map/函数值侧表…)
-        // 落 legacy(旧 _object_define + _object_set_prop_attr,无强制)保持既有行为不回归。
+        // 类型字节守卫:仅普通对象(2)/classinfo(3)走强制路;数组(1)走 _dp_array
+        // 专用路径(不落 _dp_legacy,后者 _object_define 读 offset 32 props_ptr 越
+        // 数组 32B 头)。其余(Map/函数值侧表…)落 legacy 保持既有行为不回归。
         vm.loadByte(VReg.V1, VReg.S0, 0);
         vm.cmpImm(VReg.V1, 2); vm.jeq("_dp_obj_ok");
         vm.cmpImm(VReg.V1, 3); vm.jeq("_dp_obj_ok");
+        vm.cmpImm(VReg.V1, 1); vm.jeq("_dp_array");
         vm.jmp("_dp_legacy");
 
         // ============ ToPropertyDescriptor 验证 ============
@@ -6735,7 +6737,34 @@ export class ObjectGenerator {
         vm.load(VReg.RET, VReg.SP, 0);             // 返回原对象
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 96);
 
-        // ============ legacy:非普通对象(数组/Map/函数值侧表…)旧行为,无强制 ============
+        // ============ array:数组 DefineOwnProperty 最小路径 ============
+        // S0=裸数组头(type@0,length@8,capacity@16,data_ptr@24),无 props_ptr@32。
+        // 不可复用 _dp_legacy(_object_define 读 offset 8 当 count、offset 32 当
+        // props_ptr → 数组头只有 32 字节 → 越界)。数组具名属性走闭包侧表,
+        // 索引元素/length 暂不实现强制(调用路径极少;无强制不抛但预期属性状态不坏)。
+        vm.label("_dp_array");
+        // 键归一(复用 _js_prop_key,同 _ogopd_arr :7077)
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_js_prop_key");
+        vm.mov(VReg.S1, VReg.RET);
+        // 找/建闭包侧表(同 _object_set 数组具名写侧:_object_set_fnprops→_closure_prop_set)
+        vm.mov(VReg.A0, VReg.SP, 0);
+        vm.call("_closure_props_ensure"); // RET = props(boxed 0x7FFD)
+        // 递归:props 是 TYPE_OBJECT,走 _dp_obj_ok 全强制
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.load(VReg.A2, VReg.SP, 72);               // value
+        vm.load(VReg.A3, VReg.SP, 80);               // get
+        vm.load(VReg.A4, VReg.SP, 88);               // set
+        vm.load(VReg.V2, VReg.SP, 8);                // mask
+        vm.shlImm(VReg.V2, VReg.V2, 8);
+        vm.load(VReg.V3, VReg.SP, 64);                // attr
+        vm.or(VReg.A5, VReg.V2, VReg.V3);
+        vm.call("_object_define_property");           // 递归;A0=props
+        vm.load(VReg.RET, VReg.SP, 0);                // 返原始数组 boxed
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 96);
+
+        // ============ legacy:非普通对象(Map/函数值侧表…)旧行为,无强制 ============
         vm.label("_dp_legacy");
         vm.load(VReg.V2, VReg.SP, 8);              // mask
         vm.andImm(VReg.V1, VReg.V2, DP_HAS_GET | DP_HAS_SET);

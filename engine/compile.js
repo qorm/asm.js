@@ -115,6 +115,8 @@ export const SYM_IDS = {
     _object_normalize_order: 115,
     // for-in 数组索引→字符串键(_intToStr);符号判断(_is_symbol);迭代器展开(_array_spread_into)
     _intToStr: 116, _is_symbol: 117, _array_spread_into: 118,
+    // 数组 species 协议(concat/slice/map/filter 编译期内联引用)、泛型回退
+    _array_species_check: 119, _agen_map: 120, _agen_filter: 121,
 };
 
 // 宿主可变数据全局:引用它们须运行时取宿主地址(不可内联常量)。见 compileFragment

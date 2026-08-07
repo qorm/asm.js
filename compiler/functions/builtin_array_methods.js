@@ -1775,8 +1775,26 @@ export const BuiltinArrayMethodCompiler = {
 
     // 编译 arr.map(callback) - 支持 Array 和 TypedArray
     compileArrayMap(arrayExpr, callbackExpr, thisArgExpr = null) {
-        // 编译数组
+        // [species] check this.constructor[Symbol.species]; propagate errors
+        const _msSpecFb = this.ctx.newLabel("ms_spec_fb");
+        const _msSpecEnd = this.ctx.newLabel("ms_spec_done");
+        const _msRecvSp = this.ctx.allocLocal(`__ms_spec_r_${this.nextLabelId()}`);
+        const _msCbSp = this.ctx.allocLocal(`__ms_spec_cb_${this.nextLabelId()}`);
+
+        // Save receiver and callback before species check (evaluated exactly once)
         this.compileExpression(arrayExpr);
+        this.vm.store(VReg.FP, _msRecvSp, VReg.RET);
+        this.compileExpression(callbackExpr);
+        this.vm.store(VReg.FP, _msCbSp, VReg.RET);
+        this.emitThisArgSlot(thisArgExpr, "map");
+
+        this.vm.load(VReg.A0, VReg.FP, _msRecvSp);
+        this.vm.call("_array_species_check");
+        this.vm.cmpImm(VReg.RET, 0);
+        this.vm.jne(_msSpecFb);
+
+        // fast path: default species
+        this.vm.load(VReg.RET, VReg.FP, _msRecvSp);
         const arrOffset = this.ctx.allocLocal(`__map_arr_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, arrOffset, VReg.RET);
 
@@ -1821,11 +1839,8 @@ export const BuiltinArrayMethodCompiler = {
         const newArrOffset = this.ctx.allocLocal(`__map_newarr_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, newArrOffset, VReg.RET);
 
-        // 编译回调
-        this.compileExpression(callbackExpr);
-        const cbOffset = this.ctx.allocLocal(`__map_cb_${this.nextLabelId()}`);
-        this.vm.store(VReg.FP, cbOffset, VReg.RET);
-        this.emitThisArgSlot(thisArgExpr, "map");
+        // 回调已在 species 检查前编译并存于 _msCbSp,thisArg 已设置;此处仅复用预存槽。
+        // 不重调 compileExpression/emitThisArgSlot,避免重复求值/覆盖槽位。
 
         // 初始化索引
         const idxOffset = this.ctx.allocLocal(`__map_idx_${this.nextLabelId()}`);
@@ -1854,8 +1869,8 @@ export const BuiltinArrayMethodCompiler = {
         // 保存元素值
         this.vm.store(VReg.FP, elemOffset, VReg.RET);
 
-        // 准备闭包调用
-        this.vm.load(VReg.V6, VReg.FP, cbOffset);
+        // 准备闭包调用（回调从预存槽 _msCbSp 加载）
+        this.vm.load(VReg.V6, VReg.FP, _msCbSp);
         this.vm.push(VReg.V6);
 
         // 设置参数
@@ -1892,6 +1907,17 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.jge(mapBoxDone);
         this.vm.call("_box_arr_r"); // box->helper
         this.vm.label(mapBoxDone);
+
+        this.vm.jmp(_msSpecEnd);
+
+        // fallback: non-default species -> _agen_map
+        this.vm.label(_msSpecFb);
+        this._pendingThisArgSlot = null;
+        this.vm.load(VReg.A0, VReg.FP, _msRecvSp);
+        this.vm.load(VReg.A1, VReg.FP, _msCbSp);
+        this.vm.call("_agen_map");
+
+        this.vm.label(_msSpecEnd);
     },
 
     // 编译 arr.flatMap(callback) —— map 后把返回的数组展平一层。
@@ -2009,11 +2035,26 @@ export const BuiltinArrayMethodCompiler = {
 
     // 编译 arr.filter(callback) - 支持 Array 和 TypedArray
     compileArrayFilter(arrayExpr, callbackExpr, thisArgExpr = null) {
-        // 结果用 _array_new_with_size(0)+_array_push 构建（已验证可靠、标准布局），
-        // 替掉原来手写 _alloc+[0]=1+_subscript_set 的非标准布局——后者结果 length 对
-        // 但元素读 NULL、下标越界即崩（filter 结果被 [i] 访问必崩），是自举
-        // createModuleMeta 的 `body.filter(...)[i]` 段错误根因。
+        // [species] check this.constructor[Symbol.species]; propagate errors
+        const _fsSpecFb = this.ctx.newLabel("fs_spec_fb");
+        const _fsSpecEnd = this.ctx.newLabel("fs_spec_done");
+        const _fsRecvSp = this.ctx.allocLocal(`__fs_spec_r_${this.nextLabelId()}`);
+        const _fsCbSp = this.ctx.allocLocal(`__fs_spec_cb_${this.nextLabelId()}`);
+
+        // Save receiver and callback before species check (evaluated exactly once)
         this.compileExpression(arrayExpr);
+        this.vm.store(VReg.FP, _fsRecvSp, VReg.RET);
+        this.compileExpression(callbackExpr);
+        this.vm.store(VReg.FP, _fsCbSp, VReg.RET);
+        this.emitThisArgSlot(thisArgExpr, "filter");
+
+        this.vm.load(VReg.A0, VReg.FP, _fsRecvSp);
+        this.vm.call("_array_species_check");
+        this.vm.cmpImm(VReg.RET, 0);
+        this.vm.jne(_fsSpecFb);
+
+        // fast path: default species
+        this.vm.load(VReg.RET, VReg.FP, _fsRecvSp);
         const arrOffset = this.ctx.allocLocal(`__filter_arr_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, arrOffset, VReg.RET);
 
@@ -2038,11 +2079,8 @@ export const BuiltinArrayMethodCompiler = {
         const newArrOffset = this.ctx.allocLocal(`__filter_newarr_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, newArrOffset, VReg.RET);
 
-        // 回调
-        this.compileExpression(callbackExpr);
-        const cbOffset = this.ctx.allocLocal(`__filter_cb_${this.nextLabelId()}`);
-        this.vm.store(VReg.FP, cbOffset, VReg.RET);
-        this.emitThisArgSlot(thisArgExpr, "filter");
+        // 回调已在 species 检查前编译并存于 _fsCbSp,thisArg 已设置;此处仅复用预存槽。
+        // 不重调 compileExpression/emitThisArgSlot,避免重复求值/覆盖槽位。
 
         const idxOffset = this.ctx.allocLocal(`__filter_idx_${this.nextLabelId()}`);
         this.vm.movImm(VReg.V0, 0);
@@ -2065,8 +2103,8 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.call("_subscript_get");
         this.vm.store(VReg.FP, elemOffset, VReg.RET);
 
-        // cb(elem, idx, arr)
-        this.vm.load(VReg.V6, VReg.FP, cbOffset);
+        // cb(elem, idx, arr) -- callback from pre-stored _fsCbSp
+        this.vm.load(VReg.V6, VReg.FP, _fsCbSp);
         this.vm.push(VReg.V6);
         this.vm.load(VReg.A0, VReg.FP, elemOffset);
         this.vm.load(VReg.A1, VReg.FP, idxOffset);
@@ -2113,7 +2151,17 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.load(VReg.A0, VReg.FP, typeOffset); // type
         this.vm.call("_typed_array_from");
         this.vm.label(filtEnd);
-        return;
+
+        this.vm.jmp(_fsSpecEnd);
+
+        // fallback: non-default species -> _agen_filter
+        this.vm.label(_fsSpecFb);
+        this._pendingThisArgSlot = null;
+        this.vm.load(VReg.A0, VReg.FP, _fsRecvSp);
+        this.vm.load(VReg.A1, VReg.FP, _fsCbSp);
+        this.vm.call("_agen_filter");
+
+        this.vm.label(_fsSpecEnd);
     },
 
     // 旧手写实现（保留死代码引用，已不走到）
