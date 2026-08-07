@@ -1583,13 +1583,25 @@ export class ObjectGenerator {
         vm.load(VReg.V0, VReg.S0, 16); // __proto__
         vm.cmpImm(VReg.V0, 0);
         vm.jeq(notFoundLabel);
-        // [proto boxed guard] compileDynamicNew 存 proto 可能为装箱值(0x7FFD/0x7FFE),
-        // 而非裸指针。高16非0 → 已是装箱对象,直接用作 A0;否则按裸指针装箱。
+        // [proto boxed guard] compileDynamicNew / compilePlainFunctionNew 存 proto
+        // 可能为装箱值(0x7FFD/0x7FFE)或裸指针。高16非0 → 已是装箱对象,直接用作 A0;
+        // 否则读取类型字节判断是 Object(TYPE_OBJECT=2)还是 Array(TYPE_ARRAY=1),
+        // 打对应 tag——此前一律标 0x7FFD,Array 原型按对象布局解引用 props_ptr@32 崩。
         vm.shrImm(VReg.V2, VReg.V0, 48);
         vm.cmpImm(VReg.V2, 0);
         vm.jne("_object_get_proto_boxed");
-        // 裸指针标记为 JS 对象 (0x7FFD)
-        vm.orImm(VReg.A0, VReg.V0, 0x7ffd000000000000);
+        // 裸指针:根据类型字节打 tag
+        vm.loadByte(VReg.V2, VReg.V0, 0);
+        vm.cmpImm(VReg.V2, 1); // TYPE_ARRAY
+        vm.jne("_object_get_proto_raw_obj");
+        // Array proto → 装箱为 0x7FFE
+        vm.movImm64(VReg.A0, 0x7ffe000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V0);
+        vm.jmp("_object_get_proto_call");
+        vm.label("_object_get_proto_raw_obj");
+        // 其余裸指针 → 装箱为 0x7FFD (Object/classinfo/Symbol/Map/Set 等)
+        vm.movImm64(VReg.A0, 0x7ffd000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V0);
         vm.jmp("_object_get_proto_call");
         vm.label("_object_get_proto_boxed");
         vm.mov(VReg.A0, VReg.V0);

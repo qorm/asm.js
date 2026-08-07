@@ -1,10 +1,10 @@
 # asm.js test262 conformance report
 
-_Generated 2026-08-07T16:43:28.007Z — target macos-arm64_
+_Generated 2026-08-07T16:57:00.209Z — target macos-arm64_
 
 ## Headline
 
-**asm.js passes 326 / 594 = 54.88% of the run test262 subset**
+**asm.js passes 348 / 594 = 58.59% of the run test262 subset**
 (selected `language/` + core `built-ins/`), one variant per test.
 
 Of 3081 discovered test files in the selected dirs, 113 were excluded up front (module=0, unsupported-feature=113, intl/staging-dir=0); 2968 were eligible; 594 were actually run (deterministic stride=5).
@@ -13,8 +13,8 @@ Of 3081 discovered test files in the selected dirs, 113 were excluded up front (
 
 | class | count | % of run |
 |-------|------:|---------:|
-| PASS         | 326 | 54.88 |
-| FAIL         | 248 | 41.75 |
+| PASS         | 348 | 58.59 |
+| FAIL         | 226 | 38.05 |
 | COMPILE_FAIL | 0 | 0.00 |
 | CRASH        | 20 | 3.37 |
 | **run**      | **594** | 100 |
@@ -23,7 +23,7 @@ Of 3081 discovered test files in the selected dirs, 113 were excluded up front (
 
 | area | run | PASS | FAIL | COMPILE_FAIL | CRASH | pass% |
 |------|----:|-----:|-----:|-------------:|------:|------:|
-| built-ins/Array | 594 | 326 | 248 | 0 | 20 | 54.9 |
+| built-ins/Array | 594 | 348 | 226 | 0 | 20 | 58.6 |
 
 ## Excluded categories (counted, not scored)
 
@@ -40,9 +40,9 @@ Excluded-by-feature detail:
 ## Top failing patterns (FAIL / COMPILE_FAIL / CRASH detail strings)
 
 - **187×** FAIL: assertion mismatch (Test262Error / wrong value)
-- **35×** FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)
 - **24×** FAIL: array contents mismatch (compareArray)
 - **17×** CRASH: run signal SIGSEGV
+- **13×** FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)
 - **3×** CRASH: run timeout
 - **2×** FAIL: constructor-ness reflection (isConstructor / not-a-constructor)
 
@@ -50,13 +50,13 @@ Excluded-by-feature detail:
 
 - `resizable-arraybuffer`: 12
 - `change-array-by-copy`: 11
-- `Symbol.species`: 10
+- `Symbol.species`: 9
 - `Symbol.isConcatSpreadable`: 7
-- `Array.prototype.includes`: 6
 - `Symbol.iterator`: 5
 - `Proxy`: 5
 - `array-find-from-last`: 5
 - `Array.prototype.flatMap`: 5
+- `Array.prototype.includes`: 5
 - `Symbol`: 4
 - `Array.prototype.flat`: 3
 - `Reflect.construct`: 2
@@ -64,7 +64,6 @@ Excluded-by-feature detail:
 - `exponentiation`: 2
 - `Reflect`: 1
 - `Symbol.unscopables`: 1
-- `Array.prototype.at`: 1
 
 ## Methodology / reproducibility
 
@@ -96,4 +95,4 @@ mkdir -p .test262-corpus && tar xzf /tmp/t262.tgz -C .test262-corpus --strip-com
 node tests/test262/run.mjs --stride 5 --jobs 8 --target macos-arm64
 ```
 
-_Run wall-clock: 42.9s._
+_Run wall-clock: 40.5s._
