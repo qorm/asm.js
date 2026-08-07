@@ -1,81 +1,70 @@
 # asm.js test262 conformance report
 
-_Generated 2026-08-07T16:12:14.625Z — target macos-arm64_
+_Generated 2026-08-07T16:43:28.007Z — target macos-arm64_
 
 ## Headline
 
-**asm.js passes 1343 / 1975 = 68.00% of the run test262 subset**
+**asm.js passes 326 / 594 = 54.88% of the run test262 subset**
 (selected `language/` + core `built-ins/`), one variant per test.
 
-Of 11102 discovered test files in the selected dirs, 1227 were excluded up front (module=69, unsupported-feature=1158, intl/staging-dir=0); 9875 were eligible; 1975 were actually run (deterministic stride=5).
+Of 3081 discovered test files in the selected dirs, 113 were excluded up front (module=0, unsupported-feature=113, intl/staging-dir=0); 2968 were eligible; 594 were actually run (deterministic stride=5).
 
 ## Overall breakdown
 
 | class | count | % of run |
 |-------|------:|---------:|
-| PASS         | 1343 | 68.00 |
-| FAIL         | 578 | 29.27 |
-| COMPILE_FAIL | 23 | 1.16 |
-| CRASH        | 31 | 1.57 |
-| **run**      | **1975** | 100 |
+| PASS         | 326 | 54.88 |
+| FAIL         | 248 | 41.75 |
+| COMPILE_FAIL | 0 | 0.00 |
+| CRASH        | 20 | 3.37 |
+| **run**      | **594** | 100 |
 
 ## By area
 
 | area | run | PASS | FAIL | COMPILE_FAIL | CRASH | pass% |
 |------|----:|-----:|-----:|-------------:|------:|------:|
-| language/expressions | 1975 | 1343 | 578 | 23 | 31 | 68.0 |
+| built-ins/Array | 594 | 326 | 248 | 0 | 20 | 54.9 |
 
 ## Excluded categories (counted, not scored)
 
-- **module flag** (ES modules as test262 expects): 69
-- **unsupported feature** (structurally out of scope, see UNSUPPORTED_FEATURES): 1158
+- **module flag** (ES modules as test262 expects): 0
+- **unsupported feature** (structurally out of scope, see UNSUPPORTED_FEATURES): 113
 - **intl402/ + staging/ dirs**: 0
 
 Excluded-by-feature detail:
 
-- `dynamic-import`: 688
-- `source-phase-imports`: 237
-- `BigInt`: 148
-- `import-attributes`: 42
+- `Array.fromAsync`: 95
 - `cross-realm`: 16
-- `tail-call-optimization`: 16
-- `decorators`: 10
-- `SharedArrayBuffer`: 1
+- `BigInt`: 2
 
 ## Top failing patterns (FAIL / COMPILE_FAIL / CRASH detail strings)
 
-- **365×** FAIL: assertion mismatch (Test262Error / wrong value)
-- **107×** FAIL: async ($DONE not signalled / promise rejected)
-- **61×** FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)
-- **40×** FAIL: negative test wrong outcome (phase=parse)
-- **23×** COMPILE_FAIL: asm.js could not compile (unsupported syntax / parser gap)
-- **20×** CRASH: run signal SIGSEGV
-- **9×** CRASH: run timeout
-- **5×** FAIL: array contents mismatch (compareArray)
-- **2×** CRASH: run signal SIGBUS
+- **187×** FAIL: assertion mismatch (Test262Error / wrong value)
+- **35×** FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)
+- **24×** FAIL: array contents mismatch (compareArray)
+- **17×** CRASH: run signal SIGSEGV
+- **3×** CRASH: run timeout
+- **2×** FAIL: constructor-ness reflection (isConstructor / not-a-constructor)
 
 ## Failures correlated with features (top tags among failing tests)
 
-- `async-iteration`: 186
-- `generators`: 120
-- `class`: 112
-- `destructuring-binding`: 97
-- `Symbol.iterator`: 91
-- `class-fields-public`: 70
-- `default-parameters`: 63
-- `async-functions`: 39
-- `Symbol.asyncIterator`: 31
-- `class-fields-private`: 31
-- `class-static-methods-private`: 28
-- `computed-property-names`: 26
-- `class-methods-private`: 26
-- `object-rest`: 21
-- `Symbol`: 12
-- `class-static-fields-public`: 10
-- `class-static-fields-private`: 10
-- `logical-assignment-operators`: 8
-- `arrow-function`: 6
-- `new.target`: 5
+- `resizable-arraybuffer`: 12
+- `change-array-by-copy`: 11
+- `Symbol.species`: 10
+- `Symbol.isConcatSpreadable`: 7
+- `Array.prototype.includes`: 6
+- `Symbol.iterator`: 5
+- `Proxy`: 5
+- `array-find-from-last`: 5
+- `Array.prototype.flatMap`: 5
+- `Symbol`: 4
+- `Array.prototype.flat`: 3
+- `Reflect.construct`: 2
+- `arrow-function`: 2
+- `exponentiation`: 2
+- `Reflect`: 1
+- `Symbol.unscopables`: 1
+- `Array.prototype.at`: 1
 
 ## Methodology / reproducibility
 
@@ -107,4 +96,4 @@ mkdir -p .test262-corpus && tar xzf /tmp/t262.tgz -C .test262-corpus --strip-com
 node tests/test262/run.mjs --stride 5 --jobs 8 --target macos-arm64
 ```
 
-_Run wall-clock: 121.0s._
+_Run wall-clock: 42.9s._

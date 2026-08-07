@@ -1916,13 +1916,18 @@ export const ExpressionCompiler = {
             this.vm.load(VReg.A0, VReg.FP, dnFnValSlot);
             this.vm.call("_ta_construct");
             this.vm.jmp(dynNewProxyEndL);
-            // [非构造器守卫] built-in method closures (fnptr==_aref_generic) are
-            // not constructable per ES spec. Throw TypeError to fix not-a-constructor tests.
+            // [非构造器守卫] built-in method closures (fnptr==_aref_generic or
+            // _aref_static_tramp) are not constructable per ES spec. Throw TypeError
+            // to fix not-a-constructor tests.
             this.vm.label(dnewNotTa);
             const dnewConstructable = this.ctx.newLabel("dnew_constructable");
             this.vm.lea(VReg.V0, "_aref_generic");
             this.vm.cmp(VReg.V1, VReg.V0);
+            this.vm.jeq("_dnew_not_ctor_throw");
+            this.vm.lea(VReg.V0, "_aref_static_tramp");
+            this.vm.cmp(VReg.V1, VReg.V0);
             this.vm.jne(dnewConstructable);
+            this.vm.label("_dnew_not_ctor_throw");
             this.vm.lea(VReg.A0, this.asm.addString("value is not a constructor"));
             this.vm.call("_js_box_string");
             this.vm.mov(VReg.A0, VReg.RET);

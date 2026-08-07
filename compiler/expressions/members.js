@@ -139,6 +139,10 @@ const NamespaceStaticRef = {
         getOwnPropertySymbols: "_object_getOwnPropertySymbols",
         groupBy: "_object_groupBy",
         hasOwn: "_aref_obj_hasOwn",
+        defineProperty: "_object_define_property_dyn",
+        defineProperties: "_object_define_properties_dyn",
+        fromEntries: "_object_fromEntries",
+        is: "_object_is_value",
     },
     Date: {
         now: "_date_now", // 0 参 → canonical number
@@ -464,6 +468,8 @@ const BUILTIN_REF_ARITY = {
     object_getPrototypeOf: 1, object_setPrototypeOf: 2,
     object_getOwnPropertySymbols: 1,
     object_groupBy: 2, object_hasOwn: 2,
+    object_defineProperty: 3, object_defineProperties: 2,
+    object_fromEntries: 1, object_is: 2,
     date_now: 0, date_parse: 1, date_utc: 7,
     array_isArray: 1,
     fnproto_call: 1, fnproto_apply: 2,
@@ -594,6 +600,7 @@ const OBJECT_PROTO_METHODS = [
     ["hasOwnProperty", "_aref_obj_hasOwn", 1],
     ["valueOf", "_aref_obj_valueOf", 0],
     ["toString", "_object_proto_toString", 0],
+    ["toLocaleString", "_object_proto_toString", 0],
     ["isPrototypeOf", "_is_prototype_of", 1],
     ["propertyIsEnumerable", "_object_propertyIsEnumerable", 1],
 ];
@@ -628,6 +635,10 @@ const OBJECT_STATIC_METHODS = [
     ["getOwnPropertySymbols", "_object_getOwnPropertySymbols", 1],
     ["groupBy", "_object_groupBy", 2],
     ["hasOwn", "_aref_obj_hasOwn", 2],
+    ["defineProperty", "_object_define_property_dyn", 3],
+    ["defineProperties", "_object_define_properties_dyn", 2],
+    ["fromEntries", "_object_fromEntries", 1],
+    ["is", "_object_is_value", 2],
 ];
 const MAP_PROTO_METHODS = [
     // [方法名, 守卫壳标签(品牌检查后尾调裸 helper,见 runtime/types/map/index.js), 规范 length]
@@ -827,14 +838,16 @@ export const MemberCompiler = {
             this.asm.addDataLabel(label);
             this.asm.addDataQword(0);
             this._addedBuiltinRefLabels.add(label);
-            // [W-27] 该内建入函数元数据侧表(每槽一次,与数据槽同一 once 门)。条目的
-            // code_ptr = helper 标签本身:本闭包 {magic@0, helper@8} 的 @8 恰是它,故
-            // _closure_prop_get / _js_length 的「闭包 → [P+8]」脱壳能查到。
-            // arity 用**合成形参表**交给 registerFuncMeta 的同一算法(不另写一份 arity
-            // 逻辑,也不直接构造条目——条目形状只有 registerFuncMeta 一个写者)。
-            // #32 守卫:typeof 判命中,原型链上的 toString/constructor 不是 number。
+            // [Stage A2] All static builtins share _aref_static_tramp as fnptr.
+            // name/length are stored in closure property side table (same as
+            // emitBuiltinMethodRefClosureMeta for prototype methods). The old
+            // registerFuncMeta path relied on fnptr==helper@8, which is no longer
+            // the case; now _js_length / gOPD lookups go through _closure_prop_get.
             const _bra = BUILTIN_REF_ARITY[slotKey];
             if (typeof propName === "string" && typeof _bra === "number") {
+                // Arity metadata still registered for function-metadata-side-table
+                // consumers (e.g. _js_length_dyn for unknown callee), but the primary
+                // lookup path for these closures is via _closure_prop_get on side table.
                 const _bps = [];
                 for (let i = 0; i < _bra; i = i + 1) {
                     _bps.push({ type: "Identifier", name: "a" + i });
@@ -848,7 +861,27 @@ export const MemberCompiler = {
         this.vm.load(VReg.RET, VReg.V0, 0);
         this.vm.cmpImm(VReg.RET, 0);
         this.vm.jne(doneL);
-        this.emitBuiltinFnClosure(runtimeLabel); // RET = 装箱闭包
+        this.emitStaticBuiltinRefClosure(runtimeLabel); // RET = boxed closure (24B)
+        // Store .name and .length in closure property side table so that
+        // _closure_prop_get (used by _js_length / gOPD) finds them. Same pattern
+        // as emitBuiltinMethodRefClosureMeta for prototype methods.
+        const _bra2 = BUILTIN_REF_ARITY[slotKey];
+        if (typeof propName === "string" && typeof _bra2 === "number") {
+            this.vm.mov(VReg.S0, VReg.RET); // preserve across _alloc in setter calls
+            this.vm.mov(VReg.A0, VReg.S0);
+            this.emitBoxedStringKey("name", VReg.A1);
+            this.vm.lea(VReg.A2, this.asm.addString(propName));
+            this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+            this.vm.or(VReg.A2, VReg.A2, VReg.V1);
+            this.vm.call("_closure_prop_set");
+            this.vm.mov(VReg.A0, VReg.S0);
+            this.emitBoxedStringKey("length", VReg.A1);
+            this.vm.movImm(VReg.A2, _bra2);
+            this.vm.scvtf(0, VReg.A2);
+            this.vm.fmovToInt(VReg.A2, 0);
+            this.vm.call("_closure_prop_set");
+            this.vm.mov(VReg.RET, VReg.S0); // restore closure
+        }
         this.vm.lea(VReg.V1, label);
         this.vm.store(VReg.V1, 0, VReg.RET);
         this.vm.label(doneL);
@@ -2982,6 +3015,26 @@ export const MemberCompiler = {
         this.vm.call("_js_box_function");
     },
 
+    // [Stage A2] 内置非构造器静态方法引用闭包:
+    // 24B {magic@0=0xc105, fnptr@8=_aref_static_tramp, helper@16=<helper label>}。
+    // 供 Object/Math/Number/JSON 等命名空间静态方法作一等值(可存变量/传回调,
+    // typeof "function")。蹦床 _aref_static_tramp 从 @16 取 helper 后尾调,
+    // 无接收者移位(静态方法 this 无关)。compileDynamicNew 检查
+    // fnptr==_aref_static_tramp → 抛 TypeError("value is not a constructor")。
+    emitStaticBuiltinRefClosure(runtimeLabel) {
+        this.vm.movImm(VReg.A0, 24);
+        this.vm.call("_alloc");
+        this.vm.mov(VReg.S0, VReg.RET);
+        this.vm.movImm(VReg.V1, 0xc105); // CLOSURE_MAGIC
+        this.vm.store(VReg.S0, 0, VReg.V1);
+        this.vm.lea(VReg.V1, "_aref_static_tramp");
+        this.vm.store(VReg.S0, 8, VReg.V1);
+        this.vm.lea(VReg.V1, runtimeLabel);
+        this.vm.store(VReg.S0, 16, VReg.V1);
+        this.vm.mov(VReg.A0, VReg.S0);
+        this.vm.call("_js_box_function");
+    },
+
     // [构造器全局值] TA 族/ArrayBuffer 构造器闭包(memoized,_taref_<name>):
     // 24B {magic@0, fnptr@8=_ta_ctor_tramp, type@16}。memoize 保证 `Int8Array === Int8Array`
     // 且每构造器仅建一次。type@16 由蹦床读取(见 runtime generateCtorSupport)。
@@ -3909,6 +3962,7 @@ export const MemberCompiler = {
                 // 命中判据 Array.isArray(原型链上的 Object.prototype 方法全是函数,无数组值 → 污染-safe,#32)。
                 const _opHelpers = {
                     toString: ["_object_proto_toString", 0],
+                    toLocaleString: ["_object_proto_toString", 0],
                     hasOwnProperty: ["_aref_obj_hasOwn", 1],
                     valueOf: ["_aref_obj_valueOf", 0],
                     isPrototypeOf: ["_is_prototype_of", 1],

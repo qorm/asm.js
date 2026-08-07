@@ -1259,6 +1259,7 @@ export class ObjectGenerator {
         emitProtoMethod("hasOwnProperty", "_aref_obj_hasOwn", 1);
         emitProtoMethod("valueOf", "_aref_obj_valueOf", 0);
         emitProtoMethod("toString", "_object_proto_toString", 0);
+        emitProtoMethod("toLocaleString", "_object_proto_toString", 0);
         emitProtoMethod("isPrototypeOf", "_is_prototype_of", 1);
         emitProtoMethod("propertyIsEnumerable", "_object_propertyIsEnumerable", 1);
         // [__proto__] accessor property: {get,set,enumerable:false,configurable:true}
@@ -1871,9 +1872,10 @@ export class ObjectGenerator {
     generateArefStaticTramp() {
         const vm = this.vm;
         vm.label("_aref_static_tramp");
-        vm.prologue(0, []);
-        vm.load(VReg.V1, VReg.S0, 16);  // V1 = 真实 helper 标签地址
-        vm.jmpIndirect(VReg.V1);       // 尾调 helper(S0/A0-A5 原样透传)
+        vm.prologue(0, []); // save FP/LR
+        vm.load(VReg.V6, VReg.S0, 16);  // V6 = real helper label (S0=raw closure)
+        vm.callIndirect(VReg.V6);       // helper(A0-A5, _call_argc); RET = result
+        vm.epilogue([], 0);
     }
 
     // [argc ABI/Proxy apply] _proxy_apply_tramp:可调用 Proxy 的调用蹦床。
@@ -6523,7 +6525,7 @@ export class ObjectGenerator {
         vm.asm.registerRuntimeString("_str_0", "0");
         vm.asm.registerRuntimeString("_str_1", "1");
         vm.label("_object_define_properties_dyn");
-        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
         vm.mov(VReg.S0, VReg.A0);  // obj
         vm.mov(VReg.S1, VReg.A1);  // props
         // keys = Object.keys(props)
@@ -6540,20 +6542,20 @@ export class ObjectGenerator {
         vm.mov(VReg.A0, VReg.S2);
         vm.mov(VReg.A1, VReg.S4);
         vm.call("_array_get");     // key
-        vm.mov(VReg.V0, VReg.RET); // key boxed
+        vm.mov(VReg.S5, VReg.RET); // key boxed (S5 callee-saved, survives calls)
         // Read descriptor from props[key]
         vm.mov(VReg.A0, VReg.S1);
-        vm.mov(VReg.A1, VReg.V0);
+        vm.mov(VReg.A1, VReg.S5);
         vm.call("_object_get");    // desc = props[key]
         vm.mov(VReg.A2, VReg.RET);
         vm.mov(VReg.A0, VReg.S0);
-        vm.mov(VReg.A1, VReg.V0);
+        vm.mov(VReg.A1, VReg.S5);
         vm.call("_object_define_property_dyn");
         vm.addImm(VReg.S4, VReg.S4, 1);
         vm.jmp("_odps_loop");
         vm.label("_odps_done");
         vm.mov(VReg.RET, VReg.S0);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 32);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
     }
 
     // ============ [#61 P2] per-property attributes ============
