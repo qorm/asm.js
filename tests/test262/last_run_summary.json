@@ -1,68 +1,97 @@
 {
-  "generated": "2026-08-07T06:19:46.078Z",
-  "runnerSha": "a7c356139d44453d7863a5e4a610492a001892fc",
+  "generated": "2026-08-07T14:12:32.504Z",
+  "runnerSha": "6ed43c418423497a0a3fbfb28ab922142b14981b",
   "corpusPin": "9e61c12835c5e4a3bdba93850427e6742c4f64c4",
   "config": {
     "corpus": ".test262-corpus",
     "target": "macos-arm64",
     "dirs": [
-      "built-ins/Object"
+      "language/expressions",
+      "language/statements"
     ],
-    "stride": 2,
+    "stride": 5,
     "max": 0,
-    "jobs": 4
+    "jobs": 8
   },
-  "discovered": 3411,
+  "discovered": 20439,
   "excluded": {
-    "module": 0,
-    "feature": 10,
+    "module": 83,
+    "feature": 1372,
     "dir": 0
   },
   "excludedFeatureCounts": {
-    "BigInt": 8,
-    "cross-realm": 1,
-    "SharedArrayBuffer": 1
+    "BigInt": 152,
+    "cross-realm": 16,
+    "tail-call-optimization": 34,
+    "decorators": 24,
+    "SharedArrayBuffer": 2,
+    "dynamic-import": 688,
+    "source-phase-imports": 237,
+    "import-attributes": 42,
+    "explicit-resource-management": 177
   },
-  "eligible": 3401,
-  "run": 1701,
+  "eligible": 18984,
+  "run": 3797,
   "totals": {
-    "PASS": 1101,
-    "FAIL": 588,
-    "COMPILE_FAIL": 2,
-    "CRASH": 10
+    "PASS": 2540,
+    "FAIL": 1162,
+    "COMPILE_FAIL": 31,
+    "CRASH": 64
   },
-  "passRatePct": 64.73,
+  "passRatePct": 66.89,
   "byArea": {
-    "built-ins/Object": {
-      "PASS": 1101,
-      "FAIL": 588,
-      "COMPILE_FAIL": 2,
-      "CRASH": 10
+    "language/expressions": {
+      "PASS": 1319,
+      "FAIL": 602,
+      "COMPILE_FAIL": 23,
+      "CRASH": 31
+    },
+    "language/statements": {
+      "PASS": 1221,
+      "FAIL": 560,
+      "COMPILE_FAIL": 8,
+      "CRASH": 33
     }
   },
   "topFailPatterns": [
     {
       "pattern": "FAIL: assertion mismatch (Test262Error / wrong value)",
-      "count": 370
+      "count": 683
+    },
+    {
+      "pattern": "FAIL: async ($DONE not signalled / promise rejected)",
+      "count": 240
     },
     {
       "pattern": "FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)",
-      "count": 191
+      "count": 141
     },
     {
-      "pattern": "FAIL: constructor-ness reflection (isConstructor / not-a-constructor)",
-      "count": 16
-    },
-    {
-      "pattern": "FAIL: array contents mismatch (compareArray)",
-      "count": 11
+      "pattern": "FAIL: negative test wrong outcome (phase=parse)",
+      "count": 86
     },
     {
       "pattern": "CRASH: run signal SIGSEGV",
-      "count": 10
+      "count": 33
     },
     {
       "pattern": "COMPILE_FAIL: asm.js could not compile (unsupported syntax / parser gap)",
+      "count": 31
+    },
+    {
+      "pattern": "CRASH: run timeout",
+      "count": 25
+    },
+    {
+      "pattern": "FAIL: array contents mismatch (compareArray)",
+      "count": 10
+    },
+    {
+      "pattern": "CRASH: run signal SIGBUS",
+      "count": 6
+    },
+    {
+      "pattern": "FAIL: negative test wrong outcome (phase=runtime)",
       "count": 2
     }
   ]

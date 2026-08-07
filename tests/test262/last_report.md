@@ -1,73 +1,84 @@
 # asm.js test262 conformance report
 
-_Generated 2026-08-07T06:19:46.077Z — target macos-arm64_
+_Generated 2026-08-07T14:12:32.503Z — target macos-arm64_
 
 ## Headline
 
-**asm.js passes 1101 / 1701 = 64.73% of the run test262 subset**
+**asm.js passes 2540 / 3797 = 66.89% of the run test262 subset**
 (selected `language/` + core `built-ins/`), one variant per test.
 
-Of 3411 discovered test files in the selected dirs, 10 were excluded up front (module=0, unsupported-feature=10, intl/staging-dir=0); 3401 were eligible; 1701 were actually run (deterministic stride=2).
+Of 20439 discovered test files in the selected dirs, 1455 were excluded up front (module=83, unsupported-feature=1372, intl/staging-dir=0); 18984 were eligible; 3797 were actually run (deterministic stride=5).
 
 ## Overall breakdown
 
 | class | count | % of run |
 |-------|------:|---------:|
-| PASS         | 1101 | 64.73 |
-| FAIL         | 588 | 34.57 |
-| COMPILE_FAIL | 2 | 0.12 |
-| CRASH        | 10 | 0.59 |
-| **run**      | **1701** | 100 |
+| PASS         | 2540 | 66.89 |
+| FAIL         | 1162 | 30.60 |
+| COMPILE_FAIL | 31 | 0.82 |
+| CRASH        | 64 | 1.69 |
+| **run**      | **3797** | 100 |
 
 ## By area
 
 | area | run | PASS | FAIL | COMPILE_FAIL | CRASH | pass% |
 |------|----:|-----:|-----:|-------------:|------:|------:|
-| built-ins/Object | 1701 | 1101 | 588 | 2 | 10 | 64.7 |
+| language/expressions | 1975 | 1319 | 602 | 23 | 31 | 66.8 |
+| language/statements | 1822 | 1221 | 560 | 8 | 33 | 67.0 |
 
 ## Excluded categories (counted, not scored)
 
-- **module flag** (ES modules as test262 expects): 0
-- **unsupported feature** (structurally out of scope, see UNSUPPORTED_FEATURES): 10
+- **module flag** (ES modules as test262 expects): 83
+- **unsupported feature** (structurally out of scope, see UNSUPPORTED_FEATURES): 1372
 - **intl402/ + staging/ dirs**: 0
 
 Excluded-by-feature detail:
 
-- `BigInt`: 8
-- `cross-realm`: 1
-- `SharedArrayBuffer`: 1
+- `dynamic-import`: 688
+- `source-phase-imports`: 237
+- `explicit-resource-management`: 177
+- `BigInt`: 152
+- `import-attributes`: 42
+- `tail-call-optimization`: 34
+- `decorators`: 24
+- `cross-realm`: 16
+- `SharedArrayBuffer`: 2
 
 ## Top failing patterns (FAIL / COMPILE_FAIL / CRASH detail strings)
 
-- **370×** FAIL: assertion mismatch (Test262Error / wrong value)
-- **191×** FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)
-- **16×** FAIL: constructor-ness reflection (isConstructor / not-a-constructor)
-- **11×** FAIL: array contents mismatch (compareArray)
-- **10×** CRASH: run signal SIGSEGV
-- **2×** COMPILE_FAIL: asm.js could not compile (unsupported syntax / parser gap)
+- **683×** FAIL: assertion mismatch (Test262Error / wrong value)
+- **240×** FAIL: async ($DONE not signalled / promise rejected)
+- **141×** FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)
+- **86×** FAIL: negative test wrong outcome (phase=parse)
+- **33×** CRASH: run signal SIGSEGV
+- **31×** COMPILE_FAIL: asm.js could not compile (unsupported syntax / parser gap)
+- **25×** CRASH: run timeout
+- **10×** FAIL: array contents mismatch (compareArray)
+- **6×** CRASH: run signal SIGBUS
+- **2×** FAIL: negative test wrong outcome (phase=runtime)
 
 ## Failures correlated with features (top tags among failing tests)
 
-- `Proxy`: 25
-- `Symbol`: 21
-- `arrow-function`: 17
-- `Reflect.construct`: 16
-- `__setter__`: 14
-- `__getter__`: 13
-- `Object.fromEntries`: 9
-- `Symbol.toStringTag`: 8
-- `Symbol.iterator`: 7
-- `Reflect`: 3
-- `array-grouping`: 3
-- `Object.hasOwn`: 2
-- `Symbol.toPrimitive`: 2
-- `Reflect.setPrototypeOf`: 2
-- `generators`: 2
-- `iterator-helpers`: 2
-- `resizable-arraybuffer`: 1
-- `Object.is`: 1
-- `async-functions`: 1
-- `Set`: 1
+- `async-iteration`: 383
+- `destructuring-binding`: 331
+- `class`: 245
+- `generators`: 226
+- `Symbol.iterator`: 159
+- `class-fields-public`: 150
+- `default-parameters`: 101
+- `class-methods-private`: 65
+- `async-functions`: 64
+- `class-fields-private`: 64
+- `computed-property-names`: 58
+- `class-static-methods-private`: 57
+- `object-rest`: 49
+- `Symbol.asyncIterator`: 45
+- `class-static-fields-public`: 25
+- `class-static-fields-private`: 20
+- `Symbol`: 14
+- `logical-assignment-operators`: 12
+- `destructuring-assignment`: 10
+- `new.target`: 10
 
 ## Methodology / reproducibility
 
@@ -96,7 +107,7 @@ Excluded-by-feature detail:
 curl -sL -o /tmp/t262.tgz https://github.com/tc39/test262/archive/9e61c12835c5e4a3bdba93850427e6742c4f64c4.tar.gz
 mkdir -p .test262-corpus && tar xzf /tmp/t262.tgz -C .test262-corpus --strip-components=1
 # 2. run the harness
-node tests/test262/run.mjs --stride 2 --jobs 4 --target macos-arm64
+node tests/test262/run.mjs --stride 5 --jobs 8 --target macos-arm64
 ```
 
-_Run wall-clock: 114.6s._
+_Run wall-clock: 279.0s._
