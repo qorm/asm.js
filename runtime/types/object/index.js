@@ -3469,11 +3469,23 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.V0, 0);
         vm.jeq("_object_set_append");
         // [proto boxed guard] proto 可能已是装箱值(compileDynamicNew 存 0x7FFD/0x7FFE),
-        // 若高16非0则直接用作 A0,否则按裸指针装箱 0x7FFD。
+        // 若高16非0则直接用作 A0,否则按裸指针读类型字节判定装箱 tag。
+        // 此前裸指针一律装箱 0x7FFD:Array(type=1)头仅 32B(无 props_ptr@32),
+        // 0x7FFD 进 _object_get 会被当 Object 遍历,在 [S0+32] 解引用野地址 → SIGSEGV。
         vm.shrImm(VReg.V2, VReg.V0, 48);
         vm.cmpImm(VReg.V2, 0);
         vm.jne("_object_set_proto_boxed");
+        vm.movImm64(VReg.V1, vm.ptrFloor);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jlt("_object_set_append"); // 低于 floor:非法指针 → 跳过原型查找
+        vm.loadByte(VReg.V2, VReg.V0, 0); // 读类型字节
+        vm.cmpImm(VReg.V2, 1); // TYPE_ARRAY
+        vm.jeq("_object_set_proto_array");
         vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+        vm.or(VReg.A0, VReg.V0, VReg.V1);
+        vm.jmp("_object_set_proto_call");
+        vm.label("_object_set_proto_array");
+        vm.movImm64(VReg.V1, 0x7ffe000000000000n);
         vm.or(VReg.A0, VReg.V0, VReg.V1);
         vm.jmp("_object_set_proto_call");
         vm.label("_object_set_proto_boxed");
