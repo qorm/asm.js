@@ -3063,8 +3063,12 @@ export const MemberCompiler = {
         if (offset) {
             this.vm.load(VReg.RET, VReg.FP, offset);
         } else {
-            // 如果没有 __this，返回 undefined (0)
-            this.vm.movImm(VReg.RET, 0);
+            // 如果没有 __this (入口二进制/test262),回退到 _global_this。
+            // _global_this 由 _process_init 在启动时创建,是一个普通对象。
+            // 此前返回 0 → Object.defineProperty(this,…)/defineProperties 等崩(SIGSEGV)。
+            this.vm.lea(VReg.V0, "_global_this");
+            this.vm.load(VReg.RET, VReg.V0, 0);
+            this.vm.call("_box_obj_r");
         }
     },
 

@@ -2478,6 +2478,68 @@ export const FunctionCompiler = {
                 return;
             }
 
+            // Object(x) 转换函数:实现 ToObject(19.1.1.1)。
+            // ES 规范:Object()/Object(undefined)/Object(null) → {} 空对象;
+            // Object(已对象) → 该对象原样;Object(原始值) → 对应包装对象。
+            // 此前未实现→调用被丢弃,RET含垃圾→fromEntries等崩(SIGSEGV)。
+            if (callee.name === "Object") {
+                const arg = expr.arguments.length > 0 ? expr.arguments[0] : null;
+                if (!arg) {
+                    // Object() 无参 → {}
+                    this.vm.call("_object_new");
+                    this.vm.call("_box_obj_r");
+                } else if (arg.type === "Literal" && typeof arg.value === "string") {
+                    // Object("str") 静态字符串字面量 → 创建含索引属性 "0"/"1"/… 的包装对象
+                    const str = arg.value;
+                    const id = this.nextLabelId();
+                    const objOff = this.ctx.allocLocal(`__objcall_obj_${id}`);
+                    this.vm.call("_object_new");
+                    this.vm.call("_box_obj_r");
+                    this.vm.store(VReg.FP, objOff, VReg.RET);
+                    for (let i = 0; i < str.length; i++) {
+                        this.vm.load(VReg.A0, VReg.FP, objOff);
+                        this.emitBoxedStringKey(String(i), VReg.A1);
+                        this.vm.lea(VReg.V0, this.asm.addString(str[i]));
+                        this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+                        this.vm.or(VReg.A2, VReg.V0, VReg.V1);
+                        this.vm.call("_object_set");
+                    }
+                    this.vm.load(VReg.A0, VReg.FP, objOff);
+                    this.emitBoxedStringKey("length", VReg.A1);
+                    this.vm.movImm(VReg.V0, str.length);
+                    this.vm.scvtf(0, VReg.V0);
+                    this.vm.fmovToInt(VReg.A2, 0);
+                    this.vm.call("_object_set");
+                    this.vm.load(VReg.RET, VReg.FP, objOff);
+                } else if (arg.type === "Literal" && typeof arg.value === "number") {
+                    // Object(num) → Number 包装对象(暂简化:返回原数字,记偏差)
+                    this.compileExpression(arg);
+                } else if (arg.type === "Literal" && typeof arg.value === "boolean") {
+                    // Object(bool) → Boolean 包装对象
+                    this.compileExpression(arg);
+                    this.vm.mov(VReg.A0, VReg.RET);
+                    this.vm.call("_boolean_new");
+                } else {
+                    // 动态参数:运行时 ToObject。
+                    this.compileExpression(arg);
+                    // 已是对象(0x7FFD/0x7FFE/裸指针) → 直接返回
+                    const retLabel = this.ctx.newLabel("__objc_ret");
+                    this.vm.shrImm(VReg.V1, VReg.RET, 48);
+                    this.vm.cmpImm(VReg.V1, 0x7FFD);
+                    this.vm.jeq(retLabel);
+                    this.vm.cmpImm(VReg.V1, 0x7FFE);
+                    this.vm.jeq(retLabel);
+                    this.vm.cmpImm(VReg.V1, 0);
+                    this.vm.jeq(retLabel);
+                    // 原始值 → 包装(记偏差:未实现完整 ToObject,简化为新对象)
+                    this.vm.mov(VReg.A0, VReg.RET);
+                    this.vm.call("_object_new");
+                    this.vm.call("_box_obj_r");
+                    this.vm.label(retLabel);
+                }
+                return;
+            }
+
             // Number(x), Boolean(x), String(x) 转换函数
             if (callee.name === "Number" || callee.name === "Boolean" || callee.name === "String") {
                 const arg = expr.arguments.length > 0 ? expr.arguments[0] : null;

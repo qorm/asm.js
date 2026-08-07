@@ -1847,17 +1847,37 @@ export function __RE_matchAll(str, re) {
     if (typeof re === "string") re = __RE_new(re, "g");
     var s = str;
     if (typeof s !== "string") s = "" + s;
-    var out = [];
-    re.lastIndex = 0;
-    while (true) {
-        var m = __RE_exec(re, s);
-        if (m === null) break;
-        out.push(m);
-        if (!re.global) break; // 非 g:JS 会抛,这里宽容只取一个
-        if (m[0] === "") re.lastIndex = re.lastIndex + 1; // 空匹配前进防死循环
-    }
-    re.lastIndex = 0;
-    return out;
+    // Use a working copy with g flag to drive exec scanning without mutating
+    // the original regex's lastIndex (same pattern as __RE_split).
+    var flags = re.flags;
+    if (flags.indexOf("g") < 0) flags = flags + "g";
+    var g = __RE_new(typeof re.__pat === "string" ? re.__pat : re.source, flags);
+    g.lastIndex = 0;
+    var done = false;
+    var iter = {};
+    iter.next = function() {
+        if (done) {
+            var empty = {};
+            empty.value = undefined;
+            empty.done = true;
+            return empty;
+        }
+        var m = __RE_exec(g, s);
+        if (m === null) {
+            done = true;
+            var empty2 = {};
+            empty2.value = undefined;
+            empty2.done = true;
+            return empty2;
+        }
+        if (m[0] === "") g.lastIndex = g.lastIndex + 1;
+        var result = {};
+        result.value = m;
+        result.done = false;
+        return result;
+    };
+    iter[Symbol.iterator] = function() { return iter; };
+    return iter;
 }
 
 // str.split(re[, limit]):正则分隔符。ES SplitMatch 语义:切匹配之间的片段,
