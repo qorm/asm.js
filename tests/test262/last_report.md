@@ -1,73 +1,73 @@
 # asm.js test262 conformance report
 
-_Generated 2026-08-05T16:45:19.162Z — target macos-arm64_
+_Generated 2026-08-07T06:19:46.077Z — target macos-arm64_
 
 ## Headline
 
-**asm.js passes 205 / 407 = 50.37% of the run test262 subset**
+**asm.js passes 1101 / 1701 = 64.73% of the run test262 subset**
 (selected `language/` + core `built-ins/`), one variant per test.
 
-Of 1223 discovered test files in the selected dirs, 3 were excluded up front (module=0, unsupported-feature=3, intl/staging-dir=0); 1220 were eligible; 407 were actually run (deterministic stride=3).
+Of 3411 discovered test files in the selected dirs, 10 were excluded up front (module=0, unsupported-feature=10, intl/staging-dir=0); 3401 were eligible; 1701 were actually run (deterministic stride=2).
 
 ## Overall breakdown
 
 | class | count | % of run |
 |-------|------:|---------:|
-| PASS         | 205 | 50.37 |
-| FAIL         | 187 | 45.95 |
-| COMPILE_FAIL | 3 | 0.74 |
-| CRASH        | 12 | 2.95 |
-| **run**      | **407** | 100 |
+| PASS         | 1101 | 64.73 |
+| FAIL         | 588 | 34.57 |
+| COMPILE_FAIL | 2 | 0.12 |
+| CRASH        | 10 | 0.59 |
+| **run**      | **1701** | 100 |
 
 ## By area
 
 | area | run | PASS | FAIL | COMPILE_FAIL | CRASH | pass% |
 |------|----:|-----:|-----:|-------------:|------:|------:|
-| built-ins/String | 407 | 205 | 187 | 3 | 12 | 50.4 |
+| built-ins/Object | 1701 | 1101 | 588 | 2 | 10 | 64.7 |
 
 ## Excluded categories (counted, not scored)
 
 - **module flag** (ES modules as test262 expects): 0
-- **unsupported feature** (structurally out of scope, see UNSUPPORTED_FEATURES): 3
+- **unsupported feature** (structurally out of scope, see UNSUPPORTED_FEATURES): 10
 - **intl402/ + staging/ dirs**: 0
 
 Excluded-by-feature detail:
 
-- `cross-realm`: 3
+- `BigInt`: 8
+- `cross-realm`: 1
+- `SharedArrayBuffer`: 1
 
 ## Top failing patterns (FAIL / COMPILE_FAIL / CRASH detail strings)
 
-- **156×** FAIL: assertion mismatch (Test262Error / wrong value)
-- **18×** FAIL: constructor-ness reflection (isConstructor / not-a-constructor)
-- **9×** CRASH: run signal SIGSEGV
-- **7×** FAIL: array contents mismatch (compareArray)
-- **6×** FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)
-- **3×** COMPILE_FAIL: asm.js could not compile (unsupported syntax / parser gap)
-- **2×** CRASH: run signal SIGBUS
-- **1×** CRASH: run timeout
+- **370×** FAIL: assertion mismatch (Test262Error / wrong value)
+- **191×** FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)
+- **16×** FAIL: constructor-ness reflection (isConstructor / not-a-constructor)
+- **11×** FAIL: array contents mismatch (compareArray)
+- **10×** CRASH: run signal SIGSEGV
+- **2×** COMPILE_FAIL: asm.js could not compile (unsupported syntax / parser gap)
 
 ## Failures correlated with features (top tags among failing tests)
 
-- `Reflect.construct`: 18
+- `Proxy`: 25
+- `Symbol`: 21
 - `arrow-function`: 17
-- `Symbol.toPrimitive`: 12
-- `Symbol`: 11
-- `string-trimming`: 10
-- `String.prototype.replaceAll`: 7
-- `Symbol.matchAll`: 6
-- `Symbol.match`: 5
-- `String.prototype.matchAll`: 5
-- `Symbol.replace`: 5
-- `String.prototype.trimStart`: 5
-- `String.prototype.endsWith`: 4
-- `String.prototype.trimEnd`: 4
-- `String.prototype.includes`: 3
-- `String.prototype.toWellFormed`: 3
-- `String.fromCodePoint`: 2
-- `Symbol.iterator`: 2
-- `computed-property-names`: 2
-- `String.prototype.isWellFormed`: 2
-- `regexp-v-flag`: 2
+- `Reflect.construct`: 16
+- `__setter__`: 14
+- `__getter__`: 13
+- `Object.fromEntries`: 9
+- `Symbol.toStringTag`: 8
+- `Symbol.iterator`: 7
+- `Reflect`: 3
+- `array-grouping`: 3
+- `Object.hasOwn`: 2
+- `Symbol.toPrimitive`: 2
+- `Reflect.setPrototypeOf`: 2
+- `generators`: 2
+- `iterator-helpers`: 2
+- `resizable-arraybuffer`: 1
+- `Object.is`: 1
+- `async-functions`: 1
+- `Set`: 1
 
 ## Methodology / reproducibility
 
@@ -96,7 +96,7 @@ Excluded-by-feature detail:
 curl -sL -o /tmp/t262.tgz https://github.com/tc39/test262/archive/9e61c12835c5e4a3bdba93850427e6742c4f64c4.tar.gz
 mkdir -p .test262-corpus && tar xzf /tmp/t262.tgz -C .test262-corpus --strip-components=1
 # 2. run the harness
-node tests/test262/run.mjs --stride 3 --jobs 4 --target macos-arm64
+node tests/test262/run.mjs --stride 2 --jobs 4 --target macos-arm64
 ```
 
-_Run wall-clock: 34.2s._
+_Run wall-clock: 114.6s._
