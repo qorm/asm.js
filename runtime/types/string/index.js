@@ -5335,18 +5335,37 @@ export class StringGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
         // Non-RegExp path: fall back to _str_indexOf
         vm.label(smNotRe);
+        // Non-RegExp: convert search value to string, find first match via indexOf,
+        // extract matched substring (not the full this string as before).
+        this._emitArgStrInline(VReg.S1, "_sm_search");
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S1);
         vm.movImm(VReg.A2, 0);
         vm.call("_str_indexOf");
-        vm.cmpImm(VReg.RET, 0);
+        vm.mov(VReg.S3, VReg.RET);             // S3 = match index
+        vm.cmpImm(VReg.S3, 0);
         vm.jlt("_sm_null_v2");
+        // Extract matched substring: this[start..start+searchLen]
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_getStrContent");             // RET = str_ptr
+        vm.mov(VReg.S2, VReg.RET);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_getStrContent");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_strlen");                    // RET = searchLen
+        vm.add(VReg.V1, VReg.S3, VReg.RET);    // V1 = end = idx + searchLen
+        vm.mov(VReg.A0, VReg.S2);              // A0 = str_ptr
+        vm.mov(VReg.A1, VReg.S3);              // A1 = idx (start)
+        vm.mov(VReg.A2, VReg.V1);              // A2 = end
+        vm.call("_str_substring_raw");         // RET = boxed matched substring
+        vm.mov(VReg.S3, VReg.RET);
+        // Build result array [matched_substring]
         vm.movImm(VReg.A0, 1);
         vm.call("_array_new_with_size");
         vm.mov(VReg.S2, VReg.RET);
         vm.mov(VReg.A0, VReg.S2);
         vm.movImm(VReg.A1, 0);
-        vm.mov(VReg.A2, VReg.S0);
+        vm.mov(VReg.A2, VReg.S3);
         vm.call("_array_set");
         vm.mov(VReg.A0, VReg.S2);
         vm.call("_box_arr_r");
