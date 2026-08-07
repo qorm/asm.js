@@ -3848,6 +3848,10 @@ export const FunctionCompiler = {
 
                     this.vm.load(VReg.A0, VReg.FP, dpObj);
                     this.vm.load(VReg.A1, VReg.FP, dpKey);
+                    this.vm.mov(VReg.A0, VReg.A1);
+                    this.vm.call("_js_prop_key"); // normalize key (number->string, etc.)
+                    this.vm.mov(VReg.A1, VReg.RET);
+                    this.vm.load(VReg.A0, VReg.FP, dpObj);            // reload obj (clobbered by _js_prop_key)
                     this.vm.load(VReg.A2, VReg.FP, dpVal);            // value(accessor 下运行时忽略)
                     this.vm.load(VReg.A3, VReg.FP, dpGet);            // get
                     this.vm.load(VReg.A4, VReg.FP, dpSet);            // set
