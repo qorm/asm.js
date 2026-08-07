@@ -722,9 +722,10 @@ export class CoercionGenerator {
         vm.epilogue([VReg.S0, VReg.S1], 32);
 
         vm.label("_js_add_slow");
-        // 对象(0x7FFD)/数组(0x7FFE)操作数先 ToPrimitive(default):对象 valueOf→toString、
-        // 数组 → _valueToStr(逗号连接串)。结果(串/数)再走下方常规 string/numeric 分派。
-        // 此前对象/数组直接落数值 → NaN(`1+[1,2]`、`{valueOf}+8` 等)。
+        // 对象(0x7FFD)/数组(0x7FFE)/函数(0x7FFF)操作数先 ToPrimitive(default):
+        // 对象 valueOf→toString、数组→_valueToStr(逗号串)、函数→_valueToStr(函数源文本)。
+        // 结果(串/数)再走下方常规 string/numeric 分派。
+        // 此前对象/数组/函数直接落数值 → NaN(`1+[1,2]`、`{valueOf}+8`、`f+1` 等)。
         vm.shrImm(VReg.V0, VReg.S0, 48);
         vm.cmpImm(VReg.V0, 0x7FFD);
         vm.jne("_js_add_x_not_obj");
@@ -734,7 +735,10 @@ export class CoercionGenerator {
         vm.jmp("_js_add_check_y_prim");
         vm.label("_js_add_x_not_obj");
         vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jeq("_js_add_x_arr_fn");
+        vm.cmpImm(VReg.V0, 0x7FFF);
         vm.jne("_js_add_check_y_prim");
+        vm.label("_js_add_x_arr_fn");
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_valueToStr");
         vm.mov(VReg.S0, VReg.RET);
@@ -748,7 +752,10 @@ export class CoercionGenerator {
         vm.jmp("_js_add_slow_strchk");
         vm.label("_js_add_y_not_obj");
         vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jeq("_js_add_y_arr_fn");
+        vm.cmpImm(VReg.V0, 0x7FFF);
         vm.jne("_js_add_slow_strchk");
+        vm.label("_js_add_y_arr_fn");
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_valueToStr");
         vm.mov(VReg.S1, VReg.RET);
