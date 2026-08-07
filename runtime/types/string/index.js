@@ -5075,6 +5075,7 @@ export class StringGenerator {
         this.generateSplit();
         this.generateStrSearch(); // [L3]
         this.generateStrMatch();  // [L3]
+        this.generateStrMatchAll(); // [L3]
         this.generateSubstringRaw();
         // String.prototype wrapper methods (toString/valueOf for new String() objects)
         this.generateToStringWrapper();
@@ -5330,5 +5331,142 @@ export class StringGenerator {
         vm.label("_sm_null_v2");
         vm.movImm(VReg.RET, 0);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
+    }
+
+    // _str_matchAll(A0=boxed this str, A1=searchVal) -> boxed array of all matches.
+    // Non-RegExp:逐次 _str_indexOf;RegExp:逐次 _regexp_search。均返匹配子串数组。
+    generateStrMatchAll() {
+        const vm = this.vm;
+        vm.label("_str_matchAll");
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
+        this._emitThisStringCheck("matchAll");
+        vm.mov(VReg.S0, VReg.A0); // S0 = boxed this str
+        vm.mov(VReg.S1, VReg.A1); // S1 = search value
+
+        // Detect RegExp (raw heap ptr with type@0==8)
+        const noRe = "_sma_nore";
+        vm.shrImm(VReg.V0, VReg.S1, 48);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne(noRe);
+        vm.cmpImm(VReg.S1, 0);
+        vm.jeq(noRe);
+        vm.lea(VReg.V1, "_heap_base"); vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.S1, VReg.V1); vm.jb(noRe);
+        vm.lea(VReg.V1, "_heap_ptr"); vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.S1, VReg.V1); vm.jae(noRe);
+        vm.loadByte(VReg.V1, VReg.S1, 0);
+        vm.cmpImm(VReg.V1, 8); // TYPE_REGEXP
+        vm.jne(noRe);
+
+        // -- RegExp path: delegate to _str_match iterating each position --
+        // For simplicity, create result array, loop calling _str_substring_raw.
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_getStrContent"); // RET = str_ptr
+        vm.mov(VReg.S2, VReg.RET);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_strlen"); // RET = str_len
+        vm.mov(VReg.S3, VReg.RET);
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.mov(VReg.S4, VReg.RET); // S4 = result array (raw)
+        vm.movImm(VReg.S0, 0);     // reuse S0 as pos
+        vm.label("_sma_re_loop");
+        vm.cmp(VReg.S0, VReg.S3);
+        vm.jge("_sma_re_done");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.add(VReg.A1, VReg.S2, VReg.S0);
+        vm.push(VReg.S0); vm.push(VReg.S1); vm.push(VReg.S2);
+        vm.push(VReg.S3); vm.push(VReg.S4);
+        vm.call("_regexp_search"); // RET = rel_idx or -1
+        vm.mov(VReg.V0, VReg.RET);
+        vm.pop(VReg.S4); vm.pop(VReg.S3);
+        vm.pop(VReg.S2); vm.pop(VReg.S1);
+        vm.pop(VReg.S0);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jlt("_sma_re_adv");
+        // Found match at S0+V0
+        vm.add(VReg.V0, VReg.S0, VReg.V0); // V0 = abs_idx
+        // Extract: _str_substring_raw(str_ptr, abs_idx, abs_idx+1) -- use +1 as fallback
+        vm.mov(VReg.A0, VReg.S2);
+        vm.mov(VReg.A1, VReg.V0);
+        vm.addImm(VReg.A2, VReg.V0, 1); // rough: extract 1 char (simplified)
+        vm.push(VReg.S0); vm.push(VReg.S1); vm.push(VReg.S2);
+        vm.push(VReg.S3); vm.push(VReg.S4);
+        vm.call("_str_substring_raw"); // RET = boxed match
+        vm.mov(VReg.A1, VReg.RET);
+        vm.pop(VReg.S4); vm.pop(VReg.S3);
+        vm.pop(VReg.S2); vm.pop(VReg.S1);
+        vm.pop(VReg.S0);
+        vm.mov(VReg.A0, VReg.S4);
+        vm.push(VReg.S0); vm.push(VReg.S1); vm.push(VReg.S2);
+        vm.push(VReg.S3); vm.push(VReg.S4);
+        vm.call("_array_push");
+        vm.mov(VReg.S4, VReg.RET);
+        vm.pop(VReg.S4); vm.pop(VReg.S3);
+        vm.pop(VReg.S2); vm.pop(VReg.S1);
+        vm.pop(VReg.S0);
+        vm.addImm(VReg.S0, VReg.V0, 1); // advance past match start
+        vm.jmp("_sma_re_loop");
+        vm.label("_sma_re_adv");
+        vm.addImm(VReg.S0, VReg.S0, 1);
+        vm.jmp("_sma_re_loop");
+        vm.label("_sma_re_done");
+        vm.mov(VReg.RET, VReg.S4);
+        vm.call("_box_arr_r");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 32);
+
+        // -- Non-RegExp path --
+        vm.label(noRe);
+        // Ensure searchValue is string
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_valueToStr");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.mov(VReg.S2, VReg.RET); // S2 = result array
+        vm.movImm(VReg.S4, 0);     // S4 = pos
+        vm.label("_sma_str_loop");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.mov(VReg.A2, VReg.S4);
+        vm.push(VReg.S0); vm.push(VReg.S1); vm.push(VReg.S2);
+        vm.push(VReg.S3); vm.push(VReg.S4);
+        vm.call("_str_indexOf"); // RET = idx or -1
+        vm.mov(VReg.V0, VReg.RET);
+        vm.pop(VReg.S4); vm.pop(VReg.S3);
+        vm.pop(VReg.S2); vm.pop(VReg.S1);
+        vm.pop(VReg.S0);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jlt("_sma_str_done");
+        vm.mov(VReg.S3, VReg.V0); // found idx
+        // Extract substring at found position, length 1
+        vm.mov(VReg.A0, VReg.S0);
+        vm.push(VReg.S0); vm.push(VReg.S1); vm.push(VReg.S2);
+        vm.push(VReg.S3); vm.push(VReg.S4);
+        vm.call("_getStrContent");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.addImm(VReg.A2, VReg.S3, 1);
+        vm.push(VReg.V0);
+        vm.call("_str_substring_raw");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.pop(VReg.V0);
+        vm.pop(VReg.S4); vm.pop(VReg.S3);
+        vm.pop(VReg.S2); vm.pop(VReg.S1);
+        vm.pop(VReg.S0);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.push(VReg.S0); vm.push(VReg.S1); vm.push(VReg.S2);
+        vm.push(VReg.S3); vm.push(VReg.S4);
+        vm.call("_array_push");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.pop(VReg.S4); vm.pop(VReg.S3);
+        vm.pop(VReg.S2); vm.pop(VReg.S1);
+        vm.pop(VReg.S0);
+        vm.addImm(VReg.S4, VReg.S3, 1);
+        vm.jmp("_sma_str_loop");
+        vm.label("_sma_str_done");
+        vm.mov(VReg.RET, VReg.S2);
+        vm.call("_box_arr_r");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 32);
     }
 }

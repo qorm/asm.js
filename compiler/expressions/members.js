@@ -67,6 +67,7 @@ const ArefMethodRef = {
         // Batch 2b:经 wrapper 转裸 int 下标/fromIndex
         charAt: ["_aref_str_charAt", 1],
         match: ["_str_match", 1],       // [L3]
+        matchAll: ["_str_matchAll", 1],  // [L3]
         search: ["_str_search", 1],     // [L3]
         indexOf: ["_aref_str_indexOf", 1],
     },
@@ -234,6 +235,7 @@ const STRING_PROTO_METHODS = [
     ["padStart", "_str_padStart", 1],
     ["padEnd", "_str_padEnd", 1],
     ["match", "_str_match", 1],
+    ["matchAll", "_str_matchAll", 1],
     ["search", "_str_search", 1],
     ["split", "_str_split", 2],
     ["replace", "_str_replace", 2],

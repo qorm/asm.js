@@ -491,6 +491,18 @@ export const BuiltinMethodCompiler = {
                 this.vm.call("_str_match");
                 return true;
 
+            case "matchAll":
+                // str.matchAll(regexp_or_str) -> array of match substrings
+                if (args.length > 0) {
+                    this.compileExpression(args[0]);
+                    this.vm.mov(VReg.A1, VReg.RET);
+                } else {
+                    this.vm.lea(VReg.A1, "_str_empty");
+                }
+                this.vm.pop(VReg.A0);
+                this.vm.call("_str_matchAll");
+                return true;
+
             case "search":
                 // str.search(regexp) → index or -1._str_search 内检测 RegExp/string 分派
                 if (args.length > 0) {
