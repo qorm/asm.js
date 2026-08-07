@@ -2523,22 +2523,36 @@ export class ArrayGenerator {
         vm.call("_aref_arr_at");
         vm.epilogue([VReg.S0], 0);
 
-        // Simple wrapper generators for methods that take 0 args + receiver
+        // Simple wrapper generators for methods that take 0 args + receiver.
+        // Tag guard: 0x7FFE receiver skips _agen_norm (fast path for true arrays);
+        // non-array receiver (e.g. via .call()) gets normalized first.
         const agen0 = (label, target) => {
+            const fastLabel = "__agen0_native_" + label;
             vm.label(label);
             vm.prologue(0, [VReg.S0]);
+            vm.shrImm(VReg.V0, VReg.A0, 48);
+            vm.movImm(VReg.V1, 0x7FFE);
+            vm.cmp(VReg.V0, VReg.V1);
+            vm.jeq(fastLabel);             // already a boxed array, skip norm
             vm.call("_agen_norm");
             vm.mov(VReg.A0, VReg.RET);
+            vm.label(fastLabel);
             vm.call(target);
             vm.epilogue([VReg.S0], 0);
         };
         // 1 arg + receiver
         const agen1 = (label, target) => {
+            const fastLabel = "__agen1_native_" + label;
             vm.label(label);
             vm.prologue(0, [VReg.S0]);
             vm.mov(VReg.S0, VReg.A1);
+            vm.shrImm(VReg.V0, VReg.A0, 48);
+            vm.movImm(VReg.V1, 0x7FFE);
+            vm.cmp(VReg.V0, VReg.V1);
+            vm.jeq(fastLabel);             // already a boxed array, skip norm
             vm.call("_agen_norm");
             vm.mov(VReg.A0, VReg.RET);
+            vm.label(fastLabel);
             vm.mov(VReg.A1, VReg.S0);
             vm.call(target);
             vm.epilogue([VReg.S0], 0);

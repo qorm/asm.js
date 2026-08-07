@@ -3928,6 +3928,34 @@ export class StringGenerator {
         this._emitArgStrInline(VReg.S2, "_replaceAll_repl");   // [W-25] repl ToString
         this._emitArgStrInline(VReg.S1, "_replaceAll_search"); // [W-25] search 同上(与 indexOf 一致)
 
+        // [L3] RegExp detection: high16=0, in heap, type@0==8 -> regexp replace
+        const replaceAllNotRe = "_replaceAll_not_re";
+        vm.shrImm(VReg.V1, VReg.S1, 48);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne(replaceAllNotRe);
+        vm.cmpImm(VReg.S1, 0);
+        vm.jeq(replaceAllNotRe);
+        vm.lea(VReg.V1, "_heap_base"); vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.S1, VReg.V1); vm.jb(replaceAllNotRe);
+        vm.lea(VReg.V1, "_heap_ptr"); vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.S1, VReg.V1); vm.jae(replaceAllNotRe);
+        vm.loadByte(VReg.V1, VReg.S1, 0);
+        vm.cmpImm(VReg.V1, 8); // TYPE_REGEXP
+        vm.jne(replaceAllNotRe);
+        // RegExp path: str.split(re).join(repl) via _regexp_split + _array_join
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_getStrContent");     // RET = str_ptr
+        vm.mov(VReg.S4, VReg.RET);     // S4 = str_ptr
+        vm.mov(VReg.A0, VReg.S1);      // A0 = re_ptr
+        vm.mov(VReg.A1, VReg.S4);      // A1 = str_ptr
+        vm.movImm64(VReg.A2, 0x7FFFFFFFn); // large limit (unused by _regexp_split)
+        vm.call("_regexp_split");      // RET = boxed array (0x7FFE)
+        vm.mov(VReg.A0, VReg.RET);     // A0 = boxed array
+        vm.mov(VReg.A1, VReg.S2);      // A1 = repl (already ToString'd)
+        vm.call("_array_join");        // RET = boxed result string
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 16);
+        vm.label(replaceAllNotRe);
+
         // searchLen；==0 → 返回原串（守卫死循环）
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_getStrContent");
@@ -5231,19 +5259,64 @@ export class StringGenerator {
     generateStrMatch() {
         const vm = this.vm;
         vm.label("_str_match");
-        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
         this._emitThisStringCheck("match");
         vm.mov(VReg.S0, VReg.A0);
         vm.mov(VReg.S1, VReg.A1);
-        // 调 _str_indexOf(this, arg, 0)
+        // [L3] RegExp detection: high16=0, in heap, type@0==8 -> regexp match
+        const smNotRe = "_sm_not_re";
+        vm.shrImm(VReg.V1, VReg.S1, 48);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne(smNotRe);
+        vm.cmpImm(VReg.S1, 0);
+        vm.jeq(smNotRe);
+        vm.lea(VReg.V1, "_heap_base"); vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.S1, VReg.V1); vm.jb(smNotRe);
+        vm.lea(VReg.V1, "_heap_ptr"); vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.S1, VReg.V1); vm.jae(smNotRe);
+        vm.loadByte(VReg.V1, VReg.S1, 0);
+        vm.cmpImm(VReg.V1, 8); // TYPE_REGEXP
+        vm.jne(smNotRe);
+        // RegExp path: call _regexp_search to find match, extract matched substring
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_getStrContent");   // RET = str_ptr
+        vm.mov(VReg.S2, VReg.RET);   // S2 = str_ptr
+        vm.mov(VReg.A0, VReg.S1);    // A0 = re_ptr
+        vm.mov(VReg.A1, VReg.S2);    // A1 = str_ptr
+        vm.call("_regexp_search");   // RET = match_index
+        vm.mov(VReg.S3, VReg.RET);   // S3 = match_index
+        vm.cmpImm(VReg.S3, 0);
+        vm.jlt("_sm_null_v2");       // no match -> null
+        // Load pattern_ptr from re+8, get pattern_len
+        vm.load(VReg.V0, VReg.S1, 8);   // V0 = pattern_ptr
+        vm.mov(VReg.A0, VReg.V0);
+        vm.call("_strlen");              // RET = pattern_len
+        vm.add(VReg.V1, VReg.S3, VReg.RET); // V1 = end = match_index + pattern_len
+        // Extract matched substring via _str_substring_raw
+        vm.mov(VReg.A0, VReg.S2);   // A0 = str_ptr
+        vm.mov(VReg.A1, VReg.S3);   // A1 = match_index
+        vm.mov(VReg.A2, VReg.V1);   // A2 = end
+        vm.call("_str_substring_raw"); // RET = matched str (boxed 0x7FFC)
+        vm.mov(VReg.S3, VReg.RET);  // S3 = matched str (boxed)
+        // Build result array [matched_str]
+        vm.movImm(VReg.A0, 1);
+        vm.call("_array_new_with_size");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.movImm(VReg.A1, 0);
+        vm.mov(VReg.A2, VReg.S3);
+        vm.call("_array_set");
+        vm.mov(VReg.RET, VReg.S2);
+        vm.call("_box_arr_r");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
+        // Non-RegExp path: fall back to _str_indexOf
+        vm.label(smNotRe);
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S1);
         vm.movImm(VReg.A2, 0);
         vm.call("_str_indexOf");
-        // 判 >=0 → 命中
         vm.cmpImm(VReg.RET, 0);
         vm.jlt("_sm_null_v2");
-        // 建 [receiver] 数组
         vm.movImm(VReg.A0, 1);
         vm.call("_array_new_with_size");
         vm.mov(VReg.S2, VReg.RET);
@@ -5253,9 +5326,9 @@ export class StringGenerator {
         vm.call("_array_set");
         vm.mov(VReg.A0, VReg.S2);
         vm.call("_box_arr_r");
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
         vm.label("_sm_null_v2");
         vm.movImm(VReg.RET, 0);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
     }
 }
