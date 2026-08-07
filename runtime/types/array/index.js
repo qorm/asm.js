@@ -2283,15 +2283,23 @@ export class ArrayGenerator {
         };
 
         // _agen_norm(A0=recv boxed) -> boxed 真数组。
-        // 真数组:恒等返回(快路,3 条指令)。null/undefined:抛 TypeError。
-        // 字符串:len=_strlen;对象(0x7FFD):len=ToLength(this.length)。
-        // 其余(数字/布尔/裸指针):len=0 → 空数组。
+        // 真数组:恒等返回(快路,type byte 验证)。null/undefined:抛 TypeError。
+        // 字符串(0x7FFC):len=_strlen;对象(0x7FFD):len=ToLength(this.length)。
+        // Number/Boolean 包装器: type byte 非 2/3/8 → len=0 空数组(安全)。
+        // 其余(整数/布尔/裸指针):len=0 → 空数组。
         // 元素逐索引经 _subscript_get(recv, boxed_i) 读取(对象键规范化/字符串 charAt
         // /typed 布局均由其内部处理),push 进新真数组。
         vm.label("_agen_norm");
         vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
         vm.shrImm(VReg.V0, VReg.A0, 48);
         vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jne("_agen_norm_slow");
+        // 快路: tag 0x7FFE 且 type byte == 1 (TYPE_ARRAY) → 恒等返回。
+        // 若 type byte 非 1(proto 链污染等导致堆块类型被改写)→ 走慢路。
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V2, VReg.A0, VReg.V1);
+        vm.loadByte(VReg.V2, VReg.V2, 0);
+        vm.cmpImm(VReg.V2, 1);
         vm.jne("_agen_norm_slow");
         vm.mov(VReg.RET, VReg.A0); // 真数组:恒等
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
@@ -2313,6 +2321,10 @@ export class ArrayGenerator {
         // TYPE_PROXY(8) 是属性容器(有 props_ptr 可遍历),可安全调用 _object_get;
         // 其余 0x7FFD 对象(Date=7/Promise=11/DataView=14 等)直接 len=0,
         // 避免 _object_get 冷分支对非属性布局解引用 proto@16 崩(SIGSEGV)。
+        // Number/Boolean/String 包装器(new Number/new Boolean/new String):内部 type==2
+        // (TYPE_OBJECT),有标准对象头布局,此分支对其安全——_object_get 读取 .length
+        // (未设则 undefined→ToLength→0)、_subscript_get 按对象键读元素,均走常规对象路径。
+        // 无 .length 的包装器自动 len=0(空数组),有自定义 .length 时正常迭代。
         vm.movImm64(VReg.V2, 0x0000ffffffffffffn);
         vm.and(VReg.V2, VReg.S0, VReg.V2); // V2 = 裸对象指针
         vm.loadByte(VReg.V3, VReg.V2, 0);  // V3 = 类型字节
@@ -2398,31 +2410,38 @@ export class ArrayGenerator {
         vm.call("_throw_type_error"); // 不返回
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0); // 理论不达
 
-        // 回调型两参(recv, cb)泛型 wrapper:真数组直通 _rt,其余经 _agen_norm。
+        // 回调型两参(recv, cb)泛型 wrapper: 真数组(tag 0x7FFE 且 type byte==1)直通 _rt,
+        // 其余(含非 TYPE_ARRAY 的 0x7FFE 装箱/对象/包装器/裸指针)经 _agen_norm。
         const _cb2Fast = [
-            ["_agen_forEach", "_array_forEach_rt", "__agen_forEach_fast"],
-            ["_agen_map", "_array_map_rt", "__agen_map_fast"],
-            ["_agen_filter", "_array_filter_rt", "__agen_filter_fast"],
-            ["_agen_some", "_array_some_rt", "__agen_some_fast"],
-            ["_agen_every", "_array_every_rt", "__agen_every_fast"],
-            ["_agen_find", "_array_find_rt", "__agen_find_fast"],
-            ["_agen_findIndex", "_array_findIndex_rt", "__agen_findIndex_fast"],
-            ["_agen_flatMap", "_array_flatMap_rt", "__agen_flatMap_fast"],
+            ["_agen_forEach", "_array_forEach_rt", "__agen_forEach_slow"],
+            ["_agen_map", "_array_map_rt", "__agen_map_slow"],
+            ["_agen_filter", "_array_filter_rt", "__agen_filter_slow"],
+            ["_agen_some", "_array_some_rt", "__agen_some_slow"],
+            ["_agen_every", "_array_every_rt", "__agen_every_slow"],
+            ["_agen_find", "_array_find_rt", "__agen_find_slow"],
+            ["_agen_findIndex", "_array_findIndex_rt", "__agen_findIndex_slow"],
+            ["_agen_flatMap", "_array_flatMap_rt", "__agen_flatMap_slow"],
         ];
         for (let ci = 0; ci < _cb2Fast.length; ci++) {
             const label = _cb2Fast[ci][0];
             const target = _cb2Fast[ci][1];
-            const fastLabel = _cb2Fast[ci][2];
+            const slowLabel = _cb2Fast[ci][2];
             vm.label(label);
             vm.prologue(0, [VReg.S0]);
             vm.mov(VReg.S0, VReg.A1);
             vm.shrImm(VReg.V0, VReg.A0, 48);
             vm.cmpImm(VReg.V0, 0x7FFE);
-            vm.jne(fastLabel);
+            vm.jne(slowLabel);
+            // Tag is 0x7FFE; verify raw pointer has TYPE_ARRAY(1) type byte.
+            vm.emitMaskLoad(VReg.V1);
+            vm.andMaskReg(VReg.V1, VReg.A0, VReg.V1);
+            vm.loadByte(VReg.V2, VReg.V1, 0);
+            vm.cmpImm(VReg.V2, 1);
+            vm.jne(slowLabel);
             vm.mov(VReg.A1, VReg.S0);
             vm.call(target);
             vm.epilogue([VReg.S0], 0);
-            vm.label(fastLabel);
+            vm.label(slowLabel);
             vm.call("_agen_norm");
             vm.mov(VReg.A0, VReg.RET);
             vm.mov(VReg.A1, VReg.S0);
@@ -2430,7 +2449,9 @@ export class ArrayGenerator {
             vm.epilogue([VReg.S0], 0);
         }
 
-        // 回调+seed 三参(recv, cb, seed):reduce/reduceRight
+        // 回调+seed 三参(recv, cb, seed):reduce/reduceRight。
+        // 快路: 0x7FFE tag 且裸指针处 type byte == TYPE_ARRAY(1) → 直调 _rt。
+        // 非真数组/null/undefined/其他装箱值 → _agen_norm 归一化后再调 _rt。
         const _cb3Fast = [
             ["_agen_reduce", "_array_reduce_rt", "__agen_reduce_fast"],
             ["_agen_reduceRight", "_array_reduceRight_rt", "__agen_reduceRight_fast"],
@@ -2438,19 +2459,26 @@ export class ArrayGenerator {
         for (let ci = 0; ci < _cb3Fast.length; ci++) {
             const label = _cb3Fast[ci][0];
             const target = _cb3Fast[ci][1];
-            const fastLabel = _cb3Fast[ci][2];
+            const slowLabel = _cb3Fast[ci][2];
             vm.label(label);
             vm.prologue(0, [VReg.S0, VReg.S1]);
             vm.mov(VReg.S0, VReg.A1);
             vm.mov(VReg.S1, VReg.A2);
             vm.shrImm(VReg.V0, VReg.A0, 48);
             vm.cmpImm(VReg.V0, 0x7FFE);
-            vm.jne(fastLabel);
+            vm.jne(slowLabel);
+            // Fast path: tag=0x7FFE, 但需验证裸指针处确实是 TYPE_ARRAY
+            // (防止 proto 链被修改后 0x7FFE 装箱值内部的堆布局被破坏)。
+            vm.emitMaskLoad(VReg.V1);
+            vm.andMaskReg(VReg.V1, VReg.A0, VReg.V1);
+            vm.loadByte(VReg.V2, VReg.V1, 0);
+            vm.cmpImm(VReg.V2, 1);           // TYPE_ARRAY
+            vm.jne(slowLabel);               // 不是真正数组 → 走 norm
             vm.mov(VReg.A1, VReg.S0);
             vm.mov(VReg.A2, VReg.S1);
             vm.call(target);
             vm.epilogue([VReg.S0, VReg.S1], 0);
-            vm.label(fastLabel);
+            vm.label(slowLabel);
             vm.call("_agen_norm");
             vm.mov(VReg.A0, VReg.RET);
             vm.mov(VReg.A1, VReg.S0);
@@ -2551,39 +2579,58 @@ export class ArrayGenerator {
         vm.call("_aref_arr_at");
         vm.epilogue([VReg.S0], 0);
 
-        // Simple wrapper generators for methods that take 0 args + receiver.
-        // Tag guard: 0x7FFE receiver skips _agen_norm (fast path for true arrays);
-        // non-array receiver (e.g. via .call()) gets normalized first.
+        // Simple wrapper generators for methods that take 0/1 args + receiver.
+        // Tag guard: 0x7FFE receiver + type byte == TYPE_ARRAY → fast path;
+        // everything else (non-array/null/undefined/corrupted) → _agen_norm first.
         const agen0 = (label, target) => {
-            const fastLabel = "__agen0_native_" + label;
+            const fastLabel = "__agen0_fast_" + label;
+            const slowLabel = "__agen0_slow_" + label;
             vm.label(label);
             vm.prologue(0, [VReg.S0]);
             vm.shrImm(VReg.V0, VReg.A0, 48);
             vm.movImm(VReg.V1, 0x7FFE);
             vm.cmp(VReg.V0, VReg.V1);
-            vm.jeq(fastLabel);             // already a boxed array, skip norm
-            vm.call("_agen_norm");
-            vm.mov(VReg.A0, VReg.RET);
+            vm.jne(slowLabel);             // tag != 0x7FFE → norm
+            // Tag is 0x7FFE; verify raw pointer has TYPE_ARRAY type byte.
+            vm.emitMaskLoad(VReg.V1);
+            vm.andMaskReg(VReg.V1, VReg.A0, VReg.V1);
+            vm.loadByte(VReg.V2, VReg.V1, 0);
+            vm.cmpImm(VReg.V2, 1);         // TYPE_ARRAY
+            vm.jne(slowLabel);             // not real array → norm
             vm.label(fastLabel);
             vm.call(target);
             vm.epilogue([VReg.S0], 0);
+            vm.label(slowLabel);
+            vm.call("_agen_norm");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.jmp(fastLabel);             // jump to target call with normalized A0
         };
         // 1 arg + receiver
         const agen1 = (label, target) => {
-            const fastLabel = "__agen1_native_" + label;
+            const fastLabel = "__agen1_fast_" + label;
+            const slowLabel = "__agen1_slow_" + label;
             vm.label(label);
             vm.prologue(0, [VReg.S0]);
             vm.mov(VReg.S0, VReg.A1);
             vm.shrImm(VReg.V0, VReg.A0, 48);
             vm.movImm(VReg.V1, 0x7FFE);
             vm.cmp(VReg.V0, VReg.V1);
-            vm.jeq(fastLabel);             // already a boxed array, skip norm
-            vm.call("_agen_norm");
-            vm.mov(VReg.A0, VReg.RET);
+            vm.jne(slowLabel);             // tag != 0x7FFE → norm
+            // Tag is 0x7FFE; verify raw pointer has TYPE_ARRAY type byte.
+            vm.emitMaskLoad(VReg.V1);
+            vm.andMaskReg(VReg.V1, VReg.A0, VReg.V1);
+            vm.loadByte(VReg.V2, VReg.V1, 0);
+            vm.cmpImm(VReg.V2, 1);         // TYPE_ARRAY
+            vm.jne(slowLabel);             // not real array → norm
             vm.label(fastLabel);
             vm.mov(VReg.A1, VReg.S0);
             vm.call(target);
             vm.epilogue([VReg.S0], 0);
+            vm.label(slowLabel);
+            vm.call("_agen_norm");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.mov(VReg.A1, VReg.S0);
+            vm.jmp(fastLabel);             // jump to target call with normalized A0
         };
         agen0("_agen_pop", "_array_pop");
         agen0("_agen_shift", "_array_shift");

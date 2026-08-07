@@ -1400,7 +1400,11 @@ export class ObjectGenerator {
         vm.shrImm(VReg.V2, VReg.RET, 48);
         vm.cmpImm(VReg.V2, 0x7FFB);      // undefined?
         vm.jne("_object_get_done");      // 非 undefined → 直接返回
-        vm.loadByte(VReg.V2, VReg.A0, 0); // type byte of raw receiver
+        // [fix] A0 是 caller-saved 寄存器,_subscript_get 调用后已被销毁;从 callee-saved
+        // S0(装箱接收者)重新提取裸指针读取类型字节。
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V1, VReg.S0, VReg.V1); // V1 = 裸指针(从装箱 S0)
+        vm.loadByte(VReg.V2, VReg.V1, 0);          // V2 = 类型字节
         vm.cmpImm(VReg.V2, 1);           // TYPE_ARRAY only
         vm.jne("_object_get_done");      // TypedArray/other → keep undefined
         vm.lea(VReg.V0, "_nsobj_array_proto");
