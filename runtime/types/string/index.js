@@ -5105,8 +5105,31 @@ export class StringGenerator {
         const STRTAG = 0x7ffc000000000000n;
 
         // 守卫头:成功落穿;失败 jmp <tag>_bad。前置:S0 = 接收者(已落)。
+        // 0x7FFD Number 包装对象:提取 __number_value,品牌校验后落 S0 继续数字路径。
         const guardHead = (tag) => {
             vm.shrImm(VReg.V1, VReg.S0, 48);      // V1 = high16(A 系已无活值)
+            vm.cmpImm(VReg.V1, 0x7FFD);
+            vm.jne(tag + "_chk_box");
+            // Number wrapper: extract __number_value from wrapper
+            vm.mov(VReg.A0, VReg.S0);             // A0 = boxed wrapper
+            vm.lea(VReg.A1, vm.asm.addString("__number_value"));
+            vm.movImm64(VReg.V2, STRTAG);
+            vm.or(VReg.A1, VReg.A1, VReg.V2);     // A1 = boxed "__number_value"
+            vm.call("_object_get");               // RET = stored value
+            // Brand check: must be a number (not random injected value)
+            vm.shrImm(VReg.V0, VReg.RET, 48);
+            vm.cmpImm(VReg.V0, 0x7FF8);
+            vm.jeq(tag + "_unwrap");              // boxed int32 → valid
+            vm.cmpImm(VReg.V0, 0);                // high16 == 0? (denormal/small-int zone)
+            vm.jne(tag + "_unwrap");              // > 0 (pos float) or >= 0x8000 (neg float) → valid
+            // high16 == 0: check against ptrFloor to reject raw pointers
+            vm.movImm64(VReg.V3, vm.ptrFloor);
+            vm.cmp(VReg.RET, VReg.V3);
+            vm.jge(tag + "_bad");                 // raw pointer → not a number
+            vm.label(tag + "_unwrap");
+            vm.mov(VReg.S0, VReg.RET);            // S0 = unwrapped number value
+            vm.jmp(tag + "_ok");
+            vm.label(tag + "_chk_box");
             vm.cmpImm(VReg.V1, 0x7FF8);
             vm.jeq(tag + "_ok");                  // 装箱 int32
             vm.cmpImm(VReg.V1, 0x7FF9);

@@ -19,12 +19,14 @@ export { NumberPrintGenerator } from "./print.js";
 export { SignedIntegerGenerator } from "./integers.js";
 export { UnsignedIntegerGenerator } from "./uintegers.js";
 export { FloatsGenerator } from "./floats.js";
+export { NumberWrapperGenerator } from "./wrapper.js";
 
 // 导入生成器
 import { NumberPrintGenerator } from "./print.js";
 import { SignedIntegerGenerator } from "./integers.js";
 import { UnsignedIntegerGenerator } from "./uintegers.js";
 import { FloatsGenerator } from "./floats.js";
+import { NumberWrapperGenerator } from "./wrapper.js";
 
 // Number 类型聚合生成器
 export class NumberGenerator {
@@ -37,6 +39,7 @@ export class NumberGenerator {
         this.signedIntGen = new SignedIntegerGenerator(vm, ctx);
         this.unsignedIntGen = new UnsignedIntegerGenerator(vm, ctx);
         this.floatGen = new FloatsGenerator(vm, ctx);
+        this.wrapperGen = new NumberWrapperGenerator(vm);
     }
 
     // 生成所有数字类型相关函数
@@ -45,6 +48,7 @@ export class NumberGenerator {
         this.signedIntGen.generate();
         this.unsignedIntGen.generate();
         this.floatGen.generate();
+        this.wrapperGen.generate();
     }
 
     // 生成数据段（打印缓冲区等）

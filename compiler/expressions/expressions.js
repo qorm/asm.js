@@ -282,13 +282,28 @@ export const ExpressionCompiler = {
 
             case "Float":
             case "Number":
-                // new Float(value) / new Number(value) - 返回 IEEE 754 值 (Float64)
+                // new Number(x) -> Number wrapper object (0x7FFD-tagged), matching
+                // the Boolean wrapper pattern. typeof returns "object".
                 if (args.length > 0) {
                     this.compileExpression(args[0]);
                 } else {
-                    // 返回 0.0
                     this.vm.movImm(VReg.RET, 0);
                 }
+                this.vm.mov(VReg.A0, VReg.RET);
+                this.vm.call("_number_new"); // RET = boxed wrapper (0x7FFD)
+                // Save wrapper in FP slot
+                const numWrapOff = this.ctx.allocLocal(`__nnew_wrap_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, numWrapOff, VReg.RET);
+                // Lazy-init Number.prototype, then set on wrapper
+                this.emitNumberProtoObject(); // RET = boxed Number.prototype
+                this.vm.load(VReg.V1, VReg.FP, numWrapOff);
+                this.vm.emitMaskLoad(VReg.V2);
+                this.vm.andMaskReg(VReg.V1, VReg.V1, VReg.V2); // V1 = raw wrapper ptr
+                // Unbox proto before storing: __proto__ slot expects raw pointer
+                this.vm.andMaskReg(VReg.RET, VReg.RET, VReg.V2);
+                this.vm.store(VReg.V1, 16, VReg.RET); // wrapper->proto = raw proto ptr
+                // Return boxed wrapper
+                this.vm.load(VReg.RET, VReg.FP, numWrapOff);
                 break;
 
             case "String": {
