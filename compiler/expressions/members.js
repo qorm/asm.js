@@ -30,14 +30,15 @@ const ArefMethodRef = {
         at: ["_aref_arr_at", 1],
         indexOf: ["_aref_arr_indexOf", 1],
         slice: ["_aref_arr_slice", 2], // Batch 2c:start 缺省 0、end 缺省 INT_MAX
-        // Batch 3:回调型(运行时驱动回调)
-        forEach: ["_array_forEach_rt", 1],
-        map: ["_array_map_rt", 1],
-        filter: ["_array_filter_rt", 1],
-        some: ["_array_some_rt", 1],
-        every: ["_array_every_rt", 1],
-        reduce: ["_array_reduce_rt", 1],
-        reduceRight: ["_array_reduceRight_rt", 1],
+        // Batch 3:回调型(运行时驱动回调)。经 _agen_* 泛型 helper 直连,真数组恒等直通
+        // _array_*_rt,非数组 this 经 _agen_norm 快照/抛 TypeError(同 [I3] 级方法)。
+        forEach: ["_agen_forEach", 1],
+        map: ["_agen_map", 1],
+        filter: ["_agen_filter", 1],
+        some: ["_agen_some", 1],
+        every: ["_agen_every", 1],
+        reduce: ["_agen_reduce", 1],
+        reduceRight: ["_agen_reduceRight", 1],
         // [I3] 补齐缺失方法的一等值。一律用 _agen_* 泛型 helper(真数组恒等直通 _array_*_rt,
         // 非数组经 _agen_norm 快照/抛 TypeError)——方法值不绑定接收者,`[].findIndex.call(o)`
         // 的 this 可被 .call 改成任意对象,test262 return-abrupt-from-this-length-* 即此形态;

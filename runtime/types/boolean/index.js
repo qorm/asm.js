@@ -48,7 +48,10 @@ export class BooleanGenerator {
         // Step 3: set proto from global slot (always present from generateDataSlots)
         vm.lea(VReg.V3, "_nsobj_boolean_proto");
         vm.load(VReg.V3, VReg.V3, 0); // V3 = boxed proto (0 if not yet materialized)
-        vm.store(VReg.S1, 16, VReg.V3); // obj.__proto__ = prototype
+        // Unbox proto: __proto__ slot stores raw pointer, not boxed value
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V3, VReg.V3, VReg.V1);
+        vm.store(VReg.S1, 16, VReg.V3); // obj.__proto__ = raw prototype pointer
 
         // Step 4: store __boolean_value
         vm.mov(VReg.A0, VReg.S1);

@@ -272,7 +272,9 @@ export const ExpressionCompiler = {
                 this.vm.load(VReg.V1, VReg.FP, bWrapOff);
                 this.vm.emitMaskLoad(VReg.V2);
                 this.vm.andMaskReg(VReg.V1, VReg.V1, VReg.V2); // V1 = raw wrapper ptr
-                this.vm.store(VReg.V1, 16, VReg.RET); // wrapper->proto = proto
+                // Unbox proto before storing: __proto__ slot expects raw pointer
+                this.vm.andMaskReg(VReg.RET, VReg.RET, VReg.V2);
+                this.vm.store(VReg.V1, 16, VReg.RET); // wrapper->proto = raw proto ptr
                 // Return boxed wrapper
                 this.vm.load(VReg.RET, VReg.FP, bWrapOff);
                 break;
@@ -311,7 +313,10 @@ export const ExpressionCompiler = {
                 // Set prototype: load String.prototype singleton
                 this.emitStringProtoObject(); // RET = boxed String.prototype (0x7FFD-tagged)
                 this.vm.load(VReg.V1, VReg.FP, objPtrOff);
-                this.vm.store(VReg.V1, 16, VReg.RET); // obj.__proto__ = String.prototype
+                // Unbox proto before storing: __proto__ slot expects raw pointer
+                this.vm.emitMaskLoad(VReg.V2);
+                this.vm.andMaskReg(VReg.RET, VReg.RET, VReg.V2);
+                this.vm.store(VReg.V1, 16, VReg.RET); // obj.__proto__ = raw String.prototype ptr
                 // Store __value property
                 this.vm.load(VReg.A0, VReg.FP, objPtrOff);
                 this.vm.load(VReg.A2, VReg.FP, strValOff);

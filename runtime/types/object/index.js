@@ -5661,6 +5661,11 @@ export class ObjectGenerator {
         // Reading capacity as __proto__ pointer causes SIGSEGV.
         vm.cmpImm(VReg.V0, 1); /* TYPE_ARRAY */
         vm.jeq("_gpo_array");
+        // Only TYPE_OBJECT has a standard layout with __proto__ at offset 16.
+        // Non-standard types (Date=7, Map=4, Set=5, Promise=11, etc.) have
+        // different layouts; reading offset 16 would be unsafe.
+        vm.cmpImm(VReg.V0, TYPE_OBJECT);
+        vm.jne("_object_getPrototypeOf_unsupported");
 
         // 加载 __proto__
         vm.load(VReg.RET, VReg.S1, 16); // RET = __proto__ (裸指针)
@@ -5691,6 +5696,13 @@ export class ObjectGenerator {
         vm.load(VReg.RET, VReg.V0, 0);
         vm.cmpImm(VReg.RET, 0);
         vm.jeq("_object_getPrototypeOf_null");
+        vm.epilogue([VReg.S0, VReg.S1], 32);
+
+        // 非标准对象类型(Date/Map/Set/Promise 等)无标准 __proto__ 槽位，
+        // 返回 undefined(暂不实现完整原型链)。
+        vm.label("_object_getPrototypeOf_unsupported");
+        vm.lea(VReg.RET, "_js_undefined");
+        vm.load(VReg.RET, VReg.RET, 0);
         vm.epilogue([VReg.S0, VReg.S1], 32);
 
         // 原型为空 → 规范 null 单例(旧实现返裸 0,`gPO(Object.create(null)) === null` 恒假)

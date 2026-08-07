@@ -1714,6 +1714,34 @@ export const BuiltinArrayMethodCompiler = {
         const asyncLabel = this.ctx.newLabel("cb_async");
         const doneLabel = this.ctx.newLabel("cb_done");
 
+        // [callback guard] 回调可调用性守卫:装箱函数(0x7FFF)直通;装箱对象(0x7FFD)
+        // 经下方 Proxy/clsoure 分派,非 Proxy/closure 则抛 TypeError;裸指针(high16==0)
+        // 须落 heap 范围;其余(null/undefined/数字/字符串/布尔)抛 TypeError。
+        // 此前 null callback 解引用 [0+0] 直触 SIGSEGV(arr.every(null) 崩根因)。
+        // 守卫镜像 _aref_invoke_cb 判据,在脱壳前执行(保留 tag 信息)。
+        // V5 暂存原始 tag,供下方 rawFnLabel 判定 boxed-object 不可调用。
+        const cbCallableLbl = this.ctx.newLabel("cb_callable");
+        const cbNotCallableLbl = this.ctx.newLabel("cb_not_callable");
+        vm.shrImm(VReg.V0, VReg.S0, 48);
+        vm.mov(VReg.V5, VReg.V0);               // V5 = tag (暂存,heap 检查复用后仍须保留)
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jeq(cbCallableLbl);
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jeq(cbCallableLbl);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne(cbNotCallableLbl);
+        vm.lea(VReg.V5, "_heap_base");
+        vm.load(VReg.V5, VReg.V5, 0);
+        vm.cmp(VReg.S0, VReg.V5);
+        vm.jlt(cbNotCallableLbl);
+        vm.lea(VReg.V5, "_heap_ptr");
+        vm.load(VReg.V5, VReg.V5, 0);
+        vm.cmp(VReg.S0, VReg.V5);
+        vm.jlt(cbCallableLbl);
+        vm.label(cbNotCallableLbl);
+        vm.call("_throw_not_a_function");
+        vm.label(cbCallableLbl);
+
         // S0 可能是 NaN-boxed 函数(0x7FFF) / 装箱 Proxy(0x7FFD) / 闭包对象裸指针 /
         // 纯函数指针。无条件掩码脱壳(裸指针高16=0 恒等;此前仅 0x7FFF 去壳 → 装箱
         // proxy 带 tag 解引用 [S0+0] 段错 → [1,2].map(proxyCallable) 崩)。
@@ -1741,6 +1769,10 @@ export const BuiltinArrayMethodCompiler = {
         // async 闭包暂不支持在 forEach 回调中使用
         vm.jmp(doneLabel);
 
+        // [boxed-obj guard] 0x7FFD 对象经上方 magic/type 检测非 closure 非 Proxy →
+        // 不可调用,抛 TypeError。V5 暂存原始 tag(guard 期写入,此后未被触碰)。
+        const cbObjNotFnLbl = this.ctx.newLabel("cb_obj_not_fn");
+
         vm.label(notClosureLabel);
         {
             // [Proxy 回调] 可调用 Proxy(type@0==8)→ _validate_callable 合成闭包块
@@ -1757,10 +1789,17 @@ export const BuiltinArrayMethodCompiler = {
             vm.load(VReg.S1, VReg.S0, 8);  // tramp 地址
             vm.jmp(callLabel);
             vm.label(rawFnLabel);
+            // [boxed-obj guard] magic 非 closure 且 type 非 proxy:若原 tag=0x7FFD 则不可调用。
+            vm.cmpImm(VReg.V5, 0x7FFD);
+            vm.jeq(cbObjNotFnLbl);
             // 直接是函数指针
             vm.mov(VReg.S1, VReg.S0);
             vm.movImm(VReg.S0, 0);
         }
+
+        // [boxed-obj guard] 非可调用 0x7FFD 对象归位:抛 TypeError,不返回。
+        vm.label(cbObjNotFnLbl);
+        vm.call("_throw_not_a_function");
 
         vm.label(callLabel);
         // 有 thisArg 时绑定 this(A5);无则不发射,字节与今日一致。
