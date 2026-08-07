@@ -1575,11 +1575,20 @@ export class ObjectGenerator {
 
         // 在原型链上查找
         vm.label(checkProtoLabel);
-        vm.load(VReg.V0, VReg.S0, 16); // __proto__ (裸指针)
+        vm.load(VReg.V0, VReg.S0, 16); // __proto__
         vm.cmpImm(VReg.V0, 0);
         vm.jeq(notFoundLabel);
-        // 将裸指针标记为 JS 对象 (0x7FFD)
+        // [proto boxed guard] compileDynamicNew 存 proto 可能为装箱值(0x7FFD/0x7FFE),
+        // 而非裸指针。高16非0 → 已是装箱对象,直接用作 A0;否则按裸指针装箱。
+        vm.shrImm(VReg.V2, VReg.V0, 48);
+        vm.cmpImm(VReg.V2, 0);
+        vm.jne("_object_get_proto_boxed");
+        // 裸指针标记为 JS 对象 (0x7FFD)
         vm.orImm(VReg.A0, VReg.V0, 0x7ffd000000000000);
+        vm.jmp("_object_get_proto_call");
+        vm.label("_object_get_proto_boxed");
+        vm.mov(VReg.A0, VReg.V0);
+        vm.label("_object_get_proto_call");
         vm.mov(VReg.A1, VReg.S1);
         vm.call("_object_get");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
@@ -2458,6 +2467,11 @@ export class ObjectGenerator {
         vm.load(VReg.V1, VReg.V2, 16); // proto
         vm.cmpImm(VReg.V1, 0);
         vm.jeq("_ogic_slow_delegate");
+        // [proto boxed guard] compileDynamicNew 存 proto 可能为装箱值(0x7FFD/0x7FFE),
+        // 而非裸指针。若高16非0 → 已是装箱对象,落委托(避免把装箱值当指针解引用 SIGSEGV)。
+        vm.shrImm(VReg.V3, VReg.V1, 48);
+        vm.cmpImm(VReg.V3, 0);
+        vm.jne("_ogic_slow_delegate");
         // proto 恒为 0 或堆对象裸指针(对象头域);floor + type 守卫
         vm.shrImm(VReg.V3, VReg.V1, floorShift);
         vm.cmpImm(VReg.V3, 0);
@@ -3403,8 +3417,17 @@ export class ObjectGenerator {
         vm.load(VReg.V0, VReg.S0, 16); // __proto__
         vm.cmpImm(VReg.V0, 0);
         vm.jeq("_object_set_append");
+        // [proto boxed guard] proto 可能已是装箱值(compileDynamicNew 存 0x7FFD/0x7FFE),
+        // 若高16非0则直接用作 A0,否则按裸指针装箱 0x7FFD。
+        vm.shrImm(VReg.V2, VReg.V0, 48);
+        vm.cmpImm(VReg.V2, 0);
+        vm.jne("_object_set_proto_boxed");
         vm.movImm64(VReg.V1, 0x7ffd000000000000n);
         vm.or(VReg.A0, VReg.V0, VReg.V1);
+        vm.jmp("_object_set_proto_call");
+        vm.label("_object_set_proto_boxed");
+        vm.mov(VReg.A0, VReg.V0);
+        vm.label("_object_set_proto_call");
         vm.mov(VReg.A1, VReg.S1);
         vm.call("_object_get"); // 原型链查同名键
         vm.mov(VReg.V0, VReg.RET);

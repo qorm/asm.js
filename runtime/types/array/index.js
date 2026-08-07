@@ -2309,6 +2309,34 @@ export class ArrayGenerator {
         vm.label("_agen_norm_objlen");
         vm.cmpImm(VReg.V0, 0x7FFD); // 仅对象走 length 属性读;其余 len=0
         vm.jne("_agen_norm_len0");
+        // [Number wrapper guard] 脱壳查类型字节:仅 TYPE_OBJECT(2)/TYPE_CLOSURE(3)/
+        // TYPE_PROXY(8) 是属性容器(有 props_ptr 可遍历),可安全调用 _object_get;
+        // 其余 0x7FFD 对象(Date=7/Promise=11/DataView=14 等)直接 len=0,
+        // 避免 _object_get 冷分支对非属性布局解引用 proto@16 崩(SIGSEGV)。
+        vm.movImm64(VReg.V2, 0x0000ffffffffffffn);
+        vm.and(VReg.V2, VReg.S0, VReg.V2); // V2 = 裸对象指针
+        vm.loadByte(VReg.V3, VReg.V2, 0);  // V3 = 类型字节
+        vm.cmpImm(VReg.V3, 2);             // TYPE_OBJECT
+        vm.jeq("_agen_norm_objlen_ok");
+        vm.cmpImm(VReg.V3, 3);             // TYPE_CLOSURE (classinfo)
+        vm.jeq("_agen_norm_objlen_ok");
+        vm.cmpImm(VReg.V3, 8);             // TYPE_PROXY
+        vm.jeq("_agen_norm_objlen_ok");
+        // [Number wrapper / Boolean wrapper] TYPE_OBJECT(=2) → length 读走 _object_get;
+        // 含 Number 包装对象、Boolean 包装对象、普通对象、{} 字面量。其余类型(含裸指针
+        // 高16=0 但 type 非 2/3/8 的损坏值)一律 len=0。
+        vm.jmp("_agen_norm_len0");
+        vm.label("_agen_norm_objlen_ok");
+        // [proto guard] compileDynamicNew 可能存装箱 proto(0x7FFE Array)于 [obj+16],
+        // _object_get 的 checkProtoLabel 遍历时会解引用装箱值当裸指针 → SIGSEGV。
+        // 若 proto 高16位非0(已是装箱值),直接 len=0 跳过 _object_get 避免递归崩。
+        vm.load(VReg.V4, VReg.V2, 16); // proto from [raw_obj, 16]
+        vm.cmpImm(VReg.V4, 0);
+        vm.jeq("_agen_norm_objlen_get");  // proto==null → safe, read length
+        vm.shrImm(VReg.V5, VReg.V4, 48);
+        vm.cmpImm(VReg.V5, 0);
+        vm.jne("_agen_norm_len0");        // proto is boxed → unsafe, len=0
+        vm.label("_agen_norm_objlen_get");
         vm.mov(VReg.A0, VReg.S0);
         vm.lea(VReg.A1, vm.asm.addString("length"));
         boxStr(VReg.A1);
