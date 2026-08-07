@@ -4420,7 +4420,7 @@ export class StringGenerator {
             vm.mov(VReg.A0, VReg.S1); // A0 = re_ptr
             vm.movImm64(VReg.A2, 0xffffffffn); // large limit
             vm.call("_regexp_split");
-            vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 96);
+            vm.jmp("_split_ret"); // 走 constructor 落地路径
             vm.label(splitReNot);
         }
         // 其余非串 separator 走 ToString(split(null) → "null"、split(1) → "1")

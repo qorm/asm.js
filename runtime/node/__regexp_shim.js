@@ -1885,17 +1885,27 @@ export function __RE_matchAll(str, re) {
 // 用 g 标志工作副本驱动 __RE_exec 扫描(原 re 的 lastIndex 不受影响)。
 export function __RE_split(str, re, limit) {
     var lim = (limit === undefined || limit === null) ? 4294967295 : limit;
-    if (lim === 0) return [];
+    if (lim === 0) {
+        var e0 = [];
+        e0.constructor = Array;
+        return e0;
+    }
     var flags = re.flags;
     if (flags.indexOf("g") < 0) flags = flags + "g";
     var g = __RE_new(typeof re.__pat === "string" ? re.__pat : re.source, flags);
     if (str === "") {
-        // 规范:空串上正则能匹配空 → [],否则 [""]
         var me = __RE_exec(g, "");
-        if (me === null) return [""];
-        return [];
+        if (me === null) {
+            var e1 = [""];
+            e1.constructor = Array;
+            return e1;
+        }
+        var e2 = [];
+        e2.constructor = Array;
+        return e2;
     }
     var out = [];
+    out.constructor = Array;
     var last = 0;
     g.lastIndex = 0;
     while (true) {
@@ -1904,11 +1914,11 @@ export function __RE_split(str, re, limit) {
         var q = m.index;
         if (q >= str.length) break;
         var e = q + m[0].length;
-        if (e === last) { g.lastIndex = q + 1; continue; } // 空匹配未推进:跳过
+        if (e === last) { g.lastIndex = q + 1; continue; }
         out.push(str.slice(last, q));
         if (out.length >= lim) return out;
         var k = 1;
-        while (k < m.length) { // 捕获组并入(ES 规范)
+        while (k < m.length) {
             out.push(m[k]);
             if (out.length >= lim) return out;
             k = k + 1;

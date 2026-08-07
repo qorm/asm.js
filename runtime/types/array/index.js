@@ -2370,39 +2370,59 @@ export class ArrayGenerator {
         vm.call("_throw_type_error"); // 不返回
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0); // 理论不达
 
-        // 回调型两参:_agen_<m>(A0=recv, A1=cb) → norm 后委托 _array_<m>_rt
-        const cb2 = [
-            ["_agen_forEach", "_array_forEach_rt"],
-            ["_agen_map", "_array_map_rt"],
-            ["_agen_filter", "_array_filter_rt"],
-            ["_agen_some", "_array_some_rt"],
-            ["_agen_every", "_array_every_rt"],
-            // [I3] 回调型(recv, cb)同构,泛型 norm 后委托 _rt(见 generateArefI3Methods)。
-            ["_agen_find", "_array_find_rt"],
-            ["_agen_findIndex", "_array_findIndex_rt"],
-            ["_agen_flatMap", "_array_flatMap_rt"],
+        // 回调型两参(recv, cb)泛型 wrapper:真数组直通 _rt,其余经 _agen_norm。
+        const _cb2Fast = [
+            ["_agen_forEach", "_array_forEach_rt", "__agen_forEach_fast"],
+            ["_agen_map", "_array_map_rt", "__agen_map_fast"],
+            ["_agen_filter", "_array_filter_rt", "__agen_filter_fast"],
+            ["_agen_some", "_array_some_rt", "__agen_some_fast"],
+            ["_agen_every", "_array_every_rt", "__agen_every_fast"],
+            ["_agen_find", "_array_find_rt", "__agen_find_fast"],
+            ["_agen_findIndex", "_array_findIndex_rt", "__agen_findIndex_fast"],
+            ["_agen_flatMap", "_array_flatMap_rt", "__agen_flatMap_fast"],
         ];
-        for (const [label, target] of cb2) {
+        for (let ci = 0; ci < _cb2Fast.length; ci++) {
+            const label = _cb2Fast[ci][0];
+            const target = _cb2Fast[ci][1];
+            const fastLabel = _cb2Fast[ci][2];
             vm.label(label);
             vm.prologue(0, [VReg.S0]);
-            vm.mov(VReg.S0, VReg.A1); // cb
-            vm.call("_agen_norm");    // A0=recv 已就位 → RET=真数组
+            vm.mov(VReg.S0, VReg.A1);
+            vm.shrImm(VReg.V0, VReg.A0, 48);
+            vm.cmpImm(VReg.V0, 0x7FFE);
+            vm.jne(fastLabel);
+            vm.mov(VReg.A1, VReg.S0);
+            vm.call(target);
+            vm.epilogue([VReg.S0], 0);
+            vm.label(fastLabel);
+            vm.call("_agen_norm");
             vm.mov(VReg.A0, VReg.RET);
             vm.mov(VReg.A1, VReg.S0);
             vm.call(target);
             vm.epilogue([VReg.S0], 0);
         }
 
-        // 回调+seed 三参:reduce/reduceRight(A0=recv, A1=cb, A2=seed 或 undefined)
-        const cb3 = [
-            ["_agen_reduce", "_array_reduce_rt"],
-            ["_agen_reduceRight", "_array_reduceRight_rt"],
+        // 回调+seed 三参(recv, cb, seed):reduce/reduceRight
+        const _cb3Fast = [
+            ["_agen_reduce", "_array_reduce_rt", "__agen_reduce_fast"],
+            ["_agen_reduceRight", "_array_reduceRight_rt", "__agen_reduceRight_fast"],
         ];
-        for (const [label, target] of cb3) {
+        for (let ci = 0; ci < _cb3Fast.length; ci++) {
+            const label = _cb3Fast[ci][0];
+            const target = _cb3Fast[ci][1];
+            const fastLabel = _cb3Fast[ci][2];
             vm.label(label);
             vm.prologue(0, [VReg.S0, VReg.S1]);
-            vm.mov(VReg.S0, VReg.A1); // cb
-            vm.mov(VReg.S1, VReg.A2); // seed(缺参为 undefined,_rt 内部判)
+            vm.mov(VReg.S0, VReg.A1);
+            vm.mov(VReg.S1, VReg.A2);
+            vm.shrImm(VReg.V0, VReg.A0, 48);
+            vm.cmpImm(VReg.V0, 0x7FFE);
+            vm.jne(fastLabel);
+            vm.mov(VReg.A1, VReg.S0);
+            vm.mov(VReg.A2, VReg.S1);
+            vm.call(target);
+            vm.epilogue([VReg.S0, VReg.S1], 0);
+            vm.label(fastLabel);
             vm.call("_agen_norm");
             vm.mov(VReg.A0, VReg.RET);
             vm.mov(VReg.A1, VReg.S0);
