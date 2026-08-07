@@ -1394,7 +1394,22 @@ export class ObjectGenerator {
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.A0, VReg.S0, VReg.V1);
         vm.mov(VReg.A1, VReg.S1);
-        vm.call("_subscript_get");
+        vm.call("_subscript_get");       // RET = 元素/侧表值 或 undefined
+        // [array proto fallthrough] _subscript_get 对具名键(如 "every")返回 undefined。
+        // 仅 TYPE_ARRAY(1)有 Array.prototype 链;TypedArray(0x40+)不适用此机制。
+        vm.shrImm(VReg.V2, VReg.RET, 48);
+        vm.cmpImm(VReg.V2, 0x7FFB);      // undefined?
+        vm.jne("_object_get_done");      // 非 undefined → 直接返回
+        vm.loadByte(VReg.V2, VReg.A0, 0); // type byte of raw receiver
+        vm.cmpImm(VReg.V2, 1);           // TYPE_ARRAY only
+        vm.jne("_object_get_done");      // TypedArray/other → keep undefined
+        vm.lea(VReg.V0, "_nsobj_array_proto");
+        vm.load(VReg.A0, VReg.V0, 0);    // A0 = boxed Array.prototype (0 if not init)
+        vm.cmpImm(VReg.A0, 0);
+        vm.jeq("_object_get_done");      // 未初始化 → 保持 undefined
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_get");          // 在 Array.prototype 上递归查找
+        vm.label("_object_get_done");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
 
         // 冷分支:接收者是装箱字符串(S0 保持**装箱**形态——本分支在 _object_get_tag_ok
@@ -5990,6 +6005,8 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.V0, 0x7FFB);        // undefined → treat as null
         vm.jeq("_ospo_null");
         vm.cmpImm(VReg.V0, 0x7FFD);        // Object → ok
+        vm.jeq("_ospo_type_ok");
+        vm.cmpImm(VReg.V0, 0x7FFE);        // Array → ok (ES: Array is an object)
         vm.jeq("_ospo_type_ok");
         vm.cmpImm(VReg.V0, 0);             // raw heap pointer → ok
         vm.jeq("_ospo_type_ok");

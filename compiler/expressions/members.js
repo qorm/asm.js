@@ -2779,6 +2779,9 @@ export const MemberCompiler = {
     // 数组原型,仍 false,与改造前一致;真值链修正随缺陷 B)。`Array(...)`/`new Array(...)`/
     // Array.isArray(...) 快路先命中,不经此 → 字节不变。
     emitArrayCtorObject() {
+        // Idempotent: only emit code once per compilation.
+        if (this._emittedArrayCtor) return;
+        this._emittedArrayCtor = true;
         this.emitCollectionCtorObject({
             name: "Array", length: 1, ctorFn: "_array_ctor_call",
             ctorSlot: "_nsobj_array", protoSlot: "_nsobj_array_proto",

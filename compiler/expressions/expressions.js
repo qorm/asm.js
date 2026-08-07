@@ -385,6 +385,8 @@ export const ExpressionCompiler = {
                 break;
 
             case "Array":
+                // Ensure Array ctor emitted once for proto chain lookups.
+                if (this.emitArrayCtorObject) this.emitArrayCtorObject();
                 // new Array(len) 或 new Array(a, b, c)
                 if (args.length === 0) {
                     // 空数组
