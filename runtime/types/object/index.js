@@ -4667,9 +4667,37 @@ export class ObjectGenerator {
         const vm = this.vm;
         vm.label("_object_getOwnPropertySymbols");
         vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
+
+        // Type check: null/undefined → TypeError (ToObject step)
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFA); vm.jeq("_ogops_nullish");
+        vm.cmpImm(VReg.V0, 0x7FFB); vm.jeq("_ogops_nullish");
+        // Non-object types (number, bool, string, array, function) → empty array
+        vm.cmpImm(VReg.V0, 0x7FFD); vm.jeq("_ogops_obj");
+        vm.cmpImm(VReg.V0, 0);      vm.jeq("_ogops_obj"); // bare pointer
+        // Anything else → return empty array
+        vm.label("_ogops_empty");
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.movImm64(VReg.V1, 0x7FFE000000000000n);
+        vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+
+        vm.label("_ogops_nullish");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot convert undefined or null to object"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error"); // does not return
+
+        vm.label("_ogops_obj");
         vm.mov(VReg.S0, VReg.A0);
         vm.emitMaskLoad(VReg.V4);
         vm.andMaskReg(VReg.S0, VReg.S0, VReg.V4);
+        // Only TYPE_OBJECT has count/props_ptr at expected offsets.
+        // Proxy/Date/Map/Set/etc. have different layouts.
+        vm.loadByte(VReg.V0, VReg.S0, 0);
+        vm.cmpImm(VReg.V0, TYPE_OBJECT);
+        vm.jne("_ogops_empty");
         vm.load(VReg.S1, VReg.S0, 8); // count
         vm.movImm(VReg.A0, 0);
         vm.call("_array_new_with_size");

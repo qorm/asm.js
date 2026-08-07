@@ -852,7 +852,14 @@ export const FunctionCompiler = {
 
         const normalLabel = this.ctx.newLabel("dpd_normal");
         const doneLabel = this.ctx.newLabel("dpd_done");
+        const dpdCheckProxyLabel = this.ctx.newLabel("dpd_check_proxy");
         this.vm.load(VReg.RET, VReg.FP, oOff);
+        // Tag check first: non-object → skip proxy check, let runtime throw TypeError
+        this.vm.shrImm(VReg.V0, VReg.RET, 48);
+        this.vm.cmpImm(VReg.V0, 0x7FFD); this.vm.jeq(dpdCheckProxyLabel);
+        this.vm.cmpImm(VReg.V0, 0);      this.vm.jeq(dpdCheckProxyLabel); // bare ptr
+        this.vm.jmp(normalLabel);
+        this.vm.label(dpdCheckProxyLabel);
         this.vm.emitMaskLoad(VReg.V1);
         this.vm.andMaskReg(VReg.V0, VReg.RET, VReg.V1); // 裸指针
         this.vm.cmpImm(VReg.V0, 0);
@@ -3555,9 +3562,11 @@ export const FunctionCompiler = {
                         this.vm.load(VReg.A1, VReg.FP, feIdx);
                         this.vm.call("_array_get"); // entry [k,v]
                         this.vm.store(VReg.FP, feEnt, VReg.RET);
+                        // Use _object_get for entry[0] and entry[1]: works for arrays
+                        // (via _subscript_get), string wrappers, and plain objects.
                         this.vm.mov(VReg.A0, VReg.RET);
-                        this.vm.movImm(VReg.A1, 0);
-                        this.vm.call("_array_get");
+                        this.emitBoxedStringKey("0", VReg.A1);
+                        this.vm.call("_object_get"); // key = entry["0"]
                         this.vm.store(VReg.FP, feKey, VReg.RET);
                         // ToPropertyKey:JS 对象键恒字符串,数值键须 ToString(`fromEntries([[2,"b"]])`
                         // 的 2 → 键 "2",故 obj[2]/obj["2"] 命中)。此前把裸数值键喂 _object_set →
@@ -3572,8 +3581,8 @@ export const FunctionCompiler = {
                         this.vm.store(VReg.FP, feKey, VReg.RET);
                         this.vm.label(feKeyStr);
                         this.vm.load(VReg.A0, VReg.FP, feEnt);
-                        this.vm.movImm(VReg.A1, 1);
-                        this.vm.call("_array_get");
+                        this.emitBoxedStringKey("1", VReg.A1);
+                        this.vm.call("_object_get"); // value = entry["1"]
                         this.vm.mov(VReg.A2, VReg.RET);
                         this.vm.load(VReg.A1, VReg.FP, feKey);
                         this.vm.load(VReg.A0, VReg.FP, feObj);
@@ -3754,9 +3763,17 @@ export const FunctionCompiler = {
                     // [proxy] 目标运行时为 Proxy(type==8)→ 走 defineProperty 陷阱:整份
                     // 描述符对象求值后交 handler.defineProperty(target,key,desc)。普通对象
                     // (type≠8)落常规静态分解路径,逐字节不变。
+                    // 先检查 tag: 非对象(0x7FFD)/非裸指针 → 直接走 _object_define_property
+                    // 由运行时抛出 TypeError(避免在非对象上读 type 字节→ SIGSEGV)。
                     const dpNormalLabel = this.ctx.newLabel("dp_normal");
                     const dpDoneLabel = this.ctx.newLabel("dp_done");
+                    const dpCheckProxyLabel = this.ctx.newLabel("dp_check_proxy");
                     this.vm.load(VReg.RET, VReg.FP, dpObj);
+                    this.vm.shrImm(VReg.V0, VReg.RET, 48);
+                    this.vm.cmpImm(VReg.V0, 0x7FFD); this.vm.jeq(dpCheckProxyLabel);
+                    this.vm.cmpImm(VReg.V0, 0);      this.vm.jeq(dpCheckProxyLabel); // bare ptr
+                    this.vm.jmp(dpNormalLabel); // non-object → let runtime throw TypeError
+                    this.vm.label(dpCheckProxyLabel);
                     this.vm.emitMaskLoad(VReg.V1);
                     this.vm.andMaskReg(VReg.V0, VReg.RET, VReg.V1); // 裸指针
                     this.vm.cmpImm(VReg.V0, 0);
