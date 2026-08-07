@@ -238,6 +238,13 @@ export const BuiltinArrayMethodCompiler = {
                 const _ssEnd = this.ctx.newLabel("sl_spec_done");
                 const _ssRecv = this.ctx.allocLocal(`__sl_spec_r_${this.nextLabelId()}`);
                 this.vm.store(VReg.FP, _ssRecv, VReg.RET);
+
+                // tag guard: 非真数组(0x7FFE) → 跳过 species check,直落 _agen_slice
+                this.vm.load(VReg.V0, VReg.FP, _ssRecv);
+                this.vm.shrImm(VReg.V0, VReg.V0, 48);
+                this.vm.cmpImm(VReg.V0, 0x7FFE);
+                this.vm.jne(_ssFb);
+
                 this.vm.mov(VReg.A0, VReg.RET);
                 this.vm.call("_array_species_check");
                 this.vm.cmpImm(VReg.RET, 0);
@@ -559,6 +566,13 @@ export const BuiltinArrayMethodCompiler = {
                 const _ccSpecEnd = this.ctx.newLabel("cc_spec_done");
                 const _ccRecvSp = this.ctx.allocLocal(`__cc_spec_r_${this.nextLabelId()}`);
                 this.vm.store(VReg.FP, _ccRecvSp, VReg.RET);
+
+                // tag guard: 非真数组(0x7FFE) → 跳过 species check,直落 _agen_concat
+                this.vm.load(VReg.V0, VReg.FP, _ccRecvSp);
+                this.vm.shrImm(VReg.V0, VReg.V0, 48);
+                this.vm.cmpImm(VReg.V0, 0x7FFE);
+                this.vm.jne(_ccSpecFb);
+
                 this.vm.mov(VReg.A0, VReg.RET);
                 this.vm.call("_array_species_check");
                 this.vm.cmpImm(VReg.RET, 0);
@@ -1026,16 +1040,24 @@ export const BuiltinArrayMethodCompiler = {
         const arrOffset = this.ctx.allocLocal(`__some_arr_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, arrOffset, VReg.RET);
 
-        this.vm.mov(VReg.A0, VReg.RET);
-        this.vm.call("_js_unbox");
-        this.vm.load(VReg.V1, VReg.RET, 8); // 数组 length 在 offset 8
-        const lenOffset = this.ctx.allocLocal(`__some_len_${this.nextLabelId()}`);
-        this.vm.store(VReg.FP, lenOffset, VReg.V1);
-
         this.compileExpression(callbackExpr);
         const cbOffset = this.ctx.allocLocal(`__some_cb_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, cbOffset, VReg.RET);
         this.emitThisArgSlot(thisArgExpr, "some");
+
+        // tag guard: 非真数组(0x7FFE)时走 _agen_some 安全包装
+        const someFallbackLbl = this.ctx.newLabel("some_fallback");
+        const someDoneLbl = this.ctx.newLabel("some_done");
+        this.vm.load(VReg.V0, VReg.FP, arrOffset);
+        this.vm.shrImm(VReg.V0, VReg.V0, 48);
+        this.vm.cmpImm(VReg.V0, 0x7FFE);
+        this.vm.jne(someFallbackLbl);
+
+        this.vm.load(VReg.A0, VReg.FP, arrOffset);
+        this.vm.call("_js_unbox");
+        this.vm.load(VReg.V1, VReg.RET, 8); // 数组 length 在 offset 8
+        const lenOffset = this.ctx.allocLocal(`__some_len_${this.nextLabelId()}`);
+        this.vm.store(VReg.FP, lenOffset, VReg.V1);
 
         const idxOffset = this.ctx.allocLocal(`__some_idx_${this.nextLabelId()}`);
         this.vm.movImm(VReg.V0, 0);
@@ -1087,6 +1109,16 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.load(VReg.RET, VReg.V0, 0);
 
         this.vm.label(returnLabel);
+        this.vm.jmp(someDoneLbl);
+
+        // fallback: 非真数组 → _agen_some(recv, cb)
+        this.vm.label(someFallbackLbl);
+        this._pendingThisArgSlot = null;
+        this.vm.load(VReg.A0, VReg.FP, arrOffset);
+        this.vm.load(VReg.A1, VReg.FP, cbOffset);
+        this.vm.call("_agen_some");
+
+        this.vm.label(someDoneLbl);
     },
 
     // 编译 arr.sort(comparator) -> 原地排序后的数组
@@ -1332,16 +1364,24 @@ export const BuiltinArrayMethodCompiler = {
         const arrOffset = this.ctx.allocLocal(`__every_arr_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, arrOffset, VReg.RET);
 
-        this.vm.mov(VReg.A0, VReg.RET);
-        this.vm.call("_js_unbox");
-        this.vm.load(VReg.V1, VReg.RET, 8);
-        const lenOffset = this.ctx.allocLocal(`__every_len_${this.nextLabelId()}`);
-        this.vm.store(VReg.FP, lenOffset, VReg.V1);
-
         this.compileExpression(callbackExpr);
         const cbOffset = this.ctx.allocLocal(`__every_cb_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, cbOffset, VReg.RET);
         this.emitThisArgSlot(thisArgExpr, "every");
+
+        // tag guard: 非真数组(0x7FFE)时走 _agen_every 安全包装
+        const everyFallbackLbl = this.ctx.newLabel("every_fallback");
+        const everyDoneLbl = this.ctx.newLabel("every_done");
+        this.vm.load(VReg.V0, VReg.FP, arrOffset);
+        this.vm.shrImm(VReg.V0, VReg.V0, 48);
+        this.vm.cmpImm(VReg.V0, 0x7FFE);
+        this.vm.jne(everyFallbackLbl);
+
+        this.vm.load(VReg.A0, VReg.FP, arrOffset);
+        this.vm.call("_js_unbox");
+        this.vm.load(VReg.V1, VReg.RET, 8);
+        const lenOffset = this.ctx.allocLocal(`__every_len_${this.nextLabelId()}`);
+        this.vm.store(VReg.FP, lenOffset, VReg.V1);
 
         const idxOffset = this.ctx.allocLocal(`__every_idx_${this.nextLabelId()}`);
         this.vm.movImm(VReg.V0, 0);
@@ -1393,6 +1433,16 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.load(VReg.RET, VReg.V0, 0);
 
         this.vm.label(returnLabel);
+        this.vm.jmp(everyDoneLbl);
+
+        // fallback: 非真数组 → _agen_every(recv, cb)
+        this.vm.label(everyFallbackLbl);
+        this._pendingThisArgSlot = null;
+        this.vm.load(VReg.A0, VReg.FP, arrOffset);
+        this.vm.load(VReg.A1, VReg.FP, cbOffset);
+        this.vm.call("_agen_every");
+
+        this.vm.label(everyDoneLbl);
     },
 
     // 编译 arr.find(callback) -> element or undefined
@@ -1611,7 +1661,6 @@ export const BuiltinArrayMethodCompiler = {
 
     // 编译 arr.forEach(callback) - 支持 Array 和 TypedArray
     compileArrayForEach(arrayExpr, callbackExpr, thisArgExpr = null) {
-        // 先编译数组和回调
         this.compileExpression(arrayExpr);
         const arrOffset = this.ctx.allocLocal(`__forEach_arr_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, arrOffset, VReg.RET);
@@ -1619,7 +1668,15 @@ export const BuiltinArrayMethodCompiler = {
         this.compileExpression(callbackExpr);
         const cbOffset = this.ctx.allocLocal(`__forEach_cb_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, cbOffset, VReg.RET);
-        const thisArgSlot = this.emitThisArgSlot(thisArgExpr, "forEach");
+        this.emitThisArgSlot(thisArgExpr, "forEach");
+
+        // tag guard: 非真数组(0x7FFE)时走 _agen_forEach 安全包装
+        const forEachFallbackLbl = this.ctx.newLabel("forEach_fallback");
+        const forEachDoneLbl = this.ctx.newLabel("forEach_done");
+        this.vm.load(VReg.V0, VReg.FP, arrOffset);
+        this.vm.shrImm(VReg.V0, VReg.V0, 48);
+        this.vm.cmpImm(VReg.V0, 0x7FFE);
+        this.vm.jne(forEachFallbackLbl);
 
         // 获取数组长度
         this.vm.load(VReg.A0, VReg.FP, arrOffset);
@@ -1681,6 +1738,16 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.label(endLabel);
 
         this.vm.movImm(VReg.RET, 0); // forEach 返回 undefined
+        this.vm.jmp(forEachDoneLbl);
+
+        // fallback: 非真数组 → _agen_forEach(recv, cb)
+        this.vm.label(forEachFallbackLbl);
+        this._pendingThisArgSlot = null;
+        this.vm.load(VReg.A0, VReg.FP, arrOffset);
+        this.vm.load(VReg.A1, VReg.FP, cbOffset);
+        this.vm.call("_agen_forEach");
+
+        this.vm.label(forEachDoneLbl);
     },
 
     // 闭包调用的核心逻辑（S0 = 闭包对象，参数已在 A0-A5 中）
@@ -1826,6 +1893,12 @@ export const BuiltinArrayMethodCompiler = {
         this.compileExpression(callbackExpr);
         this.vm.store(VReg.FP, _msCbSp, VReg.RET);
         this.emitThisArgSlot(thisArgExpr, "map");
+
+        // tag guard: 非真数组(0x7FFE) → 跳过 species check,直落 _agen_map
+        this.vm.load(VReg.V0, VReg.FP, _msRecvSp);
+        this.vm.shrImm(VReg.V0, VReg.V0, 48);
+        this.vm.cmpImm(VReg.V0, 0x7FFE);
+        this.vm.jne(_msSpecFb);
 
         this.vm.load(VReg.A0, VReg.FP, _msRecvSp);
         this.vm.call("_array_species_check");
@@ -2087,6 +2160,12 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.store(VReg.FP, _fsCbSp, VReg.RET);
         this.emitThisArgSlot(thisArgExpr, "filter");
 
+        // tag guard: 非真数组(0x7FFE) → 跳过 species check,直落 _agen_filter
+        this.vm.load(VReg.V0, VReg.FP, _fsRecvSp);
+        this.vm.shrImm(VReg.V0, VReg.V0, 48);
+        this.vm.cmpImm(VReg.V0, 0x7FFE);
+        this.vm.jne(_fsSpecFb);
+
         this.vm.load(VReg.A0, VReg.FP, _fsRecvSp);
         this.vm.call("_array_species_check");
         this.vm.cmpImm(VReg.RET, 0);
@@ -2347,10 +2426,32 @@ export const BuiltinArrayMethodCompiler = {
 
     // 编译 arr.reduce(callback, initialValue?)
     compileArrayReduce(arrayExpr, callbackExpr, initialValueExpr) {
-        // 编译数组
         this.compileExpression(arrayExpr);
         const arrOffset = this.ctx.allocLocal(`__reduce_arr_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, arrOffset, VReg.RET);
+
+        // 编译回调（移到 tag guard 前）
+        this.compileExpression(callbackExpr);
+        const cbOffset = this.ctx.allocLocal(`__reduce_cb_${this.nextLabelId()}`);
+        this.vm.store(VReg.FP, cbOffset, VReg.RET);
+
+        // 求值初始值（如提供，存 slot 供 tag guard 和 fallback 共用）
+        const rinitOff = this.ctx.allocLocal(`__reduce_init_${this.nextLabelId()}`);
+        if (initialValueExpr) {
+            this.compileExpression(initialValueExpr);
+            this.vm.store(VReg.FP, rinitOff, VReg.RET);
+        } else {
+            this.vm.movImm64(VReg.RET, 0x7ffb000000000000n);
+            this.vm.store(VReg.FP, rinitOff, VReg.RET);
+        }
+
+        // tag guard: 非真数组(0x7FFE)时走 _agen_reduce 安全包装
+        const reduceFallbackLbl = this.ctx.newLabel("reduce_fallback");
+        const reduceDoneLbl = this.ctx.newLabel("reduce_done");
+        this.vm.load(VReg.V0, VReg.FP, arrOffset);
+        this.vm.shrImm(VReg.V0, VReg.V0, 48);
+        this.vm.cmpImm(VReg.V0, 0x7FFE);
+        this.vm.jne(reduceFallbackLbl);
 
         // 获取数组长度——用 _array_length（内部脱壳）。原来直接读 [RET+8] 是对**装箱**
         // 数组指针(0x7ffe tag)解引用 → 高位 0x7ffe 使地址巨大 → load 段错误崩溃。
@@ -2362,7 +2463,7 @@ export const BuiltinArrayMethodCompiler = {
         // 初始化累加器
         const accOffset = this.ctx.allocLocal(`__reduce_acc_${this.nextLabelId()}`);
         if (initialValueExpr) {
-            this.compileExpression(initialValueExpr);
+            this.vm.load(VReg.RET, VReg.FP, rinitOff);
             this.vm.store(VReg.FP, accOffset, VReg.RET);
         } else {
             // 无初始值时，使用第一个元素作为初始值
@@ -2372,11 +2473,6 @@ export const BuiltinArrayMethodCompiler = {
             this.vm.call("_subscript_get");
             this.vm.store(VReg.FP, accOffset, VReg.RET);
         }
-
-        // 编译回调
-        this.compileExpression(callbackExpr);
-        const cbOffset = this.ctx.allocLocal(`__reduce_cb_${this.nextLabelId()}`);
-        this.vm.store(VReg.FP, cbOffset, VReg.RET);
 
         // 初始化索引（如果有初始值从 0 开始，否则从 1 开始）
         const idxOffset = this.ctx.allocLocal(`__reduce_idx_${this.nextLabelId()}`);
@@ -2433,6 +2529,16 @@ export const BuiltinArrayMethodCompiler = {
 
         // 返回累加器
         this.vm.load(VReg.RET, VReg.FP, accOffset);
+        this.vm.jmp(reduceDoneLbl);
+
+        // fallback: 非真数组 → _agen_reduce(recv, cb, init)
+        this.vm.label(reduceFallbackLbl);
+        this.vm.load(VReg.A0, VReg.FP, arrOffset); // recv
+        this.vm.load(VReg.A1, VReg.FP, cbOffset);  // cb
+        this.vm.load(VReg.A2, VReg.FP, rinitOff);  // seed (undefined if no initialValue)
+        this.vm.call("_agen_reduce");
+
+        this.vm.label(reduceDoneLbl);
     },
 
     // 编译 arr.reduceRight(callback, initialValue?) —— reduce 的镜像:从 len-1 递减到 0。
