@@ -1497,7 +1497,27 @@ export const OperatorCompiler = {
                 this.vm.call("_object_delete");
                 return;
             }
-            this.vm.movImm64(VReg.RET, 0x7ff9000000000001n); // was lea+load _js const
+            // [L2-②] 非成员 delete(delete identifier / delete callExpr):
+            // ES 规范:delete 普通变量返回 false(不可删除);delete 未解析引用返回 true;
+            // delete 函数调用结果返回 true(值临时属性,delete 恒 true)。
+            // 此前对所有非 MemberExpression 参数直接 movImm(true) → 既不求值参数(
+            // 忽略函数调用等副作用),也不区分可删性 → "delete foo()" foo 不被调用
+            // (bIsFooCalled stays false)、"delete a" 对局部变返 true 而非 false。
+            if (darg && darg.type === "Identifier") {
+                const offset = this.ctx.getLocal(darg.name);
+                if (offset) {
+                    // 局部变量/函数:不可删除 → false
+                    this.vm.movImm64(VReg.RET, 0x7ff9000000000000n);
+                    return;
+                }
+                // 未解析的标识符(全局/未知):delete 返回 true(ES sloppy 语义)
+                this.vm.movImm64(VReg.RET, 0x7ff9000000000001n);
+                return;
+            }
+            // CallExpression / NewExpression / 其他表达式:先求值以触发副作用,
+            // 再返回 true(临时值恒可删)。
+            this.compileExpression(darg);
+            this.vm.movImm64(VReg.RET, 0x7ff9000000000001n);
             return;
         }
         // 负数字面量的常量折叠：直接使用预计算的否定 bits

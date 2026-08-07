@@ -257,14 +257,32 @@ export const StatementCompiler = {
         }
     },
 
+    // [L2-②] 判断块是否包含 let/const 声明(TDZ 哨兵位)或 TDZ 名前缀。
+    // 纯 var/无声明的块不需要 enterScope/leaveScope——var 按 JS 语义是函数作用域。
+    _blockNeedsScope(stmt) {
+        if (stmt._tdzNames && stmt._tdzNames.length > 0) return true;
+        // 保守扫描:若有 let/const 标记(blockscope 已改名),仍需块作用域。
+        for (const s of stmt.body) {
+            if (s && s.type === "VariableDeclaration" && (s.kind === "let" || s.kind === "const")) return true;
+        }
+        return false;
+    },
+
     // 编译块语句
     compileBlockStatement(stmt) {
-        const saved = this.ctx.enterScope();
-        this.emitTdzBlockPrologue(stmt);
-        for (const s of stmt.body) {
-            this.compileStatement(s);
+        if (this._blockNeedsScope(stmt)) {
+            const saved = this.ctx.enterScope();
+            this.emitTdzBlockPrologue(stmt);
+            for (const s of stmt.body) {
+                this.compileStatement(s);
+            }
+            this.ctx.leaveScope(saved);
+        } else {
+            // 无 let/const:var 是函数作用域,不创建块作用域,allocLocal 直接落在函数级
+            for (const s of stmt.body) {
+                this.compileStatement(s);
+            }
         }
-        this.ctx.leaveScope(saved);
     },
 
     // with (obj) stmt:求值 obj 存帧槽,压入 ctx.withScopes(body 内标识符先查其属性),
