@@ -289,10 +289,25 @@ export const AssignmentCompiler = {
                 this.vm.call("_js_add");
                 this.vm.store(VReg.FP, offset, VReg.RET);
             } else if (isUnboxedArith) {
-                // 浮点运算路径
-                this.vm.fmovToFloat(0, VReg.V1); // FP0 = 左操作数
-                this.compileExpression(expr.right); // RET = 右操作数 raw bits
-                this.vm.fmovToFloat(1, VReg.RET); // FP1 = 右操作数
+                // [#F64] 未装箱算术复合赋值:slot 值可能是 tagged 值(如 x=true 存为
+                // 0x7FF9.. tag、x=null 存为 0x7FFA.. tag)，直接 fmovToFloat 会误解
+                // 位模式为 float64 → NaN/垃圾。先 ToNumber 两侧再浮点运算。
+                // V1=左槽值。compileExpression/emitNumberCoerceFast 使用 V1 作
+                // scratch → 先保护 V1→S0(callee-saved,跨 call 存活)。
+                // RHS coerce 可能调用 _number_coerce(内部 clobber caller-saved
+                // d-regs),故所有 coerce 完成后才 fmovToFloat→FP reg。
+                this.vm.mov(VReg.S0, VReg.V1);           // S0 = 左 JSValue(保护)
+                this.compileExpression(expr.right);      // RET = 右 JSValue
+                this.vm.mov(VReg.A0, VReg.RET);          // A0 = 右 JSValue
+                this.vm.call("_number_coerce");          // RET = 右 float64
+                this.vm.push(VReg.RET);                  // 栈: 右 float; SP-=16
+                this.vm.mov(VReg.A0, VReg.S0);           // A0 = 左 JSValue
+                this.vm.call("_number_coerce");          // RET = 左 float64
+                this.vm.pop(VReg.V1);                    // V1 = 右 float; SP+=16
+
+                // 现在: RET = 左 float, V1 = 右 float. 装 FP regs.
+                this.vm.fmovToFloat(0, VReg.RET);        // FP0 = 左
+                this.vm.fmovToFloat(1, VReg.V1);         // FP1 = 右
 
                 switch (op) {
                     case "-=":
@@ -307,6 +322,10 @@ export const AssignmentCompiler = {
                 }
                 // 将结果移回整数寄存器
                 this.vm.fmovToInt(VReg.RET, 0);
+                // [#nan-int0] ARM64 fmul/fsub/fdiv 对 SNaN 产生 QNaN(high16=0x7FF8)
+                // → 与 NaN-boxing int32 tag 别名 → 被误读为 tagged int。调用 _nan_canon
+                // 改写为 0x7FF0.. 安全 NaN(与 binary-expression 同形)。
+                this.emitNaNCanon();
                 // 存储回 slot
                 this.vm.store(VReg.FP, offset, VReg.RET);
             } else {
@@ -343,6 +362,8 @@ export const AssignmentCompiler = {
                     else if (op === "/=") { this.vm.fdiv(0, 0, 1); }
                     else { this.vm.fmod(0, 0, 1); }      // %=
                     this.vm.fmovToInt(VReg.RET, 0);
+                    // [#nan-int0] 同上:fmul/fsub/fdiv/fmod 结果可能为别名 NaN → 规范化
+                    this.emitNaNCanon();
                 } else
                 switch (op) {
                     case "+=":
@@ -807,6 +828,9 @@ export const AssignmentCompiler = {
                     }
                 } else {
                     // 普通变量
+                    // [#F65] slot 值可能是 tagged(boolean/null/undefined)或堆对象,
+                    // 直接 fmovToFloat 会误解位模式 → NaN/垃圾。先 ToNumber 再浮点 ±1,
+                    // 并加 NaN 规范化(同 compound-assignment [#nan-int0])。
                     this.vm.load(VReg.RET, VReg.FP, offset);
                     if (expr.prefix) {
                         if (isInt) {
@@ -816,25 +840,25 @@ export const AssignmentCompiler = {
                                 this.vm.subImm(VReg.RET, VReg.RET, 1);
                             }
                         } else {
-                            // float 类型：使用浮点运算 (unboxed 直接操作 raw bits)
-                            this.vm.fmovToFloat(0, VReg.RET); // FP0 = float bits
-                            // 加载 1.0 到 FP1
+                            this.vm.mov(VReg.A0, VReg.RET);
+                            this.vm.call("_number_coerce");   // RET = float64
+                            this.vm.fmovToFloat(0, VReg.RET);
                             this.vm.movImm(VReg.V1, 0x3ff00000);
                             this.vm.shl(VReg.V1, VReg.V1, 32);
                             this.vm.fmovToFloat(1, VReg.V1);
-                            // 执行加法或减法
                             if (expr.operator === "++") {
                                 this.vm.fadd(0, 0, 1);
                             } else {
                                 this.vm.fsub(0, 0, 1);
                             }
-                            // 移回整数寄存器
                             this.vm.fmovToInt(VReg.RET, 0);
+                            this.emitNaNCanon();
                         }
                         this.vm.store(VReg.FP, offset, VReg.RET);
                         this.syncModuleExportBinding(name, VReg.RET);
                     } else {
-                        // 后置：先保存原值
+                        // 后置：表达式值 = ToNumber(old),写回值 = ToNumber(old) ± 1。
+                        // [#F65] 对 tagged/堆对象值先 ToNumber 再浮点 ±1。
                         this.vm.mov(VReg.V1, VReg.RET);
                         if (isInt) {
                             if (expr.operator === "++") {
@@ -843,25 +867,27 @@ export const AssignmentCompiler = {
                                 this.vm.subImm(VReg.V1, VReg.V1, 1);
                             }
                         } else {
-                            // float 类型：使用浮点运算 (unboxed 直接操作 raw bits)
-                            this.vm.fmovToFloat(0, VReg.V1); // FP0 = original value bits
-                            // 加载 1.0 到 FP1
+                            this.vm.mov(VReg.A0, VReg.V1);
+                            this.vm.call("_number_coerce");   // RET = float64(old) = postfix ret
+                            this.vm.push(VReg.RET);          // 保护 postfix ret;SP-=16
+                            this.vm.fmovToFloat(0, VReg.RET);
                             this.vm.movImm(VReg.V2, 0x3ff00000);
                             this.vm.shl(VReg.V2, VReg.V2, 32);
                             this.vm.fmovToFloat(1, VReg.V2);
-                            // 执行加法或减法
                             if (expr.operator === "++") {
                                 this.vm.fadd(0, 0, 1);
                             } else {
                                 this.vm.fsub(0, 0, 1);
                             }
-                            // 移回整数寄存器到 V1 (V1 会被存回)
-                            this.vm.fmovToInt(VReg.V1, 0);
-                            // RET 已经保存原值，无需额外操作
+                            this.vm.fmovToInt(VReg.V1, 0);   // V1 = 浮点结果
+                            this.vm.mov(VReg.RET, VReg.V1);  // RET = 结果(canon)
+                            this.emitNaNCanon();             // [#nan-int0]
+                            this.vm.mov(VReg.V1, VReg.RET);  // V1 = 规范化结果
+                            this.vm.pop(VReg.RET);           // RET = postfix ret;SP+=16
                         }
                         this.vm.store(VReg.FP, offset, VReg.V1);
                         this.syncModuleExportBinding(name, VReg.V1);
-                        // RET 保持原值（后置表达式的值）
+                        // RET = postfix 表达式值(ToNumber(old))
                     }
                 }
             }
