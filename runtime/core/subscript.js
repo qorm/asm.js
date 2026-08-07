@@ -502,6 +502,12 @@ export class SubscriptGenerator {
         // Proxy(TYPE_PROXY=8):proxy[computedKey]=v 委托 _object_set 冷分支调 set 陷阱。
         vm.cmpImm(VReg.V0, 8);
         vm.jeq("_subscript_set_object");
+        // [non-array guard] Date(7)/Promise(11)/DataView(14)/ArrayBuffer(12)/
+        // Boolean wrapper 等非属性容器类型:路由到 _subscript_set_object → _object_set,
+        // 其内 type guard 对非对象类型安全返回 0,避免落下方的数组路径把类型字节当
+        // TYPE_ARRAY 解引用 array 头 → SIGSEGV(test262 Array/reduce 21 崩根因)。
+        vm.cmpImm(VReg.V0, 1); // TYPE_ARRAY
+        vm.jne("_subscript_set_object"); // 非数组 → 委托对象写路径安全 bail
 
         // 数组/TypedArray：把键归一化为整数下标
         // 字符串键(0x7FFC)走冷分支 _subscript_set_strkey(与 _subscript_get 同一裁决:
