@@ -265,9 +265,19 @@ export const DataStructureCompiler = {
             // 前缀与同名静态访问器分隔。非计算键分组键 === kn(自举字节不变)。
             let kn, computedAcc = false;
             if (p.computed) {
-                if (p.key.type !== "Identifier") continue; // 仅支持计算标识符键访问器
-                kn = " c " + p.key.name;
-                computedAcc = true;
+                // [#85] 计算键访问器:支持 Identifier / NumericLiteral / StringLiteral。
+                // 前仅支持 Identifier,NumericLiteral(1E+9)和 StringLiteral 漏分组 →
+                // getter 被当普通数据值存、读得 Function 而非 getter 返回值。
+                if (p.key.type === "Identifier") {
+                    kn = " c " + p.key.name;
+                    computedAcc = true;
+                } else if (p.key.type === "NumericLiteral" || p.key.type === "Literal") {
+                    kn = " c " + String(p.key.value);
+                } else if (p.key.type === "StringLiteral") {
+                    kn = " c " + p.key.value;
+                } else {
+                    continue; // 不支持的计算键类型(如表达式)
+                }
             } else {
                 kn = this.objectPropStaticKeyName(p.key);
                 if (kn === null) continue;
@@ -275,7 +285,19 @@ export const DataStructureCompiler = {
             if (accessorGroups === null) accessorGroups = new Map();
             let g = accessorGroups.get(kn);
             if (!g) {
-                g = { name: computedAcc ? p.key.name : kn, getter: null, setter: null,
+                // [#85] 计算键访问器:Identifier 用 name,NumericLiteral/StringLiteral 用
+                // ToString(key) → 运行时键。非计算键直接 kn。
+                let groupName;
+                if (computedAcc) {
+                    groupName = p.key.name; // Identifier:保留原名供 emitObjectLiteralComputedAccessor 运行时求键
+                } else if (p.key && (p.key.type === "NumericLiteral" || p.key.type === "Literal")) {
+                    groupName = String(p.key.value);
+                } else if (p.key && p.key.type === "StringLiteral") {
+                    groupName = p.key.value;
+                } else {
+                    groupName = kn;
+                }
+                g = { name: groupName, getter: null, setter: null,
                       emitted: false, computed: computedAcc, keyNode: p.key };
                 accessorGroups.set(kn, g);
             }
@@ -350,6 +372,20 @@ export const DataStructureCompiler = {
                 if (!group || group.emitted) continue;
                 group.emitted = true;
                 this.emitObjectLiteralComputedAccessor(group, objOffset, group.keyNode);
+                continue;
+            }
+
+            // [#85] 计算键访问器 { get [1E+9](){} , get ["str"](){} }:键为字面量(NumericLiteral/
+            // StringLiteral/Literal)→ 静态键,走 emitObjectLiteralAccessor(同非计算路径)。
+            if ((prop.kind === "get" || prop.kind === "set") && prop.computed &&
+                prop.key && (prop.key.type === "NumericLiteral" || prop.key.type === "Literal" ||
+                prop.key.type === "StringLiteral")) {
+                const accName = String(prop.key.value);
+                const group = accessorGroups !== null
+                    ? accessorGroups.get(" c " + accName) : null;
+                if (!group || group.emitted) continue;
+                group.emitted = true;
+                this.emitObjectLiteralAccessor(group, objOffset);
                 continue;
             }
 
