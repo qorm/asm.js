@@ -97,6 +97,7 @@ export class ObjectGenerator {
         this.generateProxyIsPrototypeOf();
         this.generateThrowProxyInvariant();
         this.generateArefObjHelpers(); // [Stage A] Object.prototype 方法引用包装
+        this.generateArefStaticTramp(); // [Stage A2] static non-constructor builtin trampoline
         this.generateProxyApplyTramp();
         this.generateProxyConstructCall();
         this.generateCompletePropDescriptor();
@@ -137,6 +138,9 @@ export class ObjectGenerator {
         this.generateObjectIsFrozen();
         this.generateObjectIsSealed();
         this.generateObjectIsExtensible();
+        this.generateObjectIsValue();       // SameValue for Object.is() value path
+        this.generateObjectFromEntries();   // runtime fallback for Object.fromEntries
+        this.generateObjectDefinePropertiesDyn(); // runtime defineProperties via Object.keys
         // [#61 P2] per-property attributes
         this.generateObjectGrowFlags();
         this.generateObjectEnsureFlags();
@@ -1856,6 +1860,20 @@ export class ObjectGenerator {
         vm.label("_aref_vof_ok");
         vm.mov(VReg.RET, VReg.A0); // 恒等(叶子,无调用,LR 保持)
         vm.ret();
+    }
+
+    // [Stage A2] _aref_static_tramp: 内置静态非构造器方法引用的蹦床。
+    // 闭包布局: {CLOSURE_MAGIC@0, _aref_static_tramp@8, helper@16}。
+    // 调用点按普通闭包分派进来: S0=合成块、A0-A4=实参、_call_argc=实参个数。
+    // 从闭包@16 取真实 helper、尾调之(无接收者移位——静态方法 this 无关)。
+    // compileDynamicNew 检查 fnptr==_aref_static_tramp → 抛 TypeError
+    // "value is not a constructor"。
+    generateArefStaticTramp() {
+        const vm = this.vm;
+        vm.label("_aref_static_tramp");
+        vm.prologue(0, []);
+        vm.load(VReg.V1, VReg.S0, 16);  // V1 = 真实 helper 标签地址
+        vm.jmpIndirect(VReg.V1);       // 尾调 helper(S0/A0-A5 原样透传)
     }
 
     // [argc ABI/Proxy apply] _proxy_apply_tramp:可调用 Proxy 的调用蹦床。
@@ -6388,6 +6406,154 @@ export class ObjectGenerator {
         vm.lea(VReg.RET, "_js_false");
         vm.load(VReg.RET, VReg.RET, 0);
         vm.epilogue([], 0);
+    }
+
+    // Object.is(a, b) -- SameValue runtime helper for value-call path.
+    // The compiler inline-expands Object.is(...) for static call sites; this
+    // function handles the memoized-ref path (e.g. var f=Object.is; f(a,b)).
+    generateObjectIsValue() {
+        const vm = this.vm;
+        vm.label("_object_is_value");
+        // SameValue algorithm:
+        //   If typeof a !== typeof b, return false (handled by === below for
+        //   different box tags; +0/-0 and NaN special-cased)
+        //   If a === b: a !== 0 || 1/a === 1/b (handles +0/-0)
+        //   Else: a !== a && b !== b (both NaN)
+        // Strategy: compare A0, A1 as 64-bit integers. SameValue differs from
+        // strict equality only on NaN and signed zero. Number values are stored
+        // as IEEE754 float64 in the low 48 bits (NaN-boxed). Compare bits directly.
+        vm.mov(VReg.V0, VReg.A0);
+        vm.cmp(VReg.A0, VReg.A1);
+        vm.jne("_ois_notsame");
+        // bits equal: could be null/undefined/bool/string/obj or same number.
+        // Check for +0: if value === 0 (boxed), return true (SameValue(+0,+0)=true)
+        // Actually SameValue(0, -0) = false. But if bits are equal, it can't be +0 vs -0.
+        vm.movImm64(VReg.RET, 0x7ff9000000000001n); // true
+        vm.epilogue([], 0);
+        vm.label("_ois_notsame");
+        // Not strictly equal. Could be NaN/NaN (should be true) or +0/-0 (should be false).
+        // Check if both are numbers (tag 0 or 0x7FF8).
+        // For boxed values with tag 0x7FF8, compare bits for NaN detection.
+        vm.shrImm(VReg.V2, VReg.A0, 48);
+        vm.shrImm(VReg.V3, VReg.A1, 48);
+        // NaN: high16 is 0x7FF8 (or 0x7FF0 print-friendly). Both must be NaN-tagged.
+        vm.cmpImm(VReg.V2, 0x7FF8);
+        vm.jne("_ois_nonan");
+        vm.cmpImm(VReg.V3, 0x7FF8);
+        vm.jne("_ois_nonan");
+        // Both NaN → SameValue is true
+        vm.movImm64(VReg.RET, 0x7ff9000000000001n); // true
+        vm.epilogue([], 0);
+        vm.label("_ois_nonan");
+        // Check for +0/-0: tag is 0x7FF8 and value bits are all zero (except sign bit for -0)
+        // Actually JS numbers are stored as IEEE754 in low 48 bits. -0 has sign bit set.
+        // But since we already checked for bit equality above, if they differ, one is +0,
+        // the other is -0 → SameValue = false.
+        // Also check for NaN variations (0x7FF8 with different payload bits): SameValue = true.
+        // Since both have 0x7FF8 tag, check if both are NaN (exponent all 1s, mantissa non-zero).
+        // Simplified: if both are numbers and differ, and neither is NaN, it's a normal
+        // non-equal comparison → false (already handled by cmp+jne at top).
+        vm.movImm64(VReg.RET, 0x7ff9000000000000n); // false
+        vm.epilogue([], 0);
+    }
+
+    // Object.fromEntries(entries) -- runtime fallback for value-call path.
+    // The compiler emits an inline loop for static call sites; this helper
+    // handles the memoized-ref path (e.g. var f=Object.fromEntries; f(entries)).
+    generateObjectFromEntries() {
+        const vm = this.vm;
+        vm.asm.registerRuntimeString("_str_0", "0");
+        vm.asm.registerRuntimeString("_str_1", "1");
+        vm.label("_object_fromEntries");
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.mov(VReg.S0, VReg.A0);  // entries array
+        vm.call("_object_new");
+        vm.call("_box_obj_r");     // RET = boxed result object
+        vm.mov(VReg.S1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_length");
+        vm.mov(VReg.S2, VReg.RET); // len
+        vm.movImm(VReg.S3, 0);     // i
+        vm.label("_ofe_loop");
+        vm.cmp(VReg.S3, VReg.S2);
+        vm.jge("_ofe_done");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_array_get");     // RET = entry [k, v]
+        // Read key from entry[0]
+        vm.mov(VReg.V0, VReg.RET);
+        vm.store(VReg.SP, 0, VReg.V0);  // entry
+        vm.mov(VReg.A0, VReg.V0);
+        vm.lea(VReg.V1, "_str_0");
+        vm.movImm64(VReg.V2, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.V1, VReg.V2);
+        vm.call("_subscript_get"); // key = entry["0"]
+        vm.mov(VReg.S4, VReg.RET); // key (may be number)
+        // ToPropertyKey: ensure string key
+        vm.shrImm(VReg.V1, VReg.S4, 48);
+        vm.cmpImm(VReg.V1, 0x7FFC);
+        vm.jeq("_ofe_key_str");
+        vm.mov(VReg.A0, VReg.S4);
+        vm.call("_valueToStr");
+        vm.mov(VReg.S4, VReg.RET);
+        vm.label("_ofe_key_str");
+        // Read value from entry[1]
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.lea(VReg.V1, "_str_1");
+        vm.movImm64(VReg.V2, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.V1, VReg.V2);
+        vm.call("_subscript_get"); // val = entry["1"]
+        vm.mov(VReg.A2, VReg.RET);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_object_set");
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_ofe_loop");
+        vm.label("_ofe_done");
+        vm.mov(VReg.RET, VReg.S1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
+    }
+
+    // Object.defineProperties(obj, props) -- runtime fallback for value-call path.
+    // The compiler desugars static call sites to a sequence of defineProperty calls;
+    // this helper handles the memoized-ref path by iterating Object.keys(props) and
+    // calling _object_define_property_dyn for each key.
+    generateObjectDefinePropertiesDyn() {
+        const vm = this.vm;
+        vm.asm.registerRuntimeString("_str_0", "0");
+        vm.asm.registerRuntimeString("_str_1", "1");
+        vm.label("_object_define_properties_dyn");
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
+        vm.mov(VReg.S0, VReg.A0);  // obj
+        vm.mov(VReg.S1, VReg.A1);  // props
+        // keys = Object.keys(props)
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_object_keys");
+        vm.mov(VReg.S2, VReg.RET); // keys array
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_array_length");
+        vm.mov(VReg.S3, VReg.RET); // len
+        vm.movImm(VReg.S4, 0);     // i
+        vm.label("_odps_loop");
+        vm.cmp(VReg.S4, VReg.S3);
+        vm.jge("_odps_done");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_array_get");     // key
+        vm.mov(VReg.V0, VReg.RET); // key boxed
+        // Read descriptor from props[key]
+        vm.mov(VReg.A0, VReg.S1);
+        vm.mov(VReg.A1, VReg.V0);
+        vm.call("_object_get");    // desc = props[key]
+        vm.mov(VReg.A2, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.V0);
+        vm.call("_object_define_property_dyn");
+        vm.addImm(VReg.S4, VReg.S4, 1);
+        vm.jmp("_odps_loop");
+        vm.label("_odps_done");
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 32);
     }
 
     // ============ [#61 P2] per-property attributes ============

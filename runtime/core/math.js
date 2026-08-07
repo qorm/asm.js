@@ -970,6 +970,13 @@ export class MathGenerator {
         vm.ftrunc(2, 1);            // d2 = trunc(exp)
         vm.fcmp(1, 2);
         vm.jne("_mpow_nonint");
+        // [#85] 指数为 ±Infinity 时 ftrunc 保 Infinity、fcmp 判等,误进整数路径。
+        // (-1)^Inf → NaN 而非 -1。|exp|==Inf → 转非整数路径处理(±Inf^非整→+Inf/+0)。
+        vm.movImm64(VReg.V1, 0x7fffffffffffffffn);
+        vm.and(VReg.V2, VReg.S1, VReg.V1); // V2 = |exp| bits
+        vm.movImm64(VReg.V1, 0x7ff0000000000000n);
+        vm.cmp(VReg.V2, VReg.V1);
+        vm.jeq("_mpow_nonint");     // |exp| == Infinity → 非整数路径
         vm.fcvtzs(VReg.V0, 1);      // V0 = n(整数指数)
         vm.movImm(VReg.V2, 0);      // 负指数标志
         vm.cmpImm(VReg.V0, 0);
@@ -1014,6 +1021,13 @@ export class MathGenerator {
         vm.and(VReg.V2, VReg.S0, VReg.V1);
         vm.cmpImm(VReg.V2, 0);
         vm.jeq("_mpow_zerobase");   // base == ±0
+        // [#85] Infinity/ -Infinity base 特殊处理:
+        //   +Infinity^(y>0) → +Inf, +Infinity^(y<0) → +0
+        //   -Infinity^(y>0) → +Inf(奇整指走整数路径,此路必然非整→+Inf)
+        //   -Infinity^(y<0) → +0
+        vm.movImm64(VReg.V1, 0x7ff0000000000000n);
+        vm.cmp(VReg.V2, VReg.V1);
+        vm.jeq("_mpow_infbase");
         vm.shrImm(VReg.V2, VReg.S0, 63);
         vm.cmpImm(VReg.V2, 1);
         vm.jeq("_mpow_nan");        // base < 0,非整指 → NaN
@@ -1043,6 +1057,9 @@ export class MathGenerator {
         vm.call("_math_cbrt");
         vm.epilogue([VReg.S0, VReg.S1], 0);
         vm.label("_mpow_zerobase");
+        // [#85] 0**NaN → NaN。fcmp 自比较:NaN != NaN 故 jne 取真。
+        vm.fcmp(1, 1);
+        vm.jne("_mpow_nan");
         // 0^y(y 非整):y>0 → +0;y<0 → +Inf(按 exp 符号位判定)
         vm.shrImm(VReg.V2, VReg.S1, 63);
         vm.cmpImm(VReg.V2, 1);
@@ -1054,6 +1071,22 @@ export class MathGenerator {
         vm.epilogue([VReg.S0, VReg.S1], 0);
         vm.label("_mpow_nan");
         vm.movImm64(VReg.RET, 0x7ff0000000000001n);  // 打印友好 NaN
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+
+        // [#85] Infinity base 分支(含 -Infinity,到达时 exp 必非整)。
+        // +Inf^(y 非整):y>0 → +Inf; y<0 → +0。
+        // -Inf^(y 非整):y>0 → +Inf; y<0 → +0(奇整指走整数路径)。
+        vm.label("_mpow_infbase");
+        vm.fcmp(1, 1);               // exp NaN 自比较
+        vm.jne("_mpow_nan");         // NaN 指 → NaN
+        // exp 符号(bit63)定结果:bit63=0(y>0)→+Inf;bit63=1(y<0)→+0。
+        vm.shrImm(VReg.V2, VReg.S1, 63);
+        vm.cmpImm(VReg.V2, 1);
+        vm.jeq("_mpow_infbase_neg");
+        vm.movImm64(VReg.RET, 0x7ff0000000000000n); // +Inf (y>0)
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_mpow_infbase_neg");
+        vm.movImm(VReg.RET, 0);     // +0 (y<0)
         vm.epilogue([VReg.S0, VReg.S1], 0);
     }
 }
