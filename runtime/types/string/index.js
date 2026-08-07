@@ -5380,7 +5380,7 @@ export class StringGenerator {
     generateStrMatchAll() {
         const vm = this.vm;
         vm.label("_str_matchAll");
-        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
+        vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
         this._emitThisStringCheck("matchAll");
         vm.mov(VReg.S0, VReg.A0); // S0 = boxed this str
         vm.mov(VReg.S1, VReg.A1); // S1 = search value
@@ -5455,7 +5455,7 @@ export class StringGenerator {
         vm.label("_sma_re_done");
         vm.mov(VReg.RET, VReg.S4);
         vm.call("_box_arr_r");
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 32);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 48);
 
         // -- Non-RegExp path --
         vm.label(noRe);
@@ -5463,6 +5463,12 @@ export class StringGenerator {
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_valueToStr");
         vm.mov(VReg.S1, VReg.RET);
+        // Search string length (stored at SP+32, survives calls)
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_getStrContent");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_strlen");
+        vm.store(VReg.SP, 32, VReg.RET); // searchLen @ SP+32
         vm.movImm(VReg.A0, 0);
         vm.call("_array_new_with_size");
         vm.mov(VReg.S2, VReg.RET); // S2 = result array
@@ -5481,18 +5487,17 @@ export class StringGenerator {
         vm.cmpImm(VReg.V0, 0);
         vm.jlt("_sma_str_done");
         vm.mov(VReg.S3, VReg.V0); // found idx
-        // Extract substring at found position, length 1
+        // Extract substring at found position, length = searchLen (from SP+32)
+        vm.load(VReg.V3, VReg.SP, 32); // V3 = searchLen
         vm.mov(VReg.A0, VReg.S0);
         vm.push(VReg.S0); vm.push(VReg.S1); vm.push(VReg.S2);
         vm.push(VReg.S3); vm.push(VReg.S4);
         vm.call("_getStrContent");
         vm.mov(VReg.A0, VReg.RET);
         vm.mov(VReg.A1, VReg.S3);
-        vm.addImm(VReg.A2, VReg.S3, 1);
-        vm.push(VReg.V0);
+        vm.add(VReg.A2, VReg.S3, VReg.V3); // end = idx + searchLen
         vm.call("_str_substring_raw");
         vm.mov(VReg.A1, VReg.RET);
-        vm.pop(VReg.V0);
         vm.pop(VReg.S4); vm.pop(VReg.S3);
         vm.pop(VReg.S2); vm.pop(VReg.S1);
         vm.pop(VReg.S0);
@@ -5504,11 +5509,12 @@ export class StringGenerator {
         vm.pop(VReg.S4); vm.pop(VReg.S3);
         vm.pop(VReg.S2); vm.pop(VReg.S1);
         vm.pop(VReg.S0);
-        vm.addImm(VReg.S4, VReg.S3, 1);
+        vm.load(VReg.V3, VReg.SP, 32); // V3 = searchLen
+        vm.add(VReg.S4, VReg.S3, VReg.V3); // advance pos by searchLen
         vm.jmp("_sma_str_loop");
         vm.label("_sma_str_done");
         vm.mov(VReg.RET, VReg.S2);
         vm.call("_box_arr_r");
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 32);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 48);
     }
 }

@@ -245,6 +245,7 @@ const STRING_PROTO_METHODS = [
     ["replace", "_str_replace", 2],
     ["replaceAll", "_str_replaceAll", 2],
     ["localeCompare", "_str_localeCompare", 1],
+    ["normalize", "_str_toString_wrapper", 0],
     ["toString", "_str_toString_wrapper", 0],
     ["valueOf", "_str_valueOf", 0],
     ["constructor", null, 1],
