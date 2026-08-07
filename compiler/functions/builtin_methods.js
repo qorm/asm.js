@@ -231,7 +231,10 @@ export const BuiltinMethodCompiler = {
                     this.vm.mov(VReg.A2, VReg.RET);  // repl(串或函数闭包)
                     this.vm.pop(VReg.A1);            // search
                     this.vm.pop(VReg.A0);            // str
-                    if (replIsFn && method !== "replaceAll") {
+                    if (replIsFn) {
+                        // Function replacer: _str_replace_fn handles single replacement.
+                        // For replaceAll, this only replaces the first match (known deviation
+                        // from spec which requires all matches). Better than crashing.
                         this.vm.call("_str_replace_fn");
                     } else {
                         this.vm.call(method === "replaceAll" ? "_str_replaceAll" : "_str_replace");
