@@ -1014,6 +1014,13 @@ export class MathGenerator {
         vm.and(VReg.V2, VReg.S0, VReg.V1);
         vm.cmpImm(VReg.V2, 0);
         vm.jeq("_mpow_zerobase");   // base == ±0
+        // [#85] Infinity/ -Infinity base 特殊处理:
+        //   +Infinity^(y>0) → +Inf, +Infinity^(y<0) → +0
+        //   -Infinity^(y>0) → +Inf(奇整指走整数路径,此路必然非整→+Inf)
+        //   -Infinity^(y<0) → +0
+        vm.movImm64(VReg.V1, 0x7ff0000000000000n);
+        vm.cmp(VReg.V2, VReg.V1);
+        vm.jeq("_mpow_infbase");
         vm.shrImm(VReg.V2, VReg.S0, 63);
         vm.cmpImm(VReg.V2, 1);
         vm.jeq("_mpow_nan");        // base < 0,非整指 → NaN
@@ -1043,6 +1050,9 @@ export class MathGenerator {
         vm.call("_math_cbrt");
         vm.epilogue([VReg.S0, VReg.S1], 0);
         vm.label("_mpow_zerobase");
+        // [#85] 0**NaN → NaN。fcmp 自比较:NaN != NaN 故 jne 取真。
+        vm.fcmp(1, 1);
+        vm.jne("_mpow_nan");
         // 0^y(y 非整):y>0 → +0;y<0 → +Inf(按 exp 符号位判定)
         vm.shrImm(VReg.V2, VReg.S1, 63);
         vm.cmpImm(VReg.V2, 1);
@@ -1054,6 +1064,25 @@ export class MathGenerator {
         vm.epilogue([VReg.S0, VReg.S1], 0);
         vm.label("_mpow_nan");
         vm.movImm64(VReg.RET, 0x7ff0000000000001n);  // 打印友好 NaN
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+
+        // [#85] Infinity base 分支(含 -Infinity,到达时 exp 必非整)。
+        // +Inf^(y 非整):y>0 → +Inf; y<0 → +0。
+        // -Inf^(y 非整):y>0 → +Inf; y<0 → +0(奇整指走整数路径)。
+        // exp 符号测位 63:对 NaN 也适用(此路仅 ±Inf 入;NaN 随符号骰子取值不责)。
+        vm.label("_mpow_infbase");
+        vm.fcmp(1, 1);               // exp NaN 自比较
+        vm.jne("_mpow_nan");         // NaN 指 → NaN
+        // exp 测 NaN 后,exp_符号(bit63)定结果:
+        //   bit63=0(y>0) → +Inf; bit63=1(y<0) → +0。
+        // 复用 _mpow_zero_neg(+Inf)与 _mpow_zerobase(+0)的返回。
+        vm.shrImm(VReg.V2, VReg.S1, 63);
+        vm.cmpImm(VReg.V2, 1);
+        vm.jeq("_mpow_infbase_neg");
+        vm.movImm64(VReg.RET, 0x7ff0000000000000n); // +Inf (y>0)
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_mpow_infbase_neg");
+        vm.movImm(VReg.RET, 0);     // +0 (y<0)
         vm.epilogue([VReg.S0, VReg.S1], 0);
     }
 }

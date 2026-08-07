@@ -1305,6 +1305,11 @@ export const OperatorCompiler = {
                 this.vm.mov(VReg.A0, VReg.RET); // base(RET=left)
                 this.vm.mov(VReg.A1, VReg.V1);  // exp
                 this.vm.call("_math_pow");      // 返回 RET = float64 位
+                // [#85] _math_pow 内部用硬件 fmul/fdiv 运算,结果若是 NaN 会
+                // 被 ARM64 规范成 QNaN (high16=0x7FF8),与 NaN-boxing int32 tag
+                // 别名 → 打印成整数(如 `1**NaN` 打印 1)。规范化非别名 NaN
+                // (high16=0x7FF0),与 Math.pow 的 emitMathNanNormalize 同效。
+                if (mightBeNaN) this.emitNaNCanon();
                 break;
             default:
                 console.warn("Unhandled binary operator:", expr.operator);
