@@ -1931,22 +1931,27 @@ export const ExpressionCompiler = {
         // 消息用固定串(asm.addString 驻留)——按调用位拼接 callee 源文本会给字符串池
         // 增加几十条,可能推动自举产物越过 16KB 页界触发既有布局非确定性。
         {
-            const ctorOkL = this.ctx.newLabel("dnew_ctorok");
+            const ctorTagOkL = this.ctx.newLabel("dnew_ctortag_ok");
             const ctorBadL = this.ctx.newLabel("dnew_ctorbad");
             this.vm.cmpImm(VReg.S1, 0);
             this.vm.jeq(ctorBadL);
             this.vm.load(VReg.V1, VReg.FP, dnFnValSlot); // 原始(带 tag)值
             this.vm.shrImm(VReg.V1, VReg.V1, 48);
             this.vm.cmpImm(VReg.V1, 0); // 裸指针
-            this.vm.jeq(ctorOkL);
+            this.vm.jeq(ctorTagOkL);
             this.vm.cmpImm(VReg.V1, 0x7ffd); // 装箱对象
-            this.vm.jeq(ctorOkL);
+            this.vm.jeq(ctorTagOkL);
             this.vm.label(ctorBadL);
             this.vm.lea(VReg.A0, this.asm.addString("value is not a constructor"));
             this.vm.call("_js_box_string");
             this.vm.mov(VReg.A0, VReg.RET);
             this.vm.call("_throw_type_error"); // 不返回
-            this.vm.label(ctorOkL);
+            // Tag OK: verify type byte is classinfo (3). Regular objects (type=2)
+            // like Object.prototype are not constructors.
+            this.vm.label(ctorTagOkL);
+            this.vm.loadByte(VReg.V1, VReg.S1, 0);
+            this.vm.cmpImm(VReg.V1, 3); // TYPE_CLOSURE (classinfo)
+            this.vm.jne(ctorBadL);
         }
 
         // 1. 分配新对象（新布局：属性区独立分配、可自动增长）

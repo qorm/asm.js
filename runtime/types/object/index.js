@@ -94,6 +94,7 @@ export class ObjectGenerator {
         this.generateObjectNew();
         this.generateProxyNew();
         this.generateProxyTrapFn();
+        this.generateProxyIsPrototypeOf();
         this.generateThrowProxyInvariant();
         this.generateArefObjHelpers(); // [Stage A] Object.prototype 方法引用包装
         this.generateProxyApplyTramp();
@@ -1379,6 +1380,12 @@ export class ObjectGenerator {
         // 传**脱壳**指针:即便块类型字节被损坏落到 _subscript_get_object,那里回调
         // _object_get 也是高16=0 的裸指针路径,不会再回到本分支(无递归环)。
         vm.label("_object_get_array");
+        // Symbol keys on arrays: _subscript_get handles numeric indices and string
+        // named keys but not Symbol keys — return undefined.
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_is_symbol");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_object_get_notfound");
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.A0, VReg.S0, VReg.V1);
         vm.mov(VReg.A1, VReg.S1);
@@ -1715,6 +1722,84 @@ export class ObjectGenerator {
         vm.label("_ptf_none");
         vm.movImm(VReg.RET, 0);
         vm.epilogue([VReg.S0, VReg.S1], 16);
+    }
+
+    // _proxy_isPrototypeOf(A0=boxed proto, A1=boxed x) -> js_true/js_false
+    // Called from _is_prototype_of when x is a Proxy. Invokes the
+    // handler.getPrototypeOf trap and compares the result against proto.
+    generateProxyIsPrototypeOf() {
+        const vm = this.vm;
+        vm.label("_proxy_isPrototypeOf");
+        vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.mov(VReg.S0, VReg.A0); // boxed proto
+        vm.mov(VReg.S1, VReg.A1); // boxed x (proxy)
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.S2, VReg.S1, VReg.V1); // S2 = proxy raw
+        // Try getPrototypeOf trap
+        vm.mov(VReg.A0, VReg.S2);
+        vm.lea(VReg.A1, this.vm.asm.addString("getPrototypeOf"));
+        vm.call("_proxy_trap_fn");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_pipo_no_trap");
+        vm.mov(VReg.A3, VReg.RET);            // A3 = trap fn
+        vm.load(VReg.A0, VReg.S2, 8);         // A0 = proxy target
+        vm.lea(VReg.A1, "_js_undefined");
+        vm.load(VReg.A1, VReg.A1, 0);         // A1 = undefined thisArg
+        vm.mov(VReg.A2, VReg.A1);              // A2 = undefined arg
+        vm.call("_aref_invoke_cb");            // RET = trap result
+        // Check trap result: must be an object (or array)
+        vm.shrImm(VReg.V1, VReg.RET, 48);
+        vm.cmpImm(VReg.V1, 0x7FFD);
+        vm.jeq("_pipo_check");
+        vm.cmpImm(VReg.V1, 0x7FFE);        // array
+        vm.jeq("_pipo_check");
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_pipo_false");
+        vm.label("_pipo_check");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V0, VReg.RET, VReg.V1); // V0 = trap result raw
+        vm.mov(VReg.A1, VReg.V0);              // A1 = trap result raw
+        vm.load(VReg.A0, VReg.SP, 48);         // A0 = proto raw (from epilogue slot)
+        vm.jmp("_pipo_loop_start");
+        vm.label("_pipo_no_trap");
+        // No trap: use target's proto chain
+        vm.load(VReg.A0, VReg.S2, 8);         // V0 = proxy target
+        // Strip tag on target
+        vm.shrImm(VReg.V1, VReg.A0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFD);
+        vm.jne("_pipo_false");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V0, VReg.A0, VReg.V1); // V0 = target raw
+        vm.mov(VReg.A1, VReg.V0);              // A1 = target raw
+        vm.andMaskReg(VReg.A0, VReg.S0, VReg.V1); // A0 = proto raw
+        vm.label("_pipo_loop_start");
+        // A0 = proto raw, A1 = cur raw
+        vm.cmp(VReg.A1, VReg.A0);
+        vm.jeq("_pipo_true");
+        vm.label("_pipo_loop");
+        // Guard: only traverse proto on objects (type byte 2) and classinfo (3).
+        // Arrays (1), Dates (7), Maps (4) etc. have different layout — skip.
+        vm.loadByte(VReg.V2, VReg.A1, 0);
+        vm.andImm(VReg.V2, VReg.V2, 0xff);
+        vm.cmpImm(VReg.V2, 2);                 // TYPE_OBJECT
+        vm.jeq("_pipo_ld_proto");
+        vm.cmpImm(VReg.V2, 3);                 // classinfo
+        vm.jne("_pipo_false");
+        vm.label("_pipo_ld_proto");
+        vm.load(VReg.A1, VReg.A1, 16);         // cur = cur.__proto__
+        vm.cmpImm(VReg.A1, 0);
+        vm.jeq("_pipo_false");
+        vm.cmp(VReg.A1, VReg.A0);
+        vm.jeq("_pipo_true");
+        vm.jmp("_pipo_loop");
+        vm.label("_pipo_true");
+        vm.lea(VReg.RET, "_js_true");
+        vm.load(VReg.RET, VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 48);
+        vm.label("_pipo_false");
+        vm.lea(VReg.RET, "_js_false");
+        vm.load(VReg.RET, VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 48);
     }
 
     // [Stage A] Object.prototype 方法引用的包装 helper(经 _aref_generic 蹦床调用,
@@ -3150,6 +3235,14 @@ export class ObjectGenerator {
         // Symbol 标记块:写属性会把 desc 指针槽当 count 毁块 → 静默跳过
         vm.cmpImm(VReg.V1, TYPE_SYMBOL);
         vm.jeq("_object_set_ty_bail");
+        // Date(7)/Promise(11)/DataView(14): not property containers;
+        // writing arbitrary props would crash (same as _object_get guard).
+        vm.cmpImm(VReg.V1, TYPE_DATE);
+        vm.jeq("_object_set_ty_bail");
+        vm.cmpImm(VReg.V1, TYPE_PROMISE);
+        vm.jeq("_object_set_ty_bail");
+        vm.cmpImm(VReg.V1, TYPE_DATA_VIEW);
+        vm.jeq("_object_set_ty_bail");
         // Proxy(type=8):冷分支调 handler.set 陷阱。
         vm.cmpImm(VReg.V1, TYPE_PROXY);
         vm.jeq("_object_set_proxy");
@@ -4083,6 +4176,12 @@ export class ObjectGenerator {
         vm.emitMaskLoad(VReg.V4);
         vm.andMaskReg(VReg.S0, VReg.S0, VReg.V4);
 
+        // Symbol(61): raw heap pointer without NaN-box tag; has no own keys → empty array.
+        vm.loadByte(VReg.V0, VReg.S0, 0);
+        vm.cmpImm(VReg.V0, TYPE_SYMBOL);
+        vm.jeq("_object_keys_empty");
+
+
         // Proxy(type=8):有 ownKeys 陷阱 → handler.ownKeys(target) 的键数组;否则转发
         // target 的键(count@8 是 target 指针,不转发会当 count 迭代垃圾崩)。**偏差**:
         // Object.keys 严格应按 getOwnPropertyDescriptor 过滤 enumerable,此处返陷阱全量键
@@ -4510,6 +4609,7 @@ export class ObjectGenerator {
             // 其余非属性堆对象按类型字节([S1+0])短路。
             vm.loadByte(VReg.V0, VReg.S1, 0);
             vm.andImm(VReg.V0, VReg.V0, 0xff);
+            vm.cmpImm(VReg.V0, 8); vm.jeq("_opts_plain");       // TYPE_PROXY → Object
             vm.cmpImm(VReg.V0, 7); vm.jeq("_opts_date");        // TYPE_DATE
             vm.cmpImm(VReg.V0, 11); vm.jeq("_opts_promise");    // TYPE_PROMISE
             // TypedArray(0x40-0x61)/ArrayBuffer(12)/DataView(14)
@@ -5783,6 +5883,19 @@ export class ObjectGenerator {
         // 原裸 and(V0,A1,V1) 在 arm64 读到 V1 垃圾 → V0 野指针 → 链走查 SIGSEGV
         // (isPrototypeOf 全形态崩的根因;x64 物化掩码侥幸正确)。
         vm.andMaskReg(VReg.V0, VReg.A1, VReg.V1); // V0 = x 裸指针(cur)
+        vm.loadByte(VReg.V2, VReg.V0, 0);
+        vm.cmpImm(VReg.V2, TYPE_PROXY);    // Proxy: delegate to helper
+        vm.jne("_ipo_loop");
+        // Proxy path: call _proxy_isPrototypeOf(A0=boxed proto, A1=boxed proxy)
+        // which returns js_true / js_false after consulting the getPrototypeOf trap.
+        vm.mov(VReg.A0, VReg.S0);          // S0 = proto raw; restore boxed for call
+        vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);  // A0 = boxed proto
+        vm.mov(VReg.A1, VReg.A1);          // A1 = boxed x (proxy) still intact
+        vm.call("_proxy_isPrototypeOf");
+        // _proxy_isPrototypeOf returns js_true or js_false in RET
+        vm.epilogue([VReg.S0], 16);
+
         vm.label("_ipo_loop");
         vm.load(VReg.V0, VReg.V0, 16);     // cur = cur.__proto__(裸指针)
         vm.cmpImm(VReg.V0, 0);
@@ -5853,6 +5966,30 @@ export class ObjectGenerator {
         vm.load(VReg.V1, VReg.V1, 0);
         vm.cmp(VReg.V2, VReg.V1);
         vm.jge("_object_setPrototypeOf_done");
+        // [#T2] Cycle check: walk the proposed proto chain and reject if target
+        // appears (OrdinarySetPrototypeOf step 7). Guard: proto is null (V3==0)
+        // or target traversal depth exceeds 8192 → throw TypeError.
+        vm.cmpImm(VReg.V3, 0);
+        vm.jeq("_ospo_store");
+        vm.mov(VReg.V4, VReg.V3); // cursor = proposed proto
+        vm.movImm64(VReg.V0, 0);  // depth counter
+        vm.label("_ospo_cycle_loop");
+        vm.cmp(VReg.V4, VReg.V2);  // cursor == target? → cycle
+        vm.jeq("_ospo_cycle");
+        vm.load(VReg.V4, VReg.V4, 16); // cursor = cursor.__proto__
+        vm.cmpImm(VReg.V4, 0);   // cursor == null? → ok
+        vm.jeq("_ospo_store");
+        vm.addImm(VReg.V0, VReg.V0, 1);
+        vm.movImm64(VReg.V1, 8192);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jlt("_ospo_cycle_loop");
+        // Depth exhausted or cycle detected → TypeError
+        vm.label("_ospo_cycle");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot set prototype of object: cycle detected or immutable prototype"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error"); // 不返回
+        vm.label("_ospo_store");
         vm.store(VReg.V2, 16, VReg.V3);
         // [A2] 原型改写:保守形状置 0(键序未变;读侧形状只管自有键,置 0 无害)
         vm.movImm(VReg.V1, 0);
