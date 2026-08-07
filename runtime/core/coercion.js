@@ -709,6 +709,16 @@ export class CoercionGenerator {
         vm.fmovToFloat(1, VReg.S1);
         vm.fadd(0, 0, 1);
         vm.fmovToInt(VReg.RET, 0);
+        // NaN canonization: hardware qNaN high16 ∈ [0x7FF8,0x7FFF] aliases with
+        // NaN-boxing int/tag bits, causing coerce/print/isNaN to treat NaN as 0.
+        // Rewrite to print-friendly NaN 0x7FF0000000000001 (high16=0x7FF0).
+        vm.shrImm(VReg.V1, VReg.RET, 48);
+        vm.cmpImm(VReg.V1, 0x7FF8);
+        vm.jlt("_js_add_fast_done");
+        vm.cmpImm(VReg.V1, 0x8000);
+        vm.jge("_js_add_fast_done");
+        vm.movImm64(VReg.RET, 0x7ff0000000000001n);
+        vm.label("_js_add_fast_done");
         vm.epilogue([VReg.S0, VReg.S1], 32);
 
         vm.label("_js_add_slow");
@@ -865,6 +875,14 @@ export class CoercionGenerator {
         vm.fmovToFloat(1, VReg.S1);
         vm.fadd(0, 0, 1);
         vm.fmovToInt(VReg.RET, 0);
+        // NaN canonization (same as fast path above)
+        vm.shrImm(VReg.V1, VReg.RET, 48);
+        vm.cmpImm(VReg.V1, 0x7FF8);
+        vm.jlt("_js_add_float_done");
+        vm.cmpImm(VReg.V1, 0x8000);
+        vm.jge("_js_add_float_done");
+        vm.movImm64(VReg.RET, 0x7ff0000000000001n);
+        vm.label("_js_add_float_done");
         vm.epilogue([VReg.S0, VReg.S1], 32);
 
         vm.label("_js_add_concat");

@@ -814,6 +814,15 @@ export const StatementCompiler = {
     // 计算成员/静态成员/导出同步),避免重复手写。值先落临时局部,再以引用它的
     // Identifier 作赋值右侧。
     emitDestructureAssign(targetNode) {
+        // Pre-declare undeclared identifier targets so assignment can proceed.
+        // In sloppy mode ES, assignment to an undeclared variable creates a global;
+        // asm.js has no global scope, so we auto-declare a local slot instead.
+        if (targetNode.type === "Identifier" && targetNode.name) {
+            const name = targetNode.name;
+            if (!this.ctx.getLocal(name) && !this.ctx.getMainCapturedVar(name)) {
+                this.ctx.allocLocal(name);
+            }
+        }
         const tmpName = `__destrval_${this.nextLabelId()}`;
         const tmpOff = this.ctx.allocLocal(tmpName);
         this.vm.store(VReg.FP, tmpOff, VReg.RET);
