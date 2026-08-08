@@ -464,13 +464,10 @@ export class JSValueGenerator {
         vm.jeq("_js_typeof_function");
         // [bug1] 其余落在堆范围内的「裸」指针（Map=4/Set=5 等未 NaN-box 的堆对象，
         //  高16=0）typeof 应为 "object"，否则会被下方 double 判断误判为 "number"。
-        //  以 type@0 ∈ [1,14] 或 TypedArray 区间 [0x40,0x61] 为有效堆对象守卫，
+        //  以 type@0 ∈ [1, 0x61] 为有效堆对象守卫（覆盖 Array=1 .. BigInt=14、
+        //  TYPE_FLOAT64=29 等中间类型、TypedArray 0x40-0x61），
         //  规避真·微小 double 别名进堆区被误判（其 type@0 极少落在这些区间）。
         vm.cmpImm(VReg.V1, 1);
-        vm.jb("_js_typeof_notclass");
-        vm.cmpImm(VReg.V1, 14);
-        vm.jbe("_js_typeof_object");
-        vm.cmpImm(VReg.V1, 0x40);
         vm.jb("_js_typeof_notclass");
         vm.cmpImm(VReg.V1, 0x61);
         vm.jbe("_js_typeof_object");
