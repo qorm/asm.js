@@ -115,11 +115,9 @@ export class SubscriptGenerator {
         vm.call("_syscall_arg");
         vm.mov(VReg.S1, VReg.RET);
 
-        // x64 上 V0≡RET≡RAX，_syscall_arg 的返回值把类型标签冲掉了；
-        // 从仍然有效的 S3(=完整类型) 重取低 8 位。arm64(V0=X8) 保持不变。
-        if (vm.backend.name === "x64") {
-            vm.andImm(VReg.V0, VReg.S3, 0xff);
-        }
+        // _syscall_arg clobbers V0 on all backends (X8 caller-saved on arm64,
+        // RAX/RET on x64). Reload type byte from S3 (= full type word).
+        vm.andImm(VReg.V0, VReg.S3, 0xff);
 
         // 下标已是裸整数(S1)、类型低字节在 V0:字符串键冷分支归一后跳回此处汇合。
         vm.label("_subscript_get_idx_ok");
@@ -520,12 +518,10 @@ export class SubscriptGenerator {
         vm.call("_syscall_arg");
         vm.mov(VReg.S1, VReg.RET);
 
-        // x64 上 V0≡RET≡RAX，_syscall_arg 的返回值把类型标签冲掉了；
-        // 从仍然有效的 S0(=裸数组指针) 重取类型标签。arm64(V0=X8) 保持不变。
-        if (vm.backend.name === "x64") {
-            vm.load(VReg.V0, VReg.S0, 0);
-            vm.andImm(VReg.V0, VReg.V0, 0xff);
-        }
+        // _syscall_arg clobbers V0 on all backends (X8 caller-saved on arm64,
+        // RAX/RET on x64). Reload type byte from S0 (= bare array pointer).
+        vm.load(VReg.V0, VReg.S0, 0);
+        vm.andImm(VReg.V0, VReg.V0, 0xff);
 
         // 下标已是裸整数(S1)、类型低字节在 V0:字符串键冷分支归一后跳回此处汇合。
         vm.label("_subscript_set_idx_ok");
