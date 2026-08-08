@@ -2424,15 +2424,10 @@ export class ArrayGenerator {
         // 高16=0 但 type 非 2/3/8 的损坏值)一律 len=0。
         vm.jmp("_agen_norm_len0");
         vm.label("_agen_norm_objlen_ok");
-        // [proto guard] compileDynamicNew 可能存装箱 proto(0x7FFE Array)于 [obj+16],
-        // _object_get 的 checkProtoLabel 遍历时会解引用装箱值当裸指针 → SIGSEGV。
-        // 若 proto 高16位非0(已是装箱值),直接 len=0 跳过 _object_get 避免递归崩。
-        vm.load(VReg.V4, VReg.V2, 16); // proto from [raw_obj, 16]
-        vm.cmpImm(VReg.V4, 0);
-        vm.jeq("_agen_norm_objlen_get");  // proto==null → safe, read length
-        vm.shrImm(VReg.V5, VReg.V4, 48);
-        vm.cmpImm(VReg.V5, 0);
-        vm.jne("_agen_norm_len0");        // proto is boxed → unsafe, len=0
+        // _object_get 已支持装箱 proto 原型链遍历(obj/index.js L1593-1614,识别
+        // 高16位!0 为装箱值并直接用作递归 A0),旧 guard 反而将正常对象的 length
+        // 截断为 0 → 回调型泛型方法(如 Array.prototype.reduceRight.call(obj))
+        // 迭代零次 → 测试断言 !="true"。
         vm.label("_agen_norm_objlen_get");
         vm.mov(VReg.A0, VReg.S0);
         vm.lea(VReg.A1, vm.asm.addString("length"));
