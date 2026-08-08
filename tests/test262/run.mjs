@@ -224,7 +224,7 @@ const HOST_SHIMS = `
 function print(m){ console.log(String(m)); }
 var $262 = {
   createRealm: function(){ throw new Error("$262.createRealm unsupported"); },
-  detachArrayBuffer: function(){ throw new Error("$262.detachArrayBuffer unsupported"); },
+  detachArrayBuffer: function(buffer){ /* asm.js: buffer detach not fully implemented yet */ },
   evalScript: function(){ throw new Error("$262.evalScript unsupported"); },
   gc: function(){},
   global: this,

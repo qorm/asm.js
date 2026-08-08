@@ -1,69 +1,80 @@
 # asm.js test262 conformance report
 
-_Generated 2026-08-07T16:57:00.209Z — target macos-arm64_
+_Generated 2026-08-08T11:28:04.130Z — target macos-arm64_
 
 ## Headline
 
-**asm.js passes 348 / 594 = 58.59% of the run test262 subset**
+**asm.js passes 1246 / 2083 = 59.82% of the run test262 subset**
 (selected `language/` + core `built-ins/`), one variant per test.
 
-Of 3081 discovered test files in the selected dirs, 113 were excluded up front (module=0, unsupported-feature=113, intl/staging-dir=0); 2968 were eligible; 594 were actually run (deterministic stride=5).
+Of 11040 discovered test files in the selected dirs, 629 were excluded up front (module=0, unsupported-feature=629, intl/staging-dir=0); 10411 were eligible; 2083 were actually run (deterministic stride=5).
 
 ## Overall breakdown
 
 | class | count | % of run |
 |-------|------:|---------:|
-| PASS         | 348 | 58.59 |
-| FAIL         | 226 | 38.05 |
-| COMPILE_FAIL | 0 | 0.00 |
-| CRASH        | 20 | 3.37 |
-| **run**      | **594** | 100 |
+| PASS         | 1246 | 59.82 |
+| FAIL         | 826 | 39.65 |
+| COMPILE_FAIL | 4 | 0.19 |
+| CRASH        | 7 | 0.34 |
+| **run**      | **2083** | 100 |
 
 ## By area
 
 | area | run | PASS | FAIL | COMPILE_FAIL | CRASH | pass% |
 |------|----:|-----:|-----:|-------------:|------:|------:|
-| built-ins/Array | 594 | 348 | 226 | 0 | 20 | 58.6 |
+| built-ins/Array | 594 | 353 | 241 | 0 | 0 | 59.4 |
+| built-ins/Object | 680 | 460 | 216 | 2 | 2 | 67.6 |
+| built-ins/RegExp | 374 | 206 | 165 | 2 | 1 | 55.1 |
+| built-ins/String | 243 | 155 | 86 | 0 | 2 | 63.8 |
+| built-ins/TypedArray | 192 | 72 | 118 | 0 | 2 | 37.5 |
 
 ## Excluded categories (counted, not scored)
 
 - **module flag** (ES modules as test262 expects): 0
-- **unsupported feature** (structurally out of scope, see UNSUPPORTED_FEATURES): 113
+- **unsupported feature** (structurally out of scope, see UNSUPPORTED_FEATURES): 629
 - **intl402/ + staging/ dirs**: 0
 
 Excluded-by-feature detail:
 
+- `BigInt`: 497
 - `Array.fromAsync`: 95
-- `cross-realm`: 16
-- `BigInt`: 2
+- `cross-realm`: 32
+- `SharedArrayBuffer`: 5
 
 ## Top failing patterns (FAIL / COMPILE_FAIL / CRASH detail strings)
 
-- **187×** FAIL: assertion mismatch (Test262Error / wrong value)
-- **24×** FAIL: array contents mismatch (compareArray)
-- **17×** CRASH: run signal SIGSEGV
-- **13×** FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)
-- **3×** CRASH: run timeout
-- **2×** FAIL: constructor-ness reflection (isConstructor / not-a-constructor)
+- **581×** FAIL: assertion mismatch (Test262Error / wrong value)
+- **96×** FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)
+- **75×** FAIL: TypedArray/ArrayBuffer semantics
+- **66×** FAIL: array contents mismatch (compareArray)
+- **8×** FAIL: constructor-ness reflection (isConstructor / not-a-constructor)
+- **6×** CRASH: run signal SIGSEGV
+- **4×** COMPILE_FAIL: asm.js could not compile (unsupported syntax / parser gap)
+- **1×** CRASH: run signal SIGBUS
 
 ## Failures correlated with features (top tags among failing tests)
 
-- `resizable-arraybuffer`: 12
-- `change-array-by-copy`: 11
-- `Symbol.species`: 9
+- `TypedArray`: 102
+- `regexp-unicode-property-escapes`: 98
+- `resizable-arraybuffer`: 41
+- `Symbol`: 33
+- `Symbol.species`: 25
+- `Proxy`: 15
+- `change-array-by-copy`: 15
+- `regexp-v-flag`: 15
+- `Symbol.replace`: 12
+- `Symbol.iterator`: 11
+- `arrow-function`: 10
+- `array-find-from-last`: 9
+- `Symbol.match`: 9
+- `Symbol.split`: 9
+- `Reflect.construct`: 8
+- `Symbol.toPrimitive`: 8
 - `Symbol.isConcatSpreadable`: 7
-- `Symbol.iterator`: 5
-- `Proxy`: 5
-- `array-find-from-last`: 5
-- `Array.prototype.flatMap`: 5
-- `Array.prototype.includes`: 5
-- `Symbol`: 4
-- `Array.prototype.flat`: 3
-- `Reflect.construct`: 2
-- `arrow-function`: 2
-- `exponentiation`: 2
-- `Reflect`: 1
-- `Symbol.unscopables`: 1
+- `string-trimming`: 7
+- `__setter__`: 6
+- `Symbol.matchAll`: 6
 
 ## Methodology / reproducibility
 
@@ -95,4 +106,4 @@ mkdir -p .test262-corpus && tar xzf /tmp/t262.tgz -C .test262-corpus --strip-com
 node tests/test262/run.mjs --stride 5 --jobs 8 --target macos-arm64
 ```
 
-_Run wall-clock: 40.5s._
+_Run wall-clock: 132.8s._
