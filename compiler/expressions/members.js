@@ -2746,9 +2746,13 @@ export const MemberCompiler = {
             this.emitBuiltinFnClosure("_get_this");
             vm.lea(VReg.V0, cfg.speciesTmpSlot);
             vm.store(VReg.V0, 0, VReg.RET);
+            // emitBoxedStringKey(A1) calls _tag_key_a1 which clobbers A0/RET.
+            // Reload A0 from slot after each call.
             vm.lea(VReg.V0, cfg.speciesTmpSlot);
             vm.load(VReg.A0, VReg.V0, 0);
             this.emitBoxedStringKey("name", VReg.A1);
+            vm.lea(VReg.V0, cfg.speciesTmpSlot);
+            vm.load(VReg.A0, VReg.V0, 0);
             vm.lea(VReg.A2, this.asm.addString("get [Symbol.species]"));
             vm.movImm64(VReg.V1, 0x7ffc000000000000n);
             vm.or(VReg.A2, VReg.A2, VReg.V1);
@@ -2756,6 +2760,8 @@ export const MemberCompiler = {
             vm.lea(VReg.V0, cfg.speciesTmpSlot);
             vm.load(VReg.A0, VReg.V0, 0);
             this.emitBoxedStringKey("length", VReg.A1);
+            vm.lea(VReg.V0, cfg.speciesTmpSlot);
+            vm.load(VReg.A0, VReg.V0, 0);
             vm.movImm(VReg.A2, 0);
             vm.scvtf(0, VReg.A2);
             vm.fmovToInt(VReg.A2, 0);
@@ -2802,6 +2808,7 @@ export const MemberCompiler = {
             ctorSlot: "_nsobj_map", protoSlot: "_nsobj_map_proto",
             methods: MAP_PROTO_METHODS, sizeGetter: "_aref_map_size",
             statics: MAP_STATIC_METHODS,
+            speciesTmpSlot: "_nsobj_map_tmp",
         });
     },
     // [底层A Array 一等值] 裸 `Array`(反射位)→ 惰性物化真构造器闭包 + 原型对象(方法值经
@@ -2975,6 +2982,7 @@ export const MemberCompiler = {
             ctorSlot: "_nsobj_set", protoSlot: "_nsobj_set_proto",
             methods: SET_PROTO_METHODS, sizeGetter: "_aref_set_size",
             statics: [], aliases: [["keys", "values"]],
+            speciesTmpSlot: "_nsobj_set_tmp",
         });
     },
     emitPromiseCtorObject() {
