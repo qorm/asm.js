@@ -187,12 +187,14 @@ const REGEXP_PROTO_METHODS = [
     ["exec", "__RE_exec", 1],
     ["test", "__RE_test", 1],
     ["toString", "__RE_toString", 0],
+    ["compile", "__RE_compile", 2],
 ];
 // 名 → shim 导出名(值读取分派用;#32 铁律:查表后一律 typeof==="string" 判命中)。
 const REGEXP_PROTO_HELPER = {
     exec: "__RE_exec",
     test: "__RE_test",
     toString: "__RE_toString",
+    compile: "__RE_compile",
 };
 
 // ── [W-29] String.prototype 物化(反射用真对象)───────────────────────────────────
@@ -3669,6 +3671,15 @@ export const MemberCompiler = {
                 keyName = String(prop.value);
             const thisOffset = this.ctx.getLocal("__this");
             this.emitLoadSuperClassInfo(VReg.S1);
+            // [Guard] 父类无 classinfo(extends null / 内建 / 未初始化)→ 抛 TypeError
+            const supInfoOk = this.ctx.newLabel("supc_info_ok");
+            this.vm.cmpImm(VReg.S1, 0);
+            this.vm.jne(supInfoOk);
+            this.vm.lea(VReg.A0, this.asm.addString("Cannot read properties of undefined (reading property of super)"));
+            this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+            this.vm.or(VReg.A0, VReg.A0, VReg.V1);
+            this.vm.call("_throw_type_error"); // 不返回
+            this.vm.label(supInfoOk);
             if (!this.ctx.inStaticMethod) { this.vm.load(VReg.S1, VReg.S1, 32); this.vm.load(VReg.S1, VReg.S1, 24); }
             this.vm.emitMaskLoad(VReg.V1); this.vm.andMaskReg(VReg.A0, VReg.S1, VReg.V1);
             this.vm.movImm64(VReg.V1, 0x7ffd000000000000n); this.vm.or(VReg.A0, VReg.A0, VReg.V1);
@@ -3918,6 +3929,15 @@ export const MemberCompiler = {
             if (expr.object && expr.object.type === "SuperExpression" && this.ctx.superClass) {
                 const thisOffset = this.ctx.getLocal("__this");
                 this.emitLoadSuperClassInfo(VReg.S1); // S1 = 父类信息对象(raw);表达式父类走全局
+                // [Guard] 父类无 classinfo(extends null / 内建 / 未初始化)→ 抛 TypeError
+                const supInfoOk2 = this.ctx.newLabel("supc_info_ok2");
+                this.vm.cmpImm(VReg.S1, 0);
+                this.vm.jne(supInfoOk2);
+                this.vm.lea(VReg.A0, this.asm.addString("Cannot read properties of undefined (reading property of super)"));
+                this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+                this.vm.or(VReg.A0, VReg.A0, VReg.V1);
+                this.vm.call("_throw_type_error"); // 不返回
+                this.vm.label(supInfoOk2);
                 if (!this.ctx.inStaticMethod) {
                     this.vm.load(VReg.S1, VReg.S1, 32); // props_ptr
                     this.vm.load(VReg.S1, VReg.S1, 24); // 父 prototype 对象(raw) = props[1].val
