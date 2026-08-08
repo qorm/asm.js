@@ -2527,12 +2527,21 @@ export const FunctionCompiler = {
                     this.vm.call("_object_set");
                     this.vm.load(VReg.RET, VReg.FP, objOff);
                 } else if (arg.type === "Literal" && typeof arg.value === "number") {
-                    // Object(num) → Number 包装对象(暂简化:返回原数字,记偏差)
+                    // Object(num) → Number 包装对象
                     this.compileExpression(arg);
+                    this.vm.mov(VReg.A0, VReg.RET);
+                    const numValOff = this.ctx.allocLocal(`__objcall_num_${this.nextLabelId()}`);
+                    this.vm.store(VReg.FP, numValOff, VReg.RET);
+                    this.emitNumberProtoObject();  // 确保 Number.prototype 已物化
+                    this.vm.load(VReg.A0, VReg.FP, numValOff);
+                    this.vm.call("_number_new");
                 } else if (arg.type === "Literal" && typeof arg.value === "boolean") {
                     // Object(bool) → Boolean 包装对象
                     this.compileExpression(arg);
-                    this.vm.mov(VReg.A0, VReg.RET);
+                    const boolValOff = this.ctx.allocLocal(`__objcall_bool_${this.nextLabelId()}`);
+                    this.vm.store(VReg.FP, boolValOff, VReg.RET);
+                    this.emitBooleanProtoObject();  // 确保 Boolean.prototype 已物化
+                    this.vm.load(VReg.A0, VReg.FP, boolValOff);
                     this.vm.call("_boolean_new");
                 } else {
                     // 动态参数:运行时 ToObject。

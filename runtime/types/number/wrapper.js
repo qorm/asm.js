@@ -9,7 +9,16 @@ export class NumberWrapperGenerator {
         this.vm = vm;
     }
 
+    generateDataSlots() {
+        const asm = this.vm.asm;
+        asm.addDataLabel("_nsobj_number");
+        asm.addDataQword(0);
+        asm.addDataLabel("_nsobj_number_proto");
+        asm.addDataQword(0);
+    }
+
     generate() {
+        this.generateDataSlots();
         this.generateNumberNew();
     }
 
@@ -32,9 +41,13 @@ export class NumberWrapperGenerator {
         vm.call("_object_new");     // RET = raw obj ptr
         vm.mov(VReg.S0, VReg.RET);  // S0 = raw obj ptr
 
-        // Step 3: set proto = 0 (compiler will overwrite after materialization)
-        vm.movImm(VReg.V3, 0);
-        vm.store(VReg.S0, 16, VReg.V3); // obj.__proto__ = 0
+        // Step 3: set proto from global slot (always present from emitNumberCtorObject)
+        vm.lea(VReg.V3, "_nsobj_number_proto");
+        vm.load(VReg.V3, VReg.V3, 0); // V3 = boxed proto (0 if not yet materialized)
+        // Unbox proto: __proto__ slot stores raw pointer, not boxed value
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V3, VReg.V3, VReg.V1);
+        vm.store(VReg.S0, 16, VReg.V3); // obj.__proto__ = raw prototype pointer
 
         // Step 4: store __number_value property
         vm.mov(VReg.A0, VReg.S0);
