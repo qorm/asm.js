@@ -149,6 +149,8 @@ const NamespaceStaticRef = {
     },
     Array: {
         isArray: "_isarray_ref", // wrapper:A1=1(Array 标识)后尾跳 _instanceof
+        from: "_array_from_ref",
+        of: "_array_of_ref",
     },
 };
 
@@ -475,6 +477,7 @@ const BUILTIN_REF_ARITY = {
     object_fromEntries: 1, object_is: 2,
     date_now: 0, date_parse: 1, date_utc: 7,
     array_isArray: 1,
+    array_from: 1, array_of: 0,
     fnproto_call: 1, fnproto_apply: 2,
     // [I2 一等值] Map/Set/Promise 静态(emitCollectionCtorObject 的 emitMemoizedBuiltinRef
     // 槽键 = 构造器名小写 + "_" + 属性名,须与 PROMISE_STATIC_METHODS/MAP_STATIC_METHODS 同步)。
@@ -587,6 +590,8 @@ const ARRAY_PROTO_METHODS = [
 ];
 const ARRAY_STATIC_METHODS = [
     ["isArray", "_isarray_ref", 1],
+    ["from", "_array_from_ref", 1],
+    ["of", "_array_of_ref", 0],
 ];
 // [底层A W-A2 Object 一等值] Object.prototype 方法值表(_aref_generic 蹦床 helper 同源,
 // 供 emitObjectCtorObject 物化原型)。标签与既有 `Object.prototype.<m>` 值读取分派
@@ -1147,6 +1152,17 @@ export const MemberCompiler = {
     },
 
     _regexpGetterAst(flagName, defaultLit) {
+        // [flag getter brand check] 在读取属性前调用 __RE_flag_brand_check(this);
+        // 非 RegExp 实例时抛 TypeError(规范 22.2.6)。不用 AST IfStatement,
+        // 按 runtime shim 方式把品牌检查收敛到 __regexp_shim.js 的导出函数中。
+        const brandCheck = {
+            type: "ExpressionStatement",
+            expression: {
+                type: "CallExpression",
+                callee: { type: "Identifier", name: "__RE_flag_brand_check" },
+                arguments: [{ type: "ThisExpression" }],
+            },
+        };
         let arg = this._reThisPropAst(flagName);
         if (defaultLit !== null) {
             arg = {
@@ -1167,7 +1183,10 @@ export const MemberCompiler = {
             params: [],
             body: {
                 type: "BlockStatement",
-                body: [{ type: "ReturnStatement", argument: arg }],
+                body: [
+                    brandCheck,
+                    { type: "ReturnStatement", argument: arg },
+                ],
             },
         };
     },

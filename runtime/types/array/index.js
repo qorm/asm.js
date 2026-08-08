@@ -3205,6 +3205,145 @@ export class ArrayGenerator {
         this.generateArraySpeciesCheck();
         this.generateIsConcatSpreadable();
         this.generateConcatAppendItem();
+        this.generateArrayFromRef();
+        this.generateArrayOfRef();
+    }
+
+    // _array_from_ref(A0=src boxed, A1=mapFn boxed) -> boxed array。
+    // Array.from 作一等值(变量/回调)的运行时 helper:静态方法闭包经 _aref_static_tramp
+    // 分派到本 helper。src 是 tagged 数组(0x7FFE)时快路 copy+map;否则走 spread 收迭代器。
+    generateArrayFromRef() {
+        const vm = this.vm;
+        vm.label("_array_from_ref");
+        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2]);
+
+        vm.mov(VReg.S0, VReg.A0); // S0 = src (boxed)
+        vm.mov(VReg.S1, VReg.A1); // S1 = mapFn (boxed, 可能 undefined/垃圾)
+
+        // 数组快路:src 是 0x7FFE tagged → _array_slice 全拷贝
+        vm.shrImm(VReg.V0, VReg.S0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jne("_afr_spread");
+
+        // 快路:src 是数组,拷贝全部元素(_array_slice 需裸头,内部自行 box 0x7FFE 返回)
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_js_unbox");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.movImm(VReg.A1, 0);
+        vm.movImm(VReg.A2, 2147483647);
+        vm.call("_array_slice"); // RET = boxed 0x7FFE 副本
+        vm.mov(VReg.S2, VReg.RET);
+        vm.jmp("_afr_map");
+
+        // spread 慢路:非数组源 → _array_spread_into 收迭代器/Set/Map
+        vm.label("_afr_spread");
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.call("_box_arr_r"); // RET = boxed 空数组
+        vm.mov(VReg.S2, VReg.RET); // S2 = result (boxed)
+        vm.mov(VReg.A0, VReg.S2);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.call("_array_spread_into"); // RET = result (boxed)
+        vm.mov(VReg.S2, VReg.RET);
+
+        // mapFn 映射阶段:mapFn 是 callable(tag 0x7FFF) → _array_map_rt(result, mapFn)
+        vm.label("_afr_map");
+        vm.shrImm(VReg.V0, VReg.S1, 48);
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jne("_afr_done");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_array_map_rt"); // RET = boxed mapped array
+        vm.mov(VReg.S2, VReg.RET);
+
+        vm.label("_afr_done");
+        vm.mov(VReg.RET, VReg.S2);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 16);
+    }
+
+    // _array_of_ref: Array.of 作一等值的运行时 helper。
+    // 变参:闭包经 _aref_static_tramp 分派,A0..A4=实参(boxed),_call_argc=个数。
+    // 创建新数组、按序填入各实参、返回装箱 0x7FFE。
+    generateArrayOfRef() {
+        const vm = this.vm;
+        vm.label("_array_of_ref");
+        // 栈帧:local(48) + S0/S1/S2/S3/S4/S5 (48) = 96,对齐到 16 边界 OK
+        vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+
+        // 保存实参到 callee-saved S 寄存器(跨后续 call 保活;S 由 epilogue 恢复)
+        vm.mov(VReg.S1, VReg.A0); // arg0
+        vm.mov(VReg.S2, VReg.A1); // arg1
+        vm.mov(VReg.S3, VReg.A2); // arg2
+        vm.mov(VReg.S4, VReg.A3); // arg3
+        vm.mov(VReg.S5, VReg.A4); // arg4
+
+        // 读实参个数入栈槽 SP+0(SP=S 寄存器跨 call 保活)
+        vm.lea(VReg.V1, "_call_argc");
+        vm.load(VReg.V2, VReg.V1, 0); // V2 = argc(临时)
+        // 钳 argc 到 [0,5](寄存器窗口)
+        vm.movImm(VReg.V3, 5);
+        vm.cmp(VReg.V2, VReg.V3);
+        vm.jle("_aof_argc_ok");
+        vm.mov(VReg.V2, VReg.V3);
+        vm.label("_aof_argc_ok");
+        vm.store(VReg.SP, 0, VReg.V2); // argc → [SP+0](local 槽,跨 call 保活)
+
+        // 创建空数组:S0 = result(boxed)
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.call("_box_arr_r");
+        vm.mov(VReg.S0, VReg.RET);
+
+        // 逐实参 push 进结果数组(Unroll 5 个分支,堆栈 argc 判界)
+        // argc >= 1 → push arg0
+        vm.load(VReg.V0, VReg.SP, 0); // argc
+        vm.movImm(VReg.V1, 1);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jlt("_aof_done");
+        vm.mov(VReg.A1, VReg.S1); // arg0
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_push");     // clobbers V regs, S0-S5 存活
+        vm.mov(VReg.S0, VReg.RET);
+        // argc >= 2 → push arg1
+        vm.load(VReg.V0, VReg.SP, 0);
+        vm.movImm(VReg.V1, 2);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jlt("_aof_done");
+        vm.mov(VReg.A1, VReg.S2);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_push");
+        vm.mov(VReg.S0, VReg.RET);
+        // argc >= 3 → push arg2
+        vm.load(VReg.V0, VReg.SP, 0);
+        vm.movImm(VReg.V1, 3);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jlt("_aof_done");
+        vm.mov(VReg.A1, VReg.S3);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_push");
+        vm.mov(VReg.S0, VReg.RET);
+        // argc >= 4 → push arg3
+        vm.load(VReg.V0, VReg.SP, 0);
+        vm.movImm(VReg.V1, 4);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jlt("_aof_done");
+        vm.mov(VReg.A1, VReg.S4);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_push");
+        vm.mov(VReg.S0, VReg.RET);
+        // argc >= 5 → push arg4
+        vm.load(VReg.V0, VReg.SP, 0);
+        vm.movImm(VReg.V1, 5);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jlt("_aof_done");
+        vm.mov(VReg.A1, VReg.S5);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_push");
+        vm.mov(VReg.S0, VReg.RET);
+
+        vm.label("_aof_done");
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
     }
 
     // 一等数组迭代器(`arr.values()`/`.keys()`/`.entries()`/`arr[Symbol.iterator]()`)。

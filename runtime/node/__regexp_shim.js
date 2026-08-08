@@ -1330,6 +1330,19 @@ function __re_hide(o, names) {
     }
 }
 
+// __RE_flag_brand_check(re): RegExp flag getter 品牌检查。
+// get RegExp.prototype.{source,flags,global,…} 的 getter 在读取自身属性前
+// 调用本函数;this 非 RegExp 实例时抛 TypeError(规范 22.2.6)。
+// gen1-safe:不用正则/解构/默认参数/getter/arr.length=n 截断。
+export function __RE_flag_brand_check(re) {
+    if (re === undefined || re === null) {
+        throw new TypeError("Method RegExp.prototype.flags getter called on incompatible receiver");
+    }
+    if (re.__isRegExp !== true) {
+        throw new TypeError("Method RegExp.prototype.flags getter called on incompatible receiver");
+    }
+}
+
 export function __RE_new(pattern, flags) {
     var src = pattern;
     var f = flags;

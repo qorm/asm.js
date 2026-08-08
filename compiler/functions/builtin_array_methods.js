@@ -1043,6 +1043,7 @@ export const BuiltinArrayMethodCompiler = {
         this.compileExpression(callbackExpr);
         const cbOffset = this.ctx.allocLocal(`__some_cb_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, cbOffset, VReg.RET);
+        this.emitCallbackGuard(cbOffset);
         this.emitThisArgSlot(thisArgExpr, "some");
 
         // tag guard: 非真数组(0x7FFE)时走 _agen_some 安全包装
@@ -1367,6 +1368,7 @@ export const BuiltinArrayMethodCompiler = {
         this.compileExpression(callbackExpr);
         const cbOffset = this.ctx.allocLocal(`__every_cb_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, cbOffset, VReg.RET);
+        this.emitCallbackGuard(cbOffset);
         this.emitThisArgSlot(thisArgExpr, "every");
 
         // tag guard: 非真数组(0x7FFE)时走 _agen_every 安全包装
@@ -1460,6 +1462,7 @@ export const BuiltinArrayMethodCompiler = {
         this.compileExpression(callbackExpr);
         const cbOffset = this.ctx.allocLocal(`__find_cb_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, cbOffset, VReg.RET);
+        this.emitCallbackGuard(cbOffset);
         this.emitThisArgSlot(thisArgExpr, "find");
 
         const idxOffset = this.ctx.allocLocal(`__find_idx_${this.nextLabelId()}`);
@@ -1532,6 +1535,7 @@ export const BuiltinArrayMethodCompiler = {
         this.compileExpression(callbackExpr);
         const cbOffset = this.ctx.allocLocal(`__findL_cb_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, cbOffset, VReg.RET);
+        this.emitCallbackGuard(cbOffset);
         this.emitThisArgSlot(thisArgExpr, "findL");
         const elemOffset = this.ctx.allocLocal(`__findL_elem_${this.nextLabelId()}`);
 
@@ -1606,6 +1610,7 @@ export const BuiltinArrayMethodCompiler = {
         this.compileExpression(callbackExpr);
         const cbOffset = this.ctx.allocLocal(`__findIdx_cb_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, cbOffset, VReg.RET);
+        this.emitCallbackGuard(cbOffset);
         this.emitThisArgSlot(thisArgExpr, "findIdx");
 
         const idxOffset = this.ctx.allocLocal(`__findIdx_idx_${this.nextLabelId()}`);
@@ -1668,6 +1673,7 @@ export const BuiltinArrayMethodCompiler = {
         this.compileExpression(callbackExpr);
         const cbOffset = this.ctx.allocLocal(`__forEach_cb_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, cbOffset, VReg.RET);
+        this.emitCallbackGuard(cbOffset);
         this.emitThisArgSlot(thisArgExpr, "forEach");
 
         // tag guard: 非真数组(0x7FFE)时走 _agen_forEach 安全包装
@@ -1748,6 +1754,35 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.call("_agen_forEach");
 
         this.vm.label(forEachDoneLbl);
+    },
+
+    // 回调可调用性守卫:在循环**前**检查回调值是否可调用(规范要求 TypeError 在迭代前抛出)。
+    // cbOffset = FP 偏移量,该槽存有已求值的回调表达式结果(boxed JSValue)。
+    // 判据:tag 0x7FFF(boxed 函数)/0x7FFD(boxed 对象,可能是 Proxy)/0(裸堆指针在 heap 范围内)。
+    // 不可调用时调 _throw_not_a_function 抛 TypeError(不返回)。
+    emitCallbackGuard(cbOffset) {
+        const vm = this.vm;
+        const okL = this.ctx.newLabel("cbg_callable");
+        const badL = this.ctx.newLabel("cbg_not_callable");
+        vm.load(VReg.V0, VReg.FP, cbOffset);
+        vm.shrImm(VReg.V1, VReg.V0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFF);   // boxed function
+        vm.jeq(okL);
+        vm.cmpImm(VReg.V1, 0x7FFD);   // boxed object (may be callable Proxy)
+        vm.jeq(okL);
+        vm.cmpImm(VReg.V1, 0);        // bare heap pointer
+        vm.jne(badL);
+        vm.lea(VReg.V2, "_heap_base");
+        vm.load(VReg.V2, VReg.V2, 0);
+        vm.cmp(VReg.V0, VReg.V2);
+        vm.jlt(badL);
+        vm.lea(VReg.V2, "_heap_ptr");
+        vm.load(VReg.V2, VReg.V2, 0);
+        vm.cmp(VReg.V0, VReg.V2);
+        vm.jlt(okL);
+        vm.label(badL);
+        vm.call("_throw_not_a_function");
+        vm.label(okL);
     },
 
     // 闭包调用的核心逻辑（S0 = 闭包对象，参数已在 A0-A5 中）
@@ -1892,6 +1927,7 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.store(VReg.FP, _msRecvSp, VReg.RET);
         this.compileExpression(callbackExpr);
         this.vm.store(VReg.FP, _msCbSp, VReg.RET);
+        this.emitCallbackGuard(_msCbSp);
         this.emitThisArgSlot(thisArgExpr, "map");
 
         // tag guard: 非真数组(0x7FFE) → 跳过 species check,直落 _agen_map
@@ -2158,6 +2194,7 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.store(VReg.FP, _fsRecvSp, VReg.RET);
         this.compileExpression(callbackExpr);
         this.vm.store(VReg.FP, _fsCbSp, VReg.RET);
+        this.emitCallbackGuard(_fsCbSp);
         this.emitThisArgSlot(thisArgExpr, "filter");
 
         // tag guard: 非真数组(0x7FFE) → 跳过 species check,直落 _agen_filter
