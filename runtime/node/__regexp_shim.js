@@ -294,25 +294,12 @@ function __re_uniResolve(name, value, hasEq) {
         if (name === "General_Category" || name === "gc") return __re_uniName(__RE_UN_GC, value);
         if (name === "Script" || name === "sc") return __re_uniName(__RE_UN_SC, value);
         if (name === "Script_Extensions" || name === "scx") return __re_uniName(__RE_UN_SCX, value);
-        // Binary property with value:ASCII=T -> true, ASCII=F -> negated via flag
-        return -1; // Signal: binary property with value (caller checks __re_uniResolveBin)
+        return -1;
     }
     if (name.length === 0) return -1;
     var ti = __re_uniName(__RE_UN_BIN, name);
     if (ti >= 0) return ti;
     return __re_uniName(__RE_UN_GC, name);
-}
-
-// Binary property name=value resolution: returns [tableIndex, valueNeg]
-// where valueNeg=1 if value is No, 0 if Yes.
-// Spec: only "Yes" and "No" are valid for binary property values.
-// Returns null if name is not a binary property or value is invalid.
-function __re_uniResolveBin(name, value) {
-    var ti = __re_uniName(__RE_UN_BIN, name);
-    if (ti < 0) return null;
-    if (value === "Yes") return [ti, 0];
-    if (value === "No") return [ti, 1];
-    return null;
 }
 
 // 解析 \p{…} / \P{…} 的花括号部分(st.i 停在 'p'/'P' 之后)。
@@ -344,13 +331,6 @@ function __re_parseProp(st, isNeg) {
     if (!closed) return __re_fail(st, "Invalid property name");
     var ti = __re_uniResolve(name, value, hasEq);
     if (ti < 0) {
-        // Binary property with value (e.g. \p{ASCII=T}): try name=value resolution
-        if (hasEq) {
-            var bin = __re_uniResolveBin(name, value);
-            if (bin !== null) {
-                return { t: 5, c: "", code: 0, ti: bin[0], neg: isNeg ? (1 - bin[1]) : bin[1] };
-            }
-        }
         // v(unicodeSets)模式还有一族"字符串属性"(\p{RGI_Emoji} 等),本引擎不实现;
         // 那里报 SyntaxError 会误伤合法模式,故只在 v 模式下退回静默未实现路线。
         if (st.usets) return __re_unsup(st);
@@ -1961,7 +1941,7 @@ export function __RE_matchAll(str, re) {
 // 捕获组按序并入结果;空匹配不在 last 处重切且推进一位防死循环;limit 截断。
 // 用 g 标志工作副本驱动 __RE_exec 扫描(原 re 的 lastIndex 不受影响)。
 export function __RE_split(str, re, limit) {
-    var lim = (limit === undefined || limit === null) ? 4294967295 : (limit >>> 0);
+    var lim = (limit === undefined || limit === null) ? 4294967295 : limit;
     if (lim === 0) {
         var e0 = [];
         e0.constructor = Array;
