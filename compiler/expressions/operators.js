@@ -1576,17 +1576,32 @@ export const OperatorCompiler = {
             this.vm.call("_js_box_string");
             return;
         }
-        // [typeof 未解析名] 编译器完全解析不到的裸标识符 → 规范要求 typeof 返回
-        // "undefined"(unresolvable reference 唯一不抛的上下文)。不这样做的话
-        // compileIdentifier 兜底发裸 0,_typeof 把它判成 "number",
-        // `typeof Float16Array !== "undefined"` 等特性探测恒真 → 垃圾值被当构造器
-        // 使用 → SIGSEGV。判定见 members.js isUnresolvableIdentifier:已声明变量
-        // (哪怕值就是 0)、内建名、成员/调用路径支持的全局名一律不走这里。
+        // [typeof 未解析名] 编译器完全解析不到的裸标识符:规范要求 typeof 在
+        // unresolvable reference 时返回 "undefined"(唯一不抛的上下文)。
+        // 但该标识符可能在运行时是 globalThis 上的属性(如 Object.defineProperties
+        // 动态注入的全局属性),编译期不可知。因此 emit 运行时两步:
+        //   1) 在 globalThis 上查找该名 → 找到则用值调 _typeof
+        //   2) 未找到(_object_get 返回 undefined)→ 返回 "undefined"
+        // 此前静态返回"undefined"→ 动态全局属性 typeof 恒错(test262 typeof/get-value.js)。
         if (expr.operator === "typeof" && expr.argument.type === "Identifier" &&
             this.isUnresolvableIdentifier && this.isUnresolvableIdentifier(expr.argument)) {
-            const undefLabel = this.asm.addString("undefined");
-            this.vm.lea(VReg.A0, undefLabel);
-            this.vm.call("_js_box_string");
+            const nameLabel = this.asm.addString(expr.argument.name);
+            // 1. globalThis 装箱
+            this.vm.lea(VReg.V0, "_global_this");
+            this.vm.load(VReg.V0, VReg.V0, 0);
+            this.vm.mov(VReg.A0, VReg.V0);
+            this.vm.call("_box_obj_r");          // RET = boxed globalThis
+            this.vm.mov(VReg.V1, VReg.RET);      // V1 = boxed globalThis
+            // 2. key = boxed name string
+            this.vm.lea(VReg.A0, nameLabel);
+            this.vm.movImm64(VReg.V2, 0x7ffc000000000000n);
+            this.vm.or(VReg.A0, VReg.A0, VReg.V2); // A0 = boxed key
+            this.vm.mov(VReg.A1, VReg.A0);         // A1 = key
+            this.vm.mov(VReg.A0, VReg.V1);         // A0 = globalThis
+            this.vm.call("_object_get");          // RET = found value or JS_UNDEFINED
+            // 3. 用 _object_get 结果调 _typeof
+            this.vm.mov(VReg.A0, VReg.RET);
+            this.vm.call("_js_typeof");
             return;
         }
 
