@@ -285,6 +285,7 @@ export const BuiltinCollectionMethodCompiler = {
             // ES2025 Set 组合方法：a.<op>(b)，A0=a A1=b
             // 返回新 Set:union/intersection/difference/symmetricDifference
             // 返回布尔:isSubsetOf/isSupersetOf/isDisjointFrom
+            // 两端皆经 _set_coerce_arg 品牌守卫(b 可为 Set-like 对象,防 SIGSEGV)。
             case "union":
             case "intersection":
             case "difference":
@@ -302,9 +303,17 @@ export const BuiltinCollectionMethodCompiler = {
                         isSupersetOf: "_set_issuperset",
                         isDisjointFrom: "_set_isdisjoint",
                     }[method];
+                    // 1) 编译 b,用 _set_coerce_arg 转裸 Set
                     this.compileExpression(args[0]);
-                    this.vm.mov(VReg.A1, VReg.RET); // b(另一个 Set)
-                    this.vm.pop(VReg.A0);           // a(this Set)
+                    this.vm.mov(VReg.A0, VReg.RET);   // A0 = b(候选值)
+                    this.vm.call("_set_coerce_arg");    // RET = 裸 Set b
+                    this.vm.mov(VReg.A1, VReg.RET);    // A1 = 裸 Set b
+                    // 2) 取 a(boxed),用 _set_coerce_arg 转裸 Set;先 push A1 防被 call 毁
+                    this.vm.pop(VReg.A0);              // A0 = a(boxed,接收者)
+                    this.vm.push(VReg.A1);             // [sp] = 裸 Set b(save across call)
+                    this.vm.call("_set_coerce_arg");    // RET = 裸 Set a
+                    this.vm.mov(VReg.A0, VReg.RET);    // A0 = 裸 Set a
+                    this.vm.pop(VReg.A1);              // A1 = 裸 Set b(restore)
                     this.vm.call(setCombinatorLabel);
                     return true;
                 }

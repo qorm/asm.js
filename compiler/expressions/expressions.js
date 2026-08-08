@@ -565,11 +565,13 @@ export const ExpressionCompiler = {
                     // null/undefined 参数 → 空 Map(ES:new Map(null)/new Map(undefined) 合法)。
                     // 此前 _array_length(null) 读 null 的 length@8 → SIGSEGV。V2 避 x64 V0==RET 保 RET。
                     const mapNullishL = this.ctx.newLabel("mapnew_nullish");
+                    const mapNonArrL = this.ctx.newLabel("mapnew_nonarr");
                     const mapEndL = this.ctx.newLabel("mapnew_end");
                     this.vm.load(VReg.V2, VReg.FP, srcOff);
                     this.vm.shrImm(VReg.V2, VReg.V2, 48);
                     this.vm.cmpImm(VReg.V2, 0x7FFA); this.vm.jeq(mapNullishL); // null
                     this.vm.cmpImm(VReg.V2, 0x7FFB); this.vm.jeq(mapNullishL); // undefined
+                    this.vm.cmpImm(VReg.V2, 0x7FFE); this.vm.jne(mapNonArrL);  // 非数组(含对象/字符串)→ 避 _array_length 段错
                     this.vm.mov(VReg.A0, VReg.RET);
                     this.vm.call("_array_length"); // RET = 原始整数长度
                     const lenOff = this.ctx.allocLocal(`__mapnew_len_${this.nextLabelId()}`);
@@ -612,6 +614,9 @@ export const ExpressionCompiler = {
                     this.vm.label(doneL);
                     this.vm.load(VReg.RET, VReg.FP, collOff);
                     this.vm.jmp(mapEndL);
+                    this.vm.label(mapNonArrL); // 非数组 iterable → 空 Map(暂;后续加 Iterator 协议)
+                    this.vm.call("_map_new");
+                    this.vm.jmp(mapEndL);
                     this.vm.label(mapNullishL); // null/undefined → 空 Map
                     this.vm.call("_map_new");
                     this.vm.label(mapEndL);
@@ -645,11 +650,13 @@ export const ExpressionCompiler = {
                     this.vm.store(VReg.FP, ssrcOff, VReg.RET);
                     // null/undefined → 空 Set(同 Map,防 _array_length(null) 崩)
                     const setNullishL = this.ctx.newLabel("setnew_nullish");
+                    const setNonArrL = this.ctx.newLabel("setnew_nonarr");
                     const setEndL = this.ctx.newLabel("setnew_end");
                     this.vm.load(VReg.V2, VReg.FP, ssrcOff);
                     this.vm.shrImm(VReg.V2, VReg.V2, 48);
                     this.vm.cmpImm(VReg.V2, 0x7FFA); this.vm.jeq(setNullishL);
                     this.vm.cmpImm(VReg.V2, 0x7FFB); this.vm.jeq(setNullishL);
+                    this.vm.cmpImm(VReg.V2, 0x7FFE); this.vm.jne(setNonArrL);  // 非数组 → 避 _array_length 段错
                     this.vm.mov(VReg.A0, VReg.RET);
                     this.vm.call("_array_length");
                     const slenOff = this.ctx.allocLocal(`__setnew_len_${this.nextLabelId()}`);
@@ -680,6 +687,9 @@ export const ExpressionCompiler = {
                     this.vm.jmp(sloopL);
                     this.vm.label(sdoneL);
                     this.vm.load(VReg.RET, VReg.FP, scollOff);
+                    this.vm.jmp(setEndL);
+                    this.vm.label(setNonArrL); // 非数组 iterable → 空 Set(暂;后续加 Iterator 协议)
+                    this.vm.call("_set_new");
                     this.vm.jmp(setEndL);
                     this.vm.label(setNullishL); // null/undefined → 空 Set
                     this.vm.call("_set_new");
@@ -1852,7 +1862,161 @@ export const ExpressionCompiler = {
             vm.call(name === "entries" ? "_array_entries" : "_array_keys");
             return true;
         }
-        return false; // 委托:map/filter/forEach/reduce/some/every/find/... 走 compileArrayMethod
+        // ---- 回调型方法:转普通数组后委托 _array_*_rt ----
+        // 此前 return false 让 compileArrayMethod 接手,后者按 data_ptr@24 解引用 typed 布局
+        // → map/filter 结果全错、find/findIndex 返回垃圾、forEach 段错。
+        // 修复:先 _ta_to_array 得装箱普通数组,再调 _array_*_rt(与 _tam_* 包装器同构)。
+        // 注意:所有实参(callback 等)须 push 落栈后才调 _ta_to_array,因 A1..A7 caller-saved。
+        if (name === "toString" || name === "toLocaleString") {
+            this.compileExpression(obj);
+            vm.mov(VReg.A0, VReg.RET);
+            vm.lea(VReg.A1, "_str_comma_only");
+            vm.call("_ta_join");
+            return true;
+        }
+        if (name === "forEach") {
+            if (args.length === 0) return true;
+            this.compileExpression(obj);
+            vm.push(VReg.RET);                    // [sp] = boxed ta
+            this.compileExpression(args[0]);
+            vm.push(VReg.RET);                    // [sp] = callback, [sp+8] = boxed ta
+            vm.pop(VReg.A1);                      // A1 = callback(save)
+            vm.pop(VReg.A0);                      // A0 = boxed ta
+            vm.push(VReg.A1);                     // [sp] = callback(save across call)
+            vm.call("_ta_to_array");              // RET = boxed regular array
+            vm.pop(VReg.A1);                      // A1 = callback(restore)
+            vm.mov(VReg.A0, VReg.RET);            // A0 = boxed arr
+            vm.call("_array_forEach_rt");
+            return true;
+        }
+        if ((name === "map" || name === "filter" || name === "flatMap") && args.length >= 1) {
+            // map/filter/flatMap:TA→arr→cb→result_arr→TA(同类型回填)
+            this.compileExpression(obj);
+            vm.push(VReg.RET);                    // [sp] = boxed ta
+            vm.loadByte(VReg.V5, VReg.RET, 0);    // V5 = type byte
+            vm.push(VReg.V5);                     // [sp] = type byte, [sp+8] = boxed ta
+            this.compileExpression(args[0]);
+            vm.push(VReg.RET);                    // [sp] = callback, [sp+8] = type byte, [sp+16] = boxed ta
+            vm.pop(VReg.A2);                      // A2 = callback
+            vm.pop(VReg.V5);                      // V5 = type byte
+            vm.pop(VReg.A0);                      // A0 = boxed ta
+            vm.push(VReg.V5);                     // [sp] = type byte(save across call)
+            vm.push(VReg.A2);                     // [sp] = callback, [sp+8] = type byte
+            vm.call("_ta_to_array");              // RET = boxed regular array
+            vm.pop(VReg.A1);                      // A1 = callback(restore)
+            vm.mov(VReg.A0, VReg.RET);            // A0 = boxed arr
+            if (name === "flatMap") {
+                vm.call("_array_flatMap_rt");
+            } else if (name === "filter") {
+                vm.call("_array_filter_rt");
+            } else {
+                vm.call("_array_map_rt");
+            }
+            vm.pop(VReg.V5);                      // V5 = type byte
+            vm.mov(VReg.A1, VReg.RET);            // A1 = boxed result array
+            vm.mov(VReg.A0, VReg.V5);             // A0 = type byte
+            vm.call("_typed_array_from");
+            return true;
+        }
+        if (name === "flat") {
+            if (args.length === 0) return true;
+            this.compileExpression(obj);
+            vm.push(VReg.RET);                    // [sp] = boxed ta
+            vm.loadByte(VReg.V5, VReg.RET, 0);    // V5 = type byte
+            vm.push(VReg.V5);                     // [sp] = type byte, [sp+8] = boxed ta
+            vm.pop(VReg.V5);                      // V5 = type byte(restore)
+            vm.pop(VReg.A0);                      // A0 = boxed ta
+            vm.push(VReg.V5);                     // [sp] = type byte(save across call)
+            vm.call("_ta_to_array");              // RET = boxed regular array
+            vm.mov(VReg.A0, VReg.RET);            // A0 = boxed arr
+            if (args.length >= 1) {
+                vm.push(VReg.RET);                // [sp] = boxed arr
+                this.compileExpression(args[0]);  // RET = depth(boxed number)
+                vm.mov(VReg.A1, VReg.RET);        // A1 = depth(_array_flat_rt 内部 _to_int32 处理)
+                vm.pop(VReg.A0);                  // A0 = boxed arr
+            } else {
+                vm.movImm64(VReg.A1, 0x7ffb000000000000n); // undefined → 默认 depth=1
+            }
+            vm.call("_array_flat_rt");
+            vm.pop(VReg.V5);                      // V5 = type byte
+            vm.mov(VReg.A1, VReg.RET);            // A1 = boxed result array
+            vm.mov(VReg.A0, VReg.V5);             // A0 = type byte
+            vm.call("_typed_array_from");
+            return true;
+        }
+        if (name === "some" || name === "every") {
+            if (args.length === 0) return true;
+            this.compileExpression(obj);
+            vm.push(VReg.RET);                    // [sp] = boxed ta
+            this.compileExpression(args[0]);
+            vm.push(VReg.RET);                    // [sp] = callback, [sp+8] = boxed ta
+            vm.pop(VReg.A1);                      // A1 = callback(save)
+            vm.pop(VReg.A0);                      // A0 = boxed ta
+            vm.push(VReg.A1);                     // [sp] = callback(save across call)
+            vm.call("_ta_to_array");
+            vm.pop(VReg.A1);                      // A1 = callback(restore)
+            vm.mov(VReg.A0, VReg.RET);
+            vm.call(name === "some" ? "_array_some_rt" : "_array_every_rt");
+            return true;
+        }
+        if (name === "reduce" || name === "reduceRight") {
+            if (args.length === 0) return true;
+            this.compileExpression(obj);
+            vm.push(VReg.RET);                    // [sp] = boxed ta
+            this.compileExpression(args[0]);
+            vm.push(VReg.RET);                    // [sp] = callback, [sp+8] = boxed ta
+            if (args.length >= 2) {
+                this.compileExpression(args[1]);
+                vm.push(VReg.RET);                // [sp] = init, [sp+8] = callback, [sp+16] = boxed ta
+            }
+            if (args.length >= 2) {
+                vm.pop(VReg.A2);                  // A2 = init
+            }
+            vm.pop(VReg.A1);                      // A1 = callback
+            vm.pop(VReg.A0);                      // A0 = boxed ta
+            vm.push(VReg.A1);                     // [sp] = callback
+            if (args.length >= 2) {
+                vm.push(VReg.A2);                 // [sp] = init, [sp+8] = callback
+            }
+            vm.call("_ta_to_array");
+            vm.mov(VReg.A0, VReg.RET);            // A0 = boxed arr
+            if (args.length >= 2) {
+                vm.pop(VReg.A2);                  // A2 = init
+            } else {
+                vm.movImm64(VReg.A2, 0x7ffb000000000000n); // undefined(sentinel)
+            }
+            vm.pop(VReg.A1);                      // A1 = callback
+            vm.call(name === "reduce" ? "_array_reduce_rt" : "_array_reduceRight_rt");
+            return true;
+        }
+        if (name === "find" || name === "findIndex") {
+            if (args.length === 0) return true;
+            this.compileExpression(obj);
+            vm.push(VReg.RET);                    // [sp] = boxed ta
+            this.compileExpression(args[0]);
+            vm.push(VReg.RET);                    // [sp] = callback, [sp+8] = boxed ta
+            vm.pop(VReg.A1);                      // A1 = callback(save)
+            vm.pop(VReg.A0);                      // A0 = boxed ta
+            vm.push(VReg.A1);                     // [sp] = callback(save across call)
+            vm.call("_ta_to_array");
+            vm.pop(VReg.A1);                      // A1 = callback(restore)
+            vm.mov(VReg.A0, VReg.RET);
+            vm.call(name === "find" ? "_array_find_rt" : "_array_findIndex_rt");
+            return true;
+        }
+        if (name === "findLast" || name === "findLastIndex") {
+            if (args.length === 0) return true;
+            this.compileExpression(obj);
+            vm.push(VReg.RET);                    // [sp] = boxed ta
+            this.compileExpression(args[0]);
+            vm.push(VReg.RET);                    // [sp] = callback, [sp+8] = boxed ta
+            vm.pop(VReg.A1);                      // A1 = callback
+            vm.pop(VReg.A0);                      // A0 = boxed ta
+            vm.movImm(VReg.A2, name === "findLastIndex" ? 3 : 2); // mode:bit0=index,bit1=reverse
+            vm.call("_tam_find_core");
+            return true;
+        }
+        return false; // 剩余未识别方法:走 compileArrayMethod 通用路径
     },
 
     /**

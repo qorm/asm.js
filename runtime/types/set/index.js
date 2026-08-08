@@ -432,6 +432,106 @@ export class SetGenerator {
         // ============================================================
         const SET_MASK = 0x0000ffffffffffffn;
 
+        // ---- _set_coerce_arg(A0=任意值) -> 裸 Set 指针(非 Set → TypeError) ----
+        // Set ES2025 组合方法(intersection/union/...)的第二个实参可能是装箱 Set-like
+        // 对象而非裸 Set 指针;原 helper 直接解引用裸指针 → SIGSEGV。此 helper 做品牌
+        // 守卫:已为裸 Set→ 直返;装箱 Set 对象(0x7FFD 且 TYPE_SET)→ 脱壳返;
+        // Set-like 对象→ 先按迭代器协议造新 Set(逐 keys 值 add),再返;
+        // 其余 → TypeError。_set_coerce_arg_do_add 复用于 _set_union 内参。
+        vm.asm.registerRuntimeString("_str_sz_size", "size");
+        vm.asm.registerRuntimeString("_str_sz_has", "has");
+        vm.asm.registerRuntimeString("_str_sz_keys", "keys");
+        vm.label("_set_coerce_arg");
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.shrImm(VReg.V0, VReg.S0, 48);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_sca_raw");
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jne("_sca_bad");
+        // 装箱对象 → 脱壳验类型字节
+        vm.movImm64(VReg.V1, SET_MASK);
+        vm.and(VReg.S4, VReg.S0, VReg.V1);
+        vm.movImm64(VReg.V1, vm.ptrFloor);
+        vm.cmp(VReg.S4, VReg.V1);
+        vm.jlt("_sca_bad");
+        vm.loadByte(VReg.V1, VReg.S4, 0);
+        vm.cmpImm(VReg.V1, TYPE_SET);
+        vm.jeq("_sca_is_set");            // 装箱 Set → 脱壳直返
+        // 非 Set 装箱对象:取 keys 迭代并 add 到新 Set
+        vm.call("_set_new");
+        vm.mov(VReg.S1, VReg.RET);         // S1 = 新裸 Set
+        vm.lea(VReg.A1, "_str_sz_keys");
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.mov(VReg.A0, VReg.S0);          // 候选对象
+        vm.call("_object_get"); // RET = keys(函数/undefined)
+        vm.mov(VReg.S2, VReg.RET);
+        vm.shrImm(VReg.V0, VReg.S2, 48);
+        vm.cmpImm(VReg.V0, 0x7FFF);        // 函数 TAG
+        vm.jeq("_sca_call_keys");
+        vm.cmpImm(VReg.V0, 0);             // 裸函数指针
+        vm.jne("_sca_not_iter");           // keys 不可调用 → 放弃(返回空集)
+        // 归一化裸函数指针为装箱形式
+        vm.movImm64(VReg.V1, SET_MASK);
+        vm.and(VReg.S2, VReg.S2, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7fff000000000000n);
+        vm.or(VReg.S2, VReg.S2, VReg.V1);
+        vm.label("_sca_call_keys");
+        vm.shrImm(VReg.V0, VReg.S2, 48);
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jne("_sca_not_iter");
+        // 用 _aref_invoke_cb 调 keys(0 参);传 A0=接收者 A3=keys,压空哨兵作 element
+        vm.movImm64(VReg.A0, 0x7ffb000000000000n); // undefined 占位 element
+        vm.movImm64(VReg.A1, 0x7ffb000000000000n); // undefined 占位 idx
+        vm.mov(VReg.A2, VReg.S0);          // 数组占位 = 候选对象
+        vm.mov(VReg.A3, VReg.S2);          // keys 函数
+        vm.call("_aref_invoke_cb");        // RET = keys() 返回值(迭代器数组)
+        vm.mov(VReg.S3, VReg.RET);         // S3 = 迭代器数组(装箱)
+        vm.shrImm(VReg.V0, VReg.S3, 48);
+        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jne("_sca_not_iter");           // 返回值非数组 → 放弃
+        // 遍历迭代器数组,逐值 _set_add
+        vm.movImm(VReg.S4, 0);
+        vm.mov(VReg.A0, VReg.S3);
+        vm.call("_array_length");
+        vm.mov(VReg.S5, VReg.RET);
+        vm.label("_sca_loop");
+        vm.cmp(VReg.S4, VReg.S5);
+        vm.jge("_sca_done");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_array_get");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_set_add");
+        vm.addImm(VReg.S4, VReg.S4, 1);
+        vm.jmp("_sca_loop");
+        vm.label("_sca_not_iter");         // keys 不可用 → 返回空集
+        vm.jmp("_sca_done");
+        vm.label("_sca_is_set");
+        vm.mov(VReg.S1, VReg.S4);          // 脱壳后的裸 Set 指针
+        vm.jmp("_sca_done");
+        vm.label("_sca_raw");
+        vm.movImm64(VReg.V1, SET_MASK);
+        vm.and(VReg.V0, VReg.S0, VReg.V1);
+        vm.movImm64(VReg.V1, vm.ptrFloor);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jlt("_sca_bad");
+        vm.loadByte(VReg.V1, VReg.V0, 0);
+        vm.cmpImm(VReg.V1, TYPE_SET);
+        vm.jne("_sca_bad");
+        vm.mov(VReg.S1, VReg.V0);
+        vm.label("_sca_done");
+        vm.mov(VReg.RET, VReg.S1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
+        vm.label("_sca_bad");
+        vm.lea(VReg.A0, vm.asm.addString("Set method argument must be a Set or Set-like object"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error"); // 不返回
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32); // 理论不达
+
         // ---- _set_union(A0=a, A1=b) -> 新 Set(a ∪ b) ----
         vm.label("_set_union");
         vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
