@@ -4443,10 +4443,17 @@ export class StringGenerator {
         vm.movImm64(VReg.V1, 0x7ffb000000000000n);
         vm.cmp(VReg.S1, VReg.V1);
         vm.jeq("_split_undef_sep");
-        // [L3] RegExp separator:高16=0,堆内,type@0==TYPE_REGEXP(8)→委托 _regexp_split
+        // [L3] RegExp separator: two code paths:
+        //   (a) raw heap pointer with TYPE_REGEXP(8) — compiled-in RegExp literal
+        //   (b) boxed 0x7FFD object with __isRegExp truthy — new RegExp(...)
+        // Both delegate to _regexp_split(re_ptr, str_ptr, limit).
         {
             const splitReNot = "_split_re_not";
+            const splitReBox = "_split_re_box";
             vm.shrImm(VReg.V1, VReg.S1, 48);
+            vm.cmpImm(VReg.V1, 0x7FFD);
+            vm.jeq(splitReBox);
+            // (a) raw heap pointer: [L3]
             vm.cmpImm(VReg.V1, 0);
             vm.jne(splitReNot);
             vm.cmpImm(VReg.S1, 0);
@@ -4458,14 +4465,43 @@ export class StringGenerator {
             vm.loadByte(VReg.V1, VReg.S1, 0);
             vm.cmpImm(VReg.V1, 8); // TYPE_REGEXP
             vm.jne(splitReNot);
-            // 提取 str content 指针(调用 _getStrContent)
+            // 提取 str content 指针
+            vm.mov(VReg.A0, VReg.S0);
+            vm.call("_getStrContent");
+            vm.mov(VReg.A1, VReg.RET);
+            vm.mov(VReg.A0, VReg.S1);
+            vm.movImm64(VReg.A2, 0xffffffffn);
+            vm.call("_regexp_split");
+            vm.jmp("_split_ret");
+            // (b) boxed 0x7FFD object: check __isRegExp
+            vm.label(splitReBox);
+            vm.push(VReg.S0);
+            vm.mov(VReg.A0, VReg.S1); // A0 = boxed re obj
+            vm.lea(VReg.A1, vm.asm.addString("__isRegExp"));
+            vm.movImm64(VReg.V2, 0x7ffc000000000000n);
+            vm.or(VReg.A1, VReg.A1, VReg.V2);
+            vm.call("_object_get");
+            vm.cmpImm(VReg.RET, 0);
+            vm.pop(VReg.S0);
+            vm.jeq(splitReNot); // not a RegExp -> fall through to string path
+            // Extract __pat (pattern string) and use _regexp_split
+            vm.push(VReg.S0); vm.push(VReg.S1);
+            vm.mov(VReg.A0, VReg.S1);
+            vm.lea(VReg.A1, vm.asm.addString("__pat"));
+            vm.movImm64(VReg.V2, 0x7ffc000000000000n);
+            vm.or(VReg.A1, VReg.A1, VReg.V2);
+            vm.call("_object_get"); // RET = boxed pattern string
+            vm.mov(VReg.S1, VReg.RET); // S1 = boxed pattern
             vm.mov(VReg.A0, VReg.S0);
             vm.call("_getStrContent");
             vm.mov(VReg.A1, VReg.RET); // A1 = str_ptr
-            vm.mov(VReg.A0, VReg.S1); // A0 = re_ptr
-            vm.movImm64(VReg.A2, 0xffffffffn); // large limit
+            vm.mov(VReg.A0, VReg.S1);
+            vm.call("_getStrContent");
+            vm.mov(VReg.A0, VReg.RET); // A0 = pattern_ptr
+            vm.movImm64(VReg.A2, 0xffffffffn);
             vm.call("_regexp_split");
-            vm.jmp("_split_ret"); // 走 constructor 落地路径
+            vm.pop(VReg.S1); vm.pop(VReg.S0);
+            vm.jmp("_split_ret");
             vm.label(splitReNot);
         }
         // 其余非串 separator 走 ToString(split(null) → "null"、split(1) → "1")
