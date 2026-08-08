@@ -36,7 +36,8 @@ function _uniName(tab, name) {
     return -1;
 }
 
-// 与 shim 一致:带值仅 gc/General_Category、sc/Script、scx/Script_Extensions;
+// 与 shim 一致:带值可以是 gc/General_Category、sc/Script、scx/Script_Extensions、
+// 或二元属性名(此时 value 必须是 Yes/No/T/F/Y/N 之一);
 // 裸名先查二元属性,再查 General_Category 值(Node 对 \p{Adlam} 裸脚本名亦报错)。
 function _uniResolve(name, value, hasEq) {
     if (hasEq) {
@@ -44,12 +45,24 @@ function _uniResolve(name, value, hasEq) {
         if (name === "General_Category" || name === "gc") return _uniName(__RE_UN_GC, value);
         if (name === "Script" || name === "sc") return _uniName(__RE_UN_SC, value);
         if (name === "Script_Extensions" || name === "scx") return _uniName(__RE_UN_SCX, value);
-        return -1;
+        // Binary property with value (e.g. ASCII=T): signal -2 to caller
+        return -2;
     }
     if (name.length === 0) return -1;
     var ti = _uniName(__RE_UN_BIN, name);
     if (ti >= 0) return ti;
     return _uniName(__RE_UN_GC, name);
+}
+
+// Binary property name=value resolution: spec only allows "Yes"/"No".
+// Returns >=0 if name is a binary property and value is Yes/No.
+// Returns -1 if name is valid binary but value is invalid.
+// Returns -2 if name is not a binary property at all.
+function _uniResolveBin(name, value) {
+    var ti = _uniName(__RE_UN_BIN, name);
+    if (ti < 0) return -2;
+    if (value === "Yes" || value === "No") return ti;
+    return -1;
 }
 
 // Unicode "Properties of Strings" 名:仅 v 模式下且为正向、类外时合法。
@@ -139,7 +152,14 @@ function _scanProps(pattern, modeV) {
                     // 正向 v 类内与类外皆合法(Node 对 \p{Emoji_Keycap_Sequence} 于 [a\p{…}b] 接受)。
                     if (!modeV || neg || (inClass && classNeg)) return "Invalid property name";
                 } else {
-                    if (_uniResolve(name, value, hasEq) < 0) return "Invalid property name";
+                    var ri = _uniResolve(name, value, hasEq);
+                    if (ri === -2) {
+                        // Binary property with value: check if valid
+                        ri = _uniResolveBin(name, value);
+                        if (ri < 0) return "Invalid property name";
+                    } else if (ri < 0) {
+                        return "Invalid property name";
+                    }
                 }
                 // [test262] 类内 \p{} 紧接 '-' 且其后还有原子 → 范围端点 → SyntaxError
                 // (u 模式;v 模式 "--" 集合差文法未实现,整族留后续)

@@ -1711,7 +1711,16 @@ export const ExpressionCompiler = {
             return true;
         }
         if (name === "indexOf" || name === "includes") {
-            if (args.length === 0) return true;
+            if (args.length === 0) {
+                // indexOf() -> -1, includes() -> false
+                if (name === "indexOf") {
+                    vm.movImm(VReg.RET, -1);
+                    this.boxIntAsNumber(VReg.RET);
+                } else {
+                    vm.lea(VReg.V0, "_js_false"); vm.load(VReg.RET, VReg.V0, 0);
+                }
+                return true;
+            }
             this.compileExpression(obj);
             vm.push(VReg.RET);
             this.compileExpression(args[0]);
