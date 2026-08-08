@@ -485,6 +485,18 @@ export class PromiseGenerator {
         vm.cmpImm(VReg.S0, 0);
         vm.jeq("_pn_done");
 
+        // [test262] IsCallable(executor) 检查(25.6.3.1 步骤 2)。
+        // 非可调用值(字符串/数字/null/undefined/对象等)一律抛 TypeError，不再
+        // 经 _js_unbox 把任意 payload 当裸指针解引用(SIGBUS/SIGSEGV)。
+        vm.shrImm(VReg.V1, VReg.S0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFF);
+        vm.jeq("_pn_typeok");
+        vm.cmpImm(VReg.V1, 0); // 裸指针
+        vm.jne("_pn_notcallable");
+        vm.cmpImm(VReg.S0, 0);
+        vm.jeq("_pn_notcallable");
+        vm.label("_pn_typeok");
+
         // resolve/reject 一等函数(唯一构造点 _promise_make_resolver)
         vm.mov(VReg.A0, VReg.S2);
         vm.movImm(VReg.A1, 0);
@@ -531,6 +543,11 @@ export class PromiseGenerator {
         vm.mov(VReg.A0, VReg.S2);
         this.emitTakeException(VReg.A1);
         vm.call("_promise_reject");
+        vm.jmp("_pn_done");
+
+        vm.label("_pn_notcallable");
+        this.emitStringConst(VReg.A0, "Promise executor is not callable");
+        vm.call("_throw_type_error"); // 不返回
 
         vm.label("_pn_done");
         vm.mov(VReg.RET, VReg.S2);
@@ -1845,10 +1862,24 @@ export class PromiseGenerator {
         vm.or(VReg.A1, VReg.A1, VReg.V1);
         vm.jmp("_aref_throw_incompat");
         vm.label("_apcc_notfn");
-        vm.lea(VReg.A0, vm.asm.addString("undefined is not a function"));
+        // this 非 null/undefined/非 Promise.prototype/非 Promise 对象。
+        // 按规范 Invoke(this, "then", «undefined, onRejected») 走。
+        // [ARM64] 保存 LR:下方两次 call 会覆写 X30,ret 前必须恢复。
+        vm.push(VReg.LR);
+        vm.mov(VReg.V5, VReg.A0); // 暂存 this
+        vm.mov(VReg.V6, VReg.A1); // 暂存 cb
+        vm.lea(VReg.A1, vm.asm.addString("then"));
         vm.movImm64(VReg.V1, TAG_STRING);
-        vm.or(VReg.A0, VReg.A0, VReg.V1);
-        vm.jmp("_throw_type_error");
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get"); // RET = this.then(A0=this 不毁)
+        vm.mov(VReg.A1, VReg.V5); // thisVal = 原 this
+        vm.movImm64(VReg.A2, JS_UNDEFINED); // arg0 = undefined
+        vm.mov(VReg.A3, VReg.V6); // arg1 = cb
+        vm.movImm(VReg.A4, 2); // argc
+        vm.mov(VReg.A0, VReg.RET); // fn = this.then
+        vm.call("_promise_invoke2");
+        vm.pop(VReg.LR); // 恢复 LR
+        vm.ret();
 
         // ---- _aref_promise_finally(A0=this, A1=cb):规范 27.2.5.5 步骤 1-2——
         //   Type(this) 非 Object(原语/Symbol/BigInt)→ "Promise.prototype.finally called on non-object";
@@ -1926,7 +1957,7 @@ export class PromiseGenerator {
             vm.jeq(label + "_go");
             vm.shrImm(VReg.V0, VReg.A5, 48);
             vm.cmpImm(VReg.V0, 0x7FFF);
-            vm.jeq(label + "_notcall");     // 装箱函数
+            vm.jeq(label + "_go");          // 装箱函数 -> 接受(规范 NewPromiseCapability 入参可为函数)
             vm.cmpImm(VReg.V0, 0x7FFD);
             vm.jeq(label + "_notctor");     // 装箱对象
             vm.cmpImm(VReg.V0, 0x7FFE);
@@ -1944,7 +1975,7 @@ export class PromiseGenerator {
             vm.load(VReg.V0, VReg.A5, 0);
             vm.movImm(VReg.V1, CLOSURE_MAGIC);
             vm.cmp(VReg.V0, VReg.V1);
-            vm.jeq(label + "_notcall");     // 裸闭包指针
+            vm.jeq(label + "_go");          // 裸闭包指针 -> 接受(规范 NewPromiseCapability 入参可为函数)
             vm.loadByte(VReg.V0, VReg.A5, 0);
             vm.cmpImm(VReg.V0, 61);         // TYPE_SYMBOL
             vm.jeq(label + "_nonobj");
