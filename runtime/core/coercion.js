@@ -1087,11 +1087,21 @@ export class CoercionGenerator {
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_js_toprimitive");
         vm.mov(VReg.S0, VReg.RET);
+        // 分类 ToPrimitive 结果。结果总是原始值，类型映射与初始分类一致：
+        // high16 < 0x7FF8 或 >= 0x8000 → Float(0)
+        // 否则 tag = high16 - 0x7FF8, type = tag + 1
+        // （此前仅判 String(0x7FFC)，漏判 Boolean(0x7FF9)等，
+        //   把 Boolean 原语高位当 Float 位模式比较 → 恒不等 → Bool wrapper == 全错。）
         vm.shrImm(VReg.V0, VReg.S0, 48);
         vm.movImm(VReg.S2, 0);          // 默认 Float
-        vm.cmpImm(VReg.V0, 0x7FFC);
-        vm.jne("_ae_x_obj_p_done");
-        vm.movImm(VReg.S2, 5);          // 结果是串
+        vm.movImm(VReg.V1, 0x7FF8);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jlt("_ae_x_obj_p_done");     // high16 < 0x7FF8 → Float
+        vm.movImm(VReg.V1, 0x8000);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jge("_ae_x_obj_p_done");     // high16 >= 0x8000 → negative Float
+        vm.subImm(VReg.V0, VReg.V0, 0x7FF8);
+        vm.addImm(VReg.S2, VReg.V0, 1); // type = tag + 1 (1=Int32,2=Bool,3=Null,4=Undef,5=String,6+=Obj)
         vm.label("_ae_x_obj_p_done");
         vm.jmp("_ae_type_dispatch");
         vm.label("_ae_x_not_obj_p");
@@ -1100,11 +1110,17 @@ export class CoercionGenerator {
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_js_toprimitive");
         vm.mov(VReg.S1, VReg.RET);
+        // 同 x 侧：正确分类 ToPrimitive 结果(y 侧)
         vm.shrImm(VReg.V0, VReg.S1, 48);
         vm.movImm(VReg.S3, 0);
-        vm.cmpImm(VReg.V0, 0x7FFC);
-        vm.jne("_ae_y_obj_p_done");
-        vm.movImm(VReg.S3, 5);
+        vm.movImm(VReg.V1, 0x7FF8);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jlt("_ae_y_obj_p_done");
+        vm.movImm(VReg.V1, 0x8000);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jge("_ae_y_obj_p_done");
+        vm.subImm(VReg.V0, VReg.V0, 0x7FF8);
+        vm.addImm(VReg.S3, VReg.V0, 1);
         vm.label("_ae_y_obj_p_done");
         vm.jmp("_ae_type_dispatch");
         vm.label("_ae_y_not_obj_p");
