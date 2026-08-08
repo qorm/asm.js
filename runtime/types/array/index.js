@@ -2272,11 +2272,14 @@ export class ArrayGenerator {
         // _array_length(冲 A2)前存入 S4。无 seed(S4===undefined)→ acc=arr[0]、i 从 1;
         // 有 seed → acc=seed、i 从 0。空数组且无 seed → undefined(node 抛,此处宽松,记偏差)。
         // acc(S4)callee-saved(落栈,GC 扫栈可见)跨回调保活。回调 cb(acc,cur,idx,arr)。
+        // _array_reduce_rt(A0=arr, A1=cb, A2=seed, A3=origRecv?0)
+        // A3 可选:原始 receiver(泛型 .call 保留四参身份);A3==0 → 用 arr 兜底。
         vm.label("_array_reduce_rt");
-        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
         vm.mov(VReg.S0, VReg.A0);
         vm.mov(VReg.S1, VReg.A1);
         vm.mov(VReg.S4, VReg.A2); // seed(先存,_array_length 会冲 A2)
+        vm.mov(VReg.S5, VReg.A3); // S5 = origRecv(0=arr)
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_array_length");
         vm.mov(VReg.S2, VReg.RET);
@@ -2303,7 +2306,12 @@ export class ArrayGenerator {
         vm.mov(VReg.A0, VReg.S4);  // acc
         vm.scvtf(0, VReg.S3);
         vm.fmovToInt(VReg.A2, 0);  // idx boxed
-        vm.mov(VReg.A3, VReg.S0);  // arr
+        // 第四参:优先用原始 receiver(泛型 .call 保留身份),否则用数组自身。
+        vm.mov(VReg.A3, VReg.S5);
+        vm.cmpImm(VReg.A3, 0);
+        vm.jne("_reduce_cb_has_orig");
+        vm.mov(VReg.A3, VReg.S0); // 兜底:数组自身
+        vm.label("_reduce_cb_has_orig");
         vm.mov(VReg.A4, VReg.S1);  // callback
         vm.call("_aref_invoke_cb4");
         vm.mov(VReg.S4, VReg.RET); // acc=result
@@ -2311,18 +2319,21 @@ export class ArrayGenerator {
         vm.jmp("_reduce_loop");
         vm.label("_reduce_done");
         vm.mov(VReg.RET, VReg.S4);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 0);
         vm.label("_reduce_empty");
         vm.movImm64(VReg.RET, UNDEF);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 0);
 
         // arr.reduceRight(cb[, seed]):从末尾向前。无 seed → acc=arr[len-1]、i 从 len-2;
         // 有 seed → acc=seed、i 从 len-1。i<0 结束。
+        // _array_reduceRight_rt(A0=arr, A1=cb, A2=seed, A3=origRecv?0)
+        // A3 可选:原始 receiver(泛型 .call 保留四参身份);A3==0 → 用 arr 兜底。
         vm.label("_array_reduceRight_rt");
-        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
         vm.mov(VReg.S0, VReg.A0);
         vm.mov(VReg.S1, VReg.A1);
         vm.mov(VReg.S4, VReg.A2);
+        vm.mov(VReg.S5, VReg.A3); // S5 = origRecv(0=arr)
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_array_length");
         vm.mov(VReg.S2, VReg.RET);
@@ -2350,7 +2361,12 @@ export class ArrayGenerator {
         vm.mov(VReg.A0, VReg.S4);
         vm.scvtf(0, VReg.S3);
         vm.fmovToInt(VReg.A2, 0);
-        vm.mov(VReg.A3, VReg.S0);
+        // 第四参:优先用原始 receiver(泛型 .call 保留身份),否则用数组自身。
+        vm.mov(VReg.A3, VReg.S5);
+        vm.cmpImm(VReg.A3, 0);
+        vm.jne("_rredr_cb_has_orig");
+        vm.mov(VReg.A3, VReg.S0); // 兜底:数组自身
+        vm.label("_rredr_cb_has_orig");
         vm.mov(VReg.A4, VReg.S1);
         vm.call("_aref_invoke_cb4");
         vm.mov(VReg.S4, VReg.RET);
@@ -2358,10 +2374,10 @@ export class ArrayGenerator {
         vm.jmp("_rredr_loop");
         vm.label("_rredr_done");
         vm.mov(VReg.RET, VReg.S4);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 0);
         vm.label("_rredr_empty");
         vm.movImm64(VReg.RET, UNDEF);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 0);
     }
 
     // [test262 S1 泛型数组方法] `Array.prototype.<m>.call(recv, ...)` 的运行时分派层。
@@ -2532,23 +2548,29 @@ export class ArrayGenerator {
             const target = _cb3Fast[ci][1];
             const fastLabel = _cb3Fast[ci][2];
             vm.label(label);
-            vm.prologue(0, [VReg.S0, VReg.S1]);
+            vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
+            vm.mov(VReg.S2, VReg.A0); // S2 = original receiver
             vm.mov(VReg.S0, VReg.A1);
             vm.mov(VReg.S1, VReg.A2);
             vm.shrImm(VReg.V0, VReg.A0, 48);
             vm.cmpImm(VReg.V0, 0x7FFE);
             vm.jne(fastLabel);
+            // true array: origRecv=A3=0 (redundant, _rt uses arr as cb[3])
             vm.mov(VReg.A1, VReg.S0);
             vm.mov(VReg.A2, VReg.S1);
+            vm.movImm(VReg.A3, 0);
             vm.call(target);
-            vm.epilogue([VReg.S0, VReg.S1], 0);
+            vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
             vm.label(fastLabel);
+            // non-array: normalize for element access, keep orig as A3 for cb[3]
+            vm.mov(VReg.A0, VReg.S2);
             vm.call("_agen_norm");
-            vm.mov(VReg.A0, VReg.RET);
-            vm.mov(VReg.A1, VReg.S0);
-            vm.mov(VReg.A2, VReg.S1);
+            vm.mov(VReg.A0, VReg.RET);  // A0 = normalized array
+            vm.mov(VReg.A1, VReg.S0);   // A1 = cb
+            vm.mov(VReg.A2, VReg.S1);   // A2 = seed
+            vm.mov(VReg.A3, VReg.S2);   // A3 = original receiver
             vm.call(target);
-            vm.epilogue([VReg.S0, VReg.S1], 0);
+            vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
         }
 
         // _agen_indexOf(A0=recv, A1=value, A2=boxed from) → boxed 数字。

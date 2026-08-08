@@ -1986,6 +1986,7 @@ export const ExpressionCompiler = {
                 vm.movImm64(VReg.A2, 0x7ffb000000000000n); // undefined(sentinel)
             }
             vm.pop(VReg.A1);                      // A1 = callback
+            vm.movImm(VReg.A3, 0);                // A3 = 0 (no extra origRecv, _rt uses arr)
             vm.call(name === "reduce" ? "_array_reduce_rt" : "_array_reduceRight_rt");
             return true;
         }
