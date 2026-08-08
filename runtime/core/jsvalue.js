@@ -693,9 +693,50 @@ export class JSValueGenerator {
         vm.setCallArgcImm(1, VReg.V0, VReg.V2); // [argc ABI] [Symbol.hasInstance](x)
         vm.callIndirect(VReg.V1);
         vm.mov(VReg.A0, VReg.RET);
-        vm.call("_to_boolean");       // 归一装箱布尔
+        vm.call("_to_boolean");       // RET = 0 (falsy) or 1 (truthy)
+        // Box raw 0/1 to JS_FALSE(0x7FF9000000000000) / JS_TRUE(0x7FF9000000000001)
+        // so the compiler can distinguish from the "no hasInstance" sentinel (raw 0).
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_thi_box_false");
+        vm.movImm64(VReg.RET, 0x7ff9000000000001n); // JS_TRUE
+        vm.jmp("_thi_box_done");
+        vm.label("_thi_box_false");
+        vm.movImm64(VReg.RET, 0x7ff9000000000000n); // JS_FALSE
+        vm.label("_thi_box_done");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
+        // _thi_none: no user-defined [Symbol.hasInstance] on right operand.
+        // ES 7.3.20 InstanceofOperator step 4: if IsCallable(rval) is false, throw TypeError.
+        // Without this check, e.g. `1 instanceof Math` silently returns false
+        // instead of throwing (Math is a namespace object, not callable).
         vm.label("_thi_none");
+        vm.shrImm(VReg.V0, VReg.S2, 48);           // high16 tag
+        vm.cmpImm(VReg.V0, 0x7FFF);                // tagged function -> callable
+        vm.jeq("_thi_sentinel");
+        vm.cmpImm(VReg.V0, 0x7FFD);                // tagged object -> might be Proxy
+        vm.jne("_thi_check_raw");
+        vm.load(VReg.V0, VReg.S0, 0);              // type byte
+        vm.andImm(VReg.V0, VReg.V0, 0xff);
+        vm.cmpImm(VReg.V0, 8);                     // TYPE_PROXY -> callable
+        vm.jeq("_thi_sentinel");
+        vm.jmp("_thi_throw");
+        vm.label("_thi_check_raw");
+        vm.cmpImm(VReg.V0, 0x7FF8);                // high16 >= 0x7FF8 means NaN-boxed, not raw
+        vm.jge("_thi_throw");
+        // Raw heap pointer: validate in [heap_base, heap_ptr)
+        vm.lea(VReg.V1, "_heap_base"); vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.S0, VReg.V1); vm.jlt("_thi_throw");
+        vm.lea(VReg.V1, "_heap_ptr"); vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.S0, VReg.V1); vm.jge("_thi_throw");
+        // Raw pointer in heap is callable (closure / classinfo)
+        vm.jmp("_thi_sentinel");
+        vm.label("_thi_throw");
+        // Not callable -> TypeError("not a function")
+        vm.lea(VReg.V0, vm.asm.addString("not a function"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.V0, VReg.V0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.V0, VReg.V0, VReg.V1);
+        vm.call("_throw_type_error");
+        // _throw_type_error does not return (unwinds via _throw_unwind / _throw_impl).
+        vm.label("_thi_sentinel");
         vm.movImm(VReg.RET, 0);       // 裸 0 哨兵
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
 
