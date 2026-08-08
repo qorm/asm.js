@@ -1953,6 +1953,16 @@ export class TypedArrayGenerator {
         vm.cmpImm(VReg.S0, AB_PSEUDO);
         vm.jeq("_gcp_done");                  // ArrayBuffer.prototype 保持空对象
         vm.mov(VReg.S1, VReg.RET);            // proto(boxed)
+        // 链接原型链:Int8Array.prototype.__proto__ = %TypedArray%.prototype
+        vm.call("_ta_intrinsic");              // RET = 装箱 %TypedArray%(单例,懒建)
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, vm.asm.addString("prototype"));
+        vm.movImm64(VReg.V1, MASK); vm.and(VReg.A1, VReg.A1, VReg.V1);
+        vm.movImm64(VReg.V1, STR_TAG); vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_closure_prop_get");         // RET = %TypedArray%.prototype(boxed)
+        vm.mov(VReg.A1, VReg.RET);            // A1 = %TypedArray%.prototype
+        vm.mov(VReg.A0, VReg.S1);             // A0 = boxed 当前 TA proto
+        vm.call("_object_setPrototypeOf");
         // BYTES_PER_ELEMENT:1B(0x40/0x50/0x54)→1;2B(0x41/0x51)→2;4B(0x42/0x52/0x60)→4;余→8
         vm.movImm(VReg.A2, 8);
         vm.cmpImm(VReg.S0, TYPE_INT16_ARRAY);
@@ -1989,6 +1999,14 @@ export class TypedArrayGenerator {
         vm.movImm64(VReg.V1, STR_TAG);
         vm.or(VReg.A1, VReg.A1, VReg.V1);
         vm.call("_object_set");
+        // BYTES_PER_ELEMENT 属性描述符:{writable:false, enumerable:false, configurable:false}
+        vm.movImm64(VReg.V1, MASK);
+        vm.and(VReg.A0, VReg.S1, VReg.V1);    // 裸 proto
+        vm.lea(VReg.A1, "_str_k_bpe");
+        vm.movImm64(VReg.V1, STR_TAG);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.movImm(VReg.A2, 0);                // attr=0
+        vm.call("_object_set_prop_attr");
         vm.mov(VReg.RET, VReg.S1);
         vm.label("_gcp_done");
         vm.epilogue([VReg.S0, VReg.S1], 16);
@@ -2474,6 +2492,26 @@ export class TypedArrayGenerator {
             vm.store(VReg.S2, 8, VReg.V1);
             vm.lea(VReg.V1, getter);
             vm.store(VReg.S2, 16, VReg.V1);
+            // 挂 getter 闭包的 .name / .length(闭包属性侧表)
+            vm.mov(VReg.A0, VReg.S2);
+            vm.call("_js_box_function");       // RET = 装箱 getter(S2 仍是裸指针)
+            vm.mov(VReg.S3, VReg.RET);         // S3 = 装箱 getter(跨 _closure_prop_set call 存活)
+            vm.mov(VReg.A0, VReg.S3);
+            keyOf(VReg.A1, "name");
+            {
+                // ES 规范:getter 的 name 为 "get <属性名>"
+                const gname = name.startsWith("Symbol.") ? name : ("get " + name);
+                vm.lea(VReg.A2, vm.asm.addString(gname));
+                boxStr(VReg.A2);
+            }
+            vm.call("_closure_prop_set");
+            vm.mov(VReg.A0, VReg.S3);
+            keyOf(VReg.A1, "length");
+            vm.movImm(VReg.A2, 0);
+            vm.scvtf(0, VReg.A2);
+            vm.fmovToInt(VReg.A2, 0);
+            vm.call("_closure_prop_set");
+            // 现在创建 TYPE_GETTER 标记块,S2 仍是裸 getter 指针
             vm.movImm(VReg.A0, 24);
             vm.call("_alloc");                 // RET = 裸标记块
             vm.movImm(VReg.V1, 60);            // TYPE_GETTER
@@ -2496,6 +2534,11 @@ export class TypedArrayGenerator {
         keyOf(VReg.A1, "prototype");
         vm.mov(VReg.A2, VReg.S1);
         vm.call("_closure_prop_set");
+        // prototype 属性描述符:{writable:false, enumerable:false, configurable:false}
+        vm.mov(VReg.A0, VReg.S0);
+        keyOf(VReg.A1, "prototype");
+        vm.movImm(VReg.A2, 0);
+        vm.call("_closure_prop_set_attr");
         vm.lea(VReg.V0, "_ta_intrinsic_slot");
         vm.store(VReg.V0, 0, VReg.S0);
         vm.mov(VReg.RET, VReg.S0);
