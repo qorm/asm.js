@@ -2545,7 +2545,19 @@ export const FunctionCompiler = {
                     this.vm.cmpImm(VReg.V1, 0x7FFE);
                     this.vm.jeq(retLabel);
                     this.vm.cmpImm(VReg.V1, 0);
-                    this.vm.jeq(retLabel);
+                    this.vm.jne("__objc_not_bare");
+                    // 裸指针(high16==0):排除 Symbol(TYPE_SYMBOL),它是原始值非对象
+                    // Object(Symbol()) 必须包装成对象,typeof 才返回 "object"
+                    this.vm.cmpImm(VReg.RET, 0);
+                    this.vm.jeq("__objc_not_bare");          // null/0 → 包装
+                    this.vm.movImm64(VReg.V0, 0x100000000n); // ptrFloor
+                    this.vm.cmp(VReg.RET, VReg.V0);
+                    this.vm.jlt("__objc_not_bare");          // 地址低于 floor → 非指针
+                    this.vm.loadByte(VReg.V0, VReg.RET, 0);
+                    this.vm.cmpImm(VReg.V0, 61);             // TYPE_SYMBOL
+                    this.vm.jne(retLabel);                   // 非 Symbol → 真对象
+                    // 否则 fallthrough → 包装 Symbol
+                    this.vm.label("__objc_not_bare");
                     // 原始值 → 包装(记偏差:未实现完整 ToObject,简化为新对象)
                     this.vm.mov(VReg.A0, VReg.RET);
                     this.vm.call("_object_new");
