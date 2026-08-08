@@ -1422,6 +1422,7 @@ function __re_toIndex(v) {
 // exec:返回类数组对象 {0:整体, 1..n:分组(未命中 undefined), index, input, length}
 // 或 null。g 标志下维护 re.lastIndex(与 JS 语义一致)。
 export function __RE_exec(re, str) {
+    if (re === null || re === undefined || re.__isRegExp !== true) return null;
     var s = str;
     if (typeof s !== "string") s = "" + s;
     var prog = __re_compile(re);

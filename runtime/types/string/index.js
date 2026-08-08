@@ -1184,12 +1184,29 @@ export class StringGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
         vm.label("_valueToStr_obj_tostr");
         // 用户自有 toString(function 属性)优先:String(o)/`${o}`/`""+o` 调用它。
-        // S0 = 装箱对象。_object_user_tostr 返回其结果(装箱串)或 0(无自定义 toString)。
+        // S0 = 装箱对象。_object_user_tostr 返回其结果或 0(无自定义 toString)。
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_object_user_tostr");
         vm.cmpImm(VReg.RET, 0);
         vm.jeq("_valueToStr_object_default");
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32); // 有用户 toString → 直接返回
+        // 守卫:user toString 可能返回非原语(test262 match:toString→{})
+        vm.shrImm(VReg.V0, VReg.RET, 48);
+        vm.cmpImm(VReg.V0, 0x7FFD);       // toString 返回仍是对象
+        vm.jne("_valueToStr_obj_tostr_ok"); // 原语 → 递归归一
+        vm.mov(VReg.A0, VReg.S0);         // 恢复原装箱对象
+        vm.call("_object_user_valueof");  // 尝试 valueOf
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_valueToStr_object_default");
+        vm.shrImm(VReg.V0, VReg.RET, 48);
+        vm.cmpImm(VReg.V0, 0x7FFD);       // valueOf 又返对象
+        vm.jeq("_valueToStr_object_default");
+        vm.mov(VReg.A0, VReg.RET);        // valueOf 原语 → 递归
+        vm.call("_valueToStr");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
+        vm.label("_valueToStr_obj_tostr_ok");
+        vm.mov(VReg.A0, VReg.RET);        // toString 原语 → 递归
+        vm.call("_valueToStr");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
         vm.label("_valueToStr_object_default");
         vm.lea(VReg.A0, "_str_object");
         vm.jmp("_valueToStr_data_str_create_heap");
@@ -2376,7 +2393,7 @@ export class StringGenerator {
 
         vm.label("_str_toUpperCase");
         vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
-        this._emitThisStringCheck("toUpperCase");
+        this._emitThisToString("toUpperCase");
 
         vm.mov(VReg.S0, VReg.A0); // S0 = 源字符串（可能是 NaN-boxed）
 
@@ -2468,7 +2485,7 @@ export class StringGenerator {
 
         vm.label("_str_toLowerCase");
         vm.prologue(128, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
-        this._emitThisStringCheck("toLowerCase");
+        this._emitThisToString("toLowerCase");
 
         vm.mov(VReg.S0, VReg.A0); // S0 = 源字符串（可能是 NaN-boxed）
 
@@ -2744,7 +2761,7 @@ export class StringGenerator {
 
         vm.label("_str_charCodeAt");
         vm.prologue(0, [VReg.S0, VReg.S1]);
-        this._emitThisStringCheck("charCodeAt");
+        this._emitThisToString("charCodeAt");
 
         // 索引可能是 raw float64 位模式，先归一化为整数
         vm.push(VReg.A0);
@@ -5284,7 +5301,7 @@ export class StringGenerator {
         const vm = this.vm;
         vm.label("_str_match");
         vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
-        this._emitThisStringCheck("match");
+        this._emitThisToString("match");
         vm.mov(VReg.S0, VReg.A0);
         vm.mov(VReg.S1, VReg.A1);
         // [L3] RegExp detection: high16=0, in heap, type@0==8 -> regexp match
