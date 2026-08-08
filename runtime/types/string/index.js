@@ -5208,6 +5208,23 @@ export class StringGenerator {
         guardHead("_antf");
         argIntOr("_antf", 0, "_antf_go");
         vm.label("_antf_go");
+        // [L3] ES 21.1.3.5 step 9: if x >= 10^21, delegate to _numberToString.
+        // Only raw floats (high16 < 0x7FF8) with biased exponent >= 0x444 and
+        // non-negative. Int32/boxed values can never be this large.
+        vm.shrImm(VReg.V0, VReg.S0, 48);
+        vm.cmpImm(VReg.V0, 0x7FF8);
+        vm.jge("_antf_dots"); // tagged value (int32/object/etc.) -> not large
+        vm.shrImm(VReg.V0, VReg.S0, 63);
+        vm.cmpImm(VReg.V0, 1);
+        vm.jeq("_antf_dots"); // negative -> not >= 1e21
+        vm.shrImm(VReg.V0, VReg.S0, 52);
+        vm.andImm(VReg.V0, VReg.V0, 0x7FF);
+        vm.cmpImm(VReg.V0, 0x444); // biased exponent for 2^69 ~ 5.9e20
+        vm.jlt("_antf_dots");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_numberToString");
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_antf_dots");
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_num_toFixed");
         vm.epilogue([VReg.S0, VReg.S1], 0);
