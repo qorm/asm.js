@@ -937,19 +937,20 @@ export class CoercionGenerator {
         vm.cmp(VReg.S0, VReg.S1);
         vm.jne("_ae_not_same_bits");
 
-        // 位模式一致,检查是否是 float
+        // 位模式一致,区分 float / tagged 值。
+        // tagged 值 high16 ∈ [0x7FF8, 0x7FFF](unsigned)；其余为 float 位模式。
+        // 对 float 做自反 fcmp 排除 NaN(位相同但 NaN != NaN → false)。
         vm.shrImm(VReg.V0, VReg.S0, 48);
         vm.cmpImm(VReg.V0, 0x7ff8);
-        vm.jge("_ae_same_bits_not_float");
-
-        // 是 float 且位模式一致:检查是否是 NaN
+        vm.jb("_ae_same_bits_float");       // unsigned < 0x7FF8 → float
+        // [0x7FF8, 0x7FFF] 为 tagged 值(含 Boolean=0x7FF9、String=0x7FFC、
+        // Object=0x7FFD 等)：位一致即值相等。
+        vm.jmp("_abstract_eq_true");
+        vm.label("_ae_same_bits_float");
         vm.fmovToFloat(0, VReg.S0);
         vm.fcmp(0, 0); // NaN 检测 (NaN != NaN)
         vm.jeq("_abstract_eq_true");
         vm.jmp("_abstract_eq_false");
-
-        vm.label("_ae_same_bits_not_float");
-        vm.jmp("_abstract_eq_true");
 
         vm.label("_ae_not_same_bits");
 
