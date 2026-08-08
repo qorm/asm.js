@@ -5788,6 +5788,12 @@ export class ObjectGenerator {
         // _nsobj_array_proto data slot (lazy, filled by _ensure_array_proto or emitArrayCtorObject).
         vm.asm.addDataLabel("_nsobj_array_proto");
         vm.asm.addDataQword(0);
+        // _nsobj_string_proto data slot (for getPrototypeOf <-> String.prototype).
+        // Materialized by emitStringProtoObject (members.js). Declared here as runtime fallback
+        // reference so _object_getPrototypeOf can read the slot even when emitStringProtoObject
+        // hasn't been emitted into a specific compilation unit.
+        vm.asm.addDataLabel("_nsobj_string_proto");
+        vm.asm.addDataQword(0);
 
         // _ensure_array_proto: fill _nsobj_array_proto if empty.
         vm.label("_ensure_array_proto");
@@ -5834,11 +5840,42 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.S1, 0x7FFA); vm.jeq("_object_getPrototypeOf_nullish");
         vm.cmpImm(VReg.S1, 0x7FFB); vm.jeq("_object_getPrototypeOf_nullish");
 
-        // 其余基元(number/string/boolean/function):本运行时无包装原型对象 → undefined。
-        // 旧实现返回**裸 0**(即 float +0.0),`gPO(x) === null` 恒 false 且 console.log
-        // 打印 0;改为规范单例 undefined,使返回值始终是合法 JSValue。
+        // 其余基元:按 ES 返回对应包装类型的原型
+        vm.cmpImm(VReg.S1, 0x7FF9); // Boolean
+        vm.jeq("_gpo_boolean_proto");
+        vm.cmpImm(VReg.S1, 0x7FF8); // Number (tagged int)
+        vm.jeq("_gpo_number_proto");
+        vm.cmpImm(VReg.S1, 0x7FFC); // String
+        vm.jeq("_gpo_string_proto");
+        // Function(0x7FFF)暂返 undefined(偏差)
+        vm.cmpImm(VReg.S1, 0x7FFF);
+        vm.jeq("_gpo_undef_ret");
+        // 其余非 tagged 值(裸 float64 位模式等)→ Number.prototype
+        // 浮点值的高 16 位是 IEEE 754 指数+符号,不匹配任何 tagged sentinel。
+        // Symbol 等非标准 tagged 值也会落此(偏差:Symbol→Number.prototype)。
+        vm.jmp("_gpo_number_proto");
+        vm.label("_gpo_undef_ret");
         vm.lea(VReg.RET, "_js_undefined");
         vm.load(VReg.RET, VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1], 32);
+        vm.label("_gpo_boolean_proto");
+        vm.lea(VReg.V0, "_nsobj_boolean_proto");
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.jmp("_gpo_ret");
+        vm.label("_gpo_number_proto");
+        vm.lea(VReg.V0, "_nsobj_number_proto");
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.jmp("_gpo_ret");
+        vm.label("_gpo_string_proto");
+        vm.lea(VReg.V0, "_nsobj_string_proto");
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.label("_gpo_ret");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_gpo_ret_ok");
+        // 槽未物化 → 回退 undefined
+        vm.lea(VReg.RET, "_js_undefined");
+        vm.load(VReg.RET, VReg.RET, 0);
+        vm.label("_gpo_ret_ok");
         vm.epilogue([VReg.S0, VReg.S1], 32);
 
         vm.label("_object_getPrototypeOf_nullish");
