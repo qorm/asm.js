@@ -3880,6 +3880,11 @@ export class ObjectGenerator {
         vm.jeq("_object_has_false");
         vm.cmpImm(VReg.V0, TYPE_SYMBOL);
         vm.jeq("_object_has_false");
+        // Proxy(TYPE_PROXY=8):布局 target@8/handler@16 与对象头不兼容,按对象头遍历
+        // 解引用垃圾 → SIGSEGV。规范语义走 has trap 后才到自有属性,此处返回 false
+        // (无自有属性;has trap 由 _proxy_has 专函处理,不经过本 helper)。
+        vm.cmpImm(VReg.V0, TYPE_PROXY);
+        vm.jeq("_object_has_false");
         // Date(7)/Promise(11):布局同上与对象头不兼容(ts/status 被当 count 野扫,
         // _is_asmjs_err(Date) 段错误根因)。规范语义"无此自有属性" → false,不抛。
         vm.cmpImm(VReg.V0, TYPE_DATE);
