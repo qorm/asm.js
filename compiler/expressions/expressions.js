@@ -1999,25 +1999,42 @@ export const ExpressionCompiler = {
             vm.push(VReg.RET);                    // [sp] = callback, [sp+8] = boxed ta
             vm.pop(VReg.A1);                      // A1 = callback
             vm.pop(VReg.A0);                      // A0 = boxed ta
-            vm.push(VReg.A1);                     // [sp] = callback
-            vm.push(VReg.A0);                     // [sp] = ta, [sp+8] = callback
+
+            // Save cb and ta to callee-saved regs / frame slots before init compilation.
+            const cbSlot = this.ctx.allocLocal(`__reduce_cb_${this.nextLabelId()}`);
+            vm.store(VReg.FP, cbSlot, VReg.A1);  // cb to frame slot
+            vm.mov(VReg.S0, VReg.A0);             // S0 = ta (callee-saved)
+
+            // If init arg provided, compile and save in callee-saved S1.
             if (args.length >= 2) {
-                this.compileExpression(args[1]);  // RET = init
-                vm.push(VReg.RET);                // [sp] = init, [sp+8] = ta, [sp+16] = callback
-                vm.pop(VReg.A2);                  // A2 = init; stack=[ta, cb]
+                this.compileExpression(args[1]);  // RET = init; may clobber A0-A3
+                vm.mov(VReg.S1, VReg.RET);        // S1 = init (callee-saved)
             }
-            vm.mov(VReg.A0, VReg.A1);             // A0 = callback
-            vm.call("_ta_need_fn");               // validate callable(TypeError if not); A0 clobbered
-            vm.pop(VReg.A0);                      // A0 = ta (restore)
-            vm.call("_ta_to_array");              // A0=ta -> RET = boxed regular array
-            vm.mov(VReg.A0, VReg.RET);            // A0 = boxed arr
-            vm.pop(VReg.A1);                      // A1 = callback (restore)
+
+            // Restore ta and cb from saved locations; follow forEach pattern.
+            vm.mov(VReg.A0, VReg.S0);             // A0 = ta
+            vm.push(VReg.A0);                     // [sp] = ta
+            vm.load(VReg.A1, VReg.FP, cbSlot);   // A1 = cb (restore from frame slot)
+            vm.push(VReg.A1);                     // [sp] = cb, [sp+8] = ta
+
+            vm.mov(VReg.A0, VReg.A1);             // A0 = cb
+            vm.call("_ta_need_fn");               // validate; clobbers A0-A3
+            vm.pop(VReg.A1);                      // A1 = cb; stack=[ta]
+            vm.pop(VReg.A0);                      // A0 = ta; stack=[]
+
+            // Save cb across _ta_to_array
+            vm.push(VReg.A1);                     // [sp] = cb
+            vm.call("_ta_to_array");              // A0=ta -> RET = arr
+            vm.pop(VReg.A1);                      // A1 = cb; stack=[]
+            vm.mov(VReg.A0, VReg.RET);            // A0 = arr
+
+            // Restore init from S1 (callee-saved, survives all calls)
             if (args.length >= 2) {
-                // A2 already has init (saved before _ta_need_fn)
+                vm.mov(VReg.A2, VReg.S1);         // A2 = init
             } else {
-                vm.movImm64(VReg.A2, 0x7ffb000000000000n); // undefined(sentinel)
+                vm.movImm64(VReg.A2, 0x7ffb000000000000n); // undefined
             }
-            vm.movImm(VReg.A3, 0);                // A3 = 0 (no extra origRecv, _rt uses arr)
+            vm.movImm(VReg.A3, 0);                // A3 = 0
             vm.call(name === "reduce" ? "_array_reduce_rt" : "_array_reduceRight_rt");
             return true;
         }
