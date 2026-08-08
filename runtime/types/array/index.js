@@ -2102,14 +2102,15 @@ export class ArrayGenerator {
         vm.andMaskReg(VReg.RET, VReg.S4, VReg.V1);
         vm.movImm64(VReg.V1, 0x7ffe000000000000n);
         vm.or(VReg.RET, VReg.RET, VReg.V1); // 装箱 0x7FFE
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 0);
 
-        // arr.filter(cb) → 新数组[cb 真值的 el]。element 存栈槽 [SP+0](GC 扫栈可见)以跨回调
-        // 保活并在真值时 push;_to_boolean 判真值(RET≠0)。
+        // arr.filter(cb) → 新数组[cb 真值的 el]。
+        // _array_filter_rt(A0=arr, A1=cb, A2=origRecv?0)
         vm.label("_array_filter_rt");
-        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
+        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
         vm.mov(VReg.S0, VReg.A0);
         vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.S5, VReg.A2); // origRecv(0=arr)
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_array_length");
         vm.mov(VReg.S2, VReg.RET);
@@ -2127,7 +2128,11 @@ export class ArrayGenerator {
         vm.mov(VReg.A0, VReg.RET);
         vm.scvtf(0, VReg.S3);
         vm.fmovToInt(VReg.A1, 0);
+        vm.mov(VReg.A2, VReg.S5);
+        vm.cmpImm(VReg.A2, 0);
+        vm.jne("_filt_cb_has_orig");
         vm.mov(VReg.A2, VReg.S0);
+        vm.label("_filt_cb_has_orig");
         vm.mov(VReg.A3, VReg.S1);
         vm.call("_aref_invoke_cb"); // RET = 谓词结果
         vm.mov(VReg.A0, VReg.RET);
