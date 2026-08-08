@@ -814,19 +814,20 @@ export class SubscriptGenerator {
         vm.cmpImm(VReg.V0, 1);             // TYPE_ARRAY
         vm.jne("_js_set_length_fallback");
         vm.mov(VReg.S0, VReg.A0);
-        vm.jmp("_js_set_length_do_array");
+        vm.jmp("_js_set_length_trusted");
 
         vm.label("_js_set_length_arr_boxed");
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.S0, VReg.A0, VReg.V1);
-        // 类型字节守卫：0x7FFE 装箱值可能是损坏指针或子类数组(length override)，
-        // 若 type≠TYPE_ARRAY(1) 则回退到 _object_set 按对象属性写，避免误读数组头野地址。
-        vm.loadByte(VReg.V0, VReg.S0, 0);
-        vm.andImm(VReg.V0, VReg.V0, 0xff);
-        vm.cmpImm(VReg.V0, 1);             // TYPE_ARRAY
-        vm.jne("_js_set_length_fallback");
 
         vm.label("_js_set_length_do_array");
+        // 类型字节守卫：0x7FFE 装箱值可能是损坏指针或子类数组(length override)，
+        // 若 type≠TYPE_ARRAY(1) 则回退到 _object_set 按对象属性写，避免误读数组头野地址。
+        // ldrb 已零扩展 → andImm(V0,V0,0xff) 冗余，省略。
+        vm.loadByte(VReg.V0, VReg.S0, 0);
+        vm.cmpImm(VReg.V0, 1);             // TYPE_ARRAY
+        vm.jne("_js_set_length_fallback");
+        vm.label("_js_set_length_trusted");
         vm.load(VReg.V0, VReg.S0, 8);      // 当前 length
         vm.cmp(VReg.S1, VReg.V0);
         vm.jle("_js_set_length_set");      // n <= len：仅截断

@@ -9,24 +9,40 @@ export function __NUM_toExponential(v, f) {
     if (v !== v) return "NaN";
     if (v === Infinity) return "Infinity";
     if (v === -Infinity) return "-Infinity";
-    const neg = v < 0;
-    let a = neg ? -v : v;
-    let exp = 0;
-    let mant = a;
+    // RangeError: fractionDigits must be in [0, 100] (ES 21.1.3.6 step 8)
+    if (f !== undefined && f !== null) {
+        var fd = f | 0;
+        if (fd < 0 || fd > 100) {
+            throw new RangeError("toExponential() argument must be between 0 and 100");
+        }
+    }
+    const neg = v < 0 || (v === 0 && (1 / v) < 0);
+    var a = neg ? -v : v;
+    var exp = 0;
+    var mant = a;
     if (a !== 0) {
         exp = Math.floor(Math.log10(a));
         mant = a / _pow10(exp);
-        // log10 浮点误差:把尾数归一到 [1,10)
+        // log10 floating-point correction: normalize mantissa to [1, 10)
         if (mant >= 10) { mant = mant / 10; exp = exp + 1; }
         else if (mant < 1) { mant = mant * 10; exp = exp - 1; }
+        // The correction above may not be sufficient for edge cases
+        // where log10 gives off-by-1 due to floating-point. Re-check.
+        while (mant >= 10) { mant = mant / 10; exp = exp + 1; }
+        while (mant < 1) { mant = mant * 10; exp = exp - 1; }
     }
-    let mantStr;
+    var mantStr;
     if (f === undefined || f === null) {
-        mantStr = "" + mant; // 无参:近似最短(asm.js 数字打印为定长)
+        mantStr = "" + mant;
     } else {
         f = f | 0;
         mantStr = mant.toFixed(f);
-        if (Number(mantStr) >= 10) { exp = exp + 1; mant = mant / 10; mantStr = mant.toFixed(f); }
+        // If mantissa rounded up to 10, adjust exponent
+        if (Number(mantStr) >= 10) {
+            exp = exp + 1;
+            mant = mant / 10;
+            mantStr = mant.toFixed(f);
+        }
     }
     const eabs = exp < 0 ? -exp : exp;
     return (neg ? "-" : "") + mantStr + "e" + (exp < 0 ? "-" : "+") + eabs;
@@ -75,26 +91,34 @@ export function __NUM_toPrecision(v, p) {
     v = Number(v);
     if (p === undefined || p === null) return "" + v; // 无参 = toString
     p = p | 0;
+    // RangeError: precision must be in [1, 100] (ES 21.1.3.7 step 8)
+    if (p < 1 || p > 100) {
+        throw new RangeError("toPrecision() argument must be between 1 and 100");
+    }
     if (v !== v) return "NaN";
     if (v === Infinity) return "Infinity";
     if (v === -Infinity) return "-Infinity";
-    const neg = v < 0;
-    let a = neg ? -v : v;
+    // -0 detection (1/(-0) === -Infinity)
+    const neg = v < 0 || (v === 0 && (1 / v) < 0);
+    var a = neg ? -v : v;
     if (a === 0) {
-        if (p <= 1) return "0";
-        let s = "0.";
-        for (let i = 0; i < p - 1; i++) s = s + "0";
-        return s;
+        if (p === 1) return neg ? "-0" : "0";
+        var s = "0.";
+        for (var i = 0; i < p - 1; i++) s = s + "0";
+        return (neg ? "-" : "") + s;
     }
-    let e = Math.floor(Math.log10(a));
-    // 校正 log10 浮点误差,使 10^e <= a < 10^(e+1)
+    var e = Math.floor(Math.log10(a));
+    // Correct log10 floating-point error so that 10^e <= a < 10^(e+1)
     if (_pow10(e) > a) e = e - 1;
     if (_pow10(e + 1) <= a) e = e + 1;
-    let out;
+    // Double-check with a while loop for edge cases
+    while (_pow10(e) > a) e = e - 1;
+    while (_pow10(e + 1) <= a) e = e + 1;
+    var out;
     if (e < -6 || e >= p) {
         out = __NUM_toExponential(a, p - 1);
     } else {
-        let dec = p - 1 - e;
+        var dec = p - 1 - e;
         if (dec < 0) dec = 0;
         out = a.toFixed(dec);
     }
