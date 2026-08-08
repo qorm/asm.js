@@ -6379,7 +6379,27 @@ export class ObjectGenerator {
         const vm = this.vm;
         vm.label("_object_isFrozen");
         vm.prologue(0, []);
-        this._extGuard("_ifz", "_ifz_true"); // 非对象 → frozen true
+        // ES 19.1.2.12: primitives → true, objects check EXT_FROZEN bit
+        // Functions (0x7FFF) are objects → check frozen status
+        vm.shrImm(VReg.V1, VReg.A0, 48);
+        vm.cmpImm(VReg.V1, 0); // 裸堆指针
+        vm.jeq("_ifz_ds");
+        vm.cmpImm(VReg.V1, 0x7FFD); // 装箱对象
+        vm.jeq("_ifz_ds");
+        vm.cmpImm(VReg.V1, 0x7FFF); // 函数值(也是对象)
+        vm.jeq("_ifz_fn");
+        // 非对象(原语) → true
+        vm.label("_ifz_true");
+        vm.lea(VReg.RET, "_js_true");
+        vm.load(VReg.RET, VReg.RET, 0);
+        vm.epilogue([], 0);
+        // 函数:未实现函数 freeze → 恒 false
+        vm.label("_ifz_fn");
+        vm.lea(VReg.RET, "_js_false");
+        vm.load(VReg.RET, VReg.RET, 0);
+        vm.epilogue([], 0);
+        vm.label("_ifz_ds");
+        this._extGuard("_ifz2", "_ifz_true"); // 非 TYPE_OBJECT → true
         vm.loadByte(VReg.V1, VReg.V0, 1);
         vm.andImm(VReg.V3, VReg.V1, EXT_FROZEN);
         vm.cmpImm(VReg.V3, 0);
@@ -6395,10 +6415,6 @@ export class ObjectGenerator {
         vm.lea(VReg.RET, "_js_false");
         vm.load(VReg.RET, VReg.RET, 0);
         vm.epilogue([], 0);
-        vm.label("_ifz_true");
-        vm.lea(VReg.RET, "_js_true");
-        vm.load(VReg.RET, VReg.RET, 0);
-        vm.epilogue([], 0);
     }
 
     // Object.isSealed(obj) -> js_true/js_false。
@@ -6408,7 +6424,27 @@ export class ObjectGenerator {
         const vm = this.vm;
         vm.label("_object_isSealed");
         vm.prologue(0, []);
-        this._extGuard("_isl", "_isl_true"); // 非对象 → sealed true
+        // ES 19.1.2.13: primitives → true, objects check EXT_SEALED bit
+        // Functions (0x7FFF) are objects → check sealed status
+        vm.shrImm(VReg.V1, VReg.A0, 48);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_isl_ds");
+        vm.cmpImm(VReg.V1, 0x7FFD);
+        vm.jeq("_isl_ds");
+        vm.cmpImm(VReg.V1, 0x7FFF);
+        vm.jeq("_isl_fn");
+        // 非对象(原语) → true
+        vm.label("_isl_true");
+        vm.lea(VReg.RET, "_js_true");
+        vm.load(VReg.RET, VReg.RET, 0);
+        vm.epilogue([], 0);
+        // 函数:未实现函数 seal → 恒 false
+        vm.label("_isl_fn");
+        vm.lea(VReg.RET, "_js_false");
+        vm.load(VReg.RET, VReg.RET, 0);
+        vm.epilogue([], 0);
+        vm.label("_isl_ds");
+        this._extGuard("_isl2", "_isl_true"); // 非 TYPE_OBJECT → true
         vm.loadByte(VReg.V1, VReg.V0, 1);
         vm.andImm(VReg.V3, VReg.V1, EXT_SEALED);
         vm.cmpImm(VReg.V3, 0);
@@ -6423,10 +6459,6 @@ export class ObjectGenerator {
         vm.lea(VReg.RET, "_js_false");
         vm.load(VReg.RET, VReg.RET, 0);
         vm.epilogue([], 0);
-        vm.label("_isl_true");
-        vm.lea(VReg.RET, "_js_true");
-        vm.load(VReg.RET, VReg.RET, 0);
-        vm.epilogue([], 0);
     }
 
     // Object.isExtensible(obj) -> js_true/js_false。
@@ -6435,16 +6467,32 @@ export class ObjectGenerator {
         const vm = this.vm;
         vm.label("_object_isExtensible");
         vm.prologue(0, []);
-        this._extGuard("_iex", "_iex_false"); // 非对象 → 不可扩展
+        // ES 19.1.2.5: primitives → false, objects check EXT_NONEXT bit
+        // Functions (0x7FFF) are objects → extensible == not sealed/frozen
+        vm.shrImm(VReg.V1, VReg.A0, 48);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_iex_ds");
+        vm.cmpImm(VReg.V1, 0x7FFD);
+        vm.jeq("_iex_ds");
+        vm.cmpImm(VReg.V1, 0x7FFF);
+        vm.jeq("_iex_fn");
+        // 非对象(原语) → false
+        vm.label("_iex_false");
+        vm.lea(VReg.RET, "_js_false");
+        vm.load(VReg.RET, VReg.RET, 0);
+        vm.epilogue([], 0);
+        // 函数:未实现函数 seal/freeze → 恒 true(可扩展)
+        vm.label("_iex_fn");
+        vm.lea(VReg.RET, "_js_true");
+        vm.load(VReg.RET, VReg.RET, 0);
+        vm.epilogue([], 0);
+        vm.label("_iex_ds");
+        this._extGuard("_iex2", "_iex_false"); // 非 TYPE_OBJECT → false
         vm.loadByte(VReg.V1, VReg.V0, 1);
         vm.andImm(VReg.V1, VReg.V1, EXT_NONEXT);
         vm.cmpImm(VReg.V1, 0);
         vm.jne("_iex_false");
         vm.lea(VReg.RET, "_js_true");
-        vm.load(VReg.RET, VReg.RET, 0);
-        vm.epilogue([], 0);
-        vm.label("_iex_false");
-        vm.lea(VReg.RET, "_js_false");
         vm.load(VReg.RET, VReg.RET, 0);
         vm.epilogue([], 0);
     }
