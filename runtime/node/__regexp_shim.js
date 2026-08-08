@@ -1391,6 +1391,49 @@ export function __RE_new(pattern, flags) {
     return re;
 }
 
+// RegExp.prototype.compile(pattern, flags) - Annex B
+// 在自身 this 对象上重新编译正则,语义同 new RegExp(pattern, flags) 但复用原对象。
+// 返回 this(re);无效模式抛 SyntaxError(与 Node/Chrome 一致)。
+export function __RE_compile(re, pattern, flags) {
+    var src = pattern;
+    var f = flags;
+    if (typeof src !== "string") {
+        if (src !== null && src !== undefined && typeof src.source === "string") {
+            if (f === undefined || f === null || f === 0) f = src.flags;
+            src = typeof src.__pat === "string" ? src.__pat : src.source;
+        } else if (src === null || src === undefined) {
+            src = "";
+        } else {
+            src = "" + src;
+        }
+    }
+    if (f === null || f === undefined) f = "";
+    if (f === 0) f = "";
+    if (typeof f !== "string") f = "" + f;
+    __re_checkFlags(f);
+    // 更新属性
+    re.source = __re_escSource(src);
+    re.flags = f;
+    re.global = f.indexOf("g") !== -1;
+    re.ignoreCase = f.indexOf("i") !== -1;
+    re.multiline = f.indexOf("m") !== -1;
+    re.dotAll = f.indexOf("s") !== -1;
+    re.sticky = f.indexOf("y") !== -1;
+    re.unicode = f.indexOf("u") !== -1;
+    re.unicodeSets = f.indexOf("v") !== -1;
+    re.hasIndices = f.indexOf("d") !== -1;
+    re.lastIndex = 0;
+    re.__pat = src;
+    re.__prog = null;
+    re.__bad = false;
+    re.__err = "";
+    __re_compile(re);
+    if (re.__bad && re.__err !== "") {
+        throw new SyntaxError("Invalid regular expression: /" + src + "/: " + re.__err);
+    }
+    return re;
+}
+
 // lastIndex 是可写普通属性,用户可以塞进 undefined / null / NaN / 字符串。
 // 规范走 ToLength(ToInteger(lastIndex)):非数值一律先转数,NaN/负数 → 0。
 function __re_toIndex(v) {

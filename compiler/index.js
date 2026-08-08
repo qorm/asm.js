@@ -1518,7 +1518,7 @@ export class Compiler {
             src.indexOf("__regexp_shim") === -1 &&
             (src.indexOf(reCtorText) !== -1 || src.indexOf(reEscText) !== -1 ||
              sourceHasRegexLiteral(src) || sourceHasRegExpCall(src))) {
-            const inj = 'import { __RE_new, __RE_test, __RE_exec, __RE_match, __RE_matchAll, __RE_replace, __RE_split, __RE_escape, __RE_search, __RE_toString } from "__regexp_shim";\n';
+            const inj = 'import { __RE_new, __RE_test, __RE_exec, __RE_match, __RE_matchAll, __RE_replace, __RE_split, __RE_escape, __RE_search, __RE_toString, __RE_compile } from "__regexp_shim";\n';
             src = injectShimImport(src, inj);
             if (process.env.ASMJS_SHIM_DEBUG) {
                 console.error("[shim] regexp shim injected: " + filePath);

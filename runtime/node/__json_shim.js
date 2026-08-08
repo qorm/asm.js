@@ -99,13 +99,32 @@ function __jsonHasKey(obj, k) {
 }
 
 // 序列化"已定型"的值(已过 toJSON/replacer),返回串或 undefined(表示跳过/顶层空)。
+// __js_seen 是循环引用检测栈(对象数组):序列化进入时 push,退出时 pop;重复出现即
+// 抛 TypeError(与 node 一致,替换旧深度兜底)。
+let __js_seen = [];
 function __jsonSer(value, indent, depth) {
-    if (depth > 200) return '"[Deep]"'; // 循环引用/超深兜底(node 抛 TypeError,此处降级)
-    // [W7-2] rawJSON 直通:toJSON/replacer **之后**(__jsonPropV 已先处理 → 规范次序
-    // 天然正确),按内部品牌(模块级登记表)判,raw 文本原样嵌入(不引号、不转义)。
+    // 对象预处理:循环检测 + rawJSON 直通 + 包装对象解包。
     if (value !== null && typeof value === "object") {
+        // 循环引用检测
+        for (let si = 0; si < __js_seen.length; si++) {
+            if (__js_seen[si] === value) {
+                throw new TypeError("Converting circular structure to JSON");
+            }
+        }
+        // [W7-2] rawJSON 直通:toJSON/replacer **之后**(__jsonPropV 已先处理 → 规范次序
+        // 天然正确),按内部品牌(模块级登记表)判,raw 文本原样嵌入(不引号、不转义)。
         const __ri = __js_rawjson_objs.indexOf(value);
         if (__ri !== -1) return __js_rawjson_texts[__ri];
+        // 包装对象(Number/Boolean):规范 SerializeJSONProperty 步骤 3 要求解包内部槽。
+        if (typeof value.__boolean_value !== "undefined") {
+            return value.__boolean_value ? "true" : "false";
+        }
+        if (typeof value.__number_value !== "undefined") {
+            const __nv = value.__number_value;
+            const __nfs = "" + __nv;
+            if (__nfs === "NaN" || __nfs === "Infinity" || __nfs === "-Infinity") return "null";
+            return __nfs;
+        }
     }
     const t = typeof value;
     if (t === "number") {
@@ -153,28 +172,37 @@ function __jsonPropV(holder, key, value, indent, depth) {
 }
 
 function __jsonArr(arr, indent, depth) {
+    __js_seen.push(arr);
+    let out;
     const n = arr.length;
-    if (n === 0) return "[]";
-    const newIndent = indent + __js_gap;
-    if (__js_gap === "") {
-        let out = "[";
-        for (let i = 0; i < n; i++) {
-            if (i > 0) out += ",";
-            const e = __jsonPropV(arr, "" + i, arr[i], newIndent, depth + 1);
-            out += (e === undefined) ? "null" : e;
+    if (n === 0) { out = "[]"; }
+    else {
+        const newIndent = indent + __js_gap;
+        if (__js_gap === "") {
+            out = "[";
+            for (let i = 0; i < n; i++) {
+                if (i > 0) out += ",";
+                const e = __jsonPropV(arr, "" + i, arr[i], newIndent, depth + 1);
+                out += (e === undefined) ? "null" : e;
+            }
+            out += "]";
+        } else {
+            out = "[\n";
+            for (let i = 0; i < n; i++) {
+                if (i > 0) out += ",\n";
+                const e = __jsonPropV(arr, "" + i, arr[i], newIndent, depth + 1);
+                out += newIndent + ((e === undefined) ? "null" : e);
+            }
+            out += "\n" + indent + "]";
         }
-        return out + "]";
     }
-    let out = "[\n";
-    for (let i = 0; i < n; i++) {
-        if (i > 0) out += ",\n";
-        const e = __jsonPropV(arr, "" + i, arr[i], newIndent, depth + 1);
-        out += newIndent + ((e === undefined) ? "null" : e);
-    }
-    return out + "\n" + indent + "]";
+    __js_seen.pop();
+    return out;
 }
 
 function __jsonObj(obj, indent, depth) {
+    __js_seen.push(obj);
+    let out;
     const newIndent = indent + __js_gap;
     const mk = []; // 保留输出的键
     const mv = []; // 对应序列化串
@@ -197,21 +225,25 @@ function __jsonObj(obj, indent, depth) {
         }
     }
     const n = mk.length;
-    if (n === 0) return "{}";
-    if (__js_gap === "") {
-        let out = "{";
+    if (n === 0) {
+        out = "{}";
+    } else if (__js_gap === "") {
+        out = "{";
         for (let i = 0; i < n; i++) {
             if (i > 0) out += ",";
             out += __jsonQuote(mk[i]) + ":" + mv[i];
         }
-        return out + "}";
+        out += "}";
+    } else {
+        out = "{\n";
+        for (let i = 0; i < n; i++) {
+            if (i > 0) out += ",\n";
+            out += newIndent + __jsonQuote(mk[i]) + ": " + mv[i];
+        }
+        out += "\n" + indent + "}";
     }
-    let out = "{\n";
-    for (let i = 0; i < n; i++) {
-        if (i > 0) out += ",\n";
-        out += newIndent + __jsonQuote(mk[i]) + ": " + mv[i];
-    }
-    return out + "\n" + indent + "}";
+    __js_seen.pop();
+    return out;
 }
 
 // space → 缩进单元串:数字钳 [0,10] 个空格;字符串取前 10 字符;其余 ""。
@@ -237,12 +269,16 @@ export function __JSON_stringify(v, replacer, space) {
     const savedRep = __js_replacer;
     const savedPl = __js_proplist;
     const savedGap = __js_gap;
+    const savedSeen = __js_seen;
     __js_replacer = null;
     __js_proplist = null;
+    __js_seen = [];
     if (typeof replacer === "function") {
         __js_replacer = replacer;
     } else if (replacer instanceof Array) {
-        // 键白名单:string/number 项收集去重(number 项 ToString);其余项忽略。
+        // 键白名单:string/number/Number/String 项收集去重(number 项 ToString);
+        // Number/String/Boolean 包装对象 → String(item) 调用 toString(规范要求
+        // ToString,非 ToNumber/unbox);其余项忽略。
         const pl = [];
         for (let i = 0; i < replacer.length; i++) {
             const item = replacer[i];
@@ -250,7 +286,14 @@ export function __JSON_stringify(v, replacer, space) {
             let key;
             if (it === "string") key = item;
             else if (it === "number") key = "" + item;
-            else continue;
+            else if (it === "object" && item !== null) {
+                // Number/String/Boolean 包装对象:调用 String(item) → toString
+                if (typeof item.__number_value !== "undefined" ||
+                    typeof item.__string_value !== "undefined" ||
+                    typeof item.__boolean_value !== "undefined") {
+                    key = String(item);
+                } else continue;
+            } else continue;
             let dup = false;
             for (let j = 0; j < pl.length; j++) {
                 if (pl[j] === key) { dup = true; break; }
@@ -266,6 +309,7 @@ export function __JSON_stringify(v, replacer, space) {
     __js_replacer = savedRep;
     __js_proplist = savedPl;
     __js_gap = savedGap;
+    __js_seen = savedSeen;
     return result;
 }
 
