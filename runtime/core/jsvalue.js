@@ -711,7 +711,7 @@ export class JSValueGenerator {
         vm.jmp("_instanceof");
 
         vm.label("_instanceof");
-        vm.prologue(16, [VReg.S0]);
+        vm.prologue(16, [VReg.S0, VReg.S1]);
         vm.mov(VReg.S0, VReg.A0);
 
         vm.cmpImm(VReg.A1, 1);
@@ -795,8 +795,15 @@ export class JSValueGenerator {
         // 只用 caller-saved V1-V4(x64 别名:V1=RCX/V2=RDX/V3=R8/V4=R9,均无活参),
         // A1 全程不动;prototype 链指针为裸指针,每次解引用前守 [heap_base,heap_ptr)。
         vm.label("_iof_user");
-        // A1 必须是裸堆指针(高16=0)
         vm.shrImm(VReg.V1, VReg.A1, 48);
+        // [#B1] 装箱构造器(tag 0x7FFF/0x7FFD):脱壳后取 prototype,走原型链比对。
+        // 此前此处只认裸堆指针(high16==0),把 Boolean/Number/String 等内建装箱
+        // 构造器的闭包值(tag 0x7FFF)直接拒掉 → new Boolean instanceof Boolean 恒 false。
+        vm.cmpImm(VReg.V1, 0x7FFF);
+        vm.jeq("_iof_boxed_ctor");
+        vm.cmpImm(VReg.V1, 0x7FFD);
+        vm.jeq("_iof_boxed_ctor");
+        // A1 必须是裸堆指针(高16=0)
         vm.cmpImm(VReg.V1, 0);
         vm.jne("_iof_false");
         vm.lea(VReg.V2, "_heap_base");
@@ -862,15 +869,46 @@ export class JSValueGenerator {
         vm.load(VReg.V3, VReg.V3, 16); // cur = cur.__proto__
         vm.jmp("_iof_user_loop");
 
+        // [#B1] 装箱构造器处理:取 prototype, 脱壳后走原型链比对。
+        // A1 = 装箱构造值(tag 0x7FFF 函数或 0x7FFD 对象),S0 = 实例(未脱壳)。
+        // _closure_prop_get(A0=构造器, A1="prototype") → RET = 装箱 prototype。
+        vm.label("_iof_boxed_ctor");
+        vm.mov(VReg.A0, VReg.A1); // A0 = 装箱构造器(_closure_prop_get 的第一参数)
+        vm.mov(VReg.S1, VReg.S0); // 暂存 S0(实例,跨 _closure_prop_get 调用)
+        // 构造 boxed 串键 "prototype" → A1
+        vm.lea(VReg.A1, vm.asm.addString("prototype"));
+        vm.movImm64(VReg.V0, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V0);
+        vm.call("_closure_prop_get"); // RET = 装箱 prototype / undefined
+        vm.mov(VReg.S0, VReg.S1);     // 恢复 S0 = 实例
+        // 结果是装箱对象(tag 0x7FFD)才有效;非对象(如 undefined) → false
+        vm.shrImm(VReg.V1, VReg.RET, 48);
+        vm.cmpImm(VReg.V1, 0x7FFD);
+        vm.jne("_iof_false");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V2, VReg.RET, VReg.V1); // V2 = 裸 prototype 指针
+        vm.cmpImm(VReg.V2, 0);
+        vm.jeq("_iof_false");
+        // 守卫 V2 在堆内
+        vm.lea(VReg.V1, "_heap_base");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.V2, VReg.V1);
+        vm.jlt("_iof_false");
+        vm.lea(VReg.V1, "_heap_ptr");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.V2, VReg.V1);
+        vm.jge("_iof_false");
+        vm.jmp("_iof_proto_walk"); // V2=目标prototype, S0=实例(待脱壳),复走上溯逻辑
+
         vm.label("_iof_true");
         vm.lea(VReg.RET, "_js_true");
         vm.load(VReg.RET, VReg.RET, 0);
-        vm.epilogue([VReg.S0], 16);
+        vm.epilogue([VReg.S0, VReg.S1], 16);
 
         vm.label("_iof_false");
         vm.lea(VReg.RET, "_js_false");
         vm.load(VReg.RET, VReg.RET, 0);
-        vm.epilogue([VReg.S0], 16);
+        vm.epilogue([VReg.S0, VReg.S1], 16);
 
         // [#69] _instanceof_proto(A0=实例, A1=目标 prototype 裸指针) → true/false。
         // 普通函数 new F 挂 __proto__=F.prototype;此处沿实例 __proto__ 链上溯比对,

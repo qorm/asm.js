@@ -1015,6 +1015,16 @@ export const OperatorCompiler = {
             }
         }
 
+        // [#B1] x instanceof Boolean/Number/String:这些内建装箱构造器没有专门的
+        // type 字节(Boolean wrapper 即 TYPE_OBJECT=2),没法走 type-byte 快路;且
+        // 不是 FunctionDeclaration,落不到上方 _instanceof_proto 路径。此前落入
+        // 通用 _instanceof(把装箱闭包当 A1 传,导致 _iof_user 做 high16==0 检查
+        // 被拒 → 恒返 false)。运行时修复:在 _instanceof 内通过原型链比较代替位模式
+        // 哨兵,见 jsvalue.js _instanceof 的 [#B1] 分支。
+        //
+        // 此处直接委托通用 _instanceof 路径(含 _try_hasinstance 先试),运行时自行
+        // 处理装箱构造器。此前布尔/数字/字符串构造器传入 _instanceof 时恒为 false。
+
         if (op === "instanceof") {
             // [Symbol.hasInstance] 优先:right 定义了则以 right[Symbol.hasInstance](left) 定夺;
             // 否则(哨兵裸 0)回退常规原型链 _instanceof。用户类/对象经此路径,内建族在上方快路。

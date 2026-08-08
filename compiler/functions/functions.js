@@ -1702,6 +1702,21 @@ export const FunctionCompiler = {
                 });
                 return;
             }
+            // Error 族无 new 调用与 new Error(...) 同义(ES 规范第 19.5.1 节)。
+            // 此前 Error("msg") 走通用函数调用路径 → 不创建 Error 对象,
+            // `Error("msg") instanceof Error` 恒 false。排除用户局部遮蔽。
+            const ERR_CALL_NAMES = ["Error", "TypeError", "RangeError", "SyntaxError",
+                "ReferenceError", "URIError", "EvalError", "AggregateError"];
+            if (ERR_CALL_NAMES.indexOf(callee.name) >= 0 &&
+                !(this.ctx.getLocal && this.ctx.getLocal(callee.name)) &&
+                !(this.ctx.getFunction && this.ctx.getFunction(callee.name))) {
+                this.compileNewExpression({
+                    type: "NewExpression",
+                    callee: { type: "Identifier", name: callee.name },
+                    arguments: expr.arguments,
+                });
+                return;
+            }
 
             // 动态 import(source)。AOT 子集:specifier 编译期可静态解析(字面量/静态
             // 拼接/静态模板/const 绑定字面量)→ resolveImports 已把目标模块入图并在此
