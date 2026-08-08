@@ -2546,31 +2546,73 @@ export const FunctionCompiler = {
                 } else {
                     // 动态参数:运行时 ToObject。
                     this.compileExpression(arg);
+                    const uniq = this.nextLabelId();
+                    // 保存参数值(后续物化原型会 clobber 寄存器)
+                    const argSlot = this.ctx.allocLocal(`__objc_arg_${uniq}`);
+                    this.vm.store(VReg.FP, argSlot, VReg.RET);
+                    // 物化 Boolean/Number 原型(供 _boolean_new/_number_new 读取 _nsobj_*_proto 槽)
+                    this.emitBooleanProtoObject();
+                    this.emitNumberProtoObject();
+                    // 重载参数值
+                    this.vm.load(VReg.RET, VReg.FP, argSlot);
                     // 已是对象(0x7FFD/0x7FFE/裸指针) → 直接返回
-                    const retLabel = this.ctx.newLabel("__objc_ret");
+                    const retLabel = `__objc_ret_${uniq}`;
+                    const notBareLabel = `__objc_not_bare_${uniq}`;
+                    const wrapBoolLabel = `__objc_wrap_bool_${uniq}`;
+                    const wrapNumLabel = `__objc_wrap_num_${uniq}`;
+                    const wrapStrLabel = `__objc_wrap_str_${uniq}`;
+                    const wrapEmptyLabel = `__objc_wrap_empty_${uniq}`;
                     this.vm.shrImm(VReg.V1, VReg.RET, 48);
                     this.vm.cmpImm(VReg.V1, 0x7FFD);
                     this.vm.jeq(retLabel);
                     this.vm.cmpImm(VReg.V1, 0x7FFE);
                     this.vm.jeq(retLabel);
                     this.vm.cmpImm(VReg.V1, 0);
-                    this.vm.jne("__objc_not_bare");
+                    this.vm.jne(notBareLabel);
                     // 裸指针(high16==0):排除 Symbol(TYPE_SYMBOL),它是原始值非对象
                     // Object(Symbol()) 必须包装成对象,typeof 才返回 "object"
                     this.vm.cmpImm(VReg.RET, 0);
-                    this.vm.jeq("__objc_not_bare");          // null/0 → 包装
-                    this.vm.movImm64(VReg.V0, 0x100000000n); // ptrFloor
+                    this.vm.jeq(notBareLabel);               // null/0 → 包装
+                    this.vm.movImm64(VReg.V0, 0x100000000n);  // ptrFloor
                     this.vm.cmp(VReg.RET, VReg.V0);
-                    this.vm.jlt("__objc_not_bare");          // 地址低于 floor → 非指针
+                    this.vm.jlt(notBareLabel);               // 地址低于 floor → 非指针
                     this.vm.loadByte(VReg.V0, VReg.RET, 0);
-                    this.vm.cmpImm(VReg.V0, 61);             // TYPE_SYMBOL
-                    this.vm.jne(retLabel);                   // 非 Symbol → 真对象
-                    // 否则 fallthrough → 包装 Symbol
-                    this.vm.label("__objc_not_bare");
-                    // 原始值 → 包装(记偏差:未实现完整 ToObject,简化为新对象)
-                    this.vm.mov(VReg.A0, VReg.RET);
+                    this.vm.cmpImm(VReg.V0, 61);              // TYPE_SYMBOL
+                    this.vm.jne(retLabel);                    // 非 Symbol → 真对象
+                    // Tag 分派包装
+                    this.vm.label(notBareLabel);
+                    this.vm.load(VReg.V0, VReg.FP, argSlot);
+                    this.vm.shrImm(VReg.V1, VReg.V0, 48);
+                    this.vm.cmpImm(VReg.V1, 0x7FF9);          // Boolean
+                    this.vm.jeq(wrapBoolLabel);
+                    this.vm.cmpImm(VReg.V1, 0x7FFC);          // String
+                    this.vm.jeq(wrapStrLabel);
+                    this.vm.cmpImm(VReg.V1, 0x7FFB);          // undefined
+                    this.vm.jeq(wrapEmptyLabel);
+                    this.vm.cmpImm(VReg.V1, 0x7FFA);          // null
+                    this.vm.jeq(wrapEmptyLabel);
+                    // Number(0x7FF8) / 裸 float64 位 → 都走 _number_new
+                    this.vm.jmp(wrapNumLabel);
+                    // Boolean 包装
+                    this.vm.label(wrapBoolLabel);
+                    this.vm.load(VReg.A0, VReg.FP, argSlot);
+                    this.vm.call("_boolean_new");
+                    this.vm.jmp(retLabel);
+                    // Number 包装
+                    this.vm.label(wrapNumLabel);
+                    this.vm.load(VReg.A0, VReg.FP, argSlot);
+                    this.vm.call("_number_new");
+                    this.vm.jmp(retLabel);
+                    // String 包装:空对象(偏差:无 __string_value/索引,proto 未设)
+                    this.vm.label(wrapStrLabel);
                     this.vm.call("_object_new");
                     this.vm.call("_box_obj_r");
+                    this.vm.jmp(retLabel);
+                    // null/undefined → 空对象
+                    this.vm.label(wrapEmptyLabel);
+                    this.vm.call("_object_new");
+                    this.vm.call("_box_obj_r");
+                    this.vm.jmp(retLabel);
                     this.vm.label(retLabel);
                 }
                 return;
