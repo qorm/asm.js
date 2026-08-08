@@ -784,6 +784,40 @@ export class StringGenerator {
         vm.call("_getStrContent");
         vm.mov(VReg.S0, VReg.RET);
         vm.pop(VReg.S1); // padStr(原样,先 ToString 再取内容)
+        // [L3] Symbol fillString: ES 21.1.3.15/16 ToString(fillString) must throw
+        // TypeError for Symbol (implicit conversion is forbidden). _emitArgStrInline
+        // passes raw pointers through (high16==0), allowing Symbol blocks to be
+        // treated as strings. Check type byte first.
+        {
+            const symNot = label + "_notsym";
+            vm.shrImm(VReg.V1, VReg.S1, 48);
+            vm.cmpImm(VReg.V1, 0);
+            vm.jne(symNot);
+            vm.cmpImm(VReg.S1, 0);
+            vm.jeq(symNot);
+            vm.lea(VReg.V1, "_heap_base"); vm.load(VReg.V1, VReg.V1, 0);
+            vm.cmp(VReg.S1, VReg.V1); vm.jb(symNot);
+            vm.lea(VReg.V1, "_heap_ptr"); vm.load(VReg.V1, VReg.V1, 0);
+            vm.cmp(VReg.S1, VReg.V1); vm.jae(symNot);
+            vm.loadByte(VReg.V1, VReg.S1, 0);
+            vm.cmpImm(VReg.V1, 61); // TYPE_SYMBOL
+            vm.jne(symNot);
+            // Symbol: throw TypeError
+            vm.lea(VReg.A0, vm.asm.addString("Cannot convert a Symbol value to a string"));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+            vm.or(VReg.A0, VReg.A0, VReg.V1);
+            vm.call("_throw_type_error");
+            vm.label(symNot);
+        }
+        // [L3] fillString === undefined → default to " " (ES 21.1.3.15/16 step 7)
+        {
+            const noDef = label + "_nodef";
+            vm.movImm64(VReg.V1, 0x7ffb000000000000n);
+            vm.cmp(VReg.S1, VReg.V1);
+            vm.jne(noDef);
+            vm.lea(VReg.S1, vm.asm.addString(" "));
+            vm.label(noDef);
+        }
         // [W-25] fillString ToString:"abc".padStart(10,false) 须用 "false" 填充
         // (test262 padStart/fill-string-non-strings);此前非串 pad 落 _getStrContent
         // 非法路径 → 空串 → 退化成空格填充。
