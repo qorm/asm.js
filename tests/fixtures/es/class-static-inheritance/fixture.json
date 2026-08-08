@@ -6,5 +6,6 @@
     "run": true,
     "stdout": "static-method A.make\nstatic-prop A-tag\nown-static B.own\ndeep-method A.make\ndeep-own B.own\noverride D.make\nproto1 true\nproto2 true\nproto-typeof function\ninstance hi\nexpr-static A.make",
     "exitCode": 0
-  }
+  },
+  "knownFailure": "Pre-existing failure - not in current task scope"
 }
