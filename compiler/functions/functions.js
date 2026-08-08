@@ -3236,22 +3236,35 @@ export const FunctionCompiler = {
                         this.vm.load(VReg.A2, VReg.FP, lenOff);
                         this.vm.call("_array_like_copy");
                         this.vm.jmp(afMapL);
-                        // 可迭代:空数组 + _array_spread_into 抽干迭代器
+                        // 可迭代:空数组 + _array_spread_into 抽干迭代器(无 mapFn)
+                        // 有 mapFn 时用 _array_spread_into_map 交叠迭代与映射,避免
+                        // 无限迭代器在 _array_spread_into 中循环超时。
                         this.vm.label(afIterL);
-                        this.vm.movImm(VReg.A0, 0);
-                        this.vm.call("_array_new_with_size");
-                        this.vm.call("_box_arr_r"); // box->helper
-                        this.vm.mov(VReg.A0, VReg.RET);
-                        this.vm.load(VReg.A1, VReg.FP, objOff);
-                        this.vm.call("_array_spread_into");          // RET = 填充后的数组
-                        this.vm.store(VReg.FP, arrOff, VReg.RET);
+                        if (expr.arguments.length >= 2) {
+                            // 有 mapFn: _array_spread_into_map(arr, src, callback) 交叠迭代
+                            this.vm.movImm(VReg.A0, 0);
+                            this.vm.call("_array_new_with_size");
+                            this.vm.call("_box_arr_r"); // box->helper
+                            this.vm.mov(VReg.A0, VReg.RET); // A0 = arr
+                            this.vm.load(VReg.A1, VReg.FP, objOff); // A1 = src
+                            // 编译 callback(第 2 参)
+                            this.compileExpression(expr.arguments[1]);
+                            this.vm.mov(VReg.A2, VReg.RET); // A2 = callback
+                            this.vm.call("_array_spread_into_map"); // RET = 填充后的装箱数组
+                            this.vm.store(VReg.FP, arrOff, VReg.RET);
+                        } else {
+                            // 无 mapFn: _array_spread_into(arr, src)
+                            this.vm.movImm(VReg.A0, 0);
+                            this.vm.call("_array_new_with_size");
+                            this.vm.call("_box_arr_r"); // box->helper
+                            this.vm.mov(VReg.A0, VReg.RET);
+                            this.vm.load(VReg.A1, VReg.FP, objOff);
+                            this.vm.call("_array_spread_into");          // RET = 填充后的数组
+                            this.vm.store(VReg.FP, arrOff, VReg.RET);
+                        }
                         this.vm.label(afMapL);
                         this.vm.load(VReg.RET, VReg.FP, arrOff);
-                        if (expr.arguments.length >= 2) {
-                            // Array.from(x, mapFn, thisArg):第 3 参 thisArg 转发给 map 作 this 绑定
-                            const mapArgs = expr.arguments.length >= 3 ? [expr.arguments[1], expr.arguments[2]] : [expr.arguments[1]];
-                            this.compileArrayMethod({ type: "Identifier", name: `__afrom_arr_${fid}` }, "map", mapArgs);
-                        }
+                        // 无 mapFn 或已在上面交叠:均跳过二次 map
                         return;
                     }
                     // Array.from(typedArray[, mapFn]):typed 布局(raw 数据@16)不能落
@@ -3276,18 +3289,26 @@ export const FunctionCompiler = {
                         : { type: "ArrayExpression", elements: [{ type: "SpreadElement", argument: fromArg }] };
                     if (expr.arguments.length >= 2) {
                         // 第 3 参 thisArg 转发给 map 作 this 绑定
-                        const mapArgs = expr.arguments.length >= 3 ? [expr.arguments[1], expr.arguments[2]] : [expr.arguments[1]];
                         if (fromIsArray) {
+                            const mapArgs = expr.arguments.length >= 3 ? [expr.arguments[1], expr.arguments[2]] : [expr.arguments[1]];
                             this.compileArrayMethod(fromInput, "map", mapArgs);
                         } else {
-                            // 非数组可迭代(生成器/Set/字符串等):合成 [...x] spread 直接喂 map 抽干失败
-                            // → 空数组。先把 [...x] **物化**到临时数组(同 OBJECT/TYPED_ARRAY 路),
-                            // 再对具名临时 map(Array.from(gen, fn[, thisArg]) 此前返 [] 的根因)。
+                            // 非数组:用 _array_spread_into_map 交叠迭代与映射。
+                            // 此前 [...x] 先抽干迭代器再 map → 无限迭代器超时(Array.from(gen,fn) 崩根因)。
+                            this.vm.movImm(VReg.A0, 0);
+                            this.vm.call("_array_new_with_size");
+                            this.vm.call("_box_arr_r"); // box->helper
+                            this.vm.mov(VReg.A0, VReg.RET); // A0 = arr
+                            // 求值 src(一次)并留栈槽防二次求值
                             const fid = this.nextLabelId();
-                            const arrOff = this.ctx.allocLocal(`__afromit_${fid}`);
-                            this.compileExpression(fromInput); // [...x] 物化
-                            this.vm.store(VReg.FP, arrOff, VReg.RET);
-                            this.compileArrayMethod({ type: "Identifier", name: `__afromit_${fid}` }, "map", mapArgs);
+                            const srcOff = this.ctx.allocLocal(`__afromsrc_${fid}`);
+                            this.compileExpression(fromArg);
+                            this.vm.store(VReg.FP, srcOff, VReg.RET);
+                            this.vm.mov(VReg.A1, VReg.RET); // A1 = src
+                            // callback(第 2 参)
+                            this.compileExpression(expr.arguments[1]);
+                            this.vm.mov(VReg.A2, VReg.RET); // A2 = callback
+                            this.vm.call("_array_spread_into_map"); // RET = 装箱数组
                         }
                     } else if (fromIsArray) {
                         this.compileArrayMethod(fromInput, "slice", []);

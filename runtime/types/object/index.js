@@ -6057,7 +6057,12 @@ export class ObjectGenerator {
         // [#T2] Cycle check: walk the proposed proto chain and reject if target
         // appears (OrdinarySetPrototypeOf step 7). Guard: proto is null (V3==0)
         // or target traversal depth exceeds 8192 → throw TypeError.
+        // Proxy(TYPE_PROXY=8):handler@16 非 __proto__,跳遍历防段错误。
         vm.cmpImm(VReg.V3, 0);
+        vm.jeq("_ospo_store");
+        vm.load(VReg.V0, VReg.V3, 0);    // check type of proposed proto
+        vm.andImm(VReg.V0, VReg.V0, 0xff);
+        vm.cmpImm(VReg.V0, 8);           // TYPE_PROXY → 无 proto 链,跳遍历
         vm.jeq("_ospo_store");
         vm.mov(VReg.V4, VReg.V3); // cursor = proposed proto
         vm.movImm64(VReg.V0, 0);  // depth counter

@@ -702,6 +702,7 @@ export class SubscriptGenerator {
         this.generateKeyInt();
         this.generateJsLength();
         this.generateJsSetLength();
+        this.generateThrowRangeError();
     }
 
     // _subscript_key_int(key) -> 裸整数下标 | -1
@@ -724,10 +725,56 @@ export class SubscriptGenerator {
         vm.epilogue([VReg.S0, VReg.S1], 0);
     }
 
+    // _throw_range_error(A0 = boxed message string) -> never returns
+    // 构造 RangeError 普通对象 {name,message,__asmjs_err,cause}，
+    // 置异常槽后 _throw_unwind 交给最近 try/catch。
+    generateThrowRangeError() {
+        const vm = this.vm;
+        const boxStr = (reg) => {
+            vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(reg, reg, VReg.V1);
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(reg, reg, VReg.V1);
+        };
+        vm.label("_throw_range_error");
+        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.mov(VReg.S0, VReg.A0); // S0 = boxed message
+        vm.call("_object_new");
+        vm.call("_box_obj_r");
+        vm.mov(VReg.S2, VReg.RET); // S2 = errObj(boxed)
+        // name = "RangeError"
+        vm.mov(VReg.A0, VReg.S2);
+        vm.lea(VReg.A1, vm.asm.addString("name")); boxStr(VReg.A1);
+        vm.lea(VReg.A2, vm.asm.addString("RangeError")); boxStr(VReg.A2);
+        vm.call("_object_set");
+        // message
+        vm.mov(VReg.A0, VReg.S2);
+        vm.lea(VReg.A1, vm.asm.addString("message")); boxStr(VReg.A1);
+        vm.mov(VReg.A2, VReg.S0);
+        vm.call("_object_set");
+        // __asmjs_err = true
+        vm.mov(VReg.A0, VReg.S2);
+        vm.lea(VReg.A1, vm.asm.addString("__asmjs_err")); boxStr(VReg.A1);
+        vm.movImm64(VReg.A2, 0x7ff9000000000001n); // boxed true
+        vm.call("_object_set");
+        // cause = undefined
+        vm.mov(VReg.A0, VReg.S2);
+        vm.lea(VReg.A1, vm.asm.addString("cause")); boxStr(VReg.A1);
+        vm.movImm64(VReg.A2, 0x7ffb000000000000n); // undefined
+        vm.call("_object_set");
+        // 置异常槽并 unwind
+        vm.lea(VReg.V0, "_exception_value");
+        vm.store(VReg.V0, 0, VReg.S2);
+        vm.lea(VReg.V0, "_exception_pending");
+        vm.movImm(VReg.V1, 1);
+        vm.store(VReg.V0, 0, VReg.V1);
+        vm.call("_throw_unwind"); // 不返回
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 16);
+    }
+
     // _js_set_length(value, n_int) -> undefined
     // [#63] arr.length = N 的赋值路径。运行时按值形态分派：
     //   - 数组(装箱 0x7FFE / 裸 TYPE_ARRAY=1)：N<=len 截断(只改长度域,余量保留),
     //     N>len 经 _array_ensure_cap 扩容后把 [len,N) 填 JS_UNDEFINED,再置长度=N。
+    //     过大展开(>16M差异)跳过确保容量与填充，仅设长度(稀数组语义)。
     //   - 其余(对象等)：回退设 "length" 属性(值转 JS number)。
     // 原先 arr.length=N 一律走 _object_set_ic 把数组当哈希对象写坏 → 段错误(#63 变体)。
     generateJsSetLength() {
@@ -737,6 +784,13 @@ export class SubscriptGenerator {
         vm.label("_js_set_length");
         vm.prologue(16, [VReg.S0, VReg.S1]);
         vm.mov(VReg.S1, VReg.A1); // n (裸整数)
+
+        // [RangeError] n < 0 或 n > 0xFFFFFFFF(2^32-1) → RangeError
+        vm.cmpImm(VReg.S1, 0);
+        vm.jlt("_js_set_length_range_err");
+        vm.movImm64(VReg.V0, 0xFFFFFFFFn);
+        vm.cmp(VReg.S1, VReg.V0);
+        vm.jgt("_js_set_length_range_err");
 
         // 按值形态判定是否为数组，取裸数组头到 S0
         vm.shrImm(VReg.V0, VReg.A0, 48);
@@ -777,6 +831,12 @@ export class SubscriptGenerator {
         vm.cmp(VReg.S1, VReg.V0);
         vm.jle("_js_set_length_set");      // n <= len：仅截断
         // n > len：扩容到 n，并把 [len, n) 填 undefined
+        // [huge expand] 差异 > 16M(0x1000000) → 跳过确保容量与填充，仅设长度(稀数组语义)，
+        // 避免超大长度赋值(如 [].length=4294967295)因分配循环超时/段错误。
+        vm.sub(VReg.V2, VReg.S1, VReg.V0); // V2 = n - len
+        vm.movImm(VReg.V3, 0x1000000);     // 16M cap
+        vm.cmp(VReg.V2, VReg.V3);
+        vm.jgt("_js_set_length_set");      // too large: skip fill
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S1);
         vm.call("_array_ensure_cap");
@@ -797,6 +857,14 @@ export class SubscriptGenerator {
 
         vm.label("_js_set_length_done");
         vm.movImm(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+
+        // RangeError: 无效数组长度
+        vm.label("_js_set_length_range_err");
+        vm.lea(VReg.A0, vm.asm.addString("Invalid array length"));
+        vm.call("_js_box_string");          // RET = 装箱堆串
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_throw_range_error");      // 不返回
         vm.epilogue([VReg.S0, VReg.S1], 16);
 
         // 回退：对象.length = n，设 "length" 属性(n 转 JS number)

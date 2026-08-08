@@ -1712,6 +1712,91 @@ export class ArrayGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
     }
 
+    // _array_spread_into_map(A0=arr, A1=src, A2=callback) -> RET=arr
+    // 把可迭代 src 的元素依次经 callback(el,i,arr) 映射后 _array_push 进 arr。
+    // A3=thisArg(可选,0 表示 undefined)。与 _array_spread_into 同循环结构,
+    // 但在 push 前调用 callback。用于 Array.from(iterator, mapFn) 的迭代+映射交叠。
+    generateArraySpreadIntoMap() {
+        const vm = this.vm;
+        const UNDEF = 0x7ffb000000000000n;
+        vm.label("_array_spread_into_map");
+        vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.mov(VReg.S0, VReg.A0); // arr
+        vm.mov(VReg.S1, VReg.A1); // src(boxed)
+        vm.mov(VReg.S2, VReg.A2); // callback
+
+        // Symbol.iterator 获取
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.A1, vm.asm.addString("Symbol.iterator"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.shrImm(VReg.V0, VReg.RET, 48);
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jne("_asimap_done");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_spread_call0");
+        vm.mov(VReg.S3, VReg.RET); // iter
+        vm.movImm(VReg.S4, 0);     // index
+
+        vm.label("_asimap_loop");
+        // nextfn = iter.next
+        vm.mov(VReg.A0, VReg.S3);
+        vm.lea(VReg.A1, vm.asm.addString("next"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.shrImm(VReg.V0, VReg.RET, 48);
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jne("_asimap_done");
+        // res = nextfn.call(iter)
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_spread_call0");
+        vm.mov(VReg.S5, VReg.RET); // res
+        // if done → exit
+        vm.mov(VReg.A0, VReg.S5);
+        vm.lea(VReg.A1, vm.asm.addString("done"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S5);
+        vm.call("_maybe_getter");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_boolean");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_asimap_done");
+        // value = res.value
+        vm.mov(VReg.A0, VReg.S5);
+        vm.lea(VReg.A1, vm.asm.addString("value"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S5);
+        vm.call("_maybe_getter");
+        // mapped = callback(value, index, arr)
+        vm.mov(VReg.A0, VReg.RET); // value
+        vm.scvtf(0, VReg.S4);
+        vm.fmovToInt(VReg.A1, 0);  // index as number
+        vm.mov(VReg.A2, VReg.S0);  // arr
+        vm.mov(VReg.A3, VReg.S2);  // callback
+        vm.call("_aref_invoke_cb");
+        // push mapped
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_push");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.addImm(VReg.S4, VReg.S4, 1);
+        vm.jmp("_asimap_loop");
+
+        vm.label("_asimap_done");
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
+    }
+
     // [Stage A 内置方法引用] 蹦床:数组/字符串方法作一等值(`const f=arr.push`、
     // `arr.map`)是闭包 {magic@0=0xc105, fnptr@8=_aref_generic, helper@16=<运行时 helper 标签>}。
     // 经 `.call(recv,args)`/方法调用进入时:S0=裸闭包、A5=this(接收者)、A0-A4=用户实参。
@@ -1857,7 +1942,9 @@ export class ArrayGenerator {
         // 寄存器纪律:必须在 emitMaskLoad(V1) 前判 tag(x64 V1==RCX==A3,mask 装载
         // 会冲掉装箱 callback);scratch 只用 V0(入口无活 RET)与 V5(两后端均不
         // 别名 A0-A5),不碰已装好的回调实参 A0-A2。
+        // V5 暂存原始 tag(guard 期写入,后续 _aref_icb_bare 用其判 0x7FFD 不可调用)。
         vm.shrImm(VReg.V0, VReg.V6, 48);
+        vm.mov(VReg.V5, VReg.V0);        // V5 = 原始 tag
         vm.cmpImm(VReg.V0, 0x7FFF);
         vm.jeq("_aref_icb_callable");
         vm.cmpImm(VReg.V0, 0x7FFD);
@@ -1898,6 +1985,11 @@ export class ArrayGenerator {
         vm.load(VReg.V6, VReg.S0, 8);  // tramp 地址
         vm.jmp("_aref_icb_do");
         vm.label("_aref_icb_bare");
+        // [boxed-obj guard] magic 非 closure 且 type 非 proxy:若原 tag=0x7FFD 则不可调用。
+        // 此前 0x7FFD Object(如 new Object())经 _aref_icb_callable 通过后,在 bare 路被当
+        // 裸函数指针 callIndirect → 对堆对象头执行 → SIGBUS(arr.map(new Object()) 崩根因)。
+        vm.cmpImm(VReg.V5, 0x7FFD);
+        vm.jeq("_aref_icb_notfn");
         vm.movImm(VReg.S0, 0);          // 裸函数:无闭包
         vm.label("_aref_icb_do");
         vm.movImm64(VReg.A5, UNDEF);    // this = undefined
@@ -2126,7 +2218,9 @@ export class ArrayGenerator {
         vm.mov(VReg.V6, VReg.A4);
         // [C1] callback 可调用守卫,同 _aref_invoke_cb(x64 纪律:V1==A3 是回调实参 arr,
         // 绝不可作 scratch;tag 判在 mask 装载前,scratch 只用 V0/V5)。
+        // V5 暂存原始 tag,后续 _aref_icb4_bare 用其判 0x7FFD 不可调用。
         vm.shrImm(VReg.V0, VReg.V6, 48);
+        vm.mov(VReg.V5, VReg.V0);        // V5 = 原始 tag
         vm.cmpImm(VReg.V0, 0x7FFF);
         vm.jeq("_aref_icb4_callable");
         vm.cmpImm(VReg.V0, 0x7FFD);
@@ -2164,6 +2258,9 @@ export class ArrayGenerator {
         vm.load(VReg.V6, VReg.S0, 8);
         vm.jmp("_aref_icb4_do");
         vm.label("_aref_icb4_bare");
+        // [boxed-obj guard] 同 _aref_invoke_cb:非 closure/非 proxy 的 0x7FFD 对象不可调用。
+        vm.cmpImm(VReg.V5, 0x7FFD);
+        vm.jeq("_aref_icb4_notfn");
         vm.movImm(VReg.S0, 0);
         vm.label("_aref_icb4_do");
         vm.movImm64(VReg.A5, UNDEF);
@@ -3075,6 +3172,7 @@ export class ArrayGenerator {
         this.generateArefI3Methods();
         this.generateSpreadCall0();
         this.generateArraySpreadInto();
+        this.generateArraySpreadIntoMap();
         this.generateArrayEnsureCap();
         this.generateArrayPush();
         this.generateArrayPop();
