@@ -1568,6 +1568,11 @@ export const ExpressionCompiler = {
                     if (elem.argument.type === "Literal") {
                         return +elem.argument.value;
                     }
+                } else if (elem.type === "Identifier") {
+                    // 特殊标识符 NaN / Infinity / undefined
+                    if (elem.name === "NaN") return NaN;
+                    if (elem.name === "Infinity") return Infinity;
+                    if (elem.name === "undefined") return undefined;
                 }
                 return 0; // 默认值
             };
