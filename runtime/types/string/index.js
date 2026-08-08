@@ -3979,9 +3979,16 @@ export class StringGenerator {
         this._emitArgStrInline(VReg.S2, "_replaceAll_repl");   // [W-25] repl ToString
         this._emitArgStrInline(VReg.S1, "_replaceAll_search"); // [W-25] search 同上(与 indexOf 一致)
 
-        // [L3] RegExp detection: high16=0, in heap, type@0==8 -> regexp replace
+        // [L3] RegExp detection: two code paths:
+        //   (a) raw heap pointer with TYPE_REGEXP(8) — compiled-in RegExp literal
+        //   (b) boxed 0x7FFD object with __isRegExp truthy — new RegExp(...)
+        // Both delegate to _regexp_split + _array_join.
         const replaceAllNotRe = "_replaceAll_not_re";
+        const replaceAllReBox = "_replaceAll_re_box";
         vm.shrImm(VReg.V1, VReg.S1, 48);
+        vm.cmpImm(VReg.V1, 0x7FFD);
+        vm.jeq(replaceAllReBox);
+        // (a) raw heap pointer
         vm.cmpImm(VReg.V1, 0);
         vm.jne(replaceAllNotRe);
         vm.cmpImm(VReg.S1, 0);
@@ -3993,17 +4000,48 @@ export class StringGenerator {
         vm.loadByte(VReg.V1, VReg.S1, 0);
         vm.cmpImm(VReg.V1, 8); // TYPE_REGEXP
         vm.jne(replaceAllNotRe);
-        // RegExp path: str.split(re).join(repl) via _regexp_split + _array_join
+        // RegExp path: str.split(re).join(repl)
         vm.mov(VReg.A0, VReg.S0);
-        vm.call("_getStrContent");     // RET = str_ptr
-        vm.mov(VReg.S4, VReg.RET);     // S4 = str_ptr
-        vm.mov(VReg.A0, VReg.S1);      // A0 = re_ptr
-        vm.mov(VReg.A1, VReg.S4);      // A1 = str_ptr
-        vm.movImm64(VReg.A2, 0x7FFFFFFFn); // large limit (unused by _regexp_split)
-        vm.call("_regexp_split");      // RET = boxed array (0x7FFE)
-        vm.mov(VReg.A0, VReg.RET);     // A0 = boxed array
-        vm.mov(VReg.A1, VReg.S2);      // A1 = repl (already ToString'd)
-        vm.call("_array_join");        // RET = boxed result string
+        vm.call("_getStrContent");
+        vm.mov(VReg.S4, VReg.RET);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.movImm64(VReg.A2, 0x7FFFFFFFn);
+        vm.call("_regexp_split");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S2);
+        vm.call("_array_join");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 16);
+        // (b) boxed 0x7FFD object
+        vm.label(replaceAllReBox);
+        vm.push(VReg.S0); vm.push(VReg.S2);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.A1, vm.asm.addString("__isRegExp"));
+        vm.movImm64(VReg.V2, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V2);
+        vm.call("_object_get");
+        vm.cmpImm(VReg.RET, 0);
+        vm.pop(VReg.S2); vm.pop(VReg.S0);
+        vm.jeq(replaceAllNotRe);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.A1, vm.asm.addString("__pat"));
+        vm.movImm64(VReg.V2, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V2);
+        vm.call("_object_get");
+        vm.push(VReg.S3);
+        vm.mov(VReg.S3, VReg.RET); // S3 = boxed pattern
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_getStrContent");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S3);
+        vm.call("_getStrContent");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.movImm64(VReg.A2, 0x7FFFFFFFn);
+        vm.call("_regexp_split");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S2);
+        vm.call("_array_join");
+        vm.pop(VReg.S3);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 16);
         vm.label(replaceAllNotRe);
 
@@ -5489,9 +5527,15 @@ export class StringGenerator {
         vm.mov(VReg.S0, VReg.A0); // S0 = boxed this str
         vm.mov(VReg.S1, VReg.A1); // S1 = search value
 
-        // Detect RegExp (raw heap ptr with type@0==8)
+        // [L3] Detect RegExp: two code paths:
+        //   (a) raw heap pointer with TYPE_REGEXP(8)
+        //   (b) boxed 0x7FFD object with __isRegExp truthy
         const noRe = "_sma_nore";
+        const reBox = "_sma_rebox";
         vm.shrImm(VReg.V0, VReg.S1, 48);
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jeq(reBox);
+        // (a) raw heap pointer
         vm.cmpImm(VReg.V0, 0);
         vm.jne(noRe);
         vm.cmpImm(VReg.S1, 0);
@@ -5503,7 +5547,36 @@ export class StringGenerator {
         vm.loadByte(VReg.V1, VReg.S1, 0);
         vm.cmpImm(VReg.V1, 8); // TYPE_REGEXP
         vm.jne(noRe);
+        // (b) boxed 0x7FFD object: check __isRegExp, extract __pat
+        vm.label(reBox);
+        vm.push(VReg.S0);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.A1, vm.asm.addString("__isRegExp"));
+        vm.movImm64(VReg.V2, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V2);
+        vm.call("_object_get");
+        vm.cmpImm(VReg.RET, 0);
+        vm.pop(VReg.S0);
+        vm.jeq(noRe);
+        vm.push(VReg.S0);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.A1, vm.asm.addString("__pat"));
+        vm.movImm64(VReg.V2, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V2);
+        vm.call("_object_get");
+        vm.mov(VReg.S1, VReg.RET); // S1 = boxed pattern (will be raw ptr below)
+        vm.pop(VReg.S0);
 
+        // Normalize: for boxed RegExp path (b), S1 is boxed pattern; unbox to raw ptr.
+        // For raw ptr path (a), S1 is already a raw RegExp pointer.
+        // _regexp_search takes (pattern_ptr, str_at_pos), so a raw pattern ptr is needed.
+        vm.shrImm(VReg.V0, VReg.S1, 48);
+        vm.cmpImm(VReg.V0, 0x7FFC);
+        vm.jne("_sma_re_have_ptr");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_getStrContent");
+        vm.mov(VReg.S1, VReg.RET); // S1 = raw pattern ptr
+        vm.label("_sma_re_have_ptr");
         // -- RegExp path: delegate to _str_match iterating each position --
         // For simplicity, create result array, loop calling _str_substring_raw.
         vm.mov(VReg.A0, VReg.S0);
