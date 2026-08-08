@@ -464,12 +464,12 @@ export class JSValueGenerator {
         vm.jeq("_js_typeof_function");
         // [bug1] 其余落在堆范围内的「裸」指针（Map=4/Set=5 等未 NaN-box 的堆对象，
         //  高16=0）typeof 应为 "object"，否则会被下方 double 判断误判为 "number"。
-        //  以 type@0 ∈ [1, 0x61] 为有效堆对象守卫（覆盖 Array=1 .. BigInt=14、
-        //  TYPE_FLOAT64=29 等中间类型、TypedArray 0x40-0x61），
+        //  以 type@0 ∈ [1, 0x7f] 为有效堆对象守卫（覆盖 Array=1 .. BigInt=14、
+        //  TYPE_FLOAT64=29 等中间类型、TypedArray 0x40-0x7f），
         //  规避真·微小 double 别名进堆区被误判（其 type@0 极少落在这些区间）。
         vm.cmpImm(VReg.V1, 1);
         vm.jb("_js_typeof_notclass");
-        vm.cmpImm(VReg.V1, 0x61);
+        vm.cmpImm(VReg.V1, 0x7f);
         vm.jbe("_js_typeof_object");
         vm.label("_js_typeof_notclass");
 
@@ -720,6 +720,17 @@ export class JSValueGenerator {
         vm.jeq("_thi_sentinel");
         vm.jmp("_thi_throw");
         vm.label("_thi_check_raw");
+        // Compiler sentinel values: 1=Array, 2=Object, 3=Function.
+        // These are raw small integers used by the compiler to identify
+        // built-in constructors; _instanceof dispatches them correctly.
+        // Without this, `x instanceof Function` throws TypeError because
+        // the sentinel 3 is not a valid heap pointer.
+        vm.cmpImm(VReg.S2, 1);
+        vm.jeq("_thi_sentinel");
+        vm.cmpImm(VReg.S2, 2);
+        vm.jeq("_thi_sentinel");
+        vm.cmpImm(VReg.S2, 3);
+        vm.jeq("_thi_sentinel");
         vm.cmpImm(VReg.V0, 0x7FF8);                // high16 >= 0x7FF8 means NaN-boxed, not raw
         vm.jge("_thi_throw");
         // Raw heap pointer: validate in [heap_base, heap_ptr)

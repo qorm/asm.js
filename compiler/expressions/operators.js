@@ -1599,7 +1599,14 @@ export const OperatorCompiler = {
             this.vm.mov(VReg.A1, VReg.A0);         // A1 = key
             this.vm.mov(VReg.A0, VReg.V1);         // A0 = globalThis
             this.vm.call("_object_get");          // RET = found value or JS_UNDEFINED
-            // 3. 用 _object_get 结果调 _typeof
+            // 2.5 dispatch getter: if the value is a TYPE_GETTER block (accessor
+            // property defined via Object.defineProperties), call the getter to
+            // get the actual value. _maybe_getter(value, receiver) returns the
+            // getter result or the original value if not a getter.
+            this.vm.mov(VReg.A0, VReg.RET);        // A0 = value from _object_get
+            this.vm.mov(VReg.A1, VReg.V1);          // A1 = globalThis (receiver)
+            this.vm.call("_maybe_getter");          // RET = getter result or original value
+            // 3. call _js_typeof on the resolved value
             this.vm.mov(VReg.A0, VReg.RET);
             this.vm.call("_js_typeof");
             return;
