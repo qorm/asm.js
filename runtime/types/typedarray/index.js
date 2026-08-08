@@ -1105,10 +1105,11 @@ export class TypedArrayGenerator {
         vm.mov(VReg.A1, VReg.S0);
         vm.call("_array_join");
         vm.epilogue([VReg.S0], 0);
-        // _ta_indexof(ta, val) -> 首个 _strict_eq(elem, val) 为真的下标(裸 int),否则 -1。
+        // _ta_indexof(ta, val, fromIndex) -> 首个 _strict_eq(elem, val) 为真的下标(裸 int),否则 -1。
         // 直接逐元素比:_typed_array_get 返 canonical float,val 可能是 int 表示——_strict_eq
         // 实现 `===` 跨表示数值相等(6.0===6 为真),避 _array_indexOf 的位相等/装箱 Number 双路
         // 都不认 canonical-float 元素 vs int 搜索值的坑。(NaN 永不匹配,合 indexOf 语义。)
+        // A2 = fromIndex(裸 int,已由编译期/包装器归一)。负值加 len 后夹到 0 起步。
         const MASK = 0x0000ffffffffffffn;
         vm.label("_ta_indexof");
         vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
@@ -1116,7 +1117,16 @@ export class TypedArrayGenerator {
         vm.and(VReg.S0, VReg.A0, VReg.V1); // 裸 ta
         vm.load(VReg.S1, VReg.S0, 8);      // len
         vm.mov(VReg.S2, VReg.A1);          // val
-        vm.movImm(VReg.S3, 0);             // i
+        vm.mov(VReg.S3, VReg.A2);          // fromIndex(裸 int,缺省 0)
+        vm.cmpImm(VReg.S3, 0);
+        vm.jge("_ta_iof_start");
+        vm.add(VReg.S3, VReg.S3, VReg.S1); // fromIndex += len
+        vm.cmpImm(VReg.S3, 0);
+        vm.jge("_ta_iof_start");
+        vm.movImm(VReg.S3, 0);             // clamp to >= 0
+        vm.label("_ta_iof_start");
+        vm.cmp(VReg.S3, VReg.S1);          // fromIndex >= len → not found
+        vm.jge("_ta_iof_nf");
         vm.label("_ta_iof_loop");
         vm.cmp(VReg.S3, VReg.S1);
         vm.jge("_ta_iof_nf");
@@ -1133,14 +1143,24 @@ export class TypedArrayGenerator {
         vm.label("_ta_iof_nf");
         vm.movImm(VReg.RET, -1);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
-        // _ta_includes(ta, val) -> 裸 1(命中)/0(未命中)。同 _strict_eq 逐元素。
+        // _ta_includes(ta, val, fromIndex) -> 裸 1(命中)/0(未命中)。同 _strict_eq 逐元素。
+        // A2 = fromIndex(裸 int,已由编译期/包装器归一)。负值加 len 后夹到 0 起步。
         vm.label("_ta_includes");
         vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
         vm.movImm64(VReg.V1, MASK);
         vm.and(VReg.S0, VReg.A0, VReg.V1);
         vm.load(VReg.S1, VReg.S0, 8);
         vm.mov(VReg.S2, VReg.A1);
+        vm.mov(VReg.S3, VReg.A2);          // fromIndex(裸 int,缺省 0)
+        vm.cmpImm(VReg.S3, 0);
+        vm.jge("_ta_inc_start");
+        vm.add(VReg.S3, VReg.S3, VReg.S1); // fromIndex += len
+        vm.cmpImm(VReg.S3, 0);
+        vm.jge("_ta_inc_start");
         vm.movImm(VReg.S3, 0);
+        vm.label("_ta_inc_start");
+        vm.cmp(VReg.S3, VReg.S1);          // fromIndex >= len → not found
+        vm.jge("_ta_inc_nf");
         vm.label("_ta_inc_loop");
         vm.cmp(VReg.S3, VReg.S1);
         vm.jge("_ta_inc_nf");
@@ -2144,6 +2164,7 @@ export class TypedArrayGenerator {
         wrap("_tam_toString", joinComma);
         wrap("_tam_toLocaleString", joinComma);
         wrap("_tam_indexOf", () => {
+            argInt(VReg.S2, 0); vm.mov(VReg.A2, VReg.RET);
             vm.mov(VReg.A0, VReg.S0); vm.mov(VReg.A1, VReg.S1);
             vm.call("_ta_indexof");
             boxIntReg(VReg.RET);
@@ -2154,6 +2175,7 @@ export class TypedArrayGenerator {
             vm.call("_agen_lastIndexOf");
         });
         wrap("_tam_includes", () => {
+            argInt(VReg.S2, 0); vm.mov(VReg.A2, VReg.RET);
             vm.mov(VReg.A0, VReg.S0); vm.mov(VReg.A1, VReg.S1);
             vm.call("_ta_includes");
             boolify();
