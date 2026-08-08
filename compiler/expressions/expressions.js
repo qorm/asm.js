@@ -1716,6 +1716,15 @@ export const ExpressionCompiler = {
             vm.push(VReg.RET);
             this.compileExpression(args[0]);
             vm.mov(VReg.A1, VReg.RET);
+            // fromIndex:default 0;负值由运行时归一
+            if (args.length >= 2) {
+                vm.push(VReg.A1);
+                this.compileExpressionAsInt(args[1]);
+                vm.mov(VReg.A2, VReg.RET);
+                vm.pop(VReg.A1);
+            } else {
+                vm.movImm(VReg.A2, 0);
+            }
             vm.pop(VReg.A0);
             if (name === "indexOf") {
                 vm.call("_ta_indexof");
@@ -1883,8 +1892,10 @@ export const ExpressionCompiler = {
             vm.pop(VReg.A1);                      // A1 = callback(save)
             vm.pop(VReg.A0);                      // A0 = boxed ta
             vm.push(VReg.A1);                     // [sp] = callback(save across call)
-            vm.call("_ta_to_array");              // RET = boxed regular array
+            vm.mov(VReg.A0, VReg.A1);             // A0 = callback
+            vm.call("_ta_need_fn");               // validate callable(TypeError if not)
             vm.pop(VReg.A1);                      // A1 = callback(restore)
+            vm.call("_ta_to_array");              // RET = boxed regular array
             vm.mov(VReg.A0, VReg.RET);            // A0 = boxed arr
             vm.call("_array_forEach_rt");
             return true;
@@ -1902,8 +1913,10 @@ export const ExpressionCompiler = {
             vm.pop(VReg.A0);                      // A0 = boxed ta
             vm.push(VReg.V5);                     // [sp] = type byte(save across call)
             vm.push(VReg.A2);                     // [sp] = callback, [sp+8] = type byte
-            vm.call("_ta_to_array");              // RET = boxed regular array
+            vm.mov(VReg.A0, VReg.A2);             // A0 = callback
+            vm.call("_ta_need_fn");               // validate callable(TypeError if not)
             vm.pop(VReg.A1);                      // A1 = callback(restore)
+            vm.call("_ta_to_array");              // RET = boxed regular array
             vm.mov(VReg.A0, VReg.RET);            // A0 = boxed arr
             if (name === "flatMap") {
                 vm.call("_array_flatMap_rt");
@@ -1953,8 +1966,10 @@ export const ExpressionCompiler = {
             vm.pop(VReg.A1);                      // A1 = callback(save)
             vm.pop(VReg.A0);                      // A0 = boxed ta
             vm.push(VReg.A1);                     // [sp] = callback(save across call)
-            vm.call("_ta_to_array");
+            vm.mov(VReg.A0, VReg.A1);             // A0 = callback
+            vm.call("_ta_need_fn");               // validate callable(TypeError if not)
             vm.pop(VReg.A1);                      // A1 = callback(restore)
+            vm.call("_ta_to_array");
             vm.mov(VReg.A0, VReg.RET);
             vm.call(name === "some" ? "_array_some_rt" : "_array_every_rt");
             return true;
@@ -1968,6 +1983,7 @@ export const ExpressionCompiler = {
             if (args.length >= 2) {
                 this.compileExpression(args[1]);
                 vm.push(VReg.RET);                // [sp] = init, [sp+8] = callback, [sp+16] = boxed ta
+                vm.pop(VReg.A2);                  // A2 = init
             }
             if (args.length >= 2) {
                 vm.pop(VReg.A2);                  // A2 = init
@@ -1978,6 +1994,8 @@ export const ExpressionCompiler = {
             if (args.length >= 2) {
                 vm.push(VReg.A2);                 // [sp] = init, [sp+8] = callback
             }
+            vm.mov(VReg.A0, VReg.A1);             // A0 = callback
+            vm.call("_ta_need_fn");               // validate callable(TypeError if not)
             vm.call("_ta_to_array");
             vm.mov(VReg.A0, VReg.RET);            // A0 = boxed arr
             if (args.length >= 2) {
@@ -1999,8 +2017,10 @@ export const ExpressionCompiler = {
             vm.pop(VReg.A1);                      // A1 = callback(save)
             vm.pop(VReg.A0);                      // A0 = boxed ta
             vm.push(VReg.A1);                     // [sp] = callback(save across call)
-            vm.call("_ta_to_array");
+            vm.mov(VReg.A0, VReg.A1);             // A0 = callback
+            vm.call("_ta_need_fn");               // validate callable(TypeError if not)
             vm.pop(VReg.A1);                      // A1 = callback(restore)
+            vm.call("_ta_to_array");
             vm.mov(VReg.A0, VReg.RET);
             vm.call(name === "find" ? "_array_find_rt" : "_array_findIndex_rt");
             return true;
@@ -2013,6 +2033,10 @@ export const ExpressionCompiler = {
             vm.push(VReg.RET);                    // [sp] = callback, [sp+8] = boxed ta
             vm.pop(VReg.A1);                      // A1 = callback
             vm.pop(VReg.A0);                      // A0 = boxed ta
+            vm.mov(VReg.S1, VReg.A0);             // S1 = boxed ta(save across guard)
+            vm.mov(VReg.A0, VReg.A1);             // A0 = callback
+            vm.call("_ta_need_fn");               // validate callable(TypeError if not)
+            vm.mov(VReg.A0, VReg.S1);             // A0 = boxed ta(restore)
             vm.movImm(VReg.A2, name === "findLastIndex" ? 3 : 2); // mode:bit0=index,bit1=reverse
             vm.call("_tam_find_core");
             return true;

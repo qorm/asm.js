@@ -2031,10 +2031,12 @@ export class ArrayGenerator {
 
         // arr.forEach(cb):A0=arr(boxed), A1=callback → undefined。逐元素调 cb(element, i, arr)。
         // GC:arr/cb 存 callee-saved(prologue 落栈,GC 扫栈可见);i/length 是裸 int;无增长结果。
+        // _array_forEach_rt(A0=arr, A1=cb, A2=origRecv?0)
         vm.label("_array_forEach_rt");
-        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
         vm.mov(VReg.S0, VReg.A0); // arr(boxed)
         vm.mov(VReg.S1, VReg.A1); // callback
+        vm.mov(VReg.S4, VReg.A2); // origRecv(0=arr)
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_array_length");
         vm.mov(VReg.S2, VReg.RET); // length(裸 int)
@@ -2048,21 +2050,28 @@ export class ArrayGenerator {
         vm.mov(VReg.A0, VReg.RET); // arg0 = element
         vm.scvtf(0, VReg.S3);
         vm.fmovToInt(VReg.A1, 0);  // arg1 = 装箱 index
-        vm.mov(VReg.A2, VReg.S0);  // arg2 = arr
+        // 第三参:优先用原始 receiver(泛型 .call 保留身份),否则用数组自身。
+        vm.mov(VReg.A2, VReg.S4);
+        vm.cmpImm(VReg.A2, 0);
+        vm.jne("_fe_cb_has_orig");
+        vm.mov(VReg.A2, VReg.S0);  // 兜底:数组自身
+        vm.label("_fe_cb_has_orig");
         vm.mov(VReg.A3, VReg.S1);  // callback
         vm.call("_aref_invoke_cb");
         vm.addImm(VReg.S3, VReg.S3, 1);
         vm.jmp("_fe_loop");
         vm.label("_fe_done");
         vm.movImm64(VReg.RET, UNDEF);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
 
         // arr.map(cb) → 新数组[cb(el,i,arr)]。结果(S4)存 callee-saved(落栈,GC 扫栈可见);
         // _array_push 可能重分配 data 区、返回新头,故每轮回写 S4。
+        // _array_map_rt(A0=arr, A1=cb, A2=origRecv?0)
         vm.label("_array_map_rt");
-        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
         vm.mov(VReg.S0, VReg.A0);
         vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.S5, VReg.A2); // origRecv(0=arr)
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_array_length");
         vm.mov(VReg.S2, VReg.RET);
@@ -2522,20 +2531,26 @@ export class ArrayGenerator {
             const target = _cb2Fast[ci][1];
             const fastLabel = _cb2Fast[ci][2];
             vm.label(label);
-            vm.prologue(0, [VReg.S0]);
-            vm.mov(VReg.S0, VReg.A1);
+            vm.prologue(0, [VReg.S0, VReg.S1]);
+            vm.mov(VReg.S1, VReg.A0); // S1 = original receiver
+            vm.mov(VReg.S0, VReg.A1); // S0 = cb
             vm.shrImm(VReg.V0, VReg.A0, 48);
             vm.cmpImm(VReg.V0, 0x7FFE);
             vm.jne(fastLabel);
+            // true array: origRecv=A2=0 (redundant, _rt uses arr as cb recv)
             vm.mov(VReg.A1, VReg.S0);
+            vm.movImm(VReg.A2, 0);
             vm.call(target);
-            vm.epilogue([VReg.S0], 0);
+            vm.epilogue([VReg.S0, VReg.S1], 0);
             vm.label(fastLabel);
+            // non-array: normalize for element access, keep orig as A2 for cb recv
+            vm.mov(VReg.A0, VReg.S1);
             vm.call("_agen_norm");
-            vm.mov(VReg.A0, VReg.RET);
-            vm.mov(VReg.A1, VReg.S0);
+            vm.mov(VReg.A0, VReg.RET);  // A0 = normalized array
+            vm.mov(VReg.A1, VReg.S0);   // A1 = cb
+            vm.mov(VReg.A2, VReg.S1);   // A2 = original receiver
             vm.call(target);
-            vm.epilogue([VReg.S0], 0);
+            vm.epilogue([VReg.S0, VReg.S1], 0);
         }
 
         // 回调+seed 三参(recv, cb, seed):reduce/reduceRight
