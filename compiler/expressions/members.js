@@ -876,6 +876,7 @@ export const MemberCompiler = {
         const _bra2 = BUILTIN_REF_ARITY[slotKey];
         if (typeof propName === "string" && typeof _bra2 === "number") {
             this.vm.mov(VReg.S0, VReg.RET); // preserve across _alloc in setter calls
+            // Set .name with correct descriptor (writable:false, enumerable:false, configurable:true)
             this.vm.mov(VReg.A0, VReg.S0);
             this.emitBoxedStringKey("name", VReg.A1);
             this.vm.lea(VReg.A2, this.asm.addString(propName));
@@ -883,11 +884,20 @@ export const MemberCompiler = {
             this.vm.or(VReg.A2, VReg.A2, VReg.V1);
             this.vm.call("_closure_prop_set");
             this.vm.mov(VReg.A0, VReg.S0);
+            this.emitBoxedStringKey("name", VReg.A1);
+            this.vm.movImm(VReg.A2, BUILTIN_PROP_ATTR);
+            this.vm.call("_closure_prop_set_attr");
+            // Set .length with correct descriptor (writable:false, enumerable:false, configurable:true)
+            this.vm.mov(VReg.A0, VReg.S0);
             this.emitBoxedStringKey("length", VReg.A1);
             this.vm.movImm(VReg.A2, _bra2);
             this.vm.scvtf(0, VReg.A2);
             this.vm.fmovToInt(VReg.A2, 0);
             this.vm.call("_closure_prop_set");
+            this.vm.mov(VReg.A0, VReg.S0);
+            this.emitBoxedStringKey("length", VReg.A1);
+            this.vm.movImm(VReg.A2, BUILTIN_PROP_ATTR);
+            this.vm.call("_closure_prop_set_attr");
             this.vm.mov(VReg.RET, VReg.S0); // restore closure
         }
         this.vm.lea(VReg.V1, label);

@@ -117,6 +117,8 @@ export const SYM_IDS = {
     _intToStr: 116, _is_symbol: 117, _array_spread_into: 118,
     // 数组 species 协议(concat/slice/map/filter 编译期内联引用)、泛型回退
     _array_species_check: 119, _agen_map: 120, _agen_filter: 121,
+    // 数组 splice species 协议 + 泛型回退
+    _agen_splice: 122, _array_splice_rt: 123,
 };
 
 // 宿主可变数据全局:引用它们须运行时取宿主地址(不可内联常量)。见 compileFragment

@@ -3188,6 +3188,62 @@ export class ArrayGenerator {
         vm.call("_array_concat_rt");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 32);
 
+        // splice 泛型:_agen_splice(A0=recv, A1=start boxed, A2=delCount boxed, A3=itemsArr boxed)
+        // -> removed array(boxed)。norm 后委托 _array_splice_rt(读 _call_argc 得实参)。
+        vm.label("_agen_splice");
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.S2, VReg.A2);
+        vm.mov(VReg.S3, VReg.A3);
+        vm.call("_agen_norm");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.mov(VReg.A3, VReg.S3);
+        vm.call("_array_splice_rt");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
+
+        // 运行时 splice:从实参归一化后委托 _array_splice。
+        // A0=recv(boxed), A1-A3=实参(boxed),items 从 _call_argc 的 argc-3 取。
+        // A1(start)/A2(delCount) → _to_int32 归一化为裸 int；A3(itemsArr) → unbox 为裸指针。
+        vm.label("_array_splice_rt");
+        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.mov(VReg.S0, VReg.A0);          // recv
+        // start → int32
+        vm.mov(VReg.A0, VReg.A1);
+        vm.call("_to_int32");
+        vm.mov(VReg.S1, VReg.RET);          // start(raw int)
+        // delCount → int32; sentinel (undefined/0) → 大哨兵
+        vm.mov(VReg.A0, VReg.A2);
+        vm.shrImm(VReg.V0, VReg.A2, 48);
+        vm.cmpImm(VReg.V0, 0x7FFB);        // undefined
+        vm.jeq("_sprt_del_max");
+        vm.call("_to_int32");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jge("_sprt_del_ok");
+        vm.label("_sprt_del_max");
+        vm.movImm(VReg.RET, 0x7fffffff);
+        vm.label("_sprt_del_ok");
+        vm.mov(VReg.S2, VReg.RET);          // delCount(raw int)
+        // itemsArr → unbox to raw
+        vm.cmpImm(VReg.A3, 0);
+        vm.jne("_sprt_items_unbox");
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.mov(VReg.S3, VReg.RET);
+        vm.jmp("_sprt_go");
+        vm.label("_sprt_items_unbox");
+        vm.mov(VReg.A0, VReg.A3);
+        vm.call("_js_unbox");
+        vm.mov(VReg.S3, VReg.RET);          // itemsArr(raw)
+        vm.label("_sprt_go");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.mov(VReg.A3, VReg.S3);
+        vm.call("_array_splice");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 16);
+
         // 迭代器泛型:_agen_<kind>(A0=recv) -> norm 后 _array_iterator_new(norm, kind)。
         const agenIt = [["_agen_values", 0], ["_agen_keys", 1], ["_agen_entries", 2]];
         for (const [label, kind] of agenIt) {
@@ -3687,16 +3743,26 @@ export class ArrayGenerator {
         vm.label("_is_concat_spreadable");
         vm.prologue(0, [VReg.S0, VReg.S1]);
 
-        // Step 1: Type(O) is not Object → false (primitives: number/boolean/string/null/undefined)
+        // Step 1: Type(O) is not Object → false
+        // Only heap objects (0x7FFD/0x7FFE/0x7FFF) and bare heap pointers are objects.
+        // Tagged primitives (boolean 0x7FF9, string 0x7FFC, null 0x7FFA, undefined 0x7FFB,
+        // int32 0x7FF8) are NOT objects.
         vm.mov(VReg.S0, VReg.A0);
         vm.shrImm(VReg.V0, VReg.S0, 48);
         vm.cmpImm(VReg.V0, 0x7FFD); vm.jeq("_icsp_obj");
         vm.cmpImm(VReg.V0, 0x7FFE); vm.jeq("_icsp_obj");
         vm.cmpImm(VReg.V0, 0x7FFF); vm.jeq("_icsp_obj");
-        vm.cmpImm(VReg.V0, 0x7FF9); vm.jeq("_icsp_obj"); // Number/Boolean wrapper
-        vm.cmpImm(VReg.V0, 0x7FFC); vm.jeq("_icsp_obj"); // String object
-        vm.cmpImm(VReg.V0, 0); vm.jne("_icsp_false");    // bare pointer
-        vm.cmpImm(VReg.S0, 0); vm.jeq("_icsp_false");
+        vm.cmpImm(VReg.V0, 0); vm.jne("_icsp_false");    // tagged primitive → false
+        vm.cmpImm(VReg.S0, 0); vm.jeq("_icsp_false");    // null pointer
+        // bare heap pointer: verify in heap range
+        vm.lea(VReg.V1, "_heap_base");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.S0, VReg.V1);
+        vm.jlt("_icsp_false");
+        vm.lea(VReg.V1, "_heap_ptr");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.S0, VReg.V1);
+        vm.jge("_icsp_false");
         vm.jmp("_icsp_obj");
 
         // Step 2: spreadable = Get(O, @@isConcatSpreadable)
@@ -3706,11 +3772,9 @@ export class ArrayGenerator {
         vm.movImm64(VReg.V0, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.A1, VReg.V0);
         vm.call("_symbol_wellknown");
-        vm.mov(VReg.A1, VReg.RET);
-        vm.movImm64(VReg.V0, 0x7ffd000000000000n);
-        vm.or(VReg.A1, VReg.A1, VReg.V0);
-        vm.mov(VReg.A0, VReg.S0);
-        vm.call("_object_get");           // RET = O[@@isConcatSpreadable]
+        vm.mov(VReg.A1, VReg.RET);          // A1 = raw symbol pointer (tag 0)
+        vm.mov(VReg.A0, VReg.S0);           // A0 = original object value (boxed)
+        vm.call("_object_get");              // RET = O[@@isConcatSpreadable]
 
         // Step 3: If spreadable is not undefined, return ToBoolean(spreadable)
         vm.movImm64(VReg.V1, 0x7ffb000000000000n); // undefined

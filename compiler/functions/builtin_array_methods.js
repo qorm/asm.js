@@ -760,14 +760,35 @@ export const BuiltinArrayMethodCompiler = {
                 // arr.splice(start, delCount?, ...items) -> removed 数组(原地)。接收者已在 RET。
                 // start/delCount 编成裸 int(delCount 省略 → 大 sentinel,运行时钳到 len-start);
                 // ...items 编成 ArrayExpression 数组(真 arg 节点作 elements,gen2 安全)。
-                const id = this.nextLabelId();
-                const spArrOff = this.ctx.allocLocal(`__splice_arr_${id}`);
+                // [species] check this.constructor[Symbol.species]; propagate errors
+                const _spId = this.nextLabelId();
+                const _spSpecFb = this.ctx.newLabel("sp_spec_fb");
+                const _spSpecEnd = this.ctx.newLabel("sp_spec_done");
+                const _spRecvSp = this.ctx.allocLocal(`__sp_spec_r_${_spId}`);
+
+                // Save receiver (already in RET from compileExpression at line 203)
+                this.vm.store(VReg.FP, _spRecvSp, VReg.RET);
+
+                // tag guard: 非真数组(0x7FFE) → 跳过 species check,直落 _agen_splice
+                this.vm.load(VReg.V0, VReg.FP, _spRecvSp);
+                this.vm.shrImm(VReg.V0, VReg.V0, 48);
+                this.vm.cmpImm(VReg.V0, 0x7FFE);
+                this.vm.jne(_spSpecFb);
+
+                this.vm.load(VReg.A0, VReg.FP, _spRecvSp);
+                this.vm.call("_array_species_check");
+                this.vm.cmpImm(VReg.RET, 0);
+                this.vm.jne(_spSpecFb);
+
+                // fast path: default species
+                this.vm.load(VReg.RET, VReg.FP, _spRecvSp);
+                const spArrOff = this.ctx.allocLocal(`__splice_arr_${_spId}`);
                 this.vm.store(VReg.FP, spArrOff, VReg.RET);
-                const spStartOff = this.ctx.allocLocal(`__splice_start_${id}`);
+                const spStartOff = this.ctx.allocLocal(`__splice_start_${_spId}`);
                 if (args.length > 0) { this.compileExpressionAsInt(args[0]); }
                 else { this.vm.movImm(VReg.RET, 0); }
                 this.vm.store(VReg.FP, spStartOff, VReg.RET);
-                const spDelOff = this.ctx.allocLocal(`__splice_del_${id}`);
+                const spDelOff = this.ctx.allocLocal(`__splice_del_${_spId}`);
                 if (args.length > 1) { this.compileExpressionAsInt(args[1]); }
                 else { this.vm.movImm(VReg.RET, 0x7fffffff); } // 省略 delCount → 删到尾
                 this.vm.store(VReg.FP, spDelOff, VReg.RET);
@@ -778,6 +799,37 @@ export const BuiltinArrayMethodCompiler = {
                 this.vm.load(VReg.A1, VReg.FP, spStartOff);
                 this.vm.load(VReg.A2, VReg.FP, spDelOff);
                 this.vm.call("_array_splice");
+                this.vm.jmp(_spSpecEnd);
+
+                // fallback: non-default species -> _agen_splice
+                this.vm.label(_spSpecFb);
+                this.vm.load(VReg.A0, VReg.FP, _spRecvSp);
+                // compile start/delCount as args[0]/args[1] on stack
+                if (args.length >= 1) {
+                    this.compileExpression(args[0]);
+                    this.vm.mov(VReg.A1, VReg.RET);
+                    if (args.length >= 2) {
+                        this.compileExpression(args[1]);
+                        this.vm.mov(VReg.A2, VReg.RET);
+                    } else {
+                        this.vm.movImm64(VReg.A2, 0x7ffc000000000007n); // sentinel via tagged
+                    }
+                } else {
+                    this.vm.movImm64(VReg.A1, 0x7ff8000000000000n);
+                    this.vm.movImm64(VReg.A2, 0x7ffc000000000007n);
+                }
+                // items args: save to A3 context
+                if (args.length >= 3) {
+                    const _spCtxOff = this.ctx.allocLocal(`__sp_ctx_${_spId}`);
+                    this.compileExpression({ type: "ArrayExpression", elements: args.slice(2) });
+                    this.vm.store(VReg.FP, _spCtxOff, VReg.RET);
+                    this.vm.load(VReg.A3, VReg.FP, _spCtxOff);
+                } else {
+                    this.vm.movImm(VReg.A3, 0);
+                }
+                this.vm.call("_agen_splice");
+
+                this.vm.label(_spSpecEnd);
                 break;
             }
             case "toSpliced": {
@@ -1192,6 +1244,25 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.call("_subscript_get");
         this.vm.store(VReg.FP, bOffset, VReg.RET);
 
+        // [sort stability] undefined elements (0x7FFB) are sorted to end per ES2019+.
+        // a is undefined → swap (move undefined right), unless b is also undefined.
+        const swapLabel = this.ctx.newLabel("sort_swap");
+        const chkUndef = this.ctx.newLabel("sort_chk_undef");
+        this.vm.movImm64(VReg.V3, 0x7ffb000000000000n);
+        this.vm.load(VReg.V4, VReg.FP, aOffset);
+        this.vm.cmp(VReg.V4, VReg.V3);
+        this.vm.jne(chkUndef);
+        // a is undefined → move right unless b is also undefined
+        this.vm.load(VReg.V4, VReg.FP, bOffset);
+        this.vm.cmp(VReg.V4, VReg.V3);
+        this.vm.jeq(noSwap);   // both undefined, stay
+        this.vm.jmp(swapLabel); // a undefined, b not → swap
+        this.vm.label(chkUndef);
+        // b is undefined → keep it at right
+        this.vm.load(VReg.V4, VReg.FP, bOffset);
+        this.vm.cmp(VReg.V4, VReg.V3);
+        this.vm.jeq(noSwap);   // b undefined, don't move it left
+
         // cmp = comparator(a, b)
         this.vm.load(VReg.V6, VReg.FP, cbOffset);
         this.vm.push(VReg.V6);
@@ -1207,6 +1278,7 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.cmpImm(VReg.RET, 0);
         this.vm.jle(noSwap); // <= 0：不交换
 
+        this.vm.label(swapLabel);
         // 交换 arr[j] <-> arr[j+1]
         this.vm.load(VReg.A0, VReg.FP, arrOffset);
         this.vm.load(VReg.A1, VReg.FP, jOffset);
@@ -1306,6 +1378,23 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.call("_subscript_get");
         this.vm.store(VReg.FP, bOffset, VReg.RET);
 
+        // [sort stability] undefined elements (0x7FFB) are sorted to end per ES2019+.
+        // a is undefined → swap (move undefined right), unless b is also undefined.
+        const dswapLabel = this.ctx.newLabel("dsort_swap");
+        const dchkUndef = this.ctx.newLabel("dsort_chk_undef");
+        this.vm.movImm64(VReg.V3, 0x7ffb000000000000n);
+        this.vm.load(VReg.V4, VReg.FP, aOffset);
+        this.vm.cmp(VReg.V4, VReg.V3);
+        this.vm.jne(dchkUndef);
+        this.vm.load(VReg.V4, VReg.FP, bOffset);
+        this.vm.cmp(VReg.V4, VReg.V3);
+        this.vm.jeq(noSwap);   // both undefined, stay
+        this.vm.jmp(dswapLabel); // a undefined, b not → swap
+        this.vm.label(dchkUndef);
+        this.vm.load(VReg.V4, VReg.FP, bOffset);
+        this.vm.cmp(VReg.V4, VReg.V3);
+        this.vm.jeq(noSwap);   // b undefined, don't move it left
+
         // sa = box(ToString(a))  —— 稳定堆串
         this.vm.load(VReg.A0, VReg.FP, aOffset);
         this.vm.call("_valueToStr");
@@ -1328,6 +1417,7 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.cmpImm(VReg.RET, 0);
         this.vm.jle(noSwap);
 
+        this.vm.label(dswapLabel);
         // 交换 arr[j] <-> arr[j+1]
         this.vm.load(VReg.A0, VReg.FP, arrOffset);
         this.vm.load(VReg.A1, VReg.FP, jOffset);
