@@ -6,6 +6,5 @@
     "run": true,
     "stdout": "[ 2, 4, 6 ] true 3\n[ 10, 15, 20 ] true 3\ntrue false\nfalse 2",
     "exitCode": 0
-  },
-  "knownFailure": "Pre-existing failure - not in current task scope"
+  }
 }

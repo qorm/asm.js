@@ -1760,11 +1760,16 @@ export class CoercionGenerator {
         // 但**字面量 NaN**(members.js 发真 IEEE NaN 位 0x7FF0…01,高16=0x7FF0<0x7FF8)
         // 落"原始 double"区,不被 INT32_BASE(0x7FF8)捕获 → 此前误判 truthy
         // (`NaN?:`/`Boolean(NaN)`/`if(NaN)`/`NaN||x` 全错;computed NaN=0x7FF8 侥幸对)。
-        // 修:对高16<0x7FF8 的原始 double 做自反 fcmp,NaN(不等自身)→ falsy。
-        // Infinity/有限数自反相等 → 不误判;NaN-boxed 标记值(>=0x7FF8)不走此路。
+        // 修:用无符号区间判断 tagged=[0x7FF8,0x7FFF](跳过),其余(含正/负 NaN、正/负有限数、
+        // Infinity、-0)做自反 fcmp,NaN(不等自身)→ falsy。
+        // Infinity/有限数自反相等 → 不误判;NaN-boxed 标记值(在区间内)不走此路。
         vm.shrImm(VReg.V0, VReg.S0, 48);
         vm.cmpImm(VReg.V0, 0x7FF8);
-        vm.jge("_to_bool_skip_nan");
+        vm.jb("_to_bool_check_nan");      // unsigned < 0x7FF8 → positive float / NaN / +0
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.ja("_to_bool_check_nan");      // unsigned > 0x7FFF → negative float / -NaN / -Inf / -0
+        vm.jmp("_to_bool_skip_nan");
+        vm.label("_to_bool_check_nan");
         vm.fmovToFloat(0, VReg.S0);
         vm.fcmp(0, 0);
         vm.jnan(falsyLabel); // NaN → falsy
