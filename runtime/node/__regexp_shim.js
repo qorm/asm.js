@@ -304,14 +304,14 @@ function __re_uniResolve(name, value, hasEq) {
 }
 
 // Binary property name=value resolution: returns [tableIndex, valueNeg]
-// where valueNeg=1 if value is No, 0 if Yes.
-// Spec: only "Yes" and "No" are valid for binary property values.
+// where valueNeg=1 if value is No/N/False/F, 0 if Yes/Y/True/T.
+// ES spec allows all Unicode binary property value aliases.
 // Returns null if name is not a binary property or value is invalid.
 function __re_uniResolveBin(name, value) {
     var ti = __re_uniName(__RE_UN_BIN, name);
     if (ti < 0) return null;
-    if (value === "Yes") return [ti, 0];
-    if (value === "No") return [ti, 1];
+    if (value === "Y" || value === "Yes" || value === "T" || value === "True") return [ti, 0];
+    if (value === "N" || value === "No" || value === "F" || value === "False") return [ti, 1];
     return null;
 }
 
