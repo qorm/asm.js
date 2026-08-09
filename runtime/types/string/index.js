@@ -5605,6 +5605,8 @@ export class StringGenerator {
         vm.jlt("_sma_re_adv");
         // Found match at S0+V0
         vm.add(VReg.V0, VReg.S0, VReg.V0); // V0 = abs_idx
+        // Save abs_idx on stack before function calls clobber V0
+        vm.push(VReg.V0);
         // Extract: _str_substring_raw(str_ptr, abs_idx, abs_idx+1) -- use +1 as fallback
         vm.mov(VReg.A0, VReg.S2);
         vm.mov(VReg.A1, VReg.V0);
@@ -5624,6 +5626,7 @@ export class StringGenerator {
         vm.pop(VReg.S4); vm.pop(VReg.S3);
         vm.pop(VReg.S2); vm.pop(VReg.S1);
         vm.pop(VReg.S0);
+        vm.pop(VReg.V0);                    // restore abs_idx
         vm.addImm(VReg.S0, VReg.V0, 1); // advance past match start
         vm.jmp("_sma_re_loop");
         vm.label("_sma_re_adv");
