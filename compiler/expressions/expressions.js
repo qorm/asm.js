@@ -216,9 +216,32 @@ export const ExpressionCompiler = {
             const prop = expr.callee.property;
             if (obj.type === "Identifier" && obj.name === "Number" && prop.type === "Identifier") {
                 const subtypeName = prop.name;
-                const args = expr.arguments || [];
-                this.compileNumberSubtype(subtypeName, args);
-                return;
+                // Only route actual Number subtypes (Int8, Float64, etc.);
+                // non-subtypes like Number.parseInt must go through compileDynamicNew
+                // which throws "not a constructor" via the _aref_static_tramp guard.
+                const NUMBER_SUBTYPES = new Set([
+                    "Int", "Float", "Int8", "Int16", "Int32", "Int64",
+                    "Uint8", "Uint16", "Uint32", "Uint64",
+                    "Float16", "Float32", "Float64",
+                ]);
+                if (NUMBER_SUBTYPES.has(subtypeName)) {
+                    const args = expr.arguments || [];
+                    this.compileNumberSubtype(subtypeName, args);
+                    return;
+                }
+            }
+
+            // Number predicate functions (isFinite, isInteger, isNaN, isSafeInteger)
+            // are not constructable per ES spec. Same for Number.parseFloat/parseInt.
+            if (obj.type === "Identifier" && obj.name === "Number" && prop.type === "Identifier") {
+                const NON_CTOR_NUM_MEMBERS = new Set([
+                    "isFinite", "isInteger", "isNaN", "isSafeInteger",
+                    "parseFloat", "parseInt",
+                ]);
+                if (NON_CTOR_NUM_MEMBERS.has(prop.name)) {
+                    this.emitThrowTypeError(prop.name + " is not a constructor");
+                    return;
+                }
             }
 
             // 支持 new AST.Identifier(...)
