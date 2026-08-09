@@ -3320,12 +3320,16 @@ export const FunctionCompiler = {
                         this.vm.label(afIterL);
                         if (expr.arguments.length >= 2) {
                             // 有 mapFn: _array_spread_into_map(arr, src, callback, thisArg) 交叠迭代
+                            // [FIX arm64 A0/RET alias] _box_arr_r 的返回值在 RET(X0=arm64)=A0(X0) 中。
+                            // 下方 compileExpression(callback/thisArg) 写 RET 会同时覆盖 A0。
+                            // 先把装箱数组存到 FP 槽,等实参全部求值完再恢复到 A0。
                             this.vm.movImm(VReg.A0, 0);
                             this.vm.call("_array_new_with_size");
                             this.vm.call("_box_arr_r"); // box->helper
-                            this.vm.mov(VReg.A0, VReg.RET); // A0 = arr
+                            const afromArrSlot = this.ctx.allocLocal(`__afrom_iter_arr_${fid}`);
+                            this.vm.store(VReg.FP, afromArrSlot, VReg.RET); // 存装箱数组
                             this.vm.load(VReg.A1, VReg.FP, objOff); // A1 = src
-                            // 编译 callback(第 2 参)
+                            // 编译 callback(第 2 参) -- 写 RET=X0,arm64 会覆盖 A0
                             this.compileExpression(expr.arguments[1]);
                             this.vm.mov(VReg.A2, VReg.RET); // A2 = callback
                             // thisArg(第 3 参)
@@ -3335,6 +3339,7 @@ export const FunctionCompiler = {
                             } else {
                                 this.vm.movImm(VReg.A3, 0); // A3 = undefined
                             }
+                            this.vm.load(VReg.A0, VReg.FP, afromArrSlot); // 恢复 A0 = 装箱数组
                             this.vm.call("_array_spread_into_map"); // RET = 填充后的装箱数组
                             this.vm.store(VReg.FP, arrOff, VReg.RET);
                         } else {
@@ -3380,13 +3385,17 @@ export const FunctionCompiler = {
                         } else {
                             // 非数组:用 _array_spread_into_map 交叠迭代与映射。
                             // 此前 [...x] 先抽干迭代器再 map → 无限迭代器超时(Array.from(gen,fn) 崩根因)。
+                            // [FIX arm64 A0/RET alias] _box_arr_r 返回值在 RET(X0=arm64)=A0(X0)中。
+                            // 下方 compileExpression(fromArg/callback/thisArg) 写 RET 会同时覆盖 A0。
+                            // 先把装箱数组存到 FP 槽,等实参全部求值完再恢复到 A0。
                             this.vm.movImm(VReg.A0, 0);
                             this.vm.call("_array_new_with_size");
                             this.vm.call("_box_arr_r"); // box->helper
-                            this.vm.mov(VReg.A0, VReg.RET); // A0 = arr
-                            // 求值 src(一次)并留栈槽防二次求值
                             const fid = this.nextLabelId();
                             const srcOff = this.ctx.allocLocal(`__afromsrc_${fid}`);
+                            const afromSrcArrSlot = this.ctx.allocLocal(`__afrom_src_arr_${fid}`);
+                            this.vm.store(VReg.FP, afromSrcArrSlot, VReg.RET); // 存装箱数组
+                            // 求值 src(一次)并留栈槽防二次求值
                             this.compileExpression(fromArg);
                             this.vm.store(VReg.FP, srcOff, VReg.RET);
                             this.vm.mov(VReg.A1, VReg.RET); // A1 = src
@@ -3400,6 +3409,7 @@ export const FunctionCompiler = {
                             } else {
                                 this.vm.movImm(VReg.A3, 0); // A3 = undefined
                             }
+                            this.vm.load(VReg.A0, VReg.FP, afromSrcArrSlot); // 恢复 A0 = 装箱数组
                             this.vm.call("_array_spread_into_map"); // RET = 装箱数组
                         }
                     } else if (fromIsArray) {
