@@ -4759,15 +4759,13 @@ export const FunctionCompiler = {
                     if (expr.arguments.length === 1) {
                         this.vm.push(VReg.RET);
                         this.compileExpression(expr.arguments[0]);
-                        if (this.vm.backend.name === "x64") this.vm.mov(VReg.A0, VReg.RET);
-                        this.vm.call("_to_int32");
-                        this.vm.mov(VReg.A1, VReg.RET); // digits(裸 int)
+                        this.vm.mov(VReg.A1, VReg.RET); // digits(boxed JSValue; _aref_num_toFixed argIntOr 处理)
                         this.vm.pop(VReg.A0);
                     } else {
                         this.vm.mov(VReg.A0, VReg.RET);
-                        this.vm.movImm(VReg.A1, 0);
+                        this.vm.movImm64(VReg.A1, 0x7ffb000000000000n); // JS_UNDEFINED → argIntOr default 0
                     }
-                    this.vm.call("_num_toFixed");
+                    this.vm.call("_aref_num_toFixed");
                     return;
                 }
                 // forEach/keys/values/entries:数组/Set/Map 三者共有,unknown 接收者
