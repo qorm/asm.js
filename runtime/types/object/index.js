@@ -628,7 +628,14 @@ export class ObjectGenerator {
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.A1, VReg.V1);           // A1 = boxed "constructor"
         vm.mov(VReg.A2, VReg.S1);                   // A2 = boxed fn
-        vm.call("_object_set");
+        vm.call("_object_define");
+        // [descriptor] prototype.constructor must be non-enumerable per ES spec
+        vm.mov(VReg.A0, VReg.S0);                  // A0 = boxed proto
+        vm.lea(VReg.A1, vm.asm.addString("constructor"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);           // A1 = boxed "constructor"
+        vm.movImm(VReg.A2, 5);                      // attr=5: writable+configurable, not enumerable
+        vm.call("_object_set_prop_attr");
         // 4. fn.prototype = boxed prototype (via _closure_prop_set)
         vm.mov(VReg.A0, VReg.S1);                   // A0 = boxed fn
         vm.lea(VReg.A1, vm.asm.addString("prototype"));
