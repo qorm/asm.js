@@ -827,7 +827,24 @@ export class StringGenerator {
         vm.mov(VReg.S1, VReg.RET);
         vm.pop(VReg.A0); // targetLen
         vm.call("_syscall_arg"); // 归一化为整数
+        vm.cmpImm(VReg.RET, 0);
+        vm.jge(label + "_tl_ok");
+        vm.movImm(VReg.RET, 0); // ToLength: 负数/NaN → 0
+        vm.label(label + "_tl_ok");
         vm.mov(VReg.S3, VReg.RET);
+
+        // fillString 为空串(E21.1.3.15/16 step 7):返回原串
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_strlen");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne(label + "_fill_ok");
+        vm.mov(VReg.RET, VReg.S0);
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.RET, VReg.RET, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
+        vm.label(label + "_fill_ok");
 
         // S2 = 原串长度
         vm.mov(VReg.A0, VReg.S0);

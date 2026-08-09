@@ -2529,6 +2529,8 @@ export class ArrayGenerator {
             ["_agen_every", "_array_every_rt", "__agen_every_fast"],
             ["_agen_find", "_array_find_rt", "__agen_find_fast"],
             ["_agen_findIndex", "_array_findIndex_rt", "__agen_findIndex_fast"],
+            ["_agen_findLast", "_array_findLast_rt", "__agen_findLast_fast"],
+            ["_agen_findLastIndex", "_array_findLastIndex_rt", "__agen_findLastIndex_fast"],
             ["_agen_flatMap", "_array_flatMap_rt", "__agen_flatMap_fast"],
         ];
         for (let ci = 0; ci < _cb2Fast.length; ci++) {
@@ -2801,6 +2803,75 @@ export class ArrayGenerator {
         vm.movImm(VReg.S3, -1);
         vm.label("_findi_box");
         vm.scvtf(0, VReg.S3);      // 装箱数字(同静态派发出口)
+        vm.fmovToInt(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+
+        // arr.findLast(cb) -> 命中元素(boxed)或 undefined(反向遍历)。
+        vm.label("_array_findLast_rt");
+        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.mov(VReg.S0, VReg.A0); // arr
+        vm.mov(VReg.S1, VReg.A1); // cb
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_length");
+        vm.mov(VReg.S2, VReg.RET); // len
+        vm.subImm(VReg.S3, VReg.S2, 1); // i = len-1
+        vm.label("_findL_loop");
+        vm.cmpImm(VReg.S3, 0);
+        vm.jlt("_findL_undef");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_array_get");
+        vm.store(VReg.SP, 0, VReg.RET); // 跨回调保活
+        vm.mov(VReg.A0, VReg.RET);
+        vm.scvtf(0, VReg.S3);
+        vm.fmovToInt(VReg.A1, 0);
+        vm.mov(VReg.A2, VReg.S0);
+        vm.mov(VReg.A3, VReg.S1);
+        vm.call("_aref_invoke_cb");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_boolean");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_findL_found");
+        vm.subImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_findL_loop");
+        vm.label("_findL_found");
+        vm.load(VReg.RET, VReg.SP, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 16);
+        vm.label("_findL_undef");
+        vm.movImm64(VReg.RET, UNDEF);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 16);
+
+        // arr.findLastIndex(cb) -> 命中下标(装箱数字)或 -1(反向遍历)。
+        vm.label("_array_findLastIndex_rt");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_length");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.subImm(VReg.S3, VReg.S2, 1);
+        vm.label("_findLi_loop");
+        vm.cmpImm(VReg.S3, 0);
+        vm.jlt("_findLi_neg");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_array_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.scvtf(0, VReg.S3);
+        vm.fmovToInt(VReg.A1, 0);
+        vm.mov(VReg.A2, VReg.S0);
+        vm.mov(VReg.A3, VReg.S1);
+        vm.call("_aref_invoke_cb");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_boolean");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_findLi_box");
+        vm.subImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_findLi_loop");
+        vm.label("_findLi_neg");
+        vm.movImm(VReg.S3, -1);
+        vm.label("_findLi_box");
+        vm.scvtf(0, VReg.S3);
         vm.fmovToInt(VReg.RET, 0);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
 
