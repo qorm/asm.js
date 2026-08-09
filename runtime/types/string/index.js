@@ -2712,12 +2712,20 @@ export class StringGenerator {
 
     // _str_codepoint_at(str, rawByteOff) -> 装箱子串:该字节偏移处一个完整 UTF-8 码点
     // (1-4 字节)。仿 _str_charAt 但复制整码点。供 for-of/spread 按码点产出字符。
+    // [W-39] this-check + arg 归一:经 _aref_generic(.call) 传入时 A0/A1 均为装箱值,
+    // A1 为 float64 位模式而非裸 int,直接用作偏移 -> 地址越界 SIGSEGV。统一归一。
     generateStrCodepointAt() {
         const vm = this.vm;
         vm.label("_str_codepoint_at");
         vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
-        vm.mov(VReg.S0, VReg.A0); // str
-        vm.mov(VReg.S1, VReg.A1); // byteOff
+        this._emitThisStringCheck("codePointAt");
+        // 归一 byteOff:装箱值(_aref_generic 路径)或裸 int(静态派发路径)-> 整数
+        vm.mov(VReg.S2, VReg.A0); // preserve str across _syscall_arg call
+        vm.mov(VReg.A0, VReg.A1);
+        vm.call("_syscall_arg");
+        vm.mov(VReg.S1, VReg.RET); // byteOff (int)
+        vm.mov(VReg.A0, VReg.S2); // restore str
+        vm.mov(VReg.S0, VReg.A0); // S0 = str
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S1);
         vm.call("_str_cp_bytes");
