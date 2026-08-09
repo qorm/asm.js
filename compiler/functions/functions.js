@@ -3319,7 +3319,7 @@ export const FunctionCompiler = {
                         // 无限迭代器在 _array_spread_into 中循环超时。
                         this.vm.label(afIterL);
                         if (expr.arguments.length >= 2) {
-                            // 有 mapFn: _array_spread_into_map(arr, src, callback) 交叠迭代
+                            // 有 mapFn: _array_spread_into_map(arr, src, callback, thisArg) 交叠迭代
                             this.vm.movImm(VReg.A0, 0);
                             this.vm.call("_array_new_with_size");
                             this.vm.call("_box_arr_r"); // box->helper
@@ -3328,6 +3328,13 @@ export const FunctionCompiler = {
                             // 编译 callback(第 2 参)
                             this.compileExpression(expr.arguments[1]);
                             this.vm.mov(VReg.A2, VReg.RET); // A2 = callback
+                            // thisArg(第 3 参)
+                            if (expr.arguments.length >= 3) {
+                                this.compileExpression(expr.arguments[2]);
+                                this.vm.mov(VReg.A3, VReg.RET); // A3 = thisArg
+                            } else {
+                                this.vm.movImm(VReg.A3, 0); // A3 = undefined
+                            }
                             this.vm.call("_array_spread_into_map"); // RET = 填充后的装箱数组
                             this.vm.store(VReg.FP, arrOff, VReg.RET);
                         } else {
@@ -3386,6 +3393,13 @@ export const FunctionCompiler = {
                             // callback(第 2 参)
                             this.compileExpression(expr.arguments[1]);
                             this.vm.mov(VReg.A2, VReg.RET); // A2 = callback
+                            // thisArg(第 3 参)
+                            if (expr.arguments.length >= 3) {
+                                this.compileExpression(expr.arguments[2]);
+                                this.vm.mov(VReg.A3, VReg.RET); // A3 = thisArg
+                            } else {
+                                this.vm.movImm(VReg.A3, 0); // A3 = undefined
+                            }
                             this.vm.call("_array_spread_into_map"); // RET = 装箱数组
                         }
                     } else if (fromIsArray) {
