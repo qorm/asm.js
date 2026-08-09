@@ -569,7 +569,21 @@ export const BuiltinMethodCompiler = {
                     // limit>len 自然不截、limit=0 得空数组。此前忽略 limit(记偏差已消)。
                     const splitResSlot = this.ctx.allocLocal(`__splitres_${this.nextLabelId()}`);
                     this.vm.store(VReg.FP, splitResSlot, VReg.RET);
-                    this.compileExpressionAsInt(args[1]);
+                    this.compileExpression(args[1]);
+                    // limit===undefined → 无截断(ES 21.1.3.23 step 10: undefined → +Infinity)
+                    // _str_split 的 _split_ret 路径已设 constructor,跳过 slice 直接返回原结果。
+                    const splitDoSlice = this.ctx.newLabel(`__split_slice_${this.nextLabelId()}`);
+                    this.vm.movImm64(VReg.V1, 0x7ffb000000000000n);
+                    this.vm.cmp(VReg.RET, VReg.V1);
+                    this.vm.jne(splitDoSlice);
+                    // undefined: skip slice, RET = original _str_split result (constructor already set)
+                    const splitEnd = this.ctx.newLabel(`__split_end_${this.nextLabelId()}`);
+                    this.vm.load(VReg.RET, VReg.FP, splitResSlot);
+                    this.vm.jmp(splitEnd);
+                    // Defined limit: convert to uint32 and slice
+                    this.vm.label(splitDoSlice);
+                    if (this.vm.backend.name === "x64") this.vm.mov(VReg.A0, VReg.RET);
+                    this.vm.call("_to_uint32"); // ToUint32 per ES 21.1.3.23 step 9
                     const splitLimSlot = this.ctx.allocLocal(`__splitlim_${this.nextLabelId()}`);
                     this.vm.store(VReg.FP, splitLimSlot, VReg.RET);
                     this.vm.load(VReg.A0, VReg.FP, splitResSlot);
@@ -590,6 +604,7 @@ export const BuiltinMethodCompiler = {
                     this.vm.load(VReg.A2, VReg.V2, 0);
                     this.vm.call("_object_set");
                     this.vm.load(VReg.RET, VReg.FP, splitBoxedSlot);
+                    this.vm.label(splitEnd);
                 }
                 return true;
 
