@@ -373,6 +373,16 @@ export const ExpressionCompiler = {
                 this.emitThrowTypeError("Symbol is not a constructor");
                 break;
 
+            case "Math":
+                // Math is not a constructor. new Math() must throw TypeError.
+                this.emitThrowTypeError("Math is not a constructor");
+                break;
+
+            case "JSON":
+                // JSON is not a constructor. new JSON() must throw TypeError.
+                this.emitThrowTypeError("JSON is not a constructor");
+                break;
+
             // Number 子类型 - 整数
             case "Int8":
             case "Int16":
