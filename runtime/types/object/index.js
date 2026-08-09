@@ -6430,11 +6430,32 @@ export class ObjectGenerator {
         vm.lea(VReg.RET, "_js_true");
         vm.load(VReg.RET, VReg.RET, 0);
         vm.epilogue([], 0);
-        // 函数:未实现函数 freeze → 恒 false
+        // 函数:脱壳取裸指针,按堆对象同一布局检查 flags(与 _ifz_ds 同构)。
+        // 此前恒 false——函数虽未实现 freeze/seal(无 EXT_FROZEN 位),但至少应
+        // 按 non-extensible + 无自有属性判空对象等价,而非一律 false。
         vm.label("_ifz_fn");
-        vm.lea(VReg.RET, "_js_false");
-        vm.load(VReg.RET, VReg.RET, 0);
-        vm.epilogue([], 0);
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V0, VReg.A0, VReg.V1); // V0 = 裸函数指针
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_ifz_false");
+        vm.movImm64(VReg.V1, vm.ptrFloor);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jlt("_ifz_false");
+        vm.loadByte(VReg.V1, VReg.V0, 0);
+        // CLOSURE_MAGIC(0xc105)低字节 0x05 或 TYPE_FUNCTION(3)/TYPE_CLOSURE(3)
+        // 都不是 TYPE_OBJECT(2),但 flags 字节(offset 1)布局一致(classinfo 同)。
+        // 裸闭包 byte1=0xc1(无 EXT 位),安全对齐;非 classinfo 无真实 flags 皆 0。
+        vm.loadByte(VReg.V1, VReg.V0, 1);
+        vm.andImm(VReg.V3, VReg.V1, EXT_FROZEN);
+        vm.cmpImm(VReg.V3, 0);
+        vm.jne("_ifz_true");
+        vm.andImm(VReg.V3, VReg.V1, EXT_NONEXT);
+        vm.cmpImm(VReg.V3, 0);
+        vm.jeq("_ifz_false");
+        vm.load(VReg.V3, VReg.V0, 8); // count (classinfo 布局同 TYPE_OBJECT)
+        vm.cmpImm(VReg.V3, 0);
+        vm.jeq("_ifz_true");
+        vm.jmp("_ifz_false");
         vm.label("_ifz_ds");
         this._extGuard("_ifz2", "_ifz_true"); // 非 TYPE_OBJECT → true
         vm.loadByte(VReg.V1, VReg.V0, 1);
@@ -6475,11 +6496,26 @@ export class ObjectGenerator {
         vm.lea(VReg.RET, "_js_true");
         vm.load(VReg.RET, VReg.RET, 0);
         vm.epilogue([], 0);
-        // 函数:未实现函数 seal → 恒 false
+        // 函数:脱壳取裸指针,按堆对象同一布局检查 flags(与 _isl_ds 同构)。
         vm.label("_isl_fn");
-        vm.lea(VReg.RET, "_js_false");
-        vm.load(VReg.RET, VReg.RET, 0);
-        vm.epilogue([], 0);
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V0, VReg.A0, VReg.V1);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_isl_false");
+        vm.movImm64(VReg.V1, vm.ptrFloor);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jlt("_isl_false");
+        vm.loadByte(VReg.V1, VReg.V0, 1);
+        vm.andImm(VReg.V3, VReg.V1, EXT_SEALED);
+        vm.cmpImm(VReg.V3, 0);
+        vm.jne("_isl_true");
+        vm.andImm(VReg.V3, VReg.V1, EXT_NONEXT);
+        vm.cmpImm(VReg.V3, 0);
+        vm.jeq("_isl_false");
+        vm.load(VReg.V3, VReg.V0, 8); // count
+        vm.cmpImm(VReg.V3, 0);
+        vm.jeq("_isl_true");
+        vm.jmp("_isl_false");
         vm.label("_isl_ds");
         this._extGuard("_isl2", "_isl_true"); // 非 TYPE_OBJECT → true
         vm.loadByte(VReg.V1, VReg.V0, 1);
@@ -6956,6 +6992,18 @@ export class ObjectGenerator {
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.S0, VReg.A0, VReg.V1);  // S0 = raw obj
 
+        // ============ [dp-mix] data/accessor 冲突检测(全路径共享)============
+        // ES 6.1.7.1 ToPropertyDescriptor:不可同时设 data(value/writable) 与
+        // accessor(get/set)。此前仅 _dp_obj_ok 路径检测,_dp_legacy/_dp_array
+        // 路径盲写可能导致 accessor block 与 value 并存(语义混乱)。
+        vm.load(VReg.V0, VReg.SP, 8);                                  // mask
+        vm.andImm(VReg.V1, VReg.V0, DP_HAS_VALUE | DP_HAS_WRITABLE);   // data 位
+        vm.andImm(VReg.V2, VReg.V0, DP_HAS_GET | DP_HAS_SET);          // accessor 位
+        vm.cmpImm(VReg.V1, 0); vm.jeq("_dp_mix_ok");
+        vm.cmpImm(VReg.V2, 0); vm.jeq("_dp_mix_ok");
+        throwMsg("Invalid property descriptor: cannot both specify accessors and a value or writable attribute");
+        vm.label("_dp_mix_ok");
+
         // 类型字节守卫:仅普通对象(2)/classinfo(3)走强制路;数组(1)走 _dp_array
         // 专用路径(不落 _dp_legacy,后者 _object_define 读 offset 32 props_ptr 越
         // 数组 32B 头)。其余(Map/函数值侧表…)落 legacy 保持既有行为不回归。
@@ -6965,15 +7013,8 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.V1, 1); vm.jeq("_dp_array");
         vm.jmp("_dp_legacy");
 
-        // ============ ToPropertyDescriptor 验证 ============
+        // ============ ToPropertyDescriptor 验证(get/set 可调用性)============
         vm.label("_dp_obj_ok");
-        vm.load(VReg.V0, VReg.SP, 8);                                  // mask
-        vm.andImm(VReg.V1, VReg.V0, DP_HAS_VALUE | DP_HAS_WRITABLE);   // data 位
-        vm.andImm(VReg.V2, VReg.V0, DP_HAS_GET | DP_HAS_SET);          // accessor 位
-        vm.cmpImm(VReg.V1, 0); vm.jeq("_dp_nomix");
-        vm.cmpImm(VReg.V2, 0); vm.jeq("_dp_nomix");
-        throwMsg("Invalid property descriptor: cannot both specify accessors and a value or writable attribute");
-        vm.label("_dp_nomix");
         vm.load(VReg.V0, VReg.SP, 8);
         vm.andImm(VReg.V0, VReg.V0, DP_HAS_GET);
         vm.cmpImm(VReg.V0, 0); vm.jeq("_dp_noget");
@@ -7701,7 +7742,10 @@ export class ObjectGenerator {
         vm.mov(VReg.S1, VReg.RET);
         // [W-22] 函数值(0x7FFF)在脱壳解引用**之前**分流:函数不是对象块,下方按对象头读
         // 类型字节必然不等 TYPE_OBJECT → 恒 undefined(见 _ogopd_fn)。
+        // [string prim] 字符串原语(0x7FFC):包装成 String 对象查自有属性(length / 字符索引)。
         vm.shrImm(VReg.V1, VReg.S0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFC);
+        vm.jeq("_ogopd_string");
         vm.cmpImm(VReg.V1, 0x7FFF);
         vm.jeq("_ogopd_fn");
         vm.emitMaskLoad(VReg.V1);
@@ -7826,6 +7870,78 @@ export class ObjectGenerator {
         vm.label("_ogopd_data_en");
         this._emitDescSetBool(0, "enumerable", 32, ATTR_ENUMERABLE);
         this._emitDescSetBool(0, "configurable", 32, ATTR_CONFIGURABLE);
+        vm.load(VReg.RET, VReg.SP, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
+
+        // ===== [string prim] 字符串原语包装:String 对象自有属性 =====
+        // S0 = 装箱字符串(0x7FFC), S1 = 归一装箱键。原语无堆块,不脱壳解引用;
+        // 直接取内容长度与字符。ES:String 异质对象有两个自有:"length"(数据,
+        // writable:false,enumerable:false,configurable:false)和规范数值索引字符
+        // (数据,writable:false,enumerable:true,configurable:false,0<=idx<len)。
+        vm.label("_ogopd_string");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_getStrContent"); // RET = 内容指针(裸指针,非装箱)
+        vm.mov(VReg.S2, VReg.RET);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_strlen");        // RET = 字符串长度(int)
+        vm.mov(VReg.S3, VReg.RET);
+        // 仅处理装箱字符串键(0x7FFC);symbol 键在字符串原语上无自有属性
+        vm.shrImm(VReg.V1, VReg.S1, 48);
+        vm.cmpImm(VReg.V1, 0x7FFC);
+        vm.jne("_ogopd_undef");
+        // 匹配 "length"
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_getStrContent");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, vm.asm.addString("length"));
+        vm.call("_strcmp");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_ogopd_str_length");
+        // 试规范数值索引
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_canonical_array_index"); // RET = 索引(int) 或 -1
+        vm.mov(VReg.S4, VReg.RET);
+        vm.cmpImm(VReg.S4, -1);
+        vm.jeq("_ogopd_undef");
+        vm.cmp(VReg.S4, VReg.S3);
+        vm.jge("_ogopd_undef"); // idx >= len → 不存在
+        // 取字符:内容[idx] 的 1 字节 → 装箱成 1 字符字符串
+        vm.loadByte(VReg.V0, VReg.S2, VReg.S4);
+        vm.movImm(VReg.A0, 2); // 分配 2 字节("X\0")
+        vm.call("_alloc");
+        vm.storeByte(VReg.RET, 0, VReg.V0);
+        vm.movImm(VReg.V1, 0);
+        vm.storeByte(VReg.RET, 1, VReg.V1); // 空终止
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_js_box_string");     // RET = 装箱 1-字符
+        vm.mov(VReg.S5, VReg.RET);
+        // 构建描述符 {value: char, writable:false, enumerable:true, configurable:false}
+        vm.call("_object_new");
+        vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+        vm.or(VReg.V0, VReg.RET, VReg.V1);
+        vm.store(VReg.SP, 0, VReg.V0); // desc boxed
+        this._emitDescSetReg(0, "value", VReg.S5);
+        vm.lea(VReg.V0, "_js_false"); vm.load(VReg.V0, VReg.V0, 0);
+        this._emitDescSetReg(0, "writable", VReg.V0);
+        vm.lea(VReg.V0, "_js_true"); vm.load(VReg.V0, VReg.V0, 0);
+        this._emitDescSetReg(0, "enumerable", VReg.V0);
+        vm.lea(VReg.V0, "_js_false"); vm.load(VReg.V0, VReg.V0, 0);
+        this._emitDescSetReg(0, "configurable", VReg.V0);
+        vm.load(VReg.RET, VReg.SP, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
+        // "length" 属性
+        vm.label("_ogopd_str_length");
+        vm.scvtf(0, VReg.S3);          // FP0 = float(length)
+        vm.fmovToInt(VReg.S5, 0);      // S5 = float64 位(兼容整数/浮点读)
+        vm.call("_object_new");
+        vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+        vm.or(VReg.V0, VReg.RET, VReg.V1);
+        vm.store(VReg.SP, 0, VReg.V0);
+        this._emitDescSetReg(0, "value", VReg.S5);
+        vm.lea(VReg.V0, "_js_false"); vm.load(VReg.V0, VReg.V0, 0);
+        this._emitDescSetReg(0, "writable", VReg.V0);
+        this._emitDescSetReg(0, "enumerable", VReg.V0);
+        this._emitDescSetReg(0, "configurable", VReg.V0);
         vm.load(VReg.RET, VReg.SP, 0);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
 

@@ -980,17 +980,19 @@ export class CoercionGenerator {
         vm.jeq("_ae_x_is_string");
         // 负浮点(高16≥0x8000,符号位置位)是 Float,不是 tagged。否则 -0.0/-104 等被误分类
         // → `-0==0` 错判 false、`-104==null` 类误判(镜像 _strict_eq 同修)。
+        // [unsigned cmp] high16 为无符号 16 位量,必须用 jae(无符号 ≥)而非 jge(有符号 ≥):
+        // jge 会把 0x7FF8+(32760+) 都当成 ≥ 0x8000(-32768) → 误判 tagged 为 Float。
         vm.cmpImm(VReg.V0, 0x8000);
-        vm.jge("_ae_x_float_2");
+        vm.jae("_ae_x_float_2");
         vm.cmpImm(VReg.V0, 0x7ff8);
-        vm.jge("_ae_x_tagged");
+        vm.jae("_ae_x_tagged");
         vm.cmpImm(VReg.V0, 0x1000);
-        vm.jge("_ae_x_data_ptr");
+        vm.jae("_ae_x_data_ptr");
         vm.movImm(VReg.S2, 0); // Float
         vm.jmp("_ae_x_done");
         vm.label("_ae_x_data_ptr");
         vm.cmpImm(VReg.V0, 0x1002);
-        vm.jge("_ae_x_float_2");
+        vm.jae("_ae_x_float_2");
         vm.movImm(VReg.S2, 5); // String
         vm.jmp("_ae_x_done");
         vm.label("_ae_x_float_2");
@@ -1011,16 +1013,16 @@ export class CoercionGenerator {
         vm.jeq("_ae_y_is_string");
         // 负浮点(高16≥0x8000)是 Float,不是 tagged(同 x 侧修)。
         vm.cmpImm(VReg.V1, 0x8000);
-        vm.jge("_ae_y_float_2");
+        vm.jae("_ae_y_float_2");
         vm.cmpImm(VReg.V1, 0x7ff8);
-        vm.jge("_ae_y_tagged");
+        vm.jae("_ae_y_tagged");
         vm.cmpImm(VReg.V1, 0x1000);
-        vm.jge("_ae_y_data_ptr");
+        vm.jae("_ae_y_data_ptr");
         vm.movImm(VReg.S3, 0); // Float
         vm.jmp("_ae_y_done");
         vm.label("_ae_y_data_ptr");
         vm.cmpImm(VReg.V1, 0x1002);
-        vm.jge("_ae_y_float_2");
+        vm.jae("_ae_y_float_2");
         vm.movImm(VReg.S3, 5); // String
         vm.jmp("_ae_y_done");
         vm.label("_ae_y_float_2");
@@ -1099,7 +1101,7 @@ export class CoercionGenerator {
         vm.jlt("_ae_x_obj_p_done");     // high16 < 0x7FF8 → Float
         vm.movImm(VReg.V1, 0x8000);
         vm.cmp(VReg.V0, VReg.V1);
-        vm.jge("_ae_x_obj_p_done");     // high16 >= 0x8000 → negative Float
+        vm.jae("_ae_x_obj_p_done");     // high16 >= 0x8000 → negative Float (unsigned cmp)
         vm.subImm(VReg.V0, VReg.V0, 0x7FF8);
         vm.addImm(VReg.S2, VReg.V0, 1); // type = tag + 1 (1=Int32,2=Bool,3=Null,4=Undef,5=String,6+=Obj)
         vm.label("_ae_x_obj_p_done");
@@ -1118,7 +1120,7 @@ export class CoercionGenerator {
         vm.jlt("_ae_y_obj_p_done");
         vm.movImm(VReg.V1, 0x8000);
         vm.cmp(VReg.V0, VReg.V1);
-        vm.jge("_ae_y_obj_p_done");
+        vm.jae("_ae_y_obj_p_done");
         vm.subImm(VReg.V0, VReg.V0, 0x7FF8);
         vm.addImm(VReg.S3, VReg.V0, 1);
         vm.label("_ae_y_obj_p_done");
@@ -1860,6 +1862,17 @@ export class CoercionGenerator {
         vm.call("_bigint_to_number");
         vm.epilogue([VReg.S0, VReg.S1], 64);
         vm.label("_num_coerce_not_bigint");
+
+        // Symbol → TypeError（ES ToNumber 规范：Symbol 值转数字抛 TypeError）
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_is_symbol");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_num_coerce_not_symbol");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot convert a Symbol value to a number"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error"); // 不返回
+        vm.label("_num_coerce_not_symbol");
 
         // 检查是否是 undefined (0x7FFB000000000000)
         vm.movImm64(VReg.V0, JS_UNDEFINED);
