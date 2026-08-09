@@ -472,16 +472,18 @@ export class ARM64Backend extends Backend {
             this.asm.stpPre(r1, r2, Reg.SP, -16);
         }
 
-        // 分配栈空间
-        if (stackSize > 0) {
-            this.asm.subImm(Reg.SP, Reg.SP, stackSize);
+        // 分配栈空间（16 字节对齐，AAPCS64 要求 SP 在函数调用边界 16 字节对齐）
+        const aligned = stackSize > 0 ? Math.ceil(stackSize / 16) * 16 : 0;
+        if (aligned > 0) {
+            this.asm.subImm(Reg.SP, Reg.SP, aligned);
         }
     }
 
     epilogue(savedRegs, stackSize) {
-        // 恢复栈空间
-        if (stackSize > 0) {
-            this.asm.addImm(Reg.SP, Reg.SP, stackSize);
+        // 恢复栈空间（与 prologue 对齐一致）
+        const aligned = stackSize > 0 ? Math.ceil(stackSize / 16) * 16 : 0;
+        if (aligned > 0) {
+            this.asm.addImm(Reg.SP, Reg.SP, aligned);
         }
 
         // 恢复 callee-saved 寄存器（反序）
