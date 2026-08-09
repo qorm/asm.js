@@ -7307,11 +7307,45 @@ export class ObjectGenerator {
         vm.andImm(VReg.V1, VReg.V2, DP_HAS_VALUE);
         vm.cmpImm(VReg.V1, 0);
         vm.jeq("_dp_array_side");                 // 无值写 → 侧表(无逐元素 attr)
-        // 数组元素直写: _array_set 内部处理越界/扩容
-        vm.load(VReg.A0, VReg.SP, 0);              // boxed 数组
-        vm.mov(VReg.A1, VReg.RET);                 // 索引(裸 int,RET 仍是 _canonical_array_index 结果)
-        vm.load(VReg.A2, VReg.SP, 72);             // value
-        vm.call("_array_set");
+        // 安全写 inline:边界检查 + 容量增长 + 空档填充 + length 更新 + 落值
+        vm.mov(VReg.V2, VReg.RET);                 // V2 = 索引(跨调用保;VReg.RET 会被 _call 冲)
+        vm.cmpImm(VReg.V2, 0);
+        vm.jlt("_dp_array_side");                  // 拒负索引
+        vm.movImm(VReg.V0, 0x10000000);            // 2^28 cap
+        vm.cmp(VReg.V2, VReg.V0);
+        vm.jge("_dp_array_side");                  // 超大索引 → 侧表
+        vm.load(VReg.V0, VReg.S0, 16);             // capacity
+        vm.cmp(VReg.V2, VReg.V0);
+        vm.jlt("_dp_array_write_now");
+        vm.mov(VReg.A0, VReg.S0);                  // raw arr
+        vm.addImm(VReg.A1, VReg.V2, 1);            // need
+        vm.call("_array_ensure_cap");
+        vm.label("_dp_array_write_now");
+        vm.load(VReg.V3, VReg.S0, 8);              // old length
+        vm.cmp(VReg.V2, VReg.V3);
+        vm.jlt("_dp_array_do_write");
+        // 空档 [old_len, index) 填 undefined
+        vm.load(VReg.V1, VReg.S0, 24);             // data_ptr
+        vm.movImm64(VReg.V4, 0x7ffb000000000000n); // JS_UNDEFINED
+        vm.jmp("_dp_array_gap_test");
+        vm.label("_dp_array_gap_loop");
+        vm.shl(VReg.V0, VReg.V3, 3);
+        vm.add(VReg.V0, VReg.V1, VReg.V0);
+        vm.store(VReg.V0, 0, VReg.V4);
+        vm.addImm(VReg.V3, VReg.V3, 1);
+        vm.label("_dp_array_gap_test");
+        vm.cmp(VReg.V3, VReg.V2);
+        vm.jlt("_dp_array_gap_loop");
+        vm.addImm(VReg.V0, VReg.V2, 1);            // new length = index+1
+        vm.store(VReg.S0, 8, VReg.V0);
+        vm.label("_dp_array_do_write");
+        vm.load(VReg.A0, VReg.SP, 0);              // boxed 数组(写屏障入参)
+        vm.call("_gc_remember");
+        vm.load(VReg.V1, VReg.S0, 24);             // data_ptr(扩容后已更新@24)
+        vm.shl(VReg.V0, VReg.V2, 3);
+        vm.add(VReg.V0, VReg.V1, VReg.V0);
+        vm.load(VReg.V3, VReg.SP, 72);             // value
+        vm.store(VReg.V0, 0, VReg.V3);
         vm.jmp("_dp_array_done");
         // 具名属性/symbol/"length"/纯 attr:走闭包侧表(原路径)
         vm.label("_dp_array_side");
