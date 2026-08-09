@@ -1,0 +1,8 @@
+{
+  "description": "Valid Unicode escapes remain accepted at IdentifierStart and IdentifierPart positions in private names",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": false
+  }
+}
