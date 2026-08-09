@@ -425,9 +425,11 @@ export const BuiltinMethodCompiler = {
                 // str.padStart(targetLen, padString)
                 if (args.length >= 2) {
                     this.compileExpression(args[0]);
-                    // targetLen 需要转换为整数
-                    this.vm.fmovToFloat(0, VReg.RET);
-                    this.vm.fcvtzs(VReg.RET, 0);
+                    // targetLen -> int32 via _to_int32 (handles strings, numbers,
+                    // undefined, null, objects correctly — fcvtzs misinterprets
+                    // non-float64 bits and fails for string/"5" etc.)
+                    if (this.vm.backend.name === "x64") this.vm.mov(VReg.A0, VReg.RET);
+                    this.vm.call("_to_int32");
                     this.vm.push(VReg.RET);
                     this.compileExpression(args[1]);
                     this.vm.mov(VReg.A2, VReg.RET);
@@ -436,9 +438,9 @@ export const BuiltinMethodCompiler = {
                     this.vm.call("_str_padStart");
                 } else if (args.length === 1) {
                     this.compileExpression(args[0]);
-                    // targetLen 需要转换为整数
-                    this.vm.fmovToFloat(0, VReg.RET);
-                    this.vm.fcvtzs(VReg.RET, 0);
+                    // targetLen -> int32 (same as 2-arg path)
+                    if (this.vm.backend.name === "x64") this.vm.mov(VReg.A0, VReg.RET);
+                    this.vm.call("_to_int32");
                     this.vm.mov(VReg.A1, VReg.RET);
                     // 默认填充串为一个空格(装箱 0x7FFC 串,同 2 参路径;此前 lea 未定义
                     // 标签 `_str_space` → 链接错误 `Unknown label`,单参 padStart/padEnd 全崩)。
@@ -456,9 +458,9 @@ export const BuiltinMethodCompiler = {
                 // str.padEnd(targetLen, padString)
                 if (args.length >= 2) {
                     this.compileExpression(args[0]);
-                    // targetLen 需要转换为整数
-                    this.vm.fmovToFloat(0, VReg.RET);
-                    this.vm.fcvtzs(VReg.RET, 0);
+                    // targetLen -> int32 via _to_int32 (same as padStart)
+                    if (this.vm.backend.name === "x64") this.vm.mov(VReg.A0, VReg.RET);
+                    this.vm.call("_to_int32");
                     this.vm.push(VReg.RET);
                     this.compileExpression(args[1]);
                     this.vm.mov(VReg.A2, VReg.RET);
@@ -467,9 +469,9 @@ export const BuiltinMethodCompiler = {
                     this.vm.call("_str_padEnd");
                 } else if (args.length === 1) {
                     this.compileExpression(args[0]);
-                    // targetLen 需要转换为整数
-                    this.vm.fmovToFloat(0, VReg.RET);
-                    this.vm.fcvtzs(VReg.RET, 0);
+                    // targetLen -> int32 (same as 2-arg path)
+                    if (this.vm.backend.name === "x64") this.vm.mov(VReg.A0, VReg.RET);
+                    this.vm.call("_to_int32");
                     this.vm.mov(VReg.A1, VReg.RET);
                     // 默认填充串为一个空格(装箱 0x7FFC 串,同 2 参路径;此前 lea 未定义
                     // 标签 `_str_space` → 链接错误 `Unknown label`,单参 padStart/padEnd 全崩)。
