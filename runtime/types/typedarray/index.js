@@ -2022,6 +2022,7 @@ export class TypedArrayGenerator {
         vm.or(VReg.A1, VReg.A1, VReg.V1);
         vm.call("_object_set");
         // BYTES_PER_ELEMENT 属性描述符:{writable:false, enumerable:false, configurable:false}
+        // ATTR_WRITABLE=1, ATTR_ENUMERABLE=2, ATTR_CONFIGURABLE=4 → attr=0=ATTR_NONE 全部置假
         vm.movImm64(VReg.V1, MASK);
         vm.and(VReg.A0, VReg.S1, VReg.V1);    // 裸 proto
         vm.lea(VReg.A1, "_str_k_bpe");
