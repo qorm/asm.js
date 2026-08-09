@@ -7842,6 +7842,54 @@ export class ObjectGenerator {
         vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
         vm.call("_throw_type_error"); // 不返回
 
+        // ===== 字符串原语(0x7FFC)的包装对象描述符(S0=原装箱串, S1=已归一键)=====
+        // ES 规范 ToObject(str) 创建 String wrapper,自有属性为索引字符 + "length"。
+        // 索引:{value:char, writable:false, enumerable:true, configurable:false}
+        // length:{value:len, writable:false, enumerable:false, configurable:false}
+        vm.label("_ogopd_str_prim");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.V0, "_str_length_prop");
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.V0, VReg.V1);
+        vm.call("_object_key_eq");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_ogopd_str_len");
+        // 规范数值索引键
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_canonical_array_index");
+        vm.mov(VReg.S3, VReg.RET);
+        vm.movImm64(VReg.V1, 0xFFFFFFFFFFFFFFFFn);
+        vm.cmp(VReg.S3, VReg.V1);
+        vm.jeq("_ogopd_undef"); // 非规范索引键
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_strlen");
+        vm.cmp(VReg.S3, VReg.RET);
+        vm.jge("_ogopd_undef"); // 越界
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_str_charAt");
+        vm.mov(VReg.S5, VReg.RET); // value
+        vm.call("_object_new");
+        vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+        vm.or(VReg.V0, VReg.RET, VReg.V1);
+        vm.store(VReg.SP, 0, VReg.V0); // desc
+        vm.movImm(VReg.V2, ATTR_ENUMERABLE); // enumerable:true only
+        vm.store(VReg.SP, 32, VReg.V2);
+        vm.jmp("_ogopd_data");
+        vm.label("_ogopd_str_len");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_strlen");
+        vm.scvtf(0, VReg.RET);
+        vm.fmovToInt(VReg.RET, 0);
+        vm.mov(VReg.S5, VReg.RET); // value = JS number
+        vm.call("_object_new");
+        vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+        vm.or(VReg.V0, VReg.RET, VReg.V1);
+        vm.store(VReg.SP, 0, VReg.V0); // desc
+        vm.movImm(VReg.V2, 0); // writable:false, enumerable:false, configurable:false
+        vm.store(VReg.SP, 32, VReg.V2);
+        vm.jmp("_ogopd_data");
+
         // ===== [arr] TYPE_ARRAY 自有属性描述符(S2=裸数组头, S1=已归一装箱键, S0=原装箱值)=====
         // 数组头 32 字节 {type@0, length@8, capacity@16, data_ptr@24},无 props_ptr@32——绝不能
         // 落 _ogopd_obj 按对象头遍历(把 capacity 当 count、[头+32] 当 props_ptr 解引用垃圾)。
