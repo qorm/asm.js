@@ -1475,24 +1475,27 @@ function __re_toIndex(v) {
         if (v < 0) return 0;
         return v;
     }
-    if (typeof v === "boolean") return v ? 1 : 0;
-    if (typeof v === "string") {
-        // 只认十进制非负整数串(其余 → NaN → 0),够覆盖 ToNumber 的常见形态
-        var i = 0;
-        var n = v.length;
-        while (i < n && __re_isSpaceCode(v.charCodeAt(i))) i = i + 1;
-        var d = 0;
-        var got = 0;
-        while (i < n && __re_isDigitCode(v.charCodeAt(i))) {
-            d = d * 10 + (v.charCodeAt(i) - 48);
-            i = i + 1;
-            got = got + 1;
-        }
-        while (i < n && __re_isSpaceCode(v.charCodeAt(i))) i = i + 1;
-        if (got === 0 || i < n) return 0;
-        return d;
+    // object/boolean/string/undefined/null:走 +v 触发 ToNumber(含 valueOf,同 ToLength)
+    if (typeof v !== "string") {
+        var num = +v; // ToNumber:null→0,undefined→NaN,true→1,false→0,object→valueOf
+        if (typeof num === "number" && num === num && num >= 0) return num;
+        return 0;
     }
-    return 0; // undefined / null / object
+    // 字符串:只认十进制非负整数串(其余 → NaN → 0),够覆盖 ToNumber 的常见形态
+    var st = v;
+    var i = 0;
+    var n = st.length;
+    while (i < n && __re_isSpaceCode(st.charCodeAt(i))) i = i + 1;
+    var d = 0;
+    var got = 0;
+    while (i < n && __re_isDigitCode(st.charCodeAt(i))) {
+        d = d * 10 + (st.charCodeAt(i) - 48);
+        i = i + 1;
+        got = got + 1;
+    }
+    while (i < n && __re_isSpaceCode(st.charCodeAt(i))) i = i + 1;
+    if (got === 0 || i < n) return 0;
+    return d;
 }
 
 // exec:返回类数组对象 {0:整体, 1..n:分组(未命中 undefined), index, input, length}
