@@ -730,6 +730,7 @@ export class CoercionGenerator {
         vm.cmpImm(VReg.V0, 0x7FFD);
         vm.jne("_js_add_x_not_obj");
         vm.mov(VReg.A0, VReg.S0);
+        vm.movImm(VReg.A1, 0);           // hint = "default"
         vm.call("_js_toprimitive");
         vm.mov(VReg.S0, VReg.RET);
         vm.jmp("_js_add_check_y_prim");
@@ -747,6 +748,7 @@ export class CoercionGenerator {
         vm.cmpImm(VReg.V0, 0x7FFD);
         vm.jne("_js_add_y_not_obj");
         vm.mov(VReg.A0, VReg.S1);
+        vm.movImm(VReg.A1, 0);           // hint = "default"
         vm.call("_js_toprimitive");
         vm.mov(VReg.S1, VReg.RET);
         vm.jmp("_js_add_slow_strchk");
@@ -1086,6 +1088,7 @@ export class CoercionGenerator {
         vm.cmpImm(VReg.S2, 6); // x is Object → _js_toprimitive
         vm.jne("_ae_x_not_obj_p");
         vm.mov(VReg.A0, VReg.S0);
+        vm.movImm(VReg.A1, 0);           // hint = "default"
         vm.call("_js_toprimitive");
         vm.mov(VReg.S0, VReg.RET);
         // 分类 ToPrimitive 结果。结果总是原始值，类型映射与初始分类一致：
@@ -1109,6 +1112,7 @@ export class CoercionGenerator {
         vm.cmpImm(VReg.S3, 6); // y is Object
         vm.jne("_ae_y_not_obj_p");
         vm.mov(VReg.A0, VReg.S1);
+        vm.movImm(VReg.A1, 0);           // hint = "default"
         vm.call("_js_toprimitive");
         vm.mov(VReg.S1, VReg.RET);
         // 同 x 侧：正确分类 ToPrimitive 结果(y 侧)

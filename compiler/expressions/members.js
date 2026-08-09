@@ -46,6 +46,8 @@ const ArefMethodRef = {
         // _array_iterator_new;concat 变参由 _array_concat_rt 读 _call_argc(截断 4)。
         find: ["_agen_find", 1],
         findIndex: ["_agen_findIndex", 1],
+        findLast: ["_agen_findLast", 1],
+        findLastIndex: ["_agen_findLastIndex", 1],
         flatMap: ["_agen_flatMap", 1],
         flat: ["_agen_flat", 0],
         fill: ["_agen_fill", 1],
@@ -575,6 +577,8 @@ const ARRAY_PROTO_METHODS = [
     ["at", "_agen_at", 1],
     ["find", "_agen_find", 1],
     ["findIndex", "_agen_findIndex", 1],
+    ["findLast", "_agen_findLast", 1],
+    ["findLastIndex", "_agen_findLastIndex", 1],
     ["flatMap", "_agen_flatMap", 1],
     ["flat", "_agen_flat", 0],
     ["fill", "_agen_fill", 1],
@@ -1394,7 +1398,7 @@ export const MemberCompiler = {
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.RET, VReg.V0, 0);
         this._reSetProtoProp(protoSlot, "constructor", BUILTIN_PROP_ATTR);
-        // RegExp.prototype = 原型对象(闭包属性侧表;规范 attrs 全 false → BUILTIN_CONST_ATTR)
+        // RegExp.prototype = 原型对象(闭包属性侧表;规范 attrs 全 false)
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.A0, VReg.V0, 0);
         this.emitBoxedStringKey("prototype", VReg.A1);
@@ -1572,7 +1576,7 @@ export const MemberCompiler = {
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.RET, VReg.V0, 0);
         this._reSetProtoProp(protoSlot, "constructor", BUILTIN_PROP_ATTR);
-        // String.prototype = 原型对象(闭包属性侧表;规范 attrs 全 false → BUILTIN_CONST_ATTR)
+        // String.prototype = 原型对象(闭包属性侧表;规范 attrs 全 false)
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.A0, VReg.V0, 0);
         this.emitBoxedStringKey("prototype", VReg.A1);
@@ -1725,7 +1729,7 @@ export const MemberCompiler = {
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.RET, VReg.V0, 0);
         this._reSetProtoProp(protoSlot, "constructor", BUILTIN_PROP_ATTR);
-        // Boolean.prototype = 原型对象 (prototype 属性 descriptor: writable:false, enumerable:false, configurable:false)
+        // Boolean.prototype = 原型对象(闭包属性侧表;规范 attrs 全 false)
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.A0, VReg.V0, 0);
         this.emitBoxedStringKey("prototype", VReg.A1);
@@ -1838,7 +1842,7 @@ export const MemberCompiler = {
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
         vm.or(VReg.A2, VReg.A2, VReg.V1); // A2 = boxed "Symbol"
         vm.call("_object_set");
-        // Symbol.prototype = 原型对象 (prototype 属性 descriptor: writable:false, enumerable:false, configurable:false)
+        // Symbol.prototype = 原型对象(闭包属性侧表;规范 attrs 全 false)
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.A0, VReg.V0, 0);
         this.emitBoxedStringKey("prototype", VReg.A1);
@@ -4097,6 +4101,8 @@ export const MemberCompiler = {
                     // 后委托 _array_iterator_new。runtime/types/array/index.js:generateArefI3Methods。
                     find: ["_agen_find", 1],
                     findIndex: ["_agen_findIndex", 1],
+                    findLast: ["_agen_findLast", 1],
+                    findLastIndex: ["_agen_findLastIndex", 1],
                     flatMap: ["_agen_flatMap", 1],
                     flat: ["_agen_flat", 0],
                     fill: ["_agen_fill", 1],

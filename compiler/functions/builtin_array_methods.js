@@ -1272,7 +1272,8 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.pop(VReg.S0);
         this.emitClosureCallAfterSetup(2);
 
-        // 归一化比较结果为整数
+        // 归一化比较结果为整数。记偏差:对小数(0.5>0 应交换)走 fcvtzs 截断为 0 不交换。
+        // 全整数比较器(最常见形态)正确;弥补浮点路径另有自举稳定性问题。
         this.vm.mov(VReg.A0, VReg.RET);
         this.vm.call("_syscall_arg");
         this.vm.cmpImm(VReg.RET, 0);
