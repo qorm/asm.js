@@ -1394,13 +1394,18 @@ export const MemberCompiler = {
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.RET, VReg.V0, 0);
         this._reSetProtoProp(protoSlot, "constructor", BUILTIN_PROP_ATTR);
-        // RegExp.prototype = 原型对象(闭包属性侧表;规范 attrs 全 false,侧表无 attrs 概念)
+        // RegExp.prototype = 原型对象(闭包属性侧表;规范 attrs 全 false → BUILTIN_CONST_ATTR)
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.A0, VReg.V0, 0);
         this.emitBoxedStringKey("prototype", VReg.A1);
         vm.lea(VReg.V0, protoSlot);
         vm.load(VReg.A2, VReg.V0, 0);
         vm.call("_closure_prop_set");
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("prototype", VReg.A1);
+        vm.movImm(VReg.A2, BUILTIN_CONST_ATTR);
+        vm.call("_closure_prop_set_attr");
         // Symbol.species on RegExp constructor: getter accessor that returns `this`.
         // ES spec: get RegExp[@@species]() returns this. Stored as a TYPE_GETTER block
         // on the constructor's closure side table; setter=0 (read-only accessor).
@@ -1567,13 +1572,18 @@ export const MemberCompiler = {
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.RET, VReg.V0, 0);
         this._reSetProtoProp(protoSlot, "constructor", BUILTIN_PROP_ATTR);
-        // String.prototype = 原型对象(闭包属性侧表)
+        // String.prototype = 原型对象(闭包属性侧表;规范 attrs 全 false → BUILTIN_CONST_ATTR)
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.A0, VReg.V0, 0);
         this.emitBoxedStringKey("prototype", VReg.A1);
         vm.lea(VReg.V0, protoSlot);
         vm.load(VReg.A2, VReg.V0, 0);
         vm.call("_closure_prop_set");
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("prototype", VReg.A1);
+        vm.movImm(VReg.A2, BUILTIN_CONST_ATTR);
+        vm.call("_closure_prop_set_attr");
         // [W3] 静态方法 fromCharCode/fromCodePoint 作构造器闭包属性(attr 5,规范 21.1.2;
         // 落位顺序与 Node gOPN 一致)。值经 emitStringStaticRef 的合成函数 memoized 闭包
         // (与静态值读同槽 → String.fromCharCode === gOPD(String,"fromCharCode").value);
@@ -1715,13 +1725,18 @@ export const MemberCompiler = {
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.RET, VReg.V0, 0);
         this._reSetProtoProp(protoSlot, "constructor", BUILTIN_PROP_ATTR);
-        // Boolean.prototype = 原型对象
+        // Boolean.prototype = 原型对象 (prototype 属性 descriptor: writable:false, enumerable:false, configurable:false)
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.A0, VReg.V0, 0);
         this.emitBoxedStringKey("prototype", VReg.A1);
         vm.lea(VReg.V0, protoSlot);
         vm.load(VReg.A2, VReg.V0, 0);
         vm.call("_closure_prop_set");
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("prototype", VReg.A1);
+        vm.movImm(VReg.A2, BUILTIN_CONST_ATTR);
+        vm.call("_closure_prop_set_attr");
         // Boolean.prototype[Symbol.toStringTag] = "Boolean"
         vm.lea(VReg.A0, "_symwk_toStringTag");
         vm.lea(VReg.A1, this.asm.addString("Symbol.toStringTag"));
@@ -1823,13 +1838,18 @@ export const MemberCompiler = {
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
         vm.or(VReg.A2, VReg.A2, VReg.V1); // A2 = boxed "Symbol"
         vm.call("_object_set");
-        // Symbol.prototype = 原型对象
+        // Symbol.prototype = 原型对象 (prototype 属性 descriptor: writable:false, enumerable:false, configurable:false)
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.A0, VReg.V0, 0);
         this.emitBoxedStringKey("prototype", VReg.A1);
         vm.lea(VReg.V0, protoSlot);
         vm.load(VReg.A2, VReg.V0, 0);
         vm.call("_closure_prop_set");
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("prototype", VReg.A1);
+        vm.movImm(VReg.A2, BUILTIN_CONST_ATTR);
+        vm.call("_closure_prop_set_attr");
         // Well-known symbols as own properties
         const WK_SYMBOLS = ["asyncIterator", "hasInstance", "isConcatSpreadable",
             "iterator", "match", "matchAll", "replace", "search",
