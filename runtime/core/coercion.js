@@ -1871,6 +1871,19 @@ export class CoercionGenerator {
         vm.epilogue([VReg.S0, VReg.S1], 64);
         vm.label("_num_coerce_not_bigint");
 
+        // Symbol → TypeError
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_is_symbol");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_num_coerce_not_symbol");
+        vm.lea(VReg.V0, vm.asm.addString("Cannot convert a Symbol value to a number"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.V0, VReg.V0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.V0, VReg.V0, VReg.V1);
+        vm.mov(VReg.A0, VReg.V0);
+        vm.call("_throw_type_error");
+        // unreachable (_throw_type_error unwinds)
+        vm.label("_num_coerce_not_symbol");
+
         // 检查是否是 undefined (0x7FFB000000000000)
         vm.movImm64(VReg.V0, JS_UNDEFINED);
         vm.cmp(VReg.S0, VReg.V0);

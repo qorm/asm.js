@@ -7232,15 +7232,37 @@ export class ObjectGenerator {
         // ============ array:数组 DefineOwnProperty 最小路径 ============
         // S0=裸数组头(type@0,length@8,capacity@16,data_ptr@24),无 props_ptr@32。
         // 不可复用 _dp_legacy(_object_define 读 offset 8 当 count、offset 32 当
-        // props_ptr → 数组头只有 32 字节 → 越界)。数组具名属性走闭包侧表,
-        // 索引元素/length 暂不实现强制(调用路径极少;无强制不抛但预期属性状态不坏)。
+        // props_ptr → 数组头只有 32 字节 → 越界)。规范数值索引键 → 写数组元素;
+        // 具名/symbol 键 → 闭包侧表。
         vm.label("_dp_array");
-        // 键归一(复用 _js_prop_key,同 _ogopd_arr :7077)
+        // 键归一(复用 _js_prop_key,同 _ogopd_arr)
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_js_prop_key");
         vm.mov(VReg.S1, VReg.RET);
-        // 找/建闭包侧表(同 _object_set 数组具名写侧:_object_set_fnprops→_closure_prop_set)
-        vm.mov(VReg.A0, VReg.SP, 0);
+        // 规范数值索引键 → 元素写
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_canonical_array_index"); // RET = idx / -1
+        vm.movImm64(VReg.V1, 0xFFFFFFFFFFFFFFFFn);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_dp_array_side"); // 非规范索引键 → 闭包侧表
+        // 索引键:有 value 且无 get/set 时写数组元素;否则走侧表保留全描述符语义
+        vm.load(VReg.V2, VReg.SP, 8);              // mask
+        vm.andImm(VReg.V0, VReg.V2, DP_HAS_VALUE);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_dp_array_side");                  // 无 value → 侧表
+        vm.andImm(VReg.V0, VReg.V2, DP_HAS_GET | DP_HAS_SET);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_dp_array_side");                  // 有 get/set → 侧表
+        // 写数组元素:_subscript_set(arr, idx, value)
+        vm.mov(VReg.A1, VReg.RET);                 // idx
+        vm.load(VReg.A0, VReg.SP, 0);              // boxed arr
+        vm.load(VReg.A2, VReg.SP, 72);             // value
+        vm.call("_subscript_set");
+        vm.load(VReg.RET, VReg.SP, 0);             // 返原始数组 boxed
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 96);
+        // 具名/symbol 键:闭包侧表
+        vm.label("_dp_array_side");
+        vm.load(VReg.A0, VReg.SP, 0);
         vm.call("_closure_props_ensure"); // RET = props(boxed 0x7FFD)
         // 递归:props 是 TYPE_OBJECT,走 _dp_obj_ok 全强制
         vm.mov(VReg.A0, VReg.RET);
@@ -7704,6 +7726,10 @@ export class ObjectGenerator {
         vm.shrImm(VReg.V1, VReg.S0, 48);
         vm.cmpImm(VReg.V1, 0x7FFF);
         vm.jeq("_ogopd_fn");
+        // [string primitive] 装箱字符串(0x7FFC)→ 包装对象描述符(索引字符 + "length")
+        vm.shrImm(VReg.V1, VReg.S0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFC);
+        vm.jeq("_ogopd_str_prim");
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.S2, VReg.S0, VReg.V1); // raw obj
         vm.cmpImm(VReg.S2, 0);

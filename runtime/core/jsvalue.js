@@ -922,6 +922,33 @@ export class JSValueGenerator {
         // A1 = 装箱构造值(tag 0x7FFF 函数或 0x7FFD 对象),S0 = 实例(未脱壳)。
         // _closure_prop_get(A0=构造器, A1="prototype") → RET = 装箱 prototype。
         vm.label("_iof_boxed_ctor");
+        // [bound] 探测 bound function:raw[+0]=0xc105 且 raw[+8] == _bound_tramp →
+        // [[BoundTargetFunction]] 在 raw[+16],递归 instanceof(instance, target)。
+        vm.movImm64(VReg.V0, 0x0000ffffffffffffn);
+        vm.and(VReg.V1, VReg.A1, VReg.V0);       // V1 = raw ptr
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_iobc_norm");
+        vm.lea(VReg.V2, "_heap_base");
+        vm.load(VReg.V2, VReg.V2, 0);
+        vm.cmp(VReg.V1, VReg.V2);
+        vm.jlt("_iobc_norm");
+        vm.lea(VReg.V2, "_heap_ptr");
+        vm.load(VReg.V2, VReg.V2, 0);
+        vm.cmp(VReg.V1, VReg.V2);
+        vm.jge("_iobc_norm");
+        vm.load(VReg.V0, VReg.V1, 0);
+        vm.cmpImm(VReg.V0, 0xc105);               // CLOSURE_MAGIC?
+        vm.jne("_iobc_norm");
+        vm.load(VReg.V0, VReg.V1, 8);
+        vm.lea(VReg.V2, "_bound_tramp");
+        vm.cmp(VReg.V0, VReg.V2);                 // bound tramp?
+        vm.jne("_iobc_norm");
+        // Bound function: instance unchanged, constructor = target(raw[+16])
+        vm.load(VReg.A1, VReg.V1, 16);
+        vm.mov(VReg.A0, VReg.S0);                 // instance
+        vm.call("_instanceof");                   // recurse
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+        vm.label("_iobc_norm");
         vm.mov(VReg.A0, VReg.A1); // A0 = 装箱构造器(_closure_prop_get 的第一参数)
         vm.mov(VReg.S1, VReg.S0); // 暂存 S0(实例,跨 _closure_prop_get 调用)
         // 构造 boxed 串键 "prototype" → A1
