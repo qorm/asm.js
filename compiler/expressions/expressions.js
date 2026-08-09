@@ -368,6 +368,11 @@ export const ExpressionCompiler = {
                 break;
             }
 
+            case "Symbol":
+                // Symbol is not a constructor. new Symbol() must throw TypeError.
+                this.emitThrowTypeError("Symbol is not a constructor");
+                break;
+
             // Number 子类型 - 整数
             case "Int8":
             case "Int16":

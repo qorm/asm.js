@@ -5313,6 +5313,17 @@ export const FunctionCompiler = {
 
         // 通用函数调用
         if (callee.type === "Identifier") {
+            // Namespace objects and non-constructor builtins that are not callable:
+            // Math(), JSON(), Symbol() without new must throw TypeError.
+            if ((callee.name === "Math" &&
+                 !(this.ctx.getLocal && this.ctx.getLocal("Math")) &&
+                 !(this.ctx.getFunction && this.ctx.getFunction("Math"))) ||
+                (callee.name === "JSON" &&
+                 !(this.ctx.getLocal && this.ctx.getLocal("JSON")) &&
+                 !(this.ctx.getFunction && this.ctx.getFunction("JSON")))) {
+                this.emitThrowTypeError(callee.name + " is not a function");
+                return;
+            }
             // with(obj) 内 method() 直接调用:callee 非已知函数/局部时,经 with-read 解析
             // (obj.method)后闭包调用(命中);miss 走词法(未知标识符→undefined→not a function)。
             // 仅活跃 with 作用域触发,普通代码不变。(this=undefined,罕用,记偏差)
