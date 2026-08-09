@@ -570,6 +570,14 @@ export const BuiltinMethodCompiler = {
                     const splitResSlot = this.ctx.allocLocal(`__splitres_${this.nextLabelId()}`);
                     this.vm.store(VReg.FP, splitResSlot, VReg.RET);
                     this.compileExpressionAsInt(args[1]);
+                    // Clamp limit >= 0: negative limits treated as 0 per ToUint32(limit) semantics
+                    // (without clamping, _array_slice normalizes negative end as relative index,
+                    //  causing "abc".split("a", -1) to truncate to len-1 instead of returning all)
+                    this.vm.cmpImm(VReg.RET, 0);
+                    const splitLimOk = this.ctx.newLabel(`__splitlim_ok_${this.nextLabelId()}`);
+                    this.vm.jge(splitLimOk);
+                    this.vm.movImm(VReg.RET, 0);
+                    this.vm.label(splitLimOk);
                     const splitLimSlot = this.ctx.allocLocal(`__splitlim_${this.nextLabelId()}`);
                     this.vm.store(VReg.FP, splitLimSlot, VReg.RET);
                     this.vm.load(VReg.A0, VReg.FP, splitResSlot);
