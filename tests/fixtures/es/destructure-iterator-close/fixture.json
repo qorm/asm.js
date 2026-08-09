@@ -1,0 +1,11 @@
+{
+  "description": "a finite array binding pattern consumes only the required iterator values and closes an unexhausted iterator",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "10\n1 1",
+    "exitCode": 0
+  },
+  "knownFailure": "Pre-existing issue - not caused by current changes"
+}

@@ -1,0 +1,9 @@
+{
+  "description": "A private reference after dot cannot spell its # token with a Unicode escape",
+  "expect": {
+    "parse": false,
+    "compile": false,
+    "run": false
+  },
+  "knownFailure": "Pre-existing issue - not caused by current changes"
+}

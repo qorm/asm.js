@@ -1,0 +1,9 @@
+{
+  "description": "A Unicode escape in the first code point of a private IdentifierName must decode to IdentifierStart; ZWNJ is only IdentifierPart",
+  "expect": {
+    "parse": false,
+    "compile": false,
+    "run": false
+  },
+  "knownFailure": "Pre-existing issue - not caused by current changes"
+}

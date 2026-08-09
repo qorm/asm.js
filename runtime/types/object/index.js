@@ -5532,18 +5532,26 @@ export class ObjectGenerator {
         vm.jeq("_object_assign_next"); // 不可枚举 → 跳过
 
         vm.label("_object_assign_take");
-        // 获取 source 的 key 和 value（source props_ptr 在 S1 头 @32）
+        // 获取 source 的 key（source props_ptr 在 S1 头 @32）
         vm.load(VReg.V2, VReg.S1, OBJECT_PROPS_PTR_OFFSET);
         vm.shl(VReg.V0, VReg.S3, 4);
         vm.add(VReg.V0, VReg.V2, VReg.V0);
 
         vm.load(VReg.V1, VReg.V0, 0); // key
-        vm.load(VReg.V2, VReg.V0, 8); // value
+        // [fix] 用 _object_get 触发 getter:此前直接读 props[+8] 裸值,
+        // accessor 属性会拿到 TYPE_GETTER 标记块而非 getter 返回值(ES [[Get]] 要求触发 getter)。
+        // 存 key 到栈(跨 _object_get A1 被毁),重装箱 source(S1 脱壳裸指针)。
+        vm.store(VReg.SP, 0, VReg.V1);            // SP+0 = key(保活)
+        vm.movImm64(VReg.V1, 0x7ffd000000000000n); // 对象 tag 0x7FFD
+        vm.mov(VReg.A0, VReg.S1);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);         // A0 = 装箱 source
+        vm.load(VReg.A1, VReg.SP, 0);             // A1 = key
+        vm.call("_object_get");                   // RET = 解析后值(getter 已触发)
 
         // 设置到 target
-        vm.mov(VReg.A0, VReg.S0);
-        vm.mov(VReg.A1, VReg.V1);
-        vm.mov(VReg.A2, VReg.V2);
+        vm.mov(VReg.A2, VReg.RET);                // 值(已解 getter)
+        vm.mov(VReg.A0, VReg.S0);                 // raw target(_object_set 兼容 raw/boxed)
+        vm.load(VReg.A1, VReg.SP, 0);             // key(重载)
         vm.call("_object_set");
 
         vm.label("_object_assign_next");
@@ -7277,19 +7285,38 @@ export class ObjectGenerator {
         vm.load(VReg.RET, VReg.SP, 0);             // 返回原对象
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 96);
 
-        // ============ array:数组 DefineOwnProperty 最小路径 ============
+        // ============ array:数组 DefineOwnProperty ============
         // S0=裸数组头(type@0,length@8,capacity@16,data_ptr@24),无 props_ptr@32。
         // 不可复用 _dp_legacy(_object_define 读 offset 8 当 count、offset 32 当
-        // props_ptr → 数组头只有 32 字节 → 越界)。数组具名属性走闭包侧表,
-        // 索引元素/length 暂不实现强制(调用路径极少;无强制不抛但预期属性状态不坏)。
+        // props_ptr → 数组头只有 32 字节 → 越界)。数组具名属性走闭包侧表。
+        // [fix] 规范数值索引键经 _canonical_array_index 判识后写入数组元素
+        // (此前全量走闭包侧表,defineProperty(arr,"0",{value:x}) 不修改 arr[0])。
+        // 具名键(含 "length"/symbol/非索引串)仍走闭包侧表。
         vm.label("_dp_array");
         // 键归一(复用 _js_prop_key,同 _ogopd_arr :7077)
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_js_prop_key");
         vm.mov(VReg.S1, VReg.RET);
-        // 找/建闭包侧表(同 _object_set 数组具名写侧:_object_set_fnprops→_closure_prop_set)
+        // [fix] 判规范数值索引:若是且 HAS_VALUE → 直写数组元素;否则 → 侧表
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_canonical_array_index");         // RET = idx(0..2^32-2) / -1(非索引)
+        vm.movImm64(VReg.V1, 0xFFFFFFFFFFFFFFFFn);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_dp_array_side");                 // 非索引键 → 具名侧表
+        vm.load(VReg.V2, VReg.SP, 8);              // mask
+        vm.andImm(VReg.V1, VReg.V2, DP_HAS_VALUE);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_dp_array_side");                 // 无值写 → 侧表(无逐元素 attr)
+        // 数组元素直写: _array_set 内部处理越界/扩容
+        vm.load(VReg.A0, VReg.SP, 0);              // boxed 数组
+        vm.mov(VReg.A1, VReg.RET);                 // 索引(裸 int,RET 仍是 _canonical_array_index 结果)
+        vm.load(VReg.A2, VReg.SP, 72);             // value
+        vm.call("_array_set");
+        vm.jmp("_dp_array_done");
+        // 具名属性/symbol/"length"/纯 attr:走闭包侧表(原路径)
+        vm.label("_dp_array_side");
         vm.mov(VReg.A0, VReg.SP, 0);
-        vm.call("_closure_props_ensure"); // RET = props(boxed 0x7FFD)
+        vm.call("_closure_props_ensure");          // RET = props(boxed 0x7FFD)
         // 递归:props 是 TYPE_OBJECT,走 _dp_obj_ok 全强制
         vm.mov(VReg.A0, VReg.RET);
         vm.mov(VReg.A1, VReg.S1);
@@ -7301,6 +7328,7 @@ export class ObjectGenerator {
         vm.load(VReg.V3, VReg.SP, 64);                // attr
         vm.or(VReg.A5, VReg.V2, VReg.V3);
         vm.call("_object_define_property");           // 递归;A0=props
+        vm.label("_dp_array_done");
         vm.load(VReg.RET, VReg.SP, 0);                // 返原始数组 boxed
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 96);
 

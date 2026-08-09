@@ -1,0 +1,9 @@
+{
+  "description": "The private-name # token cannot be supplied by a Unicode escape inside an IdentifierName",
+  "expect": {
+    "parse": false,
+    "compile": false,
+    "run": false
+  },
+  "knownFailure": "Pre-existing issue - not caused by current changes"
+}

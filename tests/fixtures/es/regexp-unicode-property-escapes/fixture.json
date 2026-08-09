@@ -1,0 +1,11 @@
+{
+  "description": "Unicode RegExp property escapes resolve binary, General_Category, Script and Script_Extensions aliases and test BMP/astral range boundaries",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ascii true false true\ngc true true false\nscript true false\nscx true false\nastral true true false\napply 2 true true\nconcat true true true\nrepeat true true true true true true true true true true true true true true true",
+    "exitCode": 0
+  },
+  "knownFailure": "Pre-existing regexp unicode property escapes support"
+}

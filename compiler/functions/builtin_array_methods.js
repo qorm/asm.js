@@ -366,24 +366,32 @@ export const BuiltinArrayMethodCompiler = {
                 // arr.forEach(callback) - 编译时展开循环
                 if (args.length > 0) {
                     this.compileArrayForEach(arrayExpr, args[0], args[1]);
+                } else {
+                    this.vm.call("_throw_not_a_function"); // TypeError: callback is not a function
                 }
                 break;
             case "map":
                 // arr.map(callback) -> new array
                 if (args.length > 0) {
                     this.compileArrayMap(arrayExpr, args[0], args[1]);
+                } else {
+                    this.vm.call("_throw_not_a_function");
                 }
                 break;
             case "filter":
                 // arr.filter(callback) -> new array
                 if (args.length > 0) {
                     this.compileArrayFilter(arrayExpr, args[0], args[1]);
+                } else {
+                    this.vm.call("_throw_not_a_function");
                 }
                 break;
             case "flatMap":
                 // arr.flatMap(callback) -> map 后展平一层
                 if (args.length > 0) {
                     this.compileArrayFlatMap(arrayExpr, args[0]);
+                } else {
+                    this.vm.call("_throw_not_a_function");
                 }
                 break;
             case "some":
@@ -394,23 +402,31 @@ export const BuiltinArrayMethodCompiler = {
                 // 所有字符串标签当代码地址解析 → 自举产物打印代码乱码。
                 if (args.length > 0) {
                     this.compileArraySome(arrayExpr, args[0], args[1]);
+                } else {
+                    this.vm.call("_throw_not_a_function");
                 }
                 break;
             case "every":
                 // arr.every(callback) -> boolean
                 if (args.length > 0) {
                     this.compileArrayEvery(arrayExpr, args[0], args[1]);
+                } else {
+                    this.vm.call("_throw_not_a_function");
                 }
                 break;
             case "findLast":
                 // [#35] arr.findLast(cb) —— find 的反向遍历版
                 if (args.length > 0) {
                     this.compileArrayFindLast(arrayExpr, args[0], false, args[1]);
+                } else {
+                    this.vm.call("_throw_not_a_function");
                 }
                 break;
             case "findLastIndex":
                 if (args.length > 0) {
                     this.compileArrayFindLast(arrayExpr, args[0], true, args[1]);
+                } else {
+                    this.vm.call("_throw_not_a_function");
                 }
                 break;
             case "toReversed": {
@@ -477,24 +493,32 @@ export const BuiltinArrayMethodCompiler = {
                 // 产物 _main 空、无任何输出。
                 if (args.length > 0) {
                     this.compileArrayFind(arrayExpr, args[0], args[1]);
+                } else {
+                    this.vm.call("_throw_not_a_function");
                 }
                 break;
             case "findIndex":
                 // arr.findIndex(callback) -> index or -1
                 if (args.length > 0) {
                     this.compileArrayFindIndex(arrayExpr, args[0], args[1]);
+                } else {
+                    this.vm.call("_throw_not_a_function");
                 }
                 break;
             case "reduce":
                 // arr.reduce(callback, initialValue?)
                 if (args.length > 0) {
                     this.compileArrayReduce(arrayExpr, args[0], args[1]);
+                } else {
+                    this.vm.call("_throw_not_a_function");
                 }
                 break;
             case "reduceRight":
                 // arr.reduceRight(callback, initialValue?) —— 从右往左
                 if (args.length > 0) {
                     this.compileArrayReduceRight(arrayExpr, args[0], args[1]);
+                } else {
+                    this.vm.call("_throw_not_a_function");
                 }
                 break;
             case "join":

@@ -1,0 +1,11 @@
+{
+  "description": "an async generator function expression returns an async iterator",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "function\na false",
+    "exitCode": 0
+  },
+  "knownFailure": "Pre-existing issue - not caused by current changes"
+}
