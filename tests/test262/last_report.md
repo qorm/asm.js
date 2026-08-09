@@ -1,6 +1,6 @@
 # asm.js test262 conformance report
 
-_Generated 2026-08-09T08:56:46.556Z — target macos-arm64_
+_Generated 2026-08-09T09:20:21.197Z — target macos-arm64_
 
 ## Headline
 
@@ -68,8 +68,8 @@ Excluded-by-feature detail:
 - **81×** FAIL: negative test wrong outcome (phase=parse)
 - **60×** FAIL: TypedArray/ArrayBuffer semantics
 - **43×** COMPILE_FAIL: asm.js could not compile (unsupported syntax / parser gap)
-- **39×** CRASH: run timeout
-- **23×** CRASH: run signal SIGSEGV
+- **38×** CRASH: run timeout
+- **24×** CRASH: run signal SIGSEGV
 - **14×** FAIL: constructor-ness reflection (isConstructor / not-a-constructor)
 - **4×** CRASH: run signal SIGBUS
 - **2×** FAIL: negative test wrong outcome (phase=runtime)
@@ -127,4 +127,4 @@ mkdir -p .test262-corpus && tar xzf /tmp/t262.tgz -C .test262-corpus --strip-com
 node tests/test262/run.mjs --stride 5 --jobs 8 --target macos-arm64
 ```
 
-_Run wall-clock: 444.3s._
+_Run wall-clock: 425.7s._

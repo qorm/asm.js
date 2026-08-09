@@ -1,6 +1,6 @@
 {
-  "generated": "2026-08-09T08:56:46.557Z",
-  "runnerSha": "69dd2e9b81b37c2429f3731beea4c58f6042327b",
+  "generated": "2026-08-09T09:20:21.199Z",
+  "runnerSha": "0b4469464982c79bf784e2f2061f32119dd0a010",
   "corpusPin": "9e61c12835c5e4a3bdba93850427e6742c4f64c4",
   "config": {
     "corpus": ".test262-corpus",
@@ -177,11 +177,11 @@
     },
     {
       "pattern": "CRASH: run timeout",
-      "count": 39
+      "count": 38
     },
     {
       "pattern": "CRASH: run signal SIGSEGV",
-      "count": 23
+      "count": 24
     },
     {
       "pattern": "FAIL: constructor-ness reflection (isConstructor / not-a-constructor)",

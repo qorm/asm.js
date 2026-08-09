@@ -1961,7 +1961,7 @@ export function __RE_matchAll(str, re) {
 // 捕获组按序并入结果;空匹配不在 last 处重切且推进一位防死循环;limit 截断。
 // 用 g 标志工作副本驱动 __RE_exec 扫描(原 re 的 lastIndex 不受影响)。
 export function __RE_split(str, re, limit) {
-    var lim = (limit === undefined || limit === null) ? 4294967295 : (limit >>> 0);
+    var lim = (limit === undefined) ? 4294967295 : (limit >>> 0);
     if (lim === 0) {
         var e0 = [];
         e0.constructor = Array;
