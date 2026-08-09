@@ -3717,6 +3717,14 @@ export class ArrayGenerator {
         vm.or(VReg.A1, VReg.A1, VReg.V0);
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_object_get");
+        // Species === Array constructor itself -> default
+        // (the @@species getter returns _get_this, so Array[Symbol.species]===Array
+        //  which is the default. Without this check all default arrays fall to
+        //  the agen slow path.)
+        vm.lea(VReg.V0, "_nsobj_array");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmp(VReg.RET, VReg.V0);
+        vm.jeq("_asc_default");
         vm.shrImm(VReg.V0, VReg.RET, 48);
         vm.cmpImm(VReg.V0, 0x7FFA);
         vm.jeq("_asc_default");
