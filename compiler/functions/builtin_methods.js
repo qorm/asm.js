@@ -232,10 +232,9 @@ export const BuiltinMethodCompiler = {
                     this.vm.pop(VReg.A1);            // search
                     this.vm.pop(VReg.A0);            // str
                     if (replIsFn) {
-                        // Function replacer: _str_replace_fn handles single replacement.
-                        // For replaceAll, this only replaces the first match (known deviation
-                        // from spec which requires all matches). Better than crashing.
-                        this.vm.call("_str_replace_fn");
+                        // Function replacer: _str_replace_fn for single replacement,
+                        // _str_replaceAll_fn for replaceAll (loops all matches).
+                        this.vm.call(method === "replaceAll" ? "_str_replaceAll_fn" : "_str_replace_fn");
                     } else {
                         this.vm.call(method === "replaceAll" ? "_str_replaceAll" : "_str_replace");
                     }

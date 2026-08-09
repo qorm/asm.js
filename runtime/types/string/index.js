@@ -4188,6 +4188,149 @@ export class StringGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 16);
     }
 
+    // _str_replaceAll_fn(A0=str, A1=search, A2=fn 闭包) -> RET:函数替换所有匹配。
+    // 与 _str_replace_fn 同调用约定(仅传 matched 一参),但循环所有匹配。
+    // 寄存器:S0=remaining, S1=search, S2=fn, S3=acc, S4=searchLen, S5=newRemaining。
+    // SP+0=idx, SP+8=left, SP+0=repl(复用 idx 槽,idx 已在计算 left/remaining 后不再需要)。
+    generateReplaceAllFn() {
+        const vm = this.vm;
+
+        vm.label("_str_replaceAll_fn");
+        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.mov(VReg.S0, VReg.A0); // remaining(初值 = str)
+        vm.mov(VReg.S1, VReg.A1); // search
+        vm.mov(VReg.S2, VReg.A2); // fn closure
+        this._emitArgStrInline(VReg.S1, "_replaceAllFn_search");
+
+        // searchLen;==0 -> 返回原串(守卫死循环)
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_getStrContent");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_strlen");
+        vm.mov(VReg.S4, VReg.RET); // S4 = searchLen
+        vm.cmpImm(VReg.S4, 0);
+        vm.jeq("_replAllFn_wholestr");
+
+        // acc = ""(boxed empty)
+        vm.lea(VReg.RET, "_str_empty");
+        {
+            const maskReg = vm.backend.name === "x64" ? VReg.V2 : VReg.V0;
+            vm.movImm64(maskReg, 0x0000ffffffffffffn);
+            vm.and(VReg.RET, VReg.RET, maskReg);
+        }
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.mov(VReg.S3, VReg.RET); // S3 = acc
+
+        vm.label("_replAllFn_loop");
+        // ---- Step 1: idx = indexOf(remaining, search, 0) ----
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.movImm(VReg.A2, 0);
+        vm.call("_str_indexOf");
+        // S0-S4 preserved by call. RET = raw idx or -1.
+        vm.store(VReg.SP, 0, VReg.RET); // SP+0 = idx
+        vm.cmpImm(VReg.RET, -1);
+        vm.jeq("_replAllFn_done");
+
+        // ---- Step 2: left = slice(remaining, 0, idx) ----
+        vm.mov(VReg.A0, VReg.S0);
+        vm.movImm64(VReg.A1, 0x7FF8000000000000n); // box 0
+        vm.load(VReg.A2, VReg.SP, 0);              // idx(raw), gets boxed
+        {
+            const mask = vm.backend.name === "x64" ? VReg.V2 : VReg.V1;
+            vm.movImm64(mask, 0xFFFFFFFFn);
+            vm.and(VReg.A2, VReg.A2, mask);
+        }
+        vm.movImm64(VReg.V2, 0x7FF8000000000000n);
+        vm.or(VReg.A2, VReg.A2, VReg.V2);          // box idx
+        vm.call("_str_slice");
+        // S0-S4 preserved. RET = boxed left string.
+        vm.store(VReg.SP, 8, VReg.RET);            // SP+8 = left
+
+        // ---- Step 3: compute new remaining = slice(remaining, idx+searchLen, lenRemaining) ----
+        // Get lenRemaining first, before setting up A0/A1/A2 for _str_slice
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_getStrContent");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_strlen");                        // RET = lenRemaining(raw int)
+        vm.mov(VReg.S5, VReg.RET);                 // S5 = lenRemaining(raw,暂存)
+        // Now set up A0/A1/A2 for _str_slice
+        vm.mov(VReg.A0, VReg.S0);                 // A0 = remaining (boxed string)
+        vm.load(VReg.A1, VReg.SP, 0);             // A1 = idx(raw)
+        vm.add(VReg.A1, VReg.A1, VReg.S4);        // A1 = idx + searchLen = rightStart(raw)
+        {
+            const mask = vm.backend.name === "x64" ? VReg.V2 : VReg.V1;
+            vm.movImm64(mask, 0xFFFFFFFFn);
+            vm.and(VReg.A1, VReg.A1, mask);
+        }
+        vm.movImm64(VReg.V2, 0x7FF8000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V2);         // box rightStart
+        vm.mov(VReg.A2, VReg.S5);                 // A2 = lenRemaining(raw, from S5)
+        {
+            const mask = vm.backend.name === "x64" ? VReg.V2 : VReg.V1;
+            vm.movImm64(mask, 0xFFFFFFFFn);
+            vm.and(VReg.A2, VReg.A2, mask);
+        }
+        vm.or(VReg.A2, VReg.A2, VReg.V2);         // box lenRemaining
+        vm.call("_str_slice");
+        // S0-S4 preserved. RET = new remaining (boxed string).
+        vm.mov(VReg.S5, VReg.RET);                // S5 = new remaining (overwrites lenRemaining)
+
+        // ---- Step 4: call fn(matched=search) ----
+        // Save acc(S3) to SP+0 (overwrite idx, no longer needed)
+        vm.store(VReg.SP, 0, VReg.S3);            // SP+0 = acc(backup)
+        // Setup closure call (mirror _str_replace_fn pattern)
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V0, VReg.S2, VReg.V1); // V0 = closure pointer
+        vm.load(VReg.V1, VReg.V0, 8);             // V1 = real fn pointer
+        vm.mov(VReg.A0, VReg.S1);                 // matched = search
+        vm.movImm64(VReg.A5, 0x7ffb000000000000n);// this = undefined
+        vm.mov(VReg.S0, VReg.V0);                 // S0 = closure ptr (overwrites old remaining)
+        vm.setCallArgcImm(1, VReg.V2, VReg.V3);   // argc = 1
+        vm.callIndirect(VReg.V1);                 // RET = replacement string (boxed)
+        // callIndirect preserves S0-S5. RET = repl.
+        vm.store(VReg.SP, 0, VReg.RET);           // SP+0 = repl (overwrite acc backup)
+
+        // Restore acc from... wait, I overwrote it. Need to restore from somewhere.
+        // Actually, acc was in S3 which is preserved across callIndirect. But I stored
+        // it to SP+0 and then overwrote SP+0 with repl. S3 should still hold the acc
+        // value since S registers are callee-saved.
+
+        // ---- Step 5: acc = acc + left + repl ----
+        // But wait, after callIndirect:
+        // S3 = acc (preserved)
+        // S5 = new remaining (preserved)
+        // S1 = search (preserved)
+        // S2 = fn (preserved)
+        // S4 = searchLen (preserved)
+        // But S0 was overwritten to closure pointer!
+        // Need to load S0 = new remaining from S5 (which saved it).
+
+        vm.mov(VReg.S0, VReg.S5);                 // restore remaining from S5
+        vm.load(VReg.A1, VReg.SP, 8);             // A1 = left
+        vm.mov(VReg.A0, VReg.S3);                 // A0 = acc
+        vm.call("_strconcat");                    // RET = acc + left (clobbers V regs)
+        // S0-S4 preserved. RET = acc+left.
+        vm.mov(VReg.S3, VReg.RET);                // S3 = acc+left
+        vm.load(VReg.A1, VReg.SP, 0);             // A1 = repl
+        vm.mov(VReg.A0, VReg.S3);                 // A0 = acc+left
+        vm.call("_strconcat");                    // RET = acc+left+repl = new acc
+        vm.mov(VReg.S3, VReg.RET);                // S3 = new acc
+        vm.jmp("_replAllFn_loop");
+
+        vm.label("_replAllFn_done");
+        // acc + remaining
+        vm.mov(VReg.A0, VReg.S3);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.call("_strconcat");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 16);
+
+        vm.label("_replAllFn_wholestr");
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 16);
+    }
+
     // _num_toString(value, radix_raw) -> 装箱字符串
     // value: 装箱 int32 或裸 float64(经 _to_int32 取整);radix: 裸 int(2..36,非法回退 10)。
     // 小数部分不输出(JS 会输出基数小数,暂不支持)。倒序填 scratch 缓冲后
@@ -5185,6 +5328,7 @@ export class StringGenerator {
         this.generateReplaceExpand();
         this.generateReplace();
         this.generateReplaceAll();
+        this.generateReplaceAllFn();
         this.generateNumToString();
         this.generateNumToFixed();
         this.generateSlice();

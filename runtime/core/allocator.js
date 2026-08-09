@@ -2511,6 +2511,7 @@ export class AllocatorGenerator {
             // 更多字符串方法。
             "_str_padStart", "_str_padEnd", "_str_at", "_str_charAt",
             "_str_startsWith", "_str_endsWith", "_str_replaceAll",
+            "_str_replaceAll_fn",
             // 更多数组方法(无闭包)。
             "_array_push", "_array_get", "_array_reverse", "_array_slice",
             "_array_includes", "_array_indexOf", "_array_at", "_array_flat",
