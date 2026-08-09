@@ -69,6 +69,7 @@ export const BuiltinCollectionMethodCompiler = {
                 // map.clear() - 走运行时（需同时重置 head/tail 并清零哈希桶数组）
                 this.vm.pop(VReg.A0);
                 this.vm.call("_map_clear");
+                this.vm.movImm64(VReg.RET, 0x7ffb000000000000n); // JS_UNDEFINED (spec: return undefined)
                 return true;
 
             case "forEach":
@@ -258,6 +259,7 @@ export const BuiltinCollectionMethodCompiler = {
                 // set.clear()
                 this.vm.pop(VReg.A0);
                 this.vm.call("_set_clear");
+                this.vm.movImm64(VReg.RET, 0x7ffb000000000000n); // JS_UNDEFINED (spec: return undefined)
                 return true;
 
             case "forEach":
