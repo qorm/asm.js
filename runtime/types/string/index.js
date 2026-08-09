@@ -1683,12 +1683,31 @@ export class StringGenerator {
         vm.mov(VReg.RET, VReg.S2);    // 原样返回(无 Symbol.toPrimitive)
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
 
-        // _js_toprimitive(A0 = 装箱对象 0x7FFD) -> RET:ToPrimitive(obj, default)。
-        // Symbol.toPrimitive 优先(hint="default");否则 valueOf 优先、toString、"[object Object]"。二元 `+` 用。
+        // _js_toprimitive(A0 = obj_boxed, A1 = optional hint_boxed) -> RET:ToPrimitive(obj, hint)。
+        // A1 为装箱字符串("default"/"number"/"string")时按指定 hint 执行;A1 非装箱串或不传时默认 "default"。
+        // "default"/"number" hint:Symbol.toPrimitive → valueOf → toString(via _valueToStr)。
+        // "string" hint:Symbol.toPrimitive → toString(via _object_user_tostr) → valueOf。
         vm.label("_js_toprimitive");
-        vm.prologue(16, [VReg.S0]);
+        vm.prologue(32, [VReg.S0]);
         vm.mov(VReg.S0, VReg.A0);
-        // [Symbol.toPrimitive] 优先(hint "default")
+        // --- 读 A1 hint,默认 "default" ---
+        // 守卫:A1 为 0/非装箱串 → default;否则取内容判是否为 "string"。
+        vm.cmpImm(VReg.A1, 0);
+        vm.jeq("_js_toprim_def");
+        vm.shrImm(VReg.V0, VReg.A1, 48);
+        vm.cmpImm(VReg.V0, 0x7FFC);
+        vm.jne("_js_toprim_def");
+        // 保存 hint 内容指针到栈槽;后续 call 不碰 [SP+0]
+        vm.mov(VReg.A0, VReg.A1);
+        vm.call("_getStrContent");
+        vm.store(VReg.SP, 0, VReg.RET);   // [SP+0] = hint 内容指针
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, vm.asm.addString("string"));
+        vm.call("_strcmp");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_js_toprim_str");          // hint == "string"
+        // "default" 或 "number" hint → valueOf 优先(同既有行为)
+        vm.label("_js_toprim_def");
         vm.mov(VReg.A0, VReg.S0);
         vm.lea(VReg.A1, vm.asm.addString("default"));
         vm.movImm64(VReg.V0, 0x7ffc000000000000n);
@@ -1711,8 +1730,37 @@ export class StringGenerator {
         // 检查冗余但无害。
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_valueToStr");
+        vm.jmp("_js_toprim_done");
+        // "string" hint:toString first, then valueOf
+        vm.label("_js_toprim_str");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.lea(VReg.A1, vm.asm.addString("string"));
+        vm.movImm64(VReg.V0, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V0);
+        vm.call("_call_toprimitive");
+        vm.shrImm(VReg.V2, VReg.RET, 48);
+        vm.cmpImm(VReg.V2, 0x7FFD);
+        vm.jne("_js_toprim_done");
+        // toString first for "string" hint
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_user_tostr");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_js_toprim_str_vo");
+        vm.shrImm(VReg.V2, VReg.RET, 48);
+        vm.cmpImm(VReg.V2, 0x7FFD);
+        vm.jne("_js_toprim_done");
+        // valueOf fallback for "string" hint
+        vm.label("_js_toprim_str_vo");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_user_valueof");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_js_toprim_try_tostr");
+        vm.shrImm(VReg.V2, VReg.RET, 48);
+        vm.cmpImm(VReg.V2, 0x7FFD);
+        vm.jne("_js_toprim_done");
+        vm.jmp("_js_toprim_try_tostr");
         vm.label("_js_toprim_done");
-        vm.epilogue([VReg.S0], 16);
+        vm.epilogue([VReg.S0], 32);
     }
 
     // _is_asmjs_err(boxedVal) -> 1/0
