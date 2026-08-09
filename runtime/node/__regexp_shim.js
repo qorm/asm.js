@@ -1541,7 +1541,13 @@ export function __RE_exec(re, str) {
         }
         var end = __re_mAlts(mst, prog.alts, p, idFn);
         if (end >= 0) {
-            if (anchored) re.lastIndex = end;
+            if (anchored) {
+                if (end === p) {
+                    re.lastIndex = p + 1; // empty match: advance to prevent infinite loop
+                } else {
+                    re.lastIndex = end;
+                }
+            }
             var m = { index: p, input: s, length: prog.ncap + 1 };
             // 注意:必须用字面量下标逐个赋值——asm.js 的对象计算键赋值 m[g](g 为
             // 数值变量)有键归一化 bug(全部塌到同一槽),字面量键则正常。
