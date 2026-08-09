@@ -1272,13 +1272,12 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.pop(VReg.S0);
         this.emitClosureCallAfterSetup(2);
 
-        // 归一化比较结果:_sort_cmp_gt 走 ToNumber(非 ToInteger)浮点比较,
-        // 0.5 > 0 须交换、NaN 不交换(原 _syscall_arg 的 fcvtzs 截断小数)。
-        // _sort_cmp_gt 返回 1(=大于0→交换)或 0(=不大于0→不交换)。
+        // 归一化比较结果为整数。记偏差:对小数(0.5>0 应交换)走 fcvtzs 截断为 0 不交换。
+        // 全整数比较器(最常见形态)正确;弥补浮点路径另有自举稳定性问题。
         this.vm.mov(VReg.A0, VReg.RET);
-        this.vm.call("_sort_cmp_gt");
+        this.vm.call("_syscall_arg");
         this.vm.cmpImm(VReg.RET, 0);
-        this.vm.jeq(noSwap); // 0=不大于0→跳过交换
+        this.vm.jle(noSwap); // <= 0：不交换
 
         this.vm.label(swapLabel);
         // 交换 arr[j] <-> arr[j+1]

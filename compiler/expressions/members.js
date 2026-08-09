@@ -4101,6 +4101,8 @@ export const MemberCompiler = {
                     // 后委托 _array_iterator_new。runtime/types/array/index.js:generateArefI3Methods。
                     find: ["_agen_find", 1],
                     findIndex: ["_agen_findIndex", 1],
+                    findLast: ["_agen_findLast", 1],
+                    findLastIndex: ["_agen_findLastIndex", 1],
                     flatMap: ["_agen_flatMap", 1],
                     flat: ["_agen_flat", 0],
                     fill: ["_agen_fill", 1],

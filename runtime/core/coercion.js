@@ -27,7 +27,6 @@ export class CoercionGenerator {
         this.generateBigInt();
         this.generateRelCmp();
         this.generateNaNCanon();
-        this.generateSortCmpGt(); // sort comparator result normalization
         this.generateBuiltinFns();
     }
 
@@ -669,73 +668,6 @@ export class CoercionGenerator {
 
         vm.label("_syscall_ptr_raw");
         vm.mov(VReg.RET, VReg.A0);
-        vm.ret();
-    }
-
-    // _sort_cmp_gt(jsval): 归一化 sort 比较器返回值,判断是否 >0。
-    // ES 262 SortCompare 走 ToNumber(非 ToInteger):0.5 > 0 须交换,NaN 不交换。
-    // 输入 A0 = 装箱 JSValue(比较器返回值)
-    // 输出 RET = 1(>0) 或 0(<=0 或 NaN)
-    generateSortCmpGt() {
-        const vm = this.vm;
-        vm.label("_sort_cmp_gt");
-        vm.shrImm(VReg.V1, VReg.A0, 48);
-        vm.cmpImm(VReg.V1, 0);
-        vm.jeq("_sort_cmp_raw");
-        vm.cmpImm(VReg.V1, 0x7FF8);
-        vm.jlt("_sort_cmp_float");
-        vm.cmpImm(VReg.V1, 0x7FFF);
-        vm.jgt("_sort_cmp_float");
-        // tagged(0x7FF8..0x7FFF):取 payload → 整数比较
-        vm.emitMaskLoad(VReg.V1);
-        vm.andMaskReg(VReg.V0, VReg.A0, VReg.V1);
-        vm.cmpImm(VReg.V0, 0);
-        vm.jgt("_sort_cmp_true");
-        vm.movImm(VReg.RET, 0);
-        vm.ret();
-        vm.label("_sort_cmp_float");
-        // float64:FCMP with 0.0
-        vm.fmovToFloat(0, VReg.A0);
-        vm.fcmpZero(0);
-        vm.jgt("_sort_cmp_true");
-        vm.movImm(VReg.RET, 0);
-        vm.ret();
-        vm.label("_sort_cmp_raw");
-        // 裸指针(含 heap Number):尝试按堆对象读数值
-        vm.cmpImm(VReg.A0, 0);
-        vm.jeq("_sort_cmp_false");
-        vm.lea(VReg.V1, "_heap_base");
-        vm.load(VReg.V1, VReg.V1, 0);
-        vm.cmp(VReg.A0, VReg.V1);
-        vm.jlt("_sort_cmp_false");
-        vm.lea(VReg.V1, "_heap_ptr");
-        vm.load(VReg.V1, VReg.V1, 0);
-        vm.cmp(VReg.A0, VReg.V1);
-        vm.jge("_sort_cmp_false");
-        vm.load(VReg.V1, VReg.A0, -16);
-        vm.andImm(VReg.V1, VReg.V1, 0xff);
-        vm.cmpImm(VReg.V1, 13); // TYPE_NUMBER
-        vm.jeq("_sort_cmp_heapint");
-        vm.cmpImm(VReg.V1, 29); // TYPE_FLOAT64
-        vm.jeq("_sort_cmp_heapfloat");
-        vm.label("_sort_cmp_false");
-        vm.movImm(VReg.RET, 0);
-        vm.ret();
-        vm.label("_sort_cmp_heapint");
-        vm.load(VReg.V0, VReg.A0, -8);
-        vm.cmpImm(VReg.V0, 0);
-        vm.jgt("_sort_cmp_true");
-        vm.movImm(VReg.RET, 0);
-        vm.ret();
-        vm.label("_sort_cmp_heapfloat");
-        vm.load(VReg.V1, VReg.A0, -8);
-        vm.fmovToFloat(0, VReg.V1);
-        vm.fcmpZero(0);
-        vm.jgt("_sort_cmp_true");
-        vm.movImm(VReg.RET, 0);
-        vm.ret();
-        vm.label("_sort_cmp_true");
-        vm.movImm(VReg.RET, 1);
         vm.ret();
     }
 
