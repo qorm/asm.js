@@ -1143,7 +1143,9 @@ export class TypedArrayGenerator {
         vm.label("_ta_iof_nf");
         vm.movImm(VReg.RET, -1);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
-        // _ta_includes(ta, val, fromIndex) -> 裸 1(命中)/0(未命中)。同 _strict_eq 逐元素。
+        // _ta_includes(ta, val, fromIndex) -> 裸 1(命中)/0(未命中)。
+        // 使用 SameValueZero(_map_key_eq)而非 ===(_strict_eq)以匹配 ES 规范:
+        // SameValueZero 下 NaN===NaN 为真、+0===-0 为真(与 includes 要求一致)。
         // A2 = fromIndex(裸 int,已由编译期/包装器归一)。负值加 len 后夹到 0 起步。
         vm.label("_ta_includes");
         vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
@@ -1165,7 +1167,7 @@ export class TypedArrayGenerator {
         vm.cmp(VReg.S3, VReg.S1);
         vm.jge("_ta_inc_nf");
         vm.mov(VReg.A0, VReg.S0); vm.mov(VReg.A1, VReg.S3); vm.call("_typed_array_get");
-        vm.mov(VReg.A0, VReg.RET); vm.mov(VReg.A1, VReg.S2); vm.call("_strict_eq");
+        vm.mov(VReg.A0, VReg.RET); vm.mov(VReg.A1, VReg.S2); vm.call("_map_key_eq");
         vm.andImm(VReg.V0, VReg.RET, 1);
         vm.cmpImm(VReg.V0, 0);
         vm.jne("_ta_inc_found");
