@@ -885,7 +885,7 @@ export const MemberCompiler = {
             this.vm.call("_closure_prop_set");
             this.vm.mov(VReg.A0, VReg.S0);
             this.emitBoxedStringKey("name", VReg.A1);
-            this.vm.movImm(VReg.A2, BUILTIN_PROP_ATTR);
+            this.vm.movImm(VReg.A2, 4); // configurable, not writable, not enumerable (per ES spec 20.2.1)
             this.vm.call("_closure_prop_set_attr");
             // Set .length with correct descriptor (writable:false, enumerable:false, configurable:true)
             this.vm.mov(VReg.A0, VReg.S0);
@@ -896,7 +896,7 @@ export const MemberCompiler = {
             this.vm.call("_closure_prop_set");
             this.vm.mov(VReg.A0, VReg.S0);
             this.emitBoxedStringKey("length", VReg.A1);
-            this.vm.movImm(VReg.A2, BUILTIN_PROP_ATTR);
+            this.vm.movImm(VReg.A2, 4); // configurable, not writable, not enumerable (per ES spec 20.2.1)
             this.vm.call("_closure_prop_set_attr");
             this.vm.mov(VReg.RET, VReg.S0); // restore closure
         }
