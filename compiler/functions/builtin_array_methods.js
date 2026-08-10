@@ -1164,6 +1164,10 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.load(VReg.V1, VReg.FP, lenOffset);
         this.vm.cmp(VReg.V0, VReg.V1);
         this.vm.jge(endLabel);
+        // [timeout guard] max safe iterations
+        this.vm.movImm(VReg.V2, 0x1000000);
+        this.vm.cmp(VReg.V0, VReg.V2);
+        this.vm.jge(endLabel);
 
         this.vm.load(VReg.A0, VReg.FP, arrOffset);
         this.vm.load(VReg.A1, VReg.FP, idxOffset);
@@ -1527,6 +1531,10 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.load(VReg.V1, VReg.FP, lenOffset);
         this.vm.cmp(VReg.V0, VReg.V1);
         this.vm.jge(endLabel);
+        // [timeout guard] max safe iterations
+        this.vm.movImm(VReg.V2, 0x1000000);
+        this.vm.cmp(VReg.V0, VReg.V2);
+        this.vm.jge(endLabel);
 
         this.vm.load(VReg.A0, VReg.FP, arrOffset);
         this.vm.load(VReg.A1, VReg.FP, idxOffset);
@@ -1607,6 +1615,10 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.load(VReg.V1, VReg.FP, lenOffset);
         this.vm.cmp(VReg.V0, VReg.V1);
         this.vm.jge(endLabel);
+        // [timeout guard] max safe iterations
+        this.vm.movImm(VReg.V2, 0x1000000);
+        this.vm.cmp(VReg.V0, VReg.V2);
+        this.vm.jge(endLabel);
 
         this.vm.load(VReg.A0, VReg.FP, arrOffset);
         this.vm.load(VReg.A1, VReg.FP, idxOffset);
@@ -1675,6 +1687,10 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.load(VReg.V0, VReg.FP, idxOffset);
         this.vm.cmpImm(VReg.V0, 0);
         this.vm.jlt(endLabel);
+        // [timeout guard] max safe iterations
+        this.vm.movImm(VReg.V2, 0x1000000);
+        this.vm.cmp(VReg.V0, VReg.V2);
+        this.vm.jge(endLabel);
 
         this.vm.load(VReg.A0, VReg.FP, arrOffset);
         this.vm.load(VReg.A1, VReg.FP, idxOffset);
@@ -1754,6 +1770,10 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.load(VReg.V0, VReg.FP, idxOffset);
         this.vm.load(VReg.V1, VReg.FP, lenOffset);
         this.vm.cmp(VReg.V0, VReg.V1);
+        this.vm.jge(endLabel);
+        // [timeout guard] max safe iterations
+        this.vm.movImm(VReg.V2, 0x1000000);
+        this.vm.cmp(VReg.V0, VReg.V2);
         this.vm.jge(endLabel);
 
         this.vm.load(VReg.A0, VReg.FP, arrOffset);
@@ -1835,6 +1855,11 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.load(VReg.V0, VReg.FP, idxOffset);
         this.vm.load(VReg.V1, VReg.FP, lenOffset);
         this.vm.cmp(VReg.V0, VReg.V1);
+        this.vm.jge(endLabel);
+
+        // [timeout guard] max safe iterations: prevent infinite loop on corrupted length
+        this.vm.movImm(VReg.V2, 0x1000000); // 16M iterations ceiling
+        this.vm.cmp(VReg.V0, VReg.V2);
         this.vm.jge(endLabel);
 
         // 获取当前元素 - 使用 _subscript_get 统一处理 Array 和 TypedArray
@@ -2135,6 +2160,10 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.load(VReg.V1, VReg.FP, lenOffset);
         this.vm.cmp(VReg.V0, VReg.V1);
         this.vm.jge(endLabel);
+        // [timeout guard] max safe iterations
+        this.vm.movImm(VReg.V2, 0x1000000);
+        this.vm.cmp(VReg.V0, VReg.V2);
+        this.vm.jge(endLabel);
 
         // 获取当前元素 - 使用 _subscript_get 统一处理
         this.vm.load(VReg.A0, VReg.FP, arrOffset); // arr
@@ -2377,6 +2406,10 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.load(VReg.V0, VReg.FP, idxOffset);
         this.vm.load(VReg.V1, VReg.FP, lenOffset);
         this.vm.cmp(VReg.V0, VReg.V1);
+        this.vm.jge(endLabel);
+        // [timeout guard] max safe iterations
+        this.vm.movImm(VReg.V2, 0x1000000);
+        this.vm.cmp(VReg.V0, VReg.V2);
         this.vm.jge(endLabel);
 
         // elem = src[idx]
@@ -2656,6 +2689,10 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.load(VReg.V1, VReg.FP, lenOffset);
         this.vm.cmp(VReg.V0, VReg.V1);
         this.vm.jge(endLabel);
+        // [timeout guard] max safe iterations
+        this.vm.movImm(VReg.V2, 0x1000000);
+        this.vm.cmp(VReg.V0, VReg.V2);
+        this.vm.jge(endLabel);
 
         // 获取当前元素 - 使用 _subscript_get 统一处理 Array 和 TypedArray
         this.vm.load(VReg.A0, VReg.FP, arrOffset);
@@ -2774,6 +2811,10 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.load(VReg.V0, VReg.FP, idxOffset);
         this.vm.cmpImm(VReg.V0, 0);
         this.vm.jlt(endLabel);
+        // [timeout guard] max safe iterations (reverse direction, check idx fits in safe range)
+        this.vm.movImm(VReg.V2, 0x1000000);
+        this.vm.cmp(VReg.V0, VReg.V2);
+        this.vm.jge(endLabel);
 
         // 当前元素 arr[idx]
         this.vm.load(VReg.A0, VReg.FP, arrOffset);
