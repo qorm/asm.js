@@ -204,10 +204,23 @@ export const BuiltinArrayMethodCompiler = {
 
         switch (method) {
             case "pop":
+                // tag guard: 非真数组(0x7FFE) → 走 _agen_pop 安全包装(handle .call() / typed array / non-array)
+                {
+                const _popFallbackLbl = this.ctx.newLabel("pop_fallback");
+                const _popEndLbl = this.ctx.newLabel("pop_end");
+                this.vm.shrImm(VReg.V0, VReg.RET, 48);
+                this.vm.cmpImm(VReg.V0, 0x7FFE);
+                this.vm.jne(_popFallbackLbl);
                 this.vm.mov(VReg.A0, VReg.RET);
                 this.vm.call("_js_unbox");
                 this.vm.mov(VReg.A0, VReg.RET);
                 this.vm.call("_array_pop");
+                this.vm.jmp(_popEndLbl);
+                this.vm.label(_popFallbackLbl);
+                this.vm.mov(VReg.A0, VReg.RET);
+                this.vm.call("_agen_pop");
+                this.vm.label(_popEndLbl);
+                }
                 break;
             case "length":
                 this.vm.mov(VReg.A0, VReg.RET);
