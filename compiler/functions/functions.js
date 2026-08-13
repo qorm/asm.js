@@ -41,6 +41,34 @@ export const FunctionCompiler = {
     ...ClosureCompiler,
     ...OperatorCompiler,
 
+    // 覆盖 closures.js:默认参数表达式也可引用 `arguments`(test262
+    // params-dflt-ref-arguments)。原先只扫函数体 → 未建 arguments 对象,
+    // 默认值里 `arguments[2]` 把未绑定标识符当 0 解引用 → SIGSEGV。
+    // 仍从 body/params 分别走,不扫整个函数节点(其 type 即 FunctionExpression,
+    // walk 会立刻 return false)。嵌套函数仍截断,箭头穿透(词法 arguments)。
+    functionBodyUsesArguments(expr) {
+        const walk = (node) => {
+            if (!node || typeof node !== "object") return false;
+            if (Array.isArray(node)) {
+                for (const n of node) if (walk(n)) return true;
+                return false;
+            }
+            if (node.type === "Identifier" && node.name === "arguments") return true;
+            if (node.type === "FunctionExpression" || node.type === "FunctionDeclaration") return false;
+            for (const k in node) {
+                if (k === "type" || k === "loc" || k === "start" || k === "end") continue;
+                if (node.type === "MemberExpression" && k === "property" && !node.computed) continue;
+                if (node.type === "Property" && k === "key" && !node.computed) continue;
+                const v = node[k];
+                if (v && typeof v === "object") { if (walk(v)) return true; }
+            }
+            return false;
+        };
+        if (!expr) return false;
+        if (walk(expr.body)) return true;
+        return walk(expr.params);
+    },
+
     // [W-23] TypedArray 方法分派的**扩展入口**:先试本文件补齐的 TA 方法,未命中再落既有
     // compileTypedArrayMethod(expressions.js)。所有 TA 分派点统一改调这里,避免在多处
     // 复制判断。目前只补 lastIndexOf —— 此前 TA 没有该分派,`ta.lastIndexOf(v)` 落
@@ -1939,7 +1967,8 @@ export const FunctionCompiler = {
             }
 
             if (callee.name === "String") {
-                // String(x) -> ToString
+                // String(x) 作函数调用:_builtin_string(含 SymbolDescriptiveString);
+                // 隐式 ToString 仍走 _valueToStr(symbol → TypeError)。
                 if (expr.arguments.length > 0) {
                     // String(/re/) → __RE_toString(re)("/source/flags");_valueToStr 对
                     // 正则对象只得 "[object Object]"。仅静态 REGEXP 介入。
@@ -1953,7 +1982,7 @@ export const FunctionCompiler = {
                     }
                     this.compileExpression(expr.arguments[0]);
                     this.vm.mov(VReg.A0, VReg.RET);
-                    this.vm.call("_valueToStr");
+                    this.vm.call("_builtin_string");
                 } else {
                     this.vm.lea(VReg.A0, "_str_empty");
                     this.vm.call("_js_box_string");
@@ -4067,6 +4096,10 @@ export const FunctionCompiler = {
                     const tmpOff = this.ctx.allocLocal(tmpName);
                     this.compileExpression(expr.arguments[0]);
                     this.vm.store(VReg.FP, tmpOff, VReg.RET);
+                    // [W7] 空表也须校验接收者(defineProperties(true,{}) → TypeError);
+                    // 动态路走 _object_define_properties_dyn,静态脱糖原先漏检。
+                    this.vm.load(VReg.A0, VReg.FP, tmpOff);
+                    this.vm.call("_object_define_properties_recv_check");
                     const objRef = { type: "Identifier", name: tmpName };
                     const dpCallee = {
                         type: "MemberExpression",
@@ -5410,10 +5443,8 @@ export const FunctionCompiler = {
             const t = node.type;
             if (t === "VariableDeclarator") {
                 if (node.id && node.id.type === "Identifier" && isAnonCallable(node.init)) {
-                    const nm = node.id.name;
-                    const blkCut = nm.indexOf("$blk$");
-                    const unmangled = blkCut !== -1 ? nm.slice(0, blkCut) : nm;
-                    hints.set(node.init, unmangled);
+                    // 原名:hints 在 renameBlockScopedBindings 之前采集(见 compiler/index.js)
+                    hints.set(node.init, node.id.name);
                 }
             } else if (t === "AssignmentExpression") {
                 // [ext] 扩展至逻辑赋值运算符(??=/&&=/||=)
@@ -5421,22 +5452,14 @@ export const FunctionCompiler = {
                     node.operator === "&&=" || node.operator === "||=";
                 if ((node.operator === "=" || isLogicalAssign) &&
                     node.left && node.left.type === "Identifier" && isAnonCallable(node.right)) {
-                    const nm = node.left.name;
-                    const blkCut = nm.indexOf("$blk$");
-                    const unmangled = blkCut !== -1 ? nm.slice(0, blkCut) : nm;
-                    hints.set(node.right, unmangled);
+                    hints.set(node.right, node.left.name);
                 }
             } else if (t === "AssignmentPattern") {
                 // [ext] 解构默认值: {arrow = ()=>{}} 中 AssignmentPattern
                 // left 是绑定标识符,right 是函数/箭头/匿名类 → name = 绑定标识符名。
-                // [W-24 fix] 块级 let/const 绑定被 renameBlockScopedBindings 改名为
-                // name$blk$N,函数名须用原名(去 $blk$N 后缀)——否则 fn.name 得
-                // "fn$blk$4" 非规范 "fn"。
+                // [W-24] hints 在块级改名之前采集,此处直接用原名(勿 indexOf("$blk$")).
                 if (node.left && node.left.type === "Identifier" && isAnonCallable(node.right)) {
-                    const nm = node.left.name;
-                    const blkCut = nm.indexOf("$blk$");
-                    const unmangled = blkCut !== -1 ? nm.slice(0, blkCut) : nm;
-                    hints.set(node.right, unmangled);
+                    hints.set(node.right, node.left.name);
                 }
             } else if (t === "Property") {
                 if ((!node.kind || node.kind === "init") && isAnonCallable(node.value)) {

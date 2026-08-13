@@ -1297,9 +1297,10 @@ export class Compiler {
         if (parser.errors && parser.errors.length > 0) {
             throw new Error("Syntax errors:\n  " + parser.errors.join("\n  "));
         }
-        // [批次D] 块级作用域前置改名(let/const shadowing + TDZ 标记):
-        // 在闭包分析/编译前跑,使所有按名解析的下游消费者天然一致。
-        renameBlockScopedBindings(ast, parser.inStrictMode());
+        // [批次D] 块级改名延后到 _collectFnNameHints 之后(见 _renameModulesBlockScope):
+        // NamedEvaluation 在用户原名上采集 hints,避免 indexOf("$blk$") 在自举下
+        // host/native 分叉(gen1 含原名、gen2 残留 name$blk$N → gen1!=gen2)。
+        ast._bsStrict = parser.inStrictMode();
         return ast;
     }
 
@@ -1518,7 +1519,7 @@ export class Compiler {
             src.indexOf("__regexp_shim") === -1 &&
             (src.indexOf(reCtorText) !== -1 || src.indexOf(reEscText) !== -1 ||
              sourceHasRegexLiteral(src) || sourceHasRegExpCall(src))) {
-            const inj = 'import { __RE_new, __RE_test, __RE_exec, __RE_match, __RE_matchAll, __RE_replace, __RE_split, __RE_escape, __RE_search, __RE_toString, __RE_compile, __RE_flag_brand_check, __RE_sym_match, __RE_sym_search, __RE_sym_split, __RE_sym_replace, __RE_sym_matchAll } from "__regexp_shim";\n';
+            const inj = 'import { __RE_new, __RE_test, __RE_exec, __RE_match, __RE_matchAll, __RE_replace, __RE_split, __RE_escape, __RE_search, __RE_toString, __RE_compile, __RE_sym_match, __RE_sym_search, __RE_sym_split, __RE_sym_replace, __RE_sym_matchAll } from "__regexp_shim";\n';
             src = injectShimImport(src, inj);
             if (process.env.ASMJS_SHIM_DEBUG) {
                 console.error("[shim] regexp shim injected: " + filePath);
@@ -2060,10 +2061,11 @@ export class Compiler {
             this.createModuleMeta(this._moduleOrder[moduleIdx], moduleIdx);
         }
 
-        // [W-24] 函数名推断预扫:须在任何函数体发射(→ registerFuncMeta)之前跑完全部模块。
+        // [W-24] 函数名推断预扫:须在块级改名之前(原名)且在任何函数体发射之前。
         for (const moduleAst of this._moduleOrder) {
             this._collectFnNameHints(moduleAst);
         }
+        this._renameModulesBlockScope();
 
         for (const moduleAst of this._moduleOrder) {
             this.collectFunctions(moduleAst, this.getModuleMeta(moduleAst));
@@ -2830,6 +2832,7 @@ export class Compiler {
 
     compileProgramForLibrary(ast) {
         this._collectFnNameHints(ast); // [W-24] 同 compileProgram:发射前预扫函数名
+        renameBlockScopedBindings(ast, !!ast._bsStrict);
         this.collectFunctions(ast);
         this.compileUserFunctions();
         this.generatePendingFunctions();
@@ -3274,6 +3277,13 @@ export class Compiler {
     //   类 MethodDefinition(非计算键)          → 方法名(登记点尚未接入,提前备好)
     // 不覆盖(名字有歧义或形态特殊,宁缺勿错):计算键 [k](){}、getter/setter(规范名是
     // "get x"/"set x")、export default(名 "default")、解构默认值 ({a = () => {}})。
+    _renameModulesBlockScope() {
+        for (let i = 0; i < this._moduleOrder.length; i++) {
+            const moduleAst = this._moduleOrder[i];
+            renameBlockScopedBindings(moduleAst, !!moduleAst._bsStrict);
+        }
+    }
+
     _collectFnNameHints(ast) {
         if (!this._fnNameHints) this._fnNameHints = new Map();
         const hints = this._fnNameHints;

@@ -527,6 +527,11 @@ export class MapGenerator {
         vm.jeq("_map_kv_done");
         vm.add(VReg.V6, VReg.S3, VReg.V5); // &node[字段偏移]
         vm.load(VReg.V0, VReg.V6, 0); // key 或 value
+        // 直写 data[] 不经 _array_set:裸 +0.0 与 hole 哨兵 0 同位 → 规范为装箱 int0
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_map_kv_store");
+        vm.movImm64(VReg.V0, 0x7ff8000000000000n);
+        vm.label("_map_kv_store");
         vm.shlImm(VReg.V1, VReg.V4, 3);
         vm.add(VReg.V2, VReg.S2, VReg.V1);
         vm.store(VReg.V2, 0, VReg.V0); // data[i] = 元素
@@ -566,8 +571,16 @@ export class MapGenerator {
         vm.mov(VReg.V5, VReg.RET); // V5 = 内层头
         vm.load(VReg.V6, VReg.V5, 24); // V6 = 内层 data_ptr
         vm.load(VReg.V0, VReg.S3, 0); // node.key @0
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_map_ent_k");
+        vm.movImm64(VReg.V0, 0x7ff8000000000000n);
+        vm.label("_map_ent_k");
         vm.store(VReg.V6, 0, VReg.V0); // inner[0] = key
         vm.load(VReg.V0, VReg.S3, 8); // node.value @8
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_map_ent_v");
+        vm.movImm64(VReg.V0, 0x7ff8000000000000n);
+        vm.label("_map_ent_v");
         vm.store(VReg.V6, 8, VReg.V0); // inner[1] = value
         vm.movImm64(VReg.V1, 0x7FFE000000000000n);
         vm.mov(VReg.V2, VReg.V5);

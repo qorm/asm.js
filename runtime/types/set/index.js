@@ -340,6 +340,11 @@ export class SetGenerator {
         vm.cmpImm(VReg.S3, 0);
         vm.jeq("_set_values_done");
         vm.load(VReg.V0, VReg.S3, 0); // node.value @0
+        // 直写 data[]:+0.0 → 装箱 int0(避 hole 哨兵)
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_set_values_store");
+        vm.movImm64(VReg.V0, 0x7ff8000000000000n);
+        vm.label("_set_values_store");
         vm.shlImm(VReg.V1, VReg.V4, 3);
         vm.add(VReg.V2, VReg.S2, VReg.V1);
         vm.store(VReg.V2, 0, VReg.V0); // data[i] = value
@@ -376,6 +381,10 @@ export class SetGenerator {
         vm.mov(VReg.V5, VReg.RET); // V5 = 内层头
         vm.load(VReg.V6, VReg.V5, 24); // V6 = 内层 data_ptr
         vm.load(VReg.V0, VReg.S3, 0); // node.value @0
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_set_ent_v");
+        vm.movImm64(VReg.V0, 0x7ff8000000000000n);
+        vm.label("_set_ent_v");
         vm.store(VReg.V6, 0, VReg.V0); // inner[0] = value
         vm.store(VReg.V6, 8, VReg.V0); // inner[1] = value
         vm.movImm64(VReg.V1, 0x7FFE000000000000n);
@@ -436,20 +445,27 @@ export class SetGenerator {
         // Set ES2025 组合方法(intersection/union/...)的第二个实参可能是装箱 Set-like
         // 对象而非裸 Set 指针;原 helper 直接解引用裸指针 → SIGSEGV。此 helper 做品牌
         // 守卫:已为裸 Set→ 直返;装箱 Set 对象(0x7FFD 且 TYPE_SET)→ 脱壳返;
-        // Set-like 对象→ 先按迭代器协议造新 Set(逐 keys 值 add),再返;
-        // 其余 → TypeError。_set_coerce_arg_do_add 复用于 _set_union 内参。
+        // 装箱数组(0x7FFE)亦为 Object,可走 GetSetRecord(set-like-array);
+        // 裸 Map → 按插入序键物化为 Set(combines-Map);
+        // Set-like 对象→ Call(keys)后 next 物化到新 Set;
+        // 其余 → TypeError。
+        const TYPE_MAP = 4;
         vm.asm.registerRuntimeString("_str_sz_size", "size");
         vm.asm.registerRuntimeString("_str_sz_has", "has");
         vm.asm.registerRuntimeString("_str_sz_keys", "keys");
         vm.label("_set_coerce_arg");
-        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
         vm.mov(VReg.S0, VReg.A0);
         vm.shrImm(VReg.V0, VReg.S0, 48);
         vm.cmpImm(VReg.V0, 0);
         vm.jeq("_sca_raw");
+        // 0x7FFD 普通对象 / 0x7FFE 数组(仍为 ES Object,可作 set-like)
         vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jeq("_sca_boxed_obj");
+        vm.cmpImm(VReg.V0, 0x7FFE);
         vm.jne("_sca_bad");
-        // 装箱对象 → 脱壳验类型字节
+        vm.label("_sca_boxed_obj");
+        // 装箱对象/数组 → 脱壳验类型字节
         vm.movImm64(VReg.V1, SET_MASK);
         vm.and(VReg.S4, VReg.S0, VReg.V1);
         vm.movImm64(VReg.V1, vm.ptrFloor);
@@ -458,45 +474,140 @@ export class SetGenerator {
         vm.loadByte(VReg.V1, VReg.S4, 0);
         vm.cmpImm(VReg.V1, TYPE_SET);
         vm.jeq("_sca_is_set");            // 装箱 Set → 脱壳直返
-        // 非 Set 装箱对象:取 keys 迭代并 add 到新 Set
-        vm.call("_set_new");
-        vm.mov(VReg.S1, VReg.RET);         // S1 = 新裸 Set
+        vm.cmpImm(VReg.V1, TYPE_MAP);
+        vm.jeq("_sca_from_map");          // 装箱 Map → 键物化
+        // ---- GetSetRecord(obj) 守卫(size/has/keys)后再尝试物化 ----
+        // size: Get → 拒 BigInt → ToNumber → 拒 NaN/负
+        vm.lea(VReg.A1, "_str_sz_size");
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_get");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_is_bigint");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_sca_bad");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_number_coerce");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.fmovToFloat(0, VReg.S2);
+        vm.fcmp(0, 0);
+        vm.jnan("_sca_bad");
+        vm.movImm(VReg.V1, 0); // +0.0
+        vm.fmovToFloat(1, VReg.V1);
+        vm.fcmp(0, 1);
+        vm.jflt("_sca_bad");
+        // has 必须可调用
+        vm.lea(VReg.A1, "_str_sz_has");
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_get");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.shrImm(VReg.V0, VReg.S2, 48);
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jeq("_sca_has_ok");
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_sca_bad");
+        vm.cmpImm(VReg.S2, 0);
+        vm.jeq("_sca_bad");
+        vm.label("_sca_has_ok");
+        // keys 必须可调用(随后再 Call;此处仅 IsCallable)
         vm.lea(VReg.A1, "_str_sz_keys");
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.A1, VReg.V1);
-        vm.mov(VReg.A0, VReg.S0);          // 候选对象
-        vm.call("_object_get"); // RET = keys(函数/undefined)
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_get");
         vm.mov(VReg.S2, VReg.RET);
         vm.shrImm(VReg.V0, VReg.S2, 48);
-        vm.cmpImm(VReg.V0, 0x7FFF);        // 函数 TAG
-        vm.jeq("_sca_call_keys");
-        vm.cmpImm(VReg.V0, 0);             // 裸函数指针
-        vm.jne("_sca_not_iter");           // keys 不可调用 → 放弃(返回空集)
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jeq("_sca_keys_ok");
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_sca_bad");
+        vm.cmpImm(VReg.S2, 0);
+        vm.jeq("_sca_bad");
         // 归一化裸函数指针为装箱形式
         vm.movImm64(VReg.V1, SET_MASK);
         vm.and(VReg.S2, VReg.S2, VReg.V1);
         vm.movImm64(VReg.V1, 0x7fff000000000000n);
         vm.or(VReg.S2, VReg.S2, VReg.V1);
-        vm.label("_sca_call_keys");
+        vm.label("_sca_keys_ok");
+        // 非 Set 装箱对象:Call(keys, obj) 后物化到新 Set
+        //   数组(0x7FFE)→ 按下标遍历(兼容 keys 直接返数组);
+        //   对象(0x7FFD)/裸堆 → GetIteratorDirect:循环 next()/done/value(生成器与自定义迭代器)。
+        vm.call("_set_new");
+        vm.mov(VReg.S1, VReg.RET);         // S1 = 新裸 Set
+        // S2 已是 keys 函数(GetSetRecord 缓存,避免二次 Get)
         vm.shrImm(VReg.V0, VReg.S2, 48);
         vm.cmpImm(VReg.V0, 0x7FFF);
-        vm.jne("_sca_not_iter");
-        // 用 _aref_invoke_cb 调 keys(0 参);传 A0=接收者 A3=keys,压空哨兵作 element
-        vm.movImm64(VReg.A0, 0x7ffb000000000000n); // undefined 占位 element
-        vm.movImm64(VReg.A1, 0x7ffb000000000000n); // undefined 占位 idx
-        vm.mov(VReg.A2, VReg.S0);          // 数组占位 = 候选对象
-        vm.mov(VReg.A3, VReg.S2);          // keys 函数
-        vm.call("_aref_invoke_cb");        // RET = keys() 返回值(迭代器数组)
-        vm.mov(VReg.S3, VReg.RET);         // S3 = 迭代器数组(装箱)
+        vm.jne("_sca_bad");
+        // Call(keys, obj)——_spread_call0 正确绑 this=obj(规范 GetIteratorFromMethod)
+        vm.mov(VReg.A0, VReg.S2);          // keys 函数
+        vm.mov(VReg.A1, VReg.S0);          // this = 候选对象
+        vm.call("_spread_call0");
+        vm.mov(VReg.S3, VReg.RET);         // S3 = keys() 返回值
         vm.shrImm(VReg.V0, VReg.S3, 48);
         vm.cmpImm(VReg.V0, 0x7FFE);
-        vm.jne("_sca_not_iter");           // 返回值非数组 → 放弃
-        // 遍历迭代器数组,逐值 _set_add
+        vm.jeq("_sca_arr_loop_init");     // 数组快路
+        // Type(iterator) 须为 Object(0x7FFD)或裸堆;其余 → TypeError
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jeq("_sca_gen_loop");
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_sca_bad");
+        vm.cmpImm(VReg.S3, 0);
+        vm.jeq("_sca_bad");
+        // ---- 迭代器物化:IteratorStepValue 循环 ----
+        vm.label("_sca_gen_loop");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.lea(VReg.A1, vm.asm.addString("next"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        // next 可能是访问器(set-like-class-order 的 get next);解包后再判可调用
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_maybe_getter");
+        vm.shrImm(VReg.V2, VReg.RET, 48); // V2 不别名待调的 next(RET/V0)
+        vm.cmpImm(VReg.V2, 0x7FFF);
+        vm.jne("_sca_bad");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_spread_call0");         // res = next.call(iter)
+        vm.mov(VReg.S4, VReg.RET);         // S4 = res
+        // if (ToBoolean(res.done)) → 结束
+        vm.mov(VReg.A0, VReg.S4);
+        vm.lea(VReg.A1, vm.asm.addString("done"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_maybe_getter");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_boolean");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_sca_done");
+        // value = res.value; _set_add(S1, value)
+        vm.mov(VReg.A0, VReg.S4);
+        vm.lea(VReg.A1, vm.asm.addString("value"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_maybe_getter");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_set_add");
+        vm.jmp("_sca_gen_loop");
+        // ---- 数组快路(keys 直接返回数组) ----
+        vm.label("_sca_arr_loop_init");
         vm.movImm(VReg.S4, 0);
         vm.mov(VReg.A0, VReg.S3);
         vm.call("_array_length");
         vm.mov(VReg.S5, VReg.RET);
-        vm.label("_sca_loop");
+        vm.label("_sca_arr_loop");
         vm.cmp(VReg.S4, VReg.S5);
         vm.jge("_sca_done");
         vm.mov(VReg.A0, VReg.S3);
@@ -506,12 +617,24 @@ export class SetGenerator {
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_set_add");
         vm.addImm(VReg.S4, VReg.S4, 1);
-        vm.jmp("_sca_loop");
-        vm.label("_sca_not_iter");         // keys 不可用 → 返回空集
-        vm.jmp("_sca_done");
+        vm.jmp("_sca_arr_loop");
         vm.label("_sca_is_set");
         vm.mov(VReg.S1, VReg.S4);          // 脱壳后的裸 Set 指针
         vm.jmp("_sca_done");
+        // ---- 裸/装箱 Map → 按插入序键物化为新 Set(等价 Map.prototype.keys) ----
+        vm.label("_sca_from_map");
+        // S4 = 裸 Map 指针(调用方已脱壳或 raw 路径置入)
+        vm.call("_set_new");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.load(VReg.S3, VReg.S4, 16);     // cur = map.head
+        vm.label("_sca_map_loop");
+        vm.cmpImm(VReg.S3, 0);
+        vm.jeq("_sca_done");
+        vm.load(VReg.A1, VReg.S3, 0);      // node.key @0
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_set_add");
+        vm.load(VReg.S3, VReg.S3, 16);     // cur = node.next @16
+        vm.jmp("_sca_map_loop");
         vm.label("_sca_raw");
         vm.movImm64(VReg.V1, SET_MASK);
         vm.and(VReg.V0, VReg.S0, VReg.V1);
@@ -520,17 +643,22 @@ export class SetGenerator {
         vm.jlt("_sca_bad");
         vm.loadByte(VReg.V1, VReg.V0, 0);
         vm.cmpImm(VReg.V1, TYPE_SET);
+        vm.jeq("_sca_raw_set");
+        vm.cmpImm(VReg.V1, TYPE_MAP);
         vm.jne("_sca_bad");
+        vm.mov(VReg.S4, VReg.V0);          // 裸 Map
+        vm.jmp("_sca_from_map");
+        vm.label("_sca_raw_set");
         vm.mov(VReg.S1, VReg.V0);
         vm.label("_sca_done");
         vm.mov(VReg.RET, VReg.S1);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
         vm.label("_sca_bad");
         vm.lea(VReg.A0, vm.asm.addString("Set method argument must be a Set or Set-like object"));
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
         vm.or(VReg.A0, VReg.A0, VReg.V1);
         vm.call("_throw_type_error"); // 不返回
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32); // 理论不达
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48); // 理论不达
 
         // ---- _set_union(A0=a, A1=b) -> 新 Set(a ∪ b) ----
         vm.label("_set_union");

@@ -82,45 +82,134 @@ export class StringGenerator {
         vm.label(okLabel);
     }
 
-    // _emitThisToString(methodName) —— 与 _emitThisStringCheck 同形,但对非字符串接收者
-    // 调用 _valueToStr 强制转换为字符串,而非抛 TypeError。供 trim/trimStart/trimEnd
-    // 等 ES 要求先 ToString(this) 的方法使用。
+    _emitThrowTypeError(msg) {
+        const vm = this.vm;
+        vm.lea(VReg.A0, vm.asm.addString(msg));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+    }
+
+    // _emitThisToString(methodName) —— ES RequireObjectCoercible(this) + ToString(this)。
+    // 快路径:装箱串(0x7FFC)与编译器静态派发的裸串指针(high16=0,非 Symbol)原样通过。
+    // null/undefined → TypeError; Symbol 裸块 → TypeError; 其余走 _valueToStr。
+    // 调用前必须先把 A1/A2 存进 S* 或栈:本函数会 call,摧毁 caller-saved。
     _emitThisToString(methodName) {
         const vm = this.vm;
         const okLabel = "_thiscoerce_ok_" + methodName;
         const extractLabel = "_thiscoerce_extract_" + methodName;
         const forceLabel = "_thiscoerce_force_" + methodName;
+        const throwNull = "_thiscoerce_nullish_" + methodName;
+        const throwSym = "_thiscoerce_sym_" + methodName;
         vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFA);  // null
+        vm.jeq(throwNull);
+        vm.cmpImm(VReg.V0, 0x7FFB);  // undefined
+        vm.jeq(throwNull);
         vm.cmpImm(VReg.V0, 0x7FFC);  // boxed string
         vm.jeq(okLabel);
-        vm.cmpImm(VReg.V0, 0x7FFD);  // boxed wrapper object
+        vm.cmpImm(VReg.V0, 0x7FFD);  // boxed wrapper / 普通对象
         vm.jeq(extractLabel);
-        vm.cmpImm(VReg.V0, 0);       // raw pointer (compiler static dispatch)
-        vm.jeq(okLabel);
-        // 非字符串/非指针接收者:调用 _valueToStr 强制转为装箱字符串
+        vm.cmpImm(VReg.V0, 0);       // 裸指针:编译器静态串,或 Symbol 堆块,或 int 0
+        vm.jne(forceLabel);
+        vm.cmpImm(VReg.A0, 0);
+        vm.jeq(forceLabel); // 整数 0(+0→int0):ToString → "0",不是空串指针
+        vm.lea(VReg.V1, "_heap_base");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.A0, VReg.V1);
+        vm.jb(okLabel);
+        vm.lea(VReg.V1, "_heap_ptr");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.A0, VReg.V1);
+        vm.jae(okLabel);
+        vm.loadByte(VReg.V1, VReg.A0, 0);
+        vm.cmpImm(VReg.V1, 61); // TYPE_SYMBOL
+        vm.jeq(throwSym);
+        vm.jmp(okLabel);
+        vm.label(throwNull);
+        this._emitThrowTypeError("Cannot convert undefined or null to object");
+        vm.label(throwSym);
+        this._emitThrowTypeError("Cannot convert a Symbol value to a string");
         vm.label(forceLabel);
-        vm.call("_valueToStr");           // A0 = JSValue → RET = 装箱字符串
+        vm.call("_valueToStr");
         vm.mov(VReg.A0, VReg.RET);
         vm.jmp(okLabel);
-        // 0x7FFD extraction:尝试 __value(仅 String 包装器有效)
-        // 若返回非字符串,回退到 _valueToStr。
-        // 注意:调用函数前须将 boxed obj 存至栈,因 _object_get/_tag_key_a1
-        // 会破坏 V0-V4(调用者保存寄存器)。
         vm.label(extractLabel);
-        vm.push(VReg.A0);                 // 保存 boxed obj 到栈
-        vm.mov(VReg.A0, VReg.A0);         // A0 = boxed obj (for _object_get)
+        vm.push(VReg.A0);
         vm.lea(VReg.A1, vm.asm.addString("__value"));
         vm.call("_tag_key_a1");
-        vm.call("_object_get");           // RET = __value or undefined
-        vm.pop(VReg.V1);                  // V1 = original boxed obj (从栈恢复)
-        // 检查 RET 是否为装箱字符串(0x7FFC)
+        vm.call("_object_get");
+        vm.pop(VReg.V1);
         vm.shrImm(VReg.V0, VReg.RET, 48);
         vm.cmpImm(VReg.V0, 0x7FFC);
-        vm.jne("_thiscoerce_fallback_" + methodName); // 非字符串→_valueToStr
-        vm.mov(VReg.A0, VReg.RET);        // A0 = extracted string
+        vm.jne("_thiscoerce_prim_" + methodName);
+        vm.mov(VReg.A0, VReg.RET);
         vm.jmp(okLabel);
+        vm.label("_thiscoerce_prim_" + methodName);
+        // __value 是数字/布尔等原始值:ToString(__value);缺省/对象则 ToString(原 this)
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_thiscoerce_fallback_" + methodName);
+        vm.cmpImm(VReg.V0, 0x7FFA);
+        vm.jeq("_thiscoerce_fallback_" + methodName);
+        vm.cmpImm(VReg.V0, 0x7FFB);
+        vm.jeq("_thiscoerce_fallback_" + methodName);
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jeq("_thiscoerce_fallback_" + methodName);
+        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jeq("_thiscoerce_fallback_" + methodName);
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jeq("_thiscoerce_fallback_" + methodName);
+        vm.mov(VReg.A0, VReg.RET);
+        vm.jmp(forceLabel);
         vm.label("_thiscoerce_fallback_" + methodName);
-        vm.mov(VReg.A0, VReg.V1);         // A0 = 原 boxed obj(from stack),投 _valueToStr
+        // String 包装用 __value;Number/Boolean 包装分别是 __number_value / __boolean_value。
+        vm.mov(VReg.A0, VReg.V1);
+        vm.push(VReg.V1);
+        vm.lea(VReg.A1, vm.asm.addString("__number_value"));
+        vm.call("_tag_key_a1");
+        vm.call("_object_get");
+        vm.pop(VReg.V1);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_thiscoerce_trybool_" + methodName);
+        vm.shrImm(VReg.V0, VReg.RET, 48);
+        vm.cmpImm(VReg.V0, 0x7FFA);
+        vm.jeq("_thiscoerce_trybool_" + methodName);
+        vm.cmpImm(VReg.V0, 0x7FFB); // miss → undefined,不可 ToString(undefined)
+        vm.jeq("_thiscoerce_trybool_" + methodName);
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jeq("_thiscoerce_trybool_" + methodName);
+        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jeq("_thiscoerce_trybool_" + methodName);
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jeq("_thiscoerce_trybool_" + methodName);
+        vm.mov(VReg.A0, VReg.RET);
+        vm.jmp(forceLabel);
+        vm.label("_thiscoerce_trybool_" + methodName);
+        vm.mov(VReg.A0, VReg.V1);
+        vm.push(VReg.V1);
+        vm.lea(VReg.A1, vm.asm.addString("__boolean_value"));
+        vm.call("_tag_key_a1");
+        vm.call("_object_get");
+        vm.pop(VReg.V1);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_thiscoerce_obj_" + methodName);
+        vm.shrImm(VReg.V0, VReg.RET, 48);
+        vm.cmpImm(VReg.V0, 0x7FFA);
+        vm.jeq("_thiscoerce_obj_" + methodName);
+        vm.cmpImm(VReg.V0, 0x7FFB);
+        vm.jeq("_thiscoerce_obj_" + methodName);
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jeq("_thiscoerce_obj_" + methodName);
+        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jeq("_thiscoerce_obj_" + methodName);
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jeq("_thiscoerce_obj_" + methodName);
+        vm.mov(VReg.A0, VReg.RET);
+        vm.jmp(forceLabel);
+        vm.label("_thiscoerce_obj_" + methodName);
+        vm.mov(VReg.A0, VReg.V1);
         vm.jmp(forceLabel);
         vm.label(okLabel);
     }
@@ -255,9 +344,11 @@ export class StringGenerator {
         const vm = this.vm;
         vm.label("_str_localeCompare");
         vm.prologue(0, [VReg.S0, VReg.S1]);
-        this._emitThisStringCheck("localeCompare");
         vm.mov(VReg.S0, VReg.A0);
         vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.A0, VReg.S0);
+        this._emitThisToString("localeCompare");
+        vm.mov(VReg.S0, VReg.A0);
         // [W-25] that 实参 ToString:localeCompare(undefined) 须与 "undefined" 比较
         // (test262 15.5.4.9_3),此前 _getStrContent(undefined) → 空串 → 恒返 1。
         this._emitArgStrInline(VReg.S1, "_localeCompare_that");
@@ -364,13 +455,33 @@ export class StringGenerator {
     _emitArgStrInline(reg, tagLabel) {
         const vm = this.vm;
         const skip = "_argstr_skip_" + tagLabel;
+        const coerce = "_argstr_coerce_" + tagLabel;
         vm.shrImm(VReg.V1, reg, 48);
-        vm.cmpImm(VReg.V1, 0);
-        vm.jeq(skip);
         vm.cmpImm(VReg.V1, 0x7ffc);
         vm.jeq(skip);
         vm.cmpImm(VReg.V1, 0x7fff);
         vm.jeq(skip);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne(coerce);
+        // high16==0:数据段/堆串指针放行;堆普通对象须 ToString(否则当串指针解引用 SIGSEGV)
+        vm.cmpImm(reg, 0);
+        vm.jeq(skip);
+        vm.lea(VReg.V0, "_heap_base");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmp(reg, VReg.V0);
+        vm.jb(skip);
+        vm.lea(VReg.V0, "_heap_ptr");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmp(reg, VReg.V0);
+        vm.jae(skip);
+        vm.loadByte(VReg.V0, reg, 0);
+        vm.cmpImm(VReg.V0, 61); // TYPE_SYMBOL:ToString 必须 TypeError(String.raw 替换等)
+        vm.jeq(coerce);
+        vm.cmpImm(VReg.V0, 2); // TYPE_OBJECT
+        vm.jne(skip);
+        vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+        vm.or(reg, reg, VReg.V1);
+        vm.label(coerce);
         vm.mov(VReg.A0, reg);
         vm.call("_str_argstr");
         vm.mov(reg, VReg.RET);
@@ -733,8 +844,9 @@ export class StringGenerator {
         vm.label("_char_to_str");
         vm.prologue(16, [VReg.S0, VReg.S1, VReg.S4, VReg.S5]); // S4/S5 被本函数当 scratch,须保存(P1 审计)
 
-        vm.call("_syscall_arg"); // 归一化 code 为整数
-        vm.mov(VReg.S0, VReg.RET);
+        vm.call("_to_uint32"); // ToNumber + ToUint32(Boolean 对象 valueOf→1)
+        vm.movImm64(VReg.V1, 0xffffn);
+        vm.and(VReg.S0, VReg.RET, VReg.V1); // ToUint16
 
         vm.movImm(VReg.A0, 8);
         vm.call("_alloc");
@@ -776,11 +888,11 @@ export class StringGenerator {
 
         vm.label(label);
         vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
-        this._emitThisStringCheck(label);
-
-        // S0 = 原串内容, S1 = pad 内容, S3 = targetLen
         vm.push(VReg.A1);
         vm.push(VReg.A2);
+        this._emitThisToString(label);
+
+        // S0 = 原串内容, S1 = pad 内容, S3 = targetLen
         vm.call("_getStrContent");
         vm.mov(VReg.S0, VReg.RET);
         vm.pop(VReg.S1); // padStr(原样,先 ToString 再取内容)
@@ -825,14 +937,41 @@ export class StringGenerator {
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_getStrContent");
         vm.mov(VReg.S1, VReg.RET);
-        vm.pop(VReg.A0); // targetLen
-        vm.call("_syscall_arg"); // 归一化为整数
+        vm.pop(VReg.A0); // maxLength
+        // 静态派发已 _to_int32,走 _syscall_arg;对象须 ToPrimitive(hint number)
+        // 再 ToNumber(padStart/observable-operations:valueOf 返 {}、toString 返 11)。
+        // 不可对 0x7FFD 用 _syscall_arg:会把堆指针当长度→巨 alloc 超时。
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jeq(label + "_lenobj");
+        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jeq(label + "_lenobj");
+        vm.call("_syscall_arg");
         vm.mov(VReg.S3, VReg.RET);
+        vm.jmp(label + "_lenpos");
+        vm.label(label + "_lenobj");
+        vm.call("_js_toprimitive");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_number_coerce");
+        vm.fmovToFloat(0, VReg.RET);
+        vm.fcvtzs(VReg.S3, 0);
+        vm.label(label + "_lenpos");
+        vm.cmpImm(VReg.S3, 0);
+        vm.jge(label + "_lenok");
+        vm.movImm(VReg.S3, 0);
+        vm.label(label + "_lenok");
 
         // S2 = 原串长度
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_strlen");
         vm.mov(VReg.S2, VReg.RET);
+        // ES: fillString 为空串 → 直接返回 S(不可用空格填)。
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_strlen");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne(label + "_hasfill");
+        vm.mov(VReg.S3, VReg.S2);
+        vm.label(label + "_hasfill");
 
         // targetLen <= len: 返回原串（重新装箱）
         vm.cmp(VReg.S3, VReg.S2);
@@ -1222,11 +1361,33 @@ export class StringGenerator {
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_object_user_tostr");
         vm.cmpImm(VReg.RET, 0);
-        vm.jeq("_valueToStr_object_default");
-        // 守卫:user toString 可能返回非原语(test262 match:toString→{})
+        vm.jeq("_valueToStr_try_vo"); // toString 非 callable → 试 valueOf(hint string 第二方法)
         vm.shrImm(VReg.V0, VReg.RET, 48);
         vm.cmpImm(VReg.V0, 0x7FFD);       // toString 返回仍是对象
-        vm.jne("_valueToStr_obj_tostr_ok"); // 原语 → 递归归一
+        vm.jeq("_valueToStr_try_vo");
+        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jeq("_valueToStr_try_vo");
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_valueToStr_obj_tostr_ok"); // 带 tag 的原语 → 递归归一
+        // high16==0:裸堆对象(return {})须试 valueOf;数据段串则当原语。
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_valueToStr_try_vo");
+        vm.lea(VReg.V1, "_heap_base");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jb("_valueToStr_obj_tostr_ok");
+        vm.lea(VReg.V1, "_heap_ptr");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jae("_valueToStr_obj_tostr_ok");
+        vm.loadByte(VReg.V1, VReg.RET, 0);
+        vm.andImm(VReg.V1, VReg.V1, 0xff);
+        vm.cmpImm(VReg.V1, TYPE_OBJECT);
+        vm.jeq("_valueToStr_try_vo");
+        vm.cmpImm(VReg.V1, TYPE_ARRAY);
+        vm.jeq("_valueToStr_try_vo");
+        vm.jmp("_valueToStr_obj_tostr_ok");
+        vm.label("_valueToStr_try_vo");
         vm.mov(VReg.A0, VReg.S0);         // 恢复原装箱对象
         vm.call("_object_user_valueof");  // 尝试 valueOf
         vm.cmpImm(VReg.RET, 0);
@@ -1234,6 +1395,27 @@ export class StringGenerator {
         vm.shrImm(VReg.V0, VReg.RET, 48);
         vm.cmpImm(VReg.V0, 0x7FFD);       // valueOf 又返对象
         vm.jeq("_valueToStr_object_default");
+        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jeq("_valueToStr_object_default");
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_valueToStr_vo_ok");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_valueToStr_object_default");
+        vm.lea(VReg.V1, "_heap_base");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jb("_valueToStr_vo_ok");
+        vm.lea(VReg.V1, "_heap_ptr");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jae("_valueToStr_vo_ok");
+        vm.loadByte(VReg.V1, VReg.RET, 0);
+        vm.andImm(VReg.V1, VReg.V1, 0xff);
+        vm.cmpImm(VReg.V1, TYPE_OBJECT);
+        vm.jeq("_valueToStr_object_default");
+        vm.cmpImm(VReg.V1, TYPE_ARRAY);
+        vm.jeq("_valueToStr_object_default");
+        vm.label("_valueToStr_vo_ok");
         vm.mov(VReg.A0, VReg.RET);        // valueOf 原语 → 递归
         vm.call("_valueToStr");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
@@ -1242,8 +1424,11 @@ export class StringGenerator {
         vm.call("_valueToStr");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
         vm.label("_valueToStr_object_default");
-        vm.lea(VReg.A0, "_str_object");
-        vm.jmp("_valueToStr_data_str_create_heap");
+        // OrdinaryToPrimitive:toString/valueOf 皆非 callable 或皆返对象 → TypeError。
+        // 不可回落 "[object Object]":{toString:undefined,valueOf:undefined} 必须抛
+        // (test262 toLowerCase/substring this-value-tostring-throws-toprimitive)。
+        // 普通 {} 走 Object.prototype.toString,不会落到本支。
+        this._emitThrowTypeError("Cannot convert object to primitive value");
 
         vm.label("_valueToStr_js_date");
         // Date → _date_toString(接受装箱 0x7ffd/裸指针;非 Date 已被上方类型字节拦截)
@@ -1482,9 +1667,9 @@ export class StringGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
 
         vm.label("_valueToStr_as_symbol");
-        vm.mov(VReg.A0, VReg.S0);
-        vm.call("_symbol_to_string"); // RET = boxed 堆串
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
+        // ToString(Symbol) 必须 TypeError(隐式转换 / String.raw 替换)。String(sym)
+        // 规范有 SymbolDescriptiveString 特例,在 _builtin_string;此处走 ToString。
+        this._emitThrowTypeError("Cannot convert a Symbol value to a string");
 
         vm.label("_valueToStr_bigint");
         // 64 位值在 user_ptr +0；_intToStr 返回 NaN-boxed 堆串（有符号十进制）。
@@ -1599,16 +1784,33 @@ export class StringGenerator {
         vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2]);
         vm.mov(VReg.S2, VReg.A0); // S2 = 装箱对象(this)
         vm.mov(VReg.A0, VReg.S2);
-        vm.lea(VReg.A1, "_str_key_toString");
+        vm.lea(VReg.A1, vm.asm.addString("toString"));
         vm.movImm64(VReg.V0, 0x7ffc000000000000n);
-        vm.or(VReg.A1, VReg.A1, VReg.V0); // 装箱 "toString" 键
-        vm.call("_object_get");           // RET = toString 值(miss→0/undef)
+        vm.or(VReg.A1, VReg.A1, VReg.V0);
+        vm.call("_object_get");
+        vm.shrImm(VReg.V0, VReg.RET, 48);
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jne("_object_user_tostr_getter");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.RET, VReg.RET, VReg.V1);
+        vm.label("_object_user_tostr_getter");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S2);
+        vm.call("_maybe_getter");
         vm.mov(VReg.S1, VReg.RET);
+        vm.cmpImm(VReg.S1, 0);
+        vm.jeq("_object_user_tostr_none");
         vm.shrImm(VReg.V0, VReg.S1, 48);
         vm.cmpImm(VReg.V0, 0x7FFF);       // function tag
         vm.jne("_object_user_tostr_none");
         vm.emitMaskLoad(VReg.V0);
         vm.andMaskReg(VReg.S0, VReg.S1, VReg.V0); // S0 = 闭包指针(函数体入口约定)
+        vm.load(VReg.V1, VReg.S0, 0);
+        vm.cmpImm(VReg.V1, 0xc105);
+        vm.jeq("_object_user_tostr_ok");
+        vm.cmpImm(VReg.V1, 0xa51c);
+        vm.jne("_object_user_tostr_none");
+        vm.label("_object_user_tostr_ok");
         vm.load(VReg.V1, VReg.S0, 8);      // V1 = 真函数指针
         vm.mov(VReg.A0, VReg.S2);
         vm.mov(VReg.A5, VReg.S2);          // this = 对象
@@ -1625,16 +1827,33 @@ export class StringGenerator {
         vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2]);
         vm.mov(VReg.S2, VReg.A0);
         vm.mov(VReg.A0, VReg.S2);
-        vm.lea(VReg.A1, "_str_key_valueOf");
+        vm.lea(VReg.A1, vm.asm.addString("valueOf"));
         vm.movImm64(VReg.V0, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.A1, VReg.V0);
         vm.call("_object_get");
+        vm.shrImm(VReg.V0, VReg.RET, 48);
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jne("_object_user_valueof_getter");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.RET, VReg.RET, VReg.V1);
+        vm.label("_object_user_valueof_getter");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S2);
+        vm.call("_maybe_getter");
         vm.mov(VReg.S1, VReg.RET);
+        vm.cmpImm(VReg.S1, 0);
+        vm.jeq("_object_user_valueof_none");
         vm.shrImm(VReg.V0, VReg.S1, 48);
         vm.cmpImm(VReg.V0, 0x7FFF);
         vm.jne("_object_user_valueof_none");
         vm.emitMaskLoad(VReg.V0);
         vm.andMaskReg(VReg.S0, VReg.S1, VReg.V0);
+        vm.load(VReg.V1, VReg.S0, 0);
+        vm.cmpImm(VReg.V1, 0xc105);
+        vm.jeq("_object_user_valueof_ok");
+        vm.cmpImm(VReg.V1, 0xa51c);
+        vm.jne("_object_user_valueof_none");
+        vm.label("_object_user_valueof_ok");
         vm.load(VReg.V1, VReg.S0, 8);
         vm.mov(VReg.A0, VReg.S2);
         vm.mov(VReg.A5, VReg.S2);
@@ -1666,10 +1885,28 @@ export class StringGenerator {
         vm.mov(VReg.A1, VReg.RET);
         vm.mov(VReg.A0, VReg.S2);
         vm.call("_object_get");       // RET = 方法或 undef/0
+        vm.shrImm(VReg.V0, VReg.RET, 48);
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jne("_ctp_getter");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.RET, VReg.RET, VReg.V1); // 装箱 getter 标记须脱壳,_maybe_getter 只认裸指针
+        vm.label("_ctp_getter");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S2);
+        vm.call("_maybe_getter");     // GetMethod:访问器必须调用(可抛 Test262Error)
         vm.mov(VReg.S1, VReg.RET);
+        vm.lea(VReg.V0, "_js_undefined");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmp(VReg.S1, VReg.V0);
+        vm.jeq("_ctp_none");
+        vm.movImm64(VReg.V0, 0x7ffa000000000000n); // null
+        vm.cmp(VReg.S1, VReg.V0);
+        vm.jeq("_ctp_none");
+        vm.cmpImm(VReg.S1, 0);
+        vm.jeq("_ctp_none");
         vm.shrImm(VReg.V0, VReg.S1, 48);
         vm.cmpImm(VReg.V0, 0x7FFF);   // function tag
-        vm.jne("_ctp_none");
+        vm.jne("_ctp_not_callable");
         // 调用 [Symbol.toPrimitive](hint):约定同 _object_user_tostr(S0=闭包、[+8]=真函数、A5=this)
         vm.movImm64(VReg.V0, 0x0000ffffffffffffn);
         vm.and(VReg.S0, VReg.S1, VReg.V0);
@@ -1678,7 +1915,17 @@ export class StringGenerator {
         vm.mov(VReg.A5, VReg.S2);     // this = obj
         vm.setCallArgcImm(1, VReg.V0, VReg.V2); // [argc ABI] [Symbol.toPrimitive](hint)
         vm.callIndirect(VReg.V1);
+        // ToPrimitive:exotic 返回对象 → TypeError(不可回落 OrdinaryToPrimitive)
+        vm.shrImm(VReg.V0, VReg.RET, 48);
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jeq("_ctp_obj_result");
+        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jeq("_ctp_obj_result");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
+        vm.label("_ctp_not_callable");
+        this._emitThrowTypeError("Cannot convert object to primitive value");
+        vm.label("_ctp_obj_result");
+        this._emitThrowTypeError("Cannot convert object to primitive value");
         vm.label("_ctp_none");
         vm.mov(VReg.RET, VReg.S2);    // 原样返回(无 Symbol.toPrimitive)
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
@@ -1705,10 +1952,13 @@ export class StringGenerator {
         vm.cmpImm(VReg.V2, 0x7FFD);        // valueOf 结果又是对象?
         vm.jne("_js_toprim_done");         // 原始值 → 用
         vm.label("_js_toprim_try_tostr");
-        // toString 步:委托 _valueToStr —— 覆盖 Error("name: message")、有用户 toString、
-        // 数组、否则 "[object Object]"(此前仅 _object_user_tostr+默认,Error+"" 得 "[object Object]")。
-        // 至此已确认无 Symbol.toPrimitive(前置 default 检查未命中),_valueToStr 内的 string
-        // 检查冗余但无害。
+        // OrdinaryToPrimitive:valueOf 返对象后调用户 toString(可抛);无则 _valueToStr。
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_user_tostr");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_js_toprim_default_str");
+        vm.epilogue([VReg.S0], 16);
+        vm.label("_js_toprim_default_str");
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_valueToStr");
         vm.label("_js_toprim_done");
@@ -2608,10 +2858,11 @@ export class StringGenerator {
 
         vm.label("_str_charAt");
         vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2]);
-        this._emitThisStringCheck("charAt");
-
-        vm.mov(VReg.S0, VReg.A0); // S0 = 原始字符串指针
-        vm.mov(VReg.S1, VReg.A1); // S1 = index
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.A0, VReg.S0);
+        this._emitThisToString("charAt");
+        vm.mov(VReg.S0, VReg.A0);
 
         // 越界检查:index<0 或 >=length → 返回空字符串(charAt 语义;此前无检查 → 越界
         // 读堆邻居返垃圾字符,是 `"hi".charAt(5)`/`s[oob]` 返垃圾、动态串下标崩的共因)。
@@ -2718,12 +2969,31 @@ export class StringGenerator {
         const vm = this.vm;
         vm.label("_str_codepoint_at");
         vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
-        this._emitThisStringCheck("codePointAt");
+        vm.mov(VReg.S2, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.A0, VReg.S2);
+        this._emitThisToString("codePointAt");
         // 归一 byteOff:装箱值(_aref_generic 路径)或裸 int(静态派发路径)-> 整数
         vm.mov(VReg.S2, VReg.A0); // preserve str across _syscall_arg call
-        vm.mov(VReg.A0, VReg.A1);
+        vm.mov(VReg.A0, VReg.S1);
+        // 静态派发传裸 int(含负数,high16=0xFFFF);_syscall_arg 会把 -1 当 float NaN→0。
+        vm.shrImm(VReg.V1, VReg.A0, 48);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_cpat_rawoff");
+        vm.cmpImm(VReg.V1, 0xFFFF);
+        vm.jeq("_cpat_rawoff");
         vm.call("_syscall_arg");
+        vm.jmp("_cpat_offdone");
+        vm.label("_cpat_rawoff");
+        vm.mov(VReg.RET, VReg.A0);
+        vm.label("_cpat_offdone");
         vm.mov(VReg.S1, VReg.RET); // byteOff (int)
+        vm.cmpImm(VReg.S1, 0);
+        vm.jlt("_cpat_undef");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_strlen");
+        vm.cmp(VReg.S1, VReg.RET);
+        vm.jge("_cpat_undef");
         vm.mov(VReg.A0, VReg.S2); // restore str
         vm.mov(VReg.S0, VReg.A0); // S0 = str
         vm.mov(VReg.A0, VReg.S0);
@@ -2771,6 +3041,81 @@ export class StringGenerator {
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
         vm.or(VReg.RET, VReg.RET, VReg.V1);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 64);
+        vm.label("_cpat_undef");
+        vm.movImm64(VReg.RET, 0x7ffb000000000000n); // undefined
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 64);
+    }
+
+    // _str_proto_codePointAt(this, pos) -> JS number | undefined。
+    // String.prototype.codePointAt:ToInteger(pos),越界 undefined,否则该处 UTF-8
+    // 码点的数值(非子串)。for-of 仍走 _str_codepoint_at(返子串)。
+    generateStrProtoCodePointAt() {
+        const vm = this.vm;
+        vm.label("_str_proto_codePointAt");
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.A0, VReg.S0);
+        this._emitThisToString("protoCodePointAt");
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.A0, VReg.S1);
+        // 静态/裸负数 high16=0xFFFF 不可走 _syscall_arg(-1 当 float NaN→0)
+        vm.shrImm(VReg.V1, VReg.A0, 48);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_pcpat_rawoff");
+        vm.cmpImm(VReg.V1, 0xFFFF);
+        vm.jeq("_pcpat_rawoff");
+        vm.call("_syscall_arg");
+        vm.jmp("_pcpat_offdone");
+        vm.label("_pcpat_rawoff");
+        vm.mov(VReg.RET, VReg.A0);
+        vm.label("_pcpat_offdone");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.cmpImm(VReg.S1, 0);
+        vm.jlt("_pcpat_undef");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_strlen");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.cmp(VReg.S1, VReg.S2);
+        vm.jge("_pcpat_undef");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_getStrContent");
+        vm.add(VReg.S3, VReg.RET, VReg.S1); // S3 = byte ptr
+        vm.loadByte(VReg.V0, VReg.S3, 0);
+        vm.andImm(VReg.V0, VReg.V0, 0xFF);
+        vm.cmpImm(VReg.V0, 0x80);
+        vm.jlt("_pcpat_1");
+        vm.cmpImm(VReg.V0, 0xE0);
+        vm.jlt("_pcpat_2");
+        vm.cmpImm(VReg.V0, 0xF0);
+        vm.jlt("_pcpat_3");
+        // 4-byte: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+        vm.andImm(VReg.V1, VReg.V0, 0x07);
+        vm.shlImm(VReg.V1, VReg.V1, 18);
+        vm.loadByte(VReg.V0, VReg.S3, 1); vm.andImm(VReg.V0, VReg.V0, 0x3F); vm.shlImm(VReg.V0, VReg.V0, 12); vm.or(VReg.V1, VReg.V1, VReg.V0);
+        vm.loadByte(VReg.V0, VReg.S3, 2); vm.andImm(VReg.V0, VReg.V0, 0x3F); vm.shlImm(VReg.V0, VReg.V0, 6); vm.or(VReg.V1, VReg.V1, VReg.V0);
+        vm.loadByte(VReg.V0, VReg.S3, 3); vm.andImm(VReg.V0, VReg.V0, 0x3F); vm.or(VReg.V1, VReg.V1, VReg.V0);
+        vm.jmp("_pcpat_box");
+        vm.label("_pcpat_3");
+        vm.andImm(VReg.V1, VReg.V0, 0x0F);
+        vm.shlImm(VReg.V1, VReg.V1, 12);
+        vm.loadByte(VReg.V0, VReg.S3, 1); vm.andImm(VReg.V0, VReg.V0, 0x3F); vm.shlImm(VReg.V0, VReg.V0, 6); vm.or(VReg.V1, VReg.V1, VReg.V0);
+        vm.loadByte(VReg.V0, VReg.S3, 2); vm.andImm(VReg.V0, VReg.V0, 0x3F); vm.or(VReg.V1, VReg.V1, VReg.V0);
+        vm.jmp("_pcpat_box");
+        vm.label("_pcpat_2");
+        vm.andImm(VReg.V1, VReg.V0, 0x1F);
+        vm.shlImm(VReg.V1, VReg.V1, 6);
+        vm.loadByte(VReg.V0, VReg.S3, 1); vm.andImm(VReg.V0, VReg.V0, 0x3F); vm.or(VReg.V1, VReg.V1, VReg.V0);
+        vm.jmp("_pcpat_box");
+        vm.label("_pcpat_1");
+        vm.mov(VReg.V1, VReg.V0);
+        vm.label("_pcpat_box");
+        vm.scvtf(0, VReg.V1);
+        vm.fmovToInt(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
+        vm.label("_pcpat_undef");
+        vm.movImm64(VReg.RET, 0x7ffb000000000000n);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
     }
 
     // _str_index_char(str, raw_int_idx) -> 单字符 | undefined。字符串下标 str[i] 语义:
@@ -2803,11 +3148,12 @@ export class StringGenerator {
 
         vm.label("_str_charCodeAt");
         vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S1, VReg.A1); // 先存 index:ToString 会 call
         this._emitThisToString("charCodeAt");
 
         // 索引可能是 raw float64 位模式，先归一化为整数
         vm.push(VReg.A0);
-        vm.mov(VReg.A0, VReg.A1);
+        vm.mov(VReg.A0, VReg.S1);
         vm.call("_syscall_arg");
         vm.mov(VReg.S0, VReg.RET); // S0 = index (int)
         vm.pop(VReg.A0);
@@ -3037,14 +3383,42 @@ export class StringGenerator {
         vm.mov(VReg.S0, VReg.A0);
         vm.shrImm(VReg.V1, VReg.S0, 48);
         vm.cmpImm(VReg.V1, 0);
-        vm.jeq("_sas_pass");
+        vm.jeq("_sas_raw");
         vm.cmpImm(VReg.V1, 0x7ffc);
         vm.jeq("_sas_pass");
         vm.cmpImm(VReg.V1, 0x7fff);
         vm.jeq("_sas_pass");
+        vm.cmpImm(VReg.V1, 0x7ffd);
+        vm.jne("_sas_valtostr");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_js_toprimitive");
+        vm.shrImm(VReg.V1, VReg.RET, 48);
+        vm.cmpImm(VReg.V1, 0x7ffd);
+        vm.jeq("_sas_valtostr");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.shrImm(VReg.V1, VReg.S0, 48);
+        vm.cmpImm(VReg.V1, 0x7ffc);
+        vm.jeq("_sas_pass");
+        vm.label("_sas_valtostr");
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_valueToStr");
         vm.epilogue([VReg.S0], 0);
+        vm.label("_sas_raw");
+        // 裸指针:堆内 Symbol 块 → TypeError;其余当串指针直通。
+        vm.cmpImm(VReg.S0, 0);
+        vm.jeq("_sas_pass");
+        vm.lea(VReg.V0, "_heap_base");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmp(VReg.S0, VReg.V0);
+        vm.jb("_sas_pass");
+        vm.lea(VReg.V0, "_heap_ptr");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmp(VReg.S0, VReg.V0);
+        vm.jae("_sas_pass");
+        vm.loadByte(VReg.V0, VReg.S0, 0);
+        vm.cmpImm(VReg.V0, 61); // TYPE_SYMBOL
+        vm.jne("_sas_pass");
+        this._emitThrowTypeError("Cannot convert a Symbol value to a string");
         vm.label("_sas_pass");
         vm.mov(VReg.RET, VReg.S0);
         vm.epilogue([VReg.S0], 0);
@@ -3291,11 +3665,13 @@ export class StringGenerator {
         vm.label("_str_slice");
         // S0=str, S1=start, S2=end/result, S3=len, S4=newLen, S5=index
         vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
-        this._emitThisStringCheck("slice");
-
-        vm.mov(VReg.S0, VReg.A0); // S0 = str (Original JSValue)
-        vm.mov(VReg.S1, VReg.A1); // S1 = start (JSValue)
-        vm.mov(VReg.S2, VReg.A2); // S2 = end (JSValue)
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.store(VReg.SP, 0, VReg.A2);
+        vm.mov(VReg.A0, VReg.S0);
+        this._emitThisToString("slice");
+        vm.mov(VReg.S0, VReg.A0);
+        vm.load(VReg.S2, VReg.SP, 0);
 
         // 1. 获取解箱后的内容指针和长度
         vm.mov(VReg.A0, VReg.S0);
@@ -3433,9 +3809,14 @@ export class StringGenerator {
 
         vm.label("_str_substring");
         vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
-        this._emitThisStringCheck("substring");
-
-        vm.mov(VReg.S0, VReg.A0); // str
+        vm.store(VReg.SP, 0, VReg.A1);
+        vm.store(VReg.SP, 8, VReg.A2);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.A0, VReg.S0);
+        this._emitThisToString("substring");
+        vm.mov(VReg.S0, VReg.A0);
+        vm.load(VReg.A1, VReg.SP, 0);
+        vm.load(VReg.A2, VReg.SP, 8);
 
         // 获取内容指针
         vm.mov(VReg.A0, VReg.S0);
@@ -3604,11 +3985,12 @@ export class StringGenerator {
 
         vm.label("_str_substr");
         vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
-        this._emitThisStringCheck("substr");
-
-        vm.mov(VReg.S0, VReg.A0); // str (装箱)
-        vm.mov(VReg.S1, VReg.A1); // start (boxed)
-        vm.mov(VReg.S2, VReg.A2); // length (boxed 或 JS_UNDEFINED)
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.S2, VReg.A2);
+        vm.mov(VReg.A0, VReg.S0);
+        this._emitThisToString("substr");
+        vm.mov(VReg.S0, VReg.A0);
 
         // len
         vm.mov(VReg.A0, VReg.S0);
@@ -3662,6 +4044,201 @@ export class StringGenerator {
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_str_slice");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+    }
+
+
+    // ── String ↔ RegExp @@ 协议(GetMethod + Call)────────────────────────────────
+    // ES: match/replace/replaceAll/search/split/matchAll 在 searchValue 为对象时先
+    // GetMethod(searchValue, @@*),有则 Call(method, searchValue, « O, … »)。
+    // 动态 RegExp(静态类型丢失)与自定义 @@ 钩子都走此路;静态字面量仍由编译器改派
+    // __RE_*。well-known 槽复用 _symwk_{match,replace,…}(SymbolGenerator 已建)。
+
+    generateSymGetMethod() {
+        const vm = this.vm;
+        vm.label("_str_getmethod");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.shrImm(VReg.V0, VReg.S0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jne("_sgm_undef");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_get");
+        vm.shrImm(VReg.V0, VReg.RET, 48);
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jne("_sgm_getter");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.RET, VReg.RET, VReg.V1);
+        vm.label("_sgm_getter");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.call("_maybe_getter");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.lea(VReg.V0, "_js_undefined");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmp(VReg.S1, VReg.V0);
+        vm.jeq("_sgm_undef");
+        vm.movImm64(VReg.V0, 0x7ffa000000000000n);
+        vm.cmp(VReg.S1, VReg.V0);
+        vm.jeq("_sgm_undef");
+        vm.shrImm(VReg.V0, VReg.S1, 48);
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jne("_sgm_not_callable");
+        vm.mov(VReg.RET, VReg.S1);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_sgm_undef");
+        vm.lea(VReg.RET, "_js_undefined");
+        vm.load(VReg.RET, VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_sgm_not_callable");
+        vm.lea(VReg.A0, vm.asm.addString("Property is not callable"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+    }
+
+    generateSymCallMethod() {
+        const vm = this.vm;
+        vm.label("_str_call_method");
+        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.S2, VReg.A2);
+        vm.mov(VReg.S3, VReg.A3);
+        vm.mov(VReg.S4, VReg.A4);
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.S0, VReg.A0, VReg.V1);
+        vm.load(VReg.V0, VReg.S0, 0);
+        vm.movImm(VReg.V1, 0xc105);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jne("_scm_bare");
+        vm.load(VReg.V1, VReg.S0, 8);
+        vm.jmp("_scm_ready");
+        vm.label("_scm_bare");
+        vm.mov(VReg.V1, VReg.S0);
+        vm.movImm(VReg.S0, 0);
+        vm.label("_scm_ready");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.mov(VReg.A5, VReg.S1);
+        vm.cmpImm(VReg.S4, 2);
+        vm.jeq("_scm_argc2");
+        vm.setCallArgcImm(1, VReg.V2, VReg.V3);
+        vm.jmp("_scm_do");
+        vm.label("_scm_argc2");
+        vm.setCallArgcImm(2, VReg.V2, VReg.V3);
+        vm.label("_scm_do");
+        vm.callIndirect(VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 16);
+    }
+
+    _emitLoadWellknownSymbol(symName) {
+        const vm = this.vm;
+        vm.lea(VReg.A0, "_symwk_" + symName);
+        vm.lea(VReg.A1, vm.asm.addString("Symbol." + symName));
+        vm.movImm64(VReg.V0, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V0);
+        vm.call("_symbol_wellknown");
+    }
+
+    _emitSymDelegate(opts) {
+        const vm = this.vm;
+        const {
+            symName, searchReg, thisReg, arg2Reg, argc,
+            fallLabel, savedRegs, frameSize, tag,
+        } = opts;
+        const noMethod = "_ssd_nomethod_" + tag;
+        vm.shrImm(VReg.V0, searchReg, 48);
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jne(fallLabel);
+        this._emitLoadWellknownSymbol(symName);
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, searchReg);
+        vm.call("_str_getmethod");
+        vm.lea(VReg.V0, "_js_undefined");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmp(VReg.RET, VReg.V0);
+        vm.jeq(noMethod);
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, searchReg);
+        vm.mov(VReg.A2, thisReg);
+        if (argc === 2) {
+            vm.mov(VReg.A3, arg2Reg);
+            vm.movImm(VReg.A4, 2);
+        } else {
+            vm.movImm64(VReg.A3, 0x7ffb000000000000n);
+            vm.movImm(VReg.A4, 1);
+        }
+        vm.call("_str_call_method");
+        vm.epilogue(savedRegs, frameSize);
+        vm.label(noMethod);
+    }
+
+    _emitReplaceAllRegExpGCheck(searchReg, tag) {
+        const vm = this.vm;
+        const notRe = "_rall_g_notre_" + tag;
+        const hasG = "_rall_g_ok_" + tag;
+        this._emitLoadWellknownSymbol("match");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, searchReg);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, searchReg);
+        vm.call("_maybe_getter");
+        vm.lea(VReg.V0, "_js_undefined");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmp(VReg.RET, VReg.V0);
+        vm.jeq(notRe);
+        vm.movImm64(VReg.V0, 0x7ffa000000000000n);
+        vm.cmp(VReg.RET, VReg.V0);
+        vm.jeq(notRe);
+        vm.movImm64(VReg.V0, 0x7ff9000000000000n);
+        vm.cmp(VReg.RET, VReg.V0);
+        vm.jeq(notRe);
+        vm.push(searchReg);
+        vm.mov(VReg.A0, searchReg);
+        vm.lea(VReg.A1, vm.asm.addString("flags"));
+        vm.movImm64(VReg.V2, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V2);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.load(VReg.A1, VReg.SP, 0);
+        vm.call("_maybe_getter");
+        vm.pop(searchReg);
+        vm.lea(VReg.V0, "_js_undefined");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmp(VReg.RET, VReg.V0);
+        vm.jeq("_rall_g_flags_err_" + tag);
+        vm.movImm64(VReg.V0, 0x7ffa000000000000n);
+        vm.cmp(VReg.RET, VReg.V0);
+        vm.jeq("_rall_g_flags_err_" + tag);
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_valueToStr");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, vm.asm.addString("g"));
+        vm.movImm64(VReg.V2, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V2);
+        vm.movImm(VReg.A2, 0);
+        vm.call("_str_indexOf");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jge(hasG);
+        vm.lea(VReg.A0, vm.asm.addString("String.prototype.replaceAll called with a non-global RegExp argument"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+        vm.label("_rall_g_flags_err_" + tag);
+        vm.lea(VReg.A0, vm.asm.addString("Cannot convert undefined or null to object"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+        vm.label(notRe);
+        vm.label(hasG);
     }
 
     // 替换串 $ 模式展开。$$→字面 $、$&→匹配子串、$`→匹配前文、$'→匹配后文。
@@ -3838,17 +4415,42 @@ export class StringGenerator {
     // 无匹配返回原串。空 search 命中 index 0(与 JS 一致,插到串首)。
     generateReplace() {
         const vm = this.vm;
+        const replSaved = [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5];
 
         vm.label("_str_replace");
-        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]); // SP:0=left,8=right
-        vm.mov(VReg.S0, VReg.A0); // str
+        vm.prologue(16, replSaved); // SP:0=left,8=right
+        vm.mov(VReg.S0, VReg.A0); // str / O
         vm.mov(VReg.S1, VReg.A1); // search
         vm.mov(VReg.S2, VReg.A2); // repl
-        // [W-25] repl ToString(函数替换器由 _str_argstr 直通,仍交上游 _str_replace_fn):
-        // "undefined".replace("e", undefined) 须得 "undundefinedfined"。
+        {
+            const skipSym = "_replace_skip_sym";
+            vm.lea(VReg.V0, "_js_undefined");
+            vm.load(VReg.V0, VReg.V0, 0);
+            vm.cmp(VReg.S1, VReg.V0);
+            vm.jeq(skipSym);
+            vm.movImm64(VReg.V0, 0x7ffa000000000000n);
+            vm.cmp(VReg.S1, VReg.V0);
+            vm.jeq(skipSym);
+            this._emitSymDelegate({
+                symName: "replace", searchReg: VReg.S1, thisReg: VReg.S0,
+                arg2Reg: VReg.S2, argc: 2, fallLabel: skipSym,
+                savedRegs: replSaved, frameSize: 16, tag: "replace",
+            });
+            vm.label(skipSym);
+        }
+        vm.mov(VReg.A0, VReg.S0);
+        this._emitThisToString("replace");
+        vm.mov(VReg.S0, VReg.A0);
+        vm.shrImm(VReg.V0, VReg.S2, 48);
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jne("_replace_not_fn");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_str_replace_fn");
+        vm.epilogue(replSaved, 16);
+        vm.label("_replace_not_fn");
         this._emitArgStrInline(VReg.S2, "_replace_repl");
-        // search 也必须在此归一:下方 searchLen 走 _getStrContent,而 _str_indexOf 内部
-        // 已自带 ToString——两处不一致会算出错位的 searchLen 并切错串。
         this._emitArgStrInline(VReg.S1, "_replace_search");
 
         // idx = indexOf(str, search)
@@ -3978,14 +4580,47 @@ export class StringGenerator {
     // (与 JS 的 "abc".replaceAll("","X")="XaXbXcX" 有出入,属已知偏差,换取安全)。
     generateReplaceAll() {
         const vm = this.vm;
+        const replAllSaved = [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5];
 
         vm.label("_str_replaceAll");
-        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]); // SP+0=hasDollar
-        vm.mov(VReg.S0, VReg.A0); // remaining（初值 = str）
+        vm.prologue(16, replAllSaved); // SP+0=hasDollar
+        vm.mov(VReg.S0, VReg.A0); // remaining / O
         vm.mov(VReg.S1, VReg.A1); // search
         vm.mov(VReg.S2, VReg.A2); // repl
-        this._emitArgStrInline(VReg.S2, "_replaceAll_repl");   // [W-25] repl ToString
-        this._emitArgStrInline(VReg.S1, "_replaceAll_search"); // [W-25] search 同上(与 indexOf 一致)
+        {
+            const skipSym = "_replaceAll_skip_sym";
+            vm.lea(VReg.V0, "_js_undefined");
+            vm.load(VReg.V0, VReg.V0, 0);
+            vm.cmp(VReg.S1, VReg.V0);
+            vm.jeq(skipSym);
+            vm.movImm64(VReg.V0, 0x7ffa000000000000n);
+            vm.cmp(VReg.S1, VReg.V0);
+            vm.jeq(skipSym);
+            vm.shrImm(VReg.V0, VReg.S1, 48);
+            vm.cmpImm(VReg.V0, 0x7FFD);
+            vm.jne(skipSym);
+            this._emitReplaceAllRegExpGCheck(VReg.S1, "rall");
+            this._emitSymDelegate({
+                symName: "replace", searchReg: VReg.S1, thisReg: VReg.S0,
+                arg2Reg: VReg.S2, argc: 2, fallLabel: skipSym,
+                savedRegs: replAllSaved, frameSize: 16, tag: "replaceAll",
+            });
+            vm.label(skipSym);
+        }
+        vm.mov(VReg.A0, VReg.S0);
+        this._emitThisToString("replaceAll");
+        vm.mov(VReg.S0, VReg.A0);
+        vm.shrImm(VReg.V0, VReg.S2, 48);
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jne("_replaceAll_not_fn");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_str_replaceAll_fn");
+        vm.epilogue(replAllSaved, 16);
+        vm.label("_replaceAll_not_fn");
+        this._emitArgStrInline(VReg.S2, "_replaceAll_repl");
+        this._emitArgStrInline(VReg.S1, "_replaceAll_search");
 
         // [L3] RegExp detection: two code paths:
         //   (a) raw heap pointer with TYPE_REGEXP(8) — compiled-in RegExp literal
@@ -4639,25 +5274,61 @@ export class StringGenerator {
     // _str_split(str, separator) -> 数组
     generateSplit() {
         const vm = this.vm;
-        { const dl = vm.asm.dataLabels || []; let f = false;
-          for (let i = 0; i < dl.length; i++) { if (dl[i].name === "_nsobj_array") { f = true; break; } }
-          if (!f) { vm.asm.addDataLabel("_nsobj_array"); vm.asm.addDataQword(0); } }
+        { const dl = vm.asm.dataLabels || [];
+          const ensure = (n) => { let f = false;
+            for (let i = 0; i < dl.length; i++) { if (dl[i].name === n) { f = true; break; } }
+            if (!f) { vm.asm.addDataLabel(n); vm.asm.addDataQword(0); } };
+          ensure("_nsobj_array");
+          ensure("_nsobj_array_proto"); }
         vm.label("_str_split");
-        vm.prologue(96, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
-        this._emitThisStringCheck("split");
-
-        // S0 = 装箱 str, S1 = 装箱 sep, S2 = str content 指针, S3 = 结果数组(装箱),
-        // S4 = 段起点 i(绝对下标), S5 = sep 长度。
-        // 多字符分隔符复用 _str_indexOf(已支持多字符+fromIndex),逐段定位切分——
-        // 旧实现只比对 sep 首字节,"a\r\nb".split("\r\n") 误按 "\r" 切。
+        // 薄入口(64B/S0-S4,与 _strconcat 同形):用户 toString 抛错必须能 unwind。
+        // 96B+S5 的 core 帧内抛会 SIGSEGV;@@split 查找也会。sep ToString 放在
+        // this 强制之前,避免 _emitThisToString 的 extract 路径污染 S1。
+        vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
         vm.mov(VReg.S0, VReg.A0);
         vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.S2, VReg.A2);
+        // ToString(separator);undefined 留给 core 整串路径;RegExp 原样交给 core。
+        vm.movImm64(VReg.V1, 0x7ffb000000000000n);
+        vm.cmp(VReg.S1, VReg.V1);
+        vm.jeq("_split_this_coerce");
+        vm.shrImm(VReg.V1, VReg.S1, 48);
+        vm.cmpImm(VReg.V1, 0x7ffc);
+        vm.jeq("_split_this_coerce");
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_split_this_coerce");
+        // 0x7FFD:直接 ToString。不可先 _object_get(__isRegExp)——对 {toString:throw}
+        // 的 get 会污染后续 _valueToStr 的 throw unwind(SIGSEGV)。
+        // 字面量 RegExp 是裸 TYPE_REGEXP(high16=0),已在上方跳过。
+        vm.label("_split_sep_tostr");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_valueToStr");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.label("_split_this_coerce");
+        vm.mov(VReg.A0, VReg.S0);
+        this._emitThisToString("split");
+        vm.mov(VReg.S0, VReg.A0);
+        // limit 由编译器在 call 之后 _array_slice(ToUint32) 截断(builtin_methods.js)。
+        // 静态/动态 1 参 split 都不置 A2:此处若把残留 0x7FF8 装箱 int 当 limit,
+        // HTTP 头 `lines[0].split(" ")` 会被截成 1 段 → statusCode=0(fixtures 回归)。
+        vm.movImm64(VReg.S2, 0xffffffffn);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_str_split_core");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
 
-        // 结果数组(空,动态 push)
+        vm.label("_str_split_core");
+        vm.prologue(96, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.mov(VReg.S0, VReg.A0);          // 已 ToString 的 this
+        vm.mov(VReg.S1, VReg.A1);          // 已 ToString 的 sep(或 undefined)
+        vm.store(VReg.SP, 8, VReg.A2);     // ToUint32(lim)
         vm.movImm(VReg.A0, 0);
         vm.call("_array_new_with_size");
-        vm.mov(VReg.S3, VReg.RET); // 装箱数组
-
+        vm.mov(VReg.S3, VReg.RET);
+        vm.load(VReg.V1, VReg.SP, 8);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_split_box_s3");
         // [W-25] separator === undefined → 整串作单元素返回(ES 21.1.3.23 step 8)。
         // 必须在 ToString 之前判:此前 undefined 被 _getStrContent 判非法 → 空串 →
         // 落逐字符路径("abc".split(undefined) 得 ["a","b","c"],test262 separator-undef)。
@@ -4693,7 +5364,7 @@ export class StringGenerator {
             vm.call("_getStrContent");
             vm.mov(VReg.A1, VReg.RET);
             vm.mov(VReg.A0, VReg.S1);
-            vm.movImm64(VReg.A2, 0xffffffffn);
+            vm.load(VReg.A2, VReg.SP, 8);
             vm.call("_regexp_split");
             vm.jmp("_split_ret");
             // (b) boxed 0x7FFD object: check __isRegExp
@@ -4708,6 +5379,7 @@ export class StringGenerator {
             vm.pop(VReg.S0);
             vm.jeq(splitReNot); // not a RegExp -> fall through to string path
             // Extract __pat (pattern string) and use _regexp_split
+            vm.load(VReg.S4, VReg.SP, 8); // lim 进 callee-saved,跨 push/call 存活
             vm.push(VReg.S0); vm.push(VReg.S1);
             vm.mov(VReg.A0, VReg.S1);
             vm.lea(VReg.A1, vm.asm.addString("__pat"));
@@ -4721,14 +5393,12 @@ export class StringGenerator {
             vm.mov(VReg.A0, VReg.S1);
             vm.call("_getStrContent");
             vm.mov(VReg.A0, VReg.RET); // A0 = pattern_ptr
-            vm.movImm64(VReg.A2, 0xffffffffn);
+            vm.mov(VReg.A2, VReg.S4);
             vm.call("_regexp_split");
             vm.pop(VReg.S1); vm.pop(VReg.S0);
             vm.jmp("_split_ret");
             vm.label(splitReNot);
         }
-        // 其余非串 separator 走 ToString(split(null) → "null"、split(1) → "1")
-        this._emitArgStrInline(VReg.S1, "_split_sep");
 
         // str content 指针(供 _str_substring_raw 切段)
         vm.mov(VReg.A0, VReg.S0);
@@ -4753,10 +5423,16 @@ export class StringGenerator {
         vm.call("_str_indexOf");
         vm.cmpImm(VReg.RET, -1);
         vm.jeq("_split_last_seg");
+        vm.store(VReg.SP, 16, VReg.RET); // 保住 idx:_array_length 冲 RET
+        // 已满 limit → 不再切
+        vm.mov(VReg.A0, VReg.S3);
+        vm.call("_array_length");
+        vm.load(VReg.V1, VReg.SP, 8);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jge("_split_box_s3");
         // 命中:push substring(content, i, idx),下一段起点 i = idx + seplen。
-        // 先把 idx 取入 A2(substring 的 end),再算 idx+seplen 暂存栈(跨调用)。
-        vm.mov(VReg.A2, VReg.RET);          // end = idx
-        vm.add(VReg.V0, VReg.RET, VReg.S5); // 下一 i = idx + seplen
+        vm.load(VReg.A2, VReg.SP, 16);      // end = idx
+        vm.add(VReg.V0, VReg.A2, VReg.S5); // 下一 i = idx + seplen
         vm.push(VReg.V0);
         vm.mov(VReg.A0, VReg.S2);           // content
         vm.mov(VReg.A1, VReg.S4);           // start = i
@@ -4769,6 +5445,11 @@ export class StringGenerator {
         vm.jmp("_split_scan");
 
         vm.label("_split_last_seg");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.call("_array_length");
+        vm.load(VReg.V1, VReg.SP, 8);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jge("_split_box_s3");
         // 最后一段 substring(content, i, len)
         vm.mov(VReg.A0, VReg.S2);
         vm.call("_strlen");
@@ -4779,24 +5460,16 @@ export class StringGenerator {
         vm.mov(VReg.A1, VReg.RET);
         vm.mov(VReg.A0, VReg.S3);
         vm.call("_array_push");
-        // 装箱为 JSValue 数组（0x7FFE）——_array_new_with_size 返回裸指针，
-        // 下游 .join()/typeof 等按 boxed 数组处理，未装箱会崩。
-        vm.emitMaskLoad(VReg.V1);
-        vm.andMaskReg(VReg.RET, VReg.RET, VReg.V1);
-        vm.movImm64(VReg.V1, 0x7ffe000000000000n);
-        vm.or(VReg.RET, VReg.RET, VReg.V1);
-        vm.jmp("_split_ret");
+        vm.mov(VReg.S3, VReg.RET);
+        vm.jmp("_split_box_s3");
 
         // [W-25] separator === undefined:[整串]
         vm.label("_split_undef_sep");
         vm.mov(VReg.A0, VReg.S3);
         vm.mov(VReg.A1, VReg.S0); // 原装箱串直接入数组
         vm.call("_array_push");
-        vm.emitMaskLoad(VReg.V1);
-        vm.andMaskReg(VReg.RET, VReg.RET, VReg.V1);
-        vm.movImm64(VReg.V1, 0x7ffe000000000000n);
-        vm.or(VReg.RET, VReg.RET, VReg.V1);
-        vm.jmp("_split_ret");
+        vm.mov(VReg.S3, VReg.RET);
+        vm.jmp("_split_box_s3");
 
         vm.label("_split_empty_sep");
         // 空分隔符：每字符一个元素。S1(装箱 sep 不再需要)复用为 str 长度。
@@ -4806,6 +5479,11 @@ export class StringGenerator {
         vm.movImm(VReg.S4, 0);
         vm.label("_split_empty_loop");
         vm.cmp(VReg.S4, VReg.S1);
+        vm.jge("_split_empty_done");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.call("_array_length");
+        vm.load(VReg.V1, VReg.SP, 8);
+        vm.cmp(VReg.RET, VReg.V1);
         vm.jge("_split_empty_done");
         vm.mov(VReg.A0, VReg.S2);
         vm.mov(VReg.A1, VReg.S4);
@@ -4818,6 +5496,9 @@ export class StringGenerator {
         vm.addImm(VReg.S4, VReg.S4, 1);
         vm.jmp("_split_empty_loop");
         vm.label("_split_empty_done");
+        vm.label("_split_box_s3");
+        // 装箱为 JSValue 数组（0x7FFE）——_array_new_with_size 返回裸指针，
+        // 下游 .join()/typeof 等按 boxed 数组处理，未装箱会崩。
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.RET, VReg.S3, VReg.V1);
         vm.movImm64(VReg.V1, 0x7ffe000000000000n);
@@ -4827,27 +5508,19 @@ export class StringGenerator {
         vm.label("_split_ret");
         vm.mov(VReg.S0, VReg.RET);
         vm.lea(VReg.V1, "_nsobj_array");
-        vm.load(VReg.V2, VReg.V1, 0);
-        vm.cmpImm(VReg.V2, 0);
-        vm.jne("_split_ctor_ready");
-        vm.movImm(VReg.A0, 16);
-        vm.call("_alloc");
-        vm.movImm(VReg.V3, 0xc105);
-        vm.store(VReg.RET, 0, VReg.V3);
-        vm.lea(VReg.V3, "_array_ctor_call");
-        vm.store(VReg.RET, 8, VReg.V3);
-        vm.emitMaskLoad(VReg.V3);
-        vm.andMaskReg(VReg.V2, VReg.RET, VReg.V3);
-        vm.movImm64(VReg.V3, 0x7fff000000000000n);
-        vm.or(VReg.V2, VReg.V2, VReg.V3);
-        vm.store(VReg.V1, 0, VReg.V2);
-        vm.label("_split_ctor_ready");
+        vm.load(VReg.S1, VReg.V1, 0);
+        vm.cmpImm(VReg.S1, 0);
+        vm.jeq("_split_ctor_skip");
+        // 槽已有 Array 构造器(自举/测试已物化):写到结果 own constructor。
+        // 不在槽空时写 stub——会挡住 emitCollectionCtorObject 完整物化,
+        // 导致 constructor 与全局 Array 身份不同(SameValue 两个 [Function])。
         vm.mov(VReg.A0, VReg.S0);
         vm.lea(VReg.A1, this.vm.asm.addString("constructor"));
         vm.movImm64(VReg.V3, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.A1, VReg.V3);
-        vm.mov(VReg.A2, VReg.V2);
+        vm.mov(VReg.A2, VReg.S1);
         vm.call("_object_set");
+        vm.label("_split_ctor_skip");
         vm.mov(VReg.RET, VReg.S0);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 96);
     }
@@ -4910,10 +5583,12 @@ export class StringGenerator {
         // (str, search, fromIndex_raw) -> index or -1。A2=裸 int 起始下标,
         // 所有调用点必须显式置 A2(缺省 0)——否则读到上文残留垃圾。
         vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
-        this._emitThisStringCheck("indexOf");
         vm.mov(VReg.S0, VReg.A0);
         vm.mov(VReg.S1, VReg.A1);
-        vm.mov(VReg.S4, VReg.A2); // S4 = fromIndex(入口即捕获,后续调用会冲 A2)
+        vm.mov(VReg.S4, VReg.A2); // 先存:this 检查若走 extract 会冲 A1/A2
+        vm.mov(VReg.A0, VReg.S0);
+        this._emitThisStringCheck("indexOf");
+        vm.mov(VReg.S0, VReg.A0);
 
         this._emitArgStrInline(VReg.S1, "_indexOf_search"); // [W-25] search 非串 → ToString
 
@@ -4993,9 +5668,13 @@ export class StringGenerator {
         const vm = this.vm;
         vm.label("_str_includes");
         vm.prologue(16, [VReg.S0, VReg.S1]);
-        this._emitThisStringCheck("includes");
         vm.mov(VReg.S0, VReg.A0);
         vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.A0, VReg.S0);
+        this._emitThisToString("includes");
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
         vm.movImm(VReg.A2, 0); // fromIndex=0(_str_indexOf 新增第三参,必须显式置)
         vm.call("_str_indexOf");
         // 不可 movImm(V0,-1)+cmp(RET,V0):x64 上 V0=RAX=RET,movImm 先冲掉结果 →
@@ -5016,9 +5695,11 @@ export class StringGenerator {
         const vm = this.vm;
         vm.label("_str_startsWith");
         vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2]);
-        this._emitThisStringCheck("startsWith");
         vm.mov(VReg.S0, VReg.A0);
         vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.A0, VReg.S0);
+        this._emitThisToString("startsWith");
+        vm.mov(VReg.S0, VReg.A0);
         this._emitArgStrInline(VReg.S1, "_startsWith_search"); // [W-25]
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_getStrContent"); vm.mov(VReg.S0, VReg.RET);
@@ -5048,8 +5729,10 @@ export class StringGenerator {
         const vm = this.vm;
         vm.label("_str_endsWith");
         vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
-        this._emitThisStringCheck("endsWith");
         vm.mov(VReg.S0, VReg.A0); vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.A0, VReg.S0);
+        this._emitThisToString("endsWith");
+        vm.mov(VReg.S0, VReg.A0);
         this._emitArgStrInline(VReg.S1, "_endsWith_search"); // [W-25]
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_getStrContent"); vm.mov(VReg.S0, VReg.RET);
@@ -5086,21 +5769,43 @@ export class StringGenerator {
         // getStrContent/strlen 调用的 A 寄存器踩踏(同 _date_toISOString 的 SP 相对存法)。
         vm.store(VReg.SP, 0, VReg.A2);
         vm.mov(VReg.S0, VReg.A0); vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.A0, VReg.S0);
+        this._emitThisToString("lastIndexOf");
+        vm.mov(VReg.S0, VReg.A0);
         this._emitArgStrInline(VReg.S1, "_lastIndexOf_search"); // [W-25]
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_getStrContent"); vm.mov(VReg.S0, VReg.RET);
         vm.mov(VReg.A0, VReg.S1); vm.call("_getStrContent"); vm.mov(VReg.S1, VReg.RET);
         vm.mov(VReg.A0, VReg.S0); vm.call("_strlen"); vm.mov(VReg.S2, VReg.RET);
         vm.mov(VReg.A0, VReg.S1); vm.call("_strlen"); vm.mov(VReg.S3, VReg.RET);
-        vm.cmp(VReg.S3, VReg.S2); vm.ja("_lastIndexOf_notFound");
-        vm.sub(VReg.S4, VReg.S2, VReg.S3); // Start index (S4) = strlen - searchlen
-        // fromIndex 钳位:负 → 0;再 S4 = min(S4, fromIndex)(从 <=fromIndex 处向前搜)。
+        // fromIndex 必须在 length 比较之前 ToNumber(规范 4 步;valueOf 可抛)。
         vm.load(VReg.V0, VReg.SP, 0);
+        vm.shrImm(VReg.V1, VReg.V0, 48);
+        vm.cmpImm(VReg.V1, 0x7ffb); vm.jeq("_lastIndexOf_fi_inf"); // undefined → +∞
+        vm.cmpImm(VReg.V1, 0); vm.jne("_lastIndexOf_fi_box");
+        vm.movImm(VReg.V1, 0x7FFFFFFF);
+        vm.cmp(VReg.V0, VReg.V1); vm.jeq("_lastIndexOf_fi_inf"); // 静态无参哨兵
+        vm.jmp("_lastIndexOf_fi_raw");
+        vm.label("_lastIndexOf_fi_box");
+        vm.mov(VReg.A0, VReg.V0);
+        vm.call("_number_coerce");
+        vm.shrImm(VReg.V1, VReg.RET, 52);
+        vm.andImm(VReg.V1, VReg.V1, 0x7FF);
+        vm.cmpImm(VReg.V1, 0x7FF); vm.jeq("_lastIndexOf_fi_inf"); // NaN/Inf → +∞
+        vm.fmovToFloat(0, VReg.RET);
+        vm.fcvtzs(VReg.V0, 0);
+        vm.label("_lastIndexOf_fi_raw");
+        vm.cmp(VReg.S3, VReg.S2); vm.ja("_lastIndexOf_notFound");
+        vm.sub(VReg.S4, VReg.S2, VReg.S3);
         vm.cmpImm(VReg.V0, 0); vm.jge("_lastIndexOf_fi_pos");
         vm.movImm(VReg.V0, 0);
         vm.label("_lastIndexOf_fi_pos");
         vm.cmp(VReg.V0, VReg.S4); vm.jge("_lastIndexOf_fi_keep");
         vm.mov(VReg.S4, VReg.V0);
+        vm.jmp("_lastIndexOf_fi_keep");
+        vm.label("_lastIndexOf_fi_inf");
+        vm.cmp(VReg.S3, VReg.S2); vm.ja("_lastIndexOf_notFound");
+        vm.sub(VReg.S4, VReg.S2, VReg.S3);
         vm.label("_lastIndexOf_fi_keep");
         const outer = "_lastIndexOf_outer";
         const inner = "_lastIndexOf_inner";
@@ -5123,13 +5828,31 @@ export class StringGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
     }
 
+    // _aref_str_lastIndexOf:原型/.call 路径。装箱 this/实参,返装箱 number。
+    // 静态 compileStringMethod 仍直连 _str_lastIndexOf(裸 int)+boxIntAsNumber。
+    generateArefLastIndexOf() {
+        const vm = this.vm;
+        vm.label("_aref_str_lastIndexOf");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_str_lastIndexOf");
+        vm.scvtf(0, VReg.RET);
+        vm.fmovToInt(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+    }
+
     // _str_repeat(str, count) -> str
     generateRepeat() {
         const vm = this.vm;
         vm.label("_str_repeat");
         vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
-        this._emitThisStringCheck("repeat");
         vm.mov(VReg.S0, VReg.A0); vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.A0, VReg.S0);
+        this._emitThisToString("repeat");
+        vm.mov(VReg.S0, VReg.A0);
         // count 由活跃 dispatch(builtin_methods.js)以 fcvtzs 转好的裸 int32 传入 A1,
         // 不可再调 _to_int32(会把裸整数当 NaN-boxed 解析→得 0→误走 _repeat_empty→空串)。
         // [W-25] count 越界 → RangeError(ES: count < 0 或 count 为 +∞ 时 throw)。
@@ -5195,8 +5918,10 @@ export class StringGenerator {
         const vm = this.vm;
         vm.label("_str_at");
         vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2]);
-        this._emitThisStringCheck("at");
         vm.mov(VReg.S0, VReg.A0); vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.A0, VReg.S0);
+        this._emitThisToString("at");
+        vm.mov(VReg.S0, VReg.A0);
         vm.mov(VReg.A0, VReg.S1); vm.call("_to_int32"); vm.mov(VReg.S1, VReg.RET);
         vm.mov(VReg.A0, VReg.S0); vm.call("_strlen"); vm.mov(VReg.S2, VReg.RET);
         vm.cmpImm(VReg.S1, 0); vm.jge("_at_check"); vm.add(VReg.S1, VReg.S1, VReg.S2);
@@ -5210,23 +5935,29 @@ export class StringGenerator {
     }
 
     // _str_concat(str1, str2) -> str
+    // 原型方法入口:RequireObjectCoercible+ToString(this) 后尾调 _strconcat。
+    // `_strconcat` 本身是 `+` 热路径,不能加 ROC(编译器拼接依赖)。
     generateConcat() {
         const vm = this.vm;
         vm.label("_str_concat");
-        // this-check: A0 must be装箱字符串(0x7FFC)或裸指针(高16位=0)
-        vm.shrImm(VReg.V0, VReg.A0, 48);
-        vm.cmpImm(VReg.V0, 0x7FFC);
-        vm.jeq("_concat_this_ok");
-        vm.cmpImm(VReg.V0, 0);
-        vm.jeq("_concat_this_ok");
-        vm.lea(VReg.A0, vm.asm.addString("String.prototype method called on non-string value"));
-        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
-        vm.and(VReg.A0, VReg.A0, VReg.V1);
-        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
-        vm.or(VReg.A0, VReg.A0, VReg.V1);
-        vm.call("_throw_type_error");
-        vm.label("_concat_this_ok");
-        vm.jmp("_strconcat");
+        vm.prologue(16, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.A0, VReg.S0);
+        this._emitThisToString("concat");
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_strconcat");
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+    }
+
+    // _str_normalize(this) -> ToString(this)。字节模型下 NFC/NFD 恒等。
+    generateNormalize() {
+        const vm = this.vm;
+        vm.label("_str_normalize");
+        vm.prologue(0, []);
+        this._emitThisToString("normalize");
+        vm.mov(VReg.RET, VReg.A0);
+        vm.epilogue([], 0);
     }
 
     // _str_toString_wrapper(this) -> string value
@@ -5241,26 +5972,46 @@ export class StringGenerator {
         vm.prologue(0, [VReg.S0, VReg.S1]);
         vm.shrImm(VReg.V0, VReg.A0, 48);
         vm.cmpImm(VReg.V0, 0x7FFC);
-        vm.jeq("_tsw_ret_primitive");
+        vm.jeq("_tsw_ret_a0");
         vm.cmpImm(VReg.V0, 0x7FFD);
         vm.jeq("_tsw_extract");
         vm.cmpImm(VReg.V0, 0);
-        vm.jeq("_tsw_ret_primitive");
-        // TypeError for non-string/non-wrapper values (e.g., String.prototype.toString.call(5))
-        vm.lea(VReg.A0, vm.asm.addString("String.prototype method called on non-string value"));
-        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
-        vm.and(VReg.A0, VReg.A0, VReg.V1);
-        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
-        vm.or(VReg.A0, VReg.A0, VReg.V1);
-        vm.call("_throw_type_error");
-        // 0x7FFD: extract __value property from wrapper object
+        vm.jne("_tsw_throw");
+        // 裸指针:堆内 Symbol 块 → TypeError;其余当原始串
+        vm.cmpImm(VReg.A0, 0);
+        vm.jeq("_tsw_ret_a0");
+        vm.lea(VReg.V1, "_heap_base");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.A0, VReg.V1);
+        vm.jb("_tsw_ret_a0");
+        vm.lea(VReg.V1, "_heap_ptr");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.A0, VReg.V1);
+        vm.jae("_tsw_ret_a0");
+        vm.loadByte(VReg.V1, VReg.A0, 0);
+        vm.cmpImm(VReg.V1, 61); // TYPE_SYMBOL
+        vm.jne("_tsw_ret_a0");
+        vm.label("_tsw_throw");
+        this._emitThrowTypeError("String.prototype.toString called on incompatible receiver");
         vm.label("_tsw_extract");
-        vm.mov(VReg.V0, VReg.A0);         // V0 = boxed wrapper object
-        vm.mov(VReg.A0, VReg.V0);         // A0 = boxed obj (first arg to _object_get)
+        vm.mov(VReg.S0, VReg.A0);
         vm.lea(VReg.A1, vm.asm.addString("__value"));
-        vm.call("_tag_key_a1");            // A1 = boxed "__value" key
-        vm.call("_object_get");            // RET = primitive string (0x7FFC)
-        vm.label("_tsw_ret_primitive");
+        vm.call("_tag_key_a1");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_get");
+        vm.shrImm(VReg.V0, VReg.RET, 48);
+        vm.cmpImm(VReg.V0, 0x7FFC);
+        vm.jeq("_tsw_ret");
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_tsw_throw");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_tsw_throw");
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.jmp("_tsw_ret");
+        vm.label("_tsw_ret_a0");
+        vm.mov(VReg.RET, VReg.A0);
+        vm.label("_tsw_ret");
         vm.epilogue([VReg.S0, VReg.S1], 0);
     }
 
@@ -5272,24 +6023,45 @@ export class StringGenerator {
         vm.prologue(0, [VReg.S0, VReg.S1]);
         vm.shrImm(VReg.V0, VReg.A0, 48);
         vm.cmpImm(VReg.V0, 0x7FFC);
-        vm.jeq("_vo_ret_primitive");
+        vm.jeq("_vo_ret_a0");
         vm.cmpImm(VReg.V0, 0x7FFD);
         vm.jeq("_vo_extract");
         vm.cmpImm(VReg.V0, 0);
-        vm.jeq("_vo_ret_primitive");
-        vm.lea(VReg.A0, vm.asm.addString("String.prototype method called on non-string value"));
-        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
-        vm.and(VReg.A0, VReg.A0, VReg.V1);
-        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
-        vm.or(VReg.A0, VReg.A0, VReg.V1);
-        vm.call("_throw_type_error");
+        vm.jne("_vo_throw");
+        vm.cmpImm(VReg.A0, 0);
+        vm.jeq("_vo_ret_a0");
+        vm.lea(VReg.V1, "_heap_base");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.A0, VReg.V1);
+        vm.jb("_vo_ret_a0");
+        vm.lea(VReg.V1, "_heap_ptr");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.A0, VReg.V1);
+        vm.jae("_vo_ret_a0");
+        vm.loadByte(VReg.V1, VReg.A0, 0);
+        vm.cmpImm(VReg.V1, 61);
+        vm.jne("_vo_ret_a0");
+        vm.label("_vo_throw");
+        this._emitThrowTypeError("String.prototype.valueOf called on incompatible receiver");
         vm.label("_vo_extract");
-        vm.mov(VReg.V0, VReg.A0);
-        vm.mov(VReg.A0, VReg.V0);
+        vm.mov(VReg.S0, VReg.A0);
         vm.lea(VReg.A1, vm.asm.addString("__value"));
-        vm.call("_tag_key_a1");            // A1 = boxed "__value" key
+        vm.call("_tag_key_a1");
+        vm.mov(VReg.A0, VReg.S0);
         vm.call("_object_get");
-        vm.label("_vo_ret_primitive");
+        vm.shrImm(VReg.V0, VReg.RET, 48);
+        vm.cmpImm(VReg.V0, 0x7FFC);
+        vm.jeq("_vo_ret");
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_vo_throw");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_vo_throw");
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.jmp("_vo_ret");
+        vm.label("_vo_ret_a0");
+        vm.mov(VReg.RET, VReg.A0);
+        vm.label("_vo_ret");
         vm.epilogue([VReg.S0, VReg.S1], 0);
     }
 
@@ -5323,11 +6095,14 @@ export class StringGenerator {
         this.generateCharAt();
         this.generateStrCpBytes();
         this.generateStrCodepointAt();
+        this.generateStrProtoCodePointAt();
         this.generateStrIndexChar();
         this.generateCharCodeAt();
         this.generateWsLen();      // [W-25] 空白判定(完整 WhiteSpace ∪ LineTerminator)
         this.generateWsLenBack();  // [W-25] 同上,尾部扫描方向
         this.generateArgStr();     // [W-25] 字符串实参 ToString 归一
+        this.generateSymGetMethod(); // [W4]
+        this.generateSymCallMethod(); // [W4]
         this.generateTrim();
         this.generateTrimStart();
         this.generateTrimEnd();
@@ -5346,9 +6121,11 @@ export class StringGenerator {
         this.generateStartsWith();
         this.generateEndsWith();
         this.generateLastIndexOf();
+        this.generateArefLastIndexOf();
         this.generateRepeat();
         this.generateAt();
         this.generateConcat();
+        this.generateNormalize();
         this.generateSplit();
         this.generateStrSearch(); // [L3]
         this.generateStrMatch();  // [L3]
@@ -5538,11 +6315,47 @@ export class StringGenerator {
     // A1 = 装箱参数(RegExp 或 字符串)
     generateStrSearch() {
         const vm = this.vm;
+        const searchSaved = [VReg.S0, VReg.S1, VReg.S2, VReg.S3];
         vm.label("_str_search");
-        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
-        this._emitThisStringCheck("search");
+        vm.prologue(32, searchSaved);
         vm.mov(VReg.S0, VReg.A0); // str
         vm.mov(VReg.S1, VReg.A1); // arg
+        vm.mov(VReg.A0, VReg.S0);
+        this._emitThisToString("search");
+        vm.mov(VReg.S0, VReg.A0);
+        {
+            const skipSym = "_sr_skip_sym";
+            const noMethod = "_sr_nomethod";
+            vm.lea(VReg.V0, "_js_undefined");
+            vm.load(VReg.V0, VReg.V0, 0);
+            vm.cmp(VReg.S1, VReg.V0);
+            vm.jeq(skipSym);
+            vm.movImm64(VReg.V0, 0x7ffa000000000000n);
+            vm.cmp(VReg.S1, VReg.V0);
+            vm.jeq(skipSym);
+            vm.shrImm(VReg.V0, VReg.S1, 48);
+            vm.cmpImm(VReg.V0, 0x7FFD);
+            vm.jne(skipSym);
+            this._emitLoadWellknownSymbol("search");
+            vm.mov(VReg.A1, VReg.RET);
+            vm.mov(VReg.A0, VReg.S1);
+            vm.call("_str_getmethod");
+            vm.lea(VReg.V0, "_js_undefined");
+            vm.load(VReg.V0, VReg.V0, 0);
+            vm.cmp(VReg.RET, VReg.V0);
+            vm.jeq(noMethod);
+            vm.mov(VReg.A0, VReg.RET);
+            vm.mov(VReg.A1, VReg.S1);
+            vm.mov(VReg.A2, VReg.S0);
+            vm.movImm64(VReg.A3, 0x7ffb000000000000n);
+            vm.movImm(VReg.A4, 1);
+            vm.call("_str_call_method");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.call("_to_int32");
+            vm.epilogue(searchSaved, 32);
+            vm.label(noMethod);
+            vm.label(skipSym);
+        }
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_getStrContent");
         vm.mov(VReg.S2, VReg.RET); // S2 = str_ptr
@@ -5576,11 +6389,30 @@ export class StringGenerator {
 
     generateStrMatch() {
         const vm = this.vm;
+        const matchSaved = [VReg.S0, VReg.S1, VReg.S2, VReg.S3];
         vm.label("_str_match");
-        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
-        this._emitThisToString("match");
+        vm.prologue(32, matchSaved);
         vm.mov(VReg.S0, VReg.A0);
         vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.A0, VReg.S0);
+        this._emitThisToString("match");
+        vm.mov(VReg.S0, VReg.A0);
+        {
+            const skipSym = "_sm_skip_sym";
+            vm.lea(VReg.V0, "_js_undefined");
+            vm.load(VReg.V0, VReg.V0, 0);
+            vm.cmp(VReg.S1, VReg.V0);
+            vm.jeq(skipSym);
+            vm.movImm64(VReg.V0, 0x7ffa000000000000n);
+            vm.cmp(VReg.S1, VReg.V0);
+            vm.jeq(skipSym);
+            this._emitSymDelegate({
+                symName: "match", searchReg: VReg.S1, thisReg: VReg.S0,
+                arg2Reg: null, argc: 1, fallLabel: skipSym,
+                savedRegs: matchSaved, frameSize: 32, tag: "match",
+            });
+            vm.label(skipSym);
+        }
         // [L3] RegExp detection: high16=0, in heap, type@0==8 -> regexp match
         const smNotRe = "_sm_not_re";
         vm.shrImm(VReg.V1, VReg.S1, 48);
@@ -5673,21 +6505,39 @@ export class StringGenerator {
     // Non-RegExp:逐次 _str_indexOf;RegExp:逐次 _regexp_search。均返匹配子串数组。
     generateStrMatchAll() {
         const vm = this.vm;
+        const maSaved = [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4];
         vm.label("_str_matchAll");
-        vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
-        this._emitThisStringCheck("matchAll");
-        vm.mov(VReg.S0, VReg.A0); // S0 = boxed this str
-        vm.mov(VReg.S1, VReg.A1); // S1 = search value
-
-        // [L3] Detect RegExp: two code paths:
-        //   (a) raw heap pointer with TYPE_REGEXP(8)
-        //   (b) boxed 0x7FFD object with __isRegExp truthy
+        vm.prologue(48, maSaved);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.A0, VReg.S0);
+        this._emitThisToString("matchAll");
+        vm.mov(VReg.S0, VReg.A0);
+        {
+            const skipSym = "_sma_skip_sym";
+            vm.lea(VReg.V0, "_js_undefined");
+            vm.load(VReg.V0, VReg.V0, 0);
+            vm.cmp(VReg.S1, VReg.V0);
+            vm.jeq(skipSym);
+            vm.movImm64(VReg.V0, 0x7ffa000000000000n);
+            vm.cmp(VReg.S1, VReg.V0);
+            vm.jeq(skipSym);
+            vm.shrImm(VReg.V0, VReg.S1, 48);
+            vm.cmpImm(VReg.V0, 0x7FFD);
+            vm.jne(skipSym);
+            this._emitReplaceAllRegExpGCheck(VReg.S1, "mall");
+            this._emitSymDelegate({
+                symName: "matchAll", searchReg: VReg.S1, thisReg: VReg.S0,
+                arg2Reg: null, argc: 1, fallLabel: skipSym,
+                savedRegs: maSaved, frameSize: 48, tag: "matchAll",
+            });
+            vm.label(skipSym);
+        }
         const noRe = "_sma_nore";
         const reBox = "_sma_rebox";
         vm.shrImm(VReg.V0, VReg.S1, 48);
         vm.cmpImm(VReg.V0, 0x7FFD);
         vm.jeq(reBox);
-        // (a) raw heap pointer
         vm.cmpImm(VReg.V0, 0);
         vm.jne(noRe);
         vm.cmpImm(VReg.S1, 0);
@@ -5697,9 +6547,9 @@ export class StringGenerator {
         vm.lea(VReg.V1, "_heap_ptr"); vm.load(VReg.V1, VReg.V1, 0);
         vm.cmp(VReg.S1, VReg.V1); vm.jae(noRe);
         vm.loadByte(VReg.V1, VReg.S1, 0);
-        vm.cmpImm(VReg.V1, 8); // TYPE_REGEXP
+        vm.cmpImm(VReg.V1, 8);
         vm.jne(noRe);
-        // (b) boxed 0x7FFD object: check __isRegExp, extract __pat
+        vm.jmp("_sma_re_have_ptr");
         vm.label(reBox);
         vm.push(VReg.S0);
         vm.mov(VReg.A0, VReg.S1);

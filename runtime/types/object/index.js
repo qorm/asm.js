@@ -59,6 +59,11 @@ const ATTR_DEFAULT = 7; // 普通属性:writable+enumerable+configurable 全 1
 const ATTR_FN_DELETED = 0x80; // bit7: 函数 name/length 已删除墓碑(抑制元数据回落)
 const ATTR_FN_DELETED_TOMB = 0x80 | ATTR_CONFIGURABLE; // 墓碑条目实际 attr(可配置 → 可被 _object_delete 清除)
 
+// [W7b] 数组头 type 字 byte1 标志(与对象 EXT_* 同位布局,数组此前 byte1 恒 0)。
+// length [[Writable]] 缺省 true;defineProperty(arr,"length",{writable:false}) 置本位置位。
+const ARR_LEN_NONWRITABLE = 1; // bit0: array [[Length]] writable:false
+const ARR_HAS_SIDETABLE = 2; // bit1: 已挂 _closure_props_registry。热路径 arr[i] 无此位则跳过 O(n) 链表。
+
 // [#dp-mask] Object.defineProperty 字段存在位掩码(field-presence mask)。
 // 编译器按描述符里**实际出现**的字段置位,运行时仅对出现的字段做验证/强制/改写;
 // 未出现的字段保留既有值/属性位(绝不以 undefined 覆盖、绝不默认 false)。这是上一版
@@ -151,6 +156,7 @@ export class ObjectGenerator {
         this.generateObjectDefinePropertyHelpers();
         this.generateObjectDefineProperty();
         this.generateObjectDefinePropertyDyn();
+        this.generateArraySideElementHelpers(); // [W7b] 数组索引侧表 get/set(writable/accessor)
         this.generateCanonicalArrayIndex();
         this.generateObjectNormalizeOrder();
         this.generateObjectApplyClearAttrs();
@@ -536,6 +542,18 @@ export class ObjectGenerator {
         vm.movImm64(VReg.V1, OBJ_TAG);
         vm.or(VReg.RET, VReg.S1, VReg.V1); // 装箱 props
         vm.label("_cpe_done");
+        // 数组键:置 ARR_HAS_SIDETABLE,让 _array_side_elem_* 热路径 O(1) 跳过链表。
+        // 函数 magic 头不是 TYPE_ARRAY,不受影响。
+        vm.movImm64(VReg.V1, MASK);
+        vm.and(VReg.V0, VReg.S0, VReg.V1);
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.andImm(VReg.V1, VReg.V1, 0xff);
+        vm.cmpImm(VReg.V1, 1); // TYPE_ARRAY
+        vm.jne("_cpe_ret");
+        vm.loadByte(VReg.V1, VReg.V0, 1);
+        vm.orImm(VReg.V1, VReg.V1, ARR_HAS_SIDETABLE);
+        vm.storeByte(VReg.V0, 1, VReg.V1);
+        vm.label("_cpe_ret");
         vm.epilogue([VReg.S0, VReg.S1], 0);
 
         // _closure_prop_get(A0=fn, A1=key) -> value / undefined(无 props 或键 miss)。
@@ -1476,13 +1494,11 @@ export class ObjectGenerator {
         // GC 复用后邻居非零 → 确定性崩,任务 #19)。
         vm.cmpImm(VReg.V1, 12);
         vm.jeq("_object_get_notfound");
-        // Date(7)/Promise(11) 同理不是属性对象:16B Date 块 [type@0, ts@8] 的 ts、
-        // Promise 块 [type@0, status@8, value@16, ...] 的 status 会被当 count、
-        // 邻域垃圾当 props_ptr 野扫解引用崩(String(d)/""+d/`${d}` 经 _is_asmjs_err/
-        // _call_toprimitive 前导遍历全崩根因;Promise 同隐患,见 print.js:607 实证)。
-        // 它们的方法由编译器 tag 分派,不经此路径;任意字符串属性一律 undefined。
+        // Date(7):16B 块无 props 槽;具名属性走闭包侧表(与数组/函数同登记)。
+        // 先查侧表,miss 再走原型链(Date.prototype.get 等)——defineProperty 以 Date 作
+        // Attributes、defineProperties 以 Date 作 Properties 依赖此。
         vm.cmpImm(VReg.V1, TYPE_DATE);
-        vm.jeq("_object_get_notfound");
+        vm.jeq("_object_get_date_side");
         vm.cmpImm(VReg.V1, TYPE_PROMISE);
         vm.jeq("_object_get_notfound");
         // DataView(14):32B 块 [type@0, data_ptr@8, byteOffset@16, byteLength@24],**块尾即 32**,
@@ -1650,6 +1666,28 @@ export class ObjectGenerator {
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
         vm.or(VReg.RET, VReg.RET, VReg.V1);
         vm.label("_object_get_symbol_ret");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
+
+        // [W7b] Date:侧表自有属性 + Date.prototype 继承(无 __proto__ 槽)
+        vm.label("_object_get_date_side");
+        // 重装箱 Date 供 _closure_prop_get(接受裸/箱)
+        vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+        vm.or(VReg.A0, VReg.S0, VReg.V1);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_closure_prop_get");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jne("_object_get_date_hit");
+        // 继承:读 _nsobj_date_proto(由 members.js 物化;未物化则 0 → undefined)
+        vm.lea(VReg.V0, "_nsobj_date_proto");
+        vm.load(VReg.A0, VReg.V0, 0);
+        vm.cmpImm(VReg.A0, 0);
+        vm.jeq(notFoundLabel);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_get");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
+        vm.label("_object_get_date_hit");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
 
         // 冷分支:接收者是 DataView 块(S0=裸指针)。只有 byteLength@24 / byteOffset@16 两个
@@ -2909,12 +2947,19 @@ export class ObjectGenerator {
         vm.jeq("_odel_tag_ok");
         vm.cmpImm(VReg.V1, 0x7FFD);
         vm.jeq("_odel_tag_ok");
+        // 装箱数组(0x7FFE):数值索引清槽为 hole(0);具名键走侧表。
+        vm.cmpImm(VReg.V1, 0x7FFE);
+        vm.jeq("_odel_array_boxed");
         // [I6] 函数值(0x7FFF)→ 闭包属性侧表删除(_closure_prop_del:name/length 落墓碑
         // 永久移除,其余键侧表常规删)。此前落 _odel_true 空转(delete 返 true 但属性被
         // 元数据回落复活,verifyProperty 的 isConfigurable 探针恒败)。
         vm.cmpImm(VReg.V1, 0x7FFF);
         vm.jeq("_odel_fn");
         vm.jmp("_odel_true");
+        vm.label("_odel_array_boxed");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.S0, VReg.S0, VReg.V1);
+        vm.jmp("_odel_array");
         vm.label("_odel_tag_ok");
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.S0, VReg.S0, VReg.V1); // 脱壳
@@ -3066,15 +3111,41 @@ export class ObjectGenerator {
         // _odel_true 使 delete 空转、name/length 被元数据复活)。函数元数据侧表按
         // code_ptr 登记全部编译期函数,命中 ⟹ 函数值 → 墓碑删除路。仅 type 字节非
         // TYPE_OBJECT/TYPE_PROXY 的裸堆指针入此(装箱数组/字符串/数值在上面 tag 分派
-        // 已短路;数组 type=1 免探直接 true),delete 本为冷路径,探测开销可接受。
+        // 已短路)。
         vm.label("_odel_maybe_fn");
-        vm.cmpImm(VReg.V1, 1); // TYPE_ARRAY:确定非函数,免探测
-        vm.jeq("_odel_true");
+        vm.cmpImm(VReg.V1, 1); // TYPE_ARRAY → 元素/侧表删除
+        vm.jeq("_odel_array");
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_func_meta_entry"); // RET=entry_ptr(0=未登记)
         vm.cmpImm(VReg.RET, 0);
         vm.jeq("_odel_true");
         vm.jmp("_odel_fn_raw");
+
+        // 数组 delete:规范数值索引 → 清槽为 hole(0),length 不变;非索引 → 侧表删。
+        // S0=裸数组头,S1=已归一装箱键。
+        vm.label("_odel_array");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_canonical_array_index"); // RET = idx / -1
+        vm.movImm64(VReg.V1, 0xFFFFFFFFFFFFFFFFn);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_odel_array_named");
+        vm.mov(VReg.S2, VReg.RET); // idx
+        vm.load(VReg.V0, VReg.S0, 8); // length
+        vm.cmp(VReg.S2, VReg.V0);
+        vm.jge("_odel_true"); // 越界 delete → true(属性本不存在)
+        vm.cmpImm(VReg.S2, 0);
+        vm.jlt("_odel_true");
+        vm.load(VReg.V1, VReg.S0, 24); // data_ptr
+        vm.shl(VReg.V0, VReg.S2, 3);
+        vm.add(VReg.V0, VReg.V1, VReg.V0);
+        vm.movImm(VReg.V1, 0); // hole
+        vm.store(VReg.V0, 0, VReg.V1);
+        vm.jmp("_odel_true");
+        vm.label("_odel_array_named");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_closure_prop_del");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
 
         vm.label("_odel_fn");
         vm.emitMaskLoad(VReg.V1);
@@ -3105,10 +3176,8 @@ export class ObjectGenerator {
         vm.shrImm(VReg.V0, VReg.S0, 48);
         vm.cmpImm(VReg.V0, 0);
         vm.jne("_maybe_getter_pass");
-        // [bug A 根本障碍,勿再试读侧转换] miss 哨兵裸 0 与存储的 +0.0
-        // (raw double 全零位)不可区分——曾把零值短路改成返回 undefined,
-        // regexp shim(pos=0)/零值属性全部塌成 undefined。根治需存储侧把
-        // raw-double-zero 规范化为装箱 int0 后才能解放哨兵,另案。
+        // [array hole] 数组元素写路径已把 +0.0 规范为装箱 int0,槽 0=真 hole。
+        // 对象属性 miss 哨兵仍为裸 0;此处 0 短路仍作「非 getter」通过(对象侧未改)。
         vm.cmpImm(VReg.S0, 0);
         vm.jeq("_maybe_getter_pass");
         vm.lea(VReg.V0, "_heap_base");
@@ -3291,10 +3360,9 @@ export class ObjectGenerator {
         // Symbol 标记块:写属性会把 desc 指针槽当 count 毁块 → 静默跳过
         vm.cmpImm(VReg.V1, TYPE_SYMBOL);
         vm.jeq("_object_set_ty_bail");
-        // Date(7)/Promise(11)/DataView(14): not property containers;
-        // writing arbitrary props would crash (same as _object_get guard).
+        // Date(7):具名属性走闭包侧表(defineProperties 以 Date 作 Properties)。
         vm.cmpImm(VReg.V1, TYPE_DATE);
-        vm.jeq("_object_set_ty_bail");
+        vm.jeq("_object_set_date_side");
         vm.cmpImm(VReg.V1, TYPE_PROMISE);
         vm.jeq("_object_set_ty_bail");
         vm.cmpImm(VReg.V1, TYPE_DATA_VIEW);
@@ -3308,6 +3376,15 @@ export class ObjectGenerator {
         vm.jgt("_object_set_ty_ok");
         vm.label("_object_set_ty_bail");
         vm.movImm(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
+        // [W7b] Date 具名写 → 侧表
+        vm.label("_object_set_date_side");
+        vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+        vm.or(VReg.A0, VReg.S0, VReg.V1);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_closure_prop_set");
+        vm.mov(VReg.RET, VReg.S2);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
         vm.label("_object_set_ty_ok");
 
@@ -3892,15 +3969,23 @@ export class ObjectGenerator {
         // (无自有属性;has trap 由 _proxy_has 专函处理,不经过本 helper)。
         vm.cmpImm(VReg.V0, TYPE_PROXY);
         vm.jeq("_object_has_false");
-        // Date(7)/Promise(11):布局同上与对象头不兼容(ts/status 被当 count 野扫,
-        // _is_asmjs_err(Date) 段错误根因)。规范语义"无此自有属性" → false,不抛。
+        // Date(7):侧表自有属性(defineProperties Properties=Date)
         vm.cmpImm(VReg.V0, TYPE_DATE);
-        vm.jeq("_object_has_false");
+        vm.jeq("_object_has_date_side");
         vm.cmpImm(VReg.V0, TYPE_PROMISE);
         vm.jeq("_object_has_false");
         vm.jmp("_object_has_obj");
 
         vm.label("_object_has_idx");
+        // "length" 是数组/TypedArray/arguments 的自有数据属性(不可枚举)。
+        // 此前非数字键直接 false → verifyProperty(arr,"length") / hasOwnProperty("length") 恒败。
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.V0, "_str_length_prop");
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.V0, VReg.V1);
+        vm.call("_object_key_eq");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_object_has_true");
         vm.mov(VReg.A0, VReg.S1); // 规范化键(装箱串)→ 内容指针 atoi
         vm.call("_getStrContent");
         vm.mov(VReg.V2, VReg.RET); // 游标
@@ -3911,9 +3996,9 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.V0, 0);
         vm.jeq("_object_has_arr_done");
         vm.cmpImm(VReg.V0, 48); // '0'
-        vm.jlt("_object_has_false");
+        vm.jlt("_object_has_arr_side"); // 非数字 → 具名侧表(TYPE_ARRAY) / false(TA)
         vm.cmpImm(VReg.V0, 57); // '9'
-        vm.jgt("_object_has_false");
+        vm.jgt("_object_has_arr_side");
         vm.subImm(VReg.V0, VReg.V0, 48);
         vm.movImm(VReg.V1, 10);
         vm.mul(VReg.V3, VReg.V3, VReg.V1);
@@ -3922,12 +4007,43 @@ export class ObjectGenerator {
         vm.addImm(VReg.V2, VReg.V2, 1);
         vm.jmp("_object_has_arr_atoi");
         vm.label("_object_has_arr_done");
-        vm.cmpImm(VReg.S3, 0); // 空/非数字键(含 "length")→ false(记偏差)
-        vm.jeq("_object_has_false");
+        vm.cmpImm(VReg.S3, 0); // 空串 → 侧表/false
+        vm.jeq("_object_has_arr_side");
         vm.load(VReg.S2, VReg.S0, 8); // length @ +8
         vm.cmp(VReg.V3, VReg.S2);
-        vm.jlt("_object_has_true");
-        vm.jmp("_object_has_false");
+        vm.jge("_object_has_arr_side"); // 越界索引仍可能在侧表(accessor define 未扩 length 的旧态)
+        // TypedArray:界内 true。TYPE_ARRAY:槽!=0(真 hole);洞再查侧表
+        vm.loadByte(VReg.V0, VReg.S0, 0);
+        vm.cmpImm(VReg.V0, 1); // TYPE_ARRAY
+        vm.jne("_object_has_true");
+        // [W7b] 稀疏大 length:idx≥capacity 不读稠密槽(防 OOB),改查侧表
+        vm.load(VReg.V0, VReg.S0, 16); // capacity
+        vm.cmp(VReg.V3, VReg.V0);
+        vm.jge("_object_has_arr_side");
+        vm.load(VReg.V1, VReg.S0, 24); // data_ptr
+        vm.shl(VReg.V0, VReg.V3, 3);
+        vm.add(VReg.V0, VReg.V1, VReg.V0);
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_object_has_arr_side"); // hole → 侧表可能有 accessor/覆盖
+        vm.jmp("_object_has_true");
+        // TYPE_ARRAY 具名属性 / 索引侧表回落(defineProperty 写入的闭包 props)。
+        // TypedArray 无此侧表 → false。
+        vm.label("_object_has_arr_side");
+        vm.loadByte(VReg.V0, VReg.S0, 0);
+        vm.andImm(VReg.V0, VReg.V0, 0xff);
+        vm.cmpImm(VReg.V0, 1); // TYPE_ARRAY only
+        vm.jne("_object_has_false");
+        vm.mov(VReg.A0, VReg.S0); // 裸数组指针(侧表键)
+        vm.call("_closure_props_find");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_object_has_false");
+        vm.mov(VReg.A0, VReg.RET); // props 对象
+        vm.mov(VReg.A1, VReg.S1);  // key
+        vm.call("_object_has");   // 递归:props 是 TYPE_OBJECT
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
 
         vm.label("_object_has_obj");
         vm.load(VReg.S2, VReg.S0, 8); // count
@@ -3959,6 +4075,20 @@ export class ObjectGenerator {
 
         vm.label("_object_has_false");
         vm.movImm(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
+
+        // [W7b] Date own:侧表
+        vm.label("_object_has_date_side");
+        vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+        vm.or(VReg.A0, VReg.S0, VReg.V1);
+        vm.call("_closure_props_find");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_object_has_false");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_has");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
 
         // [I5] 函数值 own 判定(S0=裸闭包指针, S1=归一装箱键)。与 _ogopd_fn 同构
@@ -4063,7 +4193,7 @@ export class ObjectGenerator {
         vm.jeq("_prop_in_fn");
         vm.cmpImm(VReg.V1, 0xa51c);
         vm.jeq("_prop_in_fn");
-        // [in] 数组(TYPE_ARRAY=1):数值键界内判定 `"i" in arr ≡ 0<=i<length`。
+        // [in] 数组(TYPE_ARRAY=1):数值键 `"i" in arr ≡ 0<=i<length && 槽!=0`(真 hole)。
         // 数组块布局 length@8、无 props_ptr;走对象路径会把 length 当 count、把
         // cap/data_ptr 当 props 读 → 崩(`"0" in [...]` SIGSEGV 根因)。先按类型字节分流。
         vm.loadByte(VReg.V0, VReg.S0, 0);
@@ -4122,8 +4252,18 @@ export class ObjectGenerator {
         vm.jeq("_prop_in_false");
         vm.load(VReg.S2, VReg.S0, 8); // length @ block+8
         vm.cmp(VReg.V3, VReg.S2);
-        vm.jlt("_prop_in_true");
-        vm.jmp("_prop_in_false");
+        vm.jge("_prop_in_false");
+        // TypedArray:界内即 true。TYPE_ARRAY:槽!=0 才 true(hole 哨兵 0)。
+        vm.loadByte(VReg.V0, VReg.S0, 0);
+        vm.cmpImm(VReg.V0, 1); // TYPE_ARRAY
+        vm.jne("_prop_in_true");
+        vm.load(VReg.V1, VReg.S0, 24); // data_ptr
+        vm.shl(VReg.V0, VReg.V3, 3);
+        vm.add(VReg.V0, VReg.V1, VReg.V0);
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_prop_in_false"); // hole
+        vm.jmp("_prop_in_true");
         vm.label("_prop_in_obj");
 
         vm.load(VReg.S2, VReg.S0, 8); // count
@@ -4262,7 +4402,9 @@ export class ObjectGenerator {
         vm.loadByte(VReg.V0, VReg.S0, 0);
         vm.cmpImm(VReg.V0, TYPE_SYMBOL);
         vm.jeq("_object_keys_empty");
-
+        // [W7b] Date:侧表键(不可按对象头扫 ts)
+        vm.cmpImm(VReg.V0, TYPE_DATE);
+        vm.jeq("_object_keys_date");
 
         // Proxy(type=8):有 ownKeys 陷阱 → handler.ownKeys(target) 的键数组;否则转发
         // target 的键(count@8 是 target 指针,不转发会当 count 迭代垃圾崩)。**偏差**:
@@ -4439,6 +4581,24 @@ export class ObjectGenerator {
         // desugar 的崩因)。函数的自有具名属性挂在 _closure_props_* 侧表(与 _object_get 的
         // 0x7FFF 分支同表),故转为枚举侧表 props 普通对象(TYPE_OBJECT,不会再落本分支,
         // 无递归环);从未写过 fn.x → 侧表 miss → 空数组。
+        // [W7b] Date keys → 侧表(与函数同形,无 length/name 过滤)
+        vm.label("_object_keys_date");
+        vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+        vm.or(VReg.A0, VReg.S0, VReg.V1);
+        vm.call("_closure_props_find");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_object_keys_empty");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.cmpImm(VReg.S5, 0);
+        vm.jne("_object_keys_date_own");
+        vm.call("_object_keys");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 0);
+        vm.label("_object_keys_date_own");
+        vm.call("_object_own_keys");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 0);
+
         vm.label("_object_keys_fn");
         vm.call("_closure_props_find"); // A0=fn 值 → RET=props(装箱 0x7FFD)/undefined
         vm.lea(VReg.V1, "_js_undefined");
@@ -5635,17 +5795,20 @@ export class ObjectGenerator {
     }
 
     // [rest] 对象解构 rest:_object_rest(src, excludedKeysArray) -> 新对象
-    // 遍历 src 自有属性,键不在 excluded 数组中的复制入新对象。
+    // CopyDataProperties:对 src 每个自有键,未被 excluded 且 enumerable,
+    // 则 value = Get(src, key)(触发 getter),再 CreateDataProperty(result, key, value)。
     // src = boxed 对象;excluded = JS 数组(元素为 boxed 字符串键,可空)。
     // 全程用栈槽保存循环状态,免依赖被调用 helper 的 S 寄存器保存契约。
-    // 栈布局(prologue 80):
-    //   +0 src指针  +8 src count  +16 i  +24 excluded指针  +32 excluded长度
-    //   +40 result(boxed)  +48 当前key  +56 当前val  +64 j
+    // 栈布局(prologue 96, 16B 对齐):
+    //   +0 src裸指针  +8 src count  +16 i  +24 excluded指针  +32 excluded长度
+    //   +40 result  +48 当前key  +56 (unused)  +64 j  +72 src装箱(原始 A0)
     generateObjectRest() {
         const vm = this.vm;
 
         vm.label("_object_rest");
-        vm.prologue(80, []);
+        vm.prologue(96, []);
+
+        vm.store(VReg.SP, 72, VReg.A0);  // 原始装箱 src(供 [[Get]] / _maybe_getter this)
 
         vm.emitMaskLoad(VReg.V4);
         vm.andMaskReg(VReg.V0, VReg.A0, VReg.V4);
@@ -5681,7 +5844,22 @@ export class ObjectGenerator {
         vm.cmp(VReg.V0, VReg.V1);
         vm.jge("_object_rest_done");
 
-        // propAddr = src.props_ptr + i*16
+        // 可枚举判别(复用 _object_keys):flags_ptr==0 → 默认可枚举(自举对象);
+        // 否则 flags[i]&ATTR_ENUMERABLE==0 → 跳过(obj-ptrn-rest-skip-non-enumerable)
+        vm.load(VReg.V2, VReg.SP, 0);
+        vm.load(VReg.V2, VReg.V2, OBJECT_FLAGS_PTR_OFFSET);
+        vm.cmpImm(VReg.V2, 0);
+        vm.jeq("_object_rest_enum_ok");
+        vm.load(VReg.V0, VReg.SP, 16);             // i
+        vm.add(VReg.V2, VReg.V2, VReg.V0);
+        vm.loadByte(VReg.V2, VReg.V2, 0);
+        vm.movImm(VReg.V0, ATTR_ENUMERABLE);
+        vm.and(VReg.V2, VReg.V2, VReg.V0);
+        vm.cmpImm(VReg.V2, 0);
+        vm.jeq("_object_rest_skip");               // 不可枚举 → 跳过
+
+        vm.label("_object_rest_enum_ok");
+        // propAddr = src.props_ptr + i*16(只取 key;值走 [[Get]],不读槽裸 val)
         vm.load(VReg.V2, VReg.SP, 0);
         vm.load(VReg.V2, VReg.V2, OBJECT_PROPS_PTR_OFFSET);
         vm.load(VReg.V0, VReg.SP, 16);
@@ -5689,8 +5867,6 @@ export class ObjectGenerator {
         vm.add(VReg.V2, VReg.V2, VReg.V0);
         vm.load(VReg.V1, VReg.V2, 0);
         vm.store(VReg.SP, 48, VReg.V1);  // key
-        vm.load(VReg.V1, VReg.V2, 8);
-        vm.store(VReg.SP, 56, VReg.V1);  // val
 
         // 内层:j 遍历 excluded,命中则跳过本属性
         vm.movImm(VReg.V0, 0);
@@ -5717,9 +5893,16 @@ export class ObjectGenerator {
         vm.jmp("_object_rest_inner");
 
         vm.label("_object_rest_keep");
+        // [[Get]] + _maybe_getter:触发 getter,把数据值(非标记块)写入 rest
+        vm.load(VReg.A0, VReg.SP, 72);   // 原始装箱 src
+        vm.load(VReg.A1, VReg.SP, 48);   // key
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);       // value(可能含 getter 标记)
+        vm.load(VReg.A1, VReg.SP, 72);   // this = 装箱 src
+        vm.call("_maybe_getter");
+        vm.mov(VReg.A2, VReg.RET);
         vm.load(VReg.A0, VReg.SP, 40);   // result
         vm.load(VReg.A1, VReg.SP, 48);   // key
-        vm.load(VReg.A2, VReg.SP, 56);   // val
         vm.call("_object_set");
 
         vm.label("_object_rest_skip");
@@ -5735,7 +5918,7 @@ export class ObjectGenerator {
         // 小 double)。属性访问/Object.keys 兼容裸指针而侥幸工作,掩盖此漏。
         vm.movImm64(VReg.V1, 0x7ffd000000000000n);
         vm.or(VReg.RET, VReg.RET, VReg.V1);
-        vm.epilogue([], 80);
+        vm.epilogue([], 96);
     }
 
     // Object.create(proto) -> obj
@@ -5808,6 +5991,9 @@ export class ObjectGenerator {
         // reference so _object_getPrototypeOf can read the slot even when emitStringProtoObject
         // hasn't been emitted into a specific compilation unit.
         vm.asm.addDataLabel("_nsobj_string_proto");
+        vm.asm.addDataQword(0);
+        // Date.prototype 槽(members.js 物化;此处声明以便 _object_get_date_side 可链)
+        vm.asm.addDataLabel("_nsobj_date_proto");
         vm.asm.addDataQword(0);
 
         // _ensure_array_proto: fill _nsobj_array_proto if empty.
@@ -6639,8 +6825,9 @@ export class ObjectGenerator {
     // handles the memoized-ref path (e.g. var f=Object.fromEntries; f(entries)).
     generateObjectFromEntries() {
         const vm = this.vm;
-        vm.asm.registerRuntimeString("_str_0", "0");
-        vm.asm.registerRuntimeString("_str_1", "1");
+        // 唯一标签:勿与其它 helper 共用 _str_0/_str_1(重复 registerRuntimeString 会自举振荡)
+        vm.asm.registerRuntimeString("_str_ofe_0", "0");
+        vm.asm.registerRuntimeString("_str_ofe_1", "1");
         vm.label("_object_fromEntries");
         vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
         vm.mov(VReg.S0, VReg.A0);  // entries array
@@ -6661,7 +6848,7 @@ export class ObjectGenerator {
         vm.mov(VReg.V0, VReg.RET);
         vm.store(VReg.SP, 0, VReg.V0);  // entry
         vm.mov(VReg.A0, VReg.V0);
-        vm.lea(VReg.V1, "_str_0");
+        vm.lea(VReg.V1, "_str_ofe_0");
         vm.movImm64(VReg.V2, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.V1, VReg.V2);
         vm.call("_subscript_get"); // key = entry["0"]
@@ -6676,7 +6863,7 @@ export class ObjectGenerator {
         vm.label("_ofe_key_str");
         // Read value from entry[1]
         vm.load(VReg.A0, VReg.SP, 0);
-        vm.lea(VReg.V1, "_str_1");
+        vm.lea(VReg.V1, "_str_ofe_1");
         vm.movImm64(VReg.V2, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.V1, VReg.V2);
         vm.call("_subscript_get"); // val = entry["1"]
@@ -6697,12 +6884,25 @@ export class ObjectGenerator {
     // calling _object_define_property_dyn for each key.
     generateObjectDefinePropertiesDyn() {
         const vm = this.vm;
-        vm.asm.registerRuntimeString("_str_0", "0");
-        vm.asm.registerRuntimeString("_str_1", "1");
+        const boxStr = (reg) => {
+            vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(reg, reg, VReg.V1);
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(reg, reg, VReg.V1);
+        };
         vm.label("_object_define_properties_dyn");
         vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
         vm.mov(VReg.S0, VReg.A0);  // obj
         vm.mov(VReg.S1, VReg.A1);  // props
+        // 接收者守卫(与 _object_define_property 对齐):原语 boolean/number/string/nullish → TypeError。
+        // 此前缺检 → defineProperties(true, {}) 静默成功(test262 15.2.3.7-1-*).
+        vm.shrImm(VReg.V1, VReg.S0, 48);
+        vm.cmpImm(VReg.V1, 0x7ffd); vm.jeq("_odps_recv_ok");
+        vm.cmpImm(VReg.V1, 0x7ffe); vm.jeq("_odps_recv_ok");
+        vm.cmpImm(VReg.V1, 0x7fff); vm.jeq("_odps_recv_ok");
+        vm.cmpImm(VReg.V1, 0); vm.jeq("_odps_recv_ok");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot define properties, target is not an object"));
+        boxStr(VReg.A0);
+        vm.call("_throw_type_error");
+        vm.label("_odps_recv_ok");
         // keys = Object.keys(props)
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_object_keys");
@@ -6731,6 +6931,21 @@ export class ObjectGenerator {
         vm.label("_odps_done");
         vm.mov(VReg.RET, VReg.S0);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
+
+        // _object_define_properties_recv_check(A0=obj):静态 defineProperties 脱糖入口校验。
+        // 与 _odps_recv_ok 同判据;原语 → TypeError(不返回)。
+        vm.label("_object_define_properties_recv_check");
+        vm.prologue(0, []);
+        vm.shrImm(VReg.V1, VReg.A0, 48);
+        vm.cmpImm(VReg.V1, 0x7ffd); vm.jeq("_odps_chk_ok");
+        vm.cmpImm(VReg.V1, 0x7ffe); vm.jeq("_odps_chk_ok");
+        vm.cmpImm(VReg.V1, 0x7fff); vm.jeq("_odps_chk_ok");
+        vm.cmpImm(VReg.V1, 0); vm.jeq("_odps_chk_ok");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot define properties, target is not an object"));
+        boxStr(VReg.A0);
+        vm.call("_throw_type_error");
+        vm.label("_odps_chk_ok");
+        vm.epilogue([], 0);
     }
 
     // ============ [#61 P2] per-property attributes ============
@@ -7211,17 +7426,41 @@ export class ObjectGenerator {
         // ============ 落值 + 落 attr ============
         vm.label("_dp_apply");
         vm.load(VReg.V2, VReg.SP, 8);              // mask
-        // storeValue:新 accessor → 建标记块;否则 HAS_VALUE → value;否则保留 oldval
+        // storeValue:新 accessor → 建标记块;否则 data;accessor→data 转换时缺 value → undefined
         vm.andImm(VReg.V1, VReg.V2, DP_HAS_GET | DP_HAS_SET);
         vm.cmpImm(VReg.V1, 0); vm.jne("_dp_apply_acc");
+        // data 描述符(或 generic)
+        vm.load(VReg.V5, VReg.SP, 40);             // oldIsAccessor
+        vm.cmpImm(VReg.V5, 0); vm.jeq("_dp_apply_data_same");
+        // 旧为 accessor:仅当 Desc 含 value/writable 才转 data(空 {} 保留 accessor)
+        vm.andImm(VReg.V1, VReg.V2, DP_HAS_VALUE | DP_HAS_WRITABLE);
+        vm.cmpImm(VReg.V1, 0); vm.jeq("_dp_apply_keep");
+        vm.andImm(VReg.V1, VReg.V2, DP_HAS_VALUE);
+        vm.cmpImm(VReg.V1, 0); vm.jeq("_dp_apply_conv_undef");
+        vm.load(VReg.V5, VReg.SP, 72);
+        vm.movImm(VReg.V0, 1);
+        vm.store(VReg.SP, 16, VReg.V0); // convertToData=1
+        vm.jmp("_dp_apply_store");
+        vm.label("_dp_apply_conv_undef");
+        vm.movImm64(VReg.V5, 0x7ffb000000000000n);
+        vm.movImm(VReg.V0, 1);
+        vm.store(VReg.SP, 16, VReg.V0);
+        vm.jmp("_dp_apply_store");
+        vm.label("_dp_apply_data_same");
+        vm.movImm(VReg.V0, 0);
+        vm.store(VReg.SP, 16, VReg.V0); // convertToData=0
         vm.andImm(VReg.V1, VReg.V2, DP_HAS_VALUE);
         vm.cmpImm(VReg.V1, 0); vm.jeq("_dp_apply_keep");
         vm.load(VReg.V5, VReg.SP, 72);             // storeValue = value
         vm.jmp("_dp_apply_store");
         vm.label("_dp_apply_keep");
+        vm.movImm(VReg.V0, 0);
+        vm.store(VReg.SP, 16, VReg.V0);
         vm.load(VReg.V5, VReg.SP, 24);             // storeValue = oldval(保留)
         vm.jmp("_dp_apply_store");
         vm.label("_dp_apply_acc");
+        vm.movImm(VReg.V0, 0);
+        vm.store(VReg.SP, 16, VReg.V0); // convertToData=0
         // 标记块:get = HAS_GET? 新 : oldGet;set = HAS_SET? 新 : oldSet
         vm.movImm(VReg.A0, 24); vm.call("_alloc"); // _alloc 毁 V/S4/S5;故全从 SP 取
         vm.mov(VReg.V5, VReg.RET);                 // V5 = 标记块
@@ -7251,10 +7490,16 @@ export class ObjectGenerator {
         vm.mov(VReg.A1, VReg.S1);                  // key
         vm.mov(VReg.A2, VReg.V5);                  // storeValue
         vm.call("_object_define");                 // 落值(新键追加/既有覆写;冻结对象无变更则短路无害)
-        // finalAttr:不存在 → attr;存在 → oldattr 仅覆写 mask 标记位
+        // finalAttr:不存在 → attr;存在 → oldattr 仅覆写 mask 标记位;
+        // accessor→data 转换时 writable 先清为缺省 false(再按 mask 覆写)
         vm.load(VReg.V0, VReg.SP, 32);             // oldattr
         vm.movImm64(VReg.V1, 0xFFFFFFFFFFFFFFFFn);
         vm.cmp(VReg.V0, VReg.V1); vm.jeq("_dp_attr_new");
+        vm.load(VReg.V4, VReg.SP, 16);             // convertToData?
+        vm.cmpImm(VReg.V4, 0);
+        vm.jeq("_dp_attr_merge");
+        vm.andImm(VReg.V0, VReg.V0, 0xFE);         // 清 writable
+        vm.label("_dp_attr_merge");
         vm.load(VReg.V2, VReg.SP, 8);              // mask
         vm.load(VReg.V3, VReg.SP, 64);             // attr
         vm.andImm(VReg.V1, VReg.V2, DP_HAS_WRITABLE);
@@ -7288,70 +7533,323 @@ export class ObjectGenerator {
         // ============ array:数组 DefineOwnProperty ============
         // S0=裸数组头(type@0,length@8,capacity@16,data_ptr@24),无 props_ptr@32。
         // 不可复用 _dp_legacy(_object_define 读 offset 8 当 count、offset 32 当
-        // props_ptr → 数组头只有 32 字节 → 越界)。数组具名属性走闭包侧表。
-        // [fix] 规范数值索引键经 _canonical_array_index 判识后写入数组元素
-        // (此前全量走闭包侧表,defineProperty(arr,"0",{value:x}) 不修改 arr[0])。
-        // 具名键(含 "length"/symbol/非索引串)仍走闭包侧表。
+        // props_ptr → 数组头只有 32 字节 → 越界)。
+        //
+        // 策略(W7):索引键 → 侧表做 ValidateAndApply(attrs/强制) + 数组槽同步值;
+        // 具名键 → 仅侧表。空档保持 hole 哨兵 0(不填 undefined);+0 → 装箱 int0。
+        // arguments 亦 TYPE_ARRAY,同路径。
         vm.label("_dp_array");
-        // 键归一(复用 _js_prop_key,同 _ogopd_arr :7077)
+        // 键归一(复用 _js_prop_key,同 _ogopd_arr)
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_js_prop_key");
         vm.mov(VReg.S1, VReg.RET);
-        // [fix] 判规范数值索引:若是且 HAS_VALUE → 直写数组元素;否则 → 侧表
+        // "length" 特殊:拒 accessor;数据 value → 写 length(简化 ToUint32)
         vm.mov(VReg.A0, VReg.S1);
-        vm.call("_canonical_array_index");         // RET = idx(0..2^32-2) / -1(非索引)
+        vm.lea(VReg.V0, "_str_length_prop");
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.V0, VReg.V1);
+        vm.call("_object_key_eq");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_dp_array_length");
+        // 判规范数值索引
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_canonical_array_index");         // RET = idx / -1
         vm.movImm64(VReg.V1, 0xFFFFFFFFFFFFFFFFn);
         vm.cmp(VReg.RET, VReg.V1);
         vm.jeq("_dp_array_side");                 // 非索引键 → 具名侧表
+        vm.cmpImm(VReg.RET, 0);
+        vm.jlt("_dp_array_side");
+        vm.store(VReg.SP, 16, VReg.RET);           // idx(稠密与稀疏共用)
+        vm.movImm(VReg.V0, 0x10000000);            // 2^28 soft cap
+        vm.cmp(VReg.RET, VReg.V0);
+        vm.jge("_dp_array_sparse");               // 大索引:侧表+抬 length
+
+        // ---- 若数组槽已有数据属性但侧表无此键:先以 DEFAULT attrs 播种,供后续强制 ----
+        vm.load(VReg.V2, VReg.SP, 16);             // idx
+        vm.load(VReg.V3, VReg.S0, 8);              // length
+        vm.cmp(VReg.V2, VReg.V3);
+        vm.jge("_dp_array_idx_apply");            // 越界 → 无既存数组数据
+        vm.load(VReg.V1, VReg.S0, 24);             // data_ptr
+        vm.shl(VReg.V0, VReg.V2, 3);
+        vm.add(VReg.V0, VReg.V1, VReg.V0);
+        vm.load(VReg.V0, VReg.V0, 0);              // slot
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_dp_array_idx_apply");            // hole → 无既存数据
+        vm.store(VReg.SP, 24, VReg.V0);            // 暂存 old slot 值于 oldval 槽
+        vm.load(VReg.A0, VReg.SP, 0);               // boxed arr
+        vm.call("_closure_props_find");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_dp_array_idx_seed");             // 无侧表 → 需播种
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_dp_array_idx_apply");            // 侧表已有 → 不播种
+        vm.label("_dp_array_idx_seed");
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.call("_closure_props_ensure");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.load(VReg.A2, VReg.SP, 24);             // value = slot
+        vm.movImm64(VReg.A3, 0x7ffb000000000000n); // get = undefined
+        vm.mov(VReg.A4, VReg.A3);                  // set = undefined
+        // mask = VALUE|WRITABLE|ENUM|CONFIG, attr = ATTR_DEFAULT
+        vm.movImm(VReg.V0, (DP_HAS_VALUE | DP_HAS_WRITABLE | DP_HAS_ENUMERABLE | DP_HAS_CONFIGURABLE) << 8);
+        vm.orImm(VReg.A5, VReg.V0, ATTR_DEFAULT);
+        vm.call("_object_define_property");
+
+        // ---- 用户描述符落到侧表(完整强制)----
+        vm.label("_dp_array_idx_apply");
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.call("_closure_props_ensure");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.load(VReg.A2, VReg.SP, 72);             // value
+        vm.load(VReg.A3, VReg.SP, 80);             // get
+        vm.load(VReg.A4, VReg.SP, 88);             // set
         vm.load(VReg.V2, VReg.SP, 8);              // mask
-        vm.andImm(VReg.V1, VReg.V2, DP_HAS_VALUE);
-        vm.cmpImm(VReg.V1, 0);
-        vm.jeq("_dp_array_side");                 // 无值写 → 侧表(无逐元素 attr)
-        // 安全写 inline:边界检查 + 容量增长 + 空档填充 + length 更新 + 落值
-        vm.mov(VReg.V2, VReg.RET);                 // V2 = 索引(跨调用保;VReg.RET 会被 _call 冲)
-        vm.cmpImm(VReg.V2, 0);
-        vm.jlt("_dp_array_side");                  // 拒负索引
-        vm.movImm(VReg.V0, 0x10000000);            // 2^28 cap
-        vm.cmp(VReg.V2, VReg.V0);
-        vm.jge("_dp_array_side");                  // 超大索引 → 侧表
+        vm.shlImm(VReg.V2, VReg.V2, 8);
+        vm.load(VReg.V3, VReg.SP, 64);             // attr
+        vm.or(VReg.A5, VReg.V2, VReg.V3);
+        vm.call("_object_define_property");       // 可能抛
+
+        // ---- 同步数组槽 + length(空档保持 hole=0; +0→int0)----
+        vm.load(VReg.V2, VReg.SP, 16);             // idx
         vm.load(VReg.V0, VReg.S0, 16);             // capacity
         vm.cmp(VReg.V2, VReg.V0);
-        vm.jlt("_dp_array_write_now");
-        vm.mov(VReg.A0, VReg.S0);                  // raw arr
-        vm.addImm(VReg.A1, VReg.V2, 1);            // need
+        vm.jlt("_dp_array_idx_cap_ok");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.addImm(VReg.A1, VReg.V2, 1);
         vm.call("_array_ensure_cap");
-        vm.label("_dp_array_write_now");
+        vm.label("_dp_array_idx_cap_ok");
         vm.load(VReg.V3, VReg.S0, 8);              // old length
         vm.cmp(VReg.V2, VReg.V3);
-        vm.jlt("_dp_array_do_write");
-        // 空档 [old_len, index) 填 undefined
-        vm.load(VReg.V1, VReg.S0, 24);             // data_ptr
-        vm.movImm64(VReg.V4, 0x7ffb000000000000n); // JS_UNDEFINED
-        vm.jmp("_dp_array_gap_test");
-        vm.label("_dp_array_gap_loop");
+        vm.jlt("_dp_array_idx_len_ok");
+        // 空档 [old_len, idx) 显式写 hole 哨兵 0(ensure_cap 不保证清零)
+        vm.load(VReg.V1, VReg.S0, 24);
+        vm.movImm(VReg.V4, 0);                     // hole
+        vm.jmp("_dp_array_idx_gap_test");
+        vm.label("_dp_array_idx_gap_loop");
         vm.shl(VReg.V0, VReg.V3, 3);
         vm.add(VReg.V0, VReg.V1, VReg.V0);
         vm.store(VReg.V0, 0, VReg.V4);
         vm.addImm(VReg.V3, VReg.V3, 1);
-        vm.label("_dp_array_gap_test");
+        vm.label("_dp_array_idx_gap_test");
         vm.cmp(VReg.V3, VReg.V2);
-        vm.jlt("_dp_array_gap_loop");
-        vm.addImm(VReg.V0, VReg.V2, 1);            // new length = index+1
-        vm.store(VReg.S0, 8, VReg.V0);
-        vm.label("_dp_array_do_write");
-        vm.load(VReg.A0, VReg.SP, 0);              // boxed 数组(写屏障入参)
+        vm.jlt("_dp_array_idx_gap_loop");
+        vm.addImm(VReg.V0, VReg.V2, 1);
+        vm.store(VReg.S0, 8, VReg.V0);             // length = idx+1
+        vm.label("_dp_array_idx_len_ok");
+        // 读侧表最终值:accessor → 槽写 hole;数据 → 写值(+0 规范)
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.call("_closure_props_find");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_get");                   // 不触发 getter(标记块原样返回)
+        vm.mov(VReg.V5, VReg.RET);                 // store candidate
+        // TYPE_GETTER 标记块?
+        vm.shrImm(VReg.V1, VReg.V5, 48);
+        vm.cmpImm(VReg.V1, 0); vm.jne("_dp_array_idx_data");
+        vm.cmpImm(VReg.V5, 0); vm.jeq("_dp_array_idx_data");
+        vm.lea(VReg.V1, "_heap_base"); vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.V5, VReg.V1); vm.jlt("_dp_array_idx_data");
+        vm.lea(VReg.V1, "_heap_ptr"); vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.V5, VReg.V1); vm.jge("_dp_array_idx_data");
+        vm.load(VReg.V1, VReg.V5, 0);
+        vm.cmpImm(VReg.V1, TYPE_GETTER); vm.jne("_dp_array_idx_data");
+        vm.movImm(VReg.V5, 0);                     // accessor → hole(读走侧表/gOPD)
+        vm.jmp("_dp_array_idx_write");
+        vm.label("_dp_array_idx_data");
+        // +0.0(位全 0)与 hole 同位 → 装箱 int0
+        vm.cmpImm(VReg.V5, 0);
+        vm.jne("_dp_array_idx_write");
+        vm.movImm64(VReg.V5, 0x7ff8000000000000n);
+        vm.label("_dp_array_idx_write");
+        vm.load(VReg.A0, VReg.SP, 0);
         vm.call("_gc_remember");
-        vm.load(VReg.V1, VReg.S0, 24);             // data_ptr(扩容后已更新@24)
+        vm.load(VReg.V2, VReg.SP, 16);             // idx
+        vm.load(VReg.V1, VReg.S0, 24);
         vm.shl(VReg.V0, VReg.V2, 3);
         vm.add(VReg.V0, VReg.V1, VReg.V0);
-        vm.load(VReg.V3, VReg.SP, 72);             // value
-        vm.store(VReg.V0, 0, VReg.V3);
+        vm.store(VReg.V0, 0, VReg.V5);
         vm.jmp("_dp_array_done");
-        // 具名属性/symbol/"length"/纯 attr:走闭包侧表(原路径)
+
+        // ---- length:拒 accessor; ToUint32 + writable 位(ARR_LEN_NONWRITABLE) ----
+        vm.label("_dp_array_length");
+        vm.load(VReg.V2, VReg.SP, 8);              // mask
+        vm.andImm(VReg.V1, VReg.V2, DP_HAS_GET | DP_HAS_SET);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_dp_array_len_data");
+        throwMsg("Cannot redefine array length as accessor");
+        vm.label("_dp_array_len_data");
+        vm.andImm(VReg.V1, VReg.V2, DP_HAS_WRITABLE);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_dp_array_len_val");
+        vm.load(VReg.V0, VReg.SP, 64);
+        vm.andImm(VReg.V0, VReg.V0, ATTR_WRITABLE);
+        vm.loadByte(VReg.V1, VReg.S0, 1);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_dp_array_len_wr_off");
+        vm.andImm(VReg.V1, VReg.V1, (~ARR_LEN_NONWRITABLE) & 0xff);
+        vm.jmp("_dp_array_len_wr_store");
+        vm.label("_dp_array_len_wr_off");
+        vm.orImm(VReg.V1, VReg.V1, ARR_LEN_NONWRITABLE);
+        vm.label("_dp_array_len_wr_store");
+        vm.storeByte(VReg.S0, 1, VReg.V1);
+        vm.label("_dp_array_len_val");
+        vm.andImm(VReg.V1, VReg.V2, DP_HAS_VALUE);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_dp_array_done");
+        vm.loadByte(VReg.V0, VReg.S0, 1);
+        vm.andImm(VReg.V0, VReg.V0, ARR_LEN_NONWRITABLE);
+        vm.store(VReg.SP, 40, VReg.V0);
+        vm.load(VReg.A0, VReg.SP, 72);
+        vm.call("_number_coerce");
+        vm.store(VReg.SP, 48, VReg.RET);
+        vm.fmovToFloat(0, VReg.RET);
+        vm.fcvtzs(VReg.S2, 0);
+        vm.load(VReg.V3, VReg.SP, 48);
+        vm.movImm64(VReg.V1, 0x7ff0000000000000n);
+        vm.mov(VReg.V0, VReg.V3);
+        vm.shlImm(VReg.V0, VReg.V0, 1);
+        vm.shrImm(VReg.V0, VReg.V0, 1);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jae("_dp_array_len_range");
+        vm.cmpImm(VReg.S2, 0);
+        vm.jge("_dp_array_len_nonneg");
+        vm.movImm64(VReg.V1, 0x100000000n);
+        vm.add(VReg.S2, VReg.S2, VReg.V1);
+        vm.label("_dp_array_len_nonneg");
+        vm.movImm64(VReg.V1, 0xFFFFFFFFn);
+        vm.cmp(VReg.S2, VReg.V1);
+        vm.jgt("_dp_array_len_range");
+        vm.scvtf(0, VReg.S2);
+        vm.fmovToInt(VReg.V3, 0);
+        vm.load(VReg.V0, VReg.SP, 48);
+        vm.cmp(VReg.V3, VReg.V0);
+        vm.jeq("_dp_array_len_num_ok");
+        vm.cmpImm(VReg.S2, 0);
+        vm.jne("_dp_array_len_range");
+        vm.shlImm(VReg.V1, VReg.V0, 1);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_dp_array_len_range");
+        vm.label("_dp_array_len_num_ok");
+        vm.load(VReg.V0, VReg.SP, 40);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_dp_array_len_do");
+        vm.load(VReg.V1, VReg.S0, 8);
+        vm.cmp(VReg.S2, VReg.V1);
+        vm.jeq("_dp_array_done");
+        throwMsg("Cannot redefine non-writable array length");
+        vm.label("_dp_array_len_do");
+        vm.load(VReg.S3, VReg.S0, 8);
+        vm.cmp(VReg.S2, VReg.S3);
+        vm.jge("_dp_array_len_set");
+        vm.mov(VReg.S4, VReg.S3);
+        vm.label("_dp_array_len_shrink");
+        vm.cmp(VReg.S4, VReg.S2);
+        vm.jle("_dp_array_len_set");
+        vm.subImm(VReg.S4, VReg.S4, 1);
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.call("_closure_props_find");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_dp_array_len_dense_del");
+        vm.mov(VReg.S5, VReg.RET);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.scvtf(0, VReg.A1);
+        vm.fmovToInt(VReg.A0, 0);
+        vm.call("_js_prop_key");
+        vm.store(VReg.SP, 24, VReg.RET);
+        vm.mov(VReg.A0, VReg.S5);
+        vm.load(VReg.A1, VReg.SP, 24);
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_dp_array_len_dense_del");
+        vm.emitMaskLoad(VReg.V0);
+        vm.andMaskReg(VReg.V5, VReg.S5, VReg.V0);
+        vm.load(VReg.V2, VReg.V5, 8);
+        vm.movImm(VReg.V3, 0);
+        vm.store(VReg.SP, 56, VReg.V5);
+        vm.label("_dp_array_len_sfind");
+        vm.cmp(VReg.V3, VReg.V2);
+        vm.jge("_dp_array_len_dense_del");
+        vm.load(VReg.V1, VReg.SP, 56);
+        vm.load(VReg.V0, VReg.V1, OBJECT_PROPS_PTR_OFFSET);
+        vm.shlImm(VReg.V4, VReg.V3, 4);
+        vm.add(VReg.V0, VReg.V0, VReg.V4);
+        vm.load(VReg.A0, VReg.V0, 0);
+        vm.load(VReg.A1, VReg.SP, 24);
+        vm.store(VReg.SP, 32, VReg.V3);
+        vm.call("_object_key_eq");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_dp_array_len_shit");
+        vm.load(VReg.V3, VReg.SP, 32);
+        vm.addImm(VReg.V3, VReg.V3, 1);
+        vm.load(VReg.V2, VReg.SP, 56);
+        vm.load(VReg.V2, VReg.V2, 8);
+        vm.jmp("_dp_array_len_sfind");
+        vm.label("_dp_array_len_shit");
+        vm.load(VReg.A0, VReg.SP, 56);
+        vm.load(VReg.A1, VReg.SP, 32);
+        vm.call("_object_get_attr");
+        vm.andImm(VReg.V0, VReg.RET, ATTR_CONFIGURABLE);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_dp_array_len_stuck");
+        vm.mov(VReg.A0, VReg.S5);
+        vm.load(VReg.A1, VReg.SP, 24);
+        vm.call("_object_delete");
+        vm.label("_dp_array_len_dense_del");
+        vm.load(VReg.V0, VReg.S0, 16);
+        vm.cmp(VReg.S4, VReg.V0);
+        vm.jge("_dp_array_len_shrink");
+        vm.load(VReg.V1, VReg.S0, 24);
+        vm.shl(VReg.V0, VReg.S4, 3);
+        vm.add(VReg.V0, VReg.V1, VReg.V0);
+        vm.movImm(VReg.V1, 0);
+        vm.store(VReg.V0, 0, VReg.V1);
+        vm.jmp("_dp_array_len_shrink");
+        vm.label("_dp_array_len_stuck");
+        vm.addImm(VReg.V0, VReg.S4, 1);
+        vm.store(VReg.S0, 8, VReg.V0);
+        throwMsg("Cannot delete non-configurable array index when shortening length");
+        vm.label("_dp_array_len_set");
+        vm.store(VReg.S0, 8, VReg.S2);
+        vm.jmp("_dp_array_done");
+        vm.label("_dp_array_len_range");
+        vm.lea(VReg.A0, vm.asm.addString("Invalid array length"));
+        boxStr(VReg.A0);
+        vm.call("_throw_range_error");
+
+        // 大索引稀疏:侧表 + length=idx+1
+        vm.label("_dp_array_sparse");
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.call("_closure_props_ensure");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.load(VReg.A2, VReg.SP, 72);
+        vm.load(VReg.A3, VReg.SP, 80);
+        vm.load(VReg.A4, VReg.SP, 88);
+        vm.load(VReg.V2, VReg.SP, 8);
+        vm.shlImm(VReg.V2, VReg.V2, 8);
+        vm.load(VReg.V3, VReg.SP, 64);
+        vm.or(VReg.A5, VReg.V2, VReg.V3);
+        vm.call("_object_define_property");
+        vm.load(VReg.V2, VReg.SP, 16);
+        vm.load(VReg.V0, VReg.S0, 8);
+        vm.addImm(VReg.V1, VReg.V2, 1);
+        vm.cmp(VReg.V1, VReg.V0);
+        vm.jle("_dp_array_done");
+        vm.store(VReg.S0, 8, VReg.V1);
+        vm.jmp("_dp_array_done");
+
+        // 具名属性/symbol:走闭包侧表(原路径)
         vm.label("_dp_array_side");
-        vm.mov(VReg.A0, VReg.SP, 0);
+        vm.load(VReg.A0, VReg.SP, 0);
         vm.call("_closure_props_ensure");          // RET = props(boxed 0x7FFD)
-        // 递归:props 是 TYPE_OBJECT,走 _dp_obj_ok 全强制
         vm.mov(VReg.A0, VReg.RET);
         vm.mov(VReg.A1, VReg.S1);
         vm.load(VReg.A2, VReg.SP, 72);               // value
@@ -7481,6 +7979,293 @@ export class ObjectGenerator {
         vm.or(VReg.A5, VReg.V0, VReg.V1);          // packed
         vm.call("_object_define_property");        // RET = obj(或抛)
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
+    }
+
+    // [W7b] 数组索引侧表元素读写(供 _subscript_get/_set):
+    //   _array_side_elem_has(A0=arr, A1=idx) -> 0/1
+    //   _array_side_elem_get(A0=arr, A1=idx) -> 值(先 has;this=arr 触发 getter)
+    //   _array_side_elem_set(A0=arr, A1=idx, A2=value) -> 0=继续稠密写 / 1=已处理
+    generateArraySideElementHelpers() {
+        const vm = this.vm;
+        const idxToKey = () => {
+            vm.scvtf(0, VReg.A1);
+            vm.fmovToInt(VReg.A0, 0);
+            vm.call("_js_prop_key");
+        };
+        let _asesBoxUid = 0;
+        const boxArrThis = () => {
+            // S0=arr → A5=boxed 0x7FFE (若已装箱则原样)
+            const u = _asesBoxUid++;
+            const keep = `_ases_box_keep_${u}`;
+            const done = `_ases_box_done_${u}`;
+            vm.shrImm(VReg.V2, VReg.S0, 48);
+            vm.cmpImm(VReg.V2, 0x7FFE);
+            vm.jeq(keep);
+            vm.movImm64(VReg.V1, 0x7ffe000000000000n);
+            vm.or(VReg.A5, VReg.S0, VReg.V1);
+            vm.jmp(done);
+            vm.label(keep);
+            vm.mov(VReg.A5, VReg.S0);
+            vm.label(done);
+        };
+
+        vm.label("_array_side_elem_has");
+        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.V0, VReg.S0, VReg.V1);
+        vm.loadByte(VReg.V1, VReg.V0, 1);
+        vm.andImm(VReg.V1, VReg.V1, ARR_HAS_SIDETABLE);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_aseh_no");
+        vm.call("_closure_props_find");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_aseh_no");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        idxToKey();
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_object_has");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 16);
+        vm.label("_aseh_no");
+        vm.movImm(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 16);
+
+        vm.label("_array_side_elem_get");
+        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.V0, VReg.S0, VReg.V1);
+        vm.loadByte(VReg.V1, VReg.V0, 1);
+        vm.andImm(VReg.V1, VReg.V1, ARR_HAS_SIDETABLE);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_aseg_undef");
+        vm.call("_closure_props_find");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_aseg_undef");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        idxToKey();
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.call("_maybe_getter");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 16);
+        vm.label("_aseg_undef");
+        vm.movImm64(VReg.RET, 0x7ffb000000000000n);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 16);
+
+        vm.label("_array_side_elem_set");
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.S2, VReg.A2);
+        vm.movImm(VReg.V0, 0x10000000);
+        vm.cmp(VReg.S1, VReg.V0);
+        vm.jge("_ases_sparse");
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.V0, VReg.S0, VReg.V1);
+        vm.loadByte(VReg.V1, VReg.V0, 1);
+        vm.andImm(VReg.V1, VReg.V1, ARR_HAS_SIDETABLE);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_ases_cont");
+        vm.call("_closure_props_find");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_ases_cont");
+        vm.mov(VReg.S3, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        idxToKey();
+        vm.mov(VReg.S4, VReg.RET);
+        vm.mov(VReg.A0, VReg.S3);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_ases_cont");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_object_get");
+        vm.mov(VReg.S5, VReg.RET);
+        // accessor?
+        vm.shrImm(VReg.V1, VReg.S5, 48);
+        vm.cmpImm(VReg.V1, 0); vm.jne("_ases_data");
+        vm.cmpImm(VReg.S5, 0); vm.jeq("_ases_data");
+        vm.lea(VReg.V1, "_heap_base"); vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.S5, VReg.V1); vm.jlt("_ases_data");
+        vm.lea(VReg.V1, "_heap_ptr"); vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.S5, VReg.V1); vm.jge("_ases_data");
+        vm.load(VReg.V1, VReg.S5, 0);
+        vm.cmpImm(VReg.V1, TYPE_GETTER); vm.jne("_ases_data");
+        vm.load(VReg.V0, VReg.S5, 16);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_ases_done");
+        boxArrThis();
+        vm.mov(VReg.A0, VReg.S2);
+        vm.lea(VReg.V1, "_heap_base"); vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.V0, VReg.V1); vm.jlt("_ases_acc_call");
+        vm.lea(VReg.V1, "_heap_ptr"); vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.V0, VReg.V1); vm.jge("_ases_acc_call");
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.cmpImm(VReg.V1, 0xc105); vm.jeq("_ases_acc_cl");
+        vm.cmpImm(VReg.V1, 0xa51c); vm.jne("_ases_acc_call");
+        vm.label("_ases_acc_cl");
+        vm.mov(VReg.S3, VReg.V0); // 保活闭包(S0=arr 不可毁)
+        vm.load(VReg.V0, VReg.S3, 8);
+        vm.mov(VReg.S0, VReg.S3); // callIndirect 约定:S0=闭包
+        vm.label("_ases_acc_call");
+        vm.setCallArgcImm(1, VReg.V1, VReg.V2);
+        vm.callIndirect(VReg.V0);
+        vm.jmp("_ases_done");
+        vm.label("_ases_data");
+        // writable?
+        vm.emitMaskLoad(VReg.V0);
+        vm.andMaskReg(VReg.V5, VReg.S3, VReg.V0);
+        vm.load(VReg.V2, VReg.V5, 8);
+        vm.movImm(VReg.V3, 0);
+        vm.store(VReg.SP, 0, VReg.V5);
+        vm.label("_ases_find");
+        vm.cmp(VReg.V3, VReg.V2);
+        vm.jge("_ases_cont");
+        vm.load(VReg.V1, VReg.SP, 0);
+        vm.load(VReg.V0, VReg.V1, OBJECT_PROPS_PTR_OFFSET);
+        vm.shlImm(VReg.V4, VReg.V3, 4);
+        vm.add(VReg.V0, VReg.V0, VReg.V4);
+        vm.load(VReg.A0, VReg.V0, 0);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.store(VReg.SP, 8, VReg.V3);
+        vm.call("_object_key_eq");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_ases_found");
+        vm.load(VReg.V3, VReg.SP, 8);
+        vm.addImm(VReg.V3, VReg.V3, 1);
+        vm.load(VReg.V2, VReg.SP, 0);
+        vm.load(VReg.V2, VReg.V2, 8);
+        vm.jmp("_ases_find");
+        vm.label("_ases_found");
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.load(VReg.A1, VReg.SP, 8);
+        vm.call("_object_get_attr");
+        vm.andImm(VReg.V0, VReg.RET, ATTR_WRITABLE);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_ases_done");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_object_define");
+        vm.label("_ases_cont");
+        vm.movImm(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
+        vm.label("_ases_done");
+        vm.movImm(VReg.RET, 1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
+
+        // 稀疏大索引:侧表写入 + length 抬升
+        vm.label("_ases_sparse");
+        vm.call("_closure_props_ensure");
+        vm.mov(VReg.S3, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        idxToKey();
+        vm.mov(VReg.S4, VReg.RET);
+        vm.mov(VReg.A0, VReg.S3);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_ases_sp_put");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_object_get");
+        vm.mov(VReg.S5, VReg.RET);
+        vm.shrImm(VReg.V1, VReg.S5, 48);
+        vm.cmpImm(VReg.V1, 0); vm.jne("_ases_sp_data");
+        vm.cmpImm(VReg.S5, 0); vm.jeq("_ases_sp_data");
+        vm.lea(VReg.V1, "_heap_base"); vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.S5, VReg.V1); vm.jlt("_ases_sp_data");
+        vm.lea(VReg.V1, "_heap_ptr"); vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.S5, VReg.V1); vm.jge("_ases_sp_data");
+        vm.load(VReg.V1, VReg.S5, 0);
+        vm.cmpImm(VReg.V1, TYPE_GETTER); vm.jne("_ases_sp_data");
+        vm.load(VReg.V0, VReg.S5, 16);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_ases_sp_len");
+        boxArrThis();
+        vm.mov(VReg.A0, VReg.S2);
+        vm.lea(VReg.V1, "_heap_base"); vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.V0, VReg.V1); vm.jlt("_ases_sp_acc");
+        vm.lea(VReg.V1, "_heap_ptr"); vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.V0, VReg.V1); vm.jge("_ases_sp_acc");
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.cmpImm(VReg.V1, 0xc105); vm.jeq("_ases_sp_cl");
+        vm.cmpImm(VReg.V1, 0xa51c); vm.jne("_ases_sp_acc");
+        vm.label("_ases_sp_cl");
+        vm.mov(VReg.S3, VReg.V0);
+        vm.load(VReg.V0, VReg.S3, 8);
+        vm.mov(VReg.S0, VReg.S3);
+        vm.label("_ases_sp_acc");
+        vm.setCallArgcImm(1, VReg.V1, VReg.V2);
+        vm.callIndirect(VReg.V0);
+        vm.jmp("_ases_sp_len");
+        vm.label("_ases_sp_data");
+        vm.emitMaskLoad(VReg.V0);
+        vm.andMaskReg(VReg.V5, VReg.S3, VReg.V0);
+        vm.load(VReg.V2, VReg.V5, 8);
+        vm.movImm(VReg.V3, 0);
+        vm.store(VReg.SP, 0, VReg.V5);
+        vm.label("_ases_spf");
+        vm.cmp(VReg.V3, VReg.V2);
+        vm.jge("_ases_sp_put");
+        vm.load(VReg.V1, VReg.SP, 0);
+        vm.load(VReg.V0, VReg.V1, OBJECT_PROPS_PTR_OFFSET);
+        vm.shlImm(VReg.V4, VReg.V3, 4);
+        vm.add(VReg.V0, VReg.V0, VReg.V4);
+        vm.load(VReg.A0, VReg.V0, 0);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.store(VReg.SP, 8, VReg.V3);
+        vm.call("_object_key_eq");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_ases_spf_hit");
+        vm.load(VReg.V3, VReg.SP, 8);
+        vm.addImm(VReg.V3, VReg.V3, 1);
+        vm.load(VReg.V2, VReg.SP, 0);
+        vm.load(VReg.V2, VReg.V2, 8);
+        vm.jmp("_ases_spf");
+        vm.label("_ases_spf_hit");
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.load(VReg.A1, VReg.SP, 8);
+        vm.call("_object_get_attr");
+        vm.andImm(VReg.V0, VReg.RET, ATTR_WRITABLE);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_ases_done");
+        vm.label("_ases_sp_put");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_object_define");
+        vm.label("_ases_sp_len");
+        vm.shrImm(VReg.V1, VReg.S0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFE);
+        vm.jne("_ases_sp_raw");
+        vm.emitMaskLoad(VReg.V0);
+        vm.andMaskReg(VReg.V2, VReg.S0, VReg.V0);
+        vm.jmp("_ases_sp_len2");
+        vm.label("_ases_sp_raw");
+        vm.mov(VReg.V2, VReg.S0);
+        vm.label("_ases_sp_len2");
+        vm.load(VReg.V0, VReg.V2, 8);
+        vm.addImm(VReg.V1, VReg.S1, 1);
+        vm.cmp(VReg.V1, VReg.V0);
+        vm.jle("_ases_done");
+        vm.store(VReg.V2, 8, VReg.V1);
+        vm.jmp("_ases_done");
     }
 
     // _canonical_array_index(key_boxed) -> RET = 规范数组索引值(0..2^32-2)或 -1(非索引)。
@@ -8065,24 +8850,41 @@ export class ObjectGenerator {
         vm.movImm64(VReg.V1, 0xFFFFFFFFFFFFFFFFn);
         vm.cmp(VReg.S3, VReg.V1);
         vm.jeq("_ogopd_arr_side"); // 非索引字符串键("foo"/"01"/"1.0"/"-0"…)→ 侧表
+        // [W7] 侧表优先:defineProperty 写下的 attrs/accessor 以侧表为准
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_closure_props_find");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_ogopd_arr_idx_slot");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_getOwnPropertyDescriptor");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jne("_ogopd_arr_side_hit"); // 侧表命中 → 返回该描述符
+        vm.label("_ogopd_arr_idx_slot");
         vm.load(VReg.V0, VReg.S2, 8); // length
         vm.cmp(VReg.S3, VReg.V0);
-        vm.jge("_ogopd_undef"); // 越界 → undefined(node 语义,同 _array_get :198-200)
-        // 元素读(内联 _array_get :202-206 读式): data_ptr + idx*8
+        vm.jge("_ogopd_undef"); // 越界 → undefined
         vm.load(VReg.V1, VReg.S2, 24); // data_ptr
         vm.shl(VReg.V0, VReg.S3, 3);
         vm.add(VReg.V0, VReg.V1, VReg.V0);
         vm.load(VReg.S5, VReg.V0, 0); // 元素值
-        vm.call("_object_new"); // RET = 裸描述符对象(保 S0/S1;S2-S5 其体内不写)
+        vm.cmpImm(VReg.S5, 0);
+        vm.jeq("_ogopd_undef"); // hole → 不存在
+        vm.call("_object_new");
         vm.movImm64(VReg.V1, 0x7ffd000000000000n);
         vm.or(VReg.V0, VReg.RET, VReg.V1);
         vm.store(VReg.SP, 0, VReg.V0); // desc boxed
         vm.movImm(VReg.V2, ATTR_DEFAULT); // 7 = writable+enumerable+configurable
         vm.store(VReg.SP, 32, VReg.V2); // attr
         vm.jmp("_ogopd_data");
+        vm.label("_ogopd_arr_side_hit");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
 
-        // "length":value = 长度装箱成 canonical number(float64 位模式,同 _object_get_str_named
-        // :808-811 与 _subscript_get_named_len :426-429);attr = ATTR_WRITABLE(仅 writable 真)。
+        // "length":value = 长度装箱;attr 缺省仅 writable;ARR_LEN_NONWRITABLE → writable:false。
         vm.label("_ogopd_arr_len");
         vm.load(VReg.V0, VReg.S2, 8); // length
         vm.scvtf(0, VReg.V0);
@@ -8092,7 +8894,15 @@ export class ObjectGenerator {
         vm.movImm64(VReg.V1, 0x7ffd000000000000n);
         vm.or(VReg.V0, VReg.RET, VReg.V1);
         vm.store(VReg.SP, 0, VReg.V0); // desc boxed
+        vm.loadByte(VReg.V0, VReg.S2, 1);
+        vm.andImm(VReg.V0, VReg.V0, ARR_LEN_NONWRITABLE);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_ogopd_arr_len_ro");
         vm.movImm(VReg.V2, ATTR_WRITABLE); // 1 = 仅 writable
+        vm.jmp("_ogopd_arr_len_attr");
+        vm.label("_ogopd_arr_len_ro");
+        vm.movImm(VReg.V2, 0); // writable:false, enumerable:false, configurable:false
+        vm.label("_ogopd_arr_len_attr");
         vm.store(VReg.SP, 32, VReg.V2); // attr
         vm.jmp("_ogopd_data");
 

@@ -34,12 +34,8 @@ export const DataStructureCompiler = {
         // 填充元素：_array_set(arr, index, value)
         for (let i = 0; i < count; i++) {
             if (!elements[i]) {
-                // 空位洞 [1,,3]:显式填 undefined(否则读回 _array_new_with_size 初值,
-                // 非 undefined;dense-with-undefined,`in`/forEach-skip 语义为记录偏差)。
-                this.vm.load(VReg.A0, VReg.FP, arrOffset);
-                this.vm.movImm(VReg.A1, i);
-                this.vm.movImm64(VReg.A2, 0x7ffb000000000000n); // JS_UNDEFINED
-                this.vm.call("_array_set");
+                // 空位洞 [1,,3]:保留 _array_new_with_size 初值 0(真 hole)。
+                // 勿填 undefined——那是 dense-with-undefined,`1 in a` 会误 true。
                 continue;
             }
             this.compileExpression(elements[i]);

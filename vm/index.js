@@ -1078,6 +1078,11 @@ export class VirtualMachine {
         this.backend.fmovToFloat(fpReg, gpReg);
     }
 
+    // arm64 后端别名:fmovFromInt ≡ fmovToFloat(object 运行时等调用点)
+    fmovFromInt(fpReg, gpReg) {
+        this.fmovToFloat(fpReg, gpReg);
+    }
+
     // 将浮点寄存器的位模式移动到整数寄存器
     fmovToInt(gpReg, fpReg) {
         if (this._recN >= 0) { const k = this._recN; if (k < REC_CAP) { this._recOp[k] = RC_FMOVTOINT; this._recA[k] = gpReg; this._recB[k] = fpReg; this._recC[k] = 0; this._recN = k + 1; return; } this._flushRecordVerbatim(); }

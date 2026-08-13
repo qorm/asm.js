@@ -97,6 +97,9 @@ export class SubscriptGenerator {
         // Proxy(TYPE_PROXY=8):proxy[computedKey] 按对象键读,委托 _object_get 冷分支调陷阱。
         vm.cmpImm(VReg.V0, 8);
         vm.jeq("_subscript_get_object");
+        // [W7b] Date(7):具名/计算键读走 _object_get(侧表+原型)。此前落入数组路径。
+        vm.cmpImm(VReg.V0, 7); // TYPE_DATE
+        vm.jeq("_subscript_get_object");
 
         // 字符串：str[i] 返回单字符（TYPE_STRING=6）
         vm.cmpImm(VReg.V0, 6);
@@ -359,6 +362,18 @@ export class SubscriptGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
 
         vm.label("_subscript_get_array");
+        // [W7b] 侧表优先:defineProperty 的 accessor/attrs/稀疏大索引。
+        // 无 ARR_HAS_SIDETABLE 时 helper 立即 miss(否则每次数组读都扫全局链表,自举卡死)。
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_array_side_elem_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_subscript_get_arr_dense");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_array_side_elem_get");
+        vm.jmp("_subscript_get_done");
+        vm.label("_subscript_get_arr_dense");
         // [bug A] 边界检查:index<0 或 >=length → tagged undefined(node 语义;
         // 此前直接越界读堆邻居,`while((v=a[i++])!==undefined)` 垃圾值/死循环)
         vm.load(VReg.V2, VReg.S0, 8); // length
@@ -366,11 +381,22 @@ export class SubscriptGenerator {
         vm.jlt("_subscript_get_arr_oob");
         vm.cmp(VReg.S1, VReg.V2);
         vm.jge("_subscript_get_arr_oob");
+        // 超出 capacity 的「逻辑」元素(稀疏大 length)→ 侧表已查过,此处 undefined
+        vm.load(VReg.V0, VReg.S0, 16); // capacity
+        vm.cmp(VReg.S1, VReg.V0);
+        vm.jge("_subscript_get_arr_oob");
         // 元素地址: data_ptr(@24) + index * 8
         vm.load(VReg.V0, VReg.S0, 24); // data_ptr
         vm.shl(VReg.V1, VReg.S1, 3);
         vm.add(VReg.V1, VReg.V0, VReg.V1);
         vm.load(VReg.RET, VReg.V1, 0);
+        // 真 hole:槽==0 → undefined;装箱 int0 → float +0
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_subscript_get_arr_oob");
+        vm.movImm64(VReg.V1, 0x7ff8000000000000n);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jne("_subscript_get_done");
+        vm.movImm(VReg.RET, 0);
 
         vm.label("_subscript_get_done");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
@@ -563,6 +589,14 @@ export class SubscriptGenerator {
         // 仍拦截真正损坏的巨大下标(2^28–2^48)避免 OOM。movImm 仍是单条 MOVZ，不增码。
         vm.cmpImm(VReg.S1, 0);
         vm.jlt("_subscript_set_done");
+        // [W7b] 侧表 writable/accessor/稀疏大索引(≥2^28 在 helper 内处理)。
+        // 无 ARR_HAS_SIDETABLE 时 O(1) 返回 0,不扫 _closure_props_registry。
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_array_side_elem_set"); // 0=继续稠密 / 1=已处理
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_subscript_set_done");
         vm.movImm(VReg.V0, 0x10000000); // 256M 上限(2^28)
         vm.cmp(VReg.S1, VReg.V0);
         vm.jge("_subscript_set_done");
@@ -570,22 +604,21 @@ export class SubscriptGenerator {
         vm.mov(VReg.A0, VReg.S0);
         vm.addImm(VReg.A1, VReg.S1, 1);
         vm.call("_array_ensure_cap");
-        // index >= length：逻辑空档 [old_len, index) 须填 **JS_UNDEFINED**(非 0)。
-        // _array_ensure_cap 只把容量区补 0；若不覆盖逻辑空档,`a[6]=v`(a 原长 3)后
-        // a[4]/a[5] 读作 0(typeof "number"、===undefined 假、join 显 "0" 而非空)。
-        // 与 _js_set_length 的 undefined 填空一致。index < length(覆盖已有槽)无空档。
+        // index >= length：逻辑空档 [old_len, index) 填 hole(0)。
+        // _array_ensure_cap 只把*新*容量区补 0；截断后再扩展时旧槽可能残留 → 须清为 0。
+        // ES:`a[6]=v`(原长 3)后 3..5 为 hole(`in` 假),非 dense undefined。
         vm.load(VReg.V3, VReg.S0, 8); // old length
         vm.cmp(VReg.S1, VReg.V3);
         vm.jlt("_sss_no_gap");
         vm.load(VReg.V1, VReg.S0, 24); // data_ptr
-        vm.movImm64(VReg.V4, 0x7ffb000000000000n); // JS_UNDEFINED
+        vm.movImm(VReg.V4, 0); // hole
         vm.mov(VReg.V2, VReg.V3); // cursor = old_len
         vm.label("_sss_gap_loop");
         vm.cmp(VReg.V2, VReg.S1);
         vm.jge("_sss_gap_done");
         vm.shl(VReg.V0, VReg.V2, 3);
         vm.add(VReg.V0, VReg.V1, VReg.V0);
-        vm.store(VReg.V0, 0, VReg.V4); // arr[cursor] = undefined
+        vm.store(VReg.V0, 0, VReg.V4); // arr[cursor] = hole
         vm.addImm(VReg.V2, VReg.V2, 1);
         vm.jmp("_sss_gap_loop");
         vm.label("_sss_gap_done");
@@ -593,6 +626,11 @@ export class SubscriptGenerator {
         vm.addImm(VReg.V0, VReg.S1, 1);
         vm.store(VReg.S0, 8, VReg.V0);
         vm.label("_sss_no_gap");
+        // +0.0 → 装箱 int0(与 hole 哨兵区分);-0 保留
+        vm.cmpImm(VReg.S2, 0);
+        vm.jne("_sss_store");
+        vm.movImm64(VReg.S2, 0x7ff8000000000000n);
+        vm.label("_sss_store");
         // 存 value 到 index（元素地址 = data_ptr(@24) + index * 8）
         vm.load(VReg.V1, VReg.S0, 24); // data_ptr（增长后可能已更新）
         vm.shl(VReg.V0, VReg.S1, 3); // index * 8
@@ -637,6 +675,11 @@ export class SubscriptGenerator {
         vm.mov(VReg.RET, VReg.S2); // 赋值表达式之值
         vm.jmp("_subscript_set_done");
         vm.label("_subscript_set_named_len");
+        // [W7b] length writable:false → 静默拒(sloppy) / 与 defineProperty 同位
+        vm.loadByte(VReg.V0, VReg.S0, 1);
+        vm.andImm(VReg.V0, VReg.V0, 1); // ARR_LEN_NONWRITABLE
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_subscript_set_done");
         vm.mov(VReg.A0, VReg.S2);
         vm.call("_syscall_arg"); // 值 -> 裸整数长度
         vm.mov(VReg.A1, VReg.RET);
@@ -769,13 +812,12 @@ export class SubscriptGenerator {
     // _js_set_length(value, n_int) -> undefined
     // [#63] arr.length = N 的赋值路径。运行时按值形态分派：
     //   - 数组(装箱 0x7FFE / 裸 TYPE_ARRAY=1)：N<=len 截断(只改长度域,余量保留),
-    //     N>len 经 _array_ensure_cap 扩容后把 [len,N) 填 JS_UNDEFINED,再置长度=N。
+    //     N>len 经 _array_ensure_cap 扩容后把 [len,N) 填 hole(0),再置长度=N。
     //     过大展开(>16M差异)跳过确保容量与填充，仅设长度(稀数组语义)。
     //   - 其余(对象等)：回退设 "length" 属性(值转 JS number)。
     // 原先 arr.length=N 一律走 _object_set_ic 把数组当哈希对象写坏 → 段错误(#63 变体)。
     generateJsSetLength() {
         const vm = this.vm;
-        const JS_UNDEFINED = 0x7ffb000000000000n;
 
         vm.label("_js_set_length");
         vm.prologue(16, [VReg.S0, VReg.S1]);
@@ -810,12 +852,18 @@ export class SubscriptGenerator {
         vm.cmpImm(VReg.V0, 1);             // TYPE_ARRAY
         vm.jne("_js_set_length_fallback");
         vm.mov(VReg.S0, VReg.A0);
-        vm.jmp("_js_set_length_trusted");
+        vm.jmp("_js_set_length_writable_chk");
 
         vm.label("_js_set_length_arr_boxed");
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.S0, VReg.A0, VReg.V1);
 
+        vm.label("_js_set_length_writable_chk");
+        // [W7b] ARR_LEN_NONWRITABLE → 静默忽略(sloppy [[Set]])
+        vm.loadByte(VReg.V0, VReg.S0, 1);
+        vm.andImm(VReg.V0, VReg.V0, 1);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_js_set_length_done");
         vm.label("_js_set_length_do_array");
         // 类型字节守卫：0x7FFE 装箱值可能是损坏指针或子类数组(length override)，
         // 若 type≠TYPE_ARRAY(1) 则回退到 _object_set 按对象属性写，避免误读数组头野地址。
@@ -827,7 +875,7 @@ export class SubscriptGenerator {
         vm.load(VReg.V0, VReg.S0, 8);      // 当前 length
         vm.cmp(VReg.S1, VReg.V0);
         vm.jle("_js_set_length_set");      // n <= len：仅截断
-        // n > len：扩容到 n，并把 [len, n) 填 undefined
+        // n > len：扩容到 n，并把 [len, n) 填 hole(0)
         // [huge expand] 差异 > 16M(0x1000000) → 跳过确保容量与填充，仅设长度(稀数组语义)，
         // 避免超大长度赋值(如 [].length=4294967295)因分配循环超时/段错误。
         vm.sub(VReg.V2, VReg.S1, VReg.V0); // V2 = n - len
@@ -839,7 +887,7 @@ export class SubscriptGenerator {
         vm.call("_array_ensure_cap");
         vm.load(VReg.V0, VReg.S0, 8);      // len(未变)
         vm.load(VReg.V1, VReg.S0, 24);     // data_ptr(扩容后可能变化)
-        vm.movImm64(VReg.V4, JS_UNDEFINED);
+        vm.movImm(VReg.V4, 0);             // hole
         vm.label("_js_set_length_fill");
         vm.cmp(VReg.V0, VReg.S1);
         vm.jge("_js_set_length_set");

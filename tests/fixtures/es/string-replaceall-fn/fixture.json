@@ -1,0 +1,11 @@
+{
+  "entry": "main.js",
+  "description": "String.prototype.replaceAll with function replacer (non-empty search)",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "4LeoLeo36\nundundefinedfinundefinedd\n",
+    "exitCode": 0
+  }
+}

@@ -400,9 +400,9 @@ export const BuiltinArrayMethodCompiler = {
                 }
                 break;
             case "flatMap":
-                // arr.flatMap(callback) -> map 后展平一层
+                // arr.flatMap(callback[, thisArg]) -> map 后展平一层
                 if (args.length > 0) {
-                    this.compileArrayFlatMap(arrayExpr, args[0]);
+                    this.compileArrayFlatMap(arrayExpr, args[0], args[1]);
                 } else {
                     this.vm.call("_throw_not_a_function");
                 }
@@ -1133,7 +1133,7 @@ export const BuiltinArrayMethodCompiler = {
         const cbOffset = this.ctx.allocLocal(`__some_cb_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, cbOffset, VReg.RET);
         this.emitCallbackGuard(cbOffset);
-        this.emitThisArgSlot(thisArgExpr, "some");
+        const someThisArgSlot = this.emitThisArgSlot(thisArgExpr, "some");
 
         // tag guard: 非真数组(0x7FFE)时走 _agen_some 安全包装
         const someFallbackLbl = this.ctx.newLabel("some_fallback");
@@ -1143,74 +1143,12 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.cmpImm(VReg.V0, 0x7FFE);
         this.vm.jne(someFallbackLbl);
 
-        this.vm.load(VReg.A0, VReg.FP, arrOffset);
-        this.vm.call("_js_unbox");
-        this.vm.load(VReg.V1, VReg.RET, 8); // 数组 length 在 offset 8
-        const lenOffset = this.ctx.allocLocal(`__some_len_${this.nextLabelId()}`);
-        this.vm.store(VReg.FP, lenOffset, VReg.V1);
-
-        const idxOffset = this.ctx.allocLocal(`__some_idx_${this.nextLabelId()}`);
-        this.vm.movImm(VReg.V0, 0);
-        this.vm.store(VReg.FP, idxOffset, VReg.V0);
-        const elemOffset = this.ctx.allocLocal(`__some_elem_${this.nextLabelId()}`);
-
-        const loopLabel = this.ctx.newLabel("some_loop");
-        const endLabel = this.ctx.newLabel("some_end");
-        const trueLabel = this.ctx.newLabel("some_true");
-        const returnLabel = this.ctx.newLabel("some_return");
-
-        this.vm.label(loopLabel);
-        this.vm.load(VReg.V0, VReg.FP, idxOffset);
-        this.vm.load(VReg.V1, VReg.FP, lenOffset);
-        this.vm.cmp(VReg.V0, VReg.V1);
-        this.vm.jge(endLabel);
-        // [timeout guard] max safe iterations
-        this.vm.movImm(VReg.V2, 0x1000000);
-        this.vm.cmp(VReg.V0, VReg.V2);
-        this.vm.jge(endLabel);
-
-        this.vm.load(VReg.A0, VReg.FP, arrOffset);
-        this.vm.load(VReg.A1, VReg.FP, idxOffset);
-        this.vm.call("_subscript_get");
-        this.vm.store(VReg.FP, elemOffset, VReg.RET);
-
-        this.vm.load(VReg.V6, VReg.FP, cbOffset);
-        this.vm.push(VReg.V6);
-        this.vm.load(VReg.A0, VReg.FP, elemOffset);
-        this.vm.load(VReg.A1, VReg.FP, idxOffset);
-        this.vm.scvtf(0, VReg.A1); this.vm.fmovToInt(VReg.A1, 0); // index → 装箱 JS number
-        this.vm.load(VReg.A2, VReg.FP, arrOffset);
-        this.vm.pop(VReg.S0);
-        this.emitClosureCallAfterSetup();
-
-        this.vm.mov(VReg.A0, VReg.RET);   // 回调结果 RET->A0（_to_boolean 读 A0）
-        this.vm.call("_to_boolean");
-        this.vm.cmpImm(VReg.RET, 0);
-        this.vm.jne(trueLabel);
-
-        this.vm.load(VReg.V0, VReg.FP, idxOffset);
-        this.vm.addImm(VReg.V0, VReg.V0, 1);
-        this.vm.store(VReg.FP, idxOffset, VReg.V0);
-        this.vm.jmp(loopLabel);
-
-        this.vm.label(trueLabel);
-        this.vm.lea(VReg.V0, "_js_true");
-        this.vm.load(VReg.RET, VReg.V0, 0);
-        this.vm.jmp(returnLabel);
-
-        this.vm.label(endLabel);
-        this.vm.lea(VReg.V0, "_js_false");
-        this.vm.load(VReg.RET, VReg.V0, 0);
-
-        this.vm.label(returnLabel);
+        this.emitArrayRtCbCall("_array_some_rt_t", arrOffset, cbOffset, someThisArgSlot);
         this.vm.jmp(someDoneLbl);
 
-        // fallback: 非真数组 → _agen_some(recv, cb)
+        // fallback: 非真数组 → _agen_some(recv, cb, thisArg)
         this.vm.label(someFallbackLbl);
-        this._pendingThisArgSlot = null;
-        this.vm.load(VReg.A0, VReg.FP, arrOffset);
-        this.vm.load(VReg.A1, VReg.FP, cbOffset);
-        this.vm.call("_agen_some");
+        this.emitAgenCbCall("_agen_some", arrOffset, cbOffset, someThisArgSlot);
 
         this.vm.label(someDoneLbl);
     },
@@ -1500,7 +1438,7 @@ export const BuiltinArrayMethodCompiler = {
         const cbOffset = this.ctx.allocLocal(`__every_cb_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, cbOffset, VReg.RET);
         this.emitCallbackGuard(cbOffset);
-        this.emitThisArgSlot(thisArgExpr, "every");
+        const everyThisArgSlot = this.emitThisArgSlot(thisArgExpr, "every");
 
         // tag guard: 非真数组(0x7FFE)时走 _agen_every 安全包装
         const everyFallbackLbl = this.ctx.newLabel("every_fallback");
@@ -1510,74 +1448,12 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.cmpImm(VReg.V0, 0x7FFE);
         this.vm.jne(everyFallbackLbl);
 
-        this.vm.load(VReg.A0, VReg.FP, arrOffset);
-        this.vm.call("_js_unbox");
-        this.vm.load(VReg.V1, VReg.RET, 8);
-        const lenOffset = this.ctx.allocLocal(`__every_len_${this.nextLabelId()}`);
-        this.vm.store(VReg.FP, lenOffset, VReg.V1);
-
-        const idxOffset = this.ctx.allocLocal(`__every_idx_${this.nextLabelId()}`);
-        this.vm.movImm(VReg.V0, 0);
-        this.vm.store(VReg.FP, idxOffset, VReg.V0);
-        const elemOffset = this.ctx.allocLocal(`__every_elem_${this.nextLabelId()}`);
-
-        const loopLabel = this.ctx.newLabel("every_loop");
-        const endLabel = this.ctx.newLabel("every_end");
-        const falseLabel = this.ctx.newLabel("every_false");
-        const returnLabel = this.ctx.newLabel("every_return");
-
-        this.vm.label(loopLabel);
-        this.vm.load(VReg.V0, VReg.FP, idxOffset);
-        this.vm.load(VReg.V1, VReg.FP, lenOffset);
-        this.vm.cmp(VReg.V0, VReg.V1);
-        this.vm.jge(endLabel);
-        // [timeout guard] max safe iterations
-        this.vm.movImm(VReg.V2, 0x1000000);
-        this.vm.cmp(VReg.V0, VReg.V2);
-        this.vm.jge(endLabel);
-
-        this.vm.load(VReg.A0, VReg.FP, arrOffset);
-        this.vm.load(VReg.A1, VReg.FP, idxOffset);
-        this.vm.call("_subscript_get");
-        this.vm.store(VReg.FP, elemOffset, VReg.RET);
-
-        this.vm.load(VReg.V6, VReg.FP, cbOffset);
-        this.vm.push(VReg.V6);
-        this.vm.load(VReg.A0, VReg.FP, elemOffset);
-        this.vm.load(VReg.A1, VReg.FP, idxOffset);
-        this.vm.scvtf(0, VReg.A1); this.vm.fmovToInt(VReg.A1, 0); // index → 装箱 JS number
-        this.vm.load(VReg.A2, VReg.FP, arrOffset);
-        this.vm.pop(VReg.S0);
-        this.emitClosureCallAfterSetup();
-
-        this.vm.mov(VReg.A0, VReg.RET);
-        this.vm.call("_to_boolean");
-        this.vm.cmpImm(VReg.RET, 0);
-        this.vm.jeq(falseLabel);
-
-        this.vm.load(VReg.V0, VReg.FP, idxOffset);
-        this.vm.addImm(VReg.V0, VReg.V0, 1);
-        this.vm.store(VReg.FP, idxOffset, VReg.V0);
-        this.vm.jmp(loopLabel);
-
-        this.vm.label(falseLabel);
-        this.vm.lea(VReg.V0, "_js_false");
-        this.vm.load(VReg.RET, VReg.V0, 0);
-        this.vm.jmp(returnLabel);
-
-        this.vm.label(endLabel);
-        this.vm.lea(VReg.V0, "_js_true");
-        this.vm.load(VReg.RET, VReg.V0, 0);
-
-        this.vm.label(returnLabel);
+        this.emitArrayRtCbCall("_array_every_rt_t", arrOffset, cbOffset, everyThisArgSlot);
         this.vm.jmp(everyDoneLbl);
 
-        // fallback: 非真数组 → _agen_every(recv, cb)
+        // fallback: 非真数组 → _agen_every(recv, cb, thisArg)
         this.vm.label(everyFallbackLbl);
-        this._pendingThisArgSlot = null;
-        this.vm.load(VReg.A0, VReg.FP, arrOffset);
-        this.vm.load(VReg.A1, VReg.FP, cbOffset);
-        this.vm.call("_agen_every");
+        this.emitAgenCbCall("_agen_every", arrOffset, cbOffset, everyThisArgSlot);
 
         this.vm.label(everyDoneLbl);
     },
@@ -1821,7 +1697,7 @@ export const BuiltinArrayMethodCompiler = {
         const cbOffset = this.ctx.allocLocal(`__forEach_cb_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, cbOffset, VReg.RET);
         this.emitCallbackGuard(cbOffset);
-        this.emitThisArgSlot(thisArgExpr, "forEach");
+        const forEachThisArgSlot = this.emitThisArgSlot(thisArgExpr, "forEach");
 
         // tag guard: 非真数组(0x7FFE)时走 _agen_forEach 安全包装
         const forEachFallbackLbl = this.ctx.newLabel("forEach_fallback");
@@ -1831,79 +1707,13 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.cmpImm(VReg.V0, 0x7FFE);
         this.vm.jne(forEachFallbackLbl);
 
-        // 获取数组长度
-        this.vm.load(VReg.A0, VReg.FP, arrOffset);
-        this.vm.call("_array_length");
-        this.vm.mov(VReg.V0, VReg.RET);
-        const lenOffset = this.ctx.allocLocal(`__forEach_len_${this.nextLabelId()}`);
-        this.vm.store(VReg.FP, lenOffset, VReg.V0);
-
-        // 初始化索引
-        const idxOffset = this.ctx.allocLocal(`__forEach_idx_${this.nextLabelId()}`);
-        this.vm.movImm(VReg.V0, 0);
-        this.vm.store(VReg.FP, idxOffset, VReg.V0);
-
-        // 元素临时存储
-        const elemOffset = this.ctx.allocLocal(`__forEach_elem_${this.nextLabelId()}`);
-
-        const loopLabel = this.ctx.newLabel("forEach_loop");
-        const endLabel = this.ctx.newLabel("forEach_end");
-
-        this.vm.label(loopLabel);
-
-        // 比较索引和长度
-        this.vm.load(VReg.V0, VReg.FP, idxOffset);
-        this.vm.load(VReg.V1, VReg.FP, lenOffset);
-        this.vm.cmp(VReg.V0, VReg.V1);
-        this.vm.jge(endLabel);
-
-        // [timeout guard] max safe iterations: prevent infinite loop on corrupted length
-        this.vm.movImm(VReg.V2, 0x1000000); // 16M iterations ceiling
-        this.vm.cmp(VReg.V0, VReg.V2);
-        this.vm.jge(endLabel);
-
-        // 获取当前元素 - 使用 _subscript_get 统一处理 Array 和 TypedArray
-        this.vm.load(VReg.A0, VReg.FP, arrOffset); // arr
-        this.vm.load(VReg.A1, VReg.FP, idxOffset); // index
-        this.vm.call("_subscript_get");
-
-        // 保存元素值
-        this.vm.store(VReg.FP, elemOffset, VReg.RET);
-
-        // 加载闭包并 push
-        this.vm.load(VReg.V6, VReg.FP, cbOffset);
-        this.vm.push(VReg.V6);
-
-        // 设置参数
-        this.vm.load(VReg.A0, VReg.FP, elemOffset); // element
-        this.vm.load(VReg.A1, VReg.FP, idxOffset); // index (raw)
-        this.vm.scvtf(0, VReg.A1);                  // int → double
-        this.vm.fmovToInt(VReg.A1, 0);              // → 装箱 JS number（回调 i 才是数字而非裸整数≈0）
-        this.vm.load(VReg.A2, VReg.FP, arrOffset); // array
-
-        // 弹出闭包到 S0
-        this.vm.pop(VReg.S0);
-
-        // 调用闭包
-        this.emitClosureCallAfterSetup();
-
-        // 索引++
-        this.vm.load(VReg.V0, VReg.FP, idxOffset);
-        this.vm.addImm(VReg.V0, VReg.V0, 1);
-        this.vm.store(VReg.FP, idxOffset, VReg.V0);
-
-        this.vm.jmp(loopLabel);
-        this.vm.label(endLabel);
-
-        this.vm.movImm(VReg.RET, 0); // forEach 返回 undefined
+        // 真数组:委托 `_array_forEach_rt_t`(槽==0 跳 hole;与 agen 真数组快路同语义)
+        this.emitArrayRtCbCall("_array_forEach_rt_t", arrOffset, cbOffset, forEachThisArgSlot);
         this.vm.jmp(forEachDoneLbl);
 
-        // fallback: 非真数组 → _agen_forEach(recv, cb)
+        // fallback: 非真数组 → _agen_forEach(recv, cb, thisArg)
         this.vm.label(forEachFallbackLbl);
-        this._pendingThisArgSlot = null;
-        this.vm.load(VReg.A0, VReg.FP, arrOffset);
-        this.vm.load(VReg.A1, VReg.FP, cbOffset);
-        this.vm.call("_agen_forEach");
+        this.emitAgenCbCall("_agen_forEach", arrOffset, cbOffset, forEachThisArgSlot);
 
         this.vm.label(forEachDoneLbl);
     },
@@ -1913,28 +1723,11 @@ export const BuiltinArrayMethodCompiler = {
     // 判据:tag 0x7FFF(boxed 函数)/0x7FFD(boxed 对象,可能是 Proxy)/0(裸堆指针在 heap 范围内)。
     // 不可调用时调 _throw_not_a_function 抛 TypeError(不返回)。
     emitCallbackGuard(cbOffset) {
+        // 委托 _aref_require_cb(与运行时 IsCallable 单一真源)。此前内联放行全部
+        // 0x7FFD → [].map({}) 空长不抛。
         const vm = this.vm;
-        const okL = this.ctx.newLabel("cbg_callable");
-        const badL = this.ctx.newLabel("cbg_not_callable");
-        vm.load(VReg.V0, VReg.FP, cbOffset);
-        vm.shrImm(VReg.V1, VReg.V0, 48);
-        vm.cmpImm(VReg.V1, 0x7FFF);   // boxed function
-        vm.jeq(okL);
-        vm.cmpImm(VReg.V1, 0x7FFD);   // boxed object (may be callable Proxy)
-        vm.jeq(okL);
-        vm.cmpImm(VReg.V1, 0);        // bare heap pointer
-        vm.jne(badL);
-        vm.lea(VReg.V2, "_heap_base");
-        vm.load(VReg.V2, VReg.V2, 0);
-        vm.cmp(VReg.V0, VReg.V2);
-        vm.jlt(badL);
-        vm.lea(VReg.V2, "_heap_ptr");
-        vm.load(VReg.V2, VReg.V2, 0);
-        vm.cmp(VReg.V0, VReg.V2);
-        vm.jlt(okL);
-        vm.label(badL);
-        vm.call("_throw_not_a_function");
-        vm.label(okL);
+        vm.load(VReg.A0, VReg.FP, cbOffset);
+        vm.call("_aref_require_cb");
     },
 
     // 闭包调用的核心逻辑（S0 = 闭包对象，参数已在 A0-A5 中）
@@ -1944,6 +1737,7 @@ export const BuiltinArrayMethodCompiler = {
     // 字节不变)。须在回调已求值之后调用(求值序:接收者→回调→thisArg,同 node)。
     // 字段传递而非显式实参:避免改动每个回调方法里(结构各异的)间接调用点,降低回归面;
     // 单个回调方法内 set→loop 内唯一一次 call 之间无其它闭包调用,故不会跨方法泄漏。
+    // 返回槽偏移(或 null),供 _agen_* fallback 装 A2=thisArg(与内联路径共享求值结果)。
     emitThisArgSlot(thisArgExpr, tag) {
         if (!thisArgExpr) { this._pendingThisArgSlot = null; return null; }
         this.compileExpression(thisArgExpr);
@@ -1951,6 +1745,35 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.store(VReg.FP, slot, VReg.RET);
         this._pendingThisArgSlot = slot;
         return slot;
+    },
+
+    // 非真数组/_species fallback:调 _agen_*(A0=recv, A1=cb, A2=thisArg)。
+    // thisArgSlot 为 emitThisArgSlot 返回值;缺省装 JS_UNDEFINED。
+    emitAgenCbCall(agenLabel, recvSlot, cbSlot, thisArgSlot) {
+        this._pendingThisArgSlot = null;
+        this.vm.load(VReg.A0, VReg.FP, recvSlot);
+        this.vm.load(VReg.A1, VReg.FP, cbSlot);
+        if (thisArgSlot != null) {
+            this.vm.load(VReg.A2, VReg.FP, thisArgSlot);
+        } else {
+            this.vm.movImm64(VReg.A2, 0x7ffb000000000000n);
+        }
+        this.vm.call(agenLabel);
+    },
+
+    // 真数组 → `_array_*_rt_t`(A2=origRecv0, A3=thisArg)。与 agen 真数组快路同 ABI;
+    // 跳洞/访洞语义集中在 runtime,避免编译器内联循环漏跳 hole。
+    emitArrayRtCbCall(rtLabel, recvSlot, cbSlot, thisArgSlot) {
+        this._pendingThisArgSlot = null;
+        this.vm.load(VReg.A0, VReg.FP, recvSlot);
+        this.vm.load(VReg.A1, VReg.FP, cbSlot);
+        this.vm.movImm(VReg.A2, 0); // origRecv=0 → rt 用 arr
+        if (thisArgSlot != null) {
+            this.vm.load(VReg.A3, VReg.FP, thisArgSlot);
+        } else {
+            this.vm.movImm64(VReg.A3, 0x7ffb000000000000n);
+        }
+        this.vm.call(rtLabel);
     },
 
     // 回调间接调用。若 _pendingThisArgSlot 非空,则在调用前把 A5(隐藏的 this 寄存器,见
@@ -2080,7 +1903,7 @@ export const BuiltinArrayMethodCompiler = {
         this.compileExpression(callbackExpr);
         this.vm.store(VReg.FP, _msCbSp, VReg.RET);
         this.emitCallbackGuard(_msCbSp);
-        this.emitThisArgSlot(thisArgExpr, "map");
+        const mapThisArgSlot = this.emitThisArgSlot(thisArgExpr, "map");
 
         // tag guard: 非真数组(0x7FFE) → 跳过 species check,直落 _agen_map
         this.vm.load(VReg.V0, VReg.FP, _msRecvSp);
@@ -2093,141 +1916,21 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.cmpImm(VReg.RET, 0);
         this.vm.jne(_msSpecFb);
 
-        // fast path: default species
-        this.vm.load(VReg.RET, VReg.FP, _msRecvSp);
-        const arrOffset = this.ctx.allocLocal(`__map_arr_${this.nextLabelId()}`);
-        this.vm.store(VReg.FP, arrOffset, VReg.RET);
-
-        // 保存数组类型（用于创建同类型的结果数组）
-        this.vm.mov(VReg.A0, VReg.RET);
-        this.vm.call("_js_unbox");
-        this.vm.load(VReg.V0, VReg.RET, 0); // 加载类型标签（unbox 后的裸指针）
-        this.vm.andImm(VReg.V0, VReg.V0, 0xff); // 取低 8 位
-        const typeOffset = this.ctx.allocLocal(`__map_type_${this.nextLabelId()}`);
-        this.vm.store(VReg.FP, typeOffset, VReg.V0);
-
-        // 获取数组长度
-        this.vm.load(VReg.A0, VReg.FP, arrOffset);
-        this.vm.call("_array_length");
-        this.vm.mov(VReg.V0, VReg.RET); // 长度
-        const lenOffset = this.ctx.allocLocal(`__map_len_${this.nextLabelId()}`);
-        this.vm.store(VReg.FP, lenOffset, VReg.V0);
-
-        // 根据类型创建新数组
-        // 检查是否是 TypedArray (类型 >= 0x40)
-        this.vm.load(VReg.V1, VReg.FP, typeOffset);
-        this.vm.cmpImm(VReg.V1, 0x40);
-        const createTypedArray = this.ctx.newLabel("map_create_ta");
-        const createDone = this.ctx.newLabel("map_create_done");
-        this.vm.jge(createTypedArray);
-
-        // 创建普通 Array（标准布局 [type,length,capacity,elems@24]）：
-        // 用 _array_new_with_size(length)，替掉原来手写 _alloc+16 字节头（缺 capacity）——
-        // 后者与 _subscript_set/get 的标准 24 字节头布局不一致 → 元素写/读错位、map 结果
-        // 全为 0（与已修的 filter 同类 bug）。
-        this.vm.load(VReg.A0, VReg.FP, lenOffset);
-        this.vm.call("_array_new_with_size");
-        this.vm.jmp(createDone);
-
-        // 创建 TypedArray
-        this.vm.label(createTypedArray);
-        this.vm.load(VReg.A0, VReg.FP, typeOffset); // type
-        this.vm.load(VReg.A1, VReg.FP, lenOffset); // length
-        this.vm.call("_typed_array_new");
-
-        this.vm.label(createDone);
-        const newArrOffset = this.ctx.allocLocal(`__map_newarr_${this.nextLabelId()}`);
-        this.vm.store(VReg.FP, newArrOffset, VReg.RET);
-
-        // 回调已在 species 检查前编译并存于 _msCbSp,thisArg 已设置;此处仅复用预存槽。
-        // 不重调 compileExpression/emitThisArgSlot,避免重复求值/覆盖槽位。
-
-        // 初始化索引
-        const idxOffset = this.ctx.allocLocal(`__map_idx_${this.nextLabelId()}`);
-        this.vm.movImm(VReg.V0, 0);
-        this.vm.store(VReg.FP, idxOffset, VReg.V0);
-
-        // 元素临时存储
-        const elemOffset = this.ctx.allocLocal(`__map_elem_${this.nextLabelId()}`);
-
-        const loopLabel = this.ctx.newLabel("map_loop");
-        const endLabel = this.ctx.newLabel("map_end");
-
-        this.vm.label(loopLabel);
-
-        // 比较索引和长度
-        this.vm.load(VReg.V0, VReg.FP, idxOffset);
-        this.vm.load(VReg.V1, VReg.FP, lenOffset);
-        this.vm.cmp(VReg.V0, VReg.V1);
-        this.vm.jge(endLabel);
-        // [timeout guard] max safe iterations
-        this.vm.movImm(VReg.V2, 0x1000000);
-        this.vm.cmp(VReg.V0, VReg.V2);
-        this.vm.jge(endLabel);
-
-        // 获取当前元素 - 使用 _subscript_get 统一处理
-        this.vm.load(VReg.A0, VReg.FP, arrOffset); // arr
-        this.vm.load(VReg.A1, VReg.FP, idxOffset); // index
-        this.vm.call("_subscript_get");
-
-        // 保存元素值
-        this.vm.store(VReg.FP, elemOffset, VReg.RET);
-
-        // 准备闭包调用（回调从预存槽 _msCbSp 加载）
-        this.vm.load(VReg.V6, VReg.FP, _msCbSp);
-        this.vm.push(VReg.V6);
-
-        // 设置参数
-        this.vm.load(VReg.A0, VReg.FP, elemOffset); // element
-        this.vm.load(VReg.A1, VReg.FP, idxOffset); // index (raw)
-        this.vm.scvtf(0, VReg.A1); this.vm.fmovToInt(VReg.A1, 0); // index → 装箱 JS number
-        this.vm.load(VReg.A2, VReg.FP, arrOffset); // array
-
-        // 弹出闭包并调用
-        this.vm.pop(VReg.S0);
-        this.emitClosureCallAfterSetup();
-
-        // 存储结果到新数组 - 使用 _subscript_set 统一处理
-        this.vm.mov(VReg.A2, VReg.RET); // value (返回值)
-        this.vm.load(VReg.A0, VReg.FP, newArrOffset); // arr
-        this.vm.load(VReg.A1, VReg.FP, idxOffset); // index
-        this.vm.call("_subscript_set");
-
-        // 索引++
-        this.vm.load(VReg.V0, VReg.FP, idxOffset);
-        this.vm.addImm(VReg.V0, VReg.V0, 1);
-        this.vm.store(VReg.FP, idxOffset, VReg.V0);
-
-        this.vm.jmp(loopLabel);
-        this.vm.label(endLabel);
-
-        // 返回新数组:普通数组装箱 0x7FFE(for-of tag 检测,同 filter);TypedArray 结果保持
-        // 裸指针(TA 以裸指针流通,打印/下标按头字节识别——误装 0x7FFE 会让 _print_array
-        // 把 buffer@24 当 data_ptr 解引 → 段错误;与 filter 末段 TA 处理对齐)。
-        this.vm.load(VReg.RET, VReg.FP, newArrOffset);
-        this.vm.load(VReg.V1, VReg.FP, typeOffset);
-        this.vm.cmpImm(VReg.V1, 0x40);
-        const mapBoxDone = this.ctx.newLabel("map_box_done");
-        this.vm.jge(mapBoxDone);
-        this.vm.call("_box_arr_r"); // box->helper
-        this.vm.label(mapBoxDone);
-
+        // fast path: default species → `_array_map_rt_t`(保留 holes)
+        this.emitArrayRtCbCall("_array_map_rt_t", _msRecvSp, _msCbSp, mapThisArgSlot);
         this.vm.jmp(_msSpecEnd);
 
-        // fallback: non-default species -> _agen_map
+        // fallback: non-default species -> _agen_map(recv, cb, thisArg)
         this.vm.label(_msSpecFb);
-        this._pendingThisArgSlot = null;
-        this.vm.load(VReg.A0, VReg.FP, _msRecvSp);
-        this.vm.load(VReg.A1, VReg.FP, _msCbSp);
-        this.vm.call("_agen_map");
+        this.emitAgenCbCall("_agen_map", _msRecvSp, _msCbSp, mapThisArgSlot);
 
         this.vm.label(_msSpecEnd);
     },
 
-    // 编译 arr.flatMap(callback) —— map 后把返回的数组展平一层。
+    // 编译 arr.flatMap(callback[, thisArg]) —— map 后把返回的数组展平一层。
     // 结果用 _array_new_with_size(0)+_array_push 增长构建(同 filter,标准布局)。
     // 回调返回数组(tag 0x7ffe)→ 逐元素 push;否则整体 push 一次。
-    compileArrayFlatMap(arrayExpr, callbackExpr) {
+    compileArrayFlatMap(arrayExpr, callbackExpr, thisArgExpr = null) {
         this.compileExpression(arrayExpr);
         const arrOffset = this.ctx.allocLocal(`__flatmap_arr_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, arrOffset, VReg.RET);
@@ -2244,10 +1947,12 @@ export const BuiltinArrayMethodCompiler = {
         const newArrOffset = this.ctx.allocLocal(`__flatmap_newarr_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, newArrOffset, VReg.RET);
 
-        // 回调闭包
+        // 回调闭包 + 可选 thisArg
         this.compileExpression(callbackExpr);
         const cbOffset = this.ctx.allocLocal(`__flatmap_cb_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, cbOffset, VReg.RET);
+        this.emitCallbackGuard(cbOffset);
+        this.emitThisArgSlot(thisArgExpr, "flatMap");
 
         const idxOffset = this.ctx.allocLocal(`__flatmap_idx_${this.nextLabelId()}`);
         this.vm.movImm(VReg.V0, 0);
@@ -2351,7 +2056,7 @@ export const BuiltinArrayMethodCompiler = {
         this.compileExpression(callbackExpr);
         this.vm.store(VReg.FP, _fsCbSp, VReg.RET);
         this.emitCallbackGuard(_fsCbSp);
-        this.emitThisArgSlot(thisArgExpr, "filter");
+        const filterThisArgSlot = this.emitThisArgSlot(thisArgExpr, "filter");
 
         // tag guard: 非真数组(0x7FFE) → 跳过 species check,直落 _agen_filter
         this.vm.load(VReg.V0, VReg.FP, _fsRecvSp);
@@ -2364,117 +2069,13 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.cmpImm(VReg.RET, 0);
         this.vm.jne(_fsSpecFb);
 
-        // fast path: default species
-        this.vm.load(VReg.RET, VReg.FP, _fsRecvSp);
-        const arrOffset = this.ctx.allocLocal(`__filter_arr_${this.nextLabelId()}`);
-        this.vm.store(VReg.FP, arrOffset, VReg.RET);
-
-        // 源类型字节(裸指针@0 低 8 位):>=0x40 即 TypedArray → 结果转同型(node 语义,
-        // filter 保留接收者类型)。普通数组(<0x40)结果保持普通数组。
-        this.vm.mov(VReg.A0, VReg.RET);
-        this.vm.call("_js_unbox");
-        this.vm.load(VReg.V0, VReg.RET, 0);
-        this.vm.andImm(VReg.V0, VReg.V0, 0xff);
-        const typeOffset = this.ctx.allocLocal(`__filter_type_${this.nextLabelId()}`);
-        this.vm.store(VReg.FP, typeOffset, VReg.V0);
-
-        // 源数组长度
-        this.vm.load(VReg.A0, VReg.FP, arrOffset);
-        this.vm.call("_array_length");
-        const lenOffset = this.ctx.allocLocal(`__filter_len_${this.nextLabelId()}`);
-        this.vm.store(VReg.FP, lenOffset, VReg.RET);
-
-        // 建空结果数组（标准布局，装箱）
-        this.vm.movImm(VReg.A0, 0);
-        this.vm.call("_array_new_with_size");
-        const newArrOffset = this.ctx.allocLocal(`__filter_newarr_${this.nextLabelId()}`);
-        this.vm.store(VReg.FP, newArrOffset, VReg.RET);
-
-        // 回调已在 species 检查前编译并存于 _fsCbSp,thisArg 已设置;此处仅复用预存槽。
-        // 不重调 compileExpression/emitThisArgSlot,避免重复求值/覆盖槽位。
-
-        const idxOffset = this.ctx.allocLocal(`__filter_idx_${this.nextLabelId()}`);
-        this.vm.movImm(VReg.V0, 0);
-        this.vm.store(VReg.FP, idxOffset, VReg.V0);
-        const elemOffset = this.ctx.allocLocal(`__filter_elem_${this.nextLabelId()}`);
-
-        const loopLabel = this.ctx.newLabel("filter_loop");
-        const skipLabel = this.ctx.newLabel("filter_skip");
-        const endLabel = this.ctx.newLabel("filter_end");
-
-        this.vm.label(loopLabel);
-        this.vm.load(VReg.V0, VReg.FP, idxOffset);
-        this.vm.load(VReg.V1, VReg.FP, lenOffset);
-        this.vm.cmp(VReg.V0, VReg.V1);
-        this.vm.jge(endLabel);
-        // [timeout guard] max safe iterations
-        this.vm.movImm(VReg.V2, 0x1000000);
-        this.vm.cmp(VReg.V0, VReg.V2);
-        this.vm.jge(endLabel);
-
-        // elem = src[idx]
-        this.vm.load(VReg.A0, VReg.FP, arrOffset);
-        this.vm.load(VReg.A1, VReg.FP, idxOffset);
-        this.vm.call("_subscript_get");
-        this.vm.store(VReg.FP, elemOffset, VReg.RET);
-
-        // cb(elem, idx, arr) -- callback from pre-stored _fsCbSp
-        this.vm.load(VReg.V6, VReg.FP, _fsCbSp);
-        this.vm.push(VReg.V6);
-        this.vm.load(VReg.A0, VReg.FP, elemOffset);
-        this.vm.load(VReg.A1, VReg.FP, idxOffset);
-        this.vm.scvtf(0, VReg.A1); this.vm.fmovToInt(VReg.A1, 0); // index → 装箱 JS number
-        this.vm.load(VReg.A2, VReg.FP, arrOffset);
-        this.vm.pop(VReg.S0);
-        this.emitClosureCallAfterSetup();
-
-        this.vm.mov(VReg.A0, VReg.RET);
-        this.vm.call("_to_boolean");
-        this.vm.cmpImm(VReg.RET, 0);
-        this.vm.jeq(skipLabel);
-
-        // 保留：newArr = _array_push(newArr, elem)（捕获扩容后新装箱指针）
-        this.vm.load(VReg.A1, VReg.FP, elemOffset);
-        this.vm.load(VReg.A0, VReg.FP, newArrOffset);
-        this.vm.call("_array_push");
-        this.vm.store(VReg.FP, newArrOffset, VReg.RET);
-
-        this.vm.label(skipLabel);
-        this.vm.load(VReg.V0, VReg.FP, idxOffset);
-        this.vm.addImm(VReg.V0, VReg.V0, 1);
-        this.vm.store(VReg.FP, idxOffset, VReg.V0);
-        this.vm.jmp(loopLabel);
-
-        this.vm.label(endLabel);
-        this.vm.load(VReg.RET, VReg.FP, newArrOffset);
-        // 装箱为 0x7FFE 数组 JSValue——_array_new_with_size 返回裸指针，_array_push 保留
-        // 输入标签（此处输入无标签 0x0000），故链末仍是裸指针；未装箱则 for-of 的
-        // tag 检测(>>48==0x7ffe)失败落入 Symbol.iterator 路径而崩。
-        this.vm.call("_box_arr_r"); // box->helper
-        // TypedArray 源:把普通数组结果转成同型 TypedArray(_typed_array_from 逐元素按类型
-        // 强转存,含 Uint8Clamped 饱和)。普通数组源跳过。
-        const filtEnd = this.ctx.newLabel("filter_ret");
-        // x64:V0 与 RET 同为 RAX。用 V0 读 typeOffset 会毁掉 _box_arr_r 刚装箱的结果——
-        // 普通数组(type<0x40)随即 jlt 跳到 filtEnd,RET 已变成类型字节(1)→ filter 返回
-        // 数字 4e-324 而非数组(typeof number、后续 .length/下标段错)。x64 改用不与 RET
-        // 别名的 V5 作类型比较暂存;arm64 上 V0≠RET,保持 V0 → 逐字节不变、自举定点不动。
-        const typeReg = this.vm.backend.name === "x64" ? VReg.V5 : VReg.V0;
-        this.vm.load(typeReg, VReg.FP, typeOffset);
-        this.vm.cmpImm(typeReg, 0x40);
-        this.vm.jlt(filtEnd);
-        this.vm.mov(VReg.A1, VReg.RET);            // 普通数组结果(boxed)
-        this.vm.load(VReg.A0, VReg.FP, typeOffset); // type
-        this.vm.call("_typed_array_from");
-        this.vm.label(filtEnd);
-
+        // fast path: default species → `_array_filter_rt_t`(跳 hole)
+        this.emitArrayRtCbCall("_array_filter_rt_t", _fsRecvSp, _fsCbSp, filterThisArgSlot);
         this.vm.jmp(_fsSpecEnd);
 
-        // fallback: non-default species -> _agen_filter
+        // fallback: non-default species -> _agen_filter(recv, cb, thisArg)
         this.vm.label(_fsSpecFb);
-        this._pendingThisArgSlot = null;
-        this.vm.load(VReg.A0, VReg.FP, _fsRecvSp);
-        this.vm.load(VReg.A1, VReg.FP, _fsCbSp);
-        this.vm.call("_agen_filter");
+        this.emitAgenCbCall("_agen_filter", _fsRecvSp, _fsCbSp, filterThisArgSlot);
 
         this.vm.label(_fsSpecEnd);
     },
@@ -2650,86 +2251,13 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.cmpImm(VReg.V0, 0x7FFE);
         this.vm.jne(reduceFallbackLbl);
 
-        // 获取数组长度——用 _array_length（内部脱壳）。原来直接读 [RET+8] 是对**装箱**
-        // 数组指针(0x7ffe tag)解引用 → 高位 0x7ffe 使地址巨大 → load 段错误崩溃。
+        // 真数组:委托 `_array_reduce_rt`(跳 hole;无 seed 取首个存在元素)
+        this._pendingThisArgSlot = null;
         this.vm.load(VReg.A0, VReg.FP, arrOffset);
-        this.vm.call("_array_length");
-        const lenOffset = this.ctx.allocLocal(`__reduce_len_${this.nextLabelId()}`);
-        this.vm.store(VReg.FP, lenOffset, VReg.RET);
-
-        // 初始化累加器
-        const accOffset = this.ctx.allocLocal(`__reduce_acc_${this.nextLabelId()}`);
-        if (initialValueExpr) {
-            this.vm.load(VReg.RET, VReg.FP, rinitOff);
-            this.vm.store(VReg.FP, accOffset, VReg.RET);
-        } else {
-            // 无初始值时，使用第一个元素作为初始值
-            // 使用 _subscript_get 统一处理 Array 和 TypedArray
-            this.vm.load(VReg.A0, VReg.FP, arrOffset);
-            this.vm.movImm(VReg.A1, 0);
-            this.vm.call("_subscript_get");
-            this.vm.store(VReg.FP, accOffset, VReg.RET);
-        }
-
-        // 初始化索引（如果有初始值从 0 开始，否则从 1 开始）
-        const idxOffset = this.ctx.allocLocal(`__reduce_idx_${this.nextLabelId()}`);
-        this.vm.movImm(VReg.V0, initialValueExpr ? 0 : 1);
-        this.vm.store(VReg.FP, idxOffset, VReg.V0);
-
-        // 元素临时存储（在循环外分配）
-        const elemOffset = this.ctx.allocLocal(`__reduce_elem_${this.nextLabelId()}`);
-
-        const loopLabel = this.ctx.newLabel("reduce_loop");
-        const endLabel = this.ctx.newLabel("reduce_end");
-
-        this.vm.label(loopLabel);
-
-        // 比较索引和长度
-        this.vm.load(VReg.V0, VReg.FP, idxOffset);
-        this.vm.load(VReg.V1, VReg.FP, lenOffset);
-        this.vm.cmp(VReg.V0, VReg.V1);
-        this.vm.jge(endLabel);
-        // [timeout guard] max safe iterations
-        this.vm.movImm(VReg.V2, 0x1000000);
-        this.vm.cmp(VReg.V0, VReg.V2);
-        this.vm.jge(endLabel);
-
-        // 获取当前元素 - 使用 _subscript_get 统一处理 Array 和 TypedArray
-        this.vm.load(VReg.A0, VReg.FP, arrOffset);
-        this.vm.load(VReg.A1, VReg.FP, idxOffset);
-        this.vm.call("_subscript_get");
-
-        // 保存当前元素
-        this.vm.store(VReg.FP, elemOffset, VReg.RET);
-
-        // 准备闭包调用
-        this.vm.load(VReg.V6, VReg.FP, cbOffset);
-        this.vm.push(VReg.V6);
-
-        // 设置参数: callback(accumulator, currentValue, index, array)
-        this.vm.load(VReg.A0, VReg.FP, accOffset); // accumulator
-        this.vm.load(VReg.A1, VReg.FP, elemOffset); // currentValue
-        this.vm.load(VReg.A2, VReg.FP, idxOffset); // index (raw)
-        this.vm.scvtf(0, VReg.A2); this.vm.fmovToInt(VReg.A2, 0); // index → 装箱 JS number
-        this.vm.load(VReg.A3, VReg.FP, arrOffset); // array
-
-        // 弹出闭包并调用
-        this.vm.pop(VReg.S0);
-        this.emitClosureCallAfterSetup(4);
-
-        // 更新累加器
-        this.vm.store(VReg.FP, accOffset, VReg.RET);
-
-        // 索引++
-        this.vm.load(VReg.V0, VReg.FP, idxOffset);
-        this.vm.addImm(VReg.V0, VReg.V0, 1);
-        this.vm.store(VReg.FP, idxOffset, VReg.V0);
-
-        this.vm.jmp(loopLabel);
-        this.vm.label(endLabel);
-
-        // 返回累加器
-        this.vm.load(VReg.RET, VReg.FP, accOffset);
+        this.vm.load(VReg.A1, VReg.FP, cbOffset);
+        this.vm.load(VReg.A2, VReg.FP, rinitOff);
+        this.vm.movImm(VReg.A3, 0);
+        this.vm.call("_array_reduce_rt");
         this.vm.jmp(reduceDoneLbl);
 
         // fallback: 非真数组 → _agen_reduce(recv, cb, init)
@@ -2772,76 +2300,13 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.cmpImm(VReg.V0, 0x7FFE);
         this.vm.jne(rrFallbackLbl);
 
-        // len = _array_length(arr)
+        // 真数组:委托 `_array_reduceRight_rt`(跳 hole)
+        this._pendingThisArgSlot = null;
         this.vm.load(VReg.A0, VReg.FP, arrOffset);
-        this.vm.call("_array_length");
-        const lenOffset = this.ctx.allocLocal(`__rredr_len_${this.nextLabelId()}`);
-        this.vm.store(VReg.FP, lenOffset, VReg.RET);
-
-        // 累加器初值
-        const accOffset = this.ctx.allocLocal(`__rredr_acc_${this.nextLabelId()}`);
-        const idxOffset = this.ctx.allocLocal(`__rredr_idx_${this.nextLabelId()}`);
-        if (initialValueExpr) {
-            this.vm.load(VReg.RET, VReg.FP, rinitOff);
-            this.vm.store(VReg.FP, accOffset, VReg.RET);
-            // idx = len - 1
-            this.vm.load(VReg.V0, VReg.FP, lenOffset);
-            this.vm.subImm(VReg.V0, VReg.V0, 1);
-            this.vm.store(VReg.FP, idxOffset, VReg.V0);
-        } else {
-            // 无初值:acc = arr[len-1],idx = len-2
-            this.vm.load(VReg.V0, VReg.FP, lenOffset);
-            this.vm.subImm(VReg.V0, VReg.V0, 1);
-            this.vm.store(VReg.FP, idxOffset, VReg.V0);
-            this.vm.load(VReg.A0, VReg.FP, arrOffset);
-            this.vm.mov(VReg.A1, VReg.V0);
-            this.vm.call("_subscript_get");
-            this.vm.store(VReg.FP, accOffset, VReg.RET);
-            this.vm.load(VReg.V0, VReg.FP, idxOffset);
-            this.vm.subImm(VReg.V0, VReg.V0, 1);
-            this.vm.store(VReg.FP, idxOffset, VReg.V0);
-        }
-
-        const elemOffset = this.ctx.allocLocal(`__rredr_elem_${this.nextLabelId()}`);
-        const loopLabel = this.ctx.newLabel("rredr_loop");
-        const endLabel = this.ctx.newLabel("rredr_end");
-
-        this.vm.label(loopLabel);
-        // idx < 0 → 结束
-        this.vm.load(VReg.V0, VReg.FP, idxOffset);
-        this.vm.cmpImm(VReg.V0, 0);
-        this.vm.jlt(endLabel);
-        // [timeout guard] max safe iterations (reverse direction, check idx fits in safe range)
-        this.vm.movImm(VReg.V2, 0x1000000);
-        this.vm.cmp(VReg.V0, VReg.V2);
-        this.vm.jge(endLabel);
-
-        // 当前元素 arr[idx]
-        this.vm.load(VReg.A0, VReg.FP, arrOffset);
-        this.vm.load(VReg.A1, VReg.FP, idxOffset);
-        this.vm.call("_subscript_get");
-        this.vm.store(VReg.FP, elemOffset, VReg.RET);
-
-        // callback(acc, cur, idx, arr)
-        this.vm.load(VReg.V6, VReg.FP, cbOffset);
-        this.vm.push(VReg.V6);
-        this.vm.load(VReg.A0, VReg.FP, accOffset);
-        this.vm.load(VReg.A1, VReg.FP, elemOffset);
-        this.vm.load(VReg.A2, VReg.FP, idxOffset);
-        this.vm.scvtf(0, VReg.A2); this.vm.fmovToInt(VReg.A2, 0); // idx → 装箱 number
-        this.vm.load(VReg.A3, VReg.FP, arrOffset);
-        this.vm.pop(VReg.S0);
-        this.emitClosureCallAfterSetup(4);
-        this.vm.store(VReg.FP, accOffset, VReg.RET);
-
-        // idx--
-        this.vm.load(VReg.V0, VReg.FP, idxOffset);
-        this.vm.subImm(VReg.V0, VReg.V0, 1);
-        this.vm.store(VReg.FP, idxOffset, VReg.V0);
-        this.vm.jmp(loopLabel);
-        this.vm.label(endLabel);
-
-        this.vm.load(VReg.RET, VReg.FP, accOffset);
+        this.vm.load(VReg.A1, VReg.FP, cbOffset);
+        this.vm.load(VReg.A2, VReg.FP, rinitOff);
+        this.vm.movImm(VReg.A3, 0);
+        this.vm.call("_array_reduceRight_rt");
         this.vm.jmp(rrDoneLbl);
 
         // fallback: 非真数组 → _agen_reduceRight(recv, cb, init)

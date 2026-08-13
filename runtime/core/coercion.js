@@ -576,8 +576,19 @@ export class CoercionGenerator {
         vm.epilogue([VReg.S0], 16);
 
         // _builtin_string(x) -> 装箱字符串
+        // String(sym) 作函数调用是 SymbolDescriptiveString("Symbol(desc)"),不抛;
+        // ToString(sym)(_valueToStr / ""+sym / `${sym}`)仍 TypeError。
         vm.label("_builtin_string");
         vm.prologue(16, [VReg.S0]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.call("_is_symbol");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_builtin_string_tostr");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_symbol_to_string");
+        vm.epilogue([VReg.S0], 16);
+        vm.label("_builtin_string_tostr");
+        vm.mov(VReg.A0, VReg.S0);
         vm.call("_valueToStr");
         vm.epilogue([VReg.S0], 16);
     }

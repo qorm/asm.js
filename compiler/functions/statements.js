@@ -2535,33 +2535,102 @@ export const StatementCompiler = {
             stmt.expression.callee.type === "SuperExpression");
     },
 
+    // 实例计算键 `[k]`(k 非字符串/数字字面量):ClassElementName 须在类定义时求值,
+    // 不能在构造器里 compileExpression(field.key)——构造器是嵌套函数,闭包分析
+    // 看不到字段 AST 上的 `[x]`,外层 `var x` 未捕获 → ReferenceError。
+    // 字面量计算键 `["x"]`/`[10]` 的 key.value 已是名字,走静态 fieldName 路径。
+    _isRuntimeComputedFieldKey(field) {
+        return !!(field && field.computed && field.key &&
+            field.key.type !== "Literal" &&
+            field.key.type !== "StringLiteral" &&
+            field.key.type !== "NumericLiteral");
+    },
+
+    // RET = 原始键值 → RET = ToPropertyKey(字符串或 symbol 键)。
+    // 对齐静态字段:symbol → _js_prop_key,否则 _valueToStr(避免 Symbol 走 ToString 抛 TypeError)。
+    emitToPropertyKey() {
+        const kraw = this.ctx.allocLocal(`__tpk_${this.nextLabelId()}`);
+        this.vm.store(VReg.FP, kraw, VReg.RET);
+        const isSym = this.ctx.newLabel("tpk_sym");
+        const done = this.ctx.newLabel("tpk_done");
+        this.vm.load(VReg.A0, VReg.FP, kraw);
+        this.vm.call("_is_symbol");
+        this.vm.cmpImm(VReg.RET, 0);
+        this.vm.jne(isSym);
+        this.vm.load(VReg.A0, VReg.FP, kraw);
+        this.vm.call("_valueToStr");
+        this.vm.jmp(done);
+        this.vm.label(isSym);
+        this.vm.load(VReg.A0, VReg.FP, kraw);
+        this.vm.call("_js_prop_key");
+        this.vm.label(done);
+    },
+
+    // 类定义时求所有实例计算键,存入 `_cfkeys_<类>__<id>` 全局数组(GC 根,同 _classinfo_)。
+    // 须在外层 ctx(类声明作用域)发射,使 `var x`/`var y`/ToPrimitive 对象可见。
+    emitInstanceComputedKeys(instanceFields, cfkeysLabel) {
+        if (!cfkeysLabel) return;
+        let n = 0;
+        for (let i = 0; i < instanceFields.length; i++) {
+            if (this._isRuntimeComputedFieldKey(instanceFields[i])) n++;
+        }
+        if (n === 0) return;
+        this.vm.push(VReg.S0);
+        this.vm.movImm(VReg.A0, n);
+        this.vm.call("_array_new_with_size");
+        const arrSlot = this.ctx.allocLocal(`__cfkeys_${this.nextLabelId()}`);
+        this.vm.store(VReg.FP, arrSlot, VReg.RET);
+        let ki = 0;
+        for (let i = 0; i < instanceFields.length; i++) {
+            const field = instanceFields[i];
+            if (!this._isRuntimeComputedFieldKey(field)) continue;
+            this.compileExpression(field.key);
+            this.emitToPropertyKey();
+            this.vm.mov(VReg.A2, VReg.RET);
+            this.vm.load(VReg.A0, VReg.FP, arrSlot);
+            this.vm.movImm(VReg.A1, ki);
+            this.vm.call("_array_set");
+            ki++;
+        }
+        this.vm.load(VReg.V0, VReg.FP, arrSlot);
+        this.vm.lea(VReg.V1, cfkeysLabel);
+        this.vm.store(VReg.V1, 0, VReg.V0);
+        this.vm.pop(VReg.S0);
+    },
+
     // 实例字段 + 私有字段初始化(基类:构造体前;派生类:super() 后)。this 从 __this
     // 局部重载(字段初值可为破坏 A0/栈的复杂表达式),与原内联实现逐指令一致。
-    emitCtorFieldInits(instanceFields, privateFields, className, thisOffset) {
+    // 计算键按下标从类定义期填好的 cfkeys 数组取,不再在构造器里求 field.key。
+    emitCtorFieldInits(instanceFields, privateFields, className, thisOffset, cfkeysLabel) {
+        let cfKeyIdx = 0;
         for (const field of instanceFields) {
-            // 计算键 `[k]`(k 为标识符/表达式,非字符串/数字字面量):须运行时求键。
-            // 字面量计算键 `["x"]` 的 key.value 已是名字,走下方静态路径。
-            const cfRuntimeKey = field.computed && field.key &&
-                field.key.type !== "Literal" && field.key.type !== "StringLiteral" && field.key.type !== "NumericLiteral";
+            const cfRuntimeKey = this._isRuntimeComputedFieldKey(field);
             const fieldName = cfRuntimeKey ? null : (field.key && (field.key.name || field.key.value));
-            if (cfRuntimeKey || fieldName == null) {
-                // 计算键字段 `[k] = v`(变量键,非字面量):运行时求键 → _valueToStr → 定义。
-                // 键先算(_valueToStr 会毁寄存器)存临时槽,再算值,最后 _object_define。
-                if (cfRuntimeKey && field.value) {
-                    this.compileExpression(field.key);
-                    this.vm.mov(VReg.A0, VReg.RET);
-                    this.vm.call("_valueToStr");   // RET = 键字符串(content ptr,同静态键形态)
-                    const kt = this.ctx.allocLocal(`__cfk_${this.nextLabelId()}`);
-                    this.vm.store(VReg.FP, kt, VReg.RET);
+            if (cfRuntimeKey) {
+                const thisKeyIdx = cfKeyIdx++;
+                this.vm.lea(VReg.A0, cfkeysLabel);
+                this.vm.load(VReg.A0, VReg.A0, 0);
+                this.vm.movImm(VReg.A1, thisKeyIdx);
+                this.vm.call("_array_get");
+                const kt = this.ctx.allocLocal(`__cfk_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, kt, VReg.RET);
+                if (field.value) {
                     this.compileExpression(field.value);
                     this.vm.mov(VReg.V1, VReg.RET);
-                    this.vm.load(VReg.A0, VReg.FP, thisOffset);
-                    this.vm.load(VReg.A1, VReg.FP, kt);
-                    this.vm.mov(VReg.A2, VReg.V1);
-                    this.vm.call("_object_define");
+                } else {
+                    // 无初始化器的计算键字段(`[x]`)须建 own 属性 = undefined
+                    this.vm.lea(VReg.V1, "_js_undefined");
+                    this.vm.load(VReg.V1, VReg.V1, 0);
                 }
+                this.vm.load(VReg.A0, VReg.FP, thisOffset);
+                this.vm.load(VReg.A1, VReg.FP, kt);
+                this.vm.mov(VReg.A2, VReg.V1);
+                this.vm.call("_object_define");
                 continue;
             }
+            if (fieldName == null) continue;
+            // `[10]` 的 key.value 是数字;addString 只接受字符串,否则 length 为空→键 "".
+            const staticKey = String(fieldName);
             if (field.value) {
                 // 编译字段初始值（可能是 new Map() 等复杂表达式，会破坏 A0 和栈平衡，
                 // 故绝不能靠 push/pop A0 保 this——从 __this 局部重新加载，与私有字段一致）
@@ -2569,7 +2638,7 @@ export const StatementCompiler = {
                 this.vm.mov(VReg.V1, VReg.RET);
                 // 设置字段: this[fieldName] = value
                 this.vm.load(VReg.A0, VReg.FP, thisOffset);
-                this.vm.lea(VReg.A1, this.addStringConstant(fieldName));
+                this.vm.lea(VReg.A1, this.addStringConstant(staticKey));
                 // [A3.5-fix] 键装箱(0x7FFC 驻留)——实例字段键同原型方法键一并转正
                 this.vm.call("_tag_str_a1");
                 this.vm.mov(VReg.A2, VReg.V1);
@@ -2577,7 +2646,7 @@ export const StatementCompiler = {
             } else {
                 // [L2-③] 无初始化器的字段须在实例上建 own 属性,值=undefined
                 this.vm.load(VReg.A0, VReg.FP, thisOffset);
-                this.vm.lea(VReg.A1, this.addStringConstant(fieldName));
+                this.vm.lea(VReg.A1, this.addStringConstant(staticKey));
                 this.vm.call("_tag_str_a1");
                 this.vm.lea(VReg.A2, "_js_undefined");
                 this.vm.load(VReg.A2, VReg.A2, 0);
@@ -2682,6 +2751,22 @@ export const StatementCompiler = {
                 } else {
                     instanceFields.push(member);
                 }
+            }
+        }
+
+        // 实例计算键在类定义时求值,结果存 `_cfkeys_<类>__<id>`(数据段 GC 根)。
+        // 构造器只按下标取键,不再 compileExpression(field.key)。
+        let cfKeyCount = 0;
+        for (let i = 0; i < instanceFields.length; i++) {
+            if (this._isRuntimeComputedFieldKey(instanceFields[i])) cfKeyCount++;
+        }
+        const cfkeysLabel = cfKeyCount > 0 ? `_cfkeys_${className}__${labelId}` : null;
+        if (cfkeysLabel) {
+            if (!this._addedCfkeysLabels) this._addedCfkeysLabels = new Set();
+            if (!this._addedCfkeysLabels.has(cfkeysLabel)) {
+                this.asm.addDataLabel(cfkeysLabel);
+                this.asm.addDataQword(0);
+                this._addedCfkeysLabels.add(cfkeysLabel);
             }
         }
 
@@ -2859,7 +2944,7 @@ export const StatementCompiler = {
         // (`class C extends A{ b = this.a+9 }`,this.a 由 super() 设)。故派生类此处不发,
         // 由下方构造体循环在 super() 语句后注入(emitCtorFieldInits)。
         if (!superClass) {
-            this.emitCtorFieldInits(instanceFields, privateFields, className, thisOffset);
+            this.emitCtorFieldInits(instanceFields, privateFields, className, thisOffset, cfkeysLabel);
         }
 
         // 编译构造函数体（参数已在字段初始化前落栈并处理默认值）
@@ -2870,14 +2955,14 @@ export const StatementCompiler = {
                     this.compileStatement(bodyStmt);
                     // 派生类:super() 语句刚编完 → 立即注入字段初始化(node 时序)。
                     if (superClass && !fieldsEmittedAfterSuper && this._isSuperCallStmt(bodyStmt)) {
-                        this.emitCtorFieldInits(instanceFields, privateFields, className, thisOffset);
+                        this.emitCtorFieldInits(instanceFields, privateFields, className, thisOffset, cfkeysLabel);
                         fieldsEmittedAfterSuper = true;
                     }
                 }
                 // 防御:派生类构造体未见顶层 super() 语句(非常规写法)→ 体末补发,
                 // 保证字段仍被初始化(时序略偏但不丢失)。
                 if (superClass && !fieldsEmittedAfterSuper) {
-                    this.emitCtorFieldInits(instanceFields, privateFields, className, thisOffset);
+                    this.emitCtorFieldInits(instanceFields, privateFields, className, thisOffset, cfkeysLabel);
                 }
             }
         }
@@ -3156,43 +3241,31 @@ export const StatementCompiler = {
 
         // 初始化静态字段
         for (const field of staticFields) {
-            const sfRuntimeKey = field.computed && field.key &&
-                field.key.type !== "Literal" && field.key.type !== "StringLiteral" && field.key.type !== "NumericLiteral";
+            const sfRuntimeKey = this._isRuntimeComputedFieldKey(field);
             let fieldName = sfRuntimeKey ? null : (field.key && (field.key.name || field.key.value));
-            if (sfRuntimeKey || fieldName == null) {
-                // 计算键静态字段 `static [k] = v`:运行时求键 → 定义到类对象 S0。
-                // symbol 键(含 well-known `[Symbol.toStringTag]=v`)走 _js_prop_key(与下标读
-                // 路径一致);非 symbol 键仍 _valueToStr(字符串/数值)。
-                if (sfRuntimeKey && field.value) {
-                    this.vm.push(VReg.S0);
-                    this.compileExpression(field.key);
-                    const kraw = this.ctx.allocLocal(`__csfkr_${this.nextLabelId()}`);
-                    this.vm.store(VReg.FP, kraw, VReg.RET);
-                    const sfSym = this.ctx.newLabel("sf_symkey");
-                    const sfKd = this.ctx.newLabel("sf_keydone");
-                    this.vm.load(VReg.A0, VReg.FP, kraw);
-                    this.vm.call("_is_symbol");
-                    this.vm.cmpImm(VReg.RET, 0);
-                    this.vm.jne(sfSym);
-                    this.vm.load(VReg.A0, VReg.FP, kraw);
-                    this.vm.call("_valueToStr");
-                    this.vm.jmp(sfKd);
-                    this.vm.label(sfSym);
-                    this.vm.load(VReg.A0, VReg.FP, kraw);
-                    this.vm.call("_js_prop_key");
-                    this.vm.label(sfKd);
-                    const skt = this.ctx.allocLocal(`__csfk_${this.nextLabelId()}`);
-                    this.vm.store(VReg.FP, skt, VReg.RET);
+            if (sfRuntimeKey) {
+                // 计算键静态字段 `static [k] = v`:类定义时求键(含无 initializer)。
+                // symbol → _js_prop_key;非 symbol → _valueToStr。
+                this.vm.push(VReg.S0);
+                this.compileExpression(field.key);
+                this.emitToPropertyKey();
+                const skt = this.ctx.allocLocal(`__csfk_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, skt, VReg.RET);
+                if (field.value) {
                     this.compileExpression(field.value);
                     this.vm.mov(VReg.V1, VReg.RET);
-                    this.vm.pop(VReg.S0);
-                    this.vm.mov(VReg.A0, VReg.S0);
-                    this.vm.load(VReg.A1, VReg.FP, skt);
-                    this.vm.mov(VReg.A2, VReg.V1);
-                    this.vm.call("_object_define");
+                } else {
+                    this.vm.lea(VReg.V1, "_js_undefined");
+                    this.vm.load(VReg.V1, VReg.V1, 0);
                 }
+                this.vm.pop(VReg.S0);
+                this.vm.mov(VReg.A0, VReg.S0);
+                this.vm.load(VReg.A1, VReg.FP, skt);
+                this.vm.mov(VReg.A2, VReg.V1);
+                this.vm.call("_object_define");
                 continue;
             }
+            if (fieldName == null) continue;
             // static #x：键名与实例私有同法改写为 "#ClassName#x"
             if (field.key.type === "PrivateIdentifier") fieldName = "#" + className + fieldName;
             if (field.value) {
@@ -3216,6 +3289,10 @@ export const StatementCompiler = {
                 this.vm.call("_object_define");
             }
         }
+
+        // 实例计算键:类定义作用域求值(外层 var x 可见),存 cfkeys 数组供构造器取。
+        // 放在静态字段之后:static [throw()] 先于后续实例键求值,对齐 abrupt completion。
+        this.emitInstanceComputedKeys(instanceFields, cfkeysLabel);
 
         // 存储类对象到局部变量
         this.vm.store(VReg.FP, classOffset, VReg.S0);

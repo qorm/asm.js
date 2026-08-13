@@ -132,6 +132,7 @@ export class PromiseGenerator {
         this.generateAppendHandler();
         this.generateAggregateError();
         this.generateCombinatorGuard();
+        this.generateCombinatorIter();
         this.generatePromiseAll();
         this.generatePromiseRace();
         this.generatePromiseAllSettled();
@@ -1304,35 +1305,225 @@ export class PromiseGenerator {
         vm.epilogue([VReg.S0, VReg.S1], 32);
     }
 
-    // 组合器公共序幕(S0=输入数组已就位):建结果 promise -> S1、非数组守卫、
-    // 取长度 -> S2、建结果数组(boxed 0x7FFE)与 state 记录 -> S4、remaining=n+1。
-    // mode 由参数写入 state+24。notIterLabel 为非数组时的跳转目标。
-    emitCombinatorPrologue(mode, notIterLabel) {
+    // 组合器公共序幕(S0=iterable 已就位,A5 可能是 C):
+    //   C → SP+80;结果 promise → S1;物化 iterable → S0;C.resolve → SP+88;
+    //   n → S2;结果数组+state → S4;remaining=n+1。
+    // 调用方 prologue ≥128(SP+0..79 = 物化异常帧)。matCatchLabel 承接抛出。
+    emitCombinatorPrologue(mode, matCatchLabel) {
         const vm = this.vm;
+        // C = %Promise% 单例(可能尚未物化 → 0)。0 时 resolve 走 _Promise_resolve 直调。
+        vm.lea(VReg.V0, "_nsobj_promise");
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.store(VReg.SP, 80, VReg.V1);
+
         vm.movImm(VReg.A0, 0);
         vm.call("_promise_new");
-        vm.mov(VReg.S1, VReg.RET); // 结果 promise
-        vm.shrImm(VReg.V1, VReg.S0, 48);
-        vm.cmpImm(VReg.V1, 0x7FFE);
-        vm.jne(notIterLabel);
+        vm.mov(VReg.S1, VReg.RET);
+
+        this.emitExcPush(0, matCatchLabel);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_pcomb_materialize");
+        vm.mov(VReg.S0, VReg.RET);
+
+        vm.load(VReg.V1, VReg.SP, 80);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_pcomb_res_direct_" + mode);
+        vm.mov(VReg.A0, VReg.V1);
+        this.emitStringConst(VReg.A1, "resolve");
+        vm.call("_object_get");
+        vm.shrImm(VReg.V1, VReg.RET, 48);
+        vm.cmpImm(VReg.V1, 0x7FFF);
+        vm.jeq("_pcomb_resok_" + mode);
+        this.emitStringConst(VReg.A0, "Promise resolve function is not callable");
+        vm.call("_throw_type_error");
+        vm.label("_pcomb_res_direct_" + mode);
+        vm.movImm(VReg.V1, 0);
+        vm.store(VReg.SP, 88, VReg.V1); // resolveFn=0 → subscribe 直调 _Promise_resolve
+        vm.jmp("_pcomb_res_done_" + mode);
+        vm.label("_pcomb_resok_" + mode);
+        vm.store(VReg.SP, 88, VReg.RET);
+        vm.label("_pcomb_res_done_" + mode);
+        this.emitExcPop(0);
+
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_array_length");
-        vm.mov(VReg.S2, VReg.RET); // n
+        vm.mov(VReg.S2, VReg.RET);
         vm.mov(VReg.A0, VReg.S2);
         vm.call("_array_new_with_size");
         vm.movImm64(VReg.V1, MASK48);
         vm.and(VReg.V0, VReg.RET, VReg.V1);
         vm.movImm64(VReg.V1, 0x7ffe000000000000n);
-        vm.or(VReg.S3, VReg.V0, VReg.V1); // boxed 结果数组
+        vm.or(VReg.S3, VReg.V0, VReg.V1);
         vm.movImm(VReg.A0, 32);
         vm.call("_alloc");
-        vm.mov(VReg.S4, VReg.RET); // state
+        vm.mov(VReg.S4, VReg.RET);
         vm.store(VReg.S4, 0, VReg.S1);
         vm.store(VReg.S4, 8, VReg.S3);
         vm.addImm(VReg.V1, VReg.S2, 1);
-        vm.store(VReg.S4, 16, VReg.V1); // remaining = n + 1
+        vm.store(VReg.S4, 16, VReg.V1);
         vm.movImm(VReg.V1, mode);
         vm.store(VReg.S4, 24, VReg.V1);
+    }
+
+    // ==================== [test262] 组合器迭代协议 + C.resolve 订阅 ====================
+    // _pcomb_materialize(A0=iterable) -> RET boxed 数组。抛出走 _throw_unwind:
+    //   数组 → 原样;字符串 → 逐码元;其余 → GetIterator 协议(含 value getter 抛出)。
+    // _pcomb_subscribe(A0=C, A1=resolveFn, A2=value, A3=onF, A4=onR):
+    //   nextPromise = Call(resolveFn, C, «value»);
+    //   Promise 品牌 → _promise_then2;否则 Invoke(p,"then",«onF,onR»)(可抛)。
+    generateCombinatorIter() {
+        const vm = this.vm;
+
+        // ---- materialize ----
+        vm.label("_pcomb_materialize");
+        vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.mov(VReg.S0, VReg.A0); // iterable
+        vm.shrImm(VReg.V1, VReg.S0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFE);
+        vm.jeq("_pcm_ret_arr");
+        vm.cmpImm(VReg.V1, 0x7FFC);
+        vm.jeq("_pcm_string");
+        // 通用 GetIterator
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.movImm64(VReg.V1, MASK48);
+        vm.and(VReg.V0, VReg.RET, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffe000000000000n);
+        vm.or(VReg.S1, VReg.V0, VReg.V1); // boxed 空数组
+        vm.mov(VReg.A0, VReg.S0);
+        this.emitStringConst(VReg.A1, "Symbol.iterator");
+        vm.call("_object_get");
+        vm.shrImm(VReg.V2, VReg.RET, 48);
+        vm.cmpImm(VReg.V2, 0x7FFF);
+        vm.jne("_pcm_notiter");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.call("_spread_call0"); // iterator = method.call(obj)
+        vm.mov(VReg.S2, VReg.RET);
+        // Type(iterator) must be Object(0x7FFD) or Array(0x7FFE) or 裸堆
+        vm.shrImm(VReg.V1, VReg.S2, 48);
+        vm.cmpImm(VReg.V1, 0x7FFD);
+        vm.jeq("_pcm_iter_ok");
+        vm.cmpImm(VReg.V1, 0x7FFE);
+        vm.jeq("_pcm_iter_ok");
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_pcm_notiter");
+        vm.cmpImm(VReg.S2, 0);
+        vm.jeq("_pcm_notiter");
+        vm.label("_pcm_iter_ok");
+        vm.label("_pcm_loop");
+        vm.mov(VReg.A0, VReg.S2);
+        this.emitStringConst(VReg.A1, "next");
+        vm.call("_object_get");
+        vm.shrImm(VReg.V2, VReg.RET, 48);
+        vm.cmpImm(VReg.V2, 0x7FFF);
+        vm.jne("_pcm_notiter");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S2);
+        vm.call("_spread_call0");
+        vm.mov(VReg.S3, VReg.RET); // res
+        vm.mov(VReg.A0, VReg.S3);
+        this.emitStringConst(VReg.A1, "done");
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_maybe_getter");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_boolean");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_pcm_ret_s1");
+        vm.mov(VReg.A0, VReg.S3);
+        this.emitStringConst(VReg.A1, "value");
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_maybe_getter"); // 抛出则穿透到调用方异常帧
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_array_push");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.jmp("_pcm_loop");
+
+        vm.label("_pcm_string");
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.movImm64(VReg.V1, MASK48);
+        vm.and(VReg.V0, VReg.RET, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffe000000000000n);
+        vm.or(VReg.S1, VReg.V0, VReg.V1);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_strlen");
+        vm.mov(VReg.S2, VReg.RET); // len
+        vm.movImm(VReg.S3, 0); // i
+        vm.label("_pcm_str_loop");
+        vm.cmp(VReg.S3, VReg.S2);
+        vm.jge("_pcm_ret_s1");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_str_charAt");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_array_push");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_pcm_str_loop");
+
+        vm.label("_pcm_ret_arr");
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
+        vm.label("_pcm_ret_s1");
+        vm.mov(VReg.RET, VReg.S1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
+        vm.label("_pcm_notiter");
+        this.emitStringConst(VReg.A0, "argument is not iterable");
+        vm.call("_throw_type_error"); // 不返回
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
+
+        // ---- subscribe: Call(resolve) + then ----
+        vm.label("_pcomb_subscribe");
+        vm.prologue(112, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
+        vm.mov(VReg.S0, VReg.A0); // C
+        vm.mov(VReg.S1, VReg.A1); // resolveFn
+        vm.mov(VReg.S2, VReg.A2); // value
+        vm.mov(VReg.S3, VReg.A3); // onF
+        vm.mov(VReg.S4, VReg.A4); // onR
+        vm.cmpImm(VReg.S1, 0);
+        vm.jeq("_pcs_direct");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.movImm64(VReg.A3, JS_UNDEFINED);
+        vm.movImm(VReg.A4, 1);
+        vm.call("_promise_invoke2");
+        vm.jmp("_pcs_have_p");
+        vm.label("_pcs_direct");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_Promise_resolve");
+        vm.label("_pcs_have_p");
+        vm.mov(VReg.S2, VReg.RET); // nextPromise
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_is_promise");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_pcs_brand");
+        // Invoke(p, "then", «onF, onR») — 查找/调用可抛,由调用方异常帧承接
+        vm.mov(VReg.A0, VReg.S2);
+        this.emitStringConst(VReg.A1, "then");
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S2);
+        vm.mov(VReg.A2, VReg.S3);
+        vm.mov(VReg.A3, VReg.S4);
+        vm.movImm(VReg.A4, 2);
+        vm.call("_promise_invoke2");
+        vm.movImm64(VReg.RET, JS_UNDEFINED);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 112);
+        vm.label("_pcs_brand");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.mov(VReg.A2, VReg.S4);
+        vm.call("_promise_then2");
+        vm.movImm64(VReg.RET, JS_UNDEFINED);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 112);
     }
 
     // [test262] Promise 组合器参数守卫。all/any/race/allSettled 直接把 A0 当数组
@@ -1394,41 +1585,42 @@ export class PromiseGenerator {
         vm.epilogue([VReg.S0, VReg.S1], 16);
     }
 
-    // Promise.all(A0=array) -> boxed promise
-    // [test262] 按规范逐元素订阅(见 generateCombinatorElem 顶部注释):
-    //   p = Promise.resolve(e); p.then(elem(i, fulfil), reject(result))
-    // 全部 fulfil -> resolve 结果数组;任一 reject -> 以其拒因 reject 结果 promise。
+    // Promise.all(A0=iterable) -> boxed promise
+    // [test262] GetIterator 物化 + Call(C.resolve) + then 订阅:
+    //   p = Call(promiseResolve, C, «e»); p.then(elem(i, fulfil), reject(result))
     generatePromiseAll() {
         const vm = this.vm;
         const SAVED = [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5];
         vm.label("_Promise_all");
-        vm.prologue(48, SAVED);
-        vm.mov(VReg.S0, VReg.A0); // 输入数组
-        this.emitCombinatorPrologue(0, "_pall_notiter");
-        // 共享 reject:任一元素失败即整体失败
+        vm.prologue(128, SAVED);
+        vm.mov(VReg.S0, VReg.A0);
+        this.emitCombinatorPrologue(0, "_pall_catch");
         vm.mov(VReg.A0, VReg.S1);
         vm.movImm(VReg.A1, 1);
         vm.call("_promise_make_resolver");
         vm.mov(VReg.S5, VReg.RET);
 
-        vm.movImm(VReg.S3, 0); // i
+        vm.movImm(VReg.S3, 0);
         vm.label("_pall_loop");
         vm.cmp(VReg.S3, VReg.S2);
         vm.jge("_pall_done");
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S3);
         vm.call("_array_get");
-        vm.mov(VReg.A0, VReg.RET);
-        vm.call("_Promise_resolve"); // 非 promise/thenable 一律包成 promise
-        vm.store(VReg.SP, 0, VReg.RET); // p 溢出到局部区(S 寄存器已用尽)
+        vm.store(VReg.SP, 96, VReg.RET); // value
         vm.mov(VReg.A0, VReg.S4);
         vm.mov(VReg.A1, VReg.S3);
         vm.movImm(VReg.A2, 0);
         vm.call("_pcomb_make_elem");
-        vm.mov(VReg.A1, VReg.RET); // onFulfil(先搬走:arm64 上 RET 与 A0 同寄存器)
-        vm.load(VReg.A0, VReg.SP, 0);
-        vm.mov(VReg.A2, VReg.S5);
-        vm.call("_promise_then2");
+        vm.store(VReg.SP, 104, VReg.RET); // onFulfil
+        this.emitExcPush(0, "_pall_catch");
+        vm.load(VReg.A0, VReg.SP, 80); // C
+        vm.load(VReg.A1, VReg.SP, 88); // resolveFn
+        vm.load(VReg.A2, VReg.SP, 96); // value
+        vm.load(VReg.A3, VReg.SP, 104); // onF
+        vm.mov(VReg.A4, VReg.S5); // onR = shared reject
+        vm.call("_pcomb_subscribe");
+        this.emitExcPop(0);
         vm.addImm(VReg.S3, VReg.S3, 1);
         vm.jmp("_pall_loop");
 
@@ -1436,13 +1628,15 @@ export class PromiseGenerator {
         vm.mov(VReg.A0, VReg.S4);
         vm.call("_pcomb_release");
         vm.mov(VReg.RET, VReg.S1);
-        vm.epilogue(SAVED, 48);
+        vm.epilogue(SAVED, 128);
 
-        vm.label("_pall_notiter");
+        vm.label("_pall_catch");
+        this.emitExcPop(0);
         vm.mov(VReg.A0, VReg.S1);
-        vm.call("_combinator_reject_notiterable");
+        this.emitTakeException(VReg.A1);
+        vm.call("_promise_reject");
         vm.mov(VReg.RET, VReg.S1);
-        vm.epilogue(SAVED, 48);
+        vm.epilogue(SAVED, 128);
     }
 
     // [#36/#57] f.bind(thisArg, ...boundArgs) 的绑定蹦床。绑定闭包布局
@@ -1529,18 +1723,15 @@ export class PromiseGenerator {
         vm.jmpIndirect(VReg.V5);
     }
 
-    // [#35] Promise.any(A0=array) -> boxed promise
-    // [test262] 逐元素订阅:首个 fulfil 直接 resolve 结果 promise;每个 reject 把
-    // 拒因按下标存进 errors 数组并递减 remaining,归零(全 reject)时以
-    // AggregateError{name,message,errors} reject。
+    // [#35] Promise.any(A0=iterable) -> boxed promise
+    // [test262] 首个 fulfil 胜出;全 reject → AggregateError。
     generatePromiseAny() {
         const vm = this.vm;
         const SAVED = [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5];
         vm.label("_Promise_any");
-        vm.prologue(48, SAVED);
+        vm.prologue(128, SAVED);
         vm.mov(VReg.S0, VReg.A0);
-        this.emitCombinatorPrologue(2, "_pany_notiter");
-        // 共享 resolve:任一元素成功即整体成功
+        this.emitCombinatorPrologue(2, "_pany_catch");
         vm.mov(VReg.A0, VReg.S1);
         vm.movImm(VReg.A1, 0);
         vm.call("_promise_make_resolver");
@@ -1553,17 +1744,20 @@ export class PromiseGenerator {
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S3);
         vm.call("_array_get");
-        vm.mov(VReg.A0, VReg.RET);
-        vm.call("_Promise_resolve");
-        vm.store(VReg.SP, 0, VReg.RET);
+        vm.store(VReg.SP, 96, VReg.RET);
         vm.mov(VReg.A0, VReg.S4);
         vm.mov(VReg.A1, VReg.S3);
         vm.movImm(VReg.A2, 1);
         vm.call("_pcomb_make_elem");
-        vm.mov(VReg.A2, VReg.RET); // onReject(先搬走:arm64 上 RET 与 A0 同寄存器)
-        vm.load(VReg.A0, VReg.SP, 0);
-        vm.mov(VReg.A1, VReg.S5);
-        vm.call("_promise_then2");
+        vm.store(VReg.SP, 104, VReg.RET); // onReject
+        this.emitExcPush(0, "_pany_catch");
+        vm.load(VReg.A0, VReg.SP, 80);
+        vm.load(VReg.A1, VReg.SP, 88);
+        vm.load(VReg.A2, VReg.SP, 96);
+        vm.mov(VReg.A3, VReg.S5); // onF = shared resolve
+        vm.load(VReg.A4, VReg.SP, 104); // onR
+        vm.call("_pcomb_subscribe");
+        this.emitExcPop(0);
         vm.addImm(VReg.S3, VReg.S3, 1);
         vm.jmp("_pany_loop");
 
@@ -1571,13 +1765,15 @@ export class PromiseGenerator {
         vm.mov(VReg.A0, VReg.S4);
         vm.call("_pcomb_release");
         vm.mov(VReg.RET, VReg.S1);
-        vm.epilogue(SAVED, 48);
+        vm.epilogue(SAVED, 128);
 
-        vm.label("_pany_notiter");
+        vm.label("_pany_catch");
+        this.emitExcPop(0);
         vm.mov(VReg.A0, VReg.S1);
-        vm.call("_combinator_reject_notiterable");
+        this.emitTakeException(VReg.A1);
+        vm.call("_promise_reject");
         vm.mov(VReg.RET, VReg.S1);
-        vm.epilogue(SAVED, 48);
+        vm.epilogue(SAVED, 128);
     }
 
     // p.finally(cb) —— 规范 27.2.5.3 的去糖形态:
@@ -1654,22 +1850,47 @@ export class PromiseGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32); // 理论不达
     }
 
-    // Promise.race(A0=array) -> boxed promise
-    // [test262] 逐元素订阅同一对 resolve/reject:首个结算者胜出(后续 settle 被
-    // _promise_resolve/_promise_reject 的已结算守卫忽略)。空数组永远 pending(合规)。
+    // Promise.race(A0=iterable) -> boxed promise
+    // [test262] Call(C.resolve)+then 订阅同一对 resolve/reject;空 iterable 永 pending。
     generatePromiseRace() {
         const vm = this.vm;
         const SAVED = [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5];
         vm.label("_Promise_race");
-        vm.prologue(48, SAVED);
+        vm.prologue(128, SAVED);
         vm.mov(VReg.S0, VReg.A0);
+        // C = %Promise%(快路径 A5 不可靠;resolve 猴子补丁仍经 Get 生效)
+        vm.lea(VReg.V0, "_nsobj_promise");
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.store(VReg.SP, 80, VReg.V1);
+
         vm.movImm(VReg.A0, 0);
         vm.call("_promise_new");
         vm.mov(VReg.S1, VReg.RET);
-        // [test262] 参数守卫:非数组(tag != 0x7FFE)→ reject TypeError,不解引用
-        vm.shrImm(VReg.V1, VReg.S0, 48);
-        vm.cmpImm(VReg.V1, 0x7FFE);
-        vm.jne("_prc_notiter");
+
+        this.emitExcPush(0, "_prc_catch");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_pcomb_materialize");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.load(VReg.V1, VReg.SP, 80);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_prc_res_direct");
+        vm.mov(VReg.A0, VReg.V1);
+        this.emitStringConst(VReg.A1, "resolve");
+        vm.call("_object_get");
+        vm.shrImm(VReg.V1, VReg.RET, 48);
+        vm.cmpImm(VReg.V1, 0x7FFF);
+        vm.jeq("_prc_resok");
+        this.emitStringConst(VReg.A0, "Promise resolve function is not callable");
+        vm.call("_throw_type_error");
+        vm.label("_prc_res_direct");
+        vm.movImm(VReg.V1, 0);
+        vm.store(VReg.SP, 88, VReg.V1);
+        vm.jmp("_prc_res_done");
+        vm.label("_prc_resok");
+        vm.store(VReg.SP, 88, VReg.RET);
+        vm.label("_prc_res_done");
+        this.emitExcPop(0);
+
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_array_length");
         vm.mov(VReg.S2, VReg.RET);
@@ -1689,36 +1910,40 @@ export class PromiseGenerator {
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S3);
         vm.call("_array_get");
-        vm.mov(VReg.A0, VReg.RET);
-        vm.call("_Promise_resolve");
-        vm.mov(VReg.A0, VReg.RET);
-        vm.mov(VReg.A1, VReg.S4);
-        vm.mov(VReg.A2, VReg.S5);
-        vm.call("_promise_then2");
+        vm.store(VReg.SP, 96, VReg.RET);
+        this.emitExcPush(0, "_prc_catch");
+        vm.load(VReg.A0, VReg.SP, 80);
+        vm.load(VReg.A1, VReg.SP, 88);
+        vm.load(VReg.A2, VReg.SP, 96);
+        vm.mov(VReg.A3, VReg.S4);
+        vm.mov(VReg.A4, VReg.S5);
+        vm.call("_pcomb_subscribe");
+        this.emitExcPop(0);
         vm.addImm(VReg.S3, VReg.S3, 1);
         vm.jmp("_prc_loop");
 
         vm.label("_prc_done");
         vm.mov(VReg.RET, VReg.S1);
-        vm.epilogue(SAVED, 48);
+        vm.epilogue(SAVED, 128);
 
-        vm.label("_prc_notiter");
+        vm.label("_prc_catch");
+        this.emitExcPop(0);
         vm.mov(VReg.A0, VReg.S1);
-        vm.call("_combinator_reject_notiterable");
+        this.emitTakeException(VReg.A1);
+        vm.call("_promise_reject");
         vm.mov(VReg.RET, VReg.S1);
-        vm.epilogue(SAVED, 48);
+        vm.epilogue(SAVED, 128);
     }
 
-    // Promise.allSettled(A0=array) -> boxed promise (resolve 结果数组)
-    // [test262] 逐元素订阅,fulfil/reject 两条链各挂一个 elem 闭包(kind 决定
-    // {status:"fulfilled",value} 还是 {status:"rejected",reason});全部落位后 resolve。
+    // Promise.allSettled(A0=iterable) -> boxed promise
+    // [test262] fulfil/reject 各挂 elem 闭包;全部落位后 resolve 结果数组。
     generatePromiseAllSettled() {
         const vm = this.vm;
         const SAVED = [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5];
         vm.label("_Promise_allSettled");
-        vm.prologue(48, SAVED);
+        vm.prologue(128, SAVED);
         vm.mov(VReg.S0, VReg.A0);
-        this.emitCombinatorPrologue(1, "_pas_notiter");
+        this.emitCombinatorPrologue(1, "_pas_catch");
 
         vm.movImm(VReg.S3, 0);
         vm.label("_pas_loop");
@@ -1727,22 +1952,25 @@ export class PromiseGenerator {
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S3);
         vm.call("_array_get");
-        vm.mov(VReg.A0, VReg.RET);
-        vm.call("_Promise_resolve");
-        vm.store(VReg.SP, 0, VReg.RET); // p
+        vm.store(VReg.SP, 96, VReg.RET);
         vm.mov(VReg.A0, VReg.S4);
         vm.mov(VReg.A1, VReg.S3);
         vm.movImm(VReg.A2, 0);
         vm.call("_pcomb_make_elem");
-        vm.store(VReg.SP, 8, VReg.RET); // onFulfil
+        vm.store(VReg.SP, 104, VReg.RET); // onFulfil
         vm.mov(VReg.A0, VReg.S4);
         vm.mov(VReg.A1, VReg.S3);
         vm.movImm(VReg.A2, 1);
         vm.call("_pcomb_make_elem");
-        vm.mov(VReg.A2, VReg.RET); // onReject(先搬走:arm64 上 RET 与 A0 同寄存器)
-        vm.load(VReg.A0, VReg.SP, 0);
-        vm.load(VReg.A1, VReg.SP, 8);
-        vm.call("_promise_then2");
+        vm.store(VReg.SP, 112, VReg.RET); // onReject
+        this.emitExcPush(0, "_pas_catch");
+        vm.load(VReg.A0, VReg.SP, 80);
+        vm.load(VReg.A1, VReg.SP, 88);
+        vm.load(VReg.A2, VReg.SP, 96);
+        vm.load(VReg.A3, VReg.SP, 104);
+        vm.load(VReg.A4, VReg.SP, 112);
+        vm.call("_pcomb_subscribe");
+        this.emitExcPop(0);
         vm.addImm(VReg.S3, VReg.S3, 1);
         vm.jmp("_pas_loop");
 
@@ -1750,13 +1978,15 @@ export class PromiseGenerator {
         vm.mov(VReg.A0, VReg.S4);
         vm.call("_pcomb_release");
         vm.mov(VReg.RET, VReg.S1);
-        vm.epilogue(SAVED, 48);
+        vm.epilogue(SAVED, 128);
 
-        vm.label("_pas_notiter");
+        vm.label("_pas_catch");
+        this.emitExcPop(0);
         vm.mov(VReg.A0, VReg.S1);
-        vm.call("_combinator_reject_notiterable");
+        this.emitTakeException(VReg.A1);
+        vm.call("_promise_reject");
         vm.mov(VReg.RET, VReg.S1);
-        vm.epilogue(SAVED, 48);
+        vm.epilogue(SAVED, 128);
     }
 
     // [I2 一等值] _promise_ctor_call - `Promise()` 不带 new(经值路径调用,如

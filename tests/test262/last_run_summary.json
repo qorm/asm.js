@@ -1,6 +1,6 @@
 {
-  "generated": "2026-08-09T09:20:21.199Z",
-  "runnerSha": "0b4469464982c79bf784e2f2061f32119dd0a010",
+  "generated": "2026-08-13T05:36:41.503Z",
+  "runnerSha": "177197b432f0fca39cefc1eb0d62043c25d17af5",
   "corpusPin": "9e61c12835c5e4a3bdba93850427e6742c4f64c4",
   "config": {
     "corpus": ".test262-corpus",
@@ -48,18 +48,18 @@
   "eligible": 31563,
   "run": 6313,
   "totals": {
-    "PASS": 4173,
-    "FAIL": 2031,
+    "PASS": 4431,
+    "FAIL": 1769,
     "COMPILE_FAIL": 43,
-    "CRASH": 66
+    "CRASH": 70
   },
-  "passRatePct": 66.1,
+  "passRatePct": 70.19,
   "byArea": {
     "built-ins/Array": {
-      "PASS": 362,
-      "FAIL": 232,
+      "PASS": 399,
+      "FAIL": 190,
       "COMPILE_FAIL": 0,
-      "CRASH": 0
+      "CRASH": 5
     },
     "built-ins/Boolean": {
       "PASS": 9,
@@ -80,8 +80,8 @@
       "CRASH": 0
     },
     "built-ins/Math": {
-      "PASS": 51,
-      "FAIL": 14,
+      "PASS": 53,
+      "FAIL": 12,
       "COMPILE_FAIL": 0,
       "CRASH": 0
     },
@@ -92,84 +92,84 @@
       "CRASH": 0
     },
     "built-ins/Object": {
-      "PASS": 466,
-      "FAIL": 214,
+      "PASS": 545,
+      "FAIL": 135,
       "COMPILE_FAIL": 1,
       "CRASH": 0
     },
     "built-ins/Promise": {
-      "PASS": 69,
-      "FAIL": 58,
+      "PASS": 78,
+      "FAIL": 47,
       "COMPILE_FAIL": 0,
-      "CRASH": 0
+      "CRASH": 2
     },
     "built-ins/RegExp": {
-      "PASS": 201,
-      "FAIL": 172,
+      "PASS": 229,
+      "FAIL": 144,
       "COMPILE_FAIL": 0,
       "CRASH": 1
     },
     "built-ins/Set": {
-      "PASS": 42,
-      "FAIL": 32,
+      "PASS": 51,
+      "FAIL": 23,
       "COMPILE_FAIL": 0,
       "CRASH": 2
     },
     "built-ins/String": {
-      "PASS": 153,
-      "FAIL": 89,
+      "PASS": 178,
+      "FAIL": 65,
       "COMPILE_FAIL": 0,
-      "CRASH": 1
+      "CRASH": 0
     },
     "built-ins/Symbol": {
       "PASS": 11,
-      "FAIL": 4,
+      "FAIL": 5,
       "COMPILE_FAIL": 0,
-      "CRASH": 1
+      "CRASH": 0
     },
     "built-ins/TypedArray": {
-      "PASS": 68,
-      "FAIL": 104,
+      "PASS": 69,
+      "FAIL": 103,
       "COMPILE_FAIL": 0,
       "CRASH": 19
     },
     "language/expressions": {
-      "PASS": 1368,
-      "FAIL": 559,
+      "PASS": 1403,
+      "FAIL": 523,
       "COMPILE_FAIL": 29,
-      "CRASH": 19
+      "CRASH": 20
     },
     "language/statements": {
-      "PASS": 1266,
-      "FAIL": 521,
+      "PASS": 1299,
+      "FAIL": 490,
       "COMPILE_FAIL": 13,
-      "CRASH": 22
+      "CRASH": 20
     }
   },
   "topFailPatterns": [
     {
       "pattern": "FAIL: assertion mismatch (Test262Error / wrong value)",
-      "count": 1317
+      "count": 1171
     },
     {
       "pattern": "FAIL: async ($DONE not signalled / promise rejected)",
-      "count": 265
+      "count": 256
     },
     {
       "pattern": "FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)",
-      "count": 209
-    },
-    {
-      "pattern": "FAIL: array contents mismatch (compareArray)",
-      "count": 83
+      "count": 109
     },
     {
       "pattern": "FAIL: negative test wrong outcome (phase=parse)",
       "count": 81
     },
     {
+      "pattern": "FAIL: array contents mismatch (compareArray)",
+      "count": 78
+    },
+    {
       "pattern": "FAIL: TypedArray/ArrayBuffer semantics",
-      "count": 60
+      "count": 59
     },
     {
       "pattern": "COMPILE_FAIL: asm.js could not compile (unsupported syntax / parser gap)",
@@ -177,15 +177,15 @@
     },
     {
       "pattern": "CRASH: run timeout",
-      "count": 38
+      "count": 41
     },
     {
       "pattern": "CRASH: run signal SIGSEGV",
-      "count": 24
+      "count": 25
     },
     {
       "pattern": "FAIL: constructor-ness reflection (isConstructor / not-a-constructor)",
-      "count": 14
+      "count": 13
     },
     {
       "pattern": "CRASH: run signal SIGBUS",

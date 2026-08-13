@@ -564,6 +564,7 @@ export const BuiltinMethodCompiler = {
                 this.emitArrayCtorObject();
                 this.vm.load(VReg.A1, VReg.FP, _ss);
                 this.vm.pop(VReg.A0);
+                this.vm.movImm64(VReg.A2, 0x7ffb000000000000n); // 省略 limit;截断在下方 slice
                 this.vm.call("_str_split"); // RET = boxed 数组
                 if (args.length >= 2) {
                     // [limit] 截断到 limit 个元素:_array_slice(unbox, 0, limit) 再装箱。

@@ -70,6 +70,7 @@ const ArefMethodRef = {
         matchAll: ["_str_matchAll", 1],  // [L3]
         search: ["_str_search", 1],     // [L3]
         indexOf: ["_aref_str_indexOf", 1],
+        lastIndexOf: ["_aref_str_lastIndexOf", 1],
     },
 };
 
@@ -225,7 +226,7 @@ const STRING_PROTO_METHODS = [
     ["toLocaleLowerCase", "_str_toLowerCase", 0],
     ["charAt", "_str_charAt", 1],
     ["charCodeAt", "_str_charCodeAt", 1],
-    ["codePointAt", "_str_codepoint_at", 1],
+    ["codePointAt", "_str_proto_codePointAt", 1],
     ["trim", "_str_trim", 0],
     ["trimStart", "_str_trimStart", 0],
     ["trimEnd", "_str_trimEnd", 0],
@@ -234,12 +235,12 @@ const STRING_PROTO_METHODS = [
     ["substr", "_str_substr", 2],
     ["at", "_str_at", 1],
     ["indexOf", "_aref_str_indexOf", 1],
-    ["lastIndexOf", "_str_lastIndexOf", 1],
+    ["lastIndexOf", "_aref_str_lastIndexOf", 1],
     ["includes", "_str_includes", 1],
     ["startsWith", "_str_startsWith", 1],
     ["endsWith", "_str_endsWith", 1],
     ["repeat", "_str_repeat", 1],
-    ["concat", "_strconcat", 1],
+    ["concat", "_str_concat", 1],
     ["padStart", "_str_padStart", 1],
     ["padEnd", "_str_padEnd", 1],
     ["match", "_str_match", 1],
@@ -249,7 +250,7 @@ const STRING_PROTO_METHODS = [
     ["replace", "_str_replace", 2],
     ["replaceAll", "_str_replaceAll", 2],
     ["localeCompare", "_str_localeCompare", 1],
-    ["normalize", "_str_toString_wrapper", 0],
+    ["normalize", "_str_normalize", 0],
     ["toString", "_str_toString_wrapper", 0],
     ["valueOf", "_str_valueOf", 0],
     ["constructor", null, 1],
@@ -429,9 +430,15 @@ const REGEXP_PROTO_SYMBOL_METHODS = [
 // `Math.abs === Object.getOwnPropertyDescriptor(Math,"abs").value` 且每 helper 仅建一次。
 // attrs 落 writable|configurable(=5,enumerable:false),即规范 17 节内建数据属性约定。
 //
-// 未收录的静态(max/min/hypot/imul/random/sign/f16round/sumPrecise/Symbol.toStringTag):
-// 编译器把它们**内联展开**(builtin_math.js),无单一 helper 标签可包成闭包 → 作值读取
-// 无正确实现可给,宁缺勿滥(留作后续批次)。对应 own property 仍缺失,记偏差。
+// 合成一等值(无单一 runtime helper、调用位仍走 builtin_math.js 内联):sign/imul。
+// 经 emitSynthStaticRef 落 Math own prop + .name/.length(attr 4),翻转 */name.js、
+// */length.js、prop-desc.js、not-a-constructor.js。值路径调用走合成体;语法调用
+// Math.sign(x)/Math.imul(a,b) 仍先命中 compileMathMethod → 快路字节不变。
+// 仍未收录(需 argc/熵源/新 helper):max/min/hypot/random/f16round/sumPrecise/@@toStringTag。
+const MATH_NS_SYNTH = {
+    sign: { arity: 1 },
+    imul: { arity: 2 },
+};
 const MATH_NS_CONST_BITS = {
     E: 0x4005bf0a8b145769n,
     LN10: 0x40026bb1bbb55516n,
@@ -959,6 +966,15 @@ export const MemberCompiler = {
             emitProp(mname, BUILTIN_PROP_ATTR,
                 () => this.emitMemoizedBuiltinRef("math_" + mname, helper, mname));
         }
+        // [W11 Desc] sign/imul 合成一等值(无单一 helper;调用快路仍内联)
+        for (const mname of Object.keys(MATH_NS_SYNTH)) {
+            const arity = MATH_NS_SYNTH[mname].arity;
+            emitProp(mname, BUILTIN_PROP_ATTR, () => {
+                const ast = mname === "sign" ? this._mathSignSynthAst()
+                    : this._mathImulSynthAst();
+                this.emitSynthStaticRef("math_" + mname, ast, mname, arity);
+            });
+        }
         vm.lea(VReg.V0, slot);
         vm.load(VReg.RET, VReg.V0, 0);
         vm.label(doneL);
@@ -1021,6 +1037,15 @@ export const MemberCompiler = {
         return !!((this.ctx.getLocal && this.ctx.getLocal("Number")) ||
             (this.ctx.getFunction && this.ctx.getFunction("Number")) ||
             (this.ctx.getMainCapturedVar && this.ctx.getMainCapturedVar("Number")));
+    },
+
+    // [Function.prototype 物化] `Function` 标识符被遮蔽?同 stringNameShadowed 守卫组。
+    // 裸 Function 标识符仍发哨兵 3(instanceof Function 快路);仅 `Function.prototype`
+    // 值读走物化。遮蔽时退回通用路径。
+    functionNameShadowed() {
+        return !!((this.ctx.getLocal && this.ctx.getLocal("Function")) ||
+            (this.ctx.getFunction && this.ctx.getFunction("Function")) ||
+            (this.ctx.getMainCapturedVar && this.ctx.getMainCapturedVar("Function")));
     },
 
     // [底层A] `Array` 标识符被遮蔽?同 numberNameShadowed 守卫组。
@@ -1162,17 +1187,76 @@ export const MemberCompiler = {
     },
 
     _regexpGetterAst(flagName, defaultLit) {
-        // [flag getter brand check] 在读取属性前调用 __RE_flag_brand_check(this);
-        // 非 RegExp 实例时抛 TypeError(规范 22.2.6)。不用 AST IfStatement,
-        // 按 runtime shim 方式把品牌检查收敛到 __regexp_shim.js 的导出函数中。
-        const brandCheck = {
-            type: "ExpressionStatement",
-            expression: {
-                type: "CallExpression",
-                callee: { type: "Identifier", name: "__RE_flag_brand_check" },
-                arguments: [{ type: "ThisExpression" }],
+        // [flag getter brand check] 内联 AST(无 module 自由变量)。
+        // 不可 Call 导入的 __RE_flag_brand_check:getter 闭包捕获 import 绑定会在
+        // 与 Array.from/of 或 emitCallbackGuard 同在时破坏 _maybe_getter 的 this/调用约定
+        // → gen1 编译 gen2 时 SIGSEGV(ldrb [x8] @ 0x1)。规范 22.2.6。
+        const thisExpr = () => ({ type: "ThisExpression" });
+        const throwTE = () => ({
+            type: "ThrowStatement",
+            argument: {
+                type: "NewExpression",
+                callee: { type: "Identifier", name: "TypeError" },
+                arguments: [{
+                    type: "Literal",
+                    value: "Method RegExp.prototype.flags getter called on incompatible receiver",
+                }],
             },
-        };
+        });
+        const typeofThis = () => ({
+            type: "UnaryExpression", operator: "typeof", prefix: true, argument: thisExpr(),
+        });
+        const brandGuards = [
+            {
+                type: "IfStatement",
+                test: {
+                    type: "BinaryExpression",
+                    operator: "==",
+                    left: thisExpr(),
+                    right: { type: "Literal", value: null },
+                },
+                consequent: throwTE(),
+                alternate: null,
+            },
+            {
+                type: "IfStatement",
+                test: {
+                    type: "LogicalExpression",
+                    operator: "&&",
+                    left: {
+                        type: "BinaryExpression",
+                        operator: "!==",
+                        left: typeofThis(),
+                        right: { type: "Literal", value: "object" },
+                    },
+                    right: {
+                        type: "BinaryExpression",
+                        operator: "!==",
+                        left: typeofThis(),
+                        right: { type: "Literal", value: "function" },
+                    },
+                },
+                consequent: throwTE(),
+                alternate: null,
+            },
+            {
+                type: "IfStatement",
+                test: {
+                    type: "BinaryExpression",
+                    operator: "!==",
+                    left: {
+                        type: "MemberExpression",
+                        object: thisExpr(),
+                        property: { type: "Identifier", name: "__isRegExp" },
+                        computed: false,
+                        optional: false,
+                    },
+                    right: { type: "Literal", value: true },
+                },
+                consequent: throwTE(),
+                alternate: null,
+            },
+        ];
         let arg = this._reThisPropAst(flagName);
         if (defaultLit !== null) {
             arg = {
@@ -1193,10 +1277,7 @@ export const MemberCompiler = {
             params: [],
             body: {
                 type: "BlockStatement",
-                body: [
-                    brandCheck,
-                    { type: "ReturnStatement", argument: arg },
-                ],
+                body: brandGuards.concat([{ type: "ReturnStatement", argument: arg }]),
             },
         };
     },
@@ -1528,11 +1609,21 @@ export const MemberCompiler = {
         vm.call("_closure_prop_set");
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("name", VReg.A1);
+        vm.movImm(VReg.A2, 4); // configurable, not writable, not enumerable
+        vm.call("_closure_prop_set_attr");
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
         this.emitBoxedStringKey("length", VReg.A1);
         vm.movImm(VReg.A2, 1);
         vm.scvtf(0, VReg.A2);
         vm.fmovToInt(VReg.A2, 0);
         vm.call("_closure_prop_set");
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("length", VReg.A1);
+        vm.movImm(VReg.A2, 0); // writable:false, enumerable:false, configurable:false
+        vm.call("_closure_prop_set_attr");
         // 原型对象
         vm.call("_object_new");
         vm.call("_box_obj_r");
@@ -1574,6 +1665,11 @@ export const MemberCompiler = {
         vm.lea(VReg.V0, protoSlot);
         vm.load(VReg.A2, VReg.V0, 0);
         vm.call("_closure_prop_set");
+        vm.lea(VReg.V0, ctorSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("prototype", VReg.A1);
+        vm.movImm(VReg.A2, BUILTIN_CONST_ATTR); // 规范全 false
+        vm.call("_closure_prop_set_attr");
         // [W3] 静态方法 fromCharCode/fromCodePoint 作构造器闭包属性(attr 5,规范 21.1.2;
         // 落位顺序与 Node gOPN 一致)。值经 emitStringStaticRef 的合成函数 memoized 闭包
         // (与静态值读同槽 → String.fromCharCode === gOPD(String,"fromCharCode").value);
@@ -1619,6 +1715,29 @@ export const MemberCompiler = {
         this.emitStringCtorObject(); // 填两槽(RET = 构造器,下面重载原型)
         vm.lea(VReg.V0, protoSlot);
         vm.load(VReg.RET, VReg.V0, 0);
+        vm.label(doneL);
+    },
+
+    // [Function.prototype 物化] `Function.prototype` 值读:惰性单例真对象(0x7FFD)。
+    // 此前裸 Function 是哨兵 3,`Function.prototype` 经 _object_get(3,"prototype") 得
+    // undefined → Object.defineProperty(Function.prototype, …) 抛
+    // "Cannot define property, target is not an object"(test262 13.2-18-1)。
+    // 只物化原型对象、不改 Function 标识符哨兵 → instanceof Function 字节不变。
+    // 不挂 call/apply:静态链 `Function.prototype.call` 仍走取值特判(先于本路径)。
+    // 编译器源不含 `Function.prototype` 值读 → 自举不触发本物化,仅 members.js 体积微增。
+    emitFunctionProtoObject() {
+        const vm = this.vm;
+        const protoSlot = "_nsobj_function_proto";
+        this._reEnsureSlot(protoSlot);
+        const doneL = this.ctx.newLabel("nsfnproto_done");
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne(doneL);
+        vm.call("_object_new");
+        vm.call("_box_obj_r");
+        vm.lea(VReg.V1, protoSlot);
+        vm.store(VReg.V1, 0, VReg.RET);
         vm.label(doneL);
     },
 
@@ -2017,7 +2136,7 @@ export const MemberCompiler = {
     // 此处只发闭包创建码),RET = 装箱闭包存槽;name/length 经 _closure_prop_set 落侧表
     // (合成函数匿名普通函数 → registerFuncMeta 丢弃不入表,name/length 写守卫放行)。
     // 构造器物化与静态值读两处同槽 → X.m === gOPD(X,"m").value 恒等。
-    emitSynthStaticRef(slotKey, ast, propName, arity) {
+    emitSynthStaticRef(slotKey, ast, propName, arity, wrapNonCtor) {
         const vm = this.vm;
         const label = "_builtinref_" + slotKey;
         if (!this._addedBuiltinRefLabels) this._addedBuiltinRefLabels = new Set();
@@ -2032,6 +2151,24 @@ export const MemberCompiler = {
         vm.cmpImm(VReg.RET, 0);
         vm.jne(doneL);
         this.compileFunctionExpression(ast); // RET = 装箱闭包(16B,零捕获)
+        if (wrapNonCtor) {
+            // 24B {magic, _aref_static_tramp, synth func_ptr@16}:
+            // compileDynamicNew 见 fnptr==_aref_static_tramp → TypeError
+            // (fromCharCode/fromCodePoint/raw 不可 new)。
+            vm.emitMaskLoad(VReg.V1);
+            vm.andMaskReg(VReg.S1, VReg.RET, VReg.V1);
+            vm.load(VReg.S1, VReg.S1, 8); // S1 = 合成函数入口(_alloc 保 S0-S3)
+            vm.movImm(VReg.A0, 24);
+            vm.call("_alloc");
+            vm.mov(VReg.S0, VReg.RET);
+            vm.movImm(VReg.V1, 0xc105);
+            vm.store(VReg.S0, 0, VReg.V1);
+            vm.lea(VReg.V1, "_aref_static_tramp");
+            vm.store(VReg.S0, 8, VReg.V1);
+            vm.store(VReg.S0, 16, VReg.S1);
+            vm.mov(VReg.A0, VReg.S0);
+            vm.call("_js_box_function");
+        }
         vm.lea(VReg.V1, label);
         vm.store(VReg.V1, 0, VReg.RET);
         vm.mov(VReg.S0, VReg.RET);           // 跨 call 暂存
@@ -2042,14 +2179,118 @@ export const MemberCompiler = {
         vm.or(VReg.A2, VReg.A2, VReg.V1);
         vm.call("_closure_prop_set");
         vm.mov(VReg.A0, VReg.S0);
+        this.emitBoxedStringKey("name", VReg.A1);
+        vm.movImm(VReg.A2, 4); // configurable, not writable, not enumerable (ES 20.2.1)
+        vm.call("_closure_prop_set_attr");
+        vm.mov(VReg.A0, VReg.S0);
         this.emitBoxedStringKey("length", VReg.A1);
         vm.movImm(VReg.A2, arity);
         vm.scvtf(0, VReg.A2);
         vm.fmovToInt(VReg.A2, 0);
         vm.call("_closure_prop_set");
+        vm.mov(VReg.A0, VReg.S0);
+        this.emitBoxedStringKey("length", VReg.A1);
+        vm.movImm(VReg.A2, 4); // configurable, not writable, not enumerable (ES 20.2.1)
+        vm.call("_closure_prop_set_attr");
         vm.lea(VReg.V0, label);
         vm.load(VReg.RET, VReg.V0, 0);
         vm.label(doneL);
+    },
+
+    // [W11 Desc] Math.sign 合成体:ToNumber 后保 ±0 / NaN,正→1、负→-1。
+    // 语法调用 Math.sign(x) 仍走 builtin_math.js 内联;本 AST 仅服务一等值路径。
+    _mathSignSynthAst() {
+        const id = (name) => ({ type: "Identifier", name: name });
+        const lit = (value) => ({ type: "Literal", value: value });
+        const x = id("x");
+        return {
+            type: "FunctionExpression",
+            id: null,
+            params: [x],
+            body: {
+                type: "BlockStatement",
+                body: [
+                    {
+                        type: "ExpressionStatement",
+                        expression: {
+                            type: "AssignmentExpression",
+                            operator: "=",
+                            left: x,
+                            right: {
+                                type: "UnaryExpression",
+                                operator: "+",
+                                prefix: true,
+                                argument: x,
+                            },
+                        },
+                    },
+                    {
+                        type: "IfStatement",
+                        test: {
+                            type: "BinaryExpression",
+                            operator: "!==",
+                            left: x,
+                            right: x,
+                        },
+                        consequent: { type: "ReturnStatement", argument: x },
+                        alternate: null,
+                    },
+                    {
+                        type: "IfStatement",
+                        test: {
+                            type: "BinaryExpression",
+                            operator: ">",
+                            left: x,
+                            right: lit(0),
+                        },
+                        consequent: { type: "ReturnStatement", argument: lit(1) },
+                        alternate: null,
+                    },
+                    {
+                        type: "IfStatement",
+                        test: {
+                            type: "BinaryExpression",
+                            operator: "<",
+                            left: x,
+                            right: lit(0),
+                        },
+                        consequent: { type: "ReturnStatement", argument: lit(-1) },
+                        alternate: null,
+                    },
+                    { type: "ReturnStatement", argument: x },
+                ],
+            },
+        };
+    },
+
+    // [W11 Desc] Math.imul 合成体:ToInt32 近似 (`|0`) 后乘积再 `|0`。
+    // 大 uint32 边角与原生 ToUint32 路径有偏差;语法调用仍走 builtin_math.js 精确内联。
+    _mathImulSynthAst() {
+        const id = (name) => ({ type: "Identifier", name: name });
+        const lit = (value) => ({ type: "Literal", value: value });
+        const toInt = (expr) => ({
+            type: "BinaryExpression",
+            operator: "|",
+            left: expr,
+            right: lit(0),
+        });
+        return {
+            type: "FunctionExpression",
+            id: null,
+            params: [id("a"), id("b")],
+            body: {
+                type: "BlockStatement",
+                body: [{
+                    type: "ReturnStatement",
+                    argument: toInt({
+                        type: "BinaryExpression",
+                        operator: "*",
+                        left: toInt(id("a")),
+                        right: toInt(id("b")),
+                    }),
+                }],
+            },
+        };
     },
 
     // [W3] String.fromCharCode/fromCodePoint 方法值的合成函数 AST:
@@ -2107,7 +2348,7 @@ export const MemberCompiler = {
     // [W3] String 静态方法值(fromCharCode/fromCodePoint,规范 length 均 1)。
     emitStringStaticRef(propName) {
         this.emitSynthStaticRef("string_" + propName,
-            this._stringStaticSynthAst(propName), propName, 1);
+            this._stringStaticSynthAst(propName), propName, 1, true);
     },
 
     // [W7-2] String.raw 方法值的合成函数 AST(规范 21.1.2.4,node v25 逐条校准):
@@ -2214,7 +2455,7 @@ export const MemberCompiler = {
 
     // [W7-2] String.raw 方法值(规范 length = 1:仅 callSite 计,rest 不计)。
     emitStringRawRef() {
-        this.emitSynthStaticRef("string_raw", this._stringRawSynthAst(), "raw", 1);
+        this.emitSynthStaticRef("string_raw", this._stringRawSynthAst(), "raw", 1, true);
     },
 
     // [W3] Number.is* 谓词方法值的合成函数 AST:
@@ -2818,8 +3059,16 @@ export const MemberCompiler = {
     // 数组原型,仍 false,与改造前一致;真值链修正随缺陷 B)。`Array(...)`/`new Array(...)`/
     // Array.isArray(...) 快路先命中,不经此 → 字节不变。
     emitArrayCtorObject() {
-        // Idempotent: only emit code once per compilation.
-        if (this._emittedArrayCtor) return;
+        // Idempotent materialization, but every call site must still load RET.
+        // 此前 `if (_emittedArrayCtor) return` 不装载槽 → 同编译单元里先 split
+        // 后写 `=== Array` 时 Array 标识符 RET 是垃圾,constructor===Array 恒 false。
+        if (this._emittedArrayCtor) {
+            const vm = this.vm;
+            this._reEnsureSlot("_nsobj_array");
+            vm.lea(VReg.V0, "_nsobj_array");
+            vm.load(VReg.RET, VReg.V0, 0);
+            return;
+        }
         this._emittedArrayCtor = true;
         this.emitCollectionCtorObject({
             name: "Array", length: 1, ctorFn: "_array_ctor_call",
@@ -4282,6 +4531,16 @@ export const MemberCompiler = {
             if (propName === "prototype" && expr.object.type === "Identifier" &&
                 expr.object.name === "String" && !this.stringNameShadowed()) {
                 this.emitStringProtoObject();
+                return;
+            }
+
+            // [Function.prototype 物化] `Function.prototype` → 惰性单例真对象。
+            // propName 严格限定 "prototype" 且接收者是未遮蔽的裸 `Function`。
+            // `Function.prototype.call/apply` 取值特判在上方(object 为 MemberExpression)
+            // 先命中,不经此。其它接收者字节不变。
+            if (propName === "prototype" && expr.object.type === "Identifier" &&
+                expr.object.name === "Function" && !this.functionNameShadowed()) {
+                this.emitFunctionProtoObject();
                 return;
             }
 

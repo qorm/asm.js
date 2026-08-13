@@ -392,14 +392,20 @@ export const ExpressionCompiler = {
                     // 空数组
                     this.compileArrayExpression({ elements: [] });
                 } else if (args.length === 1 && (args[0].type === "Literal" || args[0].type === "NumericLiteral") && typeof args[0].value === "number") {
-                    // new Array(len) - 创建指定长度的数组(单个数字字面量=长度,非元素)。
-                    // 此前只认 "Literal";parser 产 "NumericLiteral" 时落 else → new Array(3)=[3]。
-                    // 用 push 循环建 elements(勿用 `new Array(len).fill` —— 该调用在自举产物里
-                    // 正是本 bug 的破 Array()、返长度 1,令 elements 恒 1 元素)。
+                    // new Array(len) - 指定长度的稀疏数组(真 hole,槽=0)。
+                    // 此前填 undefined 字面量 → dense-with-undefined,`0 in new Array(3)` 误 true。
                     const len = Math.trunc(args[0].value);
-                    const elems = [];
-                    for (let i = 0; i < len; i++) elems.push({ type: "Literal", value: undefined });
-                    this.compileArrayExpression({ elements: elems });
+                    if (len < 0) {
+                        // ES RangeError;简化:空数组(与旧负长 trunc 行为接近即可)
+                        this.compileArrayExpression({ elements: [] });
+                    } else {
+                        this.vm.movImm(VReg.A0, len);
+                        this.vm.call("_array_new_with_size");
+                        this.vm.emitMaskLoad(VReg.V1);
+                        this.vm.andMaskReg(VReg.V2, VReg.RET, VReg.V1);
+                        this.vm.movImm64(VReg.V1, 0x7ffe000000000000n);
+                        this.vm.or(VReg.RET, VReg.V2, VReg.V1);
+                    }
                 } else {
                     // new Array(a, b, c) - 等同于 [a, b, c]
                     this.compileArrayExpression({ elements: args });

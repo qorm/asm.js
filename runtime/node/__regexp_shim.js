@@ -7,6 +7,7 @@
 //   str.replace(re, r) -> __RE_replace(str, re, r)
 // 正则对象是普通对象 {source, flags, global, ignoreCase, multiline, lastIndex}
 // (由 __RE_new 创建;正则字面量/new RegExp 均编译为 __RE_new 调用)。
+// exec 结果是真数组(push 捕获组)+侧表挂 index/input/groups/indices。
 //
 // 支持: 字面字符、.、\d \w \s \D \W \S \b \B、字符类 [a-z^]、
 //       量词 * + ? {n} {n,} {n,m}(贪婪 + ? 惰性)、分组 ( ) 捕获与 (?: )、
@@ -727,6 +728,18 @@ function __re_parseAtom(st) {
         // 悬空量词/括号,由上层守卫,到此即语法错
         return __re_fail(st, "Nothing to repeat");
     }
+    // u:禁用 Annex B PatternCharacter 扩展——裸 ] } 与无 Atom 的 {n} 皆 SyntaxError。
+    // 不套 v(unicodeSets):嵌套类里的 ] 会落到 parseAtom,误杀已过的 generated 用例。
+    if (st.uni && st.usets !== true) {
+        if (ch === "]" || ch === "}") {
+            return __re_fail(st, "Lone quantifier bracket");
+        }
+        if (ch === "{") {
+            var b0 = __re_tryParseBrace(st);
+            if (b0 !== null) return __re_fail(st, "Nothing to repeat");
+            return __re_fail(st, "Invalid quantifier");
+        }
+    }
     var code = st.p.charCodeAt(st.i);
     st.i = st.i + 1;
     if (code >= 192) {
@@ -1363,6 +1376,21 @@ export function __RE_flag_brand_check(re) {
     }
 }
 
+// 标志串规范序(dgimsuvy)。实例仍用自有数据属性(无 defineProperty getter——
+// accessor 在多次 RegExp 分配后触发 SIGSEGV)。@@match/@@replace 另读 global 布尔槽作补充。
+function __re_canonFlags(f) {
+    var out = "";
+    if (f.indexOf("d") >= 0) out = out + "d";
+    if (f.indexOf("g") >= 0) out = out + "g";
+    if (f.indexOf("i") >= 0) out = out + "i";
+    if (f.indexOf("m") >= 0) out = out + "m";
+    if (f.indexOf("s") >= 0) out = out + "s";
+    if (f.indexOf("u") >= 0) out = out + "u";
+    if (f.indexOf("v") >= 0) out = out + "v";
+    if (f.indexOf("y") >= 0) out = out + "y";
+    return out;
+}
+
 export function __RE_new(pattern, flags) {
     var src = pattern;
     var f = flags;
@@ -1385,6 +1413,7 @@ export function __RE_new(pattern, flags) {
     if (f === 0) f = "";
     if (typeof f !== "string") f = "" + f; // ToString(flags):new RegExp("^", 1.0) → "1"
     __re_checkFlags(f);
+    f = __re_canonFlags(f);
     var re = {
         source: __re_escSource(src),
         flags: f,
@@ -1445,6 +1474,7 @@ export function __RE_compile(re, pattern, flags) {
     if (typeof f !== "string") f = "" + f;
     __re_checkFlags(f);
     // 更新属性
+    f = __re_canonFlags(f);
     re.source = __re_escSource(src);
     re.flags = f;
     re.global = f.indexOf("g") !== -1;
@@ -1498,29 +1528,86 @@ function __re_toIndex(v) {
     return d;
 }
 
-// exec:返回类数组对象 {0:整体, 1..n:分组(未命中 undefined), index, input, length}
-// 或 null。g 标志下维护 re.lastIndex(与 JS 语义一致)。
+function __re_toInteger(v) {
+    var n = +v;
+    if (typeof n !== "number" || n !== n) return 0;
+    if (n === 0) return 0;
+    if (n > 0) return n - (n % 1);
+    return -( (-n) - ((-n) % 1) );
+}
+
+// ToString 近似:包装对象优先 valueOf 出原始值再拼串(asm.js Number#toString
+// 对非整数会丢小数,"" + new Number(1.012) → "1";valueOf 路径正确)。
+function __re_toStr(v) {
+    if (typeof v === "string") return v;
+    if (v === undefined) return "undefined";
+    if (v === null) return "null";
+    if (typeof v === "number" || typeof v === "boolean" || typeof v === "bigint") return "" + v;
+    if (typeof v === "object" || typeof v === "function") {
+        if (typeof v.valueOf === "function") {
+            var prim = v.valueOf();
+            if (typeof prim === "number" || typeof prim === "boolean" || typeof prim === "string" || typeof prim === "bigint") {
+                return "" + prim;
+            }
+        }
+        if (typeof v.toString === "function") {
+            var s2 = v.toString();
+            if (typeof s2 === "string") return s2;
+        }
+    }
+    return "" + v;
+}
+
+function __re_defData(o, k, v) {
+    Object.defineProperty(o, k, { value: v, writable: true, enumerable: true, configurable: true });
+}
+
+function __re_setLastIndex(re, v) {
+    var d = Object.getOwnPropertyDescriptor(re, "lastIndex");
+    if (d !== undefined && d !== null && d.writable === false) {
+        throw new TypeError("Cannot assign to read only property 'lastIndex' of object");
+    }
+    re.lastIndex = v;
+}
+
+function __re_regExpExec(R, S) {
+    var exec = R.exec;
+    if (typeof exec === "function") {
+        var result = exec.call(R, S);
+        if (result === undefined) return undefined;
+        if (result !== null && typeof result !== "object") {
+            throw new TypeError("RegExp exec method must return object or null");
+        }
+        return result;
+    }
+    return __RE_exec(R, S);
+}
+
+// exec:返回真数组 [整体, 分组…] + index/input/groups/indices 侧表,或 null。
+// g/y 标志下维护 re.lastIndex(与 JS 语义一致)。
 export function __RE_exec(re, str) {
     if (re === null || re === undefined || re.__isRegExp !== true) return null;
-    var s = str;
-    if (typeof s !== "string") s = "" + s;
+    var s = __re_toStr(str);
     var prog = __re_compile(re);
     if (prog === null) {
-        re.lastIndex = 0;
+        __re_setLastIndex(re, 0);
         return null;
     }
     var n = s.length;
     if (n >= __RE_PK) {
         // 超出 pk 打包上限(2^26-1 字符)的超长输入不支持(见 __RE_PK 注释)
-        re.lastIndex = 0;
+        __re_setLastIndex(re, 0);
         return null;
     }
-    var anchored = re.global || re.sticky; // lastIndex 参与匹配定位
+    // BuiltinExec 以 [[OriginalFlags]]/flags 串为准(非 Get(global) 覆写值)
+    var flagsStr = typeof re.flags === "string" ? re.flags : "";
+    var anchored = flagsStr.indexOf("g") >= 0 || flagsStr.indexOf("y") >= 0;
+    if (!anchored) anchored = re.global || re.sticky;
     var start = 0;
     if (anchored) start = __re_toIndex(re.lastIndex);
     if (start < 0) start = 0;
     if (start > n) {
-        re.lastIndex = 0;
+        __re_setLastIndex(re, 0);
         return null;
     }
     var mst = { s: s, n: n, ic: re.ignoreCase, ml: re.multiline, da: re.dotAll,
@@ -1546,39 +1633,33 @@ export function __RE_exec(re, str) {
         if (end >= 0) {
             if (anchored) {
                 if (end === p) {
-                    re.lastIndex = p + 1; // empty match: advance to prevent infinite loop
+                    __re_setLastIndex(re, p + 1); // empty match: advance to prevent infinite loop
                 } else {
-                    re.lastIndex = end;
+                    __re_setLastIndex(re, end);
                 }
             }
-            var m = { index: p, input: s, length: prog.ncap + 1 };
-            // 注意:必须用字面量下标逐个赋值——asm.js 的对象计算键赋值 m[g](g 为
-            // 数值变量)有键归一化 bug(全部塌到同一槽),字面量键则正常。
-            // 因此捕获组支持上限 9($1..$9,与 replace 的组引用范围一致)。
-            m[0] = s.slice(p, end);
-            if (prog.ncap >= 1) m[1] = __re_capVal(mst, s, 1);
-            if (prog.ncap >= 2) m[2] = __re_capVal(mst, s, 2);
-            if (prog.ncap >= 3) m[3] = __re_capVal(mst, s, 3);
-            if (prog.ncap >= 4) m[4] = __re_capVal(mst, s, 4);
-            if (prog.ncap >= 5) m[5] = __re_capVal(mst, s, 5);
-            if (prog.ncap >= 6) m[6] = __re_capVal(mst, s, 6);
-            if (prog.ncap >= 7) m[7] = __re_capVal(mst, s, 7);
-            if (prog.ncap >= 8) m[8] = __re_capVal(mst, s, 8);
-            if (prog.ncap >= 9) m[9] = __re_capVal(mst, s, 9);
-            // 命名组:.groups(无命名组时为 undefined,与 JS 一致)
-            if (prog.nameList.length > 0) m.groups = __re_buildGroups(mst, s, prog);
-            else m.groups = undefined;
-            // .slice:结果对象非真数组,挂函数属性产出真数组(闭包捕获 m);
-            // 编译器 object-tag 分派把 r.slice(...) 路由到此。
-            m.slice = function (a, b) { return __re_result_slice(m, a, b); };
-            // d 标志:.indices —— 每组 [start,end](未命中 undefined),含 .groups(命名组)。
-            if (re.hasIndices) m.indices = __re_buildIndices(mst, p, end, prog);
+            // 真数组结果(ArrayCreate):push 避开对象计算键塌陷;index/input/groups
+            // 走数组属性侧表。
+            var m = [];
+            m.push(s.slice(p, end));
+            var gi = 1;
+            while (gi <= prog.ncap) {
+                m.push(__re_capVal(mst, s, gi));
+                gi = gi + 1;
+            }
+            // CreateDataProperty(A, "index"|"input"|"groups"|"indices", …)
+            // 必须 defineProperty:赋值会命中原型 setter(indices-property 用例)。
+            __re_defData(m, "index", p);
+            __re_defData(m, "input", s);
+            if (prog.nameList.length > 0) __re_defData(m, "groups", __re_buildGroups(mst, s, prog));
+            else __re_defData(m, "groups", undefined);
+            if (re.hasIndices) __re_defData(m, "indices", __re_buildIndices(mst, p, end, prog));
             return m;
         }
         if (re.sticky) break; // sticky:只在 lastIndex 处锚定,不向后扫描
         p = p + 1;
     }
-    if (anchored) re.lastIndex = 0;
+    if (anchored) __re_setLastIndex(re, 0);
     return null;
 }
 
@@ -1587,21 +1668,15 @@ function __re_pair(a, b) { var r = []; r.push(a); r.push(b); return r; }
 // 组 gi 的 indices 项:命中→[start,end],未命中→undefined。
 function __re_indPair(mst, gi) { return mst.capS[gi] >= 0 ? __re_pair(mst.capS[gi], mst.capE[gi]) : undefined; }
 
-// 构造 exec 结果的 .indices(d 标志)。**普通对象**(非数组:asm.js 数组无命名属性容器,
-// `arr.groups=` 会崩),字面量键 0..9 + length + groups(同 m 匹配对象的伪数组模式)。
-// [i]=组 i 的 [start,end] 或 undefined;.groups 为命名组名→[start,end]。
+// 构造 exec 结果的 .indices(d 标志):真数组 + .groups 侧表。
 function __re_buildIndices(mst, p, end, prog) {
-    var ind = { length: prog.ncap + 1 };
-    ind[0] = __re_pair(p, end);
-    if (prog.ncap >= 1) ind[1] = __re_indPair(mst, 1);
-    if (prog.ncap >= 2) ind[2] = __re_indPair(mst, 2);
-    if (prog.ncap >= 3) ind[3] = __re_indPair(mst, 3);
-    if (prog.ncap >= 4) ind[4] = __re_indPair(mst, 4);
-    if (prog.ncap >= 5) ind[5] = __re_indPair(mst, 5);
-    if (prog.ncap >= 6) ind[6] = __re_indPair(mst, 6);
-    if (prog.ncap >= 7) ind[7] = __re_indPair(mst, 7);
-    if (prog.ncap >= 8) ind[8] = __re_indPair(mst, 8);
-    if (prog.ncap >= 9) ind[9] = __re_indPair(mst, 9);
+    var ind = [];
+    ind.push(__re_pair(p, end));
+    var gi = 1;
+    while (gi <= prog.ncap) {
+        ind.push(__re_indPair(mst, gi));
+        gi = gi + 1;
+    }
     if (prog.nameList.length > 0) {
         // 两遍:先把所有名字落成 undefined,再用"确实捕获到"的那个覆盖。
         // (ES2025 重名组:同名多个组只有一个会命中,后面的空组不得覆盖前面的值)
@@ -1619,9 +1694,9 @@ function __re_buildIndices(mst, p, end, prog) {
             if (typeof nm2 === "string" && mst.capS[gi2] >= 0) g[nm2] = __re_indPair(mst, gi2);
             j = j + 1;
         }
-        ind.groups = g;
+        __re_defData(ind, "groups", g);
     } else {
-        ind.groups = undefined;
+        __re_defData(ind, "groups", undefined);
     }
     return ind;
 }
@@ -1651,9 +1726,10 @@ function __re_capVal(mst, s, g) {
     return undefined;
 }
 
-// 用字面量下标读取组值(同上:asm.js 对象计算键 m[gi](gi 为数值变量)有 bug,
-// 读也会塌到 0 号槽,必须走字面量键)
+// 用字面量下标读取组值(普通对象计算键 m[gi] 有塌陷 bug);
+// 真数组结果可直接用计算下标。
 function __re_grp(m, gi) {
+    if (Array.isArray(m)) return m[gi];
     switch (gi) {
         case 0: return m[0];
         case 1: return m[1];
@@ -1706,39 +1782,67 @@ export function __RE_toString(re) {
     return "/" + re.source + "/" + re.flags;
 }
 
-// str.search(re):首个匹配的下标(无命中 -1)。规范:忽略 lastIndex,恒从 0 起搜、
-// 不改 re.lastIndex。string 参转字面正则(同 __RE_match)。
+// str.search(re):Set lastIndex=0 → RegExpExec → 恢复 lastIndex。
 export function __RE_search(str, re) {
     if (typeof re === "string") re = __RE_new(re, "");
-    var saved = re.lastIndex;
-    re.lastIndex = 0;
-    var m = __RE_exec(re, str);
-    re.lastIndex = saved;
-    return m === null ? -1 : m.index;
+    return __re_searchRx(re, str);
 }
 
-// str.match(re):非 g 同 exec;g 收集全部整体匹配(字符串数组),无命中 null。
+function __re_searchRx(rx, string) {
+    var S = __re_toStr(string);
+    var previousLastIndex = rx.lastIndex;
+    __re_setLastIndex(rx, 0);
+    var result = __re_regExpExec(rx, S);
+    __re_setLastIndex(rx, previousLastIndex);
+    if (result === null || result === undefined) return -1;
+    return __re_toInteger(result.index);
+}
+
+// str.match(re):ES2024+ 先 ToString(Get(flags)),再按串含 g/u/v 判定。
 export function __RE_match(str, re) {
     if (typeof re === "string") re = __RE_new(re, "");
-    if (!re.global) return __RE_exec(re, str);
-    var out = [];
-    re.lastIndex = 0;
-    while (true) {
-        var m = __RE_exec(re, str);
-        if (m === null) break;
-        out.push(m[0]);
-        if (m[0] === "") re.lastIndex = re.lastIndex + 1; // 空匹配前进防死循环
-    }
-    re.lastIndex = 0;
-    if (out.length === 0) return null;
-    return out;
+    return __re_matchRx(re, str);
 }
 
-// 替换串展开:$$ $& $` $' $1..$99
-function __re_expand(m, repl, s) {
+function __re_matchRx(rx, string) {
+    var S = __re_toStr(string);
+    // 先 ToString(Get(flags)) 以保留 flags-tostring-error 可观测性;
+    // 是否 global 以 Get(global) 为准(与 BuiltinExec 的 re.global 一致,避免死循环)。
+    var flagsStr = "" + rx.flags;
+    var global = !!rx.global;
+    if (!global) return __re_regExpExec(rx, S);
+    var fullUnicode = !!rx.unicode || !!rx.unicodeSets;
+    __re_setLastIndex(rx, 0);
+    var out = [];
+    var n = 0;
+    while (true) {
+        var result = __re_regExpExec(rx, S);
+        if (result === null || result === undefined) {
+            // ES2024+:null 退出不再 Set lastIndex=0(由 BuiltinExec 失败路径处理;
+            // 自定义 exec 保持 lastIndex,避免只读 lastIndex 误抛)。
+            if (n === 0) return null;
+            return out;
+        }
+        var matched = result[0];
+        if (matched === undefined || matched === null) matched = "undefined";
+        else matched = "" + matched;
+        out.push(matched);
+        n = n + 1;
+        // 规范:仅空匹配时 Set lastIndex 前进;非空匹配由 RegExpExec/自定义 exec 负责。
+        if (matched === "") {
+            var thisIndex = __re_toIndex(rx.lastIndex);
+            if (fullUnicode) { /* u/v 码点步进记偏差 */ }
+            __re_setLastIndex(rx, thisIndex + 1);
+        }
+    }
+}
+
+// 替换串展开:$$ $& $` $' $nn $<name>
+function __re_expand(m, repl, s, namedCaptures) {
     var out = "";
     var i = 0;
     var n = repl.length;
+    var nc = namedCaptures;
     while (i < n) {
         var ch = repl.charAt(i);
         if (ch === "$" && i + 1 < n) {
@@ -1763,10 +1867,7 @@ function __re_expand(m, repl, s) {
                 i = i + 2;
                 continue;
             }
-            // 规范 GetSubstitution:namedCaptures 为 undefined(正则没有命名组)时,
-            // "$<" 是**字面量**,不做组替换。
-            if (c2 === "<" && m.groups !== undefined && m.groups !== null) {
-                // $<name> 命名组引用。[#32] typeof 守卫:名命中原型链函数则不展开。
+            if (c2 === "<" && nc !== undefined && nc !== null) {
                 var gt = i + 2;
                 var gnm = "";
                 while (gt < n && repl.charAt(gt) !== ">") {
@@ -1774,20 +1875,36 @@ function __re_expand(m, repl, s) {
                     gt = gt + 1;
                 }
                 if (gt < n) {
-                    var gv = undefined;
-                    if (m.groups !== undefined && m.groups !== null) gv = m.groups[gnm];
-                    if (typeof gv === "string") out = out + gv;
+                    var gv = nc[gnm];
+                    if (gv !== undefined && gv !== null) out = out + ("" + gv);
                     i = gt + 1;
                     continue;
                 }
             }
             var d = repl.charCodeAt(i + 1) - 48;
-            if (d >= 1 && d <= 9) {
-                // 组引用 $1..$9(捕获组上限 9,见 __RE_exec 的字面量键说明;
-                // $10..$99 不支持——两位数会按 "$1" + 字面数字处理)
-                if (d < m.length) {
-                    var v = __re_grp(m, d);
+            if (d >= 0 && d <= 9) {
+                var nn = d;
+                var consumed = 1;
+                if (i + 2 < n) {
+                    var d2 = repl.charCodeAt(i + 2) - 48;
+                    if (d2 >= 0 && d2 <= 9) {
+                        nn = d * 10 + d2;
+                        consumed = 2;
+                    }
+                }
+                if (nn >= 1 && nn < m.length) {
+                    var v = __re_grp(m, nn);
                     if (v !== undefined && v !== null) out = out + v;
+                    i = i + 1 + consumed;
+                    continue;
+                }
+                if (consumed === 2) {
+                    out = out + "$" + repl.charAt(i + 1) + repl.charAt(i + 2);
+                    i = i + 3;
+                    continue;
+                }
+                if (d >= 1) {
+                    out = out + "$" + c2;
                     i = i + 2;
                     continue;
                 }
@@ -1799,60 +1916,129 @@ function __re_expand(m, repl, s) {
     return out;
 }
 
-// 函数替换参:以 (match, p1..pn, offset, string) 调用 fn,返回值转字符串。
-function __re_callRepl(fn, m, s) {
+function __re_callRepl(fn, matched, s, captures, position, namedCaptures) {
     var args = [];
-    args.push(m[0]);
-    var gc = m.length - 1; // 捕获组数
-    var gi = 1;
-    while (gi <= gc) {
-        args.push(__re_grp(m, gi)); // 未命中组传 undefined(与 JS 一致)
+    args.push(matched);
+    var gi = 0;
+    while (gi < captures.length) {
+        args.push(captures[gi]);
         gi = gi + 1;
     }
-    args.push(m.index);
+    args.push(position);
     args.push(s);
-    // 命名组存在时,replacer 末参为 groups 对象(node 语义);无命名组则不传。
-    if (m.groups !== undefined) args.push(m.groups);
-    // asm.js 直接调用支持 6 位置实参,而 fn.apply 仅透 5(调用 ABI);groups 是**末参**,故
-    // ≤6 实参(捕获组 ≤2 的命名组场景)走直接调用让 groups 到位。>6(捕获组 ≥3)才回退
-    // apply,此时 groups 溢出丢弃(6 参 ABI 限,记偏差)。
+    if (namedCaptures !== undefined) args.push(namedCaptures);
+    // 必须按真实 arity 调用:fn(a,b,c,undefined...) 会让 arguments.length 膨胀。
     var r;
-    if (args.length <= 6) {
-        r = fn(args[0], args[1], args[2], args[3], args[4], args[5]);
-    } else {
-        r = fn.apply(null, args);
-    }
-    return "" + r; // String(r):undefined→"undefined"、数字→十进制串
+    var n = args.length;
+    if (n === 1) r = fn(args[0]);
+    else if (n === 2) r = fn(args[0], args[1]);
+    else if (n === 3) r = fn(args[0], args[1], args[2]);
+    else if (n === 4) r = fn(args[0], args[1], args[2], args[3]);
+    else if (n === 5) r = fn(args[0], args[1], args[2], args[3], args[4]);
+    else if (n === 6) r = fn(args[0], args[1], args[2], args[3], args[4], args[5]);
+    else r = fn.apply(null, args);
+    return "" + r;
 }
 
-// str.replace(re, 替换串|函数)。替换串支持 $$ $& $` $' $1..$9 $<name>;
-// 函数参走 __re_callRepl。
 export function __RE_replace(str, re, repl) {
-    var s = str;
-    if (typeof s !== "string") s = "" + s;
     if (typeof re === "string") {
-        // 防御:字符串 search 本应走原生 _str_replace 路径
-        return s;
+        var s0 = str;
+        if (typeof s0 !== "string") s0 = "" + s0;
+        return s0;
     }
-    var isFn = typeof repl === "function";
-    if (!isFn && typeof repl !== "string") return s;
-    var prog = __re_compile(re);
-    if (prog === null) return s;
-    var out = "";
-    var last = 0;
-    if (re.global) re.lastIndex = 0;
-    while (true) {
-        var m = __RE_exec(re, s);
-        if (m === null) break;
-        var piece = isFn ? __re_callRepl(repl, m, s) : __re_expand(m, repl, s);
-        out = out + s.slice(last, m.index) + piece;
-        last = m.index + m[0].length;
-        if (!re.global) break;
-        if (m[0] === "") re.lastIndex = re.lastIndex + 1; // 空匹配前进防死循环
+    return __re_replaceRx(re, str, repl);
+}
+
+function __re_replaceRx(rx, string, replaceValue) {
+    var S = __re_toStr(string);
+    var functionalReplace = typeof replaceValue === "function";
+    var replaceStr = replaceValue;
+    if (!functionalReplace) {
+        replaceStr = "" + replaceValue;
     }
-    if (re.global) re.lastIndex = 0;
-    out = out + s.slice(last);
-    return out;
+    var flagsStr = "" + rx.flags; // 可观测 / flags-tostring-error
+    var global = !!rx.global;
+    var fullUnicode = !!rx.unicode || !!rx.unicodeSets;
+    if (global) __re_setLastIndex(rx, 0);
+    var results = [];
+    var done = false;
+    while (!done) {
+        var result = __re_regExpExec(rx, S);
+        if (result === null || result === undefined) {
+            done = true;
+        } else {
+            results.push(result);
+            if (!global) {
+                done = true;
+            } else {
+                var match0 = result[0];
+                if (match0 === undefined || match0 === null) match0 = "undefined";
+                else match0 = "" + match0;
+                if (match0 === "") {
+                    var thisIndex = __re_toIndex(rx.lastIndex);
+                    if (fullUnicode) { /* 码点步进记偏差 */ }
+                    __re_setLastIndex(rx, thisIndex + 1);
+                }
+            }
+        }
+    }
+    var accumulatedResult = "";
+    var nextSourcePosition = 0;
+    var ri = 0;
+    while (ri < results.length) {
+        var res = results[ri];
+        var nCaptures = 0;
+        // Get(result, "length") 可观测(result-get-length-err)。
+        // 必须计算键:`.length` 走数组长度快路,不调用户 getter。
+        var lenVal = res["length"];
+        nCaptures = __re_toIndex(lenVal);
+        if (nCaptures > 0) nCaptures = nCaptures - 1;
+        else nCaptures = 0;
+        var matched = res[0];
+        if (matched === undefined || matched === null) matched = "undefined";
+        else matched = "" + matched;
+        var matchLength = matched.length;
+        var position = __re_toInteger(res.index);
+        if (position < 0) position = 0;
+        if (position > S.length) position = S.length;
+        var captures = [];
+        var ci = 1;
+        while (ci <= nCaptures) {
+            var capVal;
+            if (ci <= 9) capVal = __re_grp(res, ci);
+            else capVal = res[ci];
+            if (capVal !== undefined && capVal !== null) capVal = "" + capVal;
+            captures.push(capVal);
+            ci = ci + 1;
+        }
+        var namedCaptures = res.groups;
+        var replacement;
+        if (functionalReplace) {
+            replacement = __re_callRepl(replaceValue, matched, S, captures, position, namedCaptures);
+        } else {
+            var fakeM = { index: position, length: nCaptures + 1, groups: namedCaptures };
+            fakeM[0] = matched;
+            if (nCaptures >= 1) fakeM[1] = captures[0];
+            if (nCaptures >= 2) fakeM[2] = captures[1];
+            if (nCaptures >= 3) fakeM[3] = captures[2];
+            if (nCaptures >= 4) fakeM[4] = captures[3];
+            if (nCaptures >= 5) fakeM[5] = captures[4];
+            if (nCaptures >= 6) fakeM[6] = captures[5];
+            if (nCaptures >= 7) fakeM[7] = captures[6];
+            if (nCaptures >= 8) fakeM[8] = captures[7];
+            if (nCaptures >= 9) fakeM[9] = captures[8];
+            replacement = __re_expand(fakeM, replaceStr, S, namedCaptures);
+        }
+        if (position >= nextSourcePosition) {
+            accumulatedResult = accumulatedResult + S.slice(nextSourcePosition, position) + replacement;
+            nextSourcePosition = position + matchLength;
+        }
+        ri = ri + 1;
+    }
+    if (nextSourcePosition < S.length) {
+        accumulatedResult = accumulatedResult + S.slice(nextSourcePosition);
+    }
+    return accumulatedResult;
 }
 
 // str.matchAll(re):返回全部匹配对象组成的数组(近似——JS 返回迭代器,
@@ -1966,22 +2152,57 @@ export function __RE_matchAll(str, re) {
     return iter;
 }
 
-// str.split(re[, limit]):正则分隔符。ES SplitMatch 语义:切匹配之间的片段,
-// 捕获组按序并入结果;空匹配不在 last 处重切且推进一位防死循环;limit 截断。
-// 用 g 标志工作副本驱动 __RE_exec 扫描(原 re 的 lastIndex 不受影响)。
-export function __RE_split(str, re, limit) {
+// SpeciesConstructor(rx, %RegExp%):无自定义 species 时返回 null(调用方走 __RE_new)。
+function __re_speciesCtor(rx) {
+    var C = rx.constructor;
+    if (C === undefined || C === null) return null;
+    if (typeof C !== "object" && typeof C !== "function") {
+        throw new TypeError("RegExp constructor is not an object");
+    }
+    var S = C[Symbol.species];
+    if (S === undefined || S === null) return null;
+    if (typeof S !== "function") {
+        throw new TypeError("RegExp species is not a constructor");
+    }
+    return S;
+}
+
+// UTF-16/字节串前进一步(u/v 记码点偏差,+1 字节)。
+function __re_advIndex(s, q, unicodeMatching) {
+    if (unicodeMatching) { /* 码点步进记偏差 */ }
+    return q + 1;
+}
+
+// RegExp.prototype[@@split] / str.split(re):Species + sticky splitter + RegExpExec。
+function __re_splitRx(rx, string, limit) {
+    var S = __re_toStr(string);
+
+    var Ctor = __re_speciesCtor(rx);
+    // Get(flags) 可观测(get-flags-err / coerce-flags)
+    var flags = "" + rx.flags;
+    var unicodeMatching = flags.indexOf("u") >= 0 || flags.indexOf("v") >= 0;
+    var newFlags = flags;
+    if (flags.indexOf("y") < 0) newFlags = flags + "y";
+
+    var splitter;
+    if (Ctor === null) {
+        var pat = typeof rx.__pat === "string" ? rx.__pat : rx.source;
+        if (typeof pat !== "string") pat = "" + pat;
+        splitter = __RE_new(pat, newFlags);
+    } else {
+        splitter = new Ctor(rx, newFlags);
+    }
+
     var lim = (limit === undefined) ? 4294967295 : (limit >>> 0);
     if (lim === 0) {
         var e0 = [];
         e0.constructor = Array;
         return e0;
     }
-    var flags = re.flags;
-    if (flags.indexOf("g") < 0) flags = flags + "g";
-    var g = __RE_new(typeof re.__pat === "string" ? re.__pat : re.source, flags);
-    if (str === "") {
-        var me = __RE_exec(g, "");
-        if (me === null) {
+
+    if (S.length === 0) {
+        var zEmpty = __re_regExpExec(splitter, S);
+        if (zEmpty === null || zEmpty === undefined) {
             var e1 = [""];
             e1.constructor = Array;
             return e1;
@@ -1990,30 +2211,49 @@ export function __RE_split(str, re, limit) {
         e2.constructor = Array;
         return e2;
     }
-    var out = [];
-    out.constructor = Array;
-    var last = 0;
-    g.lastIndex = 0;
-    while (true) {
-        var m = __RE_exec(g, str);
-        if (m === null) break;
-        var q = m.index;
-        if (q >= str.length) break;
-        var e = q + m[0].length;
-        if (e === last) { g.lastIndex = q + 1; continue; }
-        out.push(str.slice(last, q));
-        if (out.length >= lim) return out;
-        var k = 1;
-        while (k < m.length) {
-            out.push(m[k]);
-            if (out.length >= lim) return out;
-            k = k + 1;
+
+    var A = [];
+    A.constructor = Array;
+    var size = S.length;
+    var p = 0;
+    var q = 0;
+    while (q < size) {
+        __re_setLastIndex(splitter, q);
+        var z = __re_regExpExec(splitter, S);
+        if (z === null || z === undefined) {
+            q = __re_advIndex(S, q, unicodeMatching);
+        } else {
+            var e = __re_toIndex(splitter.lastIndex);
+            if (e === p) {
+                q = __re_advIndex(S, q, unicodeMatching);
+            } else {
+                A.push(S.slice(p, q));
+                if (A.length === lim) return A;
+                p = e;
+                var nCaptures = __re_toIndex(z["length"]);
+                if (nCaptures > 0) nCaptures = nCaptures - 1;
+                else nCaptures = 0;
+                var i = 1;
+                while (i <= nCaptures) {
+                    var capI;
+                    if (i <= 9) capI = __re_grp(z, i);
+                    else capI = z[i];
+                    A.push(capI);
+                    if (A.length === lim) return A;
+                    i = i + 1;
+                }
+                q = p;
+            }
         }
-        last = e;
-        g.lastIndex = (m[0].length === 0) ? q + 1 : e;
     }
-    out.push(str.slice(last));
-    return out;
+    A.push(S.slice(p, size));
+    return A;
+}
+
+// str.split(re[, limit]):正则分隔符。委托 @@split 语义(含 species)。
+export function __RE_split(str, re, limit) {
+    if (typeof re === "string") re = __RE_new(re, "");
+    return __re_splitRx(re, str, limit);
 }
 
 // ── Symbol method trampolines ─────────────────────────────────────────
@@ -2031,47 +2271,39 @@ export function __RE_split(str, re, limit) {
 // work correctly through the _aref_generic + helper trampoline chain.
 
 export function __RE_sym_match(re, str) {
-    return __RE_match(str, re);
+    return __re_matchRx(re, str);
 }
 
 export function __RE_sym_search(re, str) {
-    return __RE_search(str, re);
+    return __re_searchRx(re, str);
 }
 
 export function __RE_sym_split(re, str, limit) {
-    return __RE_split(str, re, limit);
+    return __re_splitRx(re, str, limit);
 }
 
 export function __RE_sym_replace(re, str, repl) {
-    return __RE_replace(str, re, repl);
+    return __re_replaceRx(re, str, repl);
 }
 
 export function __RE_sym_matchAll(re, str) {
     return __RE_matchAll(str, re);
 }
 
-// ── Direct-instance Symbol method wrappers ────────────────────────────
-// When a method is stored directly on a regex instance (not via _aref_generic
-// closure on the prototype) and called as re[Symbol.match](str), the compiler's
-// compileMethodCall sets `this` in A5 (receiver) and user args in A0-A4.
-// These wrappers accept `this` as the regex instance and the string as the
-// first argument, matching compileMethodCall's calling convention.
-// They are set on each regex instance in __RE_new via re[Symbol.xxx] = helper.
-
 function __RE_sym_match_direct(str) {
-    return __RE_match(str, this);
+    return __re_matchRx(this, str);
 }
 
 function __RE_sym_search_direct(str) {
-    return __RE_search(str, this);
+    return __re_searchRx(this, str);
 }
 
 function __RE_sym_split_direct(str, limit) {
-    return __RE_split(str, this, limit);
+    return __re_splitRx(this, str, limit);
 }
 
 function __RE_sym_replace_direct(str, repl) {
-    return __RE_replace(str, this, repl);
+    return __re_replaceRx(this, str, repl);
 }
 
 function __RE_sym_matchAll_direct(str) {
