@@ -760,9 +760,19 @@ export class JSValueGenerator {
 
         // [bug8] Function 构造器哨兵(A1==3):函数值 tag 0x7FFF,或裸堆 classinfo(type-3,
         // 类作值)/裸闭包 magic。其余 → false。落在 _iof_user(把 A1 当 classinfo 指针)之前拦下。
+        // [gOPD 补全] 裸 Function 已一等化(members.js emitFunctionCtorObject,槽
+        // _fnctor_singleton):RHS 不再恒为哨兵 3,而是该单例装箱闭包。指针相等即视同
+        // Function 分支;槽空(未物化)或不等 → 原 _iof_user 路径,字节序对旧程序无扰。
         vm.label("_iof_chk_fn");
         vm.cmpImm(VReg.A1, 3);
+        vm.jeq("_iof_fn_body");
+        vm.lea(VReg.V1, "_fnctor_singleton");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_iof_user");
+        vm.cmp(VReg.A1, VReg.V1);
         vm.jne("_iof_user");
+        vm.label("_iof_fn_body");
         vm.shrImm(VReg.V1, VReg.S0, 48);
         vm.cmpImm(VReg.V1, 0x7fff);
         vm.jeq("_iof_true");
@@ -1083,19 +1093,83 @@ export class JSValueGenerator {
         vm.callIndirect(VReg.V6);
         vm.epilogue(SAVED, FRAME);
 
-        // [Array.prototype.push 取值] 守卫版 push。_array_push 假定接收者是真数组,
-        // 对普通对象/类数组直接按数组头解引用 → SIGSEGV。`Array.prototype.push` 作值
-        // (propertyHelper.js 的 __push,以及 `obj.push = Array.prototype.push` 这类泛型
-        // 用法)必须先验接收者。非数组(tag ≠ 0x7FFE)→ undefined(记偏差:ES 要求按
-        // 类数组语义写 length;无 _agen_push,不在此复制数组语义);真数组 → 尾跳既有
-        // _array_push(借调用者返回地址,语义/返回值与 `arr.push` 取值形态完全一致)。
+        // [Array.prototype.push 取值] 规范:ToObject → 真数组走 _array_push;否则类数组
+        // Set(O, ToString(len), item) + length++。nullish → TypeError。
+        // argc==0:仍 Set(O,"length",len,true)(frozen 空数组 TypeError),返 len。
         vm.label("_fpg_arr_push");
-        vm.shrImm(VReg.V5, VReg.A0, 48);
+        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.mov(VReg.S1, VReg.A1);              // 保 value
+        vm.call("_agen_toobject");             // nullish → TypeError
+        vm.mov(VReg.S0, VReg.RET);             // boxed O
+        vm.lea(VReg.V0, "_call_argc");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_fpg_arr_push_noarg");
+        vm.shrImm(VReg.V5, VReg.S0, 48);
         vm.cmpImm(VReg.V5, 0x7ffe);
-        vm.jne("_fpg_arr_push_no");
-        vm.jmp("_array_push");
-        vm.label("_fpg_arr_push_no");
-        vm.movImm64(VReg.RET, UNDEF);
-        vm.ret();
+        vm.jne("_fpg_arr_push_obj");
+        // 真数组 tag:仅 TYPE_ARRAY 走稠密 push(TypedArray 0x7FFE 走对象路径)
+        vm.emitMaskLoad(VReg.V4);
+        vm.andMaskReg(VReg.V0, VReg.S0, VReg.V4);
+        vm.loadByte(VReg.V0, VReg.V0, 0);
+        vm.cmpImm(VReg.V0, 1); // TYPE_ARRAY
+        vm.jne("_fpg_arr_push_obj");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_array_push");
+        // ES push 返回新 length(非数组自身)。_array_push 返数组 → 改读 length。
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_array_length");
+        vm.scvtf(0, VReg.RET);
+        vm.fmovToInt(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 16);
+        vm.label("_fpg_arr_push_noarg");
+        // Set(length, len, true); return len
+        vm.shrImm(VReg.V5, VReg.S0, 48);
+        vm.cmpImm(VReg.V5, 0x7ffe);
+        vm.jne("_fpg_arr_push_noarg_obj");
+        vm.emitMaskLoad(VReg.V4);
+        vm.andMaskReg(VReg.V0, VReg.S0, VReg.V4);
+        vm.loadByte(VReg.V0, VReg.V0, 0);
+        vm.cmpImm(VReg.V0, 1);
+        vm.jne("_fpg_arr_push_noarg_obj");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_length");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S2);
+        vm.call("_array_setlength_throw");
+        vm.scvtf(0, VReg.S2);
+        vm.fmovToInt(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 16);
+        vm.label("_fpg_arr_push_noarg_obj");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_agen_tolength");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.scvtf(0, VReg.S2);
+        vm.fmovToInt(VReg.A2, 0);
+        vm.call("_agen_setlength_throw");
+        vm.scvtf(0, VReg.S2);
+        vm.fmovToInt(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 16);
+        vm.label("_fpg_arr_push_obj");
+        // 类数组:len=ToLength(O.length); Set(O,len,value); Set(O,"length",len+1); return len+1
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_agen_tolength");
+        vm.mov(VReg.S2, VReg.RET); // len bare
+        vm.mov(VReg.A0, VReg.S0);
+        vm.scvtf(0, VReg.S2);
+        vm.fmovToInt(VReg.A1, 0); // boxed index = len
+        vm.mov(VReg.A2, VReg.S1);
+        vm.call("_subscript_set");
+        vm.addImm(VReg.S2, VReg.S2, 1); // newLen
+        vm.mov(VReg.A0, VReg.S0);
+        vm.scvtf(0, VReg.S2);
+        vm.fmovToInt(VReg.A2, 0);
+        vm.call("_agen_setlength_throw"); // Set(..., Throw=true)
+        vm.scvtf(0, VReg.S2);
+        vm.fmovToInt(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 16);
     }
 }

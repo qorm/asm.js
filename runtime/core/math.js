@@ -103,10 +103,18 @@ export class MathGenerator {
         vm.ret();
     }
 
+    // ±Inf/NaN → NaN(IEEE;rem_pio2 对 Inf 得 Inf 会污染 kernel)。
     generateSin() {
         const vm = this.vm;
         vm.label("_math_sin");
         vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.movImm64(VReg.V1, 0x7FF0000000000000n);
+        vm.and(VReg.V0, VReg.A0, VReg.V1);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jne("_msin_finite");
+        vm.movImm64(VReg.RET, 0x7FF0000000000001n);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_msin_finite");
         vm.call("_math_rem_pio2");            // RET=r, A1=q
         vm.mov(VReg.S0, VReg.A1); vm.mov(VReg.S1, VReg.RET);
         vm.andImm(VReg.V0, VReg.S0, 1); vm.cmpImm(VReg.V0, 0); vm.jne("_msin_c");
@@ -119,10 +127,18 @@ export class MathGenerator {
         vm.epilogue([VReg.S0, VReg.S1], 0);
     }
 
+    // ±Inf/NaN → NaN(同 sin)。
     generateCos() {
         const vm = this.vm;
         vm.label("_math_cos");
         vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.movImm64(VReg.V1, 0x7FF0000000000000n);
+        vm.and(VReg.V0, VReg.A0, VReg.V1);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jne("_mcos_finite");
+        vm.movImm64(VReg.RET, 0x7FF0000000000001n);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_mcos_finite");
         vm.call("_math_rem_pio2");
         vm.mov(VReg.S0, VReg.A1); vm.mov(VReg.S1, VReg.RET);
         vm.andImm(VReg.V0, VReg.S0, 1); vm.cmpImm(VReg.V0, 0); vm.jne("_mcos_s");
@@ -290,11 +306,27 @@ export class MathGenerator {
         vm.epilogue([VReg.S0], 0);
     }
 
-    // _math_asinh(A0=x) = log(x + sqrt(x²+1))
+    // _math_asinh(A0=x) = log(x + sqrt(x²+1)); ±Inf → ±Inf(公式在 ±Inf 得 NaN)。
     generateAsinh() {
         const vm = this.vm; const K = (b, r) => this._K(b, r);
         vm.label("_math_asinh");
         vm.prologue(0, []);
+        // 指数全 1(Inf/NaN):原样返回(含符号的 ±Inf;NaN 透传)
+        vm.movImm64(VReg.V1, 0x7FF0000000000000n);
+        vm.and(VReg.V0, VReg.A0, VReg.V1);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jne("_masinh_finite");
+        vm.mov(VReg.RET, VReg.A0);
+        vm.epilogue([], 0);
+        vm.label("_masinh_finite");
+        // ±0 保号:公式 log(x+√(x²+1)) 在 -0 得 +0(−0+1=1)。
+        vm.movImm64(VReg.V1, 0x7fffffffffffffffn);
+        vm.and(VReg.V0, VReg.A0, VReg.V1);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_masinh_nz");
+        vm.mov(VReg.RET, VReg.A0);
+        vm.epilogue([], 0);
+        vm.label("_masinh_nz");
         vm.fmovToFloat(0, VReg.A0); vm.fmul(2, 0, 0); K(0x3ff0000000000000n, 1); vm.fadd(2, 2, 1); vm.fsqrt(2, 2);
         vm.fadd(0, 0, 2); vm.fmovToInt(VReg.A0, 0); vm.call("_math_log");
         vm.epilogue([], 0);
@@ -315,6 +347,14 @@ export class MathGenerator {
         const vm = this.vm; const K = (b, r) => this._K(b, r);
         vm.label("_math_atanh");
         vm.prologue(0, []);
+        // ±0 保号
+        vm.movImm64(VReg.V1, 0x7fffffffffffffffn);
+        vm.and(VReg.V0, VReg.A0, VReg.V1);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_matanh_nz");
+        vm.mov(VReg.RET, VReg.A0);
+        vm.epilogue([], 0);
+        vm.label("_matanh_nz");
         vm.fmovToFloat(0, VReg.A0); K(0x3ff0000000000000n, 1);
         vm.fadd(2, 1, 0); vm.fsub(3, 1, 0); vm.fdiv(2, 2, 3);   // (1+x)/(1-x)
         vm.fmovToInt(VReg.A0, 2); vm.call("_math_log");
@@ -377,6 +417,35 @@ export class MathGenerator {
         const vm = this.vm;
         vm.label("_math_expm1");
         vm.prologue(0, []);
+        // -Inf → -1;+Inf → +Inf;NaN → NaN(exp(-Inf) 现返 +0 → 0-1=-1 亦对,但 +Inf 须特判)
+        vm.movImm64(VReg.V1, 0x7FF0000000000000n);
+        vm.and(VReg.V0, VReg.A0, VReg.V1);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jne("_mexpm1_finite");
+        vm.movImm64(VReg.V1, 0x000FFFFFFFFFFFFFn);
+        vm.and(VReg.V0, VReg.A0, VReg.V1);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_mexpm1_nan");
+        vm.shrImm(VReg.V0, VReg.A0, 63);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_mexpm1_ninf");
+        vm.movImm64(VReg.RET, 0x7FF0000000000000n); // +Inf
+        vm.epilogue([], 0);
+        vm.label("_mexpm1_ninf");
+        vm.movImm64(VReg.RET, 0xbff0000000000000n); // -1
+        vm.epilogue([], 0);
+        vm.label("_mexpm1_nan");
+        vm.movImm64(VReg.RET, 0x7FF0000000000001n);
+        vm.epilogue([], 0);
+        vm.label("_mexpm1_finite");
+        // ±0 保号:exp(0)-1 得 +0,丢 -0
+        vm.movImm64(VReg.V1, 0x7fffffffffffffffn);
+        vm.and(VReg.V0, VReg.A0, VReg.V1);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_mexpm1_nz");
+        vm.mov(VReg.RET, VReg.A0);
+        vm.epilogue([], 0);
+        vm.label("_mexpm1_nz");
         vm.call("_math_exp");                 // A0=x → RET=exp(x) 位
         vm.fmovToFloat(0, VReg.RET);
         vm.movImm64(VReg.V1, 0x3ff0000000000000n); // 1.0
@@ -401,11 +470,27 @@ export class MathGenerator {
     }
 
     // Math.sinh(x) = (exp(x) - exp(-x)) / 2
+    // ±Inf → ±Inf;NaN → NaN;±0 保号(经公式在 ±0 亦保号,但 Inf 须特判防 exp 污染)。
     generateSinh() {
         const vm = this.vm;
         vm.label("_math_sinh");
         vm.prologue(0, [VReg.S0, VReg.S1]);
         vm.mov(VReg.S0, VReg.A0);             // S0 = x 位
+        // ±0 保号;±Inf/NaN 原样(exp 路径会污染)
+        vm.movImm64(VReg.V1, 0x7fffffffffffffffn);
+        vm.and(VReg.V0, VReg.S0, VReg.V1);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_msinh_nz");
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_msinh_nz");
+        vm.movImm64(VReg.V1, 0x7FF0000000000000n);
+        vm.and(VReg.V0, VReg.S0, VReg.V1);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jne("_msinh_finite");
+        vm.mov(VReg.RET, VReg.S0);            // ±Inf/NaN 原样(NaN 透传;±Inf 保号)
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_msinh_finite");
         vm.call("_math_exp");                 // RET = exp(x)
         vm.mov(VReg.S1, VReg.RET);            // S1 = exp(x) 位
         vm.fmovToFloat(3, VReg.S0);           // d3 = x
@@ -423,11 +508,27 @@ export class MathGenerator {
     }
 
     // Math.cosh(x) = (exp(x) + exp(-x)) / 2
+    // ±Inf → +Inf;NaN → NaN。
     generateCosh() {
         const vm = this.vm;
         vm.label("_math_cosh");
         vm.prologue(0, [VReg.S0, VReg.S1]);
         vm.mov(VReg.S0, VReg.A0);
+        vm.movImm64(VReg.V1, 0x7FF0000000000000n);
+        vm.and(VReg.V0, VReg.S0, VReg.V1);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jne("_mcosh_finite");
+        // Inf → +Inf;NaN → 归一 NaN
+        vm.movImm64(VReg.V1, 0x000FFFFFFFFFFFFFn);
+        vm.and(VReg.V0, VReg.S0, VReg.V1);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_mcosh_nan");
+        vm.movImm64(VReg.RET, 0x7FF0000000000000n); // +Inf
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_mcosh_nan");
+        vm.movImm64(VReg.RET, 0x7FF0000000000001n);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_mcosh_finite");
         vm.call("_math_exp");
         vm.mov(VReg.S1, VReg.RET);
         vm.fmovToFloat(3, VReg.S0);
@@ -446,10 +547,48 @@ export class MathGenerator {
 
     // Math.tanh(x) = (exp(x) - exp(-x)) / (exp(x) + exp(-x))
     generateTanh() {
-        const vm = this.vm;
+        const vm = this.vm; const K = (b, r) => this._K(b, r);
         vm.label("_math_tanh");
         vm.prologue(0, [VReg.S0, VReg.S1]);
         vm.mov(VReg.S0, VReg.A0);
+        // ±0 保号
+        vm.movImm64(VReg.V1, 0x7fffffffffffffffn);
+        vm.and(VReg.V0, VReg.S0, VReg.V1);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_mtanh_nz");
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_mtanh_nz");
+        // 指数全 1:NaN → NaN;±Inf → ±1。|x|≥20 亦饱和(exp 溢出路径得 NaN)。
+        vm.movImm64(VReg.V1, 0x7FF0000000000000n);
+        vm.and(VReg.V0, VReg.S0, VReg.V1);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jne("_mtanh_check20");
+        vm.movImm64(VReg.V1, 0x000FFFFFFFFFFFFFn);
+        vm.and(VReg.V0, VReg.S0, VReg.V1);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_mtanh_nan");
+        vm.jmp("_mtanh_sat");
+        vm.label("_mtanh_nan");
+        vm.movImm64(VReg.RET, 0x7FF0000000000001n);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_mtanh_check20");
+        vm.fmovToFloat(0, VReg.S0);
+        vm.fabs(0, 0);
+        K(0x4034000000000000n, 1); // 20.0
+        vm.fcmp(0, 1);
+        vm.jflt("_mtanh_body");
+        vm.label("_mtanh_sat");
+        vm.shrImm(VReg.V0, VReg.S0, 63);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_mtanh_neg1");
+        vm.movImm64(VReg.RET, 0x3ff0000000000000n); // +1
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_mtanh_neg1");
+        vm.movImm64(VReg.RET, 0xbff0000000000000n); // -1
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_mtanh_body");
+        vm.mov(VReg.A0, VReg.S0);
         vm.call("_math_exp");
         vm.mov(VReg.S1, VReg.RET);            // exp(x)
         vm.fmovToFloat(3, VReg.S0);
@@ -742,11 +881,32 @@ export class MathGenerator {
     //   |x|>1:fdlibm __ieee754_exp 风格范围归约 x=k·ln2+r(ln2 拆 hi/lo)、有理式
     //          c=r-r²·(P1+r²(P2+r²(P3+r²(P4+r²·P5))))、y=1-((lo-(r·c)/(2-c))-hi)≈exp(r)、
     //          乘 2^k((k+1023)<<52 拼指数域),≤1 ulp(已记录)。d7 作常量暂存。
-    //   溢出/±Inf/NaN 未特判(大 x 不崩,值非精确,已记录)。
+    //   溢出/±Inf/NaN:指数全 1 → +Inf→+Inf、-Inf→+0、NaN→NaN。
     generateExp() {
         const vm = this.vm;
         const K = (bits, r) => { vm.movImm64(VReg.V1, bits); vm.fmovToFloat(r, VReg.V1); };
         vm.label("_math_exp");
+        // Inf/NaN 特判(大 |x| 归约会污染)
+        vm.movImm64(VReg.V1, 0x7FF0000000000000n);
+        vm.and(VReg.V0, VReg.A0, VReg.V1);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jne("_mexp_finite");
+        vm.movImm64(VReg.V1, 0x000FFFFFFFFFFFFFn);
+        vm.and(VReg.V0, VReg.A0, VReg.V1);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_mexp_nan");
+        vm.shrImm(VReg.V0, VReg.A0, 63);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_mexp_ninf");
+        vm.movImm64(VReg.RET, 0x7FF0000000000000n); // +Inf
+        vm.ret();
+        vm.label("_mexp_ninf");
+        vm.movImm(VReg.RET, 0); // +0
+        vm.ret();
+        vm.label("_mexp_nan");
+        vm.movImm64(VReg.RET, 0x7FF0000000000001n);
+        vm.ret();
+        vm.label("_mexp_finite");
         vm.fmovToFloat(0, VReg.A0);                   // d0 = x
         // |x| ≤ 1 → 直接泰勒
         vm.movImm64(VReg.V1, 0x7fffffffffffffffn);

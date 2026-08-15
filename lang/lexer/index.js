@@ -139,6 +139,26 @@ export class Lexer {
         return { cook: this._cpToUtf8(cu), extra: 4 };
     }
 
+    // 当前是否处于 Unicode 空白码点的字节序列起点。
+    // 必须用 fromCharCode 产单字节:字面量 "\u00A0"/"\xC2" 经 _cpToUtf8 会变成多字节串,
+    // 自托管 eval 路径里 this.ch === "\xC2" 恒假 → NBSP 落成 ILLEGAL。
+    _atUnicodeWhitespace() {
+        let bA0 = String.fromCharCode(0xA0);
+        let bC2 = String.fromCharCode(0xC2);
+        let bE2 = String.fromCharCode(0xE2);
+        let b80 = String.fromCharCode(0x80);
+        let bA8 = String.fromCharCode(0xA8);
+        let bA9 = String.fromCharCode(0xA9);
+        // 单码元 NBSP(少见于文件源;部分宿主串)
+        if (this.ch === bA0) return 1;
+        // U+00A0 UTF-8: C2 A0
+        if (this.ch === bC2 && this.peekChar() === bA0) return 2;
+        // U+2028/U+2029 UTF-8: E2 80 A8 / E2 80 A9
+        if (this.ch === bE2 && this.peekChar() === b80 &&
+            (this.peekCharN(2) === bA8 || this.peekCharN(2) === bA9)) return 3;
+        return 0;
+    }
+
     // 跳过空白字符
     // 注:源码按 latin1(逐字节)读入,多字节 UTF-8 字符会变成多个独立字节。
     // U+00A0(NBSP)=C2 A0、U+2028(LS)=E2 80 A8、U+2029(PS)=E2 80 A9
@@ -151,19 +171,10 @@ export class Lexer {
                 this.readChar();
                 continue;
             }
-            // U+00A0 NO-BREAK SPACE:UTF-8 编码 C2 A0(latin1 下两个独立字节)
-            if (this.ch === "\xC2" && this.peekChar() === "\xA0") {
-                this.readChar();
-                this.readChar();
-                continue;
-            }
-            // U+2028 LINE SEPARATOR  / U+2029 PARAGRAPH SEPARATOR:
-            // UTF-8 编码 E2 80 A8 / E2 80 A9(latin1 下三个独立字节)
-            if (this.ch === "\xE2" && this.peekChar() === "\x80" &&
-                (this.peekCharN(2) === "\xA8" || this.peekCharN(2) === "\xA9")) {
-                this.readChar();
-                this.readChar();
-                this.readChar();
+            let n = this._atUnicodeWhitespace();
+            if (n > 0) {
+                let i = 0;
+                while (i < n) { this.readChar(); i = i + 1; }
                 continue;
             }
             break;
@@ -201,19 +212,29 @@ export class Lexer {
         }
     }
 
+    // 标识符续读:字母/数字,但不得吞掉 Unicode 空白 UTF-8 前缀(否则 true+C2A0 变成 IDENT "trueÂ")
+    _isIdentContinue() {
+        if (this._atUnicodeWhitespace() > 0) return false;
+        return this.isLetter(this.ch) || this.isDigit(this.ch);
+    }
+
     // 读取标识符（支持内嵌 Unicode 转义 \u{...} / \uNNNN，解码成 UTF-8 字节并入标识符值，
     // 与裸非 ASCII 标识符的字节表示一致。[test262 S1] 修 ~215 个标识符转义 COMPILE_FAIL）
     readIdentifier() {
         let startPos = this.position;
+        this._identEscaped = false;
         // 快路：无转义直接 slice（绝大多数标识符；自编译词法零额外开销）
-        while (this.isLetter(this.ch) || this.isDigit(this.ch)) {
+        while (this._isIdentContinue()) {
             this.readChar();
         }
         if (this.ch !== "\\") {
             return this.input.slice(startPos, this.position);
         }
         // 慢路：含 \u 转义 → 在已读片段后解码续接（\x 在标识符里非法，不处理，留给下轮 ILLEGAL）。
-        // 解码后经 lookupIdent 照常判关键字（ES:转义拼成 ReservedWord 非法，`var \u{69}f` 应拒）。
+        // 解码后经 lookupIdent 照常判关键字；ES 规定转义拼成的 ReservedWord/关键字非法
+        // (`\u0061sync function f(){}` 应为 SyntaxError)——由 nextToken 依 _identEscaped
+        // 标志把「带转义且解码成关键字」的 token 改判 ILLEGAL。
+        this._identEscaped = true;
         let result = this.input.slice(startPos, this.position);
         while (this.ch === "\\" && this.peekChar() === "u") {
             this.readChar();                 // 消费 '\'，this.ch = 'u'
@@ -223,7 +244,7 @@ export class Lexer {
             while (_z < _esc.extra) { this.readChar(); _z = _z + 1; }
             result = result + _esc.cook;
             this.readChar();                 // 越过转义末字符（镜像 readString 逐步进）
-            while (this.isLetter(this.ch) || this.isDigit(this.ch)) {
+            while (this._isIdentContinue()) {
                 result = result + this.ch;
                 this.readChar();
             }
@@ -459,6 +480,9 @@ export class Lexer {
     // 判断是否为字母 (ASCII字母或非ASCII Unicode字母)
     isLetter(ch) {
         let code = ch.charCodeAt(0);
+        // 单码元空白不得进标识符;UTF-8 空白前缀由 _isIdentContinue/_atUnicodeWhitespace 拦截
+        if (code === 0xA0 || code === 0xFEFF) return false; // NBSP / BOM
+        if (code === 0x2028 || code === 0x2029) return false; // LS / PS
         // ASCII字母: a-z, A-Z
         // 下划线和美元符: _, $
         // 非ASCII (多字节字符，如中文等)
@@ -544,6 +568,8 @@ export class Lexer {
         const tok = this._nextToken();
         if (tok.type !== TokenType.EOF) {
             this.lastTokenType = tok.type;
+            tok.lineBreakBefore = tok.line > (this._prevTokLine || 0);
+            this._prevTokLine = tok.line;
         }
         return tok;
     }
@@ -817,7 +843,12 @@ export class Lexer {
             let ident = this.readIdentifier();
             // When inside template expression (templateDepth > 0), treat keywords as identifiers
             let type = lookupIdent(ident, this.templateDepth > 0);
-            return newToken(type, ident, startLine, startColumn);
+            // [escaped-keyword] 转义拼成的关键字标记 escaped 标志:属性名/方法名/标签位合法,
+            // 表达式/修饰符/声明关键词位由 parser 依上下文拒(ES 12.1 关键字不得以转义书写,
+            // 但 IdentifierName 位允许)。parser 消费 tok.escaped。
+            const tok2 = newToken(type, ident, startLine, startColumn);
+            if (this._identEscaped) tok2.escaped = true;
+            return tok2;
         } else if (this.isDigit(this.ch)) {
             let num = this.readNumber();
             let type = TokenType.INT;

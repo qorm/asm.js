@@ -60,6 +60,11 @@ export const StatementParser = {
             // for 循环头的 `;` 由 parseForStatement 单独消费,不经此路径。
             return new AST.EmptyStatement();
         } else if (this.curTokenIs(TokenType.LET) || this.curTokenIs(TokenType.CONST) || this.curTokenIs(TokenType.VAR) || this.curTokenIs(TokenType.INT_TYPE)) {
+            // [escaped-let] `l\\u0065t a;`:转义拼成的 let 不是词法声明关键词,按表达式标识符
+            // 解析(其后 a 自然产生语法错误,或作 ASI 表达式语句)。
+            if (this.curTokenIs(TokenType.LET) && this.curToken.escaped) {
+                return this.parseExpressionStatement();
+            }
             // [test262 ASI] sloppy-mode `let` followed by any token on a new line is ASI:
             // `let` becomes an expression identifier, not a declaration keyword.
             // Covers: `L: let\\n{}`, `for(;;) let\\nx=1`, `if(x) let\\nx=1`, `with(o) let\\nx=1`.
@@ -78,7 +83,7 @@ export const StatementParser = {
             return decl;
         } else if (this.curTokenIs(TokenType.FUNCTION)) {
             return this.parseFunctionDeclaration();
-        } else if (this.curTokenIs(TokenType.ASYNC) && this.peekTokenIs(TokenType.FUNCTION)) {
+        } else if (this.curTokenIs(TokenType.ASYNC) && !this.curToken.escaped && this.peekTokenIs(TokenType.FUNCTION)) {
             return this.parseFunctionDeclaration();
         } else if (this.curTokenIs(TokenType.CLASS)) {
             return this.parseClassDeclaration();
@@ -162,9 +167,24 @@ export const StatementParser = {
         let label = new AST.Identifier(name);
         this.nextToken(); // 越过标识符，当前为 ':'
         this.nextToken(); // 越过 ':'，当前为被标注语句的首 token
+        // [break-label] 标签入栈:若体内是迭代/switch,parse 时经 _markBreakableLabels
+        // 把本标签记为 break 合法目标;否则 break L 在 parseBreakStatement 报错。
+        if (!this._labelStack) this._labelStack = [];
+        const rec = { name: name, breakable: false };
+        this._labelStack.push(rec);
         let body = this.parseStatement();
+        this._labelStack.pop();
         this.checkStatementBody(body);   // [test262 早期错误] label: const/let/function 声明非法
-        return new AST.LabeledStatement(label, body);
+        const stmt = new AST.LabeledStatement(label, body);
+        stmt._labelBreakable = rec.breakable;
+        return stmt;
+    },
+
+    // [break-label] 迭代/switch 解析入口调用:把当前函数内所有在栈标签记为 break 合法目标
+    // (ES:break L 的 L 必须标注外层 IterationStatement 或 SwitchStatement)。
+    _markBreakableLabels() {
+        if (!this._labelStack) return;
+        for (let i = 0; i < this._labelStack.length; i++) this._labelStack[i].breakable = true;
     },
 
     parseVariableDeclaration() {
@@ -261,8 +281,11 @@ export const StatementParser = {
         // [test262 标签重复] 标签按函数作用域隔离:保存外层集、入体前换新集
         const prevLabels = this._usedLabels;
         this._usedLabels = new Set();
+        const prevLabelStack = this._labelStack;
+        this._labelStack = [];
         let body = this.parseBlockStatement();
         this._usedLabels = prevLabels;
+        this._labelStack = prevLabelStack;
         if (isStrict) this.fnStrictDepth--;
         if (isGenerator) this.fnGenDepth--;
         if (isAsync) this.fnAsyncDepth--;
@@ -280,7 +303,12 @@ export const StatementParser = {
         if (name === "yield" && this._immediateGen) {
             this.errors.push("Cannot use 'yield' as a binding name inside a generator");
         }
-        if (name === "await" && this._immediateAsync) {
+        // [static-block-await] 静态初始化块直属语句是模块上下文,await 是保留字(不仅
+        // async 函数内);按 fnDepth 匹配:直属语句(含直接内嵌函数表达式的名字/形参,
+        // fnDepth+1 且 _inFormalParams)拒;嵌套函数**体**内的声明不穿透。
+        if (name === "await" && (this._immediateAsync ||
+            (this._staticBlockDepth && (this.fnDepth === this._staticBlockDepth ||
+                (this._inFormalParams && this.fnDepth === this._staticBlockDepth + 1))))) {
             this.errors.push("Cannot use 'await' as a binding name inside an async function");
         }
         if (this.fnStrictDepth > 0 && (name === "eval" || name === "arguments")) {
@@ -566,6 +594,10 @@ export const StatementParser = {
                 // Annex B: sloppy regular function decls only allowed as if-statement body or top-level/block
                 this.errors.push("Function declaration cannot be used in a single-statement context");
             }
+        } else if (stmt.type === "ClassDeclaration") {
+            // [decl-cls] `for (x in y) class C {}` / `if (a) class C {}`:类声明不在
+            // Statement 文法内,单语句位恒非法(此前静默放行 → negative parse 判负)。
+            this.errors.push("Class declaration cannot be used in a single-statement context");
         }
     },
 
@@ -615,6 +647,7 @@ export const StatementParser = {
                 if (!this.expectPeek(TokenType.RPAREN)) return null;
                 this.nextToken();
                 this.loopDepth++;
+                this._markBreakableLabels();
                 let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
                 this.checkStatementBody(body);   // [test262 早期错误] for-body 单语句位
                 this.loopDepth--;
@@ -628,17 +661,23 @@ export const StatementParser = {
                 if (!this.expectPeek(TokenType.RPAREN)) return null;
                 this.nextToken();
                 this.loopDepth++;
+                this._markBreakableLabels();
                 let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
                 this.checkStatementBody(body);   // [test262 早期错误] for-body 单语句位
                 this.loopDepth--;
                 return new AST.ForInStatement(init, right, body);
             }
             if (this.peekTokenIs(TokenType.OF)) {
-                // [test262 早期错误] for-await-of 的 ForBinding 不得带初值。
-                if (isAwait && init && init.type === "VariableDeclaration") {
+                // [escaped-of] `for (x \u006ff y)`:of 关键词不得以转义书写。
+                if (this.peekToken.escaped) {
+                    this.errors.push("Keyword must not contain escaped characters");
+                }
+                // [test262 早期错误] for-of 的 ForBinding 不得带初值(`for (var [x] = 1 of [])`
+                // SyntaxError);for-await-of 同拒(此前只查 isAwait,漏普通 for-of)。
+                if (init && init.type === "VariableDeclaration") {
                     for (const d of init.declarations) {
                         if (d.init) {
-                            this.errors.push("Initializer is not allowed in for-await-of head's ForBinding position");
+                            this.errors.push("Initializer is not allowed in for-of head's ForBinding position");
                             break;
                         }
                     }
@@ -649,6 +688,7 @@ export const StatementParser = {
                 if (!this.expectPeek(TokenType.RPAREN)) return null;
                 this.nextToken();
                 this.loopDepth++;
+                this._markBreakableLabels();
                 let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
                 this.checkStatementBody(body);   // [test262 早期错误] for-body 单语句位
                 this.loopDepth--;
@@ -660,6 +700,10 @@ export const StatementParser = {
             // for ([a,b] in obj)。左值为表达式(标识符/成员/数组-对象表达式);数组-对象表达式由
             // 编译器 reinterpretAsPattern 重解释为赋值形 pattern。修 ~90 个 "expected ;, got OF" COMPILE_FAIL。
             if (this.peekTokenIs(TokenType.OF)) {
+                // [escaped-of] `for (x \u006ff y)`:of 关键词不得以转义书写。
+                if (this.peekToken.escaped) {
+                    this.errors.push("Keyword must not contain escaped characters");
+                }
                 // [test262 S1] 头部左值内层目标位校验(只拒逗号序列):`for ([(x, y)] of []) {}`。
                 this.checkPatternTargets(init);
                 // for-of:of 非运算符,parseExpression 在其前已停。
@@ -669,6 +713,7 @@ export const StatementParser = {
                 if (!this.expectPeek(TokenType.RPAREN)) return null;
                 this.nextToken();
                 this.loopDepth++;
+                this._markBreakableLabels();
                 let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
                 this.checkStatementBody(body);   // [test262 早期错误] for-body 单语句位
                 this.loopDepth--;
@@ -684,6 +729,7 @@ export const StatementParser = {
                 if (!this.expectPeek(TokenType.RPAREN)) return null;   // 移到 )
                 this.nextToken();   // 移到 body
                 this.loopDepth++;
+                this._markBreakableLabels();
                 let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
                 this.checkStatementBody(body);   // [test262 早期错误] for-body 单语句位
                 this.loopDepth--;
@@ -718,6 +764,7 @@ export const StatementParser = {
         }
         this.nextToken();
         this.loopDepth++;
+                this._markBreakableLabels();
         let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
         this.checkStatementBody(body);   // [test262 早期错误] while/do-body 单语句位
         this.loopDepth--;
@@ -731,6 +778,7 @@ export const StatementParser = {
         if (!this.expectPeek(TokenType.RPAREN)) return null;
         this.nextToken();
         this.loopDepth++;
+                this._markBreakableLabels();
         let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
         this.checkStatementBody(body);   // [test262 早期错误] while/do-body 单语句位
         this.loopDepth--;
@@ -756,6 +804,7 @@ export const StatementParser = {
     parseDoWhileStatement() {
         this.nextToken();
         this.loopDepth++;
+                this._markBreakableLabels();
         let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
         this.checkStatementBody(body);   // [test262 早期错误] while/do-body 单语句位
         this.loopDepth--;
@@ -775,6 +824,7 @@ export const StatementParser = {
         if (!this.expectPeek(TokenType.RPAREN)) return null;
         if (!this.expectPeek(TokenType.LBRACE)) return null;
         this.switchDepth++;
+        this._markBreakableLabels();
         let cases = [];
         this.nextToken();
         while (!this.curTokenIs(TokenType.RBRACE) && !this.curTokenIs(TokenType.EOF)) {
@@ -805,8 +855,20 @@ export const StatementParser = {
         if (this.peekTokenIs(TokenType.IDENT)) {
             this.nextToken();
             label = new AST.Identifier(this.curToken.literal);
-            // break label can target any labelled statement (not just loop/switch).
-            // Only flag unlabelled break outside loop/switch as illegal.
+            // [break-label] break L 的 L 必须标注外层迭代/switch(ES 13.8.1):普通语句
+            // 标签(`LABEL: x=3.14; break LABEL;`)是 SyntaxError。查栈上同名词法最近条目。
+            let found = false;
+            if (this._labelStack) {
+                for (let li = this._labelStack.length - 1; li >= 0; li--) {
+                    if (this._labelStack[li].name === label.name) {
+                        if (this._labelStack[li].breakable) found = true;
+                        break;
+                    }
+                }
+            }
+            if (!found) {
+                this.errors.push("Illegal break statement");
+            }
         } else {
             // [test262 early error] break (unlabelled) must be inside a loop or switch.
             if (this.loopDepth === 0 && this.switchDepth === 0) {

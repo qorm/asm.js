@@ -71,17 +71,17 @@ export const BuiltinMethodCompiler = {
                 return true;
 
             case "codePointAt":
-                // str.codePointAt(index): use dedicated runtime for proper surrogate pair
-                // handling. Previously aliased to charCodeAt; now uses _str_codepoint_at.
+                // String.prototype.codePointAt → 数值码点(非子串)。
+                // 此前误调 `_str_codepoint_at`(for-of 用,返子串) → SameValue(「𐀀」,65536) 判负。
+                // `_str_proto_codePointAt` 内做 ToInteger(pos)+UTF-8 解码为 number。
                 if (args.length > 0) {
                     this.compileExpression(args[0]);
-                    this.vm.fmovToFloat(0, VReg.RET);
-                    this.vm.fcvtzs(VReg.A1, 0);
+                    this.vm.mov(VReg.A1, VReg.RET); // 原始 JS 值,由 rt ToInteger
                 } else {
-                    this.vm.movImm(VReg.A1, 0);
+                    this.vm.movImm64(VReg.A1, 0x7ffb000000000000n); // undefined → ToInteger → 0
                 }
                 this.vm.pop(VReg.A0);
-                this.vm.call("_str_codepoint_at");
+                this.vm.call("_str_proto_codePointAt");
                 return true;
 
             case "charCodeAt":
@@ -246,24 +246,23 @@ export const BuiltinMethodCompiler = {
 
             case "indexOf":
                 // str.indexOf(search, fromIndex?) - 返回索引或 -1
+                // A1 传装箱 JSValue,由 _str_indexOf → _emitArgStrInline ToString
+                // (缺参=undefined→"undefined";勿预 _getStrContent/勿塞空串)。
                 if (args.length > 0) {
                     this.compileExpression(args[0]);
-                    this.vm.mov(VReg.A0, VReg.RET);
-                    this.vm.call("_getStrContent");
+                    this.vm.mov(VReg.A1, VReg.RET);
                     if (args.length > 1) {
-                        // fromIndex:先存 search content,编译第二参转裸 int 入 A2
-                        this.vm.push(VReg.RET);
+                        this.vm.push(VReg.A1);
                         this.compileExpression(args[1]);
                         if (this.vm.backend.name === "x64") this.vm.mov(VReg.A0, VReg.RET);
                         this.vm.call("_to_int32");
                         this.vm.mov(VReg.A2, VReg.RET);
                         this.vm.pop(VReg.A1);
                     } else {
-                        this.vm.mov(VReg.A1, VReg.RET);
                         this.vm.movImm(VReg.A2, 0);
                     }
                 } else {
-                    this.vm.lea(VReg.A1, "_str_empty");
+                    this.vm.movImm64(VReg.A1, 0x7ffb000000000000n); // undefined
                     this.vm.movImm(VReg.A2, 0);
                 }
                 this.vm.pop(VReg.A0);
@@ -273,28 +272,21 @@ export const BuiltinMethodCompiler = {
                 return true;
 
             case "lastIndexOf":
-                // str.lastIndexOf(search) - 返回最后出现的索引或 -1。
-                // 活跃 compileStringMethod 原缺此 case → 返 false → dispatch 落通用对象
-                // 方法 _object_get("lastIndexOf") on string → 不可调用 → TypeError/崩。
-                // 镜像 indexOf 调正确的 _str_lastIndexOf 运行时（本体字节正确，只是从没被 call）。
+                // str.lastIndexOf(search, fromIndex?) — A1 装箱 JSValue(同 indexOf)。
                 if (args.length > 0) {
                     this.compileExpression(args[0]);
-                    this.vm.mov(VReg.A0, VReg.RET);
-                    this.vm.call("_getStrContent");
                     this.vm.mov(VReg.A1, VReg.RET);
                     if (args.length > 1) {
-                        // fromIndex:存 search content,编译第二参转裸 int32 入 A2
                         this.vm.push(VReg.A1);
                         this.compileExpression(args[1]);
-                        if (this.vm.backend.name === "x64") this.vm.mov(VReg.A0, VReg.RET);
-                        this.vm.call("_to_int32");
+                        // fromIndex 保持装箱,运行时 _number_coerce(规范 ToInteger)
                         this.vm.mov(VReg.A2, VReg.RET);
                         this.vm.pop(VReg.A1);
                     } else {
                         this.vm.movImm(VReg.A2, 0x7FFFFFFF); // 哨兵:不钳(搜到末尾)
                     }
                 } else {
-                    this.vm.lea(VReg.A1, "_str_empty");
+                    this.vm.movImm64(VReg.A1, 0x7ffb000000000000n); // undefined → "undefined"
                     this.vm.movImm(VReg.A2, 0x7FFFFFFF);
                 }
                 this.vm.pop(VReg.A0);

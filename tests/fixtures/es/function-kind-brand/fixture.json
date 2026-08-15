@@ -6,6 +6,5 @@
     "run": true,
     "stdout": "[object Function]\n[object GeneratorFunction]\n[object AsyncFunction]\n[object AsyncGeneratorFunction]\n[object AsyncFunction]\n[object GeneratorFunction]\n[object AsyncFunction]\n[object AsyncGeneratorFunction]",
     "exitCode": 0
-  },
-  "knownFailure": "Pre-existing failure - not in current task scope"
+  }
 }

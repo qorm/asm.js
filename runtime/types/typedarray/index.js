@@ -1685,9 +1685,25 @@ export class TypedArrayGenerator {
         const MASK = 0x0000ffffffffffffn;
         vm.label("_ta_buffer");
         vm.prologue(16, [VReg.S0, VReg.S1]);
-        vm.mov(VReg.S0, VReg.A0);          // boxed ta
+        vm.mov(VReg.S0, VReg.A0);          // ta(装箱 0x7FFD 或裸指针)
+        // [buffer-untyped] 接收者非 TA(用户对象 .buffer 属性)时回落通用具名读:
+        // 编译器把 .buffer 访问点无条件改派到这里(参数/别名接收者静态不可判),
+        // 若不回落,用户对象的同名属性被劫持成垃圾。TA 头字节 0x40..0x61,
+        // 装箱/裸指针两种表示都要认(_typed_array_new 返裸指针,多数流不装箱)。
+        vm.shrImm(VReg.V0, VReg.S0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jeq("_tab_chk_head");
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_tab_user");               // 数字/bool/字符串等 → 用户属性读
+        vm.label("_tab_chk_head");
         vm.movImm64(VReg.V1, MASK);
-        vm.and(VReg.S1, VReg.S0, VReg.V1); // S1 = 裸 ta
+        vm.and(VReg.V0, VReg.S0, VReg.V1);
+        vm.loadByte(VReg.V1, VReg.V0, 0);
+        vm.cmpImm(VReg.V1, 0x40);
+        vm.jlt("_tab_user");
+        vm.cmpImm(VReg.V1, 0x61);
+        vm.jgt("_tab_user");
+        vm.mov(VReg.S1, VReg.V0);          // S1 = 裸 ta
         vm.load(VReg.V0, VReg.S1, 24);     // buffer@24
         vm.cmpImm(VReg.V0, 0);
         vm.jeq("_tab_make");
@@ -1701,6 +1717,16 @@ export class TypedArrayGenerator {
         vm.mov(VReg.A2, VReg.S0);          // owner = boxed ta
         vm.call("_arraybuffer_wrap");      // RET = wrapper(S1 callee 保存)
         vm.store(VReg.S1, 24, VReg.RET);   // 缓存 ta.buffer@24 = wrapper
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+        vm.label("_tab_user");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.lea(VReg.A1, vm.asm.addString("buffer"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.call("_maybe_getter");
         vm.epilogue([VReg.S0, VReg.S1], 16);
     }
 
@@ -1846,6 +1872,40 @@ export class TypedArrayGenerator {
         // (它们此前靠"构造出空 TA"侥幸通过 *-not-called-on-empty 之类断言)。
         // 故保留 array-like 路;iterable 支持须先补 @@iterator 的动态取值。
         vm.label("_tact_obj");
+        // [buffer view] 装箱 ArrayBuffer 源(new TA(buffer)):头字节判 TYPE_ARRAY_BUFFER
+        // → 脱壳走视图构造(此前落 array-like 读 .length=undefined → 空构造,
+        // TypedArray at/to* 族的 makeArrayBuffer 工厂用例)。
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V0, VReg.S3, VReg.V1);
+        vm.loadByte(VReg.V1, VReg.V0, 0);
+        vm.cmpImm(VReg.V1, TYPE_ARRAY_BUFFER);
+        vm.jne("_tact_obj_iter");
+        vm.mov(VReg.S3, VReg.V0);                  // 裸 buffer
+        vm.jmp("_tact_view");
+        vm.label("_tact_obj_iter");
+        // [iterable] 优先 @@iterator(规范 %TypedArray% 构造器先查迭代协议,后 array-like):
+        // `new TA(obj)` 的 obj 是带 Symbol.iterator 的普通对象(makeIterable 工厂)时,
+        // 旧实现只读 .length(undefined)→ 宽容空构造 → 长度 0、at(0)=undefined
+        // (TypedArray at/to* 族的「Expected SameValue(«undefined», «0»)」)。
+        // 键约定:编译器的计算键写点把 Symbol.iterator 归一为字符串键 "Symbol.iterator"
+        // (getMemberPropertyName 协议),故此处读也用字符串键(用 symbol raw ptr 读会 miss)。
+        vm.mov(VReg.A0, VReg.S3);                  // obj
+        vm.lea(VReg.A1, vm.asm.addString("Symbol.iterator"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");                    // RET = 迭代方法
+        vm.mov(VReg.V0, VReg.RET);
+        vm.shrImm(VReg.V0, VReg.V0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFF);                // 函数?
+        vm.jne("_tact_obj_len");
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.call("_box_arr_r");                     // RET = 空数组(boxed)
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_array_spread_into");             // A0=arr,A1=src → RET=arr
+        vm.mov(VReg.S3, VReg.RET);
+        vm.jmp("_tact_from");
+        vm.label("_tact_obj_len");
         vm.lea(VReg.A1, "_str_k_length");
         vm.movImm64(VReg.V1, STR_TAG);
         vm.or(VReg.A1, VReg.A1, VReg.V1);
@@ -2490,7 +2550,11 @@ export class TypedArrayGenerator {
             vm.movImm(VReg.A2, arity);
             vm.scvtf(0, VReg.A2);
             vm.fmovToInt(VReg.A2, 0);
-            vm.call("_closure_prop_set");
+            // _closure_prop_define(非 _closure_prop_set):闭包元数据 arity(_aref_generic=0)
+            // 使 _closure_prop_set 的 length 写被「已存在不可写」守卫静默忽略 → 方法
+            // .length 恒 0(TA find/lastIndexOf 等 length 描述符测试判负)。define 语义
+            // 直覆生效。
+            vm.call("_closure_prop_define");
             vm.movImm64(VReg.V1, MASK);
             vm.and(VReg.A0, VReg.S1, VReg.V1); // 裸原型
             keyOf(VReg.A1, name);

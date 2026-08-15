@@ -41,13 +41,16 @@ export class NumberWrapperGenerator {
         vm.call("_object_new");     // RET = raw obj ptr
         vm.mov(VReg.S0, VReg.RET);  // S0 = raw obj ptr
 
-        // Step 3: set proto from global slot (always present from emitNumberCtorObject)
+        // Step 3: set proto from global slot;槽未物化时保留 _object_new 已链的
+        // Object.prototype(勿用裸 0 覆盖,否则 ToNumber/valueOf 全断)。
         vm.lea(VReg.V3, "_nsobj_number_proto");
         vm.load(VReg.V3, VReg.V3, 0); // V3 = boxed proto (0 if not yet materialized)
-        // Unbox proto: __proto__ slot stores raw pointer, not boxed value
+        vm.cmpImm(VReg.V3, 0);
+        vm.jeq("_nnew_skip_proto");
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.V3, VReg.V3, VReg.V1);
         vm.store(VReg.S0, 16, VReg.V3); // obj.__proto__ = raw prototype pointer
+        vm.label("_nnew_skip_proto");
 
         // Step 4: store __number_value property
         vm.mov(VReg.A0, VReg.S0);

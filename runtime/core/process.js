@@ -849,6 +849,35 @@ export class ProcessGenerator {
         vm.lea(VReg.V1, "_global_this");
         vm.store(VReg.V1, 0, VReg.RET);
 
+        // [gOPD 补全] globalThis.parseInt 挂为 own prop(15.2.3.3-4-5:此前 globalThis
+        // 对象不挂全局函数键,gOPD 得 undefined)。值 = 24B 静态引用闭包
+        // {CLOSURE_MAGIC, _aref_static_tramp, _js_parseInt}(与 members.js
+        // emitStaticBuiltinRefClosure 同形,经蹦床可调用);attr 5 = 规范
+        // {writable:true, enumerable:false, configurable:true}。测试的
+        // desc.value === global.parseInt 是同一 own prop 两读 → 恒等免费。
+        // 裸 parseInt 标识符另有编译期 memoized 槽(_builtinref_number_parseInt),
+        // 与本闭包身份不同(parseInt === globalThis.parseInt 记偏差,规范外读法)。
+        vm.movImm(VReg.A0, 24);
+        vm.call("_alloc");
+        vm.movImm(VReg.V1, 0xc105); // CLOSURE_MAGIC
+        vm.store(VReg.RET, 0, VReg.V1);
+        vm.lea(VReg.V1, "_aref_static_tramp");
+        vm.store(VReg.RET, 8, VReg.V1);
+        vm.lea(VReg.V1, "_js_parseInt");
+        vm.store(VReg.RET, 16, VReg.V1);
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_js_box_function");
+        vm.mov(VReg.A2, VReg.RET);
+        vm.lea(VReg.V1, "_global_this");
+        vm.load(VReg.A0, VReg.V1, 0);
+        vm.lea(VReg.A1, this.vm.asm.addString("parseInt"));
+        vm.call("_object_set");
+        vm.lea(VReg.V1, "_global_this");
+        vm.load(VReg.A0, VReg.V1, 0);
+        vm.lea(VReg.A1, this.vm.asm.addString("parseInt"));
+        vm.movImm(VReg.A2, 5); // {w:1,e:0,c:1}
+        vm.call("_object_set_prop_attr");
+
         // 返回 process 对象 (从全局加载，确保是正确的装箱值或指针)
         vm.lea(VReg.V1, "_process_global");
         vm.load(VReg.RET, VReg.V1, 0);

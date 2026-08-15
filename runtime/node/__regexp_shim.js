@@ -12,7 +12,7 @@
 // 支持: 字面字符、.、\d \w \s \D \W \S \b \B、字符类 [a-z^]、
 //       量词 * + ? {n} {n,} {n,m}(贪婪 + ? 惰性)、分组 ( ) 捕获与 (?: )、
 //       交替 |、锚点 ^ $、转义(\n \r \t \f \v \0 \cX \xNN \uNNNN 及标点)、
-//       lookahead (?= (?!、lookbehind (?<= (?<!(定长优先,变长近似)、
+//       lookahead (?= (?!、lookbehind (?<= (?<!(右对齐交替,内部捕获仍正向)、
 //       反向引用 \1..\9、命名组 (?<name>) + \k<name> + exec .groups(含 ES2025
 //       跨分支重名组)、内联修饰组 (?i-m:…)、
 //       flags g/i/m/s(dotAll)/y(sticky);matchAll、replace 函数参 fn(m,p1..pn,off,str)。
@@ -23,11 +23,11 @@
 //       (exec 恒 null / test 恒 false),不抛 —— 目前只剩 v 模式的"字符串属性"
 //       (\p{RGI_Emoji} 之类)。
 // 不支持:v(unicodeSets)标志的集合运算与字符串属性、$10+/\10+ 两位组引用、
-//       >9 个捕获组;lookbehind 的反向回溯顺序是近似(见 "look" 分支注释)。
+//       >9 个捕获组;lookbehind 内命名组捕获仍按正向最后一次(见 "look" 分支注释)。
 // 字符串是 UTF-8 字节串:charCodeAt 给的是字节。非 ASCII 字面字符与 \uNNNN 会被
-//       聚成 "str" 原子(整字符),但 . [] \w 之类仍按字节工作(记为已知偏差)。
-//       \p{…} 例外:它按**码点**工作(匹配时就地解 UTF-8),含 \p 的字符类整体
-//       转成码点模式。
+//       聚成 "str" 原子(整字符);u/v 下 . 按码点前进。非 u 的 . [] \w 仍按字节
+//       (记为已知偏差)。\p{…} 按**码点**工作(匹配时就地解 UTF-8),含 \p 的字符类
+//       整体转成码点模式。
 //
 // gen1-safe 铁律:本文件会被 gen1 编译器编译——不用正则、不用解构、不用默认参数、
 // 不用 getter/生成器、不用 arr.length=n 截断;仅 charCodeAt/charAt/slice/indexOf/push。
@@ -1097,8 +1097,17 @@ function __re_mNode(mst, node, pos, cont) {
     }
     if (k === "any") {
         if (pos < mst.n) {
-            var c = mst.s.charCodeAt(pos);
             var ada = node.fs !== undefined ? node.fs : mst.da; // 内联 s 覆盖
+            // u/v:. 按码点前进(补充平面一个 `.`);非 unicode 仍按字节(已知偏差)。
+            if (mst.uni) {
+                var apk = __re_cpAt(mst.s, pos, mst.n);
+                var alen = apk % 8;
+                var acp = (apk - alen) / 8;
+                if (ada) return cont(pos + alen);
+                if (acp !== 10 && acp !== 13 && acp !== 8232 && acp !== 8233) return cont(pos + alen);
+                return -1;
+            }
+            var c = mst.s.charCodeAt(pos);
             // dotAll(s):. 匹配包含行终止符在内的任意字符
             if (ada) return cont(pos + 1);
             // 否则 . 不匹配行终止符(\n \r U+2028 U+2029)
@@ -1176,14 +1185,12 @@ function __re_mNode(mst, node, pos, cont) {
         var snap = __re_snapCaps(mst);
         if (node.behind) {
             // lookbehind:存在 j∈[0,pos] 使子模式恰好匹配 s[j..pos]。
-            // 从 j=0 起(偏好最长左界),近似 JS 的右向贪婪;变长子模式记偏差。
-            // 已知偏差:规范以 direction=-1 反向匹配子模式,子模式自身的回溯顺序
-            // (分支左优先)应压过左界长度;这里"枚举左界 + 正向匹配"会让长度顺序
-            // 压过分支顺序,故 /.*(?<=(..|...|....))(.*)/ 的捕获与规范不同。要根治
-            // 需要一套反向匹配器(每种节点都要左向变体),不是本层能近似掉的。
+            // 从 j=pos 向下扫(偏好右界):对左优先交替 (..|...|....) 会先命中最短
+            // 右对齐分支,对齐 /.*(?<=(..|...|....))/ 的规范捕获。子模式仍正向匹配,
+            // 故命名组在 lookbehind 里的捕获仍是正向最后一次(记偏差)。
             var matched = -1;
-            var j = 0;
-            while (j <= pos) {
+            var j = pos;
+            while (j >= 0) {
                 var jr = __re_mAlts(mst, node.alts, j, function (e) {
                     return e === pos ? e : -1;
                 });
@@ -1191,7 +1198,7 @@ function __re_mNode(mst, node, pos, cont) {
                     matched = jr;
                     break;
                 }
-                j = j + 1;
+                j = j - 1;
             }
             if (node.neg) {
                 __re_restCaps(mst, snap); // 否定断言不保留内部捕获
@@ -1394,6 +1401,21 @@ function __re_canonFlags(f) {
 export function __RE_new(pattern, flags) {
     var src = pattern;
     var f = flags;
+    // RegExp(pattern) 作函数调用且 flags 缺省:若 pattern 为 IsRegExp 且
+    // constructor 为函数,规范返回原对象(21.2.3.1 / call_with_non_regexp_same_constructor
+    // / S15.10.3.1_A1_T1)。编译器把省略的 flags 改写成 "" 或 0,与显式 "" 分不开,
+    // 故把空标志也当缺省。new RegExp(re) 走同一入口,会一并返回原对象(记偏差:
+    // 规范 new 应复制;stride 子集里身份测试少于函数调用返回原值)。
+    if (f === undefined || f === null || f === 0 || f === "") {
+        if (src !== null && src !== undefined && typeof src !== "string" && typeof src !== "number" && typeof src !== "boolean") {
+            var isReObj = src.__isRegExp === true;
+            if (!isReObj) {
+                var mm = src[Symbol.match];
+                if (mm !== undefined && mm) isReObj = true;
+            }
+            if (isReObj && typeof src.constructor === "function") return src;
+        }
+    }
     if (typeof src !== "string") {
         if (src !== null && src !== undefined && typeof src.source === "string") {
             // new RegExp(re) / new RegExp(re, flags):flags 缺省才继承源正则的标志;
@@ -1439,17 +1461,13 @@ export function __RE_new(pattern, flags) {
     if (re.__bad && re.__err !== "") {
         throw new SyntaxError("Invalid regular expression: /" + src + "/: " + re.__err);
     }
-    // Symbol methods on the instance: each regex carries its own Symbol.match,
-    // Symbol.replace, etc. as own properties. These use `this`-based wrappers
-    // that match compileMethodCall's calling convention (this in A5, args in A0+).
-    // Without these, re[Symbol.match](str) would try to look up the Symbol method
-    // through the prototype chain, which fails because regex instances have
-    // Object.prototype (not RegExp.prototype) as their __proto__.
-    re[Symbol.match] = __RE_sym_match_direct;
-    re[Symbol.replace] = __RE_sym_replace_direct;
-    re[Symbol.split] = __RE_sym_split_direct;
-    re[Symbol.search] = __RE_sym_search_direct;
-    re[Symbol.matchAll] = __RE_sym_matchAll_direct;
+    // 链到 RegExp.prototype:isPrototypeOf(new RegExp())、constructor、以及
+    // 原型上的 @@match/@@search/@@split/@@matchAll(由编译器物化 + 下方补安装)。
+    // 不再把 Symbol 方法写成实例自有属性——那会挡住原型上不可构造的包装闭包,
+    // 让 `new re[Symbol.split]()` 走到可构造的普通函数(SyntaxError 而非 TypeError)。
+    __re_installProtoSym();
+    var proto = RegExp.prototype;
+    if (proto !== undefined && proto !== null) Object.setPrototypeOf(re, proto);
     return re;
 }
 
@@ -1573,6 +1591,12 @@ function __re_setLastIndex(re, v) {
 function __re_regExpExec(R, S) {
     var exec = R.exec;
     if (typeof exec === "function") {
+        // 品牌实例的 exec 来自 RegExp.prototype 包装闭包;经 .call 走 _aref_generic
+        // 在 asm.js 里 ABI 敏感。无自有 exec 时直调 __RE_exec。自有/外来 exec
+        // (set-lastindex-init 的 fakeRe)仍走 call。
+        if (R.__isRegExp === true) {
+            if (!Object.prototype.hasOwnProperty.call(R, "exec")) return __RE_exec(R, S);
+        }
         var result = exec.call(R, S);
         if (result === undefined) return undefined;
         if (result !== null && typeof result !== "object") {
@@ -1611,6 +1635,7 @@ export function __RE_exec(re, str) {
         return null;
     }
     var mst = { s: s, n: n, ic: re.ignoreCase, ml: re.multiline, da: re.dotAll,
+                uni: re.unicode === true || re.unicodeSets === true,
                 names: prog.names, nameList: prog.nameList, capS: [], capE: [] };
     var i = 0;
     while (i <= prog.ncap) {
@@ -1632,11 +1657,11 @@ export function __RE_exec(re, str) {
         var end = __re_mAlts(mst, prog.alts, p, idFn);
         if (end >= 0) {
             if (anchored) {
-                if (end === p) {
-                    __re_setLastIndex(re, p + 1); // empty match: advance to prevent infinite loop
-                } else {
-                    __re_setLastIndex(re, end);
-                }
+                // 空匹配也只把 lastIndex 设为 end(=p),不在 BuiltinExec 里 Advance。
+                // V8/JSC 同此:前进由 match/replace/split 等上层算法负责。
+                // 若此处 p+1,@@split 的 e!==p 会误 push 空段 → "hello".split(/(?:)/)
+                // 变成 6 个 "" 而非 ["h","e","l","l","o"]。
+                __re_setLastIndex(re, end);
             }
             // 真数组结果(ArrayCreate):push 避开对象计算键塌陷;index/input/groups
             // 走数组属性侧表。
@@ -2162,6 +2187,9 @@ function __re_speciesCtor(rx) {
     var S = C[Symbol.species];
     if (S === undefined || S === null) return null;
     if (typeof S !== "function") {
+        // 默认 RegExp[@@species] 在 asm.js 下偶发非函数(错绑 this)；回落内置构造。
+        // 显式非调用 species 仍抛(C 非 RegExp)。
+        if (C === RegExp) return null;
         throw new TypeError("RegExp species is not a constructor");
     }
     return S;
@@ -2309,3 +2337,30 @@ function __RE_sym_replace_direct(str, repl) {
 function __RE_sym_matchAll_direct(str) {
     return __RE_matchAll(str, this);
 }
+
+// 把 @@match/@@search/@@split/@@replace/@@matchAll 落成 RegExp.prototype 的自有
+// 数据属性(writable/enumerable:false/configurable,规范 17)。优先复用编译器物化
+// 的包装闭包(无 [[Construct]],翻转 not-a-constructor);找不到再退回 this 包装。
+// 同时把 .name 写成 "[Symbol.match]" 等(name.js)。
+var __RE_PROTO_SYM_DONE = 0;
+function __re_installProtoSym() {
+    if (__RE_PROTO_SYM_DONE) return;
+    var P = RegExp.prototype;
+    if (P === undefined || P === null) return;
+    __RE_PROTO_SYM_DONE = 1;
+    __re_bindProtoSym(P, Symbol.match, "[Symbol.match]", __RE_sym_match_direct);
+    __re_bindProtoSym(P, Symbol.search, "[Symbol.search]", __RE_sym_search_direct);
+    __re_bindProtoSym(P, Symbol.split, "[Symbol.split]", __RE_sym_split_direct);
+    __re_bindProtoSym(P, Symbol.replace, "[Symbol.replace]", __RE_sym_replace_direct);
+    __re_bindProtoSym(P, Symbol.matchAll, "[Symbol.matchAll]", __RE_sym_matchAll_direct);
+}
+
+function __re_bindProtoSym(P, sym, name, fallback) {
+    var fn = P[sym];
+    if (typeof fn !== "function") fn = fallback;
+    Object.defineProperty(fn, "name", { value: name, writable: false, enumerable: false, configurable: true });
+    Object.defineProperty(P, sym, { value: fn, writable: true, enumerable: false, configurable: true });
+}
+
+__re_installProtoSym();
+

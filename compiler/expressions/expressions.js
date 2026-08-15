@@ -360,7 +360,11 @@ export const ExpressionCompiler = {
                 this.vm.call("_object_set_attr");
                 this.vm.load(VReg.A0, VReg.FP, objPtrOff);
                 this.vm.movImm(VReg.A1, 1); // idx 1 = length
-                this.vm.movImm(VReg.A2, 5); // writable|configurable, not enumerable
+                // [String wrapper] ES 字符串异质对象的 length 自有属性
+                // {writable:false,enumerable:false,configurable:false}=attr 0(String/length.js
+                // verifyProperty 判负根因)。写槽代码经 _object_set(define=0)不查 writable,
+                // 不受影响;严格赋值 wrapper.length=x 抛 TypeError 恰是规范行为。
+                this.vm.movImm(VReg.A2, 0);
                 this.vm.call("_object_set_attr");
                 // Box the object
                 this.vm.load(VReg.RET, VReg.FP, objPtrOff);
@@ -412,10 +416,21 @@ export const ExpressionCompiler = {
                 }
                 break;
 
-            case "Object":
-                // new Object() - 空对象
-                this.compileObjectExpression({ properties: [] });
+            case "Object": {
+                // new Object(x) ≡ Object(x)(ToObject);无参 → {}。此前一律空对象
+                // → new Object("s").valueOf() 丢原串(S15.2.4.4_A1_T3)。
+                if (args.length === 0) {
+                    this.compileObjectExpression({ properties: [] });
+                    break;
+                }
+                // 复用 Object(x) 调用路径(同 ToObject)
+                this.compileCallExpression({
+                    type: "CallExpression",
+                    callee: { type: "Identifier", name: "Object" },
+                    arguments: args,
+                });
                 break;
+            }
 
             case "Promise":
                 // new Promise(executor) - executor 收到 resolve/reject 闭包

@@ -1492,10 +1492,20 @@ export const OperatorCompiler = {
         if (expr.operator === "delete") {
             const darg = expr.argument;
             if (darg && darg.type === "MemberExpression") {
+                // 静态键:computed 中只有字符串字面量与 well-known Symbol 成员
+                // (Symbol.iterator/asyncIterator → "Symbol.xxx",与读写侧归一一致)
+                // 是静态键——computed 的 Identifier 是变量必须走动态求值(镜像
+                // members.js :4627 判定)。此前 Symbol.iterator 落动态路径求值符号键 →
+                // _object_delete 与静态字符串键存储形态不匹配 → 漏删(返 true 但属性存活,
+                // `delete Array.prototype[Symbol.iterator]` 后解构不抛 TypeError 根因)。
                 const dName = !darg.computed
                     ? this.getMemberPropertyName(darg.property)
                     : ((darg.property.type === "Literal" || darg.property.type === "StringLiteral") &&
-                       typeof darg.property.value === "string" ? String(darg.property.value) : null);
+                       typeof darg.property.value === "string"
+                        ? String(darg.property.value)
+                        : (darg.property.type === "MemberExpression"
+                            ? this.getMemberPropertyName(darg.property)
+                            : null));
                 if (dName !== null) {
                     this.compileExpression(darg.object);
                     this.vm.mov(VReg.A0, VReg.RET);

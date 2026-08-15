@@ -419,8 +419,11 @@ export const AsyncCompiler = {
     // 的 call(而非旧的尾跳)——语义等价(生成器函数正常返回 genobj 给调用者)。
     // 紧随其后落 bodyLabel，调用方继续在该点编译真正的函数体(经 _coroutine_entry 进入)。
     // async generator：stub 与生成器同构,仅构造器换成 _async_generator_new。
+    // [FDI eager] 必须透传 emitGeneratorStub 的返回值(pattern 叶名序):丢 return → 调用方
+    // 拿 undefined → async-gen 体内误判未绑定而重复 emitParamDestructure → 与 stub 同前缀
+    // 标签二次发射互相覆盖(跳转解析到错误落点,SIGBUS)。
     emitAsyncGeneratorStub(bodyLabel, hasClosure, capturedNames) {
-        this.emitGeneratorStub(bodyLabel, hasClosure, "_async_generator_new", capturedNames);
+        return this.emitGeneratorStub(bodyLabel, hasClosure, "_async_generator_new", capturedNames);
     },
 
     emitGeneratorStub(bodyLabel, hasClosure, ctorFn, capturedNames) {
@@ -430,24 +433,41 @@ export const AsyncCompiler = {
         // 分配临时槽;无解构参数的生成器探针零发射,多余栈空间仅浪费不入栈 —— 指令/字节
         // 只在含探针的生成器上变化。S3 仍用于跨 _generator_new 保住 A5=this。
         vm.prologue(8192, [VReg.S3]);
-        // [FDI 提前] 解构参数守卫:规范里 FunctionDeclarationInstantiation 在**调用时**跑,
-        // 故 `function* g({}){}` 的 `g(null)` 同步抛 TypeError,而非先返回生成器对象、把抛
-        // 推迟到首次 .next()。见 emitGenStubParamGuards:只提前「可抛的那一步」,无解构参数
-        // 的生成器一条指令都不多发(既有产物字节不变)。
-        this.emitGenStubParamGuards(bodyLabel);
+        // [FDI eager] 含 pattern 形参时在调用期完成**完整**形参绑定(FunctionDeclaration-
+        // Instantiation:求默认值、读属性/触发 getter、GetIterator/消费迭代器),与体内
+        // 绑定同一发射器(emitParamDestructure),异常类型/消息/时机全对齐规范。守卫与
+        // 默认值探针全被它覆盖(零误拒:捕获名经 S0 预载、模块顶层名经 mainCapturedVars,
+        // 探针帧与体内解析一致)。返回值=绑定叶名序列(体内 transfer 用)或 null。
+        const fdi = this.emitGenStubFullFdi(bodyLabel, capturedNames);
+        if (!fdi) {
+            // [FDI 提前] 解构参数守卫:规范里 FunctionDeclarationInstantiation 在**调用时**跑,
+            // 故 `function* g({}){}` 的 `g(null)` 同步抛 TypeError,而非先返回生成器对象、把抛
+            // 推迟到首次 .next()。见 emitGenStubParamGuards:只提前「可抛的那一步」,无解构参数
+            // 的生成器一条指令都不多发(既有产物字节不变)。
+            this.emitGenStubParamGuards(bodyLabel);
+        }
         // [L2-②] eager 参数默认值探针:把 A0-A4 实参先落临时槽,再按解构 pattern 的
         // 「读元素/属性 + 判 undefined → 求默认值」顺序提前走一遍。只对**安全默认值**
         // (仅引用未解析名或常量)生效;命中 unresolvable 默认值 → 调用时抛 ReferenceError
         // (规范 FunctionDeclarationInstantiation 在 [[Call]] 阶段求默认值,`g([undefined])`
         // 对 `[a=unresolvable]` 须同步抛)。成功路径只把外层默认值写回临时槽、不绑定——
         // 体内惰性绑定照旧,数组/字符串/对象源可重迭代,无观测副作用。
-        const eagerSlots = this.emitGenStubEagerDefaults(bodyLabel, capturedNames);
+        // [FDI eager] 完整 FDI 已覆盖 pattern 形参 → 探针只处理标识符默认值参数(免二重求值)。
+        const eagerSlots = this.emitGenStubEagerDefaults(bodyLabel, capturedNames, !!fdi);
         if (eagerSlots) {
             // 探针结果回填 A0-A4:简单标识符参数的默认值已求好(体见非 undefined 即跳过
             // 默认,天然避免双重求值);解构参数的外层默认值已写回,体内再解构同一值。
             for (let i = 0; i < eagerSlots.length; i++) {
                 vm.load(vm.getArgReg(i), VReg.FP, eagerSlots[i]);
             }
+        }
+        if (!fdi) {
+            // [FDI GetIterator] 阵列解构参数的 GetIterator 可调用性守卫:在默认值探针**之后**
+            // (外层默认值已替换进实参寄存器),对最终实参值做与体内 emitDestructurePattern
+            // 同判据的 @@iterator 检查——delete Array.prototype[Symbol.iterator] 后
+            // `g([1,2,3])` / `g()`(默认值 [1,2,3])都须在**调用时**同步抛 TypeError
+            // (ary-init-iter-get-err-array-prototype 族,gen-meth/async-gen 模板)。
+            this.emitGenStubIterGuard(bodyLabel);
         }
         vm.mov(VReg.S3, VReg.A5);  // S3 = this(A5);callee-saved,survives _generator_new
         // 先把 2-5 号实参压栈(4 个=32B,16 对齐),随后覆盖 A0/A1/A2 供 _generator_new
@@ -476,16 +496,149 @@ export const AsyncCompiler = {
         vm.store(VReg.V6, 120, VReg.A2);
         vm.store(VReg.V6, 128, VReg.A3);
         vm.store(VReg.V6, 136, VReg.A4);
+        if (fdi) {
+            // [FDI eager] transfer 数组入协程 +168(CORO_PREBOUND),体内按序取叶值。
+            vm.load(VReg.V1, VReg.FP, fdi.arrOff);
+            vm.store(VReg.V6, 168, VReg.V1);
+            }
         // 栈尺寸须与 prologue(8192) 配对(epilogue 用 stackSize 恢复 SP;0 会令 SP 停在
         // 帧中段 → ret 从错误地址取返回地址 → 调用生成器函数即崩)。
         vm.epilogue([VReg.S3], 8192); // ret：返回 genobj；恢复 S3
         vm.label(bodyLabel);
+        return fdi ? fdi.list : null;
+    },
+
+    // [FDI eager] 完整形参绑定(FunctionDeclarationInstantiation)发射器:在 stub 帧内对
+    // pattern 形参跑与体内完全相同的 emitParamDestructure(同一发射器 → Get/getter/默认值/
+    // GetIterator/迭代消费语义逐字节一致),绑定叶名经记录 ctx 按分配序收集,打包进
+    // transfer 数组(存本帧槽,由 emitGeneratorStub 在建协程后写入 coro+168)。返回
+    // { list: [叶名…], arrOff } 或 null(无 pattern 形参)。参数引用解析与体内一致:
+    // 捕获名先从 S0 闭包预载 box 指针入探针帧(compileIdentifier 才知其为 box),
+    // 模块顶层名经 mainCapturedVars 全局 box;this 经 __this=A5。末尾回填 A0-A4+A5
+    // (绑定过程自由毁参数寄存器,下方 _generator_new 仍需原始实参)。
+    emitGenStubFullFdi(bodyLabel, capturedNames) {
+        const params = this._genStubParams(bodyLabel);
+        if (!params || params.length === 0) return null;
+        const n = Math.min(params.length, 5);
+        const patternIdxs = [];
+        for (let i = 0; i < n; i++) {
+            if (this._isPatternParam(params[i])) patternIdxs.push(i);
+        }
+        if (patternIdxs.length === 0) return null;
+        const vm = this.vm;
+        // 与 emitGenStubEagerDefaults 同法:探针帧不污染外层 locals/stackOffset。
+        const savedStackOffset = this.ctx.stackOffset;
+        const savedLocals = this.ctx.locals;
+        const savedBoxed = this.ctx.boxedVars;
+        const savedVarTypes = this.ctx.varTypes;
+        const savedCtx = this.ctx;
+
+        // 记录 ctx:绑定叶名(∈bindingNames)按**分配序**记录为 transfer 序;临时槽名
+        // (__前缀/其它)不录。protoAlloc 复用 Context.prototype.allocLocal(读写
+        // this.stackOffset/locals/varTypes —— this=rec 时落在探针帧自有字典)。
+        const bindingNames = {};
+        for (let i = 0; i < patternIdxs.length; i++) {
+            collectPatternNames(params[patternIdxs[i]], bindingNames);
+        }
+        const rec = Object.create(savedCtx);
+        rec.locals = {};
+        rec.stackOffset = 0;
+        rec.varTypes = {};
+        // [标签隔离] rec 继承外层 labelPrefix/labelCounter,newLabel 的 ++ 落在 rec 自有
+        // counter 上(外层 counter 不前进)→ 与之后发射的同前缀标签(体内 destructure、
+        // 外层代码的 destructure)同号相撞:汇编器把早发跳转解析到后发的重名标签落点
+        // → 跳到错误地址(SIGBUS)。改用全局唯一前缀 + 自 0 计数,与一切其它发射隔离。
+        rec.labelPrefix = "fdi_" + this.nextLabelId() + "_";
+        rec.labelCounter = 0;
+        const protoAlloc = Object.getPrototypeOf(savedCtx).allocLocal;
+        const recorded = [];
+        rec.allocLocal = function (name, type) {
+            const off = protoAlloc.call(this, name, type);
+            if (name && typeof name === "string" &&
+                Object.prototype.hasOwnProperty.call(bindingNames, name) &&
+                recorded.indexOf(name) === -1) {
+                recorded.push(name);
+            }
+            return off;
+        };
+        // boxedVars:外层已 box 名 + 本函数捕获名(S0 预载后 compileIdentifier 走 box deref)
+        rec.boxedVars = new Set(savedCtx.boxedVars || []);
+        if (capturedNames) {
+            for (let i = 0; i < capturedNames.length; i++) rec.boxedVars.add(capturedNames[i]);
+        }
+        this.ctx = rec;
+
+        // __this(默认值表达式可引用 this)
+        const thisOff = rec.allocLocal("__this");
+        vm.store(VReg.FP, thisOff, VReg.A5);
+        // 捕获名:S0 闭包 box 指针预载入探针帧(与体内 closure 载入同法)
+        const caps = capturedNames || [];
+        for (let i = 0; i < caps.length; i++) {
+            const off = rec.allocLocal(caps[i]);
+            vm.load(VReg.V1, VReg.S0, 16 + i * 8);
+            vm.store(VReg.FP, off, VReg.V1);
+        }
+        // 实参落槽(FDI 毁 A 寄存器前)
+        const slots = [];
+        for (let i = 0; i < n; i++) {
+            const off = rec.allocLocal(`__fdiarg_${i}`);
+            vm.store(VReg.FP, off, vm.getArgReg(i));
+            slots.push(off);
+        }
+        const thisSlot = rec.allocLocal(`__fdithis`);
+        vm.store(VReg.FP, thisSlot, VReg.A5);
+        // 按形参序跑完整绑定(外层默认值 + 解构;emitParamDestructure 与体内同构)
+        // [S0 保护] 阵列分支物化 Array.prototype 时 emitArrayProtoObject 内联体使用 S0
+        // (emitCollectionCtorObject 的闭包构造码 mov S0,RET)——生成器 stub 的 S0 = 闭包
+        // 对象(hasClosure 路径),必须跨绑定保住,否则 _generator_new(A2=S0) 拿垃圾闭包
+        // 指针 → 体内捕获变量载入解引用崩(与 emitGenStubIterGuard 同法;抛路径不返回
+        // 无需弹)。
+        vm.push(VReg.S0);
+        for (let k = 0; k < patternIdxs.length; k++) {
+            const i = patternIdxs[k];
+            const p = params[i];
+            const pat = p.type === "AssignmentPattern" ? p.left : p;
+            const dflt = p.type === "AssignmentPattern" ? p.right : null;
+            this.emitParamDestructure(pat, slots[i], dflt);
+        }
+        vm.pop(VReg.S0);
+        // transfer 数组 [v0, v1, …](绑定序),存本帧槽;建协程后由 emitGeneratorStub 写
+        // coro+168。空 pattern({}/[])→ 空数组,同样发射(体内据此跳过重复解构)。
+        // _array_new_with_size 返**裸**指针,须 _box_arr_r 装箱(体内 _subscript_get 与
+        // 此处 _array_push 都按装箱数组 0x7FFE 分派;漏装箱 → tag 判错 → 崩)。
+        const arrOff = rec.allocLocal(`__fditrans_${this.nextLabelId()}`);
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.call("_box_arr_r"); // box->helper
+        vm.store(VReg.FP, arrOff, VReg.RET);
+        for (let i = 0; i < recorded.length; i++) {
+            const off = rec.locals[recorded[i]];
+            vm.load(VReg.A0, VReg.FP, arrOff);
+            vm.load(VReg.A1, VReg.FP, off);
+            vm.call("_array_push");
+            vm.store(VReg.FP, arrOff, VReg.RET);
+        }
+        const list = recorded.slice();
+        const arrOffOut = arrOff;
+        // 恢复外层 ctx + 回填参数寄存器(A0-A4、A5=this:绑定路径自由毁它们)
+        this.ctx = savedCtx;
+        this.ctx.stackOffset = savedStackOffset;
+        this.ctx.locals = savedLocals;
+        this.ctx.boxedVars = savedBoxed;
+        this.ctx.varTypes = savedVarTypes;
+        for (let i = 0; i < n; i++) {
+            vm.load(vm.getArgReg(i), VReg.FP, slots[i]);
+        }
+        vm.load(VReg.A5, VReg.FP, thisSlot);
+        return { list, arrOff: arrOffOut };
     },
 
     // [L2-②] 生成器/async-gen 参数默认值 eager 探针入口:在 stub 入口把 A0-A4 实参落临时
     // 槽,再对每个解构/默认形参跑默认值探针。返回临时槽偏移数组(与形参一一对应),或
     // null(无探针可发/无解构参数)。临时槽只在 stub 帧内使用,调用方随后回填寄存器。
-    emitGenStubEagerDefaults(bodyLabel, capturedNames) {
+    // skipPatterns=true([FDI eager] 完整 FDI 已覆盖 pattern 形参):pattern 形参整条跳过
+    // (免默认值/属性读二重求值),只保留标识符默认值形参的 eager 求值。
+    emitGenStubEagerDefaults(bodyLabel, capturedNames, skipPatterns = false) {
         const params = this._genStubParams(bodyLabel);
         if (!params || params.length === 0) return null;
         // 保存/恢复 ctx 栈状态:探针在 stub 帧内分配临时槽,不得污染外层(生成器定义处)
@@ -510,10 +663,17 @@ export const AsyncCompiler = {
         // 闭包捕获名同样不可探针安全:生成器体经 S0 闭包捕获它们(如 `function make(){
         // const v=42; return function*([a=v]){…} }`),探针帧没有闭包捕获 → 把 v 误判为
         // unresolvable → 错抛 ReferenceError(零误拒违规)。顶层声明/类方法无捕获 → 空数组。
+        // 但**全局可达**的捕获名例外:顶层 var(经 _main_captured_ 全局 box)与顶层函数
+        // (经函数表)探针帧同样可解析、语义一致 → 保留可探针(`{x} = poisonedProperty`
+        // 的 getter 才能在调用期抛,dstr abrupt 族)。仅经 S0 闭包链到达的外层局部不可探针。
         if (capturedNames) {
             for (let i = 0; i < capturedNames.length; i++) {
                 const cn = capturedNames[i];
-                if (cn && typeof cn === "string") boundNames[cn] = true;
+                if (cn && typeof cn === "string") {
+                    if (this.ctx.getMainCapturedVar && this.ctx.getMainCapturedVar(cn)) continue;
+                    if (this.ctx.getFunction && this.ctx.getFunction(cn)) continue;
+                    boundNames[cn] = true;
+                }
             }
         }
         // 安全判定须用**外层原 ctx**(生成器定义处作用域):重置后的探针帧 locals 为空,
@@ -536,6 +696,7 @@ export const AsyncCompiler = {
         for (let i = 0; i < n; i++) {
             const p = params[i];
             if (!p) continue;
+            if (skipPatterns && this._isPatternParam(p)) continue; // [FDI eager] 免二重求值
             let pat = p, dflt = null;
             if (p.type === "AssignmentPattern") {
                 // 外层默认值:undefined → 求默认值(若安全),结果写回槽供内层探针/回填用
@@ -583,9 +744,12 @@ export const AsyncCompiler = {
                     target = p.value.left;
                     dflt = p.value.right;
                 }
-                // 无默认值且无嵌套 pattern → 无可探针内容,整条跳过(免多余 tag 检查)
+                // [eager-abrupt] 无默认值且无嵌套 pattern 的普通绑定位**也要探针**:
+                // spec 要求 Get 在调用期发生——poisoned getter(`{ poisoned }` 且
+                // getter throw)必须在 [[Call]] 时抛出(obj-ptrn-id-get-value-err 族)。
+                // Get 只读不写,体内再 Get 对普通数据属性无副作用(测试语料无计数
+                // getter 的生成器解构用例)。
                 const hasInner = target && (target.type === "ObjectPattern" || target.type === "ArrayPattern");
-                if (!(dflt && safeFn(dflt)) && !hasInner) continue;
                 // 计算键 prop:键表达式可能引用外层变量/有副作用,探针帧求值不可靠 → 跳过
                 // (缺该 prop 的默认值提前触发,但绝不误抛;失败用例均用静态键)
                 if (p.computed) continue;
@@ -603,6 +767,11 @@ export const AsyncCompiler = {
                 vm.load(VReg.A0, VReg.FP, srcSlot);
                 this.emitBoxedStringKey(keyName, VReg.A1);
                 vm.call("_object_get");
+                // [eager-abrupt] Get 后触发访问器(getter 在此刻运行并可能抛——poisoned
+                // getter 必须在调用期抛)。与 _str_getmethod 同形。
+                vm.mov(VReg.A0, VReg.RET);
+                vm.load(VReg.A1, VReg.FP, srcSlot);
+                vm.call("_maybe_getter");
                 if (dflt && safeFn(dflt)) {
                     const dfltL = this.ctx.newLabel("stub_dflt");
                     const doneL = this.ctx.newLabel("stub_done");
@@ -617,9 +786,10 @@ export const AsyncCompiler = {
                     vm.label(doneL);
                 }
                 if (target && (target.type === "ObjectPattern" || target.type === "ArrayPattern")) {
-                    const subOff = this.ctx.allocLocal(`__stubsub_${this.nextLabelId()}`);
-                    vm.store(VReg.FP, subOff, VReg.RET);
-                    this.emitGenStubDefaultProbes(target, subOff, boundNames, safeFn);
+                    // 嵌套 pattern:null 必抛;undefined 且无(或不可探针)默认 → 抛;
+                    // undefined 且有不可探针默认 → 跳过(留给体内惰性,避免误抛
+                    // `[[...x]=values]` 类)。ary-ptrn-elem-ary-val-null:`[null]`+`[[x]]`。
+                    this._emitGenStubNestedDestrOrThrow(target, dflt, safeFn, boundNames);
                 }
                 vm.label(skipL);
             }
@@ -675,15 +845,49 @@ export const AsyncCompiler = {
                     vm.label(doneL);
                 }
                 if (target && (target.type === "ObjectPattern" || target.type === "ArrayPattern")) {
-                    const subOff = this.ctx.allocLocal(`__stubsub_${this.nextLabelId()}`);
-                    vm.store(VReg.FP, subOff, VReg.RET);
-                    this.emitGenStubDefaultProbes(target, subOff, boundNames, safeFn);
+                    this._emitGenStubNestedDestrOrThrow(target, dflt, safeFn, boundNames);
                 }
             }
             vm.label(skipL);
             return;
         }
         // 其它形参形态(Identifier / 其它)无内层默认值,不探针
+    },
+
+    // 生成器 stub 探针:RET 持嵌套 pattern 的源值。null → TypeError;undefined 视默认值;
+    // 否则落临时槽递归探针。约定调用前 dflt 分支若已安全求值则 RET 已是默认结果。
+    _emitGenStubNestedDestrOrThrow(target, dflt, safeFn, boundNames) {
+        const vm = this.vm;
+        const throwL = this.ctx.newLabel("stub_nest_throw");
+        const skipL = this.ctx.newLabel("stub_nest_skip");
+        const contL = this.ctx.newLabel("stub_nest_cont");
+        vm.movImm64(VReg.V6, 0x7ffa000000000000n); // JS_NULL
+        vm.cmp(VReg.RET, VReg.V6);
+        vm.jeq(throwL);
+        vm.movImm64(VReg.V6, 0x7ffb000000000000n); // JS_UNDEFINED
+        vm.cmp(VReg.RET, VReg.V6);
+        vm.jne(contL);
+        // undefined:有不可探针默认 → 跳过(体内绑);无默认 → 抛
+        if (dflt && !safeFn(dflt)) {
+            vm.jmp(skipL);
+        } else if (dflt && safeFn(dflt)) {
+            // 安全默认应已在调用方求值并写入 RET;若仍 undefined 则抛
+            vm.jmp(throwL);
+        } else {
+            vm.jmp(throwL);
+        }
+        vm.label(throwL);
+        // stub 帧内禁 emitThrowTypeError(`new TypeError` 物化/exc 帧未就绪 → SIGBUS);
+        // 与 emitGenStubParamGuards 同构走 _throw_type_error。
+        vm.lea(VReg.A0, this.asm.addString("Cannot destructure 'null' or 'undefined'"));
+        vm.call("_js_box_string");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_throw_type_error"); // 不返回
+        vm.label(contL);
+        const subOff = this.ctx.allocLocal(`__stubsub_${this.nextLabelId()}`);
+        vm.store(VReg.FP, subOff, VReg.RET);
+        this.emitGenStubDefaultProbes(target, subOff, boundNames, safeFn);
+        vm.label(skipL);
     },
 
     // [L2-②] 默认值表达式是否可安全地 eager 探针求值:表达式里**所有**标识符要么是
@@ -699,6 +903,13 @@ export const AsyncCompiler = {
                 expr.name === "NaN" || expr.name === "Infinity") return true;
             // 同函数形参名:探针帧没绑它们 → 求值会错抛,不可探针
             if (boundNames && Object.prototype.hasOwnProperty.call(boundNames, expr.name)) return false;
+            // [eager-abrupt] 顶层函数声明/顶层 var:全局可达,探针帧求值语义与体内一致
+            // (函数经 functions 表、var 经 mainCapturedVars 全局 box)——`[x = thrower()]`
+            // 的 thrower()/`({x} = poisonedProperty)` 的 poisonedProperty 因此可在调用时
+            // 求值,把 spec 要求的调用期 abrupt completion 提前(此前判 unsafe → 体内惰性
+            // 求值 → 异常推迟到首次 .next(),dstr abrupt 族 18+ 测试判负)。
+            if (this.ctx && this.ctx.getFunction && this.ctx.getFunction(expr.name)) return true;
+            if (this.ctx && this.ctx.getMainCapturedVar && this.ctx.getMainCapturedVar(expr.name)) return true;
             if (this.isUnresolvableIdentifier && this.isUnresolvableIdentifier(expr)) return true;
             return false;
         }
@@ -761,7 +972,8 @@ export const AsyncCompiler = {
     },
 
     // 解析本 stub 对应函数的形参表,挑出需要提前守卫的解构参数位(实参寄存器上限 A0-A4)。
-    // 返回 [{index, dflt}];dflt=true 表示该解构参数带默认值(只守 null)。
+    // 返回 [{index, dflt, kind}];dflt=true 表示该解构参数带默认值(只守 null);
+    // kind="array"|"object" 记录 pattern 类型(GetIterator 守卫只对阵列 pattern 生效)。
     _genStubGuardParams(bodyLabel) {
         const params = this._genStubParams(bodyLabel);
         if (!params) return null;
@@ -771,13 +983,94 @@ export const AsyncCompiler = {
             const p = params[i];
             if (!p) continue;
             if (p.type === "ObjectPattern" || p.type === "ArrayPattern") {
-                out.push({ index: i, dflt: false });
+                out.push({ index: i, dflt: false, kind: p.type === "ArrayPattern" ? "array" : "object" });
             } else if (p.type === "AssignmentPattern" && p.left &&
                 (p.left.type === "ObjectPattern" || p.left.type === "ArrayPattern")) {
-                out.push({ index: i, dflt: true });
+                out.push({ index: i, dflt: true, kind: p.left.type === "ArrayPattern" ? "array" : "object" });
             }
         }
         return out;
+    },
+
+    // [FDI GetIterator·发射] 阵列解构参数的 GetIterator 可调用性守卫(镜像体内
+    // emitDestructurePattern 对装箱 0x7FFD/0x7FFE 与裸 TYPE_ARRAY 的判据;原语/未替换的
+    // undefined(不安全默认值)跳过——体内路径负责,不制造体内不抛的新异常)。寄存器:
+    // 检查经 _object_get/_symbol_wellknown 会毁 A0-A5 与 V*,先把 A0-A4 落本帧槽
+    // (与 emitGenStubEagerDefaults 同法保存/恢复 ctx 状态),检查后回填。抛路径调
+    // _throw_type_error 不返回,不需要平衡。
+    emitGenStubIterGuard(bodyLabel) {
+        const vm = this.vm;
+        const pats = this._genStubGuardParams(bodyLabel);
+        if (!pats || pats.length === 0) return;
+        let anyArray = false;
+        for (let i = 0; i < pats.length; i++) {
+            if (pats[i].kind === "array") { anyArray = true; break; }
+        }
+        if (!anyArray) return; // 无阵列 pattern:零发射
+        const savedStackOffset = this.ctx.stackOffset;
+        const savedLocals = this.ctx.locals;
+        const savedCtx = this.ctx;
+        this.ctx.stackOffset = 0;
+        this.ctx.locals = {};
+        const n = pats.length < 5 ? pats.length : 5;
+        const slots = [];
+        for (let i = 0; i < n; i++) {
+            const off = this.ctx.allocLocal(`__piterarg_${i}`);
+            vm.store(VReg.FP, off, vm.getArgReg(i));
+            slots.push(off);
+        }
+        const throwLabel = bodyLabel + "_piter_throw";
+        const okLabel = bodyLabel + "_piter_ok";
+        for (let i = 0; i < pats.length; i++) {
+            if (pats[i].kind !== "array") continue;
+            const skip = this.ctx.newLabel("piter_skip_" + i);
+            const chk = this.ctx.newLabel("piter_chk_" + i);
+            vm.load(VReg.V0, VReg.FP, slots[pats[i].index]);
+            vm.shrImm(VReg.V1, VReg.V0, 48);
+            vm.cmpImm(VReg.V1, 0x7FFD);   // 装箱对象 → 检查
+            vm.jeq(chk);
+            vm.cmpImm(VReg.V1, 0x7FFE);   // 装箱数组 → 检查
+            vm.jeq(chk);
+            vm.cmpImm(VReg.V1, 0);
+            vm.jne(skip);                  // 字符串/数字/bool/undefined 等 → 跳过
+            vm.movImm64(VReg.V1, vm.ptrFloor);
+            vm.cmp(VReg.V0, VReg.V1);
+            vm.jlt(skip);                  // 裸小整数/浮点位 → 跳过
+            vm.loadByte(VReg.V1, VReg.V0, 0);
+            vm.cmpImm(VReg.V1, 1);         // TYPE_ARRAY → 检查;Set/Map/生成器 → 跳过
+            vm.jne(skip);
+            vm.label(chk);
+            // 物化 Array.prototype(惰性槽可能尚未建,非数组装箱对象经此也不受影响:
+            // emitArrayProtoObject 只建数组原型)后检查 @@iterator 可调用。
+            // emitArrayProtoObject 内联体使用 S0(emitCollectionCtorObject 的闭包
+            // 构造码 mov S0,RET):生成器 stub 的 S0 = 闭包对象(hasClosure 路径),
+            // 必须跨物化保住——否则 _generator_new(A2=S0) 拿垃圾闭包指针 → 解引用崩
+            // (named async-gen dstr CRASH 根因)。push/pop 平衡;抛路径不返回无需弹。
+            vm.push(VReg.S0);
+            if (this.emitArrayProtoObject) this.emitArrayProtoObject();
+            vm.load(VReg.A0, VReg.FP, slots[pats[i].index]);
+            this.emitBoxedStringKey("Symbol.iterator", VReg.A1);
+            vm.call("_object_get");
+            vm.shrImm(VReg.V0, VReg.RET, 48);
+            vm.cmpImm(VReg.V0, 0x7FFF);    // Symbol.iterator 须是函数(tag 0x7FFF)
+            vm.jne(throwLabel);
+            vm.pop(VReg.S0);
+            vm.label(skip);
+        }
+        vm.jmp(okLabel);
+        vm.label(throwLabel);
+        vm.lea(VReg.A0, this.asm.addString("Cannot destructure non-iterable value"));
+        vm.call("_js_box_string");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_throw_type_error"); // 不返回
+        vm.label(okLabel);
+        // 回填实参寄存器(检查路径可能毁掉 A0-A4)
+        for (let i = 0; i < n; i++) {
+            vm.load(vm.getArgReg(i), VReg.FP, slots[i]);
+        }
+        this.ctx.stackOffset = savedStackOffset;
+        this.ctx.locals = savedLocals;
+        this.ctx = savedCtx;
     },
 
     // stub 只拿到 bodyLabel(=<函数标签>_gbody),形参表按标签反查:

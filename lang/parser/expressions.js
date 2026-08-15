@@ -5,6 +5,7 @@ import { TokenType } from "../lexer/token.js";
 import * as AST from "./ast.js";
 import { Precedence } from "./precedence.js";
 import { validateRegexLiteral } from "./regexp-validate.js";
+import { collectPatternNames } from "../analysis/closure.js";
 
 // 表达式解析混入
 export const ExpressionParser = {
@@ -26,6 +27,22 @@ export const ExpressionParser = {
             this.errors.push(`no prefix parse function for ${this.curToken.type} (${this.curToken.literal}) at line ${this.curToken.line}:${this.curToken.column}`);
             this.parseDepth = this.parseDepth - 1;
             return null;
+        }
+        // [escaped-keyword] 表达式位出现转义拼成的**真保留字**(new/function/class/delete/
+        // typeof/void/instanceof/in/return/throw 等)→ SyntaxError(`n\u0065w X` / `\u0064elete x`)。
+        // 上下文关键字(yield/await/async/let/get/set/of/from/static/as)在表达式位可作普通
+        // 标识符(其 escaped 形态在 sloppy 下合法),修饰符/声明位另按上下文拒。
+        if (this.curToken.escaped && this.curToken.type !== TokenType.IDENT &&
+            this.curToken.type !== TokenType.YIELD && this.curToken.type !== TokenType.AWAIT &&
+            this.curToken.type !== TokenType.ASYNC &&
+            this.curToken.type !== TokenType.GET && this.curToken.type !== TokenType.SET &&
+            this.curToken.type !== TokenType.OF && this.curToken.type !== TokenType.FROM &&
+            this.curToken.type !== TokenType.AS &&
+            this.curToken.type !== TokenType.UNDEFINED) {
+            // LET/STATIC 含在内:ES 规定 Identifier 的 StringValue 为 let/static 且源码
+            // 含转义即 SyntaxError(任何模式;escaped-let/escaped-static 族)。属性名位
+            // 不经 parseExpression,不受影响。
+            this.errors.push("Keyword must not contain escaped characters");
         }
         let leftExp = prefix();
         while (!this.peekTokenIs(TokenType.SEMICOLON) && precedence < this.peekPrecedence()) {
@@ -529,18 +546,31 @@ export const ExpressionParser = {
         }
         // 合法的模式目标:Identifier(绑定名)、MemberExpression(仅赋值上下文)、
         // AssignmentPattern(默认值)、嵌套 pattern、SpreadElement。
-        if (t === "Identifier" || t === "MemberExpression" || t === "AssignmentPattern") {
+        if (t === "Identifier") {
+            // [test262 S1] strict 下 eval/arguments 不可作解构赋值目标(`[arguments] = []` onlyStrict)。
+            if (this.inStrictMode() && (node.name === "eval" || node.name === "arguments")) {
+                this.errors.push("Invalid destructuring assignment target");
+            }
+            return;
+        }
+        if (t === "MemberExpression" || t === "AssignmentPattern") {
             return;
         }
         if (t === "ArrayExpression" || t === "ArrayPattern") {
             const els = node.elements;
             if (!els) return;
+            // [rest-before-elision] 赋值目标里 rest 后随逗号/空位是早期错误
+            // (`[...x,] = []` / `[...x,,] = []`)。spreadNotLast 由 parseArrayLiteral 置位
+            // (普通数组表达式 `[...x,]` 合法,不受此限——仅赋值目标校验消费)。
+            if (node.spreadNotLast) this.errors.push("Rest element must be last element");
             for (let i = 0; i < els.length; i++) this.checkPatternTargets(els[i]);
             return;
         }
         if (t === "ObjectExpression" || t === "ObjectPattern") {
             const props = node.properties;
             if (!props) return;
+            // [obj-rest-last] 解构模式里 rest 必须末位(for ({...rest, b} of x) 早期错误)。
+            if (node.restNotLast) this.errors.push("Rest element must be last element");
             for (let i = 0; i < props.length; i++) {
                 const p = props[i];
                 if (!p) continue;
@@ -549,9 +579,19 @@ export const ExpressionParser = {
             }
             return;
         }
-        if (t === "SpreadElement") { this.checkPatternTargets(node.argument); return; }
+        if (t === "SpreadElement") {
+            // [test262 早期错误] rest 目标不得带默认值:`[...x = 1] = []` 里数组字面量
+            // 解析把 `x = 1` 折进 spread 实参(AssignmentExpression);模式语境下此形即
+            // BindingRestElement 带初值 → 早期错误。
+            if (node.argument && node.argument.type === "AssignmentExpression") {
+                this.errors.push("Rest element may not have a default initializer");
+            }
+            this.checkPatternTargets(node.argument);
+            return;
+        }
         if (t === "AssignmentExpression" || t === "AssignmentPattern") { this.checkPatternTargets(node.left); return; }
         // Literal/ThisExpression/SuperExpression/CallExpression 等永不可作模式目标
+        // (for (this of []) / for (a + b of []) / [...{ get x(){} }] 族早期错误)。
         this.errors.push("Invalid destructuring assignment target");
     },
 
@@ -696,10 +736,30 @@ export const ExpressionParser = {
 
     parseArrowFunctionBody(params) {
         this.nextToken();
+        // [params-duplicate] 箭头形参重复恒早期错误(ES 14.2.1 Static Semantics:Early
+        // Errors:ArrowParameters 的 BoundNames 含重复即 SyntaxError,sloppy 亦拒——
+        // `(a, a) => {}` / `([a], [a]) => {}`)。普通函数 sloppy 允许重参,不受此限。
+        {
+            const seenArrow = new Map();
+            for (let ai = 0; ai < params.length; ai++) {
+                const pn = {};
+                collectPatternNames(params[ai], pn);
+                for (const nm in pn) {
+                    if (!Object.prototype.hasOwnProperty.call(pn, nm)) continue;
+                    if (seenArrow.get(nm) !== undefined) {
+                        this.errors.push("Duplicate parameter name not allowed in arrow function");
+                        break;
+                    }
+                    seenArrow.set(nm, 1);
+                }
+            }
+        }
         // [test262 S1] 箭头函数体开始:供 new.target 上下文校验
         this.fnDepth++;
         const prevLabelsArrow = this._usedLabels;
         this._usedLabels = new Set();
+        const prevLabelStackArrow = this._labelStack;
+        this._labelStack = [];
         let body,
             isExpression = false;
         if (this.curTokenIs(TokenType.LBRACE)) {
@@ -725,6 +785,7 @@ export const ExpressionParser = {
         }
         this.fnDepth--;
         this._usedLabels = prevLabelsArrow;
+        this._labelStack = prevLabelStackArrow;
         return new AST.ArrowFunctionExpression(params, body, false, isExpression);
     },
 
@@ -983,9 +1044,18 @@ export const ExpressionParser = {
 
     parseArrayLiteral() {
         let elements = [];
+        // [rest-before-elision] spread 后随任何逗号(含尾逗号/空位)标记:作赋值目标时
+        // `[...x,] = []` / `[...x,,] = []` 是早期错误(解构 rest 必须末位);普通表达式
+        // `[...x,]` 合法——只有 checkPatternTargets(赋值目标校验)消费此标志。
+        let spreadNotLast = false;
+        const mkArr = () => {
+            const e = new AST.ArrayExpression(elements);
+            if (spreadNotLast) e.spreadNotLast = true;
+            return e;
+        };
         if (this.peekTokenIs(TokenType.RBRACKET)) {
             this.nextToken();
-            return new AST.ArrayExpression(elements);
+            return mkArr();
         }
         this.nextToken();
         while (!this.curTokenIs(TokenType.RBRACKET) && !this.curTokenIs(TokenType.EOF)) {
@@ -995,7 +1065,7 @@ export const ExpressionParser = {
                 elements.push(null);
                 if (this.peekTokenIs(TokenType.RBRACKET)) {
                     this.nextToken();
-                    return new AST.ArrayExpression(elements);
+                    return mkArr();
                 }
                 this.nextToken();
                 continue;
@@ -1003,6 +1073,7 @@ export const ExpressionParser = {
             if (this.curTokenIs(TokenType.SPREAD)) {
                 this.nextToken();
                 elements.push(new AST.SpreadElement(this.parseExpression(Precedence.ASSIGN - 1)));
+                if (this.peekTokenIs(TokenType.COMMA)) spreadNotLast = true;
             } else {
                 // 元素是 AssignmentExpression 位:用 ASSIGN-1 使顶层赋值被吞并
                 // (`[a = 1]` / 解构赋值默认 `[a, b = 9] = arr`);逗号(COMMA<ASSIGN)仍不吞。
@@ -1012,7 +1083,7 @@ export const ExpressionParser = {
                 this.nextToken();
                 if (this.peekTokenIs(TokenType.RBRACKET)) {
                     this.nextToken();
-                    return new AST.ArrayExpression(elements);
+                    return mkArr();
                 }
                 this.nextToken();
             } else {
@@ -1020,11 +1091,14 @@ export const ExpressionParser = {
             }
         }
         if (!this.expectPeek(TokenType.RBRACKET)) return null;
-        return new AST.ArrayExpression(elements);
+        return mkArr();
     },
 
     parseObjectLiteral() {
         let properties = [];
+        // [obj-rest-last] {...r, x} 在**表达式**位合法(属性扩展),仅解构模式位是早期错误;
+        // 置位供 checkPatternTargets(赋值目标校验)消费,与数组 spreadNotLast 同构。
+        let restNotLast = false;
         if (this.peekTokenIs(TokenType.RBRACE)) {
             this.nextToken();
             return new AST.ObjectExpression(properties);
@@ -1039,6 +1113,7 @@ export const ExpressionParser = {
                 if (this.peekTokenIs(TokenType.COMMA)) {
                     this.nextToken();
                     if (this.peekTokenIs(TokenType.RBRACE)) break;
+                    restNotLast = true; // [obj-rest-last] rest 后仍有属性
                     this.nextToken();
                 } else {
                     break;
@@ -1048,7 +1123,7 @@ export const ExpressionParser = {
             // async 方法简写 `async m(){}` / `async *m(){}`:仅当 async 后跟方法名/`*`/`[`
             // (非 `(`/`:`/`,`/`}` — 那些是名为 "async" 的方法/键/简写)时当修饰符。
             let isAsyncMethod = false;
-            if (this.curTokenIs(TokenType.ASYNC) &&
+            if (this.curTokenIs(TokenType.ASYNC) && !this.curToken.escaped &&
                 !this.peekTokenIs(TokenType.LPAREN) && !this.peekTokenIs(TokenType.COLON) &&
                 !this.peekTokenIs(TokenType.COMMA) && !this.peekTokenIs(TokenType.RBRACE)) {
                 isAsyncMethod = true;
@@ -1066,6 +1141,7 @@ export const ExpressionParser = {
             // 已排除这四种 token。
             let accessorKind = null;
             if ((this.curTokenIs(TokenType.GET) || this.curTokenIs(TokenType.SET)) &&
+                !this.curToken.escaped &&
                 (this.peekTokenIsIdentifier() || this.peekTokenIs(TokenType.STRING) || this.peekTokenIs(TokenType.LBRACKET))) {
                 accessorKind = this.curTokenIs(TokenType.GET) ? "get" : "set";
                 this.nextToken(); // cur = 真键(或计算键 `[`)
@@ -1161,7 +1237,9 @@ export const ExpressionParser = {
             }
         }
         if (!this.expectPeek(TokenType.RBRACE)) return null;
-        return new AST.ObjectExpression(properties);
+        const objExpr = new AST.ObjectExpression(properties);
+        objExpr.restNotLast = restNotLast;
+        return objExpr;
     },
 
     parseFunctionExpression() {
@@ -1194,6 +1272,12 @@ export const ExpressionParser = {
         if (this.peekTokenIsIdentifier() && this.peekToken.type !== TokenType.LPAREN) {
             this.nextToken();
             this.checkReservedBinding(this.curToken.literal);   // [test262 早期错误 A] 函数名保留字
+            // [static-block-await] 静态块直属函数表达式的名字位 await 也是保留字
+            // ((function await(await) {}) 族;fnDepth 已为本函数 ++,比对 staticDepth+1)。
+            if (this.curToken.literal === "await" && this._staticBlockDepth &&
+                this.fnDepth === this._staticBlockDepth + 1) {
+                this.errors.push("Cannot use 'await' as a binding name inside an async function");
+            }
             let id = new AST.Identifier(this.curToken.literal);
             if (!this.expectPeek(TokenType.LPAREN)) { this.fnDepth--; if (isGenerator) this.fnGenDepth--; this._immediateGen = prevImmediateGen; this._inFieldInit = prevInFieldInit; this._inFormalParams = prevInFormalFE; return null; }
             let params = this.parseFunctionParams();
@@ -1203,8 +1287,11 @@ export const ExpressionParser = {
             this.checkInheritedStrictParams(params, isStrict);   // [test262 早期错误 C] 继承 strict 重参
             const prevLabelsFE1 = this._usedLabels;
             this._usedLabels = new Set();
+            const prevLabelStackFE1 = this._labelStack;
+            this._labelStack = [];
             let body = this.parseBlockStatement();
             this._usedLabels = prevLabelsFE1;
+            this._labelStack = prevLabelStackFE1;
             if (isStrict) this.fnStrictDepth--;
             if (isGenerator) this.fnGenDepth--;
             this.fnDepth--;
@@ -1221,8 +1308,11 @@ export const ExpressionParser = {
         this.checkInheritedStrictParams(params, isStrict);   // [test262 早期错误 C] 继承 strict 重参
         const prevLabelsFE2 = this._usedLabels;
         this._usedLabels = new Set();
+        const prevLabelStackFE2 = this._labelStack;
+        this._labelStack = [];
         let body = this.parseBlockStatement();
         this._usedLabels = prevLabelsFE2;
+        this._labelStack = prevLabelStackFE2;
         if (isStrict) this.fnStrictDepth--;
         if (isGenerator) this.fnGenDepth--;
         this.fnDepth--;
@@ -1241,8 +1331,18 @@ export const ExpressionParser = {
 
         // async function / async function*
         if (next.type === TokenType.FUNCTION) {
-            this.nextToken(); // consume async
-            this.nextToken(); // move to function keyword
+            // [escaped-async] `\u0061sync function f(){}`:修饰符位的 async 不得以转义书写。
+            if (this.curToken.escaped) {
+                this.errors.push("Keyword must not contain escaped characters");
+            }
+            this.nextToken(); // consume async → cur=FUNCTION(与同步路径 parseFunctionExpression 入口一致)
+            // [2026-08-15 修复] 此前这里再 nextToken() 吞掉 function 关键字,使
+            // parseFunctionExpression 以 cur=* 或 cur=( 进入:其 isGenerator 判据只查
+            // **peek** 是否为 ASTERISK,`async function*` 的 * 已是 cur → isGenerator
+            // 恒 false(闭包路径把 async 生成器表达式误路由到普通 async stub,参数守卫/
+            // GetIterator 全失效);`async function(a){}` 的 ( 已消费 → 形参误解析。
+            // 只吞 async、让 parseFunctionExpression 看到 cur=FUNCTION 即与同步路径
+            // 完全同构(function* 表达式 isGenerator=true,匿名/具名/解构形参均正常)。
             const prevImmediateAsyncExpr = this._immediateAsync;
             this._immediateAsync = true;
             this.fnAsyncDepth++;
@@ -1255,8 +1355,10 @@ export const ExpressionParser = {
 
         // async () => / async (x, y) =>
         if (next.type === TokenType.LPAREN) {
-            this.nextToken(); // consume async
-            this.nextToken(); // move to (
+            if (this.curToken.escaped) {
+                this.errors.push("Keyword must not contain escaped characters");
+            }
+            this.nextToken(); // consume async → cur=(;parseGroupedOrArrow 内部自行消费 (
             const prevImmediateAsyncExpr = this._immediateAsync;
             this._immediateAsync = true;
             this.fnAsyncDepth++;
@@ -1462,13 +1564,22 @@ export const ExpressionParser = {
         // [L2-④] yield 只能在 generator(含 async-gen)内出现;非生成器上下文(类体隐式
         // strict/strict 模式)中 yield 是保留字,恒 SyntaxError。
         if (!this._immediateGen) {
+            // [yield-ident-invalid] strict 下 yield 是保留字,连标识符引用也不可用
+            // (`for ([x[yield]] of [[]]);` onlyStrict 应拒)。此前仅 parseIdentifier 静默
+            // 放行 → negative parse 测试判负。
+            if (this.inStrictMode()) {
+                this.errors.push("Cannot use 'yield' as an identifier in strict mode");
+            }
             return this.parseIdentifier();
         }
         if (this._inFormalParams && this.fnGenDepth > 0) {
             this.errors.push("yield expression not allowed in formal parameter of generator");
         }
         let delegate = false;
-        if (this.peekTokenIs(TokenType.ASTERISK)) {
+        // [yield-newline] yield 的 `*` 与 yield 之间不得有换行(yield\n*1 是 SyntaxError;
+        // 无换行才解析为 yield* 委托)。带换行时保持普通 yield,后续 `*1` 作为语句再解析
+        // 自然报 prefix 错误。
+        if (this.peekTokenIs(TokenType.ASTERISK) && !this.peekToken.lineBreakBefore) {
             delegate = true;
             this.nextToken();
         }

@@ -16,7 +16,7 @@ import { execSync, execFileSync } from "child_process";
 
 // 语言前端
 import { Lexer, Parser } from "../lang/index.js";
-import { analyzeCapturedVariables, analyzeSharedVariables, analyzeTopLevelSharedVariables, analyzeDirectEvalBoxedVars, collectLocalDeclarations } from "../lang/analysis/closure.js";
+import { analyzeCapturedVariables, analyzeSharedVariables, analyzeTopLevelSharedVariables, analyzeDirectEvalBoxedVars, collectLocalDeclarations, collectVarDeclarations } from "../lang/analysis/closure.js";
 import { renameBlockScopedBindings } from "../lang/analysis/blockscope.js";
 
 // 虚拟机和汇编器
@@ -453,6 +453,19 @@ export class Compiler {
             mainCapturedVars: {},
             exports: [],
         };
+        // [TDZ 写] 模块顶层的 let/const 名集合:发射端(emitDestructureAssign)遇「未分配
+        // 槽 + 非函数/捕获」的写目标时,若名在集合内 → 是**后置声明**的词法绑定(TDZ)
+        // → 写须抛 ReferenceError(for ([...x] of y) put-let 族);不在 → 沿用 sloppy
+        // 全局模拟的自动声明。var 提升(槽已就位)与函数(hasFunction)不在此列。
+        const lexNames = new Set();
+        for (const stmt of moduleAst.body) {
+            if (!stmt || stmt.type !== "VariableDeclaration") continue;
+            if (stmt.kind !== "let" && stmt.kind !== "const") continue;
+            for (const d of stmt.declarations || []) {
+                if (d.id && d.id.type === "Identifier") lexNames.add(d.id.name);
+            }
+        }
+        meta.lexNames = lexNames;
         this._moduleMetaByAst.set(moduleAst, meta);
         if (moduleAst.filename) {
             this._moduleMetaByPath.set(moduleAst.filename, meta);
@@ -674,6 +687,9 @@ export class Compiler {
         this.ctx = moduleCtx;
         this.sourcePath = moduleMeta.ast.filename;
         this._currentModuleAst = moduleMeta.ast;
+        // [TDZ 写] 主 ctx 引用:发射端据其 locals 判「模块顶层 let/const 槽是否已分配
+        // (= 声明在前)」,以区分正常写与 TDZ 写(emitDestructureAssign put-let 族)。
+        moduleMeta.mainCtx = moduleCtx;
 
         try {
             return callback(moduleCtx);
@@ -1204,15 +1220,16 @@ export class Compiler {
         let displayName = name;
         const blkCut = typeof name === "string" ? name.indexOf("$blk$") : -1;
         if (blkCut !== -1) displayName = name.slice(0, blkCut);
-        const msgLabel = this.asm.addString(`ReferenceError: Cannot access '${displayName}' before initialization`);
+        // [TDZ 可捕获] 此前 print + syscall exit:异常不可 catch,`for ({x = y} of x)`
+        // 里 y 在 TDZ 时 assert.throws(ReferenceError) 判负(进程已退)。经运行时
+        // _throw_reference_error 单 call 形态抛可捕获 ReferenceError(内联
+        // new ReferenceError 会在录制函数体内分配槽/多发调用 → 录制重放错位,
+        // 自举产物构造器字段丢失,gen1 崩「reading 'asm'」;单 call 与录制相容)。
+        const msgLabel = this.asm.addString(`Cannot access '${displayName}' before initialization`);
         vm.lea(VReg.A0, msgLabel);
-        vm.call("_print_str");
-        vm.movImm(VReg.A0, 1);
-        if (this.arch === "arm64") {
-            vm.syscall(this.os === "linux" ? 93 : 1);
-        } else {
-            vm.syscall(this.os === "linux" ? 60 : 0x2000001);
-        }
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_reference_error"); // 不返回
 
         vm.label(okLabel);
     }
@@ -1517,7 +1534,8 @@ export class Compiler {
         const reEscText = "RegExp" + ".escape";
         if (filePath.indexOf("__regexp_shim.js") === -1 &&
             src.indexOf("__regexp_shim") === -1 &&
-            (src.indexOf(reCtorText) !== -1 || src.indexOf(reEscText) !== -1 ||
+            (src.indexOf(reCtorText) !== -1 || sourceHasBareNewRegExp(src) ||
+             src.indexOf(reEscText) !== -1 ||
              sourceHasRegexLiteral(src) || sourceHasRegExpCall(src))) {
             const inj = 'import { __RE_new, __RE_test, __RE_exec, __RE_match, __RE_matchAll, __RE_replace, __RE_split, __RE_escape, __RE_search, __RE_toString, __RE_compile, __RE_sym_match, __RE_sym_search, __RE_sym_split, __RE_sym_replace, __RE_sym_matchAll } from "__regexp_shim";\n';
             src = injectShimImport(src, inj);
@@ -1534,16 +1552,23 @@ export class Compiler {
             src.indexOf(chCtorText) !== -1) {
             src = injectShimImport(src, 'import { Channel } from "__channel_shim";\n');
         }
-        // [eval/new Function shim 注入] 源码引用全局 `eval(` 或 `new Function(` 时前置
+        // [eval/new Function/裸 Function shim 注入] 源码引用全局 `eval(` / `new Function(` /
+        // 裸 `Function()`/`Function("`/`Function('` 时前置
         // `import { __eval, __makeFunction } from "__eval_shim"`(路线同 JSON/RegExp shim);
         // 调用点由 compileCallExpression / compileNewExpression 改派到这两个绑定。__eval_shim
-        // 内含整个编译器(route B),故只有用 eval 的程序才付代价;编译器自身源码不含
-        // `eval(`/`new Function(` → 自举不注入(gate 零影响)。(检测串拆开拼接,免本文件自命中。)
+        // 内含整个编译器(route B),故只有用 eval/Function 的程序才付代价;编译器自身源码不含
+        // 下列检测串 → 自举不注入(gate 零影响)。(检测串拆开拼接,免本文件自命中。)
         const evalCallText = "eval" + "(";
         const newFnText = "new Func" + "tion(";
+        // 裸 Function 构造器调用常见形态(不含注释里的 Function(...)/Function(0x…))
+        const bareFnEmpty = "Func" + "tion()";
+        const bareFnDQuote = "Func" + 'tion("';
+        const bareFnSQuote = "Func" + "tion('";
         if (filePath.indexOf("__eval_shim.js") === -1 &&
             src.indexOf("__eval_shim") === -1 &&
-            (src.indexOf(evalCallText) !== -1 || src.indexOf(newFnText) !== -1)) {
+            (src.indexOf(evalCallText) !== -1 || src.indexOf(newFnText) !== -1 ||
+             src.indexOf(bareFnEmpty) !== -1 || src.indexOf(bareFnDQuote) !== -1 ||
+             src.indexOf(bareFnSQuote) !== -1)) {
             const inj = 'import { __eval, __makeFunction, __eval_direct } from "__eval_shim";\n';
             src = injectShimImport(src, inj);
             // [W-35] eval/new Function 的源码在编译期不可见,里面可以有 \p{…};
@@ -1646,7 +1671,7 @@ export class Compiler {
         fs.chmodSync(outputFile, 0o755);
 
         // [LABEL_MAP] env 门控诊断:导出 label→代码段偏移表(采样剖析符号化用)。
-        // 仅 gen0(node)诊断路径;asm.js 自举下 process.env 缺省为空对象不触发。
+        // 仅 gen0(node)诊断路径;asm.js 自举下 Map 无 forEach/keys,此诊断不触发。
         if (process.env.LABEL_MAP && this.asm && this.asm.labels && this.asm.labels.forEach) {
             const lines = [];
             this.asm.labels.forEach((off, name) => { lines.push(off + "\t" + name); });
@@ -2208,6 +2233,9 @@ export class Compiler {
                 this.ctx._ipExportedNames = _ipExported;
                 this.ctx._ipScanRoot = { params: [], body: { type: "BlockStatement", body: moduleAst.body } };
                 this.ctx._ipIndex = null;
+
+                // [L1 var hoist] 模块顶层 VariableEnvironment:var → undefined
+                this.emitHoistedVarInits({ type: "BlockStatement", body: moduleAst.body });
 
                 for (const stmt of moduleAst.body) {
                     if (stmt.type === "ImportDeclaration") {
@@ -2956,7 +2984,13 @@ export class Compiler {
         // 脱壳后 = 此标签;闭包路径 func_ptr@8 亦指向此)。登记种类使 async/generator 声明
         // 也被 Object.prototype.toString 正确品牌(此前仅函数表达式登记)。name 取声明名,
         // 使运行期函数值(如作参数传递)的 .name 反射到正确名字。
+        // [D1 L3b] 先盖章 [[Strict]] 再入表(registerFuncMeta 读 _fnStrict / 指令 / 程序级)。
+        const prevInStrictFunction = this.ctx.inStrictFunction;
+        const fnStrict = typeof this._computeFunctionStrict === "function"
+            ? this._computeFunctionStrict(func) : false;
+        func._fnStrict = fnStrict;
         this.registerFuncMeta(funcLabel, func, name);
+        this.ctx.inStrictFunction = fnStrict;
         // [批次D] 顶层生成器声明:标签处先落 stub(建协程+生成器对象即返回),
         // 真正函数体在 <label>_gbody(由 _coroutine_entry 首次 resume 进入)。
         // 顶层声明无闭包,stub 传 A2=0。
@@ -2967,13 +3001,15 @@ export class Compiler {
         this.ctx._ipScanRoot = (isAsync || isGenerator || isAsyncGen) ? null : func;
         this.ctx._ipIndex = null;
         this.ctx.inAsyncGenerator = isAsyncGen;
+        let fdiList = null;
         if (isGenerator) {
             // 顶层函数声明无闭包捕获 → capturedNames=null(eager 探针不排除名,但其默认值
             // 引用模块顶层 var 走 mainCapturedVars 解析,safeFn 已排除)。
-            this.emitGeneratorStub(funcLabel + "_gbody", false);
+            // [FDI eager] 含 pattern 形参时返回体内 transfer 用叶名序。
+            fdiList = this.emitGeneratorStub(funcLabel + "_gbody", false);
         } else if (isAsyncGen) {
             // 顶层 async function*：async 生成器 stub
-            this.emitAsyncGeneratorStub(funcLabel + "_gbody", false);
+            fdiList = this.emitAsyncGeneratorStub(funcLabel + "_gbody", false);
         }
         // [P1] async 禁录(S4 跨协程共享,见 closures.js 注);生成器体同理禁录;
         // [批次D] __regexp_shim 模块禁录(x64 晋升错编,见 closures.js 注)
@@ -3041,6 +3077,9 @@ export class Compiler {
             } else if (this._isPatternParam(param)) {
                 // [#47] 解构参数 function f({a,b})/f([a,b])：先把实参落临时槽,
                 // 解构延后到全部实参入栈后(见下 patternParams 循环),防 A 寄存器互踩。
+                // [FDI eager] 生成器 pattern 形参已在调用期(stub)绑定,体内走 transfer
+                // 路径(见下),此处不落槽。
+                if ((isGenerator || isAsyncGen) && fdiList) continue;
                 const pat = param.type === "AssignmentPattern" ? param.left : param;
                 const dexpr = param.type === "AssignmentPattern" ? param.right : null;
                 const pslot = this.ctx.allocLocal(`__parampat_${this.nextLabelId()}`);
@@ -3096,22 +3135,31 @@ export class Compiler {
         }
 
         // [#47] 解构参数:所有实参已落栈,此处安全解构到局部(体内即可引用)。
-        for (let i = 0; i < patternParams.length; i++) {
-            this.emitParamDestructure(patternParams[i].pat, patternParams[i].slot, patternParams[i].dflt);
+        // [FDI eager] 生成器 pattern 形参已在调用期(stub)绑定:从 coro+168 transfer 数组
+        // 按绑定序取叶值,跳过重复解构(二重消费自定义迭代器会错值/错计)。
+        if ((isGenerator || isAsyncGen) && fdiList) {
+            this.emitGenTransferLoads(fdiList);
+        } else {
+            for (let i = 0; i < patternParams.length; i++) {
+                this.emitParamDestructure(patternParams[i].pat, patternParams[i].slot, patternParams[i].dflt);
+            }
         }
+
+        // [L1 var hoist] 须在共享局部 TDZ 预建之前(见 closures.js 同构注释)。
+        this.emitHoistedVarInits(func.body);
 
         // [L2-②] 前向引用共享局部预绑定:与 closures.js compileFunctionBody 同构 —— 函数体
         // 内声明、被嵌套闭包捕获的局部,若闭包先于声明创建(`const onEvent=()=>onError;`),
         // 在入口预分配槽 + 预建 box(初值=TDZ 哨兵),使早期闭包捕获同一 box。同步点必须
         // 在编译任何语句之前(事件发射器 once 包装等依赖此)。顶层声明函数专用入口。
-        this.ctx.preboxedVars = new Set();
+        this.ctx.preboxedVars = this.ctx.preboxedVars || new Set();
         if (boxedVars && boxedVars.size > 0) {
             const bodyLocals = {};
             collectLocalDeclarations(func.body, bodyLocals);
             for (const nm in bodyLocals) {
                 if (!Object.prototype.hasOwnProperty.call(bodyLocals, nm)) continue;
                 if (!boxedVars.has(nm)) continue;
-                if (this.ctx.getLocal(nm)) continue; // 参数/已捕获外层变量
+                if (this.ctx.getLocal(nm)) continue; // 参数/已捕获外层变量 / 已 hoist 的 var
                 const off = this.ctx.allocLocal(nm);
                 vm.call("_box_alloc");
                 vm.movImm64(VReg.V1, UNINITIALIZED_BINDING_SENTINEL);
@@ -3149,6 +3197,7 @@ export class Compiler {
         }
         this.ctx.exceptionLabel = prevDeclExcLabel;
         this.ctx.inAsyncGenerator = false;
+        this.ctx.inStrictFunction = prevInStrictFunction;
 
         // If this function is exported, store its address into the captured var box
         if (this.exports && this.exports.includes(name)) {
@@ -3236,6 +3285,8 @@ export class Compiler {
     // 仅 async/generator 函数建条(普通函数缺省品牌 = Function),表随此类函数数增长
     // (自举产物内此类极少)。查表 O(N) 但只在 Object.prototype.toString 冷路径调用。
     // kind: 1=Generator, 2=Async, 3=AsyncGenerator。
+    // [D1 L3b] kind 高字节 bit8 = [[Strict]](OrdinaryCallBindThis);_func_meta_find 掩低 8 位,
+    // _func_meta_strict 读 bit8。不扩条目宽度(仍 32B),不改闭包头 captured@16。
     // name: 供运行期函数值 .name 反射(静态访问点已由 _fnNameLength 解析,此表覆盖参数/
     // 成员链等运行时函数值);匿名函数 name="" 不占 name_ptr(其 .name 回落 undefined)。
     // [W-24] arity@24:首个默认/剩余形参**之前**的形参个数(规范 length 语义,与
@@ -3250,6 +3301,12 @@ export class Compiler {
         if (isGen && isAsync) kind = 3;
         else if (isGen) kind = 1;
         else if (isAsync) kind = 2;
+        // [D1 L3b] [[Strict]] → kind bit8(侧表;闭包头不扩)
+        if (typeof this._computeFunctionStrict === "function"
+            ? this._computeFunctionStrict(expr)
+            : false) {
+            kind |= 0x100;
+        }
         let name = "";
         if (expr.id && expr.id.name) name = expr.id.name;
         else if (typeof nameHint === "string") name = nameHint;
@@ -3346,7 +3403,7 @@ export class Compiler {
         // (_func_meta_find/@8、_func_meta_name/@16、_func_meta_arity/@24)、数据发射 1 处
         // (下方每条 4 个 qword + 空表占位)。改宽度必须六处同改(治理规则 §4:布局变更原子)。
         // 表外无读者:runtime 侧只经 _func_meta_find / _func_meta_name / _func_meta_arity
-        // 三个访问器进表,不直接寻址条目。
+        // / _func_meta_strict 四个访问器进表,不直接寻址条目。
         //
         // _func_meta_init: 运行期把各函数标签地址填入 code_ptr 槽、名字串地址填入 name_ptr 槽
         // (二者 vaddr 运行期才定,故 lea);kind/arity 已静态写入数据。匿名(name="")的 name_ptr 留 0。
@@ -3389,14 +3446,31 @@ export class Compiler {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
 
         // _func_meta_find(A0=code_ptr) -> RET=kind(0=未登记)。品牌路径(_opts_func)用。
+        // [D1 L3b] kind 低 8 位为品牌;bit8 为 [[Strict]],此处掩掉以免品牌比较误命中。
         vm.label("_func_meta_find");
         vm.prologue(0, []);
         vm.call("_func_meta_entry");
         vm.cmpImm(VReg.RET, 0);
         vm.jeq("_fmfind_nf");
         vm.load(VReg.RET, VReg.RET, 8);                 // kind@8
+        vm.andImm(VReg.RET, VReg.RET, 0xff);            // 品牌 = 低 8 位
         vm.epilogue([], 0);
         vm.label("_fmfind_nf");
+        vm.movImm(VReg.RET, 0);
+        vm.epilogue([], 0);
+
+        // [D1 L3b] _func_meta_strict(A0=code_ptr) -> RET=0|1([[Strict]])。
+        // 未登记视为非严格(0):Array 回调缺 thisArg 时走 globalThis(OrdinaryCallBindThis)。
+        vm.label("_func_meta_strict");
+        vm.prologue(0, []);
+        vm.call("_func_meta_entry");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_fmstrict_nf");
+        vm.load(VReg.RET, VReg.RET, 8);                 // kind@8
+        vm.shrImm(VReg.RET, VReg.RET, 8);
+        vm.andImm(VReg.RET, VReg.RET, 1);
+        vm.epilogue([], 0);
+        vm.label("_fmstrict_nf");
         vm.movImm(VReg.RET, 0);
         vm.epilogue([], 0);
 
@@ -3682,6 +3756,112 @@ function scanRegexLiteralBody(src, i) {
         else if (c === 47 && !inClass) return any; // 闭合(体非空;// 已被注释分支排除)
         any = true;
         j++;
+    }
+    return false;
+}
+
+// `new RegExp` 无括号(ASI:`new RegExp;` / 换行)也须注入 shim。此前只认
+// `new RegExp(`，test262 `var __re = new RegExp;` 不注入 → __RE_new 未链入，
+// 构造落空对象，String.prototype.split 全挂。跳过字符串/注释(同 sourceHasRegExpCall)。
+function sourceHasBareNewRegExp(src) {
+    const newKw = "new";
+    const reKw = "Reg" + "Exp";
+    const n = src.length;
+    let i = 0;
+    let inTplText = false;
+    const tplBrace = [];
+    let brace = 0;
+    if (src.charCodeAt(0) === 35 && src.charCodeAt(1) === 33) {
+        while (i < n && src.charCodeAt(i) !== 10) i++;
+    }
+    while (i < n) {
+        const c = src.charCodeAt(i);
+        if (inTplText) {
+            if (c === 92) { i += 2; continue; }
+            if (c === 96) { inTplText = false; i++; continue; }
+            if (c === 36 && i + 1 < n && src.charCodeAt(i + 1) === 123) {
+                inTplText = false;
+                tplBrace.push(brace);
+                brace++;
+                i += 2;
+                continue;
+            }
+            i++;
+            continue;
+        }
+        if (c === 96) { inTplText = true; i++; continue; }
+        if (c === 39 || c === 34) {
+            const q = c;
+            i++;
+            while (i < n) {
+                const d = src.charCodeAt(i);
+                if (d === 92) { i += 2; continue; }
+                if (d === q) { i++; break; }
+                i++;
+            }
+            continue;
+        }
+        if (c === 47) {
+            const c2 = i + 1 < n ? src.charCodeAt(i + 1) : 0;
+            if (c2 === 47) {
+                i += 2;
+                while (i < n && src.charCodeAt(i) !== 10) i++;
+                continue;
+            }
+            if (c2 === 42) {
+                i += 2;
+                while (i + 1 < n && !(src.charCodeAt(i) === 42 && src.charCodeAt(i + 1) === 47)) i++;
+                i += 2;
+                continue;
+            }
+            i++;
+            continue;
+        }
+        if (c === 123) { brace++; i++; continue; }
+        if (c === 125) {
+            brace--;
+            if (tplBrace.length > 0 && tplBrace[tplBrace.length - 1] === brace) {
+                tplBrace.pop();
+                inTplText = true;
+            }
+            i++;
+            continue;
+        }
+        if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95 || c === 36) {
+            const s = i;
+            while (i < n) {
+                const d = src.charCodeAt(i);
+                if ((d >= 48 && d <= 57) || (d >= 65 && d <= 90) ||
+                    (d >= 97 && d <= 122) || d === 95 || d === 36) i++;
+                else break;
+            }
+            if (i - s === newKw.length && src.slice(s, i) === newKw) {
+                let j = i;
+                while (j < n) {
+                    const w = src.charCodeAt(j);
+                    if (w === 32 || w === 9 || w === 13 || w === 10) j++;
+                    else break;
+                }
+                if (j + reKw.length <= n && src.slice(j, j + reKw.length) === reKw) {
+                    const after = j + reKw.length < n ? src.charCodeAt(j + reKw.length) : 0;
+                    if (!((after >= 48 && after <= 57) || (after >= 65 && after <= 90) ||
+                          (after >= 97 && after <= 122) || after === 95 || after === 36)) {
+                        return true;
+                    }
+                }
+            }
+            continue;
+        }
+        if (c >= 48 && c <= 57) {
+            while (i < n) {
+                const d = src.charCodeAt(i);
+                if ((d >= 48 && d <= 57) || (d >= 65 && d <= 90) ||
+                    (d >= 97 && d <= 122) || d === 95 || d === 46) i++;
+                else break;
+            }
+            continue;
+        }
+        i++;
     }
     return false;
 }

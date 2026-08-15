@@ -1983,6 +1983,31 @@ export class CoercionGenerator {
         vm.load(VReg.RET, VReg.V1, 8);     // 时间戳(float64 位)
         vm.epilogue([VReg.S0, VReg.S1], 64);
         vm.label("_num_coerce_obj_vo_call");
+        // Number/Boolean 包装:自有 __number_value / __boolean_value(不依赖原型 valueOf
+        // 已物化)。`new Number(1)` 在 Number.prototype 未物化时 __proto__ 可能为 0,
+        // 仅靠 valueOf 会 NaN → `true /= new Number(1)` 回归。
+        vm.mov(VReg.A0, VReg.S0);
+        vm.lea(VReg.A1, vm.asm.addString("__number_value"));
+        vm.movImm64(VReg.V0, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V0);
+        vm.call("_object_get");
+        vm.movImm64(VReg.V0, 0x7ffb000000000000n); // undefined
+        vm.cmp(VReg.RET, VReg.V0);
+        vm.jne("_num_coerce_obj_nv_hit"); // 已是 float64 位
+        vm.mov(VReg.A0, VReg.S0);
+        vm.lea(VReg.A1, vm.asm.addString("__boolean_value"));
+        vm.movImm64(VReg.V0, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V0);
+        vm.call("_object_get");
+        vm.movImm64(VReg.V0, 0x7ffb000000000000n);
+        vm.cmp(VReg.RET, VReg.V0);
+        vm.jeq("_num_coerce_obj_toprim");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_number_coerce"); // bool → 0/1
+        vm.epilogue([VReg.S0, VReg.S1], 64);
+        vm.label("_num_coerce_obj_nv_hit");
+        vm.epilogue([VReg.S0, VReg.S1], 64);
+        vm.label("_num_coerce_obj_toprim");
         // [Symbol.toPrimitive] 优先(hint "number"):返回原始值 → 递归 ToNumber;仍是对象则回退 valueOf。
         vm.mov(VReg.A0, VReg.S0);
         vm.lea(VReg.A1, vm.asm.addString("number"));
@@ -2000,13 +2025,20 @@ export class CoercionGenerator {
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_object_user_valueof");   // RET = valueOf 结果 或 0
         vm.cmpImm(VReg.RET, 0);
-        vm.jeq("_num_coerce_nan");          // 无 valueOf → NaN
-        // 结果若又是对象 → NaN(防 valueOf 返 this 的无限递归);否则递归归一化。
+        vm.jeq("_num_coerce_obj_tostring"); // 无 valueOf → OrdinaryToPrimitive 试 toString
+        // 结果若又是对象 → 试 toString(防 valueOf 返 this;Number hint 第二方法)
         vm.mov(VReg.S1, VReg.RET);
         vm.shrImm(VReg.V0, VReg.S1, 48);
         vm.cmpImm(VReg.V0, 0x7FFD);
-        vm.jeq("_num_coerce_nan");
+        vm.jeq("_num_coerce_obj_tostring");
         vm.mov(VReg.A0, VReg.S1);
+        vm.call("_number_coerce");
+        vm.epilogue([VReg.S0, VReg.S1], 64);
+        vm.label("_num_coerce_obj_tostring");
+        // OrdinaryToPrimitive hint Number 第二步:toString → 再 ToNumber(串)
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_valueToStr");
+        vm.mov(VReg.A0, VReg.RET);
         vm.call("_number_coerce");
         vm.epilogue([VReg.S0, VReg.S1], 64);
 

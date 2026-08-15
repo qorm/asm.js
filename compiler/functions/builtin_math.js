@@ -135,12 +135,12 @@ export const BuiltinMathMethodCompiler = {
             || methodName === "sin" || methodName === "cos" || methodName === "tan"
             || methodName === "asin" || methodName === "acos" || methodName === "atan"
             || methodName === "asinh" || methodName === "acosh" || methodName === "atanh"
-            || methodName === "fround" || methodName === "clz32") {
+            || methodName === "fround" || methodName === "f16round" || methodName === "clz32") {
             if (args.length > 0) {
                 this.compileExpression(args[0]);
                 this.emitNumberCoerceFast();
                 this.vm.mov(VReg.A0, VReg.RET);
-                this.vm.call("_math_" + methodName);
+                this.vm.call(methodName === "f16round" ? "_math_fround" : "_math_" + methodName);
                 this.emitMathNanNormalize(); // 硬件 NaN(0x7FF8…)→ 可打印 0x7FF0…1
             } else {
                 this.vm.movImm64(VReg.RET, 0x7ff0000000000001n); // 无参 → NaN(可打印)

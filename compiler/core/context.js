@@ -63,6 +63,10 @@ export class CompileContext {
         this.tryFrames = null;
         this.breakTryLen = 0;
         this.continueTryLen = 0;
+        // [iterator-close] 协议 for-of 活迭代器栈;break/continue 目标处的栈深快照
+        this.iterCloseStack = null;
+        this.breakIterCloseLen = 0;
+        this.continueIterCloseLen = 0;
 
         // [#60] 标签语句支持:
         // labelMap = Map<labelName, {breakLabel, continueLabel, breakTryLen, continueTryLen}>
@@ -295,6 +299,8 @@ export class CompileContext {
         newCtx.inClass = this.inClass;
         newCtx.className = this.className;
         newCtx.superClass = this.superClass;
+        // [D1 L3b] 严格模式继承(嵌套函数 [[Strict]])
+        newCtx.inStrictFunction = this.inStrictFunction;
         // 表达式父类(`extends (expr)`):父类无编译期名字,其 classinfo 指针在类声明处
         // 求值一次并存入 superInfoLabel 全局;super()/super.m() 经该全局解析(见
         // emitLoadSuperClassInfo)。标识符父类 superClassExpr 恒 undefined → 名字快路径不变。

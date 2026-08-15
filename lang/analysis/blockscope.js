@@ -338,6 +338,9 @@ function bsWalkForEach(node, st) {
             }
         }
     } else if (node.left) {
+        // [const-reassign] 赋值形头部目标(for ([c] of x) / for ({a: c} in o))同属
+        // const 写点(sloppy → 运行期 TypeError;strict 已有早期错误路径)。
+        bsCheckConstReassign(node.left, st);
         bsWalkExpr(node.left, st);
     }
     bsWalkStmt(node.body, st);
@@ -592,7 +595,11 @@ function bsWalkExpr(node, st) {
     }
     if (t === "Property" || t === "AssignmentProperty") {
         if (node.shorthand && node.value === node.key && node.key && node.key.type === "Identifier") {
+            // [const-reassign] 复制 value 节点时保留 _constWrite 标记:bsCheckConstReassign
+            // 在 value===key 时把标记落在共享节点上,复制后的新 value 丢标记 → 发射端
+            // 看不到 const 写点 → 漏抛 TypeError(({c} = x) 族)。
             node.value = { type: "Identifier", name: node.key.name };
+            if (node.key._constWrite) node.value._constWrite = 1;
         }
         if (node.computed) bsWalkExpr(node.key, st);
         bsWalkExpr(node.value, st);
@@ -630,9 +637,14 @@ function bsCheckConstReassign(node, st) {
     if (t === "Identifier") {
         const rec = bsLookup(st, node.name);
         // Assignment to const is a SyntaxError only in strict mode.
-        // In sloppy mode it is a runtime TypeError, not an early error.
-        if (rec && rec.c && rec.d && st.strict) {
-            throw new Error("SyntaxError: Assignment to constant variable.");
+        // In sloppy mode it is a runtime TypeError, not an early error:标记写点
+        // (_constWrite),由发射端(emitDestructureAssign / 赋值路径)在运行期抛 TypeError
+        // (for ([c] of x) / ({a: c} = obj) sloppy 族)。
+        if (rec && rec.c && rec.d) {
+            if (st.strict) {
+                throw new Error("SyntaxError: Assignment to constant variable.");
+            }
+            node._constWrite = 1;
         }
         return;
     }

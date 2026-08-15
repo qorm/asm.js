@@ -47,9 +47,13 @@ const CORO_EXC_TOP = 152;
 // +160: argc —— 创建点的 _call_argc 快照;_coroutine_entry 首次进入体前恢复到全局,
 // 使协程体(生成器/async)的 arguments 构建读到真实实参个数(而非陈旧值)。
 const CORO_ARGC = 160;
+// +168: prebound —— [FDI eager] 生成器 pattern 形参在调用期(stub)完成绑定的 transfer
+// 数组指针(0=未绑定)。体内据此把叶值绑进局部、跳过重复解构(自定义迭代器二重消费会
+// 错值/错计)。生成器 stub 写、体内首读;其它协程(普通 async)恒 0 不用。
+const CORO_PREBOUND = 168;
 
 const TYPE_COROUTINE = 10;
-const COROUTINE_SIZE = 168;
+const COROUTINE_SIZE = 176;
 const COROUTINE_STACK_SIZE = 65536; // 64KB 栈
 
 // 闭包魔数（与编译器保持一致）
@@ -754,6 +758,7 @@ export class CoroutineGenerator {
         vm.store(VReg.S2, CORO_ARG4, VReg.V1);
         vm.store(VReg.S2, CORO_THIS, VReg.V1); // this=0(async 协程不写 → undefined 语义)
         vm.store(VReg.S2, CORO_EXC_TOP, VReg.V1); // 新协程异常链为空
+        vm.store(VReg.S2, CORO_PREBOUND, VReg.V1); // [FDI eager] 默认无 transfer 数组
         // [argc] 快照创建点 _call_argc(生成器 stub/async 调用点刚写,此处仍新鲜)
         vm.lea(VReg.V2, "_call_argc");
         vm.load(VReg.V2, VReg.V2, 0);

@@ -11,9 +11,9 @@
 
 | 项目 | 真值 | 权威源 |
 |------|------|--------|
-| 分支 | `dev` @ `177197b43`（ahead 27 / behind 15 `qorm/dev`） | git |
-| test262 | **70.19%**（4431/6313 stride-5） | `tests/test262/last_run_summary.json`（2026-08-13 官方全量） |
-| 距 70% | **已过 M3**（目标 4420，实际 4431，+11） | 计算 |
+| 分支 | `dev`/`main` @ `cfde2a78a`（**tag v0.3.65** 已 push `qorm/main`） | git |
+| test262 | **71.01%**（4483/6313 stride-5） | `tests/test262/last_run_summary.json`（2026-08-13 官方全量，数组 proto 跳后） |
+| 距 80% | **M4 目标 5051**，缺口 **+568 PASS** | 计算 |
 | fixtures 门禁 | `BASELINE_FIXTURES=398`；PASS=365 XFAIL=33 FAIL=0 | `scripts/bootstrap-gate.sh` |
 | CLI VERSION | **0.3.65**（cli.js / package.json / tag v0.3.65） | 源码 |
 | 文档宣称 | README / CHANGELOG 已同步 v0.3.65 与 70.19% / fixtures 398 | 本轮已对齐 |
@@ -26,7 +26,7 @@ JS → `lang/` → `compiler/` → VM IR → `backend/` → `asm/` → `binary/`
 
 ### 相对 08-05 规划的校准
 
-08-05 Wave1（Boolean/Symbol）已超额（Boolean **90%**、Symbol **68.8%**）；M1/M2（60%/65%）已过。本轮北极星改为 **M3：70%**，策略从「Object/Array 大地基」改为 **「内建独立岛并行 + Array 串行」**。
+M1–M3（60%/65%/70%）已过。本轮北极星改为 **M4：80%**（5051/6313）。策略以 **`docs/progress/2026-08-12-dep-path.md` 为执行序**：下层未稳不扩上层；同层可并行，跨层串行。for-await / TypedArray / `\p{}` 依赖未满，不立项。
 
 ---
 
@@ -150,6 +150,13 @@ node tests/test262/run.mjs --dirs built-ins/<Area> --stride 1 --jobs 8 --target 
 | L1c object-rest | Agent-Object | ✅ 全量收口 | language +34；CRASH 73→70 |
 | L3b Function | Agent-Function | ✅ 部分 | arguments 默认参数；两阶段落栈已回退；caller 未做 |
 | L4c class 计算名 | Agent-Class | ✅ M3 | 计算键 28→27 PASS；全量 **70.19%**（+37） |
+| M4 Phase A | 五路 | ✅ 收口 | 官方 **70.62%**（+27）；Promise CRASH 升至 9；statements −5 |
+| M4 Phase B Promise CRASH | Agent-Pcomb | ✅ 交卷 | stride-5 overlay **PASS 96→101 CRASH 9→2**；4 条点名不再崩；`invoke-then-*-close` 超时留给 object/ |
+| M4 Phase B species+Set | Agent-Members | ✅ 交卷 | stride-5 overlay **Set 58→66** CRASH 0；Promise 96 持平 CRASH 9；`typeof` 探针绿；species 身份 `===` 仍 false |
+| M4 Phase B for-await | — | ❌ 已取消 | 跨层（L1 迭代 + L2 数组 + L4 async）；未改文件。见 dep-path Phase E |
+| M4 Phase B 门禁 | 主控 | ✅ 官方 **70.82%** | 4471/6313（+13）；CRASH 75→68；Promise 101 CRASH 2；Set 66；距 80% **+580** |
+| M4 Phase C Array | Agent-Array | ✅ 官方 **70.84%** | Array 400/594 CRASH 1；全量 CRASH 68→64；+1 PASS（toSorted）。P1 阻塞 L1 |
+| M4 Phase C' L1 具名 miss | Agent-Object | ✅ 官方持平 **70.84%** | 探针不再 SIGSEGV；stride-5 PASS/CRASH 数字未动。fallthrough 仍关 |
 | W10 RegExp | Agent-RE | ⏸ 搁置 | 已 stash；等 String（依赖序） |
 | W11 Desc 反射 | Agent-Desc | ✅ 小增益 | Math.sign/imul；PH 大头归 Object |
 | W9 Array 洞扫尾 | Agent-Array | ✅ +4 收口 | Array 398/594（67.0%） |
@@ -226,3 +233,58 @@ node tests/test262/run.mjs --dirs built-ins/<Area> --stride 1 --jobs 8 --target 
 | 2026-08-13 | 开 L4c class 计算名：28 FAIL（`x is not defined` / Symbol ToString）；目标补齐 +26 过 70% |
 | 2026-08-13 | [L4c class](76f0c445-d14b-42cd-9916-f34a48de0223) 类定义期求实例计算键；门禁绿；官方 **70.19%**（4431，+37）；**M3 70% 达成** |
 | 2026-08-13 | 主人：提交小版本到主分支。对齐 VERSION/tag **v0.3.65**，CHANGELOG/README 同步 70.19%；下一北极星 M4 80% |
+| 2026-08-13 | **v0.3.65 已 push `qorm/main` + tag**（`cfde2a78a`）。合入 remote-main 自动块会 SIGSEGV gen1→gen2，故 `-s ours` 保留已门禁树。开 M4 Phase A：Promise∥Set∥RE-lite∥String∥class-statements |
+| 2026-08-13 | [RE-lite](cd4d29e9-046a-4042-9b48-e3a9bf49065d) 交卷：shim 原型链/`RegExp(obj)` 原值/lookbehind 右对齐/`u` 下 `.` 按码点；估 +6。等 Promise/Set/String/class 齐套再门禁 |
+| 2026-08-13 | [Set set-like](4e5639ec-4aa0-42a4-90c8-1084395edfcf) 交卷：GetSetRecord 只 Get size/has/keys；布尔方法不 Call keys；估 +7（含 2 CRASH）。`typeof Set.prototype.difference` 仍要 `members.js` |
+| 2026-08-13 | [class 私有方法](948e81b3-c776-47c3-9128-7b2465777853) 交卷：实例私有方法改构造期 own 槽；`_cfkeys_*` 未动；估 +5–15。真正 PrivateBrandCheck 要 `members.js` |
+| 2026-08-13 | [Promise](1b214675-e7fc-4443-8c45-9b467b90dfb3) 交卷：区 stride-5 **78→96 PASS（75.6%）**，FAIL 47→22。**CRASH 2→9**（4 条原 PASS 现 SIGSEGV：`iter-next-val-err` / array-setters / `iter-step-err-no-close`）。species/extends 仍要 members.js。门禁时盯 CRASH |
+| 2026-08-13 | [String](5893056e-4b8a-4fa2-9919-662e804e75f9) 交卷：区 **178→180/243（74.1%）**，CRASH 0。`codePointAt` 负下标 + RegExp ToString(this)。Phase A 齐套 → 主控门禁 |
+| 2026-08-13 | 门禁绿。官方 stride-5 **70.62%**（4458/6313，**+27** vs 70.19%）。Promise 78→96、Set 51→58（CRASH 2→0）、String 178→180、RegExp 229→231。**CRASH 70→75**（Promise +7）。**language/statements 1299→1294（−5）** 归因 class 私有 own 槽。距 80% 仍约 **+593** |
+| 2026-08-13 | 主人：继续冲 80%。开 **M4 Phase B** 三路零重叠：Promise CRASH 收口 ∥ Promise.species+Set 组合器方法值 ∥ for-await「obj is not iterable」主簇（72/117） |
+| 2026-08-13 | 主人纠偏：**一定按 JS 依赖路径，减少返工**。for-await 已停（未改文件）。执行序改回 dep-path：B 只做 L4 稳定债 → 门禁 → **C 串行 L2 Array 泛型**（179 prototype 非 PASS）→ 才允许 Class/for-await/TA。Phase A 越层账：class 私有 −5 statements、Promise 扩组合器 CRASH 2→9 |
+| 2026-08-13 | [species+Set 方法值](ad93ff90-f305-443d-ae7c-a5a155e93e3a) 交卷：`speciesTmpSlot` + 7 个 `_aref_set_*`。stride-5 overlay **Set 58→66（+8）** CRASH 0；Promise 96 持平。官方 last_run 未污染。等 B1 Promise CRASH 再门禁 |
+| 2026-08-13 | [Promise CRASH 收口](02bedebb-f6fd-493f-8eda-353eaac22305) 交卷：`_pcomb_iter_step` 对象检查 + A5 ptrFloor。overlay **Promise 96→101 CRASH 9→2**。Phase B 齐套 → 主控门禁 |
+| 2026-08-13 | Phase B 门禁绿。官方 stride-5 **70.82%**（4471/6313，**+13** vs 70.62%）。Promise 96→**101** CRASH 9→**2**；Set 58→**66** CRASH 0。全量 CRASH **75→68**。Array 399 持平。距 80% **+580**。开 Phase C L2 Array（先 sort SIGSEGV） |
+| 2026-08-13 | [L2 Array](9dbca15e-b294-47ff-bf04-a055ce658ef7) P0 交卷：sort 改运行时重读 length，4 SIGSEGV→FAIL；toSorted 非函数 comparefn +1 PASS。P1 未动——剩余 hole/`this.foo` 要 L1 object。主控门禁 |
+| 2026-08-13 | Phase C 门禁绿。官方 **70.84%**（4472/6313，+1）。Array **400** CRASH **5→1**；全量 CRASH **68→64**。开 Phase C'：L1 数组具名 miss 不得 SIGSEGV（**禁止**解开 `_object_get_array` 的 proto fallthrough） |
+| 2026-08-13 | [L1 数组具名 miss](8966b48f-b3c9-4645-b950-8feef5cf953e) 交卷：裸 TYPE_ARRAY 改走 `_object_get_array`（+ boxArrThis）。探针 `this.foo` 不再 SIGSEGV。Array 区测仍 400。fallthrough 未解。主控门禁 |
+| 2026-08-13 | Phase C' 门禁绿。官方 stride-5 **仍 70.84%**（4472/6313），CRASH 64 持平。C' 是正确性补丁，未打进 stride-5 样本。Array 泛型已跳 hole；剩余 193 FAIL 不是具名 miss SIGSEGV。不解开 proto fallthrough，也不再盲冲 Array |
+| 2026-08-13 | 主人：继续。新聚类：26 条 `not a function` 吸烟枪 `every/15.4.4.16-8-2`（`foo.prototype=new Array` 后 `f.every` 侧表 miss）。开窄修：非索引 miss → `_nsobj_array_proto`，**不**走数组块 proto@16 |
+| 2026-08-13 | [数组方法名落 prototype](0d4e107d-9e1b-4d3d-a8d3-c4d6218e4222) 交卷：非索引 miss + 非 constructor + own-only → `Array.prototype._object_get`。区测 **400→410**，not-fn 26→14，CRASH 1。2 条 reduce `-5-5` 翻负（既有 `_agen_reduce` 空数组不抛，非本跳）。主控门禁 |
+| 2026-08-13 | 门禁绿。官方 stride-5 **71.01%**（4483/6313，**+11**）。Array 400→**410（69.0%）**；Object 546→547；CRASH 64 持平。距 80% **+568** |
+| 2026-08-13 | 开 L1 下一刀：defineProperty(数组索引) 属性位（22 FAIL）+ gOPD 9 CRASH-detail。独占 object/index.js；热路径不得退化 |
+| 2026-08-13 | L1 descriptor 刀交卷：根因非 gOPD（本就对），是 `propertyIsEnumerable` 对数组恒 false + `delete` 无视侧表 configurable。修 `_opie_arr`/`_odel_array` 两函数。门禁绿；官方 **71.33%**（4503/6313，**+20**）。Object 567/113/1/0（83.3%）。B 簇 9 条确诊 members.js 内建物化缺口（Math.max/min/hypot/random、Function.prototype 等未落 own prop），留给持锁刀。距 80% **+548** |
+| 2026-08-13 | 开两刀（文件不相交并行）：① L1 内建物化补全（members.js 独占，gOPD 9 条簇）② L2 `_agen_reduce` 空数组无 seed 抛 TypeError（2 条） |
+| 2026-08-13 | ② 交卷：reduce/reduceRight 三处空出口抛 TypeError（array/index.js）。Array 区测 410→412，零回退，门禁绿。已知偏差：真数组全 hole 仍返 undefined（引擎索引不走原型链，护 8-c-4，代码内已注释） |
+| 2026-08-13 | ① 交卷：gOPD 簇 13+1 条修复（members.js 物化表 + parseInt/Function 单例/Error proto 预建）。合并态门禁绿；官方 **71.57%**（4518/6313，**+15**）。Object 581/99（85.3%）、Array 412。**回退 5 条**：RegExp 占位缺 brand 检查 4 条 PASS→FAIL；裸 Function() 调用 SIGSEGV 1 条 FAIL→CRASH。已发回原刀修复 |
+| 2026-08-13 | 回退修完 + 主控补刀：RegExp 占位无条件抛 TypeError；裸 `Function(...)` 改派 `__makeFunction`（与 `new Function` 同路）并扩展 shim 注入；修 `SYM_IDS`/`allocator` 错位（缺 `_str_replaceAll_fn`）+ `_call_argc` 入 HOST_DATA（片段 arguments 读宿主 argc）。门禁绿。官方 **71.74%**（4529/6313，**+26** vs 71.33）。CRASH **64→61**。Object 581、Array 412、RegExp 234。距 80% **+522** |
+| 2026-08-13 | 开 Phase C1b（依赖序 L2）：真数组泛型活读（HasProperty+Get）+ 原始 this ToObject。独占 `runtime/types/array/index.js`（± builtin_array_methods 仅当分派必需）；禁 object/members/TA/for-await |
+| 2026-08-13 | C1b 交卷验收：真数组回调/indexOf 改 `_agen_has_idx`+`_agen_get_idx`；`_agen_toobject` 装箱 num/bool。门禁绿。官方 **72.45%**（4574/6313，**+45**）。Array **457/136/1**；CRASH 61 持平。距 80% **+477**。残簇：concat/splice/every/indexOf/sort |
+| 2026-08-13 | 开 C1c：indexOf（len 先于 fromIndex；Infinity→-1）+ 回调缺 thisArg 绑 global；every.call(Math) 可收则收。仍独占 array/index.js |
+| 2026-08-13 | C1c 交卷验收：indexOf 序/Infinity + ToLength(+Inf)。门禁绿。官方 **72.58%**（4582/6313，**+8**）。Array **465/128/1**。thisArg→global / Math toStringTag / ToPrimitive 抛错记阻塞（需 closures 或 members，不越层）。距 80% **+469** |
+| 2026-08-13 | 开 C1d：splice/sort/concat 对 array-like（非数组 this）泛型；独占 array/index.js；禁 species/Proxy 深挖除非最小可收 |
+| 2026-08-13 | C1d 交卷验收：`_agen_concat/splice/sort` + 挂载 splice/sort。门禁绿。官方 **72.61%**（4584/6313，**+2**）。Array **467/126/1**。L2 增益变薄；回 L1 Object 残簇（getPrototypeOf / __defineGetter__）。距 80% **+467** |
+| 2026-08-13 | 开两刀（文件不相交）：① L1 getPrototypeOf/preventExtensions（object/index.js）② L1 __defineGetter__/__lookup* 挂载（members.js） |
+| 2026-08-13 | ② 交卷：Annex B 四方法挂 Object.prototype（members + object 末尾独立 helper）。区测 Object 581→600（+19），门禁绿。等 ① 交卷后合并验收 |
+| 2026-08-13 | ① 交卷：getPrototypeOf ToObject/构造器原型 + preventExtensions Array/Date/args。区测 Object→603（+22 含合并效应）。`__proto__` 仍阻塞。合并门禁绿；官方 **73.01%**（4609/6313，**+25**）。Object **603/77**；CRASH 62（+1，多 timeout 噪声）。距 80% **+442** |
+| 2026-08-13 | 开 L1 续：Object.defineProperty/defineProperties 残簇 + `__proto__` get/set 三案（独占 object/index.js） |
+| 2026-08-13 | `__proto__`/define 交卷验收：门禁绿。官方 **73.12%**（4616/6313，**+7**）。Object **610/70**。距 80% **+435** |
+| 2026-08-13 | 开两刀（文件不相交）：① Object.assign ToObject/只读抛错（object/index.js）② 内建 @@toStringTag（members.js） |
+| 2026-08-13 | ② 交卷：Math/Map/Set/Promise/Date/RegExp 挂 @@toStringTag。区测 Object +2、Array +2（every.call(Math) PASS），门禁绿。等 ① 合并验收；区测曾覆盖 last_run.json（仅 Object 681 条），官方跑将重建 |
+| 2026-08-13 | ① 交卷：assign ToObject + Set(Throw)。合并门禁绿；官方 **73.21%**（4622/6313，**+6**）。Object **614**、Array **469**、Set **68**。距 80% **+429** |
+| 2026-08-13 | 开 L1：toString 在 delete @@toStringTag 后应按规范回落 Object（收 symbol-tag-set-builtin）；独占 object/index.js |
+| 2026-08-13 | toString tag 回落交卷验收：门禁绿。官方 **73.23%**（4623/6313，**+1**）。Object **615/65**；`symbol-tag-set-builtin` PASS。距 80% **+428** |
+| 2026-08-13 | L1 增益变薄；开 Phase D1 L3b：回调缺 thisArg 时 noStrict 绑 global（OrdinaryCallBindThis），收 Array every/forEach thisArg；禁两阶段落栈 |
+| 2026-08-13 | D1 交卷验收：`[[Strict]]`→`_func_meta` kind bit8；`_aref_invoke_cbt` 分派。门禁绿。官方 **73.26%**（4625/6313，**+2**）。Array **471**。距 80% **+426**。未收：直接 `f()`/IIFE 的 this |
+| 2026-08-13 | 开 D1b：`compileClosureCall` / 直接调用 OrdinaryCallBindThis（noStrict→global），收 forEach/15.4.4.18-5-1；禁两阶段落栈 |
+| 2026-08-13 | D1b 首派未开工，重派；并行开 L1 Object.create 描述符残簇（object/index.js，与 D1b 文件不相交） |
+| 2026-08-13 | Object.create 交卷：getter this 装箱 + 包装槽不可枚举 + 数组侧表进 keys。区测 Object 615→624（+9），门禁绿。等 D1b 合并验收 |
+| 2026-08-13 | D1b 交卷 + 合并验收：直接调用绑 A5；create +9。门禁绿。官方 **73.42%**（4635/6313，**+10**）。Object **624**；CRASH **61（−1）**。距 80% **+416** |
+| 2026-08-13 | 开 L1：Object.defineProperty/defineProperties 残簇（独占 object/index.js） |
+| 2026-08-13 | freeze/seal 交卷验收：Array/Arguments/函数 EXT 位。门禁绿。官方 **73.51%**（4641/6313，**+6**）。Object **630/50**。距 80% **+410**。4-192/enumerable for-in 记闭包/statements 禁区 |
+| 2026-08-13 | 开 for-in 侧表键（statements.js）：收 define* enumerable 2 条；禁 object 大改 |
+| 2026-08-13 | for-in 侧表交卷 + 补 `_closure_props_find` 入 SYM_IDS（片段缺符号回归）。门禁绿。官方 **73.61%**（4647/6313，**+6**）。Object **634**；statements 回 1298。距 80% **+404** |
+| 2026-08-13 | D1 OrdinaryCallBindThis 交卷：func_meta kind bit8=[[Strict]]；_aref_invoke_cbt 缺 thisArg 时非严格→globalThis；区测 Array **471/122/0/1**（+2）；gate 365/0；caller 直接调用 this 未收 |
+| 2026-08-13 | L1：Array ctor 运行时槽守卫（pending FE 先于 main 物化）+ valueOf ToObject + aref 方法无惰性 .prototype。门禁绿。官方 **73.83%**（4661/6313，**+14**）。Object **639**；Array **475**。距 80% **+390** |
+| 2026-08-13 | with 标识符 [[Get]] 补 `_maybe_getter`（与成员读 `_object_get_ic` 对齐）。门禁绿。官方仍 **73.83%**（4661，持平）——stride-5 with 残多为 global `this.p*` 裸名绑定，非 accessor |
+| 2026-08-14 | 裸名读：编译期 unresolvable → runtime HasProperty/Get(_global_this)（对齐 typeof）。门禁绿。官方 **73.93%**（4667/6313，**+6**）。with **6→14**；statements **1304**。距 80% **+384** |

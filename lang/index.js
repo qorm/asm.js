@@ -10,4 +10,4 @@ export { Parser, newParser, parse } from "./parser/index.js";
 export * as AST from "./parser/ast.js";
 
 // 语义分析
-export { isBuiltinOrGlobal, analyzeCapturedVariables, collectLocalDeclarations, collectReferencedVariables, collectNestedFunctionReferences, analyzeSharedVariables } from "./analysis/closure.js";
+export { isBuiltinOrGlobal, analyzeCapturedVariables, collectLocalDeclarations, collectVarDeclarations, collectReferencedVariables, collectNestedFunctionReferences, analyzeSharedVariables } from "./analysis/closure.js";

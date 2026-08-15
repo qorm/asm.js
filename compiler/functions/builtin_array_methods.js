@@ -196,6 +196,20 @@ export const BuiltinArrayMethodCompiler = {
 
                 // 将整数长度装箱为 Number
                 this.boxIntAsNumber(VReg.RET);
+            } else {
+                // push():无元素 → 仍 Set(O,"length",len,true)(frozen 空数组 TypeError),返 len
+                this.compileExpression(arrayExpr);
+                const arrOff = this.ctx.allocLocal(`__push0_arr_${this.nextLabelId()}`);
+                const lenOff = this.ctx.allocLocal(`__push0_len_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, arrOff, VReg.RET);
+                this.vm.mov(VReg.A0, VReg.RET);
+                this.vm.call("_array_length");
+                this.vm.store(VReg.FP, lenOff, VReg.RET);
+                this.vm.load(VReg.A0, VReg.FP, arrOff);
+                this.vm.load(VReg.A1, VReg.FP, lenOff);
+                this.vm.call("_array_setlength_throw");
+                this.vm.load(VReg.RET, VReg.FP, lenOff);
+                this.boxIntAsNumber(VReg.RET);
             }
             return true;
         }
@@ -314,29 +328,21 @@ export const BuiltinArrayMethodCompiler = {
                 }
                 break;
             case "indexOf":
-                // arr.indexOf(value, fromIndex?)
+                // arr.indexOf(value, fromIndex?) — 走 _aref_arr_indexOf:
+                // ToLength 后 len==0 先 -1,再 ToInteger(from);+Inf from → -1。
                 if (args.length > 0) {
-                    this.vm.push(VReg.RET); // 数组
+                    this.vm.push(VReg.RET); // 数组(装箱)
                     this.compileExpression(args[0]);
+                    this.vm.push(VReg.RET); // value
                     if (args.length > 1) {
-                        // fromIndex:先存 value,编译第二参转裸 int 入 A2
-                        this.vm.push(VReg.RET);
-                        this.compileExpression(args[1]);
-                        if (this.vm.backend.name === "x64") this.vm.mov(VReg.A0, VReg.RET);
-                        this.vm.call("_to_int32");
-                        this.vm.mov(VReg.A2, VReg.RET);
-                        this.vm.pop(VReg.A1); // value
+                        this.compileExpression(args[1]); // boxed from(勿提前 _to_int32)
                     } else {
-                        this.vm.mov(VReg.A1, VReg.RET);
-                        this.vm.movImm(VReg.A2, 0);
+                        this.vm.movImm64(VReg.RET, 0x7ffb000000000000n); // undefined
                     }
-                    this.vm.pop(VReg.A0);
-                    // unbox JSValue 得到裸指针(_js_unbox 保 A1,不碰 A2)
-                    this.vm.call("_js_unbox");
-                    this.vm.mov(VReg.A0, VReg.RET);
-                    this.vm.call("_array_indexOf");
-                    // 装箱返回值为 Number 对象
-                    this.boxIntAsNumber(VReg.RET);
+                    this.vm.mov(VReg.A2, VReg.RET);
+                    this.vm.pop(VReg.A1); // value
+                    this.vm.pop(VReg.A0); // array
+                    this.vm.call("_aref_arr_indexOf"); // RET = 装箱数字
                 }
                 break;
             case "includes":
@@ -590,6 +596,7 @@ export const BuiltinArrayMethodCompiler = {
             case "sort":
                 // arr.sort(comparator) - 原地排序，调用用户比较器。
                 // 无比较器：按 ECMAScript 默认序（元素 ToString 后字典序）。
+                // 非真数组 this → _agen_sort(活读写回)。
                 if (args.length > 0) {
                     this.compileArraySort(arrayExpr, args[0]);
                 } else {
@@ -711,7 +718,7 @@ export const BuiltinArrayMethodCompiler = {
                 this.vm.call("_box_arr_r"); // box->helper
                 this.vm.jmp(_ccSpecEnd);
 
-                // fallback: non-default species -> _agen_concat
+                // fallback: non-default species / 非数组 this -> _agen_concat
                 this.vm.label(_ccSpecFb);
                 this.vm.load(VReg.A0, VReg.FP, _ccRecvSp);
                 for (let ci = 0; ci < Math.min(args.length, 4); ci++) {
@@ -721,6 +728,7 @@ export const BuiltinArrayMethodCompiler = {
                     else if (ci === 2) this.vm.mov(VReg.A3, VReg.RET);
                     else if (ci === 3) this.vm.mov(VReg.A4, VReg.RET);
                 }
+                this.emitSetCallArgc(Math.min(args.length, 4));
                 this.vm.call("_agen_concat");
                 this.vm.label(_ccSpecEnd);
                 break;
@@ -838,10 +846,10 @@ export const BuiltinArrayMethodCompiler = {
                 this.vm.call("_array_splice");
                 this.vm.jmp(_spSpecEnd);
 
-                // fallback: non-default species -> _agen_splice
+                // fallback: non-default species / 非数组 this -> _agen_splice_items
+                // (A3=items 数组;与方法值 _agen_splice 的 argc 打包装入口分离)
                 this.vm.label(_spSpecFb);
                 this.vm.load(VReg.A0, VReg.FP, _spRecvSp);
-                // compile start/delCount as args[0]/args[1] on stack
                 if (args.length >= 1) {
                     this.compileExpression(args[0]);
                     this.vm.mov(VReg.A1, VReg.RET);
@@ -849,13 +857,14 @@ export const BuiltinArrayMethodCompiler = {
                         this.compileExpression(args[1]);
                         this.vm.mov(VReg.A2, VReg.RET);
                     } else {
-                        this.vm.movImm64(VReg.A2, 0x7ffc000000000007n); // sentinel via tagged
+                        this.vm.movImm64(VReg.A2, 0x7ffb000000000000n); // undefined → 删到尾
                     }
                 } else {
-                    this.vm.movImm64(VReg.A1, 0x7ff8000000000000n);
-                    this.vm.movImm64(VReg.A2, 0x7ffc000000000007n);
+                    this.vm.movImm(VReg.A1, 0);
+                    this.vm.scvtf(0, VReg.A1);
+                    this.vm.fmovToInt(VReg.A1, 0);
+                    this.vm.movImm64(VReg.A2, 0x7ffb000000000000n);
                 }
-                // items args: save to A3 context
                 if (args.length >= 3) {
                     const _spCtxOff = this.ctx.allocLocal(`__sp_ctx_${_spId}`);
                     this.compileExpression({ type: "ArrayExpression", elements: args.slice(2) });
@@ -864,7 +873,7 @@ export const BuiltinArrayMethodCompiler = {
                 } else {
                     this.vm.movImm(VReg.A3, 0);
                 }
-                this.vm.call("_agen_splice");
+                this.vm.call("_agen_splice_items");
 
                 this.vm.label(_spSpecEnd);
                 break;
@@ -935,16 +944,25 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.load(VReg.A0, VReg.FP, arrOff);
         this.vm.call("_array_length");
         this.vm.store(VReg.FP, lenOff, VReg.RET);
+        // start/end:显式 undefined 须 default(0/len),不可 AsInt(undefined)→0 把 end 打成 0
         if (args.length >= 2) {
-            this.compileExpressionAsInt(args[1]);
-            this.emitRelativeIndex(lenOff, idxOff);
+            this.compileExpression(args[1]);
+            this.vm.mov(VReg.A0, VReg.RET);
+            this.vm.load(VReg.A1, VReg.FP, lenOff);
+            this.vm.movImm(VReg.A2, 0); // start 缺省 0
+            this.vm.call("_aref_relidx");
+            this.vm.store(VReg.FP, idxOff, VReg.RET);
         } else {
             this.vm.movImm(VReg.V0, 0);
             this.vm.store(VReg.FP, idxOff, VReg.V0);
         }
         if (args.length >= 3) {
-            this.compileExpressionAsInt(args[2]);
-            this.emitRelativeIndex(lenOff, endOff);
+            this.compileExpression(args[2]);
+            this.vm.mov(VReg.A0, VReg.RET);
+            this.vm.load(VReg.A1, VReg.FP, lenOff);
+            this.vm.load(VReg.A2, VReg.FP, lenOff); // end 缺省 len
+            this.vm.call("_aref_relidx");
+            this.vm.store(VReg.FP, endOff, VReg.RET);
         } else {
             this.vm.load(VReg.V0, VReg.FP, lenOff);
             this.vm.store(VReg.FP, endOff, VReg.V0);
@@ -987,26 +1005,36 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.load(VReg.A0, VReg.FP, arrOff);
         this.vm.call("_array_length");
         this.vm.store(VReg.FP, lenOff, VReg.RET);
-        // target
+        // target/start/end:显式 undefined → default(0/0/len);统一 _aref_relidx
         if (args.length >= 1) {
-            this.compileExpressionAsInt(args[0]);
-            this.emitRelativeIndex(lenOff, tgtOff);
+            this.compileExpression(args[0]);
+            this.vm.mov(VReg.A0, VReg.RET);
+            this.vm.load(VReg.A1, VReg.FP, lenOff);
+            this.vm.movImm(VReg.A2, 0);
+            this.vm.call("_aref_relidx");
+            this.vm.store(VReg.FP, tgtOff, VReg.RET);
         } else {
             this.vm.movImm(VReg.V0, 0);
             this.vm.store(VReg.FP, tgtOff, VReg.V0);
         }
-        // start
         if (args.length >= 2) {
-            this.compileExpressionAsInt(args[1]);
-            this.emitRelativeIndex(lenOff, fromOff);
+            this.compileExpression(args[1]);
+            this.vm.mov(VReg.A0, VReg.RET);
+            this.vm.load(VReg.A1, VReg.FP, lenOff);
+            this.vm.movImm(VReg.A2, 0);
+            this.vm.call("_aref_relidx");
+            this.vm.store(VReg.FP, fromOff, VReg.RET);
         } else {
             this.vm.movImm(VReg.V0, 0);
             this.vm.store(VReg.FP, fromOff, VReg.V0);
         }
-        // end
         if (args.length >= 3) {
-            this.compileExpressionAsInt(args[2]);
-            this.emitRelativeIndex(lenOff, endOff);
+            this.compileExpression(args[2]);
+            this.vm.mov(VReg.A0, VReg.RET);
+            this.vm.load(VReg.A1, VReg.FP, lenOff);
+            this.vm.load(VReg.A2, VReg.FP, lenOff); // end 缺省 len
+            this.vm.call("_aref_relidx");
+            this.vm.store(VReg.FP, endOff, VReg.RET);
         } else {
             this.vm.load(VReg.V0, VReg.FP, lenOff);
             this.vm.store(VReg.FP, endOff, VReg.V0);
@@ -1153,279 +1181,52 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.label(someDoneLbl);
     },
 
-    // 编译 arr.sort(comparator) -> 原地排序后的数组
-    // 冒泡排序：稳定、原地（依赖数组指针稳定，写回 arrayExpr 的原数组头）。
-    // 比较器返回值经 _syscall_arg 归一化为整数；>0 交换（升序）。
+    // 编译 arr.sort(comparator) → 真数组 _array_sort_cmp / 非数组 _agen_sort。
+    // 快路曾一次读 length 后冒泡;getter/setter 改 length 会按下标野读 SIGSEGV。
+    // 长度重读/边界检查集中在 runtime,此处只派发。
     compileArraySort(arrayExpr, callbackExpr) {
         this.compileExpression(arrayExpr);
         const arrOffset = this.ctx.allocLocal(`__sort_arr_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, arrOffset, VReg.RET);
-
-        // 长度（unbox 后读 @8）
-        this.vm.mov(VReg.A0, VReg.RET);
-        this.vm.call("_js_unbox");
-        this.vm.load(VReg.V1, VReg.RET, 8);
-        const lenOffset = this.ctx.allocLocal(`__sort_len_${this.nextLabelId()}`);
-        this.vm.store(VReg.FP, lenOffset, VReg.V1);
-
-        // 比较器闭包
         this.compileExpression(callbackExpr);
         const cbOffset = this.ctx.allocLocal(`__sort_cb_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, cbOffset, VReg.RET);
-
-        const iOffset = this.ctx.allocLocal(`__sort_i_${this.nextLabelId()}`);
-        const jOffset = this.ctx.allocLocal(`__sort_j_${this.nextLabelId()}`);
-        const aOffset = this.ctx.allocLocal(`__sort_a_${this.nextLabelId()}`);
-        const bOffset = this.ctx.allocLocal(`__sort_b_${this.nextLabelId()}`);
-
-        const loopI = this.ctx.newLabel("sort_i");
-        const endI = this.ctx.newLabel("sort_i_end");
-        const loopJ = this.ctx.newLabel("sort_j");
-        const endJ = this.ctx.newLabel("sort_j_end");
-        const noSwap = this.ctx.newLabel("sort_noswap");
-
-        // i = 0
-        this.vm.movImm(VReg.V0, 0);
-        this.vm.store(VReg.FP, iOffset, VReg.V0);
-
-        this.vm.label(loopI);
-        // if i >= len-1: done
-        this.vm.load(VReg.V0, VReg.FP, iOffset);
-        this.vm.load(VReg.V1, VReg.FP, lenOffset);
-        this.vm.subImm(VReg.V1, VReg.V1, 1);
-        this.vm.cmp(VReg.V0, VReg.V1);
-        this.vm.jge(endI);
-
-        // j = 0
-        this.vm.movImm(VReg.V0, 0);
-        this.vm.store(VReg.FP, jOffset, VReg.V0);
-
-        this.vm.label(loopJ);
-        // limit = len-1-i; if j >= limit: end inner
-        this.vm.load(VReg.V0, VReg.FP, jOffset);
-        this.vm.load(VReg.V1, VReg.FP, lenOffset);
-        this.vm.subImm(VReg.V1, VReg.V1, 1);
-        this.vm.load(VReg.V2, VReg.FP, iOffset);
-        this.vm.sub(VReg.V1, VReg.V1, VReg.V2);
-        this.vm.cmp(VReg.V0, VReg.V1);
-        this.vm.jge(endJ);
-
-        // a = arr[j]
+        const liveL = this.ctx.newLabel("sort_agen");
+        const doneL = this.ctx.newLabel("sort_done");
+        this.vm.load(VReg.V0, VReg.FP, arrOffset);
+        this.vm.shrImm(VReg.V0, VReg.V0, 48);
+        this.vm.cmpImm(VReg.V0, 0x7FFE);
+        this.vm.jne(liveL);
         this.vm.load(VReg.A0, VReg.FP, arrOffset);
-        this.vm.load(VReg.A1, VReg.FP, jOffset);
-        this.vm.call("_subscript_get");
-        this.vm.store(VReg.FP, aOffset, VReg.RET);
-        // b = arr[j+1]
+        this.vm.load(VReg.A1, VReg.FP, cbOffset);
+        this.vm.call("_array_sort_cmp");
+        this.vm.jmp(doneL);
+        this.vm.label(liveL);
         this.vm.load(VReg.A0, VReg.FP, arrOffset);
-        this.vm.load(VReg.V0, VReg.FP, jOffset);
-        this.vm.addImm(VReg.V0, VReg.V0, 1);
-        this.vm.mov(VReg.A1, VReg.V0);
-        this.vm.call("_subscript_get");
-        this.vm.store(VReg.FP, bOffset, VReg.RET);
-
-        // [sort stability] undefined elements (0x7FFB) are sorted to end per ES2019+.
-        // a is undefined → swap (move undefined right), unless b is also undefined.
-        const swapLabel = this.ctx.newLabel("sort_swap");
-        const chkUndef = this.ctx.newLabel("sort_chk_undef");
-        this.vm.movImm64(VReg.V3, 0x7ffb000000000000n);
-        this.vm.load(VReg.V4, VReg.FP, aOffset);
-        this.vm.cmp(VReg.V4, VReg.V3);
-        this.vm.jne(chkUndef);
-        // a is undefined → move right unless b is also undefined
-        this.vm.load(VReg.V4, VReg.FP, bOffset);
-        this.vm.cmp(VReg.V4, VReg.V3);
-        this.vm.jeq(noSwap);   // both undefined, stay
-        this.vm.jmp(swapLabel); // a undefined, b not → swap
-        this.vm.label(chkUndef);
-        // b is undefined → keep it at right
-        this.vm.load(VReg.V4, VReg.FP, bOffset);
-        this.vm.cmp(VReg.V4, VReg.V3);
-        this.vm.jeq(noSwap);   // b undefined, don't move it left
-
-        // cmp = comparator(a, b)
-        this.vm.load(VReg.V6, VReg.FP, cbOffset);
-        this.vm.push(VReg.V6);
-        this.vm.load(VReg.A0, VReg.FP, aOffset);
-        this.vm.load(VReg.A1, VReg.FP, bOffset);
-        this.vm.load(VReg.A2, VReg.FP, arrOffset);
-        this.vm.pop(VReg.S0);
-        this.emitClosureCallAfterSetup(2);
-
-        // 归一化比较结果为整数
-        this.vm.mov(VReg.A0, VReg.RET);
-        this.vm.call("_syscall_arg");
-        this.vm.cmpImm(VReg.RET, 0);
-        this.vm.jle(noSwap); // <= 0：不交换
-
-        this.vm.label(swapLabel);
-        // 交换 arr[j] <-> arr[j+1]
-        this.vm.load(VReg.A0, VReg.FP, arrOffset);
-        this.vm.load(VReg.A1, VReg.FP, jOffset);
-        this.vm.load(VReg.A2, VReg.FP, bOffset);
-        this.vm.call("_subscript_set");
-        this.vm.load(VReg.A0, VReg.FP, arrOffset);
-        this.vm.load(VReg.V0, VReg.FP, jOffset);
-        this.vm.addImm(VReg.V0, VReg.V0, 1);
-        this.vm.mov(VReg.A1, VReg.V0);
-        this.vm.load(VReg.A2, VReg.FP, aOffset);
-        this.vm.call("_subscript_set");
-
-        this.vm.label(noSwap);
-        // j++
-        this.vm.load(VReg.V0, VReg.FP, jOffset);
-        this.vm.addImm(VReg.V0, VReg.V0, 1);
-        this.vm.store(VReg.FP, jOffset, VReg.V0);
-        this.vm.jmp(loopJ);
-
-        this.vm.label(endJ);
-        // i++
-        this.vm.load(VReg.V0, VReg.FP, iOffset);
-        this.vm.addImm(VReg.V0, VReg.V0, 1);
-        this.vm.store(VReg.FP, iOffset, VReg.V0);
-        this.vm.jmp(loopI);
-
-        this.vm.label(endI);
-        // 返回排序后的数组
-        this.vm.load(VReg.RET, VReg.FP, arrOffset);
+        this.vm.load(VReg.A1, VReg.FP, cbOffset);
+        this.vm.call("_agen_sort");
+        this.vm.label(doneL);
     },
 
-    // 编译 arr.sort() 无比较器 -> 按元素 ToString 的字典序原地排序。
-    // 冒泡排序骨架同 compileArraySort，仅把「调用比较器」换成
-    // 「_valueToStr 各自装箱成稳定堆串 → _strcmp 比字节」。装箱是关键：
-    // _valueToStr 数字路径可能复用静态缓冲，直接连调两次会互相覆盖；
-    // 装箱(同 join 的 _js_box_string)得到各自独立堆串，脱壳取 content 供 _strcmp。
+    // 编译 arr.sort() 无比较器 → 真数组 _array_sort / 非数组 _agen_sort。
     compileArraySortDefault(arrayExpr) {
         this.compileExpression(arrayExpr);
-        const arrOffset = this.ctx.allocLocal(`__dsort_arr_${this.nextLabelId()}`);
+        const arrOffset = this.ctx.allocLocal(`__sort_arr_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, arrOffset, VReg.RET);
-
-        // 长度（unbox 后读 @8）
-        this.vm.mov(VReg.A0, VReg.RET);
-        this.vm.call("_js_unbox");
-        this.vm.load(VReg.V1, VReg.RET, 8);
-        const lenOffset = this.ctx.allocLocal(`__dsort_len_${this.nextLabelId()}`);
-        this.vm.store(VReg.FP, lenOffset, VReg.V1);
-
-        const iOffset = this.ctx.allocLocal(`__dsort_i_${this.nextLabelId()}`);
-        const jOffset = this.ctx.allocLocal(`__dsort_j_${this.nextLabelId()}`);
-        const aOffset = this.ctx.allocLocal(`__dsort_a_${this.nextLabelId()}`);
-        const bOffset = this.ctx.allocLocal(`__dsort_b_${this.nextLabelId()}`);
-        const saOffset = this.ctx.allocLocal(`__dsort_sa_${this.nextLabelId()}`);
-
-        const loopI = this.ctx.newLabel("dsort_i");
-        const endI = this.ctx.newLabel("dsort_i_end");
-        const loopJ = this.ctx.newLabel("dsort_j");
-        const endJ = this.ctx.newLabel("dsort_j_end");
-        const noSwap = this.ctx.newLabel("dsort_noswap");
-
-        // i = 0
-        this.vm.movImm(VReg.V0, 0);
-        this.vm.store(VReg.FP, iOffset, VReg.V0);
-
-        this.vm.label(loopI);
-        // if i >= len-1: done
-        this.vm.load(VReg.V0, VReg.FP, iOffset);
-        this.vm.load(VReg.V1, VReg.FP, lenOffset);
-        this.vm.subImm(VReg.V1, VReg.V1, 1);
-        this.vm.cmp(VReg.V0, VReg.V1);
-        this.vm.jge(endI);
-
-        // j = 0
-        this.vm.movImm(VReg.V0, 0);
-        this.vm.store(VReg.FP, jOffset, VReg.V0);
-
-        this.vm.label(loopJ);
-        // limit = len-1-i; if j >= limit: end inner
-        this.vm.load(VReg.V0, VReg.FP, jOffset);
-        this.vm.load(VReg.V1, VReg.FP, lenOffset);
-        this.vm.subImm(VReg.V1, VReg.V1, 1);
-        this.vm.load(VReg.V2, VReg.FP, iOffset);
-        this.vm.sub(VReg.V1, VReg.V1, VReg.V2);
-        this.vm.cmp(VReg.V0, VReg.V1);
-        this.vm.jge(endJ);
-
-        // a = arr[j]
+        const liveL = this.ctx.newLabel("sort0_agen");
+        const doneL = this.ctx.newLabel("sort0_done");
+        this.vm.load(VReg.V0, VReg.FP, arrOffset);
+        this.vm.shrImm(VReg.V0, VReg.V0, 48);
+        this.vm.cmpImm(VReg.V0, 0x7FFE);
+        this.vm.jne(liveL);
         this.vm.load(VReg.A0, VReg.FP, arrOffset);
-        this.vm.load(VReg.A1, VReg.FP, jOffset);
-        this.vm.call("_subscript_get");
-        this.vm.store(VReg.FP, aOffset, VReg.RET);
-        // b = arr[j+1]
+        this.vm.call("_array_sort");
+        this.vm.jmp(doneL);
+        this.vm.label(liveL);
         this.vm.load(VReg.A0, VReg.FP, arrOffset);
-        this.vm.load(VReg.V0, VReg.FP, jOffset);
-        this.vm.addImm(VReg.V0, VReg.V0, 1);
-        this.vm.mov(VReg.A1, VReg.V0);
-        this.vm.call("_subscript_get");
-        this.vm.store(VReg.FP, bOffset, VReg.RET);
-
-        // [sort stability] undefined elements (0x7FFB) are sorted to end per ES2019+.
-        // a is undefined → swap (move undefined right), unless b is also undefined.
-        const dswapLabel = this.ctx.newLabel("dsort_swap");
-        const dchkUndef = this.ctx.newLabel("dsort_chk_undef");
-        this.vm.movImm64(VReg.V3, 0x7ffb000000000000n);
-        this.vm.load(VReg.V4, VReg.FP, aOffset);
-        this.vm.cmp(VReg.V4, VReg.V3);
-        this.vm.jne(dchkUndef);
-        this.vm.load(VReg.V4, VReg.FP, bOffset);
-        this.vm.cmp(VReg.V4, VReg.V3);
-        this.vm.jeq(noSwap);   // both undefined, stay
-        this.vm.jmp(dswapLabel); // a undefined, b not → swap
-        this.vm.label(dchkUndef);
-        this.vm.load(VReg.V4, VReg.FP, bOffset);
-        this.vm.cmp(VReg.V4, VReg.V3);
-        this.vm.jeq(noSwap);   // b undefined, don't move it left
-
-        // sa = box(ToString(a))  —— 稳定堆串
-        this.vm.load(VReg.A0, VReg.FP, aOffset);
-        this.vm.call("_valueToStr");
-        this.vm.mov(VReg.A0, VReg.RET);
-        this.vm.call("_js_box_string");
-        this.vm.store(VReg.FP, saOffset, VReg.RET);
-        // sb = box(ToString(b))
-        this.vm.load(VReg.A0, VReg.FP, bOffset);
-        this.vm.call("_valueToStr");
-        this.vm.mov(VReg.A0, VReg.RET);
-        this.vm.call("_js_box_string");
-        // A1 = sb content ptr（脱壳低 48 位）
-        this.vm.emitMaskLoad(VReg.V4);
-        this.vm.andMaskReg(VReg.A1, VReg.RET, VReg.V4);
-        // A0 = sa content ptr
-        this.vm.load(VReg.V0, VReg.FP, saOffset);
-        this.vm.andMaskReg(VReg.A0, VReg.V0, VReg.V4);
-        // cmp = strcmp(sa, sb)；> 0 交换（升序字典序）
-        this.vm.call("_strcmp");
-        this.vm.cmpImm(VReg.RET, 0);
-        this.vm.jle(noSwap);
-
-        this.vm.label(dswapLabel);
-        // 交换 arr[j] <-> arr[j+1]
-        this.vm.load(VReg.A0, VReg.FP, arrOffset);
-        this.vm.load(VReg.A1, VReg.FP, jOffset);
-        this.vm.load(VReg.A2, VReg.FP, bOffset);
-        this.vm.call("_subscript_set");
-        this.vm.load(VReg.A0, VReg.FP, arrOffset);
-        this.vm.load(VReg.V0, VReg.FP, jOffset);
-        this.vm.addImm(VReg.V0, VReg.V0, 1);
-        this.vm.mov(VReg.A1, VReg.V0);
-        this.vm.load(VReg.A2, VReg.FP, aOffset);
-        this.vm.call("_subscript_set");
-
-        this.vm.label(noSwap);
-        // j++
-        this.vm.load(VReg.V0, VReg.FP, jOffset);
-        this.vm.addImm(VReg.V0, VReg.V0, 1);
-        this.vm.store(VReg.FP, jOffset, VReg.V0);
-        this.vm.jmp(loopJ);
-
-        this.vm.label(endJ);
-        // i++
-        this.vm.load(VReg.V0, VReg.FP, iOffset);
-        this.vm.addImm(VReg.V0, VReg.V0, 1);
-        this.vm.store(VReg.FP, iOffset, VReg.V0);
-        this.vm.jmp(loopI);
-
-        this.vm.label(endI);
-        // 返回排序后的数组
-        this.vm.load(VReg.RET, VReg.FP, arrOffset);
+        this.vm.movImm64(VReg.A1, 0x7ffb000000000000n);
+        this.vm.call("_agen_sort");
+        this.vm.label(doneL);
     },
 
     // 编译 arr.every(callback) -> boolean
@@ -1533,85 +1334,35 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.label(returnLabel);
     },
 
-    // [#35] arr.findLast(cb)/findLastIndex(cb) —— find/findIndex 的反向遍历版
-    // (wantIndex=false 返回元素/undefined,true 返回下标/-1)
+    // [#35] arr.findLast(cb)/findLastIndex(cb) —— 反向 find;走 runtime 与 every 同形
+    // (thisArg / 洞 Get / 泛型 this 经 _agen_findLast*)。
     compileArrayFindLast(arrayExpr, callbackExpr, wantIndex, thisArgExpr = null) {
         this.compileExpression(arrayExpr);
         const arrOffset = this.ctx.allocLocal(`__findL_arr_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, arrOffset, VReg.RET);
 
-        this.vm.mov(VReg.A0, VReg.RET);
-        this.vm.call("_js_unbox");
-        this.vm.load(VReg.V1, VReg.RET, 8);
-        this.vm.subImm(VReg.V1, VReg.V1, 1); // 从 len-1 起
-        const idxOffset = this.ctx.allocLocal(`__findL_idx_${this.nextLabelId()}`);
-        this.vm.store(VReg.FP, idxOffset, VReg.V1);
-
         this.compileExpression(callbackExpr);
         const cbOffset = this.ctx.allocLocal(`__findL_cb_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, cbOffset, VReg.RET);
         this.emitCallbackGuard(cbOffset);
-        this.emitThisArgSlot(thisArgExpr, "findL");
-        const elemOffset = this.ctx.allocLocal(`__findL_elem_${this.nextLabelId()}`);
+        const thisArgSlot = this.emitThisArgSlot(thisArgExpr, "findL");
 
-        const loopLabel = this.ctx.newLabel("findL_loop");
-        const endLabel = this.ctx.newLabel("findL_end");
-        const foundLabel = this.ctx.newLabel("findL_found");
-        const returnLabel = this.ctx.newLabel("findL_return");
+        const fbLbl = this.ctx.newLabel("findL_fallback");
+        const doneLbl = this.ctx.newLabel("findL_done");
+        this.vm.load(VReg.V0, VReg.FP, arrOffset);
+        this.vm.shrImm(VReg.V0, VReg.V0, 48);
+        this.vm.cmpImm(VReg.V0, 0x7FFE);
+        this.vm.jne(fbLbl);
 
-        this.vm.label(loopLabel);
-        this.vm.load(VReg.V0, VReg.FP, idxOffset);
-        this.vm.cmpImm(VReg.V0, 0);
-        this.vm.jlt(endLabel);
-        // [timeout guard] max safe iterations
-        this.vm.movImm(VReg.V2, 0x1000000);
-        this.vm.cmp(VReg.V0, VReg.V2);
-        this.vm.jge(endLabel);
+        const rt = wantIndex ? "_array_findLastIndex_rt_t" : "_array_findLast_rt_t";
+        this.emitArrayRtCbCall(rt, arrOffset, cbOffset, thisArgSlot);
+        this.vm.jmp(doneLbl);
 
-        this.vm.load(VReg.A0, VReg.FP, arrOffset);
-        this.vm.load(VReg.A1, VReg.FP, idxOffset);
-        this.vm.call("_subscript_get");
-        this.vm.store(VReg.FP, elemOffset, VReg.RET);
+        this.vm.label(fbLbl);
+        const agen = wantIndex ? "_agen_findLastIndex" : "_agen_findLast";
+        this.emitAgenCbCall(agen, arrOffset, cbOffset, thisArgSlot);
 
-        this.vm.load(VReg.V6, VReg.FP, cbOffset);
-        this.vm.push(VReg.V6);
-        this.vm.load(VReg.A0, VReg.FP, elemOffset);
-        this.vm.load(VReg.A1, VReg.FP, idxOffset);
-        this.vm.scvtf(0, VReg.A1); this.vm.fmovToInt(VReg.A1, 0); // index → 装箱 JS number
-        this.vm.load(VReg.A2, VReg.FP, arrOffset);
-        this.vm.pop(VReg.S0);
-        this.emitClosureCallAfterSetup();
-
-        this.vm.mov(VReg.A0, VReg.RET);
-        this.vm.call("_to_boolean");
-        this.vm.cmpImm(VReg.RET, 0);
-        this.vm.jne(foundLabel);
-
-        this.vm.load(VReg.V0, VReg.FP, idxOffset);
-        this.vm.subImm(VReg.V0, VReg.V0, 1);
-        this.vm.store(VReg.FP, idxOffset, VReg.V0);
-        this.vm.jmp(loopLabel);
-
-        this.vm.label(foundLabel);
-        if (wantIndex) {
-            this.vm.load(VReg.RET, VReg.FP, idxOffset);
-        } else {
-            this.vm.load(VReg.RET, VReg.FP, elemOffset);
-        }
-        this.vm.jmp(returnLabel);
-
-        this.vm.label(endLabel);
-        if (wantIndex) {
-            this.vm.movImm(VReg.RET, -1);
-        } else {
-            this.vm.lea(VReg.V0, "_js_undefined");
-            this.vm.load(VReg.RET, VReg.V0, 0);
-        }
-
-        this.vm.label(returnLabel);
-        if (wantIndex) {
-            this.boxIntAsNumber(VReg.RET);
-        }
+        this.vm.label(doneLbl);
     },
 
     // 编译 arr.findIndex(callback) -> index or -1

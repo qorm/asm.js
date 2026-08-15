@@ -38,49 +38,81 @@ export const AssignmentCompiler = {
         if (expr.left.type === "Identifier") {
             const name = expr.left.name;
 
-            // with(obj) 作用域赋值:命中 with 对象则写其属性(否则回退词法)。RHS 只求值一次
-            // (存帧槽),命中走 _object_set,miss 用合成 __WithPrecomputed 节点复用普通赋值全逻辑。
+            // with(obj) 作用域赋值:HasBinding 命中则 PutValue 恒写该 binding object
+            // （即便 GetValue 期间 getter 删了属性，仍 CreateDataProperty——S11.13.2_A5.*）。
+            // RHS 只求值一次。复合运算：GetValue → binop → PutValue（不再回退词法）。
             if (this.ctx.withScopes && this.ctx.withScopes.length > 0 && !this._inWithResolve) {
                 this.compileExpression(expr.right);
                 const vSlot = this.ctx.allocLocal(`__withasgn_${this.nextLabelId()}`);
                 this.vm.store(VReg.FP, vSlot, VReg.RET);
-                // 复合运算符(+= 等)+ with 目标属性的读改写:本切片仅支持简单 "=" 走 with;
-                // 复合赋值回退词法(记偏差)。
-                if (expr.operator === "=") {
-                    const doneL = this.ctx.newLabel("withasgn_done");
-                    for (let i = this.ctx.withScopes.length - 1; i >= 0; i--) {
-                        const missL = this.ctx.newLabel("withasgn_miss");
-                        const slot = this.ctx.withScopes[i];
-                        this.vm.load(VReg.A0, VReg.FP, slot);
-                        this.emitBoxedStringKey(name, VReg.A1);
-                        this.vm.call("_object_has");
-                        this.vm.cmpImm(VReg.RET, 0);
-                        this.vm.jeq(missL);
+                const doneL = this.ctx.newLabel("withasgn_done");
+                const strictSet = (this.ctx && this.ctx.inStrictFunction) ||
+                    (this._currentModuleAst && this._currentModuleAst._bsStrict);
+                const setHelper = strictSet ? "_object_set_strict" : "_object_set";
+                const binOp = expr.operator !== "=" && expr.operator.length >= 2
+                    ? expr.operator.slice(0, -1) : null;
+                for (let i = this.ctx.withScopes.length - 1; i >= 0; i--) {
+                    const missL = this.ctx.newLabel("withasgn_miss");
+                    const slot = this.ctx.withScopes[i];
+                    this._emitObjectEnvHasBinding(slot, name, missL);
+                    if (expr.operator === "=") {
                         this.vm.load(VReg.A0, VReg.FP, slot);
                         this.emitBoxedStringKey(name, VReg.A1);
                         this.vm.load(VReg.A2, VReg.FP, vSlot);
-                        this.vm.call("_object_set");
+                        this.vm.call(setHelper);
+                        this.vm.load(VReg.RET, VReg.FP, vSlot);
+                    } else if (binOp) {
+                        // GetValue(with.x) — 须解 accessor
+                        this.vm.load(VReg.A0, VReg.FP, slot);
+                        this.emitBoxedStringKey(name, VReg.A1);
+                        this.vm.call("_object_get");
+                        this.vm.mov(VReg.A0, VReg.RET);
+                        this.vm.load(VReg.A1, VReg.FP, slot); // this = binding object
+                        this.vm.call("_maybe_getter");
+                        const leftSlot = this.ctx.allocLocal(`__withcv_l_${this.nextLabelId()}`);
+                        this.vm.store(VReg.FP, leftSlot, VReg.RET);
+                        // result = left <binop> RHS（复用成员赋值脱糖，Put 恒写 with 对象）
+                        this._inWithResolve = true;
+                        this.compileAssignmentExpression({
+                            type: "AssignmentExpression",
+                            operator: "=",
+                            left: {
+                                type: "MemberExpression",
+                                object: { type: "__WithPrecomputed", slot: slot },
+                                property: { type: "Identifier", name: name },
+                                computed: false,
+                            },
+                            right: {
+                                type: "BinaryExpression",
+                                operator: binOp,
+                                left: { type: "__WithPrecomputed", slot: leftSlot },
+                                right: { type: "__WithPrecomputed", slot: vSlot },
+                            },
+                        });
+                        this._inWithResolve = false;
+                    } else {
+                        // <<= 等少见：回退词法（记偏差）
+                        this._inWithResolve = true;
+                        this.compileAssignmentExpression({
+                            type: "AssignmentExpression", operator: expr.operator,
+                            left: expr.left, right: { type: "__WithPrecomputed", slot: vSlot },
+                        });
+                        this._inWithResolve = false;
                         this.vm.jmp(doneL);
                         this.vm.label(missL);
+                        continue;
                     }
-                    // miss → 词法赋值(合成 RHS 读 vSlot,不重求值)
-                    this._inWithResolve = true;
-                    this.compileAssignmentExpression({
-                        type: "AssignmentExpression", operator: "=",
-                        left: expr.left, right: { type: "__WithPrecomputed", slot: vSlot },
-                    });
-                    this._inWithResolve = false;
-                    this.vm.label(doneL);
-                    this.vm.load(VReg.RET, VReg.FP, vSlot); // 赋值表达式值 = RHS
-                    return;
+                    this.vm.jmp(doneL);
+                    this.vm.label(missL);
                 }
-                // 复合赋值:回退普通词法路径(RHS 已在 vSlot,用合成节点避免重求值)
+                // 全 miss → 词法
                 this._inWithResolve = true;
                 this.compileAssignmentExpression({
-                    type: "AssignmentExpression", operator: expr.operator,
+                    type: "AssignmentExpression", operator: expr.operator === "=" ? "=" : expr.operator,
                     left: expr.left, right: { type: "__WithPrecomputed", slot: vSlot },
                 });
                 this._inWithResolve = false;
+                this.vm.label(doneL);
                 return;
             }
 
@@ -167,12 +199,41 @@ export const AssignmentCompiler = {
                     this.vm.mov(VReg.V1, VReg.RET); // 保存要存的值
                     this.vm.lea(VReg.V2, globalLabel);
                     this.vm.load(VReg.V2, VReg.V2, 0); // 加载 box 指针
+                    // [TDZ 写] 声明前的捕获 let/const:全局 box 预建时写入 TDZ 哨兵 → 写
+                    // 即抛 ReferenceError(put-let 族,闭包经 mainCapturedVars 写同判)。
+                    // 走运行时 _throw_reference_error 单 call(与 emitUninitializedBindingGuard
+                    // 同因:内联 new ReferenceError 破坏录制重放 → 自举崩)。
+                    this.vm.load(VReg.V3, VReg.V2, 0);
+                    const gTdzOk = this.ctx.newLabel("gtdzw_ok");
+                    this.vm.movImm64(VReg.V4, 0x7ff70000deadbeefn);
+                    this.vm.cmp(VReg.V3, VReg.V4);
+                    this.vm.jne(gTdzOk);
+                    const gTdzMsg = this.asm.addString("Cannot access '" + name.replace(/\$blk\$.*$/, "") + "' before initialization");
+                    this.vm.lea(VReg.A0, gTdzMsg);
+                    this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+                    this.vm.or(VReg.A0, VReg.A0, VReg.V1);
+                    this.vm.call("_throw_reference_error"); // 不返回
+                    this.vm.label(gTdzOk);
                     this.vm.store(VReg.V2, 0, VReg.V1); // 存入 box
                     this.vm.mov(VReg.RET, VReg.V1); // 返回值
                 } else if (isBoxed) {
                     // 装箱变量：先加载 box 指针，然后存值到 box
                     this.vm.mov(VReg.V1, VReg.RET); // 保存要存的值
                     this.vm.load(VReg.V2, VReg.FP, offset); // 加载 box 指针
+                    // [TDZ 写] 捕获的 let/const 在声明前被预建 box(初值=TDZ 哨兵):写 TDZ
+                    // 绑定须抛 ReferenceError(for ([...x] of y) put-let 族——闭包延迟编译
+                    // 使静态判据失效,运行期哨兵判准)。声明后写时 box 已是真值,零误拒。
+                    this.vm.load(VReg.V3, VReg.V2, 0); // 当前值
+                    const tdzOk = this.ctx.newLabel("tdzw_ok");
+                    this.vm.movImm64(VReg.V4, 0x7ff70000deadbeefn);
+                    this.vm.cmp(VReg.V3, VReg.V4);
+                    this.vm.jne(tdzOk);
+                    const tdzMsg = this.asm.addString("Cannot access '" + name.replace(/\$blk\$.*$/, "") + "' before initialization");
+                    this.vm.lea(VReg.A0, tdzMsg);
+                    this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+                    this.vm.or(VReg.A0, VReg.A0, VReg.V1);
+                    this.vm.call("_throw_reference_error"); // 不返回
+                    this.vm.label(tdzOk);
                     this.vm.store(VReg.V2, 0, VReg.V1); // 存入 box
                     this.vm.mov(VReg.RET, VReg.V1); // 返回值
                 } else {
@@ -292,18 +353,18 @@ export const AssignmentCompiler = {
                 // [#F64] 未装箱算术复合赋值:slot 值可能是 tagged 值(如 x=true 存为
                 // 0x7FF9.. tag、x=null 存为 0x7FFA.. tag)，直接 fmovToFloat 会误解
                 // 位模式为 float64 → NaN/垃圾。先 ToNumber 两侧再浮点运算。
-                // V1=左槽值。compileExpression/emitNumberCoerceFast 使用 V1 作
-                // scratch → 先保护 V1→S0(callee-saved,跨 call 存活)。
-                // RHS coerce 可能调用 _number_coerce(内部 clobber caller-saved
-                // d-regs),故所有 coerce 完成后才 fmovToFloat→FP reg。
-                this.vm.mov(VReg.S0, VReg.V1);           // S0 = 左 JSValue(保护)
+                // V1=左槽值。compileExpression 可能物化原型并占用 S0(如 new Number →
+                // emitNumberProtoObject),故左值必须落栈而非 S0——否则 `true /= new Number(1)`
+                // 左操作数被冲掉 → NaN。
+                this.vm.push(VReg.V1);                   // 栈: 左 JSValue
                 this.compileExpression(expr.right);      // RET = 右 JSValue
                 this.vm.mov(VReg.A0, VReg.RET);          // A0 = 右 JSValue
                 this.vm.call("_number_coerce");          // RET = 右 float64
-                this.vm.push(VReg.RET);                  // 栈: 右 float; SP-=16
-                this.vm.mov(VReg.A0, VReg.S0);           // A0 = 左 JSValue
+                this.vm.pop(VReg.V1);                    // V1 = 左 JSValue
+                this.vm.push(VReg.RET);                  // 栈: 右 float
+                this.vm.mov(VReg.A0, VReg.V1);           // A0 = 左 JSValue
                 this.vm.call("_number_coerce");          // RET = 左 float64
-                this.vm.pop(VReg.V1);                    // V1 = 右 float; SP+=16
+                this.vm.pop(VReg.V1);                    // V1 = 右 float
 
                 // 现在: RET = 左 float, V1 = 右 float. 装 FP regs.
                 this.vm.fmovToFloat(0, VReg.RET);        // FP0 = 左
@@ -553,11 +614,7 @@ export const AssignmentCompiler = {
             this.compileExpression(expr.right);
             const slenValOff = this.ctx.allocLocal(`__slen_val_${this.nextLabelId()}`);
             this.vm.store(VReg.FP, slenValOff, VReg.RET);  // 保存原始 RHS(作表达式值)
-            this.vm.mov(VReg.A0, VReg.RET);
-            this.vm.call("_number_coerce");               // RET = float64 位
-            this.vm.fmovToFloat(0, VReg.RET);
-            this.vm.fcvtzs(VReg.RET, 0);                   // RET = 裸整数 n
-            this.vm.mov(VReg.A1, VReg.RET);                // A1 = n
+            this.vm.mov(VReg.A1, VReg.RET);                // A1 = boxed value(保留 Inf/负数)
             this.vm.load(VReg.A0, VReg.FP, slenObjOff);    // A0 = 对象
             this.vm.call("_js_set_length");
             this.vm.load(VReg.RET, VReg.FP, slenValOff);   // 赋值表达式求值为原始 RHS 值
@@ -606,7 +663,11 @@ export const AssignmentCompiler = {
                 this.vm.mov(VReg.A2, VReg.RET);
                 this.vm.load(VReg.A0, VReg.FP, objOffset);
                 this.emitBoxedStringKey(computedPropName, VReg.A1);
-                this.vm.call("_object_set");
+                {
+                    const strictSet = (this.ctx && this.ctx.inStrictFunction) ||
+                        (this._currentModuleAst && this._currentModuleAst._bsStrict);
+                    this.vm.call(strictSet ? "_object_set_strict" : "_object_set");
+                }
                 this.vm.load(VReg.RET, VReg.FP, cvalOff); // 赋值表达式求值为被赋的值
                 return;
             }
@@ -707,23 +768,52 @@ export const AssignmentCompiler = {
 
     // 编译更新表达式 (++, --)
     compileUpdateExpression(expr) {
-        // with(obj) 内 n++/--n:经 with-read 取旧值、with-assign 写回(运行时目标一致)。
-        // 旧值存槽,合成 `n = (旧值) ± 1` 走 with 赋值;postfix 返旧值、prefix 返新值。
+        // with(obj) 内 n++/--n:HasBinding 只一次(含 @@unscopables getter),再 Get/Put
+        // 同一 binding object——避免 read+assign 双次 HasBinding(unscopables-inc-dec)。
         if (expr.argument.type === "Identifier" && !this._inWithResolve &&
             this.ctx.withScopes && this.ctx.withScopes.length > 0) {
-            this.compileExpression(expr.argument); // with-read 旧值
-            const oldSlot = this.ctx.allocLocal(`__withupd_${this.nextLabelId()}`);
-            this.vm.store(VReg.FP, oldSlot, VReg.RET);
-            const binOp = expr.operator === "++" ? "+" : "-";
-            this.compileAssignmentExpression({
-                type: "AssignmentExpression", operator: "=", left: expr.argument,
-                right: {
-                    type: "BinaryExpression", operator: binOp,
-                    left: { type: "__WithPrecomputed", slot: oldSlot },
-                    right: { type: "NumericLiteral", value: 1 },
-                },
-            });
-            if (!expr.prefix) this.vm.load(VReg.RET, VReg.FP, oldSlot); // postfix 返旧值
+            const name = expr.argument.name;
+            const doneL = this.ctx.newLabel("withupd_done");
+            const strictSet = (this.ctx && this.ctx.inStrictFunction) ||
+                (this._currentModuleAst && this._currentModuleAst._bsStrict);
+            const setHelper = strictSet ? "_object_set_strict" : "_object_set";
+            for (let i = this.ctx.withScopes.length - 1; i >= 0; i--) {
+                const missL = this.ctx.newLabel("withupd_miss");
+                const slot = this.ctx.withScopes[i];
+                this._emitObjectEnvHasBinding(slot, name, missL);
+                // GetValue
+                this.vm.load(VReg.A0, VReg.FP, slot);
+                this.emitBoxedStringKey(name, VReg.A1);
+                this.vm.call("_object_get");
+                this.vm.mov(VReg.A0, VReg.RET);
+                this.vm.load(VReg.A1, VReg.FP, slot);
+                this.vm.call("_maybe_getter");
+                const oldSlot = this.ctx.allocLocal(`__withupd_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, oldSlot, VReg.RET);
+                // new = old ± 1
+                this.vm.load(VReg.RET, VReg.FP, oldSlot);
+                this.emitNumberCoerceFast();
+                this.vm.fmovToFloat(0, VReg.RET);
+                this.vm.movImm(VReg.V1, 0x3ff00000);
+                this.vm.shl(VReg.V1, VReg.V1, 32); // 1.0
+                this.vm.fmovToFloat(1, VReg.V1);
+                if (expr.operator === "++") this.vm.fadd(0, 0, 1);
+                else this.vm.fsub(0, 0, 1);
+                this.vm.fmovToInt(VReg.A2, 0);
+                // PutValue 恒写本 binding(不再 HasBinding)
+                this.vm.load(VReg.A0, VReg.FP, slot);
+                this.emitBoxedStringKey(name, VReg.A1);
+                this.vm.call(setHelper);
+                if (expr.prefix) this.vm.fmovToInt(VReg.RET, 0);
+                else this.vm.load(VReg.RET, VReg.FP, oldSlot);
+                this.vm.jmp(doneL);
+                this.vm.label(missL);
+            }
+            // 全 miss → 词法 ++/--
+            this._inWithResolve = true;
+            this.compileUpdateExpression(expr);
+            this._inWithResolve = false;
+            this.vm.label(doneL);
             return;
         }
         if (expr.argument.type === "Identifier") {

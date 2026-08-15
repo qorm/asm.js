@@ -64,6 +64,46 @@ export const StatementCompiler = {
         this.vm.store(VReg.V2, 0, VReg.V3);
     },
 
+    // [iterator-close] abrupt(return/break/continue)跨越协议 for-of 时先 IteratorClose。
+    // boundaryLen = 目标处 iterCloseStack.length 快照(见循环/标签登记)。关闭下标
+    // >=boundaryLen 的活迭代器并清零槽。同层 unlabeled break 目标为 iterCloseLabel:
+    // 登记时 for-of 尚未 push,boundary==登记快照,栈顶下标>=boundary → 会先清零槽,
+    // iterCloseLabel 见 0 跳过(不双调 return)。外层 labeled continue 登记时栈更短,
+    // 本 for-of push 后下标>=boundary → close。
+    // preserveRet:return 路径 RET 已持返回值,_iterator_close 会踩 RET,先存槽后恢复。
+    emitPendingIteratorCloses(boundaryLen, preserveRet) {
+        const stack = this.ctx.iterCloseStack;
+        if (!stack || stack.length === 0) return;
+        let needClose = false;
+        for (let i = stack.length - 1; i >= boundaryLen; i--) {
+            needClose = true;
+            break;
+        }
+        if (!needClose) return;
+
+        let retSlot = 0;
+        if (preserveRet) {
+            retSlot = this.ctx.getLocal("__itc_retval");
+            if (!retSlot) retSlot = this.ctx.allocLocal("__itc_retval");
+            this.vm.store(VReg.FP, retSlot, VReg.RET);
+        }
+        for (let i = stack.length - 1; i >= boundaryLen; i--) {
+            const e = stack[i];
+            const skipL = this.ctx.newLabel("itc_pending_skip");
+            this.vm.load(VReg.V0, VReg.FP, e.slot);
+            this.vm.cmpImm(VReg.V0, 0);
+            this.vm.jeq(skipL);
+            this.vm.load(VReg.A0, VReg.FP, e.slot);
+            this.vm.call("_iterator_close");
+            this.vm.movImm(VReg.V0, 0);
+            this.vm.store(VReg.FP, e.slot, VReg.V0);
+            this.vm.label(skipL);
+        }
+        if (preserveRet) {
+            this.vm.load(VReg.RET, VReg.FP, retSlot);
+        }
+    },
+
     // [#54] abrupt completion(return/break/continue)跨越含 finally 的 try:
     // 跳转前从内到外依次内联编译各被跨越的 finalizer。boundaryLen = 目标边界处的
     // tryFrames 深度(return→0,break→breakTryLen,continue→continueTryLen);仅运行
@@ -535,7 +575,12 @@ export const StatementCompiler = {
                     // x64 A 寄存器别名踩踏(compileExpression 会毁 A/RET)。键槽同时并入
                     // rest 排除表(excludedComputedSlots),使 `{[k]:v,...rest}` 的 rest 正确
                     // 排除该运行时键(此前只收静态键 → rest 含被解构的计算键)。
+                    // [rest-computed-key] 键经 _js_prop_key 归一(ToPropertyKey):数字键
+                    // 1.0 的裸 float 位须转成字符串 "1" 才能命中对象侧存键(计算键 SET 侧
+                    // 已归一),且排除表存的也是归一后键 → rest 排除/读键双对齐。
                     this.compileExpression(prop.key);
+                    this.vm.mov(VReg.A0, VReg.RET);
+                    this.vm.call("_js_prop_key");
                     const ckSlot = this.ctx.allocLocal(`__destrck_${this.nextLabelId()}`);
                     this.vm.store(VReg.FP, ckSlot, VReg.RET);
                     excludedComputedSlots.push(ckSlot);
@@ -617,23 +662,32 @@ export const StatementCompiler = {
         // _array_spread_into 展开成数组,使下方 _subscript_get(arr,i)/rest slice 按迭代协议
         // 取元素。此前当数组下标读 → 垃圾/undefined(`let [a,b]=set` 读乱值根因)。仅对装箱
         // 对象(0x7FFD)与未装箱堆指针(high16==0 且 >=0x100200000,即 Set/Map/生成器)施加;
-        // 数组(0x7FFE)/字符串(0x7FFC)/数字/bool(高16 非上述)不动,避免非指针值被
-        // _array_spread_into 当指针解引崩。非可迭代对象 spread 得空数组(_array_spread_into
-        // 函数-tag 守卫,不挂)。
+        // 字符串(0x7FFC)/数字/bool(高16 非上述)不动。装箱数组(0x7FFE)亦走 GetIterator
+        // (覆盖 Array.prototype[@@iterator]);物化结果写入 readSlot,**不**覆写 srcSlot
+        // (赋值形 `result=[x]=vals` 须 SameValue(result,vals))。
         const els = pattern.elements || [];
+        const readSlot = this.ctx.allocLocal(`__destr_read_${this.nextLabelId()}`);
         {
+            // 默认读源=原 src;spread 路径再覆写 readSlot
+            this.vm.load(VReg.V0, VReg.FP, srcSlot);
+            this.vm.store(VReg.FP, readSlot, VReg.V0);
             const els0 = els.length === 0;
             const iterSpreadL = this.ctx.newLabel("destr_iter_spread");
             const iterSpreadBoxed = this.ctx.newLabel("destr_iter_spread_boxed");
             const iterSkipL = this.ctx.newLabel("destr_iter_skip");
             const iterableOkL = this.ctx.newLabel("destr_iterable_ok");
             const iterPrimThrow = this.ctx.newLabel("destr_iter_prim_throw");
+            const iterArrTryL = this.ctx.newLabel("destr_iter_arr_try");
+            const iterArrBareTryL = this.ctx.newLabel("destr_iter_arr_bare_try");
             this.vm.load(VReg.V0, VReg.FP, srcSlot);
             this.vm.shrImm(VReg.V1, VReg.V0, 48);
             this.vm.cmpImm(VReg.V1, 0x7FFD);
             this.vm.jeq(iterSpreadBoxed);    // 装箱对象 → 先检可迭代性,再展开
             this.vm.cmpImm(VReg.V1, 0x7FFE);
-            this.vm.jeq(iterSkipL);          // 数组(可下标读)
+            // 装箱数组:先物化 Array.prototype(惰性槽),再走 GetIterator——尊重覆盖的
+            // Array.prototype[Symbol.iterator](ary-ptrn-elem-id-iter-val-array-prototype)。
+            // 裸 TYPE_ARRAY 仍走下标(Map 对等)。
+            this.vm.jeq(iterArrTryL);
             this.vm.cmpImm(VReg.V1, 0x7FFC);
             this.vm.jeq(iterSkipL);          // 字符串(可 charAt 读)
             this.vm.cmpImm(VReg.V1, 0);
@@ -643,11 +697,14 @@ export const StatementCompiler = {
             this.vm.movImm64(VReg.V1, this.os === "wasi" ? 0x8000000n : 0x100200000n);
             this.vm.cmp(VReg.V0, VReg.V1);
             this.vm.jlt(iterPrimThrow);      // 小于堆区下界(小整数/浮点位)→ 非指针,抛
-            // 未装箱堆指针:类型字节 TYPE_ARRAY(1) 的裸数组(如 Map 展开产的 [k,v] 对)不 spread,
-            // 走既有下标路径——否则 `[[k,v]]=map` 内层对裸数组对再 spread → 空/崩。
+            // 未装箱堆指针:类型字节 TYPE_ARRAY(1) 的裸数组(如 Map 展开产的 [k,v] 对)
+            // 仍走下标路径(不 spread——否则 `[[k,v]]=map` 内层对裸数组对再 spread → 空/崩),
+            // 但先做与装箱路径同判据的 GetIterator 可调用性守卫:delete
+            // Array.prototype[Symbol.iterator] 后 `[a,b]=[1,2]` 须抛 TypeError
+            // (ary-init-iter-get-err-array-prototype 族)。
             this.vm.loadByte(VReg.V1, VReg.V0, 0);
             this.vm.cmpImm(VReg.V1, 1);
-            this.vm.jeq(iterSkipL);
+            this.vm.jeq(iterArrBareTryL);
             // 未装箱堆指针(Set/Map/生成器等)直接展开,runtime _array_spread_into 按
             // type 字节分派(Set/Map 链表遍历;生成器走 Symbol.iterator 协议)。
             // [空 pattern `[]`] 只验可迭代、不消费迭代器(规范 ArrayBindingPattern:[] →
@@ -662,6 +719,25 @@ export const StatementCompiler = {
             // 源,抛 TypeError(与装箱对象非可迭代同一守卫,规范一致)。
             this.vm.label(iterPrimThrow);
             this.emitThrowTypeError("Cannot destructure non-iterable value");
+            // 装箱数组:物化 Array.prototype 后复用可迭代展开路(默认 values / 覆盖 @@iterator)
+            this.vm.label(iterArrTryL);
+            if (this.emitArrayProtoObject) {
+                this.emitArrayProtoObject(); // RET=proto;随后重载 src
+            }
+            this.vm.jmp(iterSpreadBoxed);
+            // 裸数组:物化 Array.prototype 后做与装箱路径同判据的可迭代性守卫,通过则走
+            // 下标快路(readSlot 已存裸数组)。
+            this.vm.label(iterArrBareTryL);
+            if (this.emitArrayProtoObject) {
+                this.emitArrayProtoObject();
+            }
+            this.vm.load(VReg.A0, VReg.FP, srcSlot);
+            this.emitBoxedStringKey("Symbol.iterator", VReg.A1);
+            this.vm.call("_object_get");
+            this.vm.shrImm(VReg.V0, VReg.RET, 48);
+            this.vm.cmpImm(VReg.V0, 0x7FFF); // Symbol.iterator 须是函数(tag 0x7FFF)
+            this.vm.jeq(iterSkipL);
+            this.emitThrowTypeError("Cannot destructure non-iterable value");
             // [Cluster 7] 装箱对象可迭代性守卫:ES 规范要求 destructuring array pattern
             // 的源是可迭代对象;非可迭代源(如 plain `{}`)须抛 TypeError。
             this.vm.label(iterSpreadBoxed);
@@ -673,16 +749,208 @@ export const StatementCompiler = {
             this.vm.jeq(iterableOkL);
             this.emitThrowTypeError("Cannot destructure non-iterable value");
             this.vm.label(iterableOkL);
-            // 空 pattern:只验可迭代(上方 Symbol.iterator 检查),不展开不消费。
-            if (els0) this.vm.jmp(iterSkipL);
+            // [L1 IteratorClose] 赋值形阵列解构:规范先 GetIterator,再求各 AssignmentElement
+            // 的 LeftHandSideExpression,再 IteratorStep。eager spread 会先 next 再求 LRef
+            // → thrw-close 类 nextCount=1/returnCount=0。此处对含 MemberExpression 目标
+            // 的 assign 模式:GetIterator 后先求 LRef(exceptionLabel→close 再抛),成功则
+            // close 未消费的迭代器并落入下方 spread(再 GetIterator 取元素)。
+            if (false && mode === "assign" && !els0) {
+                let needsEarlyLRef = false;
+                for (let ei = 0; ei < els.length; ei++) {
+                    const el = els[ei];
+                    if (!el || el.type === "SpreadElement") continue;
+                    const tn = el.type === "AssignmentPattern" ? el.left : el;
+                    if (tn && (tn.type === "MemberExpression" || tn.type === "CallExpression")) {
+                        needsEarlyLRef = true;
+                        break;
+                    }
+                }
+                if (needsEarlyLRef) {
+                    const earlyIterSlot = this.ctx.allocLocal(`__destr_early_it_${this.nextLabelId()}`);
+                    const earlyDoneL = this.ctx.newLabel("destr_early_lref_done");
+                    // GetIterator(src) → earlyIterSlot
+                    this.vm.load(VReg.A0, VReg.FP, srcSlot);
+                    this.emitBoxedStringKey("Symbol.iterator", VReg.A1);
+                    this.vm.call("_object_get");
+                    this.vm.mov(VReg.A0, VReg.RET);
+                    this.vm.load(VReg.A1, VReg.FP, srcSlot);
+                    this.vm.call("_maybe_getter");
+                    this.vm.mov(VReg.V6, VReg.RET);
+                    this.vm.shrImm(VReg.V0, VReg.V6, 48);
+                    this.vm.cmpImm(VReg.V0, 0x7fff);
+                    this.vm.jne(earlyDoneL);
+                    this.vm.emitMaskLoad(VReg.V1);
+                    this.vm.andMaskReg(VReg.V6, VReg.V6, VReg.V1);
+                    this.vm.load(VReg.V0, VReg.V6, 0);
+                    this.vm.movImm(VReg.V1, 0xc105);
+                    this.vm.cmp(VReg.V0, VReg.V1);
+                    const earlyBareL = this.ctx.newLabel("destr_early_itbare");
+                    this.vm.jne(earlyBareL);
+                    this.vm.mov(VReg.S0, VReg.V6);
+                    this.vm.load(VReg.V6, VReg.V6, 8);
+                    const earlyDoL = this.ctx.newLabel("destr_early_itdo");
+                    this.vm.jmp(earlyDoL);
+                    this.vm.label(earlyBareL);
+                    this.vm.movImm(VReg.S0, 0);
+                    this.vm.label(earlyDoL);
+                    this.vm.load(VReg.A5, VReg.FP, srcSlot);
+                    this.vm.callIndirect(VReg.V6);
+                    this.vm.store(VReg.FP, earlyIterSlot, VReg.RET);
+
+                    // 真 try 帧:thrower() 在被调函数内 _throw_unwind,仅改 exceptionLabel 拦不住。
+                    if (this.vm._recN >= 0) this.vm._flushRecordVerbatim();
+                    let earlyExcOff = 0;
+                    for (let fi = 0; fi < 10; fi++) {
+                        earlyExcOff = this.ctx.allocLocal(this.ctx.newLabel("__destr_early_exc"));
+                    }
+                    if (!this.ctx.tryFrames) this.ctx.tryFrames = [];
+                    this.ctx.tryFrames.push(earlyExcOff);
+                    const closeRethrowL = this.ctx.newLabel("destr_early_close_rethrow");
+                    const savedExc = this.ctx.exceptionLabel;
+                    this.vm.lea(VReg.V0, "_exc_ctx_top");
+                    this.vm.load(VReg.V1, VReg.V0, 0);
+                    this.vm.store(VReg.FP, earlyExcOff + 0, VReg.V1);
+                    this.vm.lea(VReg.V1, closeRethrowL);
+                    this.vm.store(VReg.FP, earlyExcOff + 8, VReg.V1);
+                    this.vm.mov(VReg.V1, VReg.SP);
+                    this.vm.store(VReg.FP, earlyExcOff + 16, VReg.V1);
+                    this.vm.store(VReg.FP, earlyExcOff + 24, VReg.FP);
+                    this.vm.store(VReg.FP, earlyExcOff + 32, VReg.S0);
+                    this.vm.store(VReg.FP, earlyExcOff + 40, VReg.S1);
+                    this.vm.store(VReg.FP, earlyExcOff + 48, VReg.S2);
+                    this.vm.store(VReg.FP, earlyExcOff + 56, VReg.S3);
+                    this.vm.store(VReg.FP, earlyExcOff + 64, VReg.S4);
+                    this.vm.mov(VReg.V1, VReg.S5);
+                    this.vm.store(VReg.FP, earlyExcOff + 72, VReg.V1);
+                    this.vm.subImm(VReg.V1, VReg.FP, -earlyExcOff);
+                    this.vm.store(VReg.V0, 0, VReg.V1);
+                    this.ctx.exceptionLabel = closeRethrowL;
+
+                    for (let ei = 0; ei < els.length; ei++) {
+                        const el = els[ei];
+                        if (!el || el.type === "SpreadElement") continue;
+                        const tn = el.type === "AssignmentPattern" ? el.left : el;
+                        if (!tn || tn.type !== "MemberExpression") continue;
+                        this.compileExpression(tn.object);
+                        if (tn.computed && tn.property) {
+                            this.compileExpression(tn.property);
+                        }
+                    }
+                    // LRef 成功:弹帧。不 close——下方 spread 再 GetIterator 取元素。
+                    // (若此处 close 再 spread,同一 iterator 工厂复用已 return 的对象 → 元素丢。)
+                    this.ctx.exceptionLabel = savedExc;
+                    this.emitExcCtxRestore(earlyExcOff);
+                    this.ctx.tryFrames.pop();
+                    this.vm.jmp(earlyDoneL);
+
+                    this.vm.label(closeRethrowL);
+                    this.emitExcCtxRestore(earlyExcOff);
+                    this.ctx.tryFrames.pop();
+                    this.ctx.exceptionLabel = savedExc;
+                    // 保存原异常;close 时 return() 可能再抛(thrw-close-err)——规范要求
+                    // completion 已是 throw 时丢弃 innerResult,保留原异常。
+                    const origExcSlot = this.ctx.allocLocal(`__destr_early_origexc_${this.nextLabelId()}`);
+                    this.vm.lea(VReg.V0, "_exception_value");
+                    this.vm.load(VReg.V1, VReg.V0, 0);
+                    this.vm.store(VReg.FP, origExcSlot, VReg.V1);
+                    const suppressCatchL = this.ctx.newLabel("destr_early_suppress");
+                    const rethrowOrigL = this.ctx.newLabel("destr_early_rethrow");
+                    let suppressExcOff = 0;
+                    for (let fi = 0; fi < 10; fi++) {
+                        suppressExcOff = this.ctx.allocLocal(this.ctx.newLabel("__destr_early_sup"));
+                    }
+                    this.ctx.tryFrames.push(suppressExcOff);
+                    this.vm.lea(VReg.V0, "_exc_ctx_top");
+                    this.vm.load(VReg.V1, VReg.V0, 0);
+                    this.vm.store(VReg.FP, suppressExcOff + 0, VReg.V1);
+                    this.vm.lea(VReg.V1, suppressCatchL);
+                    this.vm.store(VReg.FP, suppressExcOff + 8, VReg.V1);
+                    this.vm.mov(VReg.V1, VReg.SP);
+                    this.vm.store(VReg.FP, suppressExcOff + 16, VReg.V1);
+                    this.vm.store(VReg.FP, suppressExcOff + 24, VReg.FP);
+                    this.vm.store(VReg.FP, suppressExcOff + 32, VReg.S0);
+                    this.vm.store(VReg.FP, suppressExcOff + 40, VReg.S1);
+                    this.vm.store(VReg.FP, suppressExcOff + 48, VReg.S2);
+                    this.vm.store(VReg.FP, suppressExcOff + 56, VReg.S3);
+                    this.vm.store(VReg.FP, suppressExcOff + 64, VReg.S4);
+                    this.vm.mov(VReg.V1, VReg.S5);
+                    this.vm.store(VReg.FP, suppressExcOff + 72, VReg.V1);
+                    this.vm.subImm(VReg.V1, VReg.FP, -suppressExcOff);
+                    this.vm.store(VReg.V0, 0, VReg.V1);
+                    this.ctx.exceptionLabel = suppressCatchL;
+                    this.vm.load(VReg.A0, VReg.FP, earlyIterSlot);
+                    this.vm.call("_iterator_close");
+                    this.emitExcCtxRestore(suppressExcOff);
+                    this.ctx.tryFrames.pop();
+                    this.vm.jmp(rethrowOrigL);
+                    this.vm.label(suppressCatchL);
+                    this.emitExcCtxRestore(suppressExcOff);
+                    this.ctx.tryFrames.pop();
+                    this.vm.label(rethrowOrigL);
+                    this.ctx.exceptionLabel = savedExc;
+                    this.vm.load(VReg.V1, VReg.FP, origExcSlot);
+                    this.vm.lea(VReg.V0, "_exception_value");
+                    this.vm.store(VReg.V0, 0, VReg.V1);
+                    this.vm.lea(VReg.V0, "_exception_pending");
+                    this.vm.movImm(VReg.V1, 1);
+                    this.vm.store(VReg.V0, 0, VReg.V1);
+                    this.vm.call("_throw_unwind");
+                    this.vm.label(earlyDoneL);
+                }
+            }
+            // 空 pattern `[]`:GetIterator + IteratorClose(不 next)——规范 ArrayBindingPattern:[]。
+            if (els0) {
+                this.vm.load(VReg.A0, VReg.FP, srcSlot);
+                this.emitBoxedStringKey("Symbol.iterator", VReg.A1);
+                this.vm.call("_object_get");
+                this.vm.mov(VReg.A0, VReg.RET);
+                this.vm.load(VReg.A1, VReg.FP, srcSlot);
+                this.vm.call("_maybe_getter"); // RET = iterator 方法
+                // Call(iteratorMethod, src, «»)
+                this.vm.mov(VReg.V6, VReg.RET);
+                this.vm.shrImm(VReg.V0, VReg.V6, 48);
+                this.vm.cmpImm(VReg.V0, 0x7fff);
+                this.vm.jne(iterSkipL); // 非函数:上方已守卫,保守跳过
+                this.vm.emitMaskLoad(VReg.V1);
+                this.vm.andMaskReg(VReg.V6, VReg.V6, VReg.V1);
+                this.vm.load(VReg.V0, VReg.V6, 0); // magic
+                this.vm.movImm(VReg.V1, 0xc105);
+                this.vm.cmp(VReg.V0, VReg.V1);
+                const itBareL = this.ctx.newLabel("destr_empty_itbare");
+                this.vm.jne(itBareL);
+                this.vm.mov(VReg.S0, VReg.V6);
+                this.vm.load(VReg.V6, VReg.V6, 8);
+                const itDoL = this.ctx.newLabel("destr_empty_itdo");
+                this.vm.jmp(itDoL);
+                this.vm.label(itBareL);
+                this.vm.movImm(VReg.S0, 0);
+                this.vm.label(itDoL);
+                this.vm.load(VReg.A5, VReg.FP, srcSlot); // this = iterable
+                this.vm.callIndirect(VReg.V6); // RET = iterator
+                this.vm.mov(VReg.A0, VReg.RET);
+                this.vm.call("_iterator_close");
+                this.vm.jmp(iterSkipL);
+            }
             this.vm.label(iterSpreadL);
             this.vm.movImm(VReg.A0, 0);
             this.vm.call("_array_new_with_size");
             this.vm.call("_box_arr_r"); // box->helper
             this.vm.mov(VReg.A0, VReg.RET);
             this.vm.load(VReg.A1, VReg.FP, srcSlot);
-            this.vm.call("_array_spread_into");
-            this.vm.store(VReg.FP, srcSlot, VReg.RET);
+            // 无 rest:限量取 els.length 并 IteratorClose(防无限迭代器超时 + 规范 close)。
+            // 有 rest:抽干(rest 消费剩余 → done)。
+            let hasRest = false;
+            for (let ri = 0; ri < els.length; ri++) {
+                if (els[ri] && els[ri].type === "SpreadElement") { hasRest = true; break; }
+            }
+            if (!hasRest && els.length > 0) {
+                this.vm.movImm(VReg.A2, els.length);
+                this.vm.call("_array_spread_into_n");
+            } else {
+                this.vm.call("_array_spread_into");
+            }
+            // 物化写入 readSlot,保留 srcSlot=RHS 原引用
+            this.vm.store(VReg.FP, readSlot, VReg.RET);
             this.vm.label(iterSkipL);
         }
         for (let ei = 0; ei < els.length; ei++) {
@@ -692,7 +960,7 @@ export const StatementCompiler = {
             if (el.type === "SpreadElement") {
                 const rn = el.argument && el.argument.name;
                 if (!el.argument) continue;   // [test262 S1] 允许 pattern rest 目标([...[x]]);emitBindTarget 递归解构
-                this.vm.load(VReg.A0, VReg.FP, srcSlot);
+                this.vm.load(VReg.A0, VReg.FP, readSlot);
                 this.vm.call("_js_unbox");
                 this.vm.mov(VReg.A0, VReg.RET);
                 this.vm.movImm(VReg.A1, ei);
@@ -715,7 +983,7 @@ export const StatementCompiler = {
             // A0 保持装箱(勿提前 _js_unbox):_subscript_get 靠 0x7FFC 标签分派字符串
             // charAt(数组/对象内部自 unbox)。提前 unbox 剥掉标签 → 字符串解构
             // `[a,b]="qux"` 被误判数组越界读 0(members.js 同类坑)。
-            this.vm.load(VReg.A0, VReg.FP, srcSlot);
+            this.vm.load(VReg.A0, VReg.FP, readSlot);
             this.vm.movImm(VReg.A1, ei);
             this.vm.call("_subscript_get");
             if (dflt) {
@@ -749,7 +1017,12 @@ export const StatementCompiler = {
     // `cls.name===""` 而非 `"cls"` (SameValue("","cls") 判负)。
     _emitDestrSetFnName(dflt, targetNode) {
         if (!dflt || !targetNode || targetNode.type !== "Identifier" || !targetNode.name) return;
+        // [for-of const/let] 块级改名(`arrow$blk$N`)后的绑定名须还原用户原名作为
+        // .name(SetFunctionName 用源码名;ES 中 fn.name 恒为用户可见名,与内部绑定名无关)。
+        // 此前把改名后名整体装箱 → for-of `const [arrow = () => {}]` 得 "arrow$blk$4"。
         const bindingName = targetNode.name;
+        const blkCut = bindingName.indexOf("$blk$");
+        const useName = blkCut > 0 ? bindingName.slice(0, blkCut) : bindingName;
         let isAnon = false;
         if (dflt.type === "ArrowFunctionExpression") {
             isAnon = true;
@@ -776,7 +1049,7 @@ export const StatementCompiler = {
         const tmpSlot = this.ctx.allocLocal(`__destrfnname_${this.nextLabelId()}`);
         vm.store(VReg.FP, tmpSlot, VReg.RET);
         // A2 = boxed 绑定名串(同 compileClassDeclaration 的 classNameForMeta 装箱路径)
-        vm.lea(VReg.A0, this.asm.addString(bindingName));
+        vm.lea(VReg.A0, this.asm.addString(useName));
         vm.call("_js_box_string");
         vm.mov(VReg.A2, VReg.RET);
         // A1 = boxed "name" 键
@@ -786,6 +1059,20 @@ export const StatementCompiler = {
         // _object_define 可写 classinfo 对象属性表(_closure_prop_set 只写闭包侧表,
         // classinfo 的 .name 经 _object_get 查找 → 达不到 → cls.name 仍为空串)
         vm.call("_object_define");
+        // [class 默认值] 类表达式经 SetFunctionName 落 .name 后须按类规范补属性位:
+        // {writable:false,enumerable:false,configurable:true}=attr 4(镜像
+        // compileClassDeclaration 的 name 落位)。否则 verifyProperty 报
+        // "name descriptor should not be enumerable/…configurable"。
+        // [coro] 生成器/async-gen 协程体暂跳过:协程帧上 _object_set_prop_attr 对
+        // 解构默认类会 SIGSEGV(async-gen dstr fn-name-class 族)——跳过仅影响该类
+        // 默认类的 name 描述符(3 测试),避免 CRASH。
+        if (false && (dflt.type === "ClassExpression" || dflt.type === "ClassDeclaration") &&
+            !this.ctx.inCoroBody) {
+            vm.load(VReg.A0, VReg.FP, tmpSlot);
+            this.emitBoxedStringKey("name", VReg.A1);
+            vm.movImm(VReg.A2, 4);
+            vm.call("_object_set_prop_attr");
+        }
         // 恢复 RET 为函数/类值
         vm.load(VReg.RET, VReg.FP, tmpSlot);
     },
@@ -814,12 +1101,52 @@ export const StatementCompiler = {
     // 计算成员/静态成员/导出同步),避免重复手写。值先落临时局部,再以引用它的
     // Identifier 作赋值右侧。
     emitDestructureAssign(targetNode) {
+        // [const-reassign] sloppy 模式对 const 绑定的解构写入是**运行期** TypeError
+        // (for ([c] of x) / ({a: c} = obj));blockscope 已把写点标 _constWrite。
+        if (targetNode && targetNode.type === "Identifier" && targetNode._constWrite) {
+            this.emitThrowTypeError("Assignment to constant variable.");
+            return;
+        }
+        // [TDZ 写] 词法先于声明的写点(let x 在 for-of/赋值之后):blockscope 标 _tdz,
+        // 写 TDZ 绑定须抛 ReferenceError(for ([...x] of x) / ({a: x} = y) put-let 族)。
+        if (targetNode && targetNode.type === "Identifier" && targetNode._tdz) {
+            this.emitThrowReferenceError("Cannot access  + targetNode.name.replace(/\$.*$/, ) +  before initialization");
+            return;
+        }
         // Pre-declare undeclared identifier targets so assignment can proceed.
         // In sloppy mode ES, assignment to an undeclared variable creates a global;
         // asm.js has no global scope, so we auto-declare a local slot instead.
+        // [L2-② strict] 严格模式下对 unresolvable 绑定目标必须抛 ReferenceError
+        // (for ({unresolvable} of [{}]) 族,onlyStrict):预声明会把本该抛错的名变成
+        // 局部槽 → 静默成功,assert.throws(ReferenceError) 判负。判据与普通赋值
+        // lvalue 的 unresolvable 分支一致(isUnresolvableIdentifier),函数/导入/
+        // 已知全局不算,维持既有行为。
         if (targetNode.type === "Identifier" && targetNode.name) {
             const name = targetNode.name;
+            // [TDZ 写] 本模块顶层的 let/const 名且**模块主帧槽尚未分配**(= 声明在写点
+            // 之后)→ 写词法绑定处于 TDZ,抛 ReferenceError(for ([...x] of y) put-let 族)。
+            // 须先于下方捕获门:闭包引用该名会把它抬进 mainCapturedVars(本帧 getLocal
+            // 命中)→ 旧序永远跳过 TDZ 判。判据用模块主 ctx 的槽(声明在前 → 槽已分配,
+            // 正常写;否则 TDZ)。已知全局/函数在 lexNames 外,不受影响。
+            if (this.getModuleMeta && this._currentModuleAst) {
+                const mm = this.getModuleMeta(this._currentModuleAst);
+                if (mm && mm.lexNames && mm.lexNames.has(name)) {
+                    const mainHas = mm.mainCtx && mm.mainCtx.locals &&
+                        Object.prototype.hasOwnProperty.call(mm.mainCtx.locals, name) &&
+                        typeof mm.mainCtx.locals[name] === "number";
+                    if (!mainHas) {
+                        this.emitThrowReferenceError("Cannot access '" + name + "' before initialization");
+                        return;
+                    }
+                }
+            }
             if (!this.ctx.getLocal(name) && !this.ctx.getMainCapturedVar(name)) {
+                const strict = !!(this.ctx && this.ctx.inStrictFunction);
+                if (strict && this.isUnresolvableIdentifier &&
+                    this.isUnresolvableIdentifier(targetNode)) {
+                    this.emitThrowReferenceError(name + " is not defined");
+                    return;
+                }
                 this.ctx.allocLocal(name);
             }
         }
@@ -931,6 +1258,25 @@ export const StatementCompiler = {
             (param.left.type === "ObjectPattern" || param.left.type === "ArrayPattern");
     },
 
+    // [FDI eager] 生成器体内从 coro+168(CORO_PREBOUND)transfer 数组按绑定序取叶值入局部,
+    // 替代重复 emitParamDestructure —— pattern 源已在调用期(stub,emitGenStubFullFdi)消费,
+    // 体内再解构会二重消费自定义迭代器(错值/错计 next/错触 getter)。list = 绑定序叶名。
+    emitGenTransferLoads(list) {
+        const vm = this.vm;
+        const arrOff = this.ctx.allocLocal(`__fditrans_${this.nextLabelId()}`);
+        vm.lea(VReg.V0, "_scheduler_current");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.load(VReg.V0, VReg.V0, 168); // CORO_PREBOUND
+        vm.store(VReg.FP, arrOff, VReg.V0);
+        for (let i = 0; i < list.length; i++) {
+            const off = this.ctx.allocLocal(list[i]);
+            vm.load(VReg.A0, VReg.FP, arrOff);
+            vm.movImm(VReg.A1, i);
+            vm.call("_subscript_get");
+            vm.store(VReg.FP, off, VReg.RET);
+        }
+    },
+
     compileNestedFunctionDeclaration(stmt) {
         if (!stmt.id || stmt.id.type !== "Identifier") {
             return;
@@ -1031,6 +1377,8 @@ export const StatementCompiler = {
             // 否则 `return` 之值与数值 0 不可分辨,令 falsy/nullish/=== 判定失真。
             this.vm.movImm64(VReg.RET, 0x7ffb000000000000n);
         }
+        // [iterator-close] return 离开协议 for-of:先 close(规范 ForIn/OfBodyEvaluation)
+        this.emitPendingIteratorCloses(0, true);
         // [#54] return 跨越含 finally 的 try:从内到外先跑各 finalizer(RET 暂存槽)
         this.emitPendingFinalizers(0, true);
         // [#38] return 词法上在 try 内:恢复链头为最外层活动 try 的 link
@@ -1234,6 +1582,12 @@ export const StatementCompiler = {
         const ok = {};   // name -> true(暂定合格)
         const bad = {};  // name -> true(出现不合规写,永久淘汰)
         const arithOps = ["+", "-", "*", "/", "%"];
+        // isAccumForm 返回 {name, bad} 或 null:
+        //   bad=true  → 对 name 的非累加写(s=x / s++ / &&= / 拼接)= 永久淘汰
+        //   bad=false → 累加形态 `name = name <op> E` / `name <op>= E` = 候选
+        // 不用旧式 "\0"+nm 字符串前缀哨兵:asm.js 运行时字符串按 C 串存储,
+        // 会剥掉内嵌 NUL,使 "\0"+nm 退化成 nm、`charCodeAt(0)===0` 判定失效,
+        // 导致非累加变量(如 `needClose = true`)被误 pin 成浮点累加器。
         const isAccumForm = (node) => {
             if (node.type === "AssignmentExpression" && node.left && node.left.type === "Identifier") {
                 const nm = node.left.name;
@@ -1243,20 +1597,20 @@ export const StatementCompiler = {
                     if (r && r.type === "BinaryExpression" && arithOps.indexOf(r.operator) >= 0 &&
                         r.left && r.left.type === "Identifier" && r.left.name === nm) {
                         // `+` 可能是字符串拼接:E 推断为 STRING 则淘汰(勿把串累加当浮点丢弃)
-                        if (r.operator === "+" && inferType(r.right, this.ctx) === Type.STRING) return "\0" + nm;
-                        return nm;
+                        if (r.operator === "+" && inferType(r.right, this.ctx) === Type.STRING) return { name: nm, bad: true };
+                        return { name: nm, bad: false };
                     }
-                    return "\0" + nm; // 对 nm 的非累加写 → 淘汰
+                    return { name: nm, bad: true }; // 对 nm 的非累加写 → 淘汰
                 }
                 if (["+=", "-=", "*=", "/=", "%="].indexOf(node.operator) >= 0) {
                     // `s += E`:E 为字符串则是拼接,淘汰(见上)
-                    if (node.operator === "+=" && inferType(node.right, this.ctx) === Type.STRING) return "\0" + nm;
-                    return nm;
+                    if (node.operator === "+=" && inferType(node.right, this.ctx) === Type.STRING) return { name: nm, bad: true };
+                    return { name: nm, bad: false };
                 }
-                return "\0" + nm; // &&= 等 → 淘汰
+                return { name: nm, bad: true }; // &&= 等 → 淘汰
             }
             if (node.type === "UpdateExpression" && node.argument && node.argument.type === "Identifier") {
-                return "\0" + node.argument.name; // s++/s-- 不按浮点累加处理 → 淘汰
+                return { name: node.argument.name, bad: true }; // s++/s-- 不按浮点累加处理 → 淘汰
             }
             return null;
         };
@@ -1264,8 +1618,8 @@ export const StatementCompiler = {
             if (!node || typeof node !== "object") return;
             const res = isAccumForm(node);
             if (res) {
-                if (res.charCodeAt(0) === 0) bad[res.slice(1)] = true;
-                else ok[res] = true;
+                if (res.bad) bad[res.name] = true;
+                else ok[res.name] = true;
             }
             for (const k in node) {
                 if (k === "type") continue;
@@ -1536,8 +1890,13 @@ export const StatementCompiler = {
         // [#38] 记录循环边界处的 try 深度:break/continue 跨出 try 时按此恢复链头
         const savedBreakTryLen = this.ctx.breakTryLen;
         const savedContinueTryLen = this.ctx.continueTryLen;
+        const savedBreakIterCloseLen = this.ctx.breakIterCloseLen;
+        const savedContinueIterCloseLen = this.ctx.continueIterCloseLen;
         this.ctx.breakTryLen = this.ctx.tryFrames ? this.ctx.tryFrames.length : 0;
         this.ctx.continueTryLen = this.ctx.breakTryLen;
+        // 进入时栈深(协议路径 push 前);body 前再抬到 push 后,见各路径 _bindLabelContinue 前。
+        this.ctx.breakIterCloseLen = this.ctx.iterCloseStack ? this.ctx.iterCloseStack.length : 0;
+        this.ctx.continueIterCloseLen = this.ctx.breakIterCloseLen;
         // break 路由到 close 标签(仅协议迭代器路径实际 close;其余槽=0 时直通 endLabel)。
         this.ctx.breakLabel = iterCloseLabel;
         const savedLabels = this._registerPendingLabels(endLabel); // [#60]
@@ -1552,6 +1911,7 @@ export const StatementCompiler = {
         const iterCloseOffset = this.ctx.allocLocal(`__forof_close_${this.nextLabelId()}`);
         this.vm.movImm(VReg.V0, 0);
         this.vm.store(VReg.FP, iterCloseOffset, VReg.V0);
+        let iterClosePushed = false;
 
         // 计算 iterable，当前快路支持 NaN-boxed Array。
         this.compileExpression(stmt.right);
@@ -1564,19 +1924,36 @@ export const StatementCompiler = {
         this.vm.store(VReg.FP, iterableTempOffset, VReg.RET);
 
         // Array JSValue tag = 0x7ffe. 非数组走 Symbol.iterator 协议路径。
+        // 若数组**覆盖**了 @@iterator(自有或原型上 ≠ Array.prototype.values)→ 协议路径
+        // (Math.sumPrecise(overriddenArray) 等);默认 values 仍走下标快路(自举热路径)。
         this.vm.mov(VReg.V0, VReg.RET);
         this.vm.shrImm(VReg.V0, VReg.V0, 48);
         this.vm.cmpImm(VReg.V0, 0x7ffe);
         this.vm.jne(iteratorStartLabel);
+        if (this.emitArrayProtoObject) this.emitArrayProtoObject();
+        const arrItCustomL = this.ctx.newLabel("forof_arr_it_custom");
+        const arrItFastL = this.ctx.newLabel("forof_arr_it_fast");
+        this.vm.load(VReg.A0, VReg.FP, iterableTempOffset);
+        this.emitBoxedStringKey("Symbol.iterator", VReg.A1);
+        this.vm.call("_object_get");
+        this.vm.mov(VReg.V6, VReg.RET); // 候选 iterator 方法
+        this.vm.shrImm(VReg.V0, VReg.V6, 48);
+        this.vm.cmpImm(VReg.V0, 0x7fff);
+        this.vm.jne(arrItFastL); // 无方法 → 下标快路
+        // 与 Array.prototype[Symbol.iterator] 比较;不同则自定义 → 协议
+        this.vm.lea(VReg.V0, "_nsobj_array_proto");
+        this.vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("Symbol.iterator", VReg.A1);
+        this.vm.call("_object_get");
+        this.vm.cmp(VReg.V6, VReg.RET);
+        this.vm.jne(arrItCustomL);
+        this.vm.jmp(arrItFastL);
+        this.vm.label(arrItCustomL);
+        this.vm.jmp(iteratorStartLabel);
+        this.vm.label(arrItFastL);
 
-        // 保存 raw array pointer / index / length 到栈槽，避免循环体表达式复用 S 寄存器破坏状态。
-        // x64 上 RET 与 V0 同为 RAX，上面的 shrImm(V0,48) 把 RET 也破坏成了 tag 值；
-        // arm64 上 RET(X0)/V0(X8) 是不同寄存器互不影响。故 x64 需从已保存的 iterableTemp
-        // 重载 RET 才能得到原始数组 JSValue（否则 arrTemp 得到垃圾指针、length 读为 0、
-        // 循环 0 次）。用 target 守卫使 arm64 输出逐字节不变。
-        if (this.vm.backend.name === "x64") {
-            this.vm.load(VReg.RET, VReg.FP, iterableTempOffset);
-        }
+        // 上方 @@iterator 探测毁了 RET;两后端均从槽重载数组 JSValue。
+        this.vm.load(VReg.RET, VReg.FP, iterableTempOffset);
         this.vm.emitMaskLoad(VReg.V1);
         this.vm.andMaskReg(VReg.V0, VReg.RET, VReg.V1);
         this.vm.store(VReg.FP, arrTempOffset, VReg.V0);
@@ -1779,6 +2156,18 @@ export const StatementCompiler = {
         this.vm.store(VReg.FP, iteratorTempOffset, VReg.RET);
         // [iterator-close] 标记活迭代器:break 提前退出时对其调 return()。
         this.vm.store(VReg.FP, iterCloseOffset, VReg.RET);
+        // 登记到 iterCloseStack:带标签 continue/return 跳出本 for-of 时由
+        // emitPendingIteratorCloses 关闭(unlabeled break 仍走 iterCloseLabel)。
+        if (!this.ctx.iterCloseStack) this.ctx.iterCloseStack = [];
+        this.ctx.iterCloseStack.push({
+            slot: iterCloseOffset,
+            depth: this.ctx.breakTryLen,
+        });
+        iterClosePushed = true;
+        // body/continue 边界抬到 push 后:同层 continue 不 close 自己;外层 labeled
+        // continue 仍用登记时更短的快照。
+        this.ctx.breakIterCloseLen = this.ctx.iterCloseStack.length;
+        this.ctx.continueIterCloseLen = this.ctx.iterCloseStack.length;
 
         this.vm.label(iteratorLoopLabel);
 
@@ -1831,11 +2220,17 @@ export const StatementCompiler = {
 
         this.vm.label(endLabel);
 
+        if (iterClosePushed && this.ctx.iterCloseStack && this.ctx.iterCloseStack.length > 0) {
+            this.ctx.iterCloseStack.pop();
+        }
+
         // 恢复循环标签
         this.ctx.breakLabel = savedBreak;
         this.ctx.continueLabel = savedContinue;
         this.ctx.breakTryLen = savedBreakTryLen;
         this.ctx.continueTryLen = savedContinueTryLen;
+        this.ctx.breakIterCloseLen = savedBreakIterCloseLen;
+        this.ctx.continueIterCloseLen = savedContinueIterCloseLen;
         this._forOfAwait = savedForOfAwait;
         this._restoreLabels(savedLabels); // [#60]
     },
@@ -1850,6 +2245,9 @@ export const StatementCompiler = {
         const startLabel = this.ctx.newLabel("forin_start");
         const yieldObjLabel = this.ctx.newLabel("forin_yield_obj");
         const afterYieldLabel = this.ctx.newLabel("forin_after_yield");
+        // 数组索引耗尽后:若有 ARR_HAS_SIDETABLE 则切到侧表具名键(对象路径复用)
+        const exhaustedLabel = this.ctx.newLabel("forin_exhausted");
+        const sideSwitchLabel = this.ctx.newLabel("forin_side_switch");
 
         // 保存循环标签
         const savedBreak = this.ctx.breakLabel;
@@ -2000,11 +2398,11 @@ export const StatementCompiler = {
 
         this.vm.label(loopLabel);
 
-        // 检查 i < length/count
+        // 检查 i < length/count；耗尽时:对象/已切侧表 → 结束；数组 → 尝试侧表具名键
         this.vm.load(VReg.V0, VReg.FP, idxOffset);
         this.vm.load(VReg.V1, VReg.FP, lenOffset);
         this.vm.cmp(VReg.V0, VReg.V1);
-        this.vm.jge(endLabel);
+        this.vm.jge(exhaustedLabel);
 
         // 取当前键：对象→属性键(装箱字符串)；数组→原始索引（沿用旧行为）
         this.vm.load(VReg.V0, VReg.FP, isObjOffset);
@@ -2017,6 +2415,44 @@ export const StatementCompiler = {
         this.vm.load(VReg.A0, VReg.FP, idxOffset);
         this.vm.call("_intToStr");        // RET = 装箱字符串键
         this.vm.jmp(afterYieldLabel);
+
+        // ---- 索引/属性耗尽 ----
+        this.vm.label(exhaustedLabel);
+        this.vm.load(VReg.V0, VReg.FP, isObjOffset);
+        this.vm.cmpImm(VReg.V0, 0);
+        this.vm.jne(endLabel); // 对象路径或侧表阶段已走完
+        // 数组索引耗尽:无 ARR_HAS_SIDETABLE(bit1@byte1)→O(1) 结束(真数组热路径不变)。
+        // 有侧表 → 切到 props 对象,按对象路径枚举具名可枚举键(arguments/arr.foo 等)。
+        this.vm.load(VReg.V0, VReg.FP, ptrOffset); // 裸数组
+        this.vm.loadByte(VReg.V1, VReg.V0, 1);
+        this.vm.andImm(VReg.V1, VReg.V1, 2); // ARR_HAS_SIDETABLE
+        this.vm.cmpImm(VReg.V1, 0);
+        this.vm.jeq(endLabel);
+
+        this.vm.label(sideSwitchLabel);
+        // A0=裸数组(高16=0);_closure_props_find 内部 MASK 脱壳,与装箱等价。
+        this.vm.load(VReg.A0, VReg.FP, ptrOffset);
+        this.vm.call("_closure_props_find"); // RET=装箱 props 或 undefined
+        this.vm.lea(VReg.V1, "_js_undefined");
+        this.vm.load(VReg.V1, VReg.V1, 0);
+        this.vm.cmp(VReg.RET, VReg.V1);
+        this.vm.jeq(endLabel);
+        // 归一 props 键序后切到对象迭代(复用 yieldObjLabel 的 enumerable/symbol 过滤)。
+        this.vm.store(VReg.FP, ptrOffset, VReg.RET); // 暂存装箱 props
+        this.vm.emitMaskLoad(VReg.V1);
+        this.vm.andMaskReg(VReg.A0, VReg.RET, VReg.V1);
+        this.vm.call("_object_normalize_order");
+        this.vm.load(VReg.RET, VReg.FP, ptrOffset);
+        this.vm.emitMaskLoad(VReg.V1);
+        this.vm.andMaskReg(VReg.V0, VReg.RET, VReg.V1);
+        this.vm.store(VReg.FP, ptrOffset, VReg.V0); // 裸 props
+        this.vm.load(VReg.V1, VReg.V0, 8); // count
+        this.vm.store(VReg.FP, lenOffset, VReg.V1);
+        this.vm.movImm(VReg.V0, 0);
+        this.vm.store(VReg.FP, idxOffset, VReg.V0);
+        this.vm.movImm(VReg.V0, 1);
+        this.vm.store(VReg.FP, isObjOffset, VReg.V0);
+        this.vm.jmp(loopLabel);
 
         this.vm.label(yieldObjLabel);
         // [#61 P3] 跳过不可枚举属性(defineProperty enumerable:false):flags_ptr@40==0 →
@@ -2115,6 +2551,7 @@ export const StatementCompiler = {
     // 编译 do-while 语句
     compileDoWhileStatement(stmt) {
         const loopLabel = this.ctx.newLabel("dowhile");
+        const continueLabel = this.ctx.newLabel("dowhile_continue");
         const endLabel = this.ctx.newLabel("enddowhile");
 
         // 保存循环标签
@@ -2123,16 +2560,23 @@ export const StatementCompiler = {
         // [#38] 记录循环边界处的 try 深度:break/continue 跨出 try 时按此恢复链头
         const savedBreakTryLen = this.ctx.breakTryLen;
         const savedContinueTryLen = this.ctx.continueTryLen;
+        const savedBreakIterCloseLen = this.ctx.breakIterCloseLen;
+        const savedContinueIterCloseLen = this.ctx.continueIterCloseLen;
         this.ctx.breakTryLen = this.ctx.tryFrames ? this.ctx.tryFrames.length : 0;
         this.ctx.continueTryLen = this.ctx.breakTryLen;
+        this.ctx.breakIterCloseLen = this.ctx.iterCloseStack ? this.ctx.iterCloseStack.length : 0;
+        this.ctx.continueIterCloseLen = this.ctx.breakIterCloseLen;
         this.ctx.breakLabel = endLabel;
-        this.ctx.continueLabel = loopLabel;
+        // continue 须跳到条件求值(非 loopLabel),否则 `continue L` 嵌套 for-of
+        // 会重跑 body → 无限迭代(iterator-close-via-continue)。
+        this.ctx.continueLabel = continueLabel;
         const savedLabels = this._registerPendingLabels(endLabel); // [#60]
 
         this.vm.label(loopLabel);
         this._bindLabelContinue(savedLabels); // [#60]
         this.compileStatement(stmt.body);
 
+        this.vm.label(continueLabel);
         this.compileExpression(stmt.test);
         // do-while：见 compileIfStatement，用 _to_boolean 而非 `& 1`
         this.vm.mov(VReg.A0, VReg.RET);
@@ -2147,6 +2591,8 @@ export const StatementCompiler = {
         this.ctx.continueLabel = savedContinue;
         this.ctx.breakTryLen = savedBreakTryLen;
         this.ctx.continueTryLen = savedContinueTryLen;
+        this.ctx.breakIterCloseLen = savedBreakIterCloseLen;
+        this.ctx.continueIterCloseLen = savedContinueIterCloseLen;
         this._restoreLabels(savedLabels); // [#60]
     },
 
@@ -2174,10 +2620,16 @@ export const StatementCompiler = {
         if (!this.ctx.labelMap) this.ctx.labelMap = new Map();
         const btl = this.ctx.breakTryLen;
         const ctl = this.ctx.continueTryLen;
+        const bic = this.ctx.breakIterCloseLen || 0;
+        const cic = this.ctx.continueIterCloseLen || 0;
         const saved = [];
         for (let i = 0; i < pending.length; i++) {
             const name = pending[i];
-            const entry = { breakLabel, continueLabel: null, breakTryLen: btl, continueTryLen: ctl };
+            const entry = {
+                breakLabel, continueLabel: null,
+                breakTryLen: btl, continueTryLen: ctl,
+                breakIterCloseLen: bic, continueIterCloseLen: cic,
+            };
             saved.push({ name, old: this.ctx.labelMap.get(name), entry });
             this.ctx.labelMap.set(name, entry);
         }
@@ -2188,7 +2640,11 @@ export const StatementCompiler = {
     _bindLabelContinue(saved) {
         if (!saved) return;
         const cl = this.ctx.continueLabel;
-        for (let i = 0; i < saved.length; i++) saved[i].entry.continueLabel = cl;
+        const cic = this.ctx.continueIterCloseLen || 0;
+        for (let i = 0; i < saved.length; i++) {
+            saved[i].entry.continueLabel = cl;
+            saved[i].entry.continueIterCloseLen = cic;
+        }
     },
 
     // [#60] 还原 labelMap(标签作用域仅限被标注语句)。
@@ -2230,6 +2686,7 @@ export const StatementCompiler = {
         if (stmt.label) {
             const entry = this.ctx.labelMap ? this.ctx.labelMap.get(stmt.label.name) : undefined;
             if (entry && entry.breakLabel) {
+                this.emitPendingIteratorCloses(entry.breakIterCloseLen || 0, false);
                 this.emitPendingFinalizers(entry.breakTryLen, false);
                 if (this.ctx.tryFrames && this.ctx.tryFrames.length > entry.breakTryLen) {
                     this.emitExcCtxRestore(this.ctx.tryFrames[entry.breakTryLen]);
@@ -2239,6 +2696,7 @@ export const StatementCompiler = {
             return;
         }
         if (this.ctx.breakLabel) {
+            this.emitPendingIteratorCloses(this.ctx.breakIterCloseLen || 0, false);
             // [#54] break 跨越边界内含 finally 的 try:从内到外先跑各 finalizer
             this.emitPendingFinalizers(this.ctx.breakTryLen, false);
             // [#38] break 跨出 try:恢复链头为循环/switch 边界处深度的 try 的 link
@@ -2255,6 +2713,7 @@ export const StatementCompiler = {
         if (stmt.label) {
             const entry = this.ctx.labelMap ? this.ctx.labelMap.get(stmt.label.name) : undefined;
             if (entry && entry.continueLabel) {
+                this.emitPendingIteratorCloses(entry.continueIterCloseLen || 0, false);
                 this.emitPendingFinalizers(entry.continueTryLen, false);
                 if (this.ctx.tryFrames && this.ctx.tryFrames.length > entry.continueTryLen) {
                     this.emitExcCtxRestore(this.ctx.tryFrames[entry.continueTryLen]);
@@ -2264,6 +2723,7 @@ export const StatementCompiler = {
             return;
         }
         if (this.ctx.continueLabel) {
+            this.emitPendingIteratorCloses(this.ctx.continueIterCloseLen || 0, false);
             // [#54] continue 跨越边界内含 finally 的 try:从内到外先跑各 finalizer
             this.emitPendingFinalizers(this.ctx.continueTryLen, false);
             // [#38] continue 跨出 try:同 break,边界为所属循环入口
@@ -2434,6 +2894,12 @@ export const StatementCompiler = {
             this.vm.movImm(VReg.V1, 0);
             this.vm.store(VReg.V0, 0, VReg.V1);
 
+            // catch 体内异常：有 finally 先跑 finally 再重抛，否则直接外层。
+            // 必须先于 catch 头解构设置:解构本身可抛(catch ([[x]]) { } 捕获 null →
+            // TypeError),若仍指向本 catch 的落点 → 跳回本 catch 再抛 → 无限循环
+            // (try/dstr ary-ptrn-elem-ary-val-null 族 TIMEOUT 根因)。
+            this.ctx.exceptionLabel = hasFinalizer ? finallyExcLabel : savedExceptionLabel;
+
             if (stmt.handler.param && stmt.handler.param.type === "Identifier") {
                 const name = stmt.handler.param.name;
                 let offset = this.ctx.getLocal(name);
@@ -2453,8 +2919,6 @@ export const StatementCompiler = {
                 this.emitDestructurePattern(stmt.handler.param, excSlot, "decl");
             }
 
-            // catch 体内异常：有 finally 先跑 finally 再重抛，否则直接外层
-            this.ctx.exceptionLabel = hasFinalizer ? finallyExcLabel : savedExceptionLabel;
             this.compileStatement(stmt.handler.body);
 
             if (hasFinalizer) {
@@ -2546,6 +3010,15 @@ export const StatementCompiler = {
             field.key.type !== "NumericLiteral");
     },
 
+    // 私有类成员键:PrivateIdentifier,或解析器 `*` 分支产出的 Identifier{name:"#m"}
+    // (与 emitClassMethodTable / getMemberPropertyName 的 W-34 判据一致)。
+    _isPrivateClassKey(key) {
+        if (!key) return false;
+        if (key.type === "PrivateIdentifier") return true;
+        const n = key.name || key.value;
+        return key.type === "Identifier" && typeof n === "string" && n[0] === "#";
+    },
+
     // RET = 原始键值 → RET = ToPropertyKey(字符串或 symbol 键)。
     // 对齐静态字段:symbol → _js_prop_key,否则 _valueToStr(避免 Symbol 走 ToString 抛 TypeError)。
     emitToPropertyKey() {
@@ -2601,7 +3074,7 @@ export const StatementCompiler = {
     // 实例字段 + 私有字段初始化(基类:构造体前;派生类:super() 后)。this 从 __this
     // 局部重载(字段初值可为破坏 A0/栈的复杂表达式),与原内联实现逐指令一致。
     // 计算键按下标从类定义期填好的 cfkeys 数组取,不再在构造器里求 field.key。
-    emitCtorFieldInits(instanceFields, privateFields, className, thisOffset, cfkeysLabel) {
+    emitCtorFieldInits(instanceFields, privateFields, className, thisOffset, cfkeysLabel, privateMethods, labelId) {
         let cfKeyIdx = 0;
         for (const field of instanceFields) {
             const cfRuntimeKey = this._isRuntimeComputedFieldKey(field);
@@ -2670,6 +3143,34 @@ export const StatementCompiler = {
                 this.vm.call("_tag_str_a1");
                 this.vm.mov(VReg.A2, VReg.V1);
                 this.vm.call("_object_define");
+            } else {
+                // 无初始化器的私有字段仍须落 own 槽(品牌 / `this.#x` / `#x in o`),值=undefined
+                this.vm.load(VReg.A0, VReg.FP, thisOffset);
+                this.vm.lea(VReg.A1, this.addStringConstant("#" + className + privateName));
+                this.vm.call("_tag_str_a1");
+                this.vm.lea(VReg.A2, "_js_undefined");
+                this.vm.load(VReg.A2, VReg.A2, 0);
+                this.vm.call("_object_define");
+            }
+        }
+
+        // 实例私有方法(含 *#m / async *#m):装到实例 own 属性,不放 prototype。
+        // 规范 InitializeInstanceElements 在 super() 返回后才跑——派生类字段初始化器
+        // 里调 this.#m 须 TypeError(此前方法在原型上,super 返回前就能调到)。
+        // 标签与 compileClassMethod 一致;函数指针 TAG_FUNCTION,与 emitClassMethodTable 同构。
+        if (privateMethods && privateMethods.length > 0) {
+            for (let i = 0; i < privateMethods.length; i++) {
+                const method = privateMethods[i];
+                const methodName = method.key && (method.key.name || method.key.value);
+                if (!methodName) continue;
+                const methodLabel = `_class_${className}_${methodName}_${labelId}`;
+                this.vm.load(VReg.A0, VReg.FP, thisOffset);
+                this.vm.lea(VReg.A1, this.addStringConstant("#" + className + methodName));
+                this.vm.call("_tag_str_a1");
+                this.vm.lea(VReg.A2, methodLabel);
+                this.vm.movImm64(VReg.V0, 0x7fff000000000000n);
+                this.vm.or(VReg.A2, VReg.A2, VReg.V0);
+                this.vm.call("_object_define");
             }
         }
     },
@@ -2736,6 +3237,12 @@ export const StatementCompiler = {
             } else if (member.type === "MethodDefinition") {
                 if (member.kind === "constructor") {
                     constructor = member;
+                } else if (!member.static && !member.computed &&
+                    this._isPrivateClassKey(member.key) &&
+                    member.kind !== "get" && member.kind !== "set") {
+                    // 实例私有方法(含生成器/async 生成器):不进 prototype 表,
+                    // 由 emitCtorFieldInits 装到实例 own 槽(品牌 / super 返回后可见)。
+                    privateMethods.push(member);
                 } else if (member.static) {
                     staticMethods.push(member);
                 } else {
@@ -2944,7 +3451,7 @@ export const StatementCompiler = {
         // (`class C extends A{ b = this.a+9 }`,this.a 由 super() 设)。故派生类此处不发,
         // 由下方构造体循环在 super() 语句后注入(emitCtorFieldInits)。
         if (!superClass) {
-            this.emitCtorFieldInits(instanceFields, privateFields, className, thisOffset, cfkeysLabel);
+            this.emitCtorFieldInits(instanceFields, privateFields, className, thisOffset, cfkeysLabel, privateMethods, labelId);
         }
 
         // 编译构造函数体（参数已在字段初始化前落栈并处理默认值）
@@ -2955,14 +3462,14 @@ export const StatementCompiler = {
                     this.compileStatement(bodyStmt);
                     // 派生类:super() 语句刚编完 → 立即注入字段初始化(node 时序)。
                     if (superClass && !fieldsEmittedAfterSuper && this._isSuperCallStmt(bodyStmt)) {
-                        this.emitCtorFieldInits(instanceFields, privateFields, className, thisOffset, cfkeysLabel);
+                        this.emitCtorFieldInits(instanceFields, privateFields, className, thisOffset, cfkeysLabel, privateMethods, labelId);
                         fieldsEmittedAfterSuper = true;
                     }
                 }
                 // 防御:派生类构造体未见顶层 super() 语句(非常规写法)→ 体末补发,
                 // 保证字段仍被初始化(时序略偏但不丢失)。
                 if (superClass && !fieldsEmittedAfterSuper) {
-                    this.emitCtorFieldInits(instanceFields, privateFields, className, thisOffset, cfkeysLabel);
+                    this.emitCtorFieldInits(instanceFields, privateFields, className, thisOffset, cfkeysLabel, privateMethods, labelId);
                 }
             }
         }
@@ -2975,6 +3482,9 @@ export const StatementCompiler = {
 
         // ========== 生成实例方法 ==========
         for (const method of instanceMethods) {
+            this.compileClassMethod(className, method, labelId, false);
+        }
+        for (const method of privateMethods) {
             this.compileClassMethod(className, method, labelId, false);
         }
 
@@ -3369,14 +3879,28 @@ export const StatementCompiler = {
         return null;
     },
 
+    // [accessor-name] 类方法静态键归一:标识符名 / 字符串字面量(含空串 "")/ 数字字面量
+    // → 字符串键。此前 `key.name || key.value` 把空串键("" 为 falsy)当无效跳过
+    // (`get ''(){}`/`get 1e2(){}` 的访问器从不落 prototype → C.prototype[''] 读 undefined,
+    // accessor-name 族 12 测试判负);数字键此前以 number 入 label/addString 亦错。
+    _classMethodKeyName(method) {
+        const k = method && method.key;
+        if (!k) return null;
+        // Identifier 键(含字符串/数字字面量归一成的 Identifier;空串键 name==="")
+        if (typeof k.name === "string") return k.name;
+        if (typeof k.value === "string") return k.value; // Literal 键兜底(含空串键)
+        if (typeof k.value === "number") return String(k.value);
+        return null;
+    },
+
     emitClassMethodTable(methods, className, labelId, isStatic, targetReg) {
         const prefix = isStatic ? "static_" : "";
         // 归组（Map 归组，禁止裸 {} 字典判真——node 原型链污染，见 [#32]）
         const accessorGroups = new Map();
         for (const method of methods) {
             if (method.kind !== "get" && method.kind !== "set") continue;
-            const mn = method.key && (method.key.name || method.key.value);
-            if (!mn) continue;
+            const mn = this._classMethodKeyName(method);
+            if (mn === null) continue;
             // 计算键访问器 `get [k]()`(k 为标识符)与同名静态访问器 `get k()` 归组分隔:
             // 前者键为运行时值,不可与静态字符串键合并。非计算键分组键 === mn(自举字节不变)。
             const grpKey = (method.computed ? "@c@" : "") + mn;
@@ -3393,9 +3917,9 @@ export const StatementCompiler = {
         }
 
         for (const method of methods) {
-            let methodName = method.key && (method.key.name || method.key.value);
+            let methodName = this._classMethodKeyName(method);
             let wkName = null;
-            if (!methodName) {
+            if (methodName === null) {
                 wkName = this._wellKnownSymbolMethodName(method); // [Symbol.X](){}
                 if (!wkName) continue; // 其余计算键仍跳过
                 methodName = wkName;   // 方法体 label 用同名(与 compileClassMethod 一致)
@@ -3455,6 +3979,11 @@ export const StatementCompiler = {
             const defineKey = isPrivateKey
                 ? "#" + className + methodName
                 : methodName;
+            // 实例私有方法(非访问器)由 emitCtorFieldInits 装 own 槽,此处跳过以免
+            // 再落到 prototype → super() 返回前就能 this.#m()(规范禁止)。
+            if (isPrivateKey && !isStatic && method.kind !== "get" && method.kind !== "set") {
+                continue;
+            }
 
             if (method.kind === "get" || method.kind === "set") {
                 const isComputedAccessor = method.computed && method.key &&
@@ -3569,8 +4098,8 @@ export const StatementCompiler = {
 
     // 编译类方法
     compileClassMethod(className, method, labelId, isStatic) {
-        let methodName = method.key && (method.key.name || method.key.value);
-        if (!methodName) {
+        let methodName = this._classMethodKeyName(method);
+        if (methodName === null) {
             methodName = this._wellKnownSymbolMethodName(method); // [Symbol.X](){}
             if (!methodName) return; // 其余计算键仍跳过
         }
@@ -3586,7 +4115,8 @@ export const StatementCompiler = {
         // 计算键与 well-known symbol 仍跳过(名非静态)。
         if (method.key &&
             (method.key.type === "Identifier" || method.key.type === "Literal" ||
-             method.key.type === "StringLiteral" || method.key.type === "NumericLiteral")) {
+             method.key.type === "StringLiteral" || method.key.type === "NumericLiteral" ||
+             method.key.type === "PrivateIdentifier")) {
             // [L2-③] 覆盖计算键中的字面量键: `["computed"](){}`/`[1](){}` 名称编译期已知
             // (静态字符串/数字键),同样入函数元数据侧表供 `.name`/`.length` 反射。
             // 变量/表达式计算键(名非静态)仍跳过,留运行期侧表路径。
@@ -3617,12 +4147,13 @@ export const StatementCompiler = {
         // async 方法:标签处先落 stub(建协程+Promise 返回);真体在 _abody(经 _coroutine_entry
         // 进入,用 async 返回路径 resolve coro+88 的 Promise)。方法以裸函数指针存表,调用点
         // compileMethodCall 不识别 async,故由 stub 自建协程(与 async 函数调用同构)。
+        let fdiList = null;
         if (isAsyncMethod) {
             this.emitAsyncMethodStub(methodLabel + "_abody", false);
         } else if (isAsyncGenMethod) {
-            this.emitAsyncGeneratorStub(methodLabel + "_gbody", false);
+            fdiList = this.emitAsyncGeneratorStub(methodLabel + "_gbody", false);
         } else if (isGenMethod) {
-            this.emitGeneratorStub(methodLabel + "_gbody", false);
+            fdiList = this.emitGeneratorStub(methodLabel + "_gbody", false);
         }
         // [P1] async 方法禁录(S4 跨协程共享,同 closures.js 注);生成器体同跑协程栈,同理禁录
         if (!(method.value && method.value.isAsync) && !isGenMethod) this.vm.beginRecord();
@@ -3708,6 +4239,9 @@ export const StatementCompiler = {
             }
             if (this._isPatternParam(param)) {
                 // [#47] 解构参数 method({a,b}){}：实参落临时槽,解构延后(防 A 寄存器互踩)。
+                // [FDI eager] 生成器方法 pattern 形参已在调用期(stub)绑定,体内走 transfer
+                // 路径(见下),此处不落槽。
+                if (isGenMethod && fdiList) continue;
                 const pat = param.type === "AssignmentPattern" ? param.left : param;
                 const dexpr = param.type === "AssignmentPattern" ? param.right : null;
                 const pslot = this.ctx.allocLocal(`__parampat_${this.nextLabelId()}`);
@@ -3755,8 +4289,14 @@ export const StatementCompiler = {
         }
 
         // [#47] 解构参数:实参已落栈,此处解构到局部。
-        for (let i = 0; i < patternParams.length; i++) {
-            this.emitParamDestructure(patternParams[i].pat, patternParams[i].slot, patternParams[i].dflt);
+        // [FDI eager] 生成器方法 pattern 形参已在调用期(stub)绑定:从 coro+168 transfer
+        // 数组按绑定序取叶值,跳过重复解构(二重消费自定义迭代器会错值/错计)。
+        if (isGenMethod && fdiList) {
+            this.emitGenTransferLoads(fdiList);
+        } else {
+            for (let i = 0; i < patternParams.length; i++) {
+                this.emitParamDestructure(patternParams[i].pat, patternParams[i].slot, patternParams[i].dflt);
+            }
         }
 
         // 编译方法体

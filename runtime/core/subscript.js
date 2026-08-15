@@ -111,9 +111,14 @@ export class SubscriptGenerator {
         // 属性键**(a[0] ≡ a["0"]),而 _syscall_arg 对字符串取的是**内容指针**(天文数字)
         // → 恒判越界 → `a[k]`(k="1")/`{0:x}=arr` 一律 undefined。判别用 V1 暂存:V0 存着
         // 类型低字节,arm64 快路靠它跨 _syscall_arg 存活,不可动。
+        // Symbol 键禁走 _syscall_arg(裸指针当下标)→ 具名侧表。
         vm.shrImm(VReg.V1, VReg.S1, 48);
         vm.cmpImm(VReg.V1, 0x7FFC);
         vm.jeq("_subscript_get_strkey");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_is_symbol");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_subscript_get_named");
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_syscall_arg");
         vm.mov(VReg.S1, VReg.RET);
@@ -374,29 +379,70 @@ export class SubscriptGenerator {
         vm.call("_array_side_elem_get");
         vm.jmp("_subscript_get_done");
         vm.label("_subscript_get_arr_dense");
-        // [bug A] 边界检查:index<0 或 >=length → tagged undefined(node 语义;
-        // 此前直接越界读堆邻居,`while((v=a[i++])!==undefined)` 垃圾值/死循环)
-        vm.load(VReg.V2, VReg.S0, 8); // length
+        // [bug A] 边界:index<0 → undefined。index>=length 或稠密 hole → 仍走
+        // Array.prototype [[Get]](ES OrdinaryGet;test262 pop/unshift 继承元素)。
+        // arguments(ARR_IS_ARGUMENTS):越界写不抬 length,但槽可能已物化 → 先读稠密。
         vm.cmpImm(VReg.S1, 0);
         vm.jlt("_subscript_get_arr_oob");
+        vm.load(VReg.V2, VReg.S0, 8); // length
         vm.cmp(VReg.S1, VReg.V2);
-        vm.jge("_subscript_get_arr_oob");
-        // 超出 capacity 的「逻辑」元素(稀疏大 length)→ 侧表已查过,此处 undefined
+        vm.jlt("_subscript_get_arr_inlen");
+        vm.loadByte(VReg.V0, VReg.S0, 1);
+        vm.andImm(VReg.V0, VReg.V0, 32); // ARR_IS_ARGUMENTS
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_subscript_get_arr_proto"); // 普通数组 ≥length → 原型
+        // arguments ≥length:若 capacity 内有非 hole 槽则返回
         vm.load(VReg.V0, VReg.S0, 16); // capacity
         vm.cmp(VReg.S1, VReg.V0);
-        vm.jge("_subscript_get_arr_oob");
+        vm.jge("_subscript_get_arr_proto");
+        vm.load(VReg.V0, VReg.S0, 24);
+        vm.shl(VReg.V1, VReg.S1, 3);
+        vm.add(VReg.V0, VReg.V0, VReg.V1);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_subscript_get_arr_proto");
+        vm.movImm64(VReg.V1, 0x7ff8000000000000n);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jne("_subscript_get_done");
+        vm.movImm(VReg.RET, 0);
+        vm.jmp("_subscript_get_done");
+        vm.label("_subscript_get_arr_inlen");
+        // 超出 capacity 的「逻辑」元素(稀疏大 length)→ 侧表已查过 → 原型
+        vm.load(VReg.V0, VReg.S0, 16); // capacity
+        vm.cmp(VReg.S1, VReg.V0);
+        vm.jge("_subscript_get_arr_proto");
         // 元素地址: data_ptr(@24) + index * 8
         vm.load(VReg.V0, VReg.S0, 24); // data_ptr
         vm.shl(VReg.V1, VReg.S1, 3);
         vm.add(VReg.V1, VReg.V0, VReg.V1);
         vm.load(VReg.RET, VReg.V1, 0);
-        // 真 hole:槽==0 → undefined;装箱 int0 → float +0
+        // 真 hole:槽==0 → 原型;装箱 int0 → float +0
         vm.cmpImm(VReg.RET, 0);
-        vm.jeq("_subscript_get_arr_oob");
+        vm.jeq("_subscript_get_arr_proto");
         vm.movImm64(VReg.V1, 0x7ff8000000000000n);
         vm.cmp(VReg.RET, VReg.V1);
         vm.jne("_subscript_get_done");
         vm.movImm(VReg.RET, 0);
+        vm.jmp("_subscript_get_done");
+
+        // hole / >=length: Get on Array.prototype with this=数组(镜像 _agen_get_arr_proto)
+        vm.label("_subscript_get_arr_proto");
+        vm.lea(VReg.V0, "_nsobj_array_proto");
+        vm.load(VReg.S2, VReg.V0, 0);
+        vm.cmpImm(VReg.S2, 0);
+        vm.jeq("_subscript_get_arr_oob");
+        vm.scvtf(0, VReg.S1);
+        vm.fmovToInt(VReg.A0, 0);
+        vm.call("_js_prop_key");
+        vm.mov(VReg.A1, VReg.RET); // boxed key
+        vm.mov(VReg.A0, VReg.S2); // Array.prototype
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        // this = 装箱数组:S0 是裸头,重装箱 0x7FFE
+        vm.movImm64(VReg.V1, 0x7ffe000000000000n);
+        vm.or(VReg.A1, VReg.S0, VReg.V1);
+        vm.call("_maybe_getter");
+        vm.jmp("_subscript_get_done");
 
         vm.label("_subscript_get_done");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
@@ -537,9 +583,14 @@ export class SubscriptGenerator {
         // 字符串键(0x7FFC)走冷分支 _subscript_set_strkey(与 _subscript_get 同一裁决:
         // 规范索引串当下标,否则具名属性)。此前 _syscall_arg 把字符串的内容指针当下标 →
         // 恒 >2^28 上限被丢弃 → `a[k]="v"`(k="1") 静默不写。
+        // Symbol 键禁当整数下标(否则 length 抬到指针量级 → concat 假死)。
         vm.shrImm(VReg.V1, VReg.S1, 48);
         vm.cmpImm(VReg.V1, 0x7FFC);
         vm.jeq("_subscript_set_strkey");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_is_symbol");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_subscript_set_named");
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_syscall_arg");
         vm.mov(VReg.S1, VReg.RET);
@@ -589,6 +640,23 @@ export class SubscriptGenerator {
         // 仍拦截真正损坏的巨大下标(2^28–2^48)避免 OOM。movImm 仍是单条 MOVZ，不增码。
         vm.cmpImm(VReg.S1, 0);
         vm.jlt("_subscript_set_done");
+        // [#L1-px] Object.preventExtensions 后拒新增索引(含 hole);既有元素仍可改写。
+        // byte1 & EXT_NONEXT(=1);与 object/index.js 同位。arguments 亦 TYPE_ARRAY。
+        vm.loadByte(VReg.V1, VReg.S0, 1);
+        vm.andImm(VReg.V1, VReg.V1, 1); // EXT_NONEXT
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_sss_px_ok");
+        vm.load(VReg.V3, VReg.S0, 8); // length
+        vm.cmp(VReg.S1, VReg.V3);
+        vm.jge("_subscript_set_done"); // 越界 → 拒扩
+        vm.load(VReg.V1, VReg.S0, 24); // data_ptr
+        vm.shl(VReg.V0, VReg.S1, 3);
+        vm.add(VReg.V0, VReg.V1, VReg.V0);
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_subscript_set_done"); // hole → 拒新建 own
+        // 既有非 hole → 允许改写(落到下方 store)
+        vm.label("_sss_px_ok");
         // [W7b] 侧表 writable/accessor/稀疏大索引(≥2^28 在 helper 内处理)。
         // 无 ARR_HAS_SIDETABLE 时 O(1) 返回 0,不扫 _closure_props_registry。
         vm.mov(VReg.A0, VReg.S0);
@@ -610,6 +678,11 @@ export class SubscriptGenerator {
         vm.load(VReg.V3, VReg.S0, 8); // old length
         vm.cmp(VReg.S1, VReg.V3);
         vm.jlt("_sss_no_gap");
+        // arguments 异质:越界索引可写但不抬 length(ES Arguments [[Set]])
+        vm.loadByte(VReg.V0, VReg.S0, 1);
+        vm.andImm(VReg.V0, VReg.V0, 32); // ARR_IS_ARGUMENTS
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_sss_args_no_len");
         vm.load(VReg.V1, VReg.S0, 24); // data_ptr
         vm.movImm(VReg.V4, 0); // hole
         vm.mov(VReg.V2, VReg.V3); // cursor = old_len
@@ -625,6 +698,9 @@ export class SubscriptGenerator {
         // 更新 length = index + 1
         vm.addImm(VReg.V0, VReg.S1, 1);
         vm.store(VReg.S0, 8, VReg.V0);
+        vm.jmp("_sss_no_gap");
+        vm.label("_sss_args_no_len");
+        // 仍写槽(capacity 已 ensure);length 保持。Get 对 arguments 越界见侧读路径。
         vm.label("_sss_no_gap");
         // +0.0 → 装箱 int0(与 hole 哨兵区分);-0 保留
         vm.cmpImm(VReg.S2, 0);
@@ -668,6 +744,24 @@ export class SubscriptGenerator {
         vm.call("_object_key_eq");
         vm.cmpImm(VReg.RET, 0);
         vm.jne("_subscript_set_named_len");
+        // [#L1-px] preventExtensions:拒新增具名键(既有侧表键仍可改)
+        vm.loadByte(VReg.V1, VReg.S0, 1);
+        vm.andImm(VReg.V1, VReg.V1, 1); // EXT_NONEXT
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_sss_named_set");
+        vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+        vm.or(VReg.A0, VReg.S0, VReg.V1);
+        vm.call("_closure_props_find");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_subscript_set_done"); // 无侧表 → 拒
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_subscript_set_done"); // 无此键 → 拒
+        vm.label("_sss_named_set");
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S1);
         vm.mov(VReg.A2, VReg.S2);
@@ -676,14 +770,16 @@ export class SubscriptGenerator {
         vm.jmp("_subscript_set_done");
         vm.label("_subscript_set_named_len");
         // [W7b] length writable:false → 静默拒(sloppy) / 与 defineProperty 同位
+        // 注:EXT_NONEXT 与 ARR_LEN_NONWRITABLE 同位 bit0——preventExtensions 后
+        // length 赋值亦拒(偏严于 ES:non-extensible 数组 length 仍可缩短;记偏差)。
         vm.loadByte(VReg.V0, VReg.S0, 1);
-        vm.andImm(VReg.V0, VReg.V0, 1); // ARR_LEN_NONWRITABLE
+        vm.andImm(VReg.V0, VReg.V0, 1); // ARR_LEN_NONWRITABLE / EXT_NONEXT
         vm.cmpImm(VReg.V0, 0);
         vm.jne("_subscript_set_done");
-        vm.mov(VReg.A0, VReg.S2);
-        vm.call("_syscall_arg"); // 值 -> 裸整数长度
-        vm.mov(VReg.A1, VReg.RET);
-        vm.mov(VReg.A0, VReg.S0);
+        // A0=boxed/raw arr, A1=boxed value(新 ABI,不再预 ToInt)
+        vm.movImm64(VReg.V1, 0x7ffe000000000000n);
+        vm.or(VReg.A0, VReg.S0, VReg.V1); // 裸头 → 装箱数组,供 _js_set_length 识别
+        vm.mov(VReg.A1, VReg.S2);
         vm.call("_js_set_length");
         vm.mov(VReg.RET, VReg.S2);
         vm.jmp("_subscript_set_done");
@@ -809,65 +905,72 @@ export class SubscriptGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 16);
     }
 
-    // _js_set_length(value, n_int) -> undefined
+    // _js_set_length(A0=obj, A1=boxed value) -> undefined
     // [#63] arr.length = N 的赋值路径。运行时按值形态分派：
-    //   - 数组(装箱 0x7FFE / 裸 TYPE_ARRAY=1)：N<=len 截断(只改长度域,余量保留),
-    //     N>len 经 _array_ensure_cap 扩容后把 [len,N) 填 hole(0),再置长度=N。
-    //     过大展开(>16M差异)跳过确保容量与填充，仅设长度(稀数组语义)。
-    //   - 其余(对象等)：回退设 "length" 属性(值转 JS number)。
-    // 原先 arr.length=N 一律走 _object_set_ic 把数组当哈希对象写坏 → 段错误(#63 变体)。
+    //   - 数组(装箱 0x7FFE / 裸 TYPE_ARRAY=1)：ToNumber 后须为 [0,2^32-1] 整数,
+    //     否则 RangeError;再截断/扩容写 length@8。
+    //   - 其余(对象等)：原样 _object_set("length", value)——可存负数/Inf(供 ToLength)。
+    // 原先对非数组也做 uint32 RangeError → `obj.length=-1` 误抛;且编译期 fcvtzs
+    // 会把 Inf 打成 INT64_MAX 再 fallback → ToLength 失真。
     generateJsSetLength() {
         const vm = this.vm;
 
         vm.label("_js_set_length");
         vm.prologue(16, [VReg.S0, VReg.S1]);
-        vm.mov(VReg.S1, VReg.A1); // n (裸整数)
+        vm.store(VReg.SP, 0, VReg.A0);  // 原 obj(fallback 用)
+        vm.store(VReg.SP, 8, VReg.A1);  // 原 boxed value
+        vm.mov(VReg.S0, VReg.A0); // obj
+        vm.mov(VReg.S1, VReg.A1); // boxed value
 
-        // [RangeError] n < 0 或 n > 0xFFFFFFFF(2^32-1) → RangeError
-        vm.cmpImm(VReg.S1, 0);
-        vm.jlt("_js_set_length_range_err");
-        vm.movImm64(VReg.V0, 0xFFFFFFFFn);
-        vm.cmp(VReg.S1, VReg.V0);
-        vm.jgt("_js_set_length_range_err");
-
-        // 按值形态判定是否为数组，取裸数组头到 S0
-        vm.shrImm(VReg.V0, VReg.A0, 48);
+        // 按值形态判定是否为数组
+        vm.shrImm(VReg.V0, VReg.S0, 48);
         vm.cmpImm(VReg.V0, 0x7FFE);        // 装箱数组
         vm.jeq("_js_set_length_arr_boxed");
         vm.cmpImm(VReg.V0, 0);             // 非 0 高位且非数组箱 → 非数组
         vm.jne("_js_set_length_fallback");
         // 高位为 0：可能是裸堆指针
-        vm.cmpImm(VReg.A0, 0);
+        vm.cmpImm(VReg.S0, 0);
         vm.jeq("_js_set_length_done");     // 空指针：无操作
         vm.lea(VReg.V0, "_heap_base");
         vm.load(VReg.V0, VReg.V0, 0);
-        vm.cmp(VReg.A0, VReg.V0);
+        vm.cmp(VReg.S0, VReg.V0);
         vm.jlt("_js_set_length_fallback");
         vm.lea(VReg.V0, "_heap_ptr");
         vm.load(VReg.V0, VReg.V0, 0);
-        vm.cmp(VReg.A0, VReg.V0);
+        vm.cmp(VReg.S0, VReg.V0);
         vm.jge("_js_set_length_fallback");
-        vm.load(VReg.V0, VReg.A0, 0);
+        vm.load(VReg.V0, VReg.S0, 0);
         vm.andImm(VReg.V0, VReg.V0, 0xff);
         vm.cmpImm(VReg.V0, 1);             // TYPE_ARRAY
         vm.jne("_js_set_length_fallback");
-        vm.mov(VReg.S0, VReg.A0);
         vm.jmp("_js_set_length_writable_chk");
 
         vm.label("_js_set_length_arr_boxed");
         vm.emitMaskLoad(VReg.V1);
-        vm.andMaskReg(VReg.S0, VReg.A0, VReg.V1);
+        vm.andMaskReg(VReg.S0, VReg.S0, VReg.V1); // 裸头
 
         vm.label("_js_set_length_writable_chk");
+        // 数组:boxed value → 有限整数 ∈[0,2^32-1]
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_number_coerce");
+        vm.mov(VReg.S1, VReg.RET); // float bits
+        vm.shrImm(VReg.V1, VReg.S1, 52);
+        vm.andImm(VReg.V1, VReg.V1, 0x7FF);
+        vm.cmpImm(VReg.V1, 0x7FF);
+        vm.jeq("_js_set_length_range_err"); // Inf/NaN
+        vm.fmovToFloat(0, VReg.S1);
+        vm.fcvtzs(VReg.S1, 0); // S1 = 裸 n
+        vm.cmpImm(VReg.S1, 0);
+        vm.jlt("_js_set_length_range_err");
+        vm.movImm64(VReg.V0, 0xFFFFFFFFn);
+        vm.cmp(VReg.S1, VReg.V0);
+        vm.jgt("_js_set_length_range_err");
         // [W7b] ARR_LEN_NONWRITABLE → 静默忽略(sloppy [[Set]])
         vm.loadByte(VReg.V0, VReg.S0, 1);
         vm.andImm(VReg.V0, VReg.V0, 1);
         vm.cmpImm(VReg.V0, 0);
         vm.jne("_js_set_length_done");
         vm.label("_js_set_length_do_array");
-        // 类型字节守卫：0x7FFE 装箱值可能是损坏指针或子类数组(length override)，
-        // 若 type≠TYPE_ARRAY(1) 则回退到 _object_set 按对象属性写，避免误读数组头野地址。
-        // ldrb 已零扩展 → andImm(V0,V0,0xff) 冗余，省略。
         vm.loadByte(VReg.V0, VReg.S0, 0);
         vm.cmpImm(VReg.V0, 1);             // TYPE_ARRAY
         vm.jne("_js_set_length_fallback");
@@ -875,9 +978,6 @@ export class SubscriptGenerator {
         vm.load(VReg.V0, VReg.S0, 8);      // 当前 length
         vm.cmp(VReg.S1, VReg.V0);
         vm.jle("_js_set_length_set");      // n <= len：仅截断
-        // n > len：扩容到 n，并把 [len, n) 填 hole(0)
-        // [huge expand] 差异 > 16M(0x1000000) → 跳过确保容量与填充，仅设长度(稀数组语义)，
-        // 避免超大长度赋值(如 [].length=4294967295)因分配循环超时/段错误。
         vm.sub(VReg.V2, VReg.S1, VReg.V0); // V2 = n - len
         vm.movImm(VReg.V3, 0x1000000);     // 16M cap
         vm.cmp(VReg.V2, VReg.V3);
@@ -904,22 +1004,21 @@ export class SubscriptGenerator {
         vm.movImm(VReg.RET, 0);
         vm.epilogue([VReg.S0, VReg.S1], 16);
 
-        // RangeError: 无效数组长度
         vm.label("_js_set_length_range_err");
         vm.lea(VReg.A0, vm.asm.addString("Invalid array length"));
-        vm.call("_js_box_string");          // RET = 装箱堆串
+        vm.call("_js_box_string");
         vm.mov(VReg.A0, VReg.RET);
-        vm.call("_throw_range_error");      // 不返回
+        vm.call("_throw_range_error");
         vm.epilogue([VReg.S0, VReg.S1], 16);
 
-        // 回退：对象.length = n，设 "length" 属性(n 转 JS number)
+        // 回退：普通对象.length = 原 boxed value(可 Inf/负数)
         vm.label("_js_set_length_fallback");
-        vm.scvtf(0, VReg.S1);              // int -> float
-        vm.fmovToInt(VReg.A2, 0);          // A2 = number 值(float64 位)
+        vm.load(VReg.A0, VReg.SP, 0); // 原 obj
         vm.lea(VReg.V0, "_str_length_prop");
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
-        vm.or(VReg.A1, VReg.V0, VReg.V1);  // 装箱字符串键 "length"
-        vm.call("_object_set");            // A0=对象(原值,未改),A1=键,A2=值
+        vm.or(VReg.A1, VReg.V0, VReg.V1);
+        vm.load(VReg.A2, VReg.SP, 8); // 原 boxed value
+        vm.call("_object_set");
         vm.movImm(VReg.RET, 0);
         vm.epilogue([VReg.S0, VReg.S1], 16);
     }

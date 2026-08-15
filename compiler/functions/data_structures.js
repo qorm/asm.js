@@ -261,9 +261,9 @@ export const DataStructureCompiler = {
             // 前缀与同名静态访问器分隔。非计算键分组键 === kn(自举字节不变)。
             let kn, computedAcc = false;
             if (p.computed) {
-                // [#85] 计算键访问器:支持 Identifier / NumericLiteral / StringLiteral。
-                // 前仅支持 Identifier,NumericLiteral(1E+9)和 StringLiteral 漏分组 →
-                // getter 被当普通数据值存、读得 Function 而非 getter 返回值。
+                // [#85] 计算键访问器:支持 Identifier / NumericLiteral / StringLiteral /
+                // Symbol.* well-known(get [Symbol.unscopables])。前仅 Identifier+字面量,
+                // MemberExpression 漏分组 → getter 当数据属性存、HasBinding 永不调 accessor。
                 if (p.key.type === "Identifier") {
                     kn = " c " + p.key.name;
                     computedAcc = true;
@@ -271,8 +271,15 @@ export const DataStructureCompiler = {
                     kn = " c " + String(p.key.value);
                 } else if (p.key.type === "StringLiteral") {
                     kn = " c " + p.key.value;
+                } else if (p.key.type === "MemberExpression" &&
+                    p.key.object && p.key.object.type === "Identifier" &&
+                    p.key.object.name === "Symbol" &&
+                    p.key.property && p.key.property.type === "Identifier") {
+                    kn = " c Symbol." + p.key.property.name;
                 } else {
-                    continue; // 不支持的计算键类型(如表达式)
+                    // 任意计算键表达式(含 `in`/Call 等):运行时求键
+                    kn = " c #" + ai;
+                    computedAcc = true;
                 }
             } else {
                 kn = this.objectPropStaticKeyName(p.key);
@@ -282,19 +289,25 @@ export const DataStructureCompiler = {
             let g = accessorGroups.get(kn);
             if (!g) {
                 // [#85] 计算键访问器:Identifier 用 name,NumericLiteral/StringLiteral 用
-                // ToString(key) → 运行时键。非计算键直接 kn。
+                // ToString(key) → 运行时键。Symbol.* → "Symbol.xxx" 静态键。
                 let groupName;
                 if (computedAcc) {
-                    groupName = p.key.name; // Identifier:保留原名供 emitObjectLiteralComputedAccessor 运行时求键
+                    // Identifier:保留原名;其它表达式 keyNode 供运行时求值
+                    groupName = (p.key.type === "Identifier") ? p.key.name : ("#" + ai);
                 } else if (p.key && (p.key.type === "NumericLiteral" || p.key.type === "Literal")) {
                     groupName = String(p.key.value);
                 } else if (p.key && p.key.type === "StringLiteral") {
                     groupName = p.key.value;
+                } else if (p.key && p.key.type === "MemberExpression" &&
+                    p.key.property && p.key.property.type === "Identifier") {
+                    groupName = "Symbol." + p.key.property.name;
                 } else {
                     groupName = kn;
                 }
                 g = { name: groupName, getter: null, setter: null,
-                      emitted: false, computed: computedAcc, keyNode: p.key };
+                      emitted: false, computed: computedAcc, keyNode: p.key,
+                      symWk: !!(p.key && p.key.type === "MemberExpression" &&
+                        p.key.object && p.key.object.name === "Symbol") };
                 accessorGroups.set(kn, g);
             }
             if (p.kind === "get") g.getter = p.value;
@@ -358,9 +371,8 @@ export const DataStructureCompiler = {
                 continue;
             }
 
-            // 计算键访问器 { get [k](){} , set [k](v){} }(k 为标识符):运行时求键→
-            // marker 以运行时键 _object_define。须在下方通用计算键分支前拦截(否则 getter
-            // 函数被当普通数据属性存)。
+            // 计算键访问器 { get [k](){} , set [k](v){} }(k 为标识符或任意表达式):
+            // 运行时求键→ marker。须在下方通用计算键分支前拦截。
             if ((prop.kind === "get" || prop.kind === "set") && prop.computed &&
                 prop.key && prop.key.type === "Identifier") {
                 const group = accessorGroups !== null
@@ -369,6 +381,17 @@ export const DataStructureCompiler = {
                 group.emitted = true;
                 this.emitObjectLiteralComputedAccessor(group, objOffset, group.keyNode);
                 continue;
+            }
+
+            // 任意计算键访问器 { get [expr](){} }(含 `in`/Call 等,分组键 " c #i")
+            if ((prop.kind === "get" || prop.kind === "set") && prop.computed &&
+                accessorGroups !== null) {
+                const gExpr = accessorGroups.get(" c #" + i);
+                if (gExpr && !gExpr.emitted && gExpr.computed) {
+                    gExpr.emitted = true;
+                    this.emitObjectLiteralComputedAccessor(gExpr, objOffset, gExpr.keyNode);
+                    continue;
+                }
             }
 
             // [#85] 计算键访问器 { get [1E+9](){} , get ["str"](){} }:键为字面量(NumericLiteral/
@@ -382,6 +405,28 @@ export const DataStructureCompiler = {
                 if (!group || group.emitted) continue;
                 group.emitted = true;
                 this.emitObjectLiteralAccessor(group, objOffset);
+                continue;
+            }
+
+            // get/set [Symbol.xxx]():
+            // - iterator/asyncIterator → 字符串键 "Symbol.X"(与 for-of/yield*/getMemberPropertyName 协议一致)
+            // - 其余(unscopables 等) → well-known Symbol 键(与 env[Symbol.unscopables]= 同键)
+            if ((prop.kind === "get" || prop.kind === "set") && prop.computed &&
+                prop.key && prop.key.type === "MemberExpression" &&
+                prop.key.object && prop.key.object.type === "Identifier" &&
+                prop.key.object.name === "Symbol" &&
+                prop.key.property && prop.key.property.type === "Identifier") {
+                const symProp = prop.key.property.name;
+                const group = accessorGroups !== null
+                    ? accessorGroups.get(" c Symbol." + symProp) : null;
+                if (!group || group.emitted) continue;
+                group.emitted = true;
+                if (symProp === "iterator" || symProp === "asyncIterator") {
+                    group.name = "Symbol." + symProp;
+                    this.emitObjectLiteralAccessor(group, objOffset);
+                } else {
+                    this.emitObjectLiteralSymWkAccessor(group, objOffset, symProp);
+                }
                 continue;
             }
 
@@ -458,6 +503,38 @@ export const DataStructureCompiler = {
                        prop.key.type === "NumericLiteral") {
                 keyName = String(prop.key.value);
             } else {
+                continue;
+            }
+
+            // ES ObjectLiteral __proto__:非计算键 "__proto__" 设 [[Prototype]],不建自有属性。
+            // `{__proto__:null}` → getPrototypeOf null(此前当普通键 define,链仍 Object.prototype)。
+            if (keyName === "__proto__") {
+                this.compileExpression(prop.value);
+                const protoNullL = this.ctx.newLabel("objlit_proto_null");
+                const protoDoneL = this.ctx.newLabel("objlit_proto_done");
+                const protoObjL = this.ctx.newLabel("objlit_proto_obj");
+                this.vm.shrImm(VReg.V0, VReg.RET, 48);
+                this.vm.cmpImm(VReg.V0, 0x7FFA); // null
+                this.vm.jeq(protoNullL);
+                this.vm.cmpImm(VReg.V0, 0x7FFD); // object
+                this.vm.jeq(protoObjL);
+                this.vm.cmpImm(VReg.V0, 0x7FFE); // array
+                this.vm.jeq(protoObjL);
+                this.vm.cmpImm(VReg.V0, 0x7FFF); // function
+                this.vm.jeq(protoObjL);
+                // 其它值:规范忽略(不改 [[Prototype]]);此处同样跳过
+                this.vm.jmp(protoDoneL);
+                this.vm.label(protoNullL);
+                this.vm.load(VReg.V1, VReg.FP, objOffset);
+                this.vm.movImm(VReg.V0, 0);
+                this.vm.store(VReg.V1, 16, VReg.V0);
+                this.vm.jmp(protoDoneL);
+                this.vm.label(protoObjL);
+                this.vm.emitMaskLoad(VReg.V0);
+                this.vm.andMaskReg(VReg.RET, VReg.RET, VReg.V0); // 裸 proto
+                this.vm.load(VReg.V1, VReg.FP, objOffset);
+                this.vm.store(VReg.V1, 16, VReg.RET);
+                this.vm.label(protoDoneL);
                 continue;
             }
 
@@ -553,6 +630,50 @@ export const DataStructureCompiler = {
         this.vm.call("_object_define");
     },
 
+    // get/set [Symbol.xxx]():TYPE_GETTER 挂 well-known Symbol 键(非 ToString 假串)。
+    emitObjectLiteralSymWkAccessor(group, objOffset, symName) {
+        this.vm.movImm(VReg.A0, 24);
+        this.vm.call("_alloc");
+        const markerOffset = this.ctx.allocLocal(`__objsacc_${this.nextLabelId()}`);
+        this.vm.store(VReg.FP, markerOffset, VReg.RET);
+        this.vm.movImm(VReg.V1, TYPE_GETTER);
+        this.vm.store(VReg.RET, 0, VReg.V1);
+        this.vm.movImm(VReg.V1, 0);
+        this.vm.store(VReg.RET, 8, VReg.V1);
+        this.vm.store(VReg.RET, 16, VReg.V1);
+
+        if (group.getter) {
+            this.compileExpression(group.getter);
+            this.vm.emitMaskLoad(VReg.V1);
+            this.vm.andMaskReg(VReg.V0, VReg.RET, VReg.V1);
+            this.vm.load(VReg.V1, VReg.FP, markerOffset);
+            this.vm.store(VReg.V1, 8, VReg.V0);
+        }
+        if (group.setter) {
+            this.compileExpression(group.setter);
+            this.vm.emitMaskLoad(VReg.V1);
+            this.vm.andMaskReg(VReg.V0, VReg.RET, VReg.V1);
+            this.vm.load(VReg.V1, VReg.FP, markerOffset);
+            this.vm.store(VReg.V1, 16, VReg.V0);
+        }
+
+        this.vm.lea(VReg.A0, "_symwk_" + symName);
+        this.vm.lea(VReg.A1, this.asm.addString("Symbol." + symName));
+        this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        this.vm.or(VReg.A1, VReg.A1, VReg.V1);
+        this.vm.call("_symbol_wellknown");
+        this.vm.mov(VReg.S0, VReg.RET); // Symbol 键跨 call
+
+        this.vm.load(VReg.V0, VReg.FP, objOffset);
+        this.vm.emitMaskLoad(VReg.V1);
+        this.vm.andMaskReg(VReg.V0, VReg.V0, VReg.V1);
+        this.vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+        this.vm.or(VReg.A0, VReg.V0, VReg.V1);
+        this.vm.mov(VReg.A1, VReg.S0);
+        this.vm.load(VReg.A2, VReg.FP, markerOffset);
+        this.vm.call("_object_define");
+    },
+
     // 计算键访问器 `{ get [k](){}, set [k](v){} }`:同 emitObjectLiteralAccessor,但键在
     // 运行时求值(keyNode → _valueToStr)。getter/setter 合并进同一 marker(编译期已归组)。
     emitObjectLiteralComputedAccessor(group, objOffset, keyNode) {
@@ -581,11 +702,23 @@ export const DataStructureCompiler = {
             this.vm.store(VReg.V1, 16, VReg.V0);
         }
 
-        // 运行时键:求值 → _valueToStr → 暂存槽(闭包/求值可能触发 GC,marker 已在槽保活)
+        // 运行时键:求值 → symbol 走 _js_prop_key、否则 _valueToStr(与数据计算键一致)
         this.compileExpression(keyNode);
-        this.vm.mov(VReg.A0, VReg.RET);
-        this.vm.call("_valueToStr");
         const kOff = this.ctx.allocLocal(`__objcack_${this.nextLabelId()}`);
+        this.vm.store(VReg.FP, kOff, VReg.RET);
+        const symKeyL = this.ctx.newLabel("objcacc_sym");
+        const keyDoneL = this.ctx.newLabel("objcacc_keydone");
+        this.vm.load(VReg.A0, VReg.FP, kOff);
+        this.vm.call("_is_symbol");
+        this.vm.cmpImm(VReg.RET, 0);
+        this.vm.jne(symKeyL);
+        this.vm.load(VReg.A0, VReg.FP, kOff);
+        this.vm.call("_valueToStr");
+        this.vm.jmp(keyDoneL);
+        this.vm.label(symKeyL);
+        this.vm.load(VReg.A0, VReg.FP, kOff);
+        this.vm.call("_js_prop_key");
+        this.vm.label(keyDoneL);
         this.vm.store(VReg.FP, kOff, VReg.RET);
 
         // _object_define(装箱 obj, 运行时键, 标记对象裸指针)

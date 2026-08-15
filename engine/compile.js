@@ -29,101 +29,166 @@ function _strLabelIsNumeric(s) {
 
 // 符号名 → id。**必须与 runtime/core/allocator.js generateEngineSymaddr 的 syms 顺序一致**。
 export const SYM_IDS = {
-    _number_coerce: 0, _js_add: 1, _valueToStr: 2, _strconcat: 3,
-    _object_get_ic: 4, _subscript_get: 5, _math_sqrt: 6,
-    // 位运算(& | ^ << >> >>>)、布尔强制(三元/逻辑)、抽象关系比较(非静态 </>)、
-    // 常用 Math。新增须与 allocator.js generateEngineSymaddr 同序追加。
-    _js_band: 7, _js_bor: 8, _js_bxor: 9, _js_bshl: 10, _js_bshr: 11, _js_bushr: 12,
-    _to_boolean: 13, _js_relcmp: 14,
-    _math_abs: 15, _math_floor: 16, _math_ceil: 17, _math_round: 18, _math_pow: 19,
-    // 宿主**可变**数据全局(共享堆指针):emitNumberCoerceFast 的堆装箱数值判别读
-    // _heap_base/_heap_ptr 范围。不可内联快照(宿主分配会改),须运行时重定位到宿主地址。
-    _heap_base: 20, _heap_ptr: 21,
-    // 抽象相等(动态类型 ==)、数值→字符串(concat 内联数字渲染)。
-    _abstract_eq: 22, _floatToString: 23,
-    // 分配类:数组/对象字面量(走宿主共享堆,P5 已重定位 _heap_base/_heap_ptr)。
-    _array_new_with_size: 24, _array_set: 25, _object_new_sized: 26, _object_define: 27,
-    // 长度 / typeof / 装箱字符串 / 数组 join。
-    _js_length: 28, _js_box_string: 29, _js_typeof: 30, _array_join: 31, _array_to_string: 32,
-    // 常用字符串方法。
-    _str_toUpperCase: 33, _str_toLowerCase: 34, _str_slice: 35, _str_indexOf: 36,
-    _str_charCodeAt: 37, _str_split: 38, _str_trim: 39, _str_substring: 40,
-    _str_repeat: 41, _str_includes: 42, _str_replace: 43,
-    _js_unbox: 44, _array_length: 45, _getStrContent: 46, _typeof: 47, _to_int32: 48,
-    // 对象属性读的 NO_IC 形态(片段专用):站点回填会写 RX 页(SIGBUS),故片段
-    // 里 emitObjectGetIC 走 _object_get + _maybe_getter,无站点写回。见 members.js。
-    _object_get: 49, _maybe_getter: 50,
-    // 关系比较 < <= > >=(operators.js relHelper;经 _js_relcmp 包装,真运行时 label)。
-    _js_lt: 51, _js_le: 52, _js_gt: 53, _js_ge: 54,
-    // 更多 Math。
-    _math_trunc: 55, _math_cbrt: 56,
-    // 更多字符串方法。
-    _str_padStart: 57, _str_padEnd: 58, _str_at: 59, _str_charAt: 60,
-    _str_startsWith: 61, _str_endsWith: 62, _str_replaceAll: 63,
-    // 更多数组方法(无闭包)。_array_push 亦为 Math.hypot 内部所用。
-    _array_push: 64, _array_get: 65, _array_reverse: 66, _array_slice: 67,
-    _array_includes: 68, _array_indexOf: 69, _array_at: 70, _array_flat: 71,
-    // 对数/指数 Math(sin/cos/tan/atan2 编译器未接,非廉价,略)。
-    _math_log: 72, _math_log2: 73, _math_log10: 74, _math_exp: 75,
-    // 异常展开(split().join() 等含边界抛出路径引用);数值解析 / 转换。
-    _throw_unwind: 76, _js_parseInt: 77, _js_parseFloat: 78, _str_to_num: 79,
-    // Number.toString(radix) / toFixed;数组 sort 比较;字符串 lastIndexOf;instanceof。
-    _is_bigint: 80, _num_toFixed: 81, _strcmp: 82, _str_lastIndexOf: 83, _instanceof: 84,
-    // Number.toString(radix);数组 sort/元素写回 _subscript_set。
-    _num_toString: 85, _subscript_set: 86,
-    // 异常状态全局(HOST_DATA:含边界抛出路径的表达式如 split()/sort() 内联引用
-    // adrp _exception_value/_pending;须重定位到宿主地址,与 eval 共享异常状态)。
-    _exception_value: 87, _exception_pending: 88,
-    // 闭包/回调类(P7:eval 内函数/箭头表达式)。_alloc 建闭包对象;_typed_array_new
-    // 为 map/filter 的 TypedArray 分支(普通数组分支不取,但 bl 指令仍内联发射,故须登记)。
-    _typed_array_new: 89, _alloc: 90,
-    // 闭包调用/回调体内常见:_coroutine_create(闭包调用路径的 async 分支,内联发射)、
-    // _strict_eq(=== 动态操作数,如 find(x=>x===2))、_syscall_arg(sort 比较器结果归一)。
-    _coroutine_create: 91, _strict_eq: 92, _syscall_arg: 93,
-    // 直接闭包调用(IIFE)的 async 分支(dead 但内联发射):建 Promise + 入调度。
-    _promise_new: 94, _scheduler_spawn: 95,
-    // 闭包捕获外层 eval 局部(如 var k; [..].map(x=>x+k)):捕获变量装箱共享 box。
-    // _print_str:捕获 box 的 TDZ 未初始化读错误路径(dead 但内联发射)。
-    _box_alloc: 96, _print_str: 97,
-    // try/catch 异常上下文链头全局(HOST_DATA:try-enter 压帧/正常退出弹帧读写它,
-    // 须重定位到宿主地址,与宿主异常状态共享);for-of 迭代字符串用 _str_codepoint_at。
-    _exc_ctx_top: 98, _str_codepoint_at: 99,
-    // throw new Error(建 Error 对象):_object_new/_object_set;for-of 迭代器路径的
-    // 字符串/Map 分支(数组 for-of 不取,但 bl 指令内联发射):_str_cp_bytes/_map_entries。
-    _object_new: 100, _object_set: 101, _str_cp_bytes: 102, _map_entries: 103,
-    // 属性键装箱 tag helper(A1 |= STRING_TAG,3 条指令):成员写 `o.k=v`(emitBoxedStringKey
-    // 的 _object_set 前)发 `bl _tag_key_a1`;方法调用 `a.push()`(键 box→helper)发
-    // `bl _tag_str_a1`。片段捕获对象/数组经成员写/方法变异必经此二者。经蹦床跳宿主 helper
-    // (仅碰 A1/V0/V1/LR,无栈,ret 回原调用点),与所有其它符号同法。
-    _tag_str_a1: 104, _tag_key_a1: 105,
-    // 动态方法调用可调用性校验(`a.push()`/`o.f()` 取属性后 `bl _validate_callable`;
-    // 非函数则抛)。片段捕获数组/对象经方法变异必经。
-    _validate_callable: 106,
-    // 数组变异簇(捕获数组经方法变异:pop/shift/unshift/splice/concat)。均为 array/index.js
-    // 恒发射的 live 实现(_array_fill 仅在死 mutate.js,故不登记)。
-    _array_pop: 107, _array_shift: 108, _array_unshift: 109, _array_splice: 110,
-    _array_concat: 111,
-    // 数组结果装箱(map/filter/slice 等返新数组:RET=(RET&PAYLOAD)|ARRAY_TAG)。
-    // eval 内数组方法闭包(`[1,2].map(v=>v+1)`)收尾装箱新数组。
-    _box_arr_r: 112,
-    // for-of IteratorClose(提前 break/error 时调 iterator.return())
-    _iterator_close: 113,
-    // box_obj_r: RET = (RET & PAYLOAD) | OBJECT_TAG(装箱为 JS 对象)
-    _box_obj_r: 114,
-    // for-in 属性序归一(_object_normalize_order):ES[[OwnPropertyKeys]]整数键升序,供片段
-    // for-in/for-of 迭代器路径使用。与 allocator.js generateEngineSymaddr 严格同序。
-    _object_normalize_order: 115,
-    // for-in 数组索引→字符串键(_intToStr);符号判断(_is_symbol);迭代器展开(_array_spread_into)
-    _intToStr: 116, _is_symbol: 117, _array_spread_into: 118,
-    // 数组 species 协议(concat/slice/map/filter 编译期内联引用)、泛型回退
-    _array_species_check: 119, _agen_map: 120, _agen_filter: 121,
-    // 数组 splice species 协议 + 泛型回退
-    _agen_splice: 122, _array_splice_rt: 123,
+    _number_coerce: 0,
+    _js_add: 1,
+    _valueToStr: 2,
+    _strconcat: 3,
+    _object_get_ic: 4,
+    _subscript_get: 5,
+    _math_sqrt: 6,
+    _js_band: 7,
+    _js_bor: 8,
+    _js_bxor: 9,
+    _js_bshl: 10,
+    _js_bshr: 11,
+    _js_bushr: 12,
+    _to_boolean: 13,
+    _js_relcmp: 14,
+    _math_abs: 15,
+    _math_floor: 16,
+    _math_ceil: 17,
+    _math_round: 18,
+    _math_pow: 19,
+    _heap_base: 20,
+    _heap_ptr: 21,
+    _abstract_eq: 22,
+    _floatToString: 23,
+    _array_new_with_size: 24,
+    _array_set: 25,
+    _object_new_sized: 26,
+    _object_define: 27,
+    _js_length: 28,
+    _js_box_string: 29,
+    _js_typeof: 30,
+    _array_join: 31,
+    _array_to_string: 32,
+    _str_toUpperCase: 33,
+    _str_toLowerCase: 34,
+    _str_slice: 35,
+    _str_indexOf: 36,
+    _str_charCodeAt: 37,
+    _str_split: 38,
+    _str_trim: 39,
+    _str_substring: 40,
+    _str_repeat: 41,
+    _str_includes: 42,
+    _str_replace: 43,
+    _js_unbox: 44,
+    _array_length: 45,
+    _getStrContent: 46,
+    _typeof: 47,
+    _to_int32: 48,
+    _object_get: 49,
+    _maybe_getter: 50,
+    _js_lt: 51,
+    _js_le: 52,
+    _js_gt: 53,
+    _js_ge: 54,
+    _math_trunc: 55,
+    _math_cbrt: 56,
+    _str_padStart: 57,
+    _str_padEnd: 58,
+    _str_at: 59,
+    _str_charAt: 60,
+    _str_startsWith: 61,
+    _str_endsWith: 62,
+    _str_replaceAll: 63,
+    _str_replaceAll_fn: 64,
+    _array_push: 65,
+    _array_get: 66,
+    _array_reverse: 67,
+    _array_slice: 68,
+    _array_includes: 69,
+    _array_indexOf: 70,
+    _array_at: 71,
+    _array_flat: 72,
+    _math_log: 73,
+    _math_log2: 74,
+    _math_log10: 75,
+    _math_exp: 76,
+    _throw_unwind: 77,
+    _js_parseInt: 78,
+    _js_parseFloat: 79,
+    _str_to_num: 80,
+    _is_bigint: 81,
+    _num_toFixed: 82,
+    _strcmp: 83,
+    _str_lastIndexOf: 84,
+    _instanceof: 85,
+    _num_toString: 86,
+    _subscript_set: 87,
+    _exception_value: 88,
+    _exception_pending: 89,
+    _typed_array_new: 90,
+    _alloc: 91,
+    _coroutine_create: 92,
+    _strict_eq: 93,
+    _syscall_arg: 94,
+    _promise_new: 95,
+    _scheduler_spawn: 96,
+    _box_alloc: 97,
+    _print_str: 98,
+    _exc_ctx_top: 99,
+    _str_codepoint_at: 100,
+    _object_new: 101,
+    _object_set: 102,
+    _str_cp_bytes: 103,
+    _map_entries: 104,
+    _tag_str_a1: 105,
+    _tag_key_a1: 106,
+    _validate_callable: 107,
+    _array_pop: 108,
+    _array_shift: 109,
+    _array_unshift: 110,
+    _array_splice: 111,
+    _array_concat: 112,
+    _box_arr_r: 113,
+    _iterator_close: 114,
+    _box_obj_r: 115,
+    _object_normalize_order: 116,
+    _intToStr: 117,
+    _is_symbol: 118,
+    _array_spread_into: 119,
+    _array_species_check: 120,
+    _agen_map: 121,
+    _agen_filter: 122,
+    _agen_splice: 123,
+    _array_splice_rt: 124,
+    _call_argc: 125,
+    // for-in 数组侧表具名键枚举(statements.js compileForInStatement)
+    _closure_props_find: 126,
+    // eval/with 片段：`in`/HasProperty、赋值前自有键探测
+    _object_has: 127,
+    // eval 数值规范化；生成器声明；闭包属性写；define 属性 attr
+    _nan_canon: 128,
+    _generator_new: 129,
+    _closure_prop_set: 130,
+    _object_set_prop_attr: 131,
+    // eval 片段读 globalThis 对象（裸名 / typeof 回落）
+    _global_this: 132,
+    // eval 内 Function [[Strict]] 元数据
+    _func_meta_strict: 133,
+    // 数组解构限量 spread + IteratorClose
+    _array_spread_into_n: 134,
+    // 片段内函数值装箱
+    _js_box_function: 135,
+    // 闭包属性侧表读/define/attr(片段内函数 .prototype/.name 与一等构造器)
+    _closure_prop_get: 136,
+    _closure_prop_define: 137,
+    _closure_prop_set_attr: 138,
+    // well-known Symbol 惰性单例(emitArrayProtoObject/for-of 片段引用)
+    _symbol_wellknown: 139,
+    // 无原型对象创建(@@unscopables 等);对象属性删除(delete 片段)
+    _object_new_raw: 140,
+    _object_delete: 141,
+    // 可捕获 ReferenceError(TDZ 读/写守卫;片段内 let 前读)
+    _throw_reference_error: 142,
+
 };
 
 // 宿主可变数据全局:引用它们须运行时取宿主地址(不可内联常量)。见 compileFragment
 // 的 adrp→ldr-literal 改写。与常量单例(_js_true 等,内联同位型)相对。
-export const HOST_DATA = { _heap_base: 1, _heap_ptr: 1, _exception_value: 1, _exception_pending: 1, _exc_ctx_top: 1 };
+export const HOST_DATA = { _heap_base: 1, _heap_ptr: 1, _exception_value: 1, _exception_pending: 1, _exc_ctx_top: 1, _call_argc: 1, _global_this: 1 };
 
 // captureLayout 串解析:`name:off[:b],name:off[:b],...`(off 为调用者帧内 FP 偏移,负整数)。
 // 直接 eval 的词法作用域捕获:compileCallExpression 在直接 `eval(x)` 调用点把外层函数的

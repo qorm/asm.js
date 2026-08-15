@@ -2553,6 +2553,28 @@ export class AllocatorGenerator {
             "_array_species_check", "_agen_map", "_agen_filter",
             // 数组 splice species 协议 + 泛型回退
             "_agen_splice", "_array_splice_rt",
+            // argc ABI 全局(HOST_DATA):Function/eval 片段体内 arguments 构造读宿主值
+            "_call_argc",
+            // for-in 数组侧表具名键(与 SYM_IDS 同序)
+            "_closure_props_find",
+            // eval/with 片段：`in`/HasProperty、赋值前自有键
+            "_object_has",
+            // eval 数值规范化；生成器声明；闭包属性写；define attr
+            "_nan_canon", "_generator_new", "_closure_prop_set", "_object_set_prop_attr",
+            // eval 片段 globalThis 数据槽；Function [[Strict]] 元数据
+            "_global_this", "_func_meta_strict",
+            // 数组解构限量 spread + IteratorClose(与 SYM_IDS 同序,加在末尾)
+            "_array_spread_into_n",
+            // 片段内函数值装箱(与 SYM_IDS 同序,加在末尾)
+            "_js_box_function",
+            // 闭包属性侧表读/define/attr(与 SYM_IDS 同序,加在末尾)
+            "_closure_prop_get", "_closure_prop_define", "_closure_prop_set_attr",
+            // well-known Symbol 惰性单例(与 SYM_IDS 同序,加在末尾)
+            "_symbol_wellknown",
+            // 无原型对象创建(@@unscopables 等);对象属性删除(delete 片段)
+            "_object_new_raw", "_object_delete",
+            // 可捕获 ReferenceError(TDZ 读/写守卫;片段内 let 前读)
+            "_throw_reference_error",
         ];
         vm.label("_engine_symaddr");
         vm.prologue(0, []);
@@ -4370,6 +4392,14 @@ export class AllocatorGenerator {
         // 位于 _data_gc_end 之前 → 被 GC 根扫描覆盖，其挂载的属性/回调不会被回收。
         asm.addDataLabel("_global_this");
         asm.addDataQword(0);  // NULL - runtime sets this to the actual global object
+
+        // [gOPD 补全] 裸 `Function` 一等值单例槽(members.js emitFunctionCtorObject
+        // 惰性物化装箱闭包写入;jsvalue.js _iof_chk_fn 以指针相等识别 → 旧哨兵 3
+        // 的 instanceof Function 快路对一等化后的 RHS 继续成立)。定义在运行时数据段
+        // 而非 members.js 编译期 addDataLabel:_instanceof 无条件引用此标签,若随
+        // 物化点按需发射,未物化的程序会缺符号。位于 GC 根扫描区 → 闭包存活。
+        asm.addDataLabel("_fnctor_singleton");
+        asm.addDataQword(0);
 
         // [shape v2 · T0] 形状转移表根(运行时首条转移边写入时惰性建表)。
         // 数据段锚槽 → 根扫描覆盖 → 表与堆上转移节点不被回收。见 SHAPE_TRANSITIONS_DESIGN.md §3/§4。

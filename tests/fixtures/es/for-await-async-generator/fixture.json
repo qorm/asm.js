@@ -6,6 +6,5 @@
     "run": true,
     "stdout": "forawait sum 15\nm 1 false\nm 11 false\nm 3 false\nm undefined true",
     "exitCode": 0
-  },
-  "knownFailure": "Pre-existing failure - not in current task scope"
+  }
 }

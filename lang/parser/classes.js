@@ -180,9 +180,15 @@ export const ClassParser = {
             this.nextToken();
             // [ES2022] 静态初始化块 static { ... }:static 后紧跟 `{`(非方法名/字段)。
             if (this.curTokenIs(TokenType.LBRACE)) {
-                // [test262 早期错误] static {} 内 new.target 合法:fnDepth 供上下文校验
+                // [test262 早期错误] static {} 内 new.target 合法:fnDepth 供上下文校验;
+                // await 在静态块的**直属语句**是保留字(模块上下文,`var [await]` 绑定须拒),
+                // 但嵌套函数/箭头体内不含 await 的约束不穿透(ContainsAwait 不下钻函数边界)
+                // —— 记深度,嵌套函数 fnDepth+1 → 不误拒(const await = 0 于箭头内合法)。
                 this.fnDepth++;
+                const prevStaticBlockDepth = this._staticBlockDepth;
+                this._staticBlockDepth = this.fnDepth;
                 const block = this.parseBlockStatement();
+                this._staticBlockDepth = prevStaticBlockDepth;
                 this.fnDepth--;
                 return new AST.StaticBlock(block ? block.body : []);
             }
@@ -196,13 +202,19 @@ export const ClassParser = {
         // 检查 getter/setter
         let kind = "method";
         if (this.curTokenIs(TokenType.GET)) {
-            // 检查是否真的是 getter (后面跟着标识符/私有名/计算键 `[` 和括号)
-            if (this.peekTokenIs(TokenType.IDENT) || this.peekTokenIs(TokenType.HASH) || this.peekTokenIs(TokenType.LBRACKET)) {
+            // 检查是否真的是 getter (后面跟着标识符/私有名/字符串/数字键/计算键 `[` 和括号)
+            // [accessor-name] 此前漏 STRING/INT/FLOAT:`get ''(){}`/`get 1e2(){}` 的 get 被当
+            // 方法名解析,成员整体丢失(test262 class/accessor-name 族)。
+            if (this.peekTokenIs(TokenType.IDENT) || this.peekTokenIs(TokenType.HASH) ||
+                this.peekTokenIs(TokenType.LBRACKET) || this.peekTokenIs(TokenType.STRING) ||
+                this.peekTokenIs(TokenType.INT) || this.peekTokenIs(TokenType.FLOAT)) {
                 kind = "get";
                 this.nextToken();
             }
         } else if (this.curTokenIs(TokenType.SET)) {
-            if (this.peekTokenIs(TokenType.IDENT) || this.peekTokenIs(TokenType.HASH) || this.peekTokenIs(TokenType.LBRACKET)) {
+            if (this.peekTokenIs(TokenType.IDENT) || this.peekTokenIs(TokenType.HASH) ||
+                this.peekTokenIs(TokenType.LBRACKET) || this.peekTokenIs(TokenType.STRING) ||
+                this.peekTokenIs(TokenType.INT) || this.peekTokenIs(TokenType.FLOAT)) {
                 kind = "set";
                 this.nextToken();
             }
@@ -211,7 +223,7 @@ export const ClassParser = {
         // async 方法修饰符:`async m(){}` / `async *m(){}`。仅当 async 后跟方法名(非
         // `(`/`=`/`;`/`}` — 那些是名为 "async" 的方法/字段)时才当修饰符,消费 async。
         let isAsyncMethod = false;
-        if (this.curTokenIs(TokenType.ASYNC) &&
+        if (this.curTokenIs(TokenType.ASYNC) && !this.curToken.escaped &&
             !this.peekTokenIs(TokenType.LPAREN) && !this.peekTokenIs(TokenType.ASSIGN) &&
             !this.peekTokenIs(TokenType.SEMICOLON) && !this.peekTokenIs(TokenType.RBRACE)) {
             isAsyncMethod = true;
@@ -251,7 +263,13 @@ export const ClassParser = {
             return this.parsePrivateFieldOrMethod(isStatic, kind, isGenerator, isAsyncMethod);
         }
 
+        // [accessor-name] 字面量键归一(同对象字面量约定):字符串键原样、数字键按
+        // String(值) 归一(0b10→"2"、1e2→"100"、0.0000001→"1e-7")——下游 emitClassMethodTable/
+        // compileClassMethod 以 Identifier(name) 为静态键,与 obj 字面量路径一致。
         let key = new AST.Identifier(this.curToken.literal);
+        if (this.curTokenIs(TokenType.INT) || this.curTokenIs(TokenType.FLOAT)) {
+            key = new AST.Identifier(String(this.parseNumberLiteral().value));
+        }
         let computed = false;
 
         // 计算属性名 [expr]

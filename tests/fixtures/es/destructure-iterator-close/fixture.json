@@ -6,6 +6,5 @@
     "run": true,
     "stdout": "10\n1 1",
     "exitCode": 0
-  },
-  "knownFailure": "Pre-existing issue - not caused by current changes"
+  }
 }

@@ -441,15 +441,15 @@ export class SetGenerator {
         // ============================================================
         const SET_MASK = 0x0000ffffffffffffn;
 
-        // ---- _set_coerce_arg(A0=任意值) -> 裸 Set 指针(非 Set → TypeError) ----
-        // Set ES2025 组合方法(intersection/union/...)的第二个实参可能是装箱 Set-like
-        // 对象而非裸 Set 指针;原 helper 直接解引用裸指针 → SIGSEGV。此 helper 做品牌
-        // 守卫:已为裸 Set→ 直返;装箱 Set 对象(0x7FFD 且 TYPE_SET)→ 脱壳返;
-        // 装箱数组(0x7FFE)亦为 Object,可走 GetSetRecord(set-like-array);
-        // 裸 Map → 按插入序键物化为 Set(combines-Map);
-        // Set-like 对象→ Call(keys)后 next 物化到新 Set;
-        // 其余 → TypeError。
+        // ---- _set_coerce_arg(A0=任意值) -> 裸 Set 或 SetRecord ----
+        // 真 Set → 脱壳裸指针;Map → 键物化为 Set;其余走 GetSetRecord:
+        // Get size/has/keys(规范序,不 Call keys)→ 堆块 SetRecord,供组合子按方法
+        // 选用 has 或实时迭代 keys(布尔方法不得误触 keys 迭代器;防 SIGSEGV)。
         const TYPE_MAP = 4;
+        // SetRecord 堆块:GetSetRecord 缓存,不物化 keys 迭代器。
+        // magic 低字节 ≠ TYPE_SET(5),组合子用全字比较区分裸 Set。
+        const SETREC_MAGIC = 0x5345545245430001n;
+        const SETREC_SIZE = 40; // magic@0 obj@8 size@16 has@24 keys@32
         vm.asm.registerRuntimeString("_str_sz_size", "size");
         vm.asm.registerRuntimeString("_str_sz_has", "has");
         vm.asm.registerRuntimeString("_str_sz_keys", "keys");
@@ -483,6 +483,9 @@ export class SetGenerator {
         vm.or(VReg.A1, VReg.A1, VReg.V1);
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.call("_maybe_getter");
         vm.mov(VReg.S2, VReg.RET);
         vm.mov(VReg.A0, VReg.S2);
         vm.call("_is_bigint");
@@ -497,13 +500,17 @@ export class SetGenerator {
         vm.movImm(VReg.V1, 0); // +0.0
         vm.fmovToFloat(1, VReg.V1);
         vm.fcmp(0, 1);
-        vm.jflt("_sca_bad");
+        vm.jflt("_sca_range"); // size < 0 → RangeError(规范 GetSetRecord)
+        vm.mov(VReg.S5, VReg.S2); // S5 = ToNumber(size) 浮点位(GetSetRecord 缓存)
         // has 必须可调用
         vm.lea(VReg.A1, "_str_sz_has");
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.A1, VReg.V1);
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.call("_maybe_getter");
         vm.mov(VReg.S2, VReg.RET);
         vm.shrImm(VReg.V0, VReg.S2, 48);
         vm.cmpImm(VReg.V0, 0x7FFF);
@@ -513,12 +520,16 @@ export class SetGenerator {
         vm.cmpImm(VReg.S2, 0);
         vm.jeq("_sca_bad");
         vm.label("_sca_has_ok");
-        // keys 必须可调用(随后再 Call;此处仅 IsCallable)
+        vm.mov(VReg.S4, VReg.S2); // S4 = has 函数(GetSetRecord 缓存,布尔方法只 Call has)
+        // keys 必须可调用(GetSetRecord 只 Get,不 Call;布尔方法不得触发 keys 迭代器)
         vm.lea(VReg.A1, "_str_sz_keys");
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.A1, VReg.V1);
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.call("_maybe_getter");
         vm.mov(VReg.S2, VReg.RET);
         vm.shrImm(VReg.V0, VReg.S2, 48);
         vm.cmpImm(VReg.V0, 0x7FFF);
@@ -533,91 +544,19 @@ export class SetGenerator {
         vm.movImm64(VReg.V1, 0x7fff000000000000n);
         vm.or(VReg.S2, VReg.S2, VReg.V1);
         vm.label("_sca_keys_ok");
-        // 非 Set 装箱对象:Call(keys, obj) 后物化到新 Set
-        //   数组(0x7FFE)→ 按下标遍历(兼容 keys 直接返数组);
-        //   对象(0x7FFD)/裸堆 → GetIteratorDirect:循环 next()/done/value(生成器与自定义迭代器)。
-        vm.call("_set_new");
-        vm.mov(VReg.S1, VReg.RET);         // S1 = 新裸 Set
-        // S2 已是 keys 函数(GetSetRecord 缓存,避免二次 Get)
-        vm.shrImm(VReg.V0, VReg.S2, 48);
-        vm.cmpImm(VReg.V0, 0x7FFF);
-        vm.jne("_sca_bad");
-        // Call(keys, obj)——_spread_call0 正确绑 this=obj(规范 GetIteratorFromMethod)
-        vm.mov(VReg.A0, VReg.S2);          // keys 函数
-        vm.mov(VReg.A1, VReg.S0);          // this = 候选对象
-        vm.call("_spread_call0");
-        vm.mov(VReg.S3, VReg.RET);         // S3 = keys() 返回值
-        vm.shrImm(VReg.V0, VReg.S3, 48);
-        vm.cmpImm(VReg.V0, 0x7FFE);
-        vm.jeq("_sca_arr_loop_init");     // 数组快路
-        // Type(iterator) 须为 Object(0x7FFD)或裸堆;其余 → TypeError
-        vm.cmpImm(VReg.V0, 0x7FFD);
-        vm.jeq("_sca_gen_loop");
-        vm.cmpImm(VReg.V0, 0);
-        vm.jne("_sca_bad");
-        vm.cmpImm(VReg.S3, 0);
-        vm.jeq("_sca_bad");
-        // ---- 迭代器物化:IteratorStepValue 循环 ----
-        vm.label("_sca_gen_loop");
-        vm.mov(VReg.A0, VReg.S3);
-        vm.lea(VReg.A1, vm.asm.addString("next"));
-        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
-        vm.or(VReg.A1, VReg.A1, VReg.V1);
-        vm.call("_object_get");
-        // next 可能是访问器(set-like-class-order 的 get next);解包后再判可调用
-        vm.mov(VReg.A0, VReg.RET);
-        vm.mov(VReg.A1, VReg.S3);
-        vm.call("_maybe_getter");
-        vm.shrImm(VReg.V2, VReg.RET, 48); // V2 不别名待调的 next(RET/V0)
-        vm.cmpImm(VReg.V2, 0x7FFF);
-        vm.jne("_sca_bad");
-        vm.mov(VReg.A0, VReg.RET);
-        vm.mov(VReg.A1, VReg.S3);
-        vm.call("_spread_call0");         // res = next.call(iter)
-        vm.mov(VReg.S4, VReg.RET);         // S4 = res
-        // if (ToBoolean(res.done)) → 结束
-        vm.mov(VReg.A0, VReg.S4);
-        vm.lea(VReg.A1, vm.asm.addString("done"));
-        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
-        vm.or(VReg.A1, VReg.A1, VReg.V1);
-        vm.call("_object_get");
-        vm.mov(VReg.A0, VReg.RET);
-        vm.mov(VReg.A1, VReg.S4);
-        vm.call("_maybe_getter");
-        vm.mov(VReg.A0, VReg.RET);
-        vm.call("_to_boolean");
-        vm.cmpImm(VReg.RET, 0);
-        vm.jne("_sca_done");
-        // value = res.value; _set_add(S1, value)
-        vm.mov(VReg.A0, VReg.S4);
-        vm.lea(VReg.A1, vm.asm.addString("value"));
-        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
-        vm.or(VReg.A1, VReg.A1, VReg.V1);
-        vm.call("_object_get");
-        vm.mov(VReg.A0, VReg.RET);
-        vm.mov(VReg.A1, VReg.S4);
-        vm.call("_maybe_getter");
-        vm.mov(VReg.A1, VReg.RET);
-        vm.mov(VReg.A0, VReg.S1);
-        vm.call("_set_add");
-        vm.jmp("_sca_gen_loop");
-        // ---- 数组快路(keys 直接返回数组) ----
-        vm.label("_sca_arr_loop_init");
-        vm.movImm(VReg.S4, 0);
-        vm.mov(VReg.A0, VReg.S3);
-        vm.call("_array_length");
-        vm.mov(VReg.S5, VReg.RET);
-        vm.label("_sca_arr_loop");
-        vm.cmp(VReg.S4, VReg.S5);
-        vm.jge("_sca_done");
-        vm.mov(VReg.A0, VReg.S3);
-        vm.mov(VReg.A1, VReg.S4);
-        vm.call("_array_get");
-        vm.mov(VReg.A1, VReg.RET);
-        vm.mov(VReg.A0, VReg.S1);
-        vm.call("_set_add");
-        vm.addImm(VReg.S4, VReg.S4, 1);
-        vm.jmp("_sca_arr_loop");
+        // 规范 GetSetRecord:只 Get size/has/keys,不 Call keys。
+        // 布尔方法(isSubsetOf/isDisjointFrom)与 difference(this.size≤arg.size)
+        // 只用 has;提前物化会误触 keys 迭代器并打乱 mutation-during-iterate。
+        vm.movImm(VReg.A0, SETREC_SIZE);
+        vm.call("_alloc");
+        vm.movImm64(VReg.V5, SETREC_MAGIC);
+        vm.store(VReg.RET, 0, VReg.V5);
+        vm.store(VReg.RET, 8, VReg.S0);  // [[SetObject]]
+        vm.store(VReg.RET, 16, VReg.S5); // [[Size]] ToNumber 浮点位
+        vm.store(VReg.RET, 24, VReg.S4); // [[Has]]
+        vm.store(VReg.RET, 32, VReg.S2); // [[Keys]] 已缓存,组合子 Call 时不再 Get
+        vm.mov(VReg.S1, VReg.RET);
+        vm.jmp("_sca_done");
         vm.label("_sca_is_set");
         vm.mov(VReg.S1, VReg.S4);          // 脱壳后的裸 Set 指针
         vm.jmp("_sca_done");
@@ -659,57 +598,310 @@ export class SetGenerator {
         vm.or(VReg.A0, VReg.A0, VReg.V1);
         vm.call("_throw_type_error"); // 不返回
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48); // 理论不达
+        vm.label("_sca_range");
+        vm.lea(VReg.A0, vm.asm.addString("Set size must be non-negative"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_range_error"); // 不返回
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
+
+        // ============================================================
+        // Set-like 组合子辅助:Call(has/keys)/克隆/按 keys 实时迭代(不预物化)。
+        // x64:V5/V6 不别名 A0-A5;setCallArgcImm 用它们以免毁 A0 实参。
+        // ============================================================
+        const STRTAG = 0x7ffc000000000000n;
+        const COMB_SAVED = [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5];
+        const emitStrA1 = (s) => {
+            vm.lea(VReg.A1, vm.asm.addString(s));
+            vm.movImm64(VReg.V5, STRTAG);
+            vm.or(VReg.A1, VReg.A1, VReg.V5);
+        };
+        const emitIsSetRec = (src, yes, no) => {
+            vm.shrImm(VReg.V5, src, 48);
+            vm.cmpImm(VReg.V5, 0);
+            vm.jne(no);
+            vm.cmpImm(src, 0);
+            vm.jeq(no);
+            vm.lea(VReg.V5, "_heap_base");
+            vm.load(VReg.V5, VReg.V5, 0);
+            vm.cmp(src, VReg.V5);
+            vm.jlt(no);
+            vm.lea(VReg.V5, "_heap_ptr");
+            vm.load(VReg.V5, VReg.V5, 0);
+            vm.cmp(src, VReg.V5);
+            vm.jge(no);
+            vm.load(VReg.V5, src, 0);
+            vm.movImm64(VReg.V6, SETREC_MAGIC);
+            vm.cmp(VReg.V5, VReg.V6);
+            vm.jeq(yes);
+            vm.jmp(no);
+        };
+        const emitRequireSet = (src, dst, bad) => {
+            vm.movImm64(VReg.V5, SET_MASK);
+            vm.and(dst, src, VReg.V5);
+            vm.movImm64(VReg.V5, vm.ptrFloor);
+            vm.cmp(dst, VReg.V5);
+            vm.jlt(bad);
+            vm.loadByte(VReg.V5, dst, 0);
+            vm.cmpImm(VReg.V5, TYPE_SET);
+            vm.jne(bad);
+        };
+        const emitKindDispatch = (pfx, likeL, fastL) => {
+            emitIsSetRec(VReg.S1, likeL, pfx + "_notrec");
+            vm.label(pfx + "_notrec");
+            vm.movImm64(VReg.V5, SET_MASK);
+            vm.and(VReg.V6, VReg.S1, VReg.V5);
+            vm.movImm64(VReg.V5, vm.ptrFloor);
+            vm.cmp(VReg.V6, VReg.V5);
+            vm.jlt(pfx + "_coerce");
+            vm.loadByte(VReg.V5, VReg.V6, 0);
+            vm.cmpImm(VReg.V5, TYPE_SET);
+            vm.jne(pfx + "_coerce");
+            vm.mov(VReg.S1, VReg.V6);
+            vm.jmp(fastL);
+            vm.label(pfx + "_coerce");
+            vm.mov(VReg.A0, VReg.S5);
+            vm.call("_set_coerce_arg");
+            vm.mov(VReg.S1, VReg.RET);
+            emitIsSetRec(VReg.S1, likeL, pfx + "_co_set");
+            vm.label(pfx + "_co_set");
+            vm.movImm64(VReg.V5, SET_MASK);
+            vm.and(VReg.S1, VReg.S1, VReg.V5);
+            vm.loadByte(VReg.V5, VReg.S1, 0);
+            vm.cmpImm(VReg.V5, TYPE_SET);
+            vm.jeq(fastL);
+            vm.jmp("_sca_bad");
+        };
+        const emitSizeLe = (setS, recS, leL, gtL) => {
+            vm.load(VReg.V5, setS, 8);
+            vm.scvtf(0, VReg.V5);
+            vm.load(VReg.V5, recS, 16);
+            vm.fmovToFloat(1, VReg.V5);
+            vm.fcmp(0, 1);
+            vm.jfle(leL);
+            vm.jmp(gtL);
+        };
+        const emitWalkKeys = (pfx, recS, emitBody) => {
+            vm.load(VReg.A0, recS, 32);
+            vm.load(VReg.A1, recS, 8);
+            vm.call("_spread_call0");
+            vm.mov(VReg.S3, VReg.RET);
+            vm.shrImm(VReg.V5, VReg.S3, 48);
+            vm.cmpImm(VReg.V5, 0x7FFE);
+            vm.jeq(pfx + "_arr");
+            vm.cmpImm(VReg.V5, 0x7FFD);
+            vm.jeq(pfx + "_it");
+            vm.cmpImm(VReg.V5, 0);
+            vm.jne(pfx + "_bad");
+            vm.cmpImm(VReg.S3, 0);
+            vm.jeq(pfx + "_bad");
+            vm.label(pfx + "_it");
+            vm.movImm(VReg.V5, 0);
+            vm.store(VReg.SP, 0, VReg.V5);
+            vm.mov(VReg.A0, VReg.S3);
+            emitStrA1("next");
+            vm.call("_object_get");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.mov(VReg.A1, VReg.S3);
+            vm.call("_maybe_getter");
+            vm.mov(VReg.S4, VReg.RET);
+            vm.jmp(pfx + "_step");
+            vm.label(pfx + "_arr");
+            vm.movImm(VReg.V5, 1);
+            vm.store(VReg.SP, 0, VReg.V5);
+            vm.movImm(VReg.S4, 0);
+            vm.mov(VReg.A0, VReg.S3);
+            vm.call("_array_length");
+            vm.mov(VReg.S5, VReg.RET);
+            vm.label(pfx + "_step");
+            vm.load(VReg.V5, VReg.SP, 0);
+            vm.cmpImm(VReg.V5, 0);
+            vm.jne(pfx + "_arr_step");
+            vm.mov(VReg.A0, VReg.S4);
+            vm.mov(VReg.A1, VReg.S3);
+            vm.call("_spread_call0");
+            vm.mov(VReg.S5, VReg.RET);
+            vm.mov(VReg.A0, VReg.S5);
+            emitStrA1("done");
+            vm.call("_object_get");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.mov(VReg.A1, VReg.S5);
+            vm.call("_maybe_getter");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.call("_to_boolean");
+            vm.cmpImm(VReg.RET, 0);
+            vm.jne(pfx + "_done");
+            vm.mov(VReg.A0, VReg.S5);
+            emitStrA1("value");
+            vm.call("_object_get");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.mov(VReg.A1, VReg.S5);
+            vm.call("_maybe_getter");
+            vm.mov(VReg.A1, VReg.RET);
+            vm.jmp(pfx + "_each");
+            vm.label(pfx + "_arr_step");
+            vm.cmp(VReg.S4, VReg.S5);
+            vm.jge(pfx + "_done");
+            vm.mov(VReg.A0, VReg.S3);
+            vm.mov(VReg.A1, VReg.S4);
+            vm.call("_array_get");
+            vm.mov(VReg.A1, VReg.RET);
+            vm.addImm(VReg.S4, VReg.S4, 1);
+            vm.label(pfx + "_each");
+            // A1 是 caller-saved;body 内 _set_has/_set_add 会毁掉它。SP+8 缓存当前 key。
+            vm.store(VReg.SP, 8, VReg.A1);
+            emitBody();
+            vm.jmp(pfx + "_step");
+            vm.label(pfx + "_bad");
+            vm.lea(VReg.A0, vm.asm.addString("Set method keys() did not return an Object"));
+            vm.movImm64(VReg.V5, STRTAG);
+            vm.or(VReg.A0, VReg.A0, VReg.V5);
+            vm.call("_throw_type_error");
+            vm.label(pfx + "_done");
+        };
+        const emitCopyHead = (srcS, dstS, pfx) => {
+            vm.load(VReg.S3, srcS, 16);
+            vm.label(pfx);
+            vm.cmpImm(VReg.S3, 0);
+            vm.jeq(pfx + "_end");
+            vm.load(VReg.A1, VReg.S3, 0);
+            vm.mov(VReg.A0, dstS);
+            vm.call("_set_add");
+            vm.load(VReg.S3, VReg.S3, 8);
+            vm.jmp(pfx);
+            vm.label(pfx + "_end");
+        };
+
+        // _set_call1(A0=fn, A1=this, A2=arg) — Call(fn, this, «arg»)
+        vm.label("_set_call1");
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.S2, VReg.A2);
+        vm.mov(VReg.S3, VReg.A0);
+        vm.shrImm(VReg.V5, VReg.S3, 48);
+        vm.cmpImm(VReg.V5, 0x7fff);
+        vm.jne("_sc1_notag");
+        vm.emitMaskLoad(VReg.V5);
+        vm.andMaskReg(VReg.S3, VReg.S3, VReg.V5);
+        vm.label("_sc1_notag");
+        vm.cmpImm(VReg.S3, 0);
+        vm.jeq("_sc1_undef");
+        vm.load(VReg.V5, VReg.S3, 0);
+        vm.movImm(VReg.V6, 0xc105);
+        vm.cmp(VReg.V5, VReg.V6);
+        vm.jne("_sc1_bare");
+        vm.mov(VReg.S0, VReg.S3);
+        vm.load(VReg.S3, VReg.S3, 8);
+        vm.jmp("_sc1_do");
+        vm.label("_sc1_bare");
+        vm.movImm(VReg.S0, 0);
+        vm.label("_sc1_do");
+        vm.setCallArgcImm(1, VReg.V5, VReg.V6);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.mov(VReg.A5, VReg.S1);
+        vm.callIndirect(VReg.S3);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
+        vm.label("_sc1_undef");
+        vm.movImm64(VReg.RET, 0x7ffb000000000000n);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
+
+        // _set_clone(A0=set) -> 新裸 Set(插入序拷贝;供 union/difference 在迭代 keys 前快照)
+        vm.label("_set_clone");
+        vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.call("_set_new");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.load(VReg.S2, VReg.S0, 16);
+        vm.label("_set_clone_loop");
+        vm.cmpImm(VReg.S2, 0);
+        vm.jeq("_set_clone_done");
+        vm.load(VReg.A1, VReg.S2, 0);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_set_add");
+        vm.load(VReg.S2, VReg.S2, 8);
+        vm.jmp("_set_clone_loop");
+        vm.label("_set_clone_done");
+        vm.mov(VReg.RET, VReg.S1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 48);
+
+        // _set_like_has(A0=setrec, A1=value) -> 1/0 (ToBoolean(Call(has, obj, «v»)))
+        vm.label("_set_like_has");
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.load(VReg.A0, VReg.S0, 24); // has
+        vm.load(VReg.A1, VReg.S0, 8);  // this = [[SetObject]]
+        vm.mov(VReg.A2, VReg.S1);      // arg
+        vm.call("_set_call1");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_boolean");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
+
+        const emitCombPrologue = () => {
+            vm.prologue(64, COMB_SAVED);
+            vm.mov(VReg.S5, VReg.A1);
+            emitRequireSet(VReg.A0, VReg.S0, "_set_comb_badthis");
+            vm.mov(VReg.S1, VReg.A1);
+        };
+        const emitCombRetSet = (src) => {
+            vm.mov(VReg.RET, src);
+            vm.epilogue(COMB_SAVED, 64);
+        };
+
+        vm.label("_set_comb_badthis");
+        vm.lea(VReg.A0, vm.asm.addString("Set method called on incompatible receiver"));
+        vm.movImm64(VReg.V5, STRTAG);
+        vm.or(VReg.A0, VReg.A0, VReg.V5);
+        vm.call("_throw_type_error");
+
+        vm.label("_set_bool_true");
+        vm.lea(VReg.RET, "_js_true");
+        vm.load(VReg.RET, VReg.RET, 0);
+        vm.epilogue(COMB_SAVED, 64);
+        vm.label("_set_bool_false");
+        vm.lea(VReg.RET, "_js_false");
+        vm.load(VReg.RET, VReg.RET, 0);
+        vm.epilogue(COMB_SAVED, 64);
 
         // ---- _set_union(A0=a, A1=b) -> 新 Set(a ∪ b) ----
         vm.label("_set_union");
-        vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
-        vm.movImm64(VReg.V1, SET_MASK);
-        vm.and(VReg.S0, VReg.A0, VReg.V1); // S0 = a
-        vm.and(VReg.S1, VReg.A1, VReg.V1); // S1 = b
+        emitCombPrologue();
+        emitKindDispatch("_su", "_set_union_like", "_set_union_fast");
+        vm.label("_set_union_fast");
         vm.call("_set_new");
-        vm.mov(VReg.S2, VReg.RET);         // S2 = 新集（裸）
-        vm.load(VReg.S3, VReg.S0, 16);     // cur = a.head
-        vm.label("_set_union_a");
-        vm.cmpImm(VReg.S3, 0);
-        vm.jeq("_set_union_bstart");
-        vm.load(VReg.A1, VReg.S3, 0);      // value
-        vm.mov(VReg.A0, VReg.S2);          // 新集
-        vm.call("_set_add");
-        vm.load(VReg.S3, VReg.S3, 8);      // cur = node.next
-        vm.jmp("_set_union_a");
-        vm.label("_set_union_bstart");
-        vm.load(VReg.S3, VReg.S1, 16);     // cur = b.head
-        vm.label("_set_union_b");
-        vm.cmpImm(VReg.S3, 0);
-        vm.jeq("_set_union_done");
-        vm.load(VReg.A1, VReg.S3, 0);
-        vm.mov(VReg.A0, VReg.S2);
-        vm.call("_set_add");
-        vm.load(VReg.S3, VReg.S3, 8);
-        vm.jmp("_set_union_b");
-        vm.label("_set_union_done");
-        vm.mov(VReg.RET, VReg.S2);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
+        vm.mov(VReg.S2, VReg.RET);
+        emitCopyHead(VReg.S0, VReg.S2, "_set_union_a");
+        emitCopyHead(VReg.S1, VReg.S2, "_set_union_b");
+        emitCombRetSet(VReg.S2);
+        vm.label("_set_union_like");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_set_clone");
+        vm.mov(VReg.S2, VReg.RET);
+        emitWalkKeys("_su_lk", VReg.S1, () => {
+            vm.load(VReg.A1, VReg.SP, 8);
+            vm.mov(VReg.A0, VReg.S2);
+            vm.call("_set_add");
+        });
+        emitCombRetSet(VReg.S2);
 
         // ---- _set_intersection(A0=a, A1=b) -> 新 Set(a ∩ b) ----
         vm.label("_set_intersection");
-        vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
-        vm.movImm64(VReg.V1, SET_MASK);
-        vm.and(VReg.S0, VReg.A0, VReg.V1);
-        vm.and(VReg.S1, VReg.A1, VReg.V1);
+        emitCombPrologue();
+        emitKindDispatch("_si", "_set_int_like", "_set_int_fast");
+        vm.label("_set_int_fast");
         vm.call("_set_new");
         vm.mov(VReg.S2, VReg.RET);
-        vm.load(VReg.S3, VReg.S0, 16);     // cur = a.head
+        vm.load(VReg.S3, VReg.S0, 16);
         vm.label("_set_int_loop");
         vm.cmpImm(VReg.S3, 0);
         vm.jeq("_set_int_done");
-        vm.load(VReg.A1, VReg.S3, 0);      // value
-        vm.mov(VReg.A0, VReg.S1);          // b
+        vm.load(VReg.A1, VReg.S3, 0);
+        vm.mov(VReg.A0, VReg.S1);
         vm.call("_set_has");
-        vm.lea(VReg.V1, "_js_true");
-        vm.load(VReg.V1, VReg.V1, 0);
-        vm.cmp(VReg.RET, VReg.V1);
-        vm.jne("_set_int_next");           // b 不含 → 跳过
+        vm.lea(VReg.V5, "_js_true");
+        vm.load(VReg.V5, VReg.V5, 0);
+        vm.cmp(VReg.RET, VReg.V5);
+        vm.jne("_set_int_next");
         vm.load(VReg.A1, VReg.S3, 0);
         vm.mov(VReg.A0, VReg.S2);
         vm.call("_set_add");
@@ -717,28 +909,65 @@ export class SetGenerator {
         vm.load(VReg.S3, VReg.S3, 8);
         vm.jmp("_set_int_loop");
         vm.label("_set_int_done");
-        vm.mov(VReg.RET, VReg.S2);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
+        emitCombRetSet(VReg.S2);
+        vm.label("_set_int_like");
+        emitSizeLe(VReg.S0, VReg.S1, "_si_lk_has", "_si_lk_keys");
+        vm.label("_si_lk_has");
+        vm.call("_set_new");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.load(VReg.S3, VReg.S0, 16);
+        vm.label("_si_lk_hloop");
+        vm.cmpImm(VReg.S3, 0);
+        vm.jeq("_si_h_done");
+        vm.load(VReg.A1, VReg.S3, 0);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_set_like_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_si_lk_hnext");
+        vm.load(VReg.A1, VReg.S3, 0);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_set_add");
+        vm.label("_si_lk_hnext");
+        vm.load(VReg.S3, VReg.S3, 8);
+        vm.jmp("_si_lk_hloop");
+        vm.label("_si_h_done");
+        emitCombRetSet(VReg.S2);
+        vm.label("_si_lk_keys");
+        vm.call("_set_new");
+        vm.mov(VReg.S2, VReg.RET);
+        emitWalkKeys("_si_k", VReg.S1, () => {
+            vm.load(VReg.A1, VReg.SP, 8);
+            vm.mov(VReg.A0, VReg.S0);
+            vm.call("_set_has");
+            vm.lea(VReg.V5, "_js_true");
+            vm.load(VReg.V5, VReg.V5, 0);
+            vm.cmp(VReg.RET, VReg.V5);
+            vm.jne("_si_k_skip");
+            vm.load(VReg.A1, VReg.SP, 8);
+            vm.mov(VReg.A0, VReg.S2);
+            vm.call("_set_add");
+            vm.label("_si_k_skip");
+        });
+        emitCombRetSet(VReg.S2);
 
         // ---- _set_difference(A0=a, A1=b) -> 新 Set(a \ b) ----
         vm.label("_set_difference");
-        vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
-        vm.movImm64(VReg.V1, SET_MASK);
-        vm.and(VReg.S0, VReg.A0, VReg.V1);
-        vm.and(VReg.S1, VReg.A1, VReg.V1);
+        emitCombPrologue();
+        emitKindDispatch("_sd", "_set_diff_like", "_set_diff_fast");
+        vm.label("_set_diff_fast");
         vm.call("_set_new");
         vm.mov(VReg.S2, VReg.RET);
-        vm.load(VReg.S3, VReg.S0, 16);     // cur = a.head
+        vm.load(VReg.S3, VReg.S0, 16);
         vm.label("_set_diff_loop");
         vm.cmpImm(VReg.S3, 0);
         vm.jeq("_set_diff_done");
         vm.load(VReg.A1, VReg.S3, 0);
-        vm.mov(VReg.A0, VReg.S1);          // b
+        vm.mov(VReg.A0, VReg.S1);
         vm.call("_set_has");
-        vm.lea(VReg.V1, "_js_true");
-        vm.load(VReg.V1, VReg.V1, 0);
-        vm.cmp(VReg.RET, VReg.V1);
-        vm.jeq("_set_diff_next");          // b 含 → 跳过
+        vm.lea(VReg.V5, "_js_true");
+        vm.load(VReg.V5, VReg.V5, 0);
+        vm.cmp(VReg.RET, VReg.V5);
+        vm.jeq("_set_diff_next");
         vm.load(VReg.A1, VReg.S3, 0);
         vm.mov(VReg.A0, VReg.S2);
         vm.call("_set_add");
@@ -746,28 +975,57 @@ export class SetGenerator {
         vm.load(VReg.S3, VReg.S3, 8);
         vm.jmp("_set_diff_loop");
         vm.label("_set_diff_done");
-        vm.mov(VReg.RET, VReg.S2);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
+        emitCombRetSet(VReg.S2);
+        vm.label("_set_diff_like");
+        emitSizeLe(VReg.S0, VReg.S1, "_sd_lk_has", "_sd_lk_keys");
+        vm.label("_sd_lk_has");
+        vm.call("_set_new");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.load(VReg.S3, VReg.S0, 16);
+        vm.label("_sd_lk_hloop");
+        vm.cmpImm(VReg.S3, 0);
+        vm.jeq("_sd_h_done");
+        vm.load(VReg.A1, VReg.S3, 0);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_set_like_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_sd_lk_hnext");
+        vm.load(VReg.A1, VReg.S3, 0);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_set_add");
+        vm.label("_sd_lk_hnext");
+        vm.load(VReg.S3, VReg.S3, 8);
+        vm.jmp("_sd_lk_hloop");
+        vm.label("_sd_h_done");
+        emitCombRetSet(VReg.S2);
+        vm.label("_sd_lk_keys");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_set_clone");
+        vm.mov(VReg.S2, VReg.RET);
+        emitWalkKeys("_sd_k", VReg.S1, () => {
+            vm.load(VReg.A1, VReg.SP, 8);
+            vm.mov(VReg.A0, VReg.S2);
+            vm.call("_set_delete");
+        });
+        emitCombRetSet(VReg.S2);
 
         // ---- _set_symdiff(A0=a, A1=b) -> 新 Set((a\b) ∪ (b\a)) ----
         vm.label("_set_symdiff");
-        vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
-        vm.movImm64(VReg.V1, SET_MASK);
-        vm.and(VReg.S0, VReg.A0, VReg.V1);
-        vm.and(VReg.S1, VReg.A1, VReg.V1);
+        emitCombPrologue();
+        emitKindDispatch("_ss", "_set_sym_like", "_set_sym_fast");
+        vm.label("_set_sym_fast");
         vm.call("_set_new");
         vm.mov(VReg.S2, VReg.RET);
-        // 相 A：a 中不在 b 的
         vm.load(VReg.S3, VReg.S0, 16);
         vm.label("_set_sym_a");
         vm.cmpImm(VReg.S3, 0);
         vm.jeq("_set_sym_bstart");
         vm.load(VReg.A1, VReg.S3, 0);
-        vm.mov(VReg.A0, VReg.S1);          // b
+        vm.mov(VReg.A0, VReg.S1);
         vm.call("_set_has");
-        vm.lea(VReg.V1, "_js_true");
-        vm.load(VReg.V1, VReg.V1, 0);
-        vm.cmp(VReg.RET, VReg.V1);
+        vm.lea(VReg.V5, "_js_true");
+        vm.load(VReg.V5, VReg.V5, 0);
+        vm.cmp(VReg.RET, VReg.V5);
         vm.jeq("_set_sym_a_next");
         vm.load(VReg.A1, VReg.S3, 0);
         vm.mov(VReg.A0, VReg.S2);
@@ -775,18 +1033,17 @@ export class SetGenerator {
         vm.label("_set_sym_a_next");
         vm.load(VReg.S3, VReg.S3, 8);
         vm.jmp("_set_sym_a");
-        // 相 B：b 中不在 a 的
         vm.label("_set_sym_bstart");
         vm.load(VReg.S3, VReg.S1, 16);
         vm.label("_set_sym_b");
         vm.cmpImm(VReg.S3, 0);
         vm.jeq("_set_sym_done");
         vm.load(VReg.A1, VReg.S3, 0);
-        vm.mov(VReg.A0, VReg.S0);          // a
+        vm.mov(VReg.A0, VReg.S0);
         vm.call("_set_has");
-        vm.lea(VReg.V1, "_js_true");
-        vm.load(VReg.V1, VReg.V1, 0);
-        vm.cmp(VReg.RET, VReg.V1);
+        vm.lea(VReg.V5, "_js_true");
+        vm.load(VReg.V5, VReg.V5, 0);
+        vm.cmp(VReg.RET, VReg.V5);
         vm.jeq("_set_sym_b_next");
         vm.load(VReg.A1, VReg.S3, 0);
         vm.mov(VReg.A0, VReg.S2);
@@ -795,93 +1052,156 @@ export class SetGenerator {
         vm.load(VReg.S3, VReg.S3, 8);
         vm.jmp("_set_sym_b");
         vm.label("_set_sym_done");
-        vm.mov(VReg.RET, VReg.S2);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
+        emitCombRetSet(VReg.S2);
+        vm.label("_set_sym_like");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_set_clone");
+        vm.mov(VReg.S2, VReg.RET);
+        // 规范:SetDataHas(O.[[SetData]], next) 用 live this,不是 result。
+        // live 有 → 从 result 删;live 无 → 写入 result(已在则 no-op)。
+        emitWalkKeys("_ss_lk", VReg.S1, () => {
+            vm.load(VReg.A1, VReg.SP, 8);
+            vm.mov(VReg.A0, VReg.S0);
+            vm.call("_set_has");
+            vm.lea(VReg.V5, "_js_true");
+            vm.load(VReg.V5, VReg.V5, 0);
+            vm.cmp(VReg.RET, VReg.V5);
+            vm.jne("_ss_lk_add");
+            vm.load(VReg.A1, VReg.SP, 8);
+            vm.mov(VReg.A0, VReg.S2);
+            vm.call("_set_delete");
+            vm.jmp("_ss_lk_skip");
+            vm.label("_ss_lk_add");
+            vm.load(VReg.A1, VReg.SP, 8);
+            vm.mov(VReg.A0, VReg.S2);
+            vm.call("_set_add");
+            vm.label("_ss_lk_skip");
+        });
+        emitCombRetSet(VReg.S2);
 
-        // ---- _set_issubset(A0=a, A1=b) -> a ⊆ b ? _js_true : _js_false ----
-        // 游标 S2:_set_has 保存 S0..S2 → 保活。
+        // ---- _set_issubset(A0=a, A1=b) -> a ⊆ b ----
         vm.label("_set_issubset");
-        vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2]);
-        vm.movImm64(VReg.V1, SET_MASK);
-        vm.and(VReg.S0, VReg.A0, VReg.V1); // a
-        vm.and(VReg.S1, VReg.A1, VReg.V1); // b
-        vm.load(VReg.S2, VReg.S0, 16);     // cur = a.head
+        emitCombPrologue();
+        emitKindDispatch("_sb", "_set_issub_like", "_set_issub_fast");
+        vm.label("_set_issub_fast");
+        vm.load(VReg.S2, VReg.S0, 16);
         vm.label("_set_issub_loop");
         vm.cmpImm(VReg.S2, 0);
-        vm.jeq("_set_issub_true");
+        vm.jeq("_set_bool_true");
         vm.load(VReg.A1, VReg.S2, 0);
-        vm.mov(VReg.A0, VReg.S1);          // b
+        vm.mov(VReg.A0, VReg.S1);
         vm.call("_set_has");
-        vm.lea(VReg.V1, "_js_true");
-        vm.load(VReg.V1, VReg.V1, 0);
-        vm.cmp(VReg.RET, VReg.V1);
-        vm.jne("_set_issub_false");        // b 不含某元素 → 非子集
+        vm.lea(VReg.V5, "_js_true");
+        vm.load(VReg.V5, VReg.V5, 0);
+        vm.cmp(VReg.RET, VReg.V5);
+        vm.jne("_set_bool_false");
         vm.load(VReg.S2, VReg.S2, 8);
         vm.jmp("_set_issub_loop");
-        vm.label("_set_issub_true");
-        vm.lea(VReg.RET, "_js_true");
-        vm.load(VReg.RET, VReg.RET, 0);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 48);
-        vm.label("_set_issub_false");
-        vm.lea(VReg.RET, "_js_false");
-        vm.load(VReg.RET, VReg.RET, 0);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 48);
+        vm.label("_set_issub_like");
+        // this.size > other.size → false; otherwise 只 Call has,永不 Call keys。
+        emitSizeLe(VReg.S0, VReg.S1, "_sb_lk_walk", "_set_bool_false");
+        vm.label("_sb_lk_walk");
+        vm.load(VReg.S2, VReg.S0, 16);
+        vm.label("_sb_lk_loop");
+        vm.cmpImm(VReg.S2, 0);
+        vm.jeq("_set_bool_true");
+        vm.load(VReg.A1, VReg.S2, 0);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_set_like_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_set_bool_false");
+        vm.load(VReg.S2, VReg.S2, 8);
+        vm.jmp("_sb_lk_loop");
 
-        // ---- _set_issuperset(A0=a, A1=b) -> a ⊇ b（即 b ⊆ a）----
+        // ---- _set_issuperset(A0=a, A1=b) -> a ⊇ b ----
         vm.label("_set_issuperset");
-        vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2]);
-        vm.movImm64(VReg.V1, SET_MASK);
-        vm.and(VReg.S0, VReg.A0, VReg.V1); // a
-        vm.and(VReg.S1, VReg.A1, VReg.V1); // b
-        vm.load(VReg.S2, VReg.S1, 16);     // cur = b.head
+        emitCombPrologue();
+        emitKindDispatch("_sp", "_set_issup_like", "_set_issup_fast");
+        vm.label("_set_issup_fast");
+        vm.load(VReg.S2, VReg.S1, 16);
         vm.label("_set_issup_loop");
         vm.cmpImm(VReg.S2, 0);
-        vm.jeq("_set_issup_true");
+        vm.jeq("_set_bool_true");
         vm.load(VReg.A1, VReg.S2, 0);
-        vm.mov(VReg.A0, VReg.S0);          // a
+        vm.mov(VReg.A0, VReg.S0);
         vm.call("_set_has");
-        vm.lea(VReg.V1, "_js_true");
-        vm.load(VReg.V1, VReg.V1, 0);
-        vm.cmp(VReg.RET, VReg.V1);
-        vm.jne("_set_issup_false");
+        vm.lea(VReg.V5, "_js_true");
+        vm.load(VReg.V5, VReg.V5, 0);
+        vm.cmp(VReg.RET, VReg.V5);
+        vm.jne("_set_bool_false");
         vm.load(VReg.S2, VReg.S2, 8);
         vm.jmp("_set_issup_loop");
-        vm.label("_set_issup_true");
-        vm.lea(VReg.RET, "_js_true");
-        vm.load(VReg.RET, VReg.RET, 0);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 48);
-        vm.label("_set_issup_false");
-        vm.lea(VReg.RET, "_js_false");
-        vm.load(VReg.RET, VReg.RET, 0);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 48);
+        vm.label("_set_issup_like");
+        // if this.size < other.size return false. emitSizeLe: this<=other → need this<other.
+        // Compare: scvtf this, fcmp this ? other. jflt → this < other → false.
+        vm.load(VReg.V5, VReg.S0, 8);
+        vm.scvtf(0, VReg.V5);
+        vm.load(VReg.V5, VReg.S1, 16);
+        vm.fmovToFloat(1, VReg.V5);
+        vm.fcmp(0, 1);
+        vm.jflt("_set_bool_false");
+        emitWalkKeys("_sp_lk", VReg.S1, () => {
+            vm.load(VReg.A1, VReg.SP, 8);
+            vm.mov(VReg.A0, VReg.S0);
+            vm.call("_set_has");
+            vm.lea(VReg.V5, "_js_true");
+            vm.load(VReg.V5, VReg.V5, 0);
+            vm.cmp(VReg.RET, VReg.V5);
+            vm.jne("_sp_lk_miss");
+        });
+        vm.jmp("_set_bool_true");
+        vm.label("_sp_lk_miss");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.call("_iterator_close");
+        vm.jmp("_set_bool_false");
 
-        // ---- _set_isdisjoint(A0=a, A1=b) -> a ∩ b == ∅ ？----
+        // ---- _set_isdisjoint(A0=a, A1=b) -> a ∩ b == ∅ ----
         vm.label("_set_isdisjoint");
-        vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2]);
-        vm.movImm64(VReg.V1, SET_MASK);
-        vm.and(VReg.S0, VReg.A0, VReg.V1); // a
-        vm.and(VReg.S1, VReg.A1, VReg.V1); // b
-        vm.load(VReg.S2, VReg.S0, 16);     // cur = a.head
+        emitCombPrologue();
+        emitKindDispatch("_dj", "_set_disj_like", "_set_disj_fast");
+        vm.label("_set_disj_fast");
+        vm.load(VReg.S2, VReg.S0, 16);
         vm.label("_set_disj_loop");
         vm.cmpImm(VReg.S2, 0);
-        vm.jeq("_set_disj_true");
+        vm.jeq("_set_bool_true");
         vm.load(VReg.A1, VReg.S2, 0);
-        vm.mov(VReg.A0, VReg.S1);          // b
+        vm.mov(VReg.A0, VReg.S1);
         vm.call("_set_has");
-        vm.lea(VReg.V1, "_js_true");
-        vm.load(VReg.V1, VReg.V1, 0);
-        vm.cmp(VReg.RET, VReg.V1);
-        vm.jeq("_set_disj_false");         // 有公共元素 → 非不相交
+        vm.lea(VReg.V5, "_js_true");
+        vm.load(VReg.V5, VReg.V5, 0);
+        vm.cmp(VReg.RET, VReg.V5);
+        vm.jeq("_set_bool_false");
         vm.load(VReg.S2, VReg.S2, 8);
         vm.jmp("_set_disj_loop");
-        vm.label("_set_disj_true");
-        vm.lea(VReg.RET, "_js_true");
-        vm.load(VReg.RET, VReg.RET, 0);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 48);
-        vm.label("_set_disj_false");
-        vm.lea(VReg.RET, "_js_false");
-        vm.load(VReg.RET, VReg.RET, 0);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 48);
+        vm.label("_set_disj_like");
+        emitSizeLe(VReg.S0, VReg.S1, "_dj_lk_has", "_dj_lk_keys");
+        vm.label("_dj_lk_has");
+        vm.load(VReg.S2, VReg.S0, 16);
+        vm.label("_dj_lk_hloop");
+        vm.cmpImm(VReg.S2, 0);
+        vm.jeq("_set_bool_true");
+        vm.load(VReg.A1, VReg.S2, 0);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_set_like_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_set_bool_false");
+        vm.load(VReg.S2, VReg.S2, 8);
+        vm.jmp("_dj_lk_hloop");
+        vm.label("_dj_lk_keys");
+        emitWalkKeys("_dj_lk", VReg.S1, () => {
+            vm.load(VReg.A1, VReg.SP, 8);
+            vm.mov(VReg.A0, VReg.S0);
+            vm.call("_set_has");
+            vm.lea(VReg.V5, "_js_true");
+            vm.load(VReg.V5, VReg.V5, 0);
+            vm.cmp(VReg.RET, VReg.V5);
+            vm.jeq("_dj_lk_hit");
+        });
+        vm.jmp("_set_bool_true");
+        vm.label("_dj_lk_hit");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.call("_iterator_close");
+        vm.jmp("_set_bool_false");
 
         // ============================================================
         // [I2 一等值] Set.prototype 方法值闭包用的 _aref_generic 安全 wrapper 族。
@@ -1031,5 +1351,12 @@ export class SetGenerator {
         guarded("_aref_set_values", TYPE_SET, "_set_values", "Method Set.prototype.values called on incompatible receiver ");
         guarded("_aref_set_entries", TYPE_SET, "_set_entries", "Method Set.prototype.entries called on incompatible receiver ");
         guarded("_aref_set_size", TYPE_SET, "_aref_coll_size", "Method get Set.prototype.size called on incompatible receiver ");
+        guarded("_aref_set_union", TYPE_SET, "_set_union", "Method Set.prototype.union called on incompatible receiver ");
+        guarded("_aref_set_intersection", TYPE_SET, "_set_intersection", "Method Set.prototype.intersection called on incompatible receiver ");
+        guarded("_aref_set_difference", TYPE_SET, "_set_difference", "Method Set.prototype.difference called on incompatible receiver ");
+        guarded("_aref_set_symdiff", TYPE_SET, "_set_symdiff", "Method Set.prototype.symmetricDifference called on incompatible receiver ");
+        guarded("_aref_set_issubset", TYPE_SET, "_set_issubset", "Method Set.prototype.isSubsetOf called on incompatible receiver ");
+        guarded("_aref_set_issuperset", TYPE_SET, "_set_issuperset", "Method Set.prototype.isSupersetOf called on incompatible receiver ");
+        guarded("_aref_set_isdisjoint", TYPE_SET, "_set_isdisjoint", "Method Set.prototype.isDisjointFrom called on incompatible receiver ");
     }
 }

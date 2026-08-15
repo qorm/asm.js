@@ -2,7 +2,7 @@
 // 编译函数表达式、闭包、函数体
 
 import { VReg } from "../../vm/index.js";
-import { analyzeCapturedVariables, analyzeSharedVariables, analyzeDirectEvalBoxedVars, collectLocalDeclarations } from "../../lang/analysis/closure.js";
+import { analyzeCapturedVariables, analyzeSharedVariables, analyzeDirectEvalBoxedVars, collectLocalDeclarations, collectVarDeclarations } from "../../lang/analysis/closure.js";
 import { ASYNC_CLOSURE_MAGIC, isAsyncFunction, isGeneratorFunction } from "../async/index.js";
 
 // 闭包魔数 - 用于区分普通函数指针和闭包对象
@@ -15,6 +15,38 @@ const TDZ_SENTINEL = 0x7ff70000deadbeefn;
 
 // 闭包编译方法混入
 export const ClosureCompiler = {
+    // [L1 var hoist] 进入 VariableEnvironment 时把所有 var 绑定写成 undefined。
+    // body: BlockStatement / 表达式体 / Program body 数组之父节点均可。
+    // 跳过已有槽的参数/捕获(保留其值);boxed 则预建 box(值=undefined)。
+    emitHoistedVarInits(body) {
+        if (!body) return;
+        const vm = this.vm;
+        const vars = {};
+        collectVarDeclarations(body, vars);
+        if (!this.ctx.preboxedVars) this.ctx.preboxedVars = new Set();
+        const undef = 0x7ffb000000000000n; // JS_UNDEFINED
+        for (const name in vars) {
+            if (!Object.prototype.hasOwnProperty.call(vars, name)) continue;
+            if (name === "__this" || name === "arguments") continue;
+            let off = this.ctx.getLocal(name);
+            const already = !!off;
+            // 参数/捕获已有槽:不覆盖(参数已绑定实参;捕获 box 已就位)
+            if (already) continue;
+            off = this.ctx.allocLocal(name);
+            const needsBox = this.ctx.boxedVars && this.ctx.boxedVars.has(name);
+            if (needsBox) {
+                vm.call("_box_alloc");
+                vm.movImm64(VReg.V1, undef);
+                vm.store(VReg.RET, 0, VReg.V1);
+                vm.store(VReg.FP, off, VReg.RET);
+                this.ctx.preboxedVars.add(name);
+            } else {
+                vm.movImm64(VReg.V1, undef);
+                vm.store(VReg.FP, off, VReg.V1);
+            }
+        }
+    },
+
     // 剩余参数 ...rest：把 A_pos..A4 中非 undefined 的实参收集为数组存入 rest 局部。
     // A5 保留给 this（方法约定），故最多收 5 个。遇 undefined 停止（未提供实参已被
     // 调用方填 JS_UNDEFINED）。用于 scratchReg(...regs) 等。
@@ -43,6 +75,35 @@ export const ClosureCompiler = {
             vm.store(VReg.FP, restOff, VReg.RET);
         }
         vm.label(done);
+    },
+
+    // [D1 L3b] 函数体指令序言是否含 "use strict"(含其它 leading 字符串指令之后)。
+    // 与 parser.peekUseStrictDirective 对齐的廉价 AST 版:只看 BlockStatement 体首连续
+    // ExpressionStatement(字符串字面量)指令序言。
+    _hasUseStrictDirective(expr) {
+        if (!expr || !expr.body) return false;
+        const stmts = expr.body.type === "BlockStatement" ? expr.body.body : null;
+        if (!stmts || stmts.length === 0) return false;
+        for (let i = 0; i < stmts.length; i++) {
+            const s = stmts[i];
+            if (!s || s.type !== "ExpressionStatement") break;
+            const e = s.expression;
+            if (!e || e.type !== "Literal" || typeof e.value !== "string") break;
+            if (e.value === "use strict") return true;
+        }
+        return false;
+    },
+
+    // [D1 L3b] 函数 [[Strict]]:自有指令 / 外层 inStrictFunction / 程序级 _bsStrict / 类体。
+    // 结果供 registerFuncMeta 打包进 kind 高字节,以及 compileFunctionBody 继承给嵌套函数。
+    _computeFunctionStrict(expr) {
+        if (!expr) return false;
+        if (expr._fnStrict === true) return true;
+        if (this._hasUseStrictDirective(expr)) return true;
+        if (this.ctx && this.ctx.inStrictFunction) return true;
+        if (this.ctx && this.ctx.inClass) return true;
+        if (this._currentModuleAst && this._currentModuleAst._bsStrict) return true;
+        return false;
     },
 
     // 编译函数表达式
@@ -122,6 +183,13 @@ export const ClosureCompiler = {
             vm.store(VReg.FP, argOff, VReg.RET);
         }
         vm.label(done);
+        // 标记 arguments 异质:越界 [[Set]] 不抬 length(ARR_IS_ARGUMENTS=bit5)
+        vm.load(VReg.A0, VReg.FP, argOff);
+        vm.emitMaskLoad(VReg.V4);
+        vm.andMaskReg(VReg.V0, VReg.A0, VReg.V4); // 裸头
+        vm.loadByte(VReg.V1, VReg.V0, 1);
+        vm.orImm(VReg.V1, VReg.V1, 32);
+        vm.storeByte(VReg.V0, 1, VReg.V1);
         for (let k = 0; k <= 4; k++) {
             vm.load(vm.getArgReg(k), VReg.FP, saved[k]);
         }
@@ -151,6 +219,10 @@ export const ClosureCompiler = {
         // 与 compileMethodCall 的普通闭包路径都会调到 stub(方法调用经 A5 传 this)。
         // 不再用 ASYNC_CLOSURE_MAGIC(那条 call-site 内联建协程路径只覆盖 f() 不覆盖 obj.f())。
         const isAsyncClosureMagic = false;
+
+        // [D1 L3b] 定义处即盖章 [[Strict]],供延迟 generatePendingFunctions→registerFuncMeta
+        // 读取(届时外层 inStrictFunction 已恢复)。不扩闭包头(captured@16 热路径不变)。
+        expr._fnStrict = this._computeFunctionStrict(expr);
 
         // 总是创建闭包对象，即使没有捕获变量
         // 这样可以统一闭包调用机制，避免区分普通函数指针和闭包对象
@@ -260,7 +332,6 @@ export const ClosureCompiler = {
         if (!this.pendingFunctions || this.pendingFunctions.length === 0) {
             return;
         }
-
         for (const func of this.pendingFunctions) {
             this.vm.label(func.label);
             // [函数元数据] func.label 即闭包 func_ptr(见 compileFunctionExpression 存 +8)。
@@ -281,18 +352,19 @@ export const ClosureCompiler = {
             if (func.sourcePath) this.sourcePath = func.sourcePath;
             // [批次D] 生成器函数表达式：标签处先落 stub（建协程+生成器对象后即返回），
             // 真正函数体在 <label>_gbody，由 _coroutine_entry 首次 resume 时进入。
+            let fdiList = null;
             if (isGeneratorFunction(func.expr) && !isAsyncFunction(func.expr)) {
-                this.emitGeneratorStub(func.label + "_gbody", true, undefined, func.captured);
+                fdiList = this.emitGeneratorStub(func.label + "_gbody", true, undefined, func.captured);
             } else if (isGeneratorFunction(func.expr) && isAsyncFunction(func.expr)) {
                 // async function*：async 生成器 stub(构造器 _async_generator_new)
-                this.emitAsyncGeneratorStub(func.label + "_gbody", true, func.captured);
+                fdiList = this.emitAsyncGeneratorStub(func.label + "_gbody", true, func.captured);
             } else if (isAsyncFunction(func.expr)) {
                 // async 函数/方法(表达式):标签处落 async stub(建协程+Promise 返回),真体在
                 // _gbody。闭包用 CLOSURE_MAGIC(见下),故 compileClosureCall/compileMethodCall
                 // 的普通闭包路径都会调到本 stub(方法调用经 A5 传 this → CORO_THIS),统一。
                 this.emitAsyncMethodStub(func.label + "_gbody", true);
             }
-            this.compileFunctionBody(func.expr, func.captured);
+            this.compileFunctionBody(func.expr, func.captured, fdiList);
             this._currentModuleAst = savedModuleAst;
             this.ctx.mainCapturedVars = savedMCV;
             this.ctx.functionAliases = savedFA;
@@ -303,7 +375,8 @@ export const ClosureCompiler = {
     },
 
     // 编译函数体
-    compileFunctionBody(expr, captured) {
+    // [FDI eager] fdiList=生成器 pattern 形参在 stub 已完成绑定的叶名序(非生成器恒 null)。
+    compileFunctionBody(expr, captured, fdiList = null) {
         const params = expr.params || [];
         const vm = this.vm;
 
@@ -326,12 +399,17 @@ export const ClosureCompiler = {
         const prevInAsyncFunction = this.ctx.inAsyncFunction;
         const prevInAsyncGenerator = this.ctx.inAsyncGenerator;
         const prevInCoroBody = this.ctx.inCoroBody;
+        const prevInStrictFunction = this.ctx.inStrictFunction;
 
         this.ctx.locals = {};
         this.ctx.stackOffset = 0;
         this.ctx.inAsyncFunction = isAsync;
         this.ctx.inAsyncGenerator = isAsync && isGenerator;
         this.ctx.inCoroBody = isGenerator; // [gen unwind] 生成器体(含 async gen)跑协程栈
+        // [D1 L3b] 本函数 [[Strict]] 继承给体内嵌套函数表达式(OrdinaryCallBindThis)。
+        const fnStrict = this._computeFunctionStrict(expr);
+        expr._fnStrict = fnStrict;
+        this.ctx.inStrictFunction = fnStrict;
 
         // 分析函数体中哪些变量会被内部闭包捕获
         const innerBoxedVars = analyzeSharedVariables(expr);
@@ -420,6 +498,9 @@ export const ClosureCompiler = {
             } else if (this._isPatternParam(p)) {
                 // [#47] 解构参数 ({a,b})=>.. / function({a,b}){}：实参落临时槽,
                 // 解构延后到全部实参入栈后(防 A 寄存器互踩)。
+                // [FDI eager] 生成器 pattern 形参已在调用期(stub)完成绑定,体内不重复
+                // 解构(见下 patternParams 循环的 transfer 路径),此处也不落槽。
+                if (isGenerator && fdiList) continue;
                 const pat = p.type === "AssignmentPattern" ? p.left : p;
                 const dexpr = p.type === "AssignmentPattern" ? p.right : null;
                 const pslot = this.ctx.allocLocal(`__parampat_${this.nextLabelId()}`);
@@ -504,9 +585,19 @@ export const ClosureCompiler = {
         }
 
         // [#47] 解构参数:所有实参已落栈,此处安全解构到局部。
-        for (let i = 0; i < patternParams.length; i++) {
-            this.emitParamDestructure(patternParams[i].pat, patternParams[i].slot, patternParams[i].dflt);
+        // [FDI eager] 生成器 pattern 形参已在调用期(stub)绑定:从 coro+168 transfer 数组
+        // 按绑定序取叶值,跳过重复解构(二重消费自定义迭代器会错值/错计)。
+        if (isGenerator && fdiList) {
+            this.emitGenTransferLoads(fdiList);
+        } else {
+            for (let i = 0; i < patternParams.length; i++) {
+                this.emitParamDestructure(patternParams[i].pat, patternParams[i].slot, patternParams[i].dflt);
+            }
         }
+
+        // [L1 var hoist] 须在共享局部 TDZ 预建之前:var 绑=undefined;随后 prebox
+        // 只补 let/const(已有槽的 var 跳过)。
+        this.emitHoistedVarInits(expr.body);
 
         // [L2-②] 前向引用共享局部预绑定:函数体内声明、且被嵌套闭包捕获的局部
         // (analyzeSharedVariables 已并入 innerBoxedVars),若闭包在声明**之前**创建
@@ -515,14 +606,14 @@ export const ClosureCompiler = {
         // 此前仅预分配失败 → 闭包捕获不到该名 → 体里读它落 compileIdentifier 兜底 0
         // (自 L2-② 起抛 ReferenceError,直接崩事件回调)。顶层共享变量走 mainCapturedVars
         // 全局 box(_main 序言已预建),不受此影响;这里只补**局部**共享变量的同名缺口。
-        this.ctx.preboxedVars = new Set();
+        this.ctx.preboxedVars = this.ctx.preboxedVars || new Set();
         if (innerBoxedVars && innerBoxedVars.size > 0) {
             const bodyLocals = {};
             collectLocalDeclarations(expr.body, bodyLocals);
             for (const nm in bodyLocals) {
                 if (!Object.prototype.hasOwnProperty.call(bodyLocals, nm)) continue;
                 if (!innerBoxedVars.has(nm)) continue;
-                if (this.ctx.getLocal(nm)) continue; // 参数/已捕获外层变量
+                if (this.ctx.getLocal(nm)) continue; // 参数/已捕获外层变量 / 已 hoist 的 var
                 const off = this.ctx.allocLocal(nm);
                 vm.call("_box_alloc");
                 vm.movImm64(VReg.V1, TDZ_SENTINEL);
@@ -544,9 +635,12 @@ export const ClosureCompiler = {
             hasImplicitReturn = true;
         }
 
-        // 默认返回 0（只有没有隐式返回时）
+        // 函数体自然落底(无显式 return):返回真正的 undefined(0x7FFB),而非裸 int 0
+        // ——与 FunctionDeclaration / 显式 `return;` 对齐。此前 function 表达式落 0,
+        // 令 `String({valueOf:function(){},toString:void 0})` 误走 ToPrimitive TypeError
+        // (valueOf 成功但 RET=0 被当成「无 valueOf」),以及 o.m()===0 等假值混淆。
         if (!hasImplicitReturn) {
-            vm.movImm(VReg.RET, 0);
+            vm.movImm64(VReg.RET, 0x7ffb000000000000n);
         }
         vm.label(returnLabel);
         if (isAsync && !isGenerator) {
@@ -569,6 +663,7 @@ export const ClosureCompiler = {
         this.ctx.inAsyncFunction = prevInAsyncFunction;
         this.ctx.inAsyncGenerator = prevInAsyncGenerator;
         this.ctx.inCoroBody = prevInCoroBody;
+        this.ctx.inStrictFunction = prevInStrictFunction;
         this.ctx.exceptionLabel = prevExceptionLabel;
     },
 };

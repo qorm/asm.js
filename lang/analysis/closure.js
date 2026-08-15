@@ -57,8 +57,15 @@ export function analyzeCapturedVariables(funcExpr, outerLocals, functions) {
     collectReferencedVariables(funcExpr.body, referenced);
     // 参数默认值/计算键中引用的外层变量也需捕获(({x=a})=>x 捕获外层 a)。
     // pattern 自身的绑定名会一并混入 referenced,但下方按 paramNames 过滤掉。
+    // [嵌套默认值] 默认值内**嵌套函数**(IIFE/箭头)引用的更外层变量同样须上抛:
+    // `function f(x = function(){ return iter; }())` 的 iter 经 IIFE 体引用,但嵌套函数
+    // 只捕获其自身作用域外的名(iter 不在 f 的 locals)→ 若不上抛,iter 不入 boxedVars
+    // → 全局 box 缺失 → IIFE 体 compileIdentifier 判 unresolvable 抛 ReferenceError
+    // (dstr ary-empty-init 族「iter is not defined」根因)。collectNestedFunctionReferences
+    // 与体内路径同判据(排除嵌套函数自身参数/局部与当前 localScope)。
     for (let i = 0; i < params.length; i++) {
         collectReferencedVariables(params[i], referenced);
+        collectNestedFunctionReferences(params[i], referenced, { ...paramNames, ...localVars });
     }
 
     // 递归收集嵌套函数需要的外部变量
@@ -152,7 +159,7 @@ export function collectLocalDeclarations(node, vars) {
         if (node.finalizer) {
             collectLocalDeclarations(node.finalizer, vars);
         }
-    } else if (node.type === "SwitchStatement") {
+        } else if (node.type === "SwitchStatement") {
         const cases = node.cases || [];
         for (let i = 0; i < cases.length; i++) {
             const c = cases[i];
@@ -160,6 +167,64 @@ export function collectLocalDeclarations(node, vars) {
                 collectLocalDeclarations(c.consequent[j], vars);
             }
         }
+    } else if (node.type === "WithStatement") {
+        // with 体内 var 仍属函数/脚本作用域(ES sloppy),须计入局部表
+        collectLocalDeclarations(node.body, vars);
+    } else if (node.type === "LabeledStatement") {
+        collectLocalDeclarations(node.body, vars);
+    }
+}
+
+// 仅收集 `var` 绑定名(不含 let/const)。用于作用域入口初始化为 undefined
+// (ES: var 提升且在进入 VariableEnvironment 时创绑定=undefined;未执行到声明语句
+// 的赋值前读应得 undefined,而非栈槽垃圾)。不进入嵌套函数。
+export function collectVarDeclarations(node, vars) {
+    if (!node) return;
+
+    if (node.type === "VariableDeclaration") {
+        if (node.kind && node.kind !== "var") return; // let/const → TDZ,不在此初始化
+        const decls = node.declarations || [];
+        for (let i = 0; i < decls.length; i++) {
+            if (decls[i].id) collectPatternNames(decls[i].id, vars);
+        }
+        return;
+    }
+    // 不进入嵌套函数(其有独立 VariableEnvironment)
+    if (node.type === "FunctionExpression" || node.type === "ArrowFunctionExpression" ||
+        node.type === "FunctionDeclaration" || node.type === "ClassDeclaration" ||
+        node.type === "ClassExpression") {
+        return;
+    }
+    if (node.type === "BlockStatement") {
+        const body = node.body || [];
+        for (let i = 0; i < body.length; i++) collectVarDeclarations(body[i], vars);
+    } else if (node.type === "IfStatement") {
+        collectVarDeclarations(node.consequent, vars);
+        if (node.alternate) collectVarDeclarations(node.alternate, vars);
+    } else if (node.type === "WhileStatement" || node.type === "DoWhileStatement") {
+        collectVarDeclarations(node.body, vars);
+    } else if (node.type === "ForStatement") {
+        if (node.init) collectVarDeclarations(node.init, vars);
+        collectVarDeclarations(node.body, vars);
+    } else if (node.type === "ForInStatement" || node.type === "ForOfStatement") {
+        if (node.left && node.left.type === "VariableDeclaration") {
+            collectVarDeclarations(node.left, vars);
+        }
+        collectVarDeclarations(node.body, vars);
+    } else if (node.type === "TryStatement") {
+        collectVarDeclarations(node.block, vars);
+        if (node.handler) collectVarDeclarations(node.handler.body, vars);
+        if (node.finalizer) collectVarDeclarations(node.finalizer, vars);
+    } else if (node.type === "SwitchStatement") {
+        const cases = node.cases || [];
+        for (let i = 0; i < cases.length; i++) {
+            const c = cases[i];
+            for (let j = 0; j < c.consequent.length; j++) {
+                collectVarDeclarations(c.consequent[j], vars);
+            }
+        }
+    } else if (node.type === "WithStatement" || node.type === "LabeledStatement") {
+        collectVarDeclarations(node.body, vars);
     }
 }
 
