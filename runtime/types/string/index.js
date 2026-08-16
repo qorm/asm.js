@@ -927,6 +927,141 @@ export class StringGenerator {
         vm.movImm(VReg.V0, 0);
         vm.storeByte(VReg.S1, 1, VReg.V0);
 
+        // [2026-07] 注:恒单字节是本引擎字符串模型的既定口径(1 字节 = 1 索引字符),
+        // 编译器自举源码的 lexer._cpToUtf8 依赖 fromCharCode 按字节拼 UTF-8(≥0x80 的
+        // 单字节)。改多字节会令 native 自举产物与 node host 分叉(gen1≠gen2)。码点级
+        // 构造走 _cp_to_str(fromCodePoint 专属)。
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.RET, VReg.S1, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S4, VReg.S5], 16);
+    }
+
+    // _cp_to_str(code) -> 单码点装箱串 (String.fromCodePoint)。1-4 字节 UTF-8;
+    // 非 [0,0x10FFFF] 或代理区(0xD800-0xDFFF)→ RangeError(ES 21.1.2.2)。
+    // 此前 fromCodePoint 复用 _char_to_str(ToUint16 截断) → astral 码点丢高 16 位
+    // (property-escapes buildString 的 astral 区间族根因)。
+    generateCpToStr() {
+        const vm = this.vm;
+        vm.label("_cp_to_str");
+        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S4, VReg.S5]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.call("_number_coerce"); // RET = raw float64 位
+        vm.mov(VReg.S0, VReg.RET);
+        // 校验(ES 21.1.2.2):NaN/±Inf、负(除 -0)、非整数、> 0x10FFFF、代理区 → RangeError。
+        vm.shrImm(VReg.V1, VReg.S0, 52);
+        vm.andImm(VReg.V1, VReg.V1, 0x7ff);
+        vm.cmpImm(VReg.V1, 0x7ff);
+        vm.jeq("_cps_range_err");                // NaN / ±Infinity
+        vm.movImm64(VReg.V2, 0x7fffffffffffffffn);
+        vm.and(VReg.V1, VReg.S0, VReg.V2);       // |v|
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_cps_zero");                     // +0 / -0 → U+0000
+        vm.shrImm(VReg.V2, VReg.S0, 63);
+        vm.andImm(VReg.V2, VReg.V2, 1);
+        vm.cmpImm(VReg.V2, 0);
+        vm.jne("_cps_range_err");                // 负数
+        vm.movImm64(VReg.V2, 0x4340000000000000n); // 2^53
+        vm.cmp(VReg.V1, VReg.V2);
+        vm.jge("_cps_range_err");                // ≥2^53 必非整/越界
+        vm.fmovToFloat(0, VReg.S0);
+        vm.fcvtzs(VReg.S4, 0);                   // 截断
+        vm.scvtf(1, VReg.S4);
+        vm.fmovToInt(VReg.V2, 1);
+        vm.cmp(VReg.V2, VReg.S0);
+        vm.jne("_cps_range_err");                // 非整数(3.14 等)
+        vm.cmpImm(VReg.S4, 0x10ffff);
+        vm.jgt("_cps_range_err");                // > 0x10FFFF
+        vm.jmp("_cps_len");
+        // (代理区不拒:ES 21.1.2.2 只查 0..0x10FFFF 与整数性,孤立代理合法 —
+        //  Node 对拍;nonMatchSymbols 含 [0xDC00,0xDFFF] 区间,拒之则 property-escapes
+        //  全族 RangeError。0xD800-0xDFFF 落 3 字节编码,与源字面量口径一致。)
+        vm.label("_cps_zero");
+        vm.movImm(VReg.S4, 0);
+        vm.jmp("_cps_len");
+        vm.label("_cps_range_err");
+        vm.call("_ta_throw_range");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S4, VReg.S5], 16); // 理论不达
+        vm.label("_cps_len");
+        // S4 = cp(裸 int)。字节长:1/2/3/4
+        vm.movImm(VReg.S5, 1);
+        vm.cmpImm(VReg.S4, 0x80);
+        vm.jlt("_cps_alloc");
+        vm.movImm(VReg.S5, 2);
+        vm.cmpImm(VReg.S4, 0x800);
+        vm.jlt("_cps_alloc");
+        vm.movImm(VReg.S5, 3);
+        vm.cmpImm(VReg.S4, 0x10000);
+        vm.jlt("_cps_alloc");
+        vm.movImm(VReg.S5, 4);
+        vm.label("_cps_alloc");
+        vm.mov(VReg.A0, VReg.S5);
+        vm.addImm(VReg.A0, VReg.A0, 8);
+        vm.call("_alloc");
+        vm.mov(VReg.S1, VReg.RET);
+        // 头:type=STRING(只改低字节)、len=S5
+        vm.load(VReg.V0, VReg.S1, -16);
+        vm.movImm64(VReg.V1, 0xffffffffffffff00n);
+        vm.and(VReg.V0, VReg.V0, VReg.V1);
+        vm.movImm(VReg.V1, TYPE_STRING);
+        vm.or(VReg.V0, VReg.V0, VReg.V1);
+        vm.store(VReg.S1, -16, VReg.V0);
+        vm.store(VReg.S1, -8, VReg.S5);
+        // 分派编码(S4 = cp)
+        vm.cmpImm(VReg.S5, 1);
+        vm.jeq("_cps_1");
+        vm.cmpImm(VReg.S5, 2);
+        vm.jeq("_cps_2");
+        vm.cmpImm(VReg.S5, 3);
+        vm.jeq("_cps_3");
+        // 4 字节:F0 | (cp>>18), 80 | ((cp>>12)&3F), 80 | ((cp>>6)&3F), 80 | (cp&3F)
+        vm.shrImm(VReg.V2, VReg.S4, 18);
+        vm.orImm(VReg.V2, VReg.V2, 0xf0);
+        vm.shrImm(VReg.V3, VReg.S4, 12);
+        vm.andImm(VReg.V3, VReg.V3, 0x3f);
+        vm.orImm(VReg.V3, VReg.V3, 0x80);
+        vm.shrImm(VReg.V4, VReg.S4, 6);
+        vm.andImm(VReg.V4, VReg.V4, 0x3f);
+        vm.orImm(VReg.V4, VReg.V4, 0x80);
+        vm.andImm(VReg.V0, VReg.S4, 0x3f);
+        vm.orImm(VReg.V0, VReg.V0, 0x80);
+        vm.storeByte(VReg.S1, 0, VReg.V2);
+        vm.storeByte(VReg.S1, 1, VReg.V3);
+        vm.storeByte(VReg.S1, 2, VReg.V4);
+        vm.storeByte(VReg.S1, 3, VReg.V0);
+        vm.movImm(VReg.V0, 0);
+        vm.storeByte(VReg.S1, 4, VReg.V0);
+        vm.jmp("_cps_done");
+        vm.label("_cps_3");
+        vm.shrImm(VReg.V2, VReg.S4, 12);
+        vm.orImm(VReg.V2, VReg.V2, 0xe0);
+        vm.shrImm(VReg.V3, VReg.S4, 6);
+        vm.andImm(VReg.V3, VReg.V3, 0x3f);
+        vm.orImm(VReg.V3, VReg.V3, 0x80);
+        vm.andImm(VReg.V0, VReg.S4, 0x3f);
+        vm.orImm(VReg.V0, VReg.V0, 0x80);
+        vm.storeByte(VReg.S1, 0, VReg.V2);
+        vm.storeByte(VReg.S1, 1, VReg.V3);
+        vm.storeByte(VReg.S1, 2, VReg.V0);
+        vm.movImm(VReg.V0, 0);
+        vm.storeByte(VReg.S1, 3, VReg.V0);
+        vm.jmp("_cps_done");
+        vm.label("_cps_2");
+        vm.shrImm(VReg.V2, VReg.S4, 6);
+        vm.orImm(VReg.V2, VReg.V2, 0xc0);
+        vm.andImm(VReg.V0, VReg.S4, 0x3f);
+        vm.orImm(VReg.V0, VReg.V0, 0x80);
+        vm.storeByte(VReg.S1, 0, VReg.V2);
+        vm.storeByte(VReg.S1, 1, VReg.V0);
+        vm.movImm(VReg.V0, 0);
+        vm.storeByte(VReg.S1, 2, VReg.V0);
+        vm.jmp("_cps_done");
+        vm.label("_cps_1");
+        vm.storeByte(VReg.S1, 0, VReg.S4);
+        vm.movImm(VReg.V0, 0);
+        vm.storeByte(VReg.S1, 1, VReg.V0);
+        vm.label("_cps_done");
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.RET, VReg.S1, VReg.V1);
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
@@ -6234,6 +6369,7 @@ export class StringGenerator {
         this.generateStrConcatIP(); // [L4.1] 原地拼接助手(编译器逃逸门控专用;守卫不满足尾委托 _strconcat)
         this.generateCstrToHeapStr();
         this.generateCharToStr();
+        this.generateCpToStr(); // [fromCodePoint astral] 码点→UTF-8 串(含 RangeError 校验)
         this.generatePadEnd();
         this.generatePadStart();
         this.generateIntToStr();

@@ -117,6 +117,7 @@ function _scanProps(pattern, modeV) {
     var classNeg = false;   // 类以 ^ 开头(否定类):字符串属性在否定类内非法
     var negPending = false; // 类的下一个字符是否可能是否定 ^(尚未消费首字符)
     var atomSeen = false;   // [W-P9] 自 `[` 或上一个 `&&` 以来是否已消费类集原子
+    var dashAsPrev = false; // [test262] 类内刚消费的原子是 '-' 且此前有原子(a-\p{X} 形)
     var i = 0;
     var n = pattern.length;
     while (i < n) {
@@ -153,21 +154,20 @@ function _scanProps(pattern, modeV) {
                     if (!modeV || neg || (inClass && classNeg)) return "Invalid property name";
                 } else {
                     var ri = _uniResolve(name, value, hasEq);
-                    if (ri === -2) {
-                        // Binary property with value: check if valid
-                        ri = _uniResolveBin(name, value);
-                        if (ri < 0) return "Invalid property name";
-                    } else if (ri < 0) {
-                        return "Invalid property name";
-                    }
+                    // [test262 binary-property-with-value-*] 二元属性带值(name=Yes/No)
+                    // 一律 SyntaxError:ES UnicodeMatchProperty 只给 gc/sc/scx 开 name=value
+                    // 形(此前按"value 合法即收"误放行 \p{ASCII=Yes} 族)。
+                    if (ri < 0) return "Invalid property name";
                 }
-                // [test262] 类内 \p{} 紧接 '-' 且其后还有原子 → 范围端点 → SyntaxError
-                // (u 模式;v 模式 "--" 集合差文法未实现,整族留后续)
-                if (!modeV && inClass && pattern.charAt(j) === "-" &&
-                    pattern.charAt(j + 1) !== "]" && pattern.charAt(j + 1) !== "") {
+                // [test262] 类内 \p{} 作范围端点 → SyntaxError(u 模式;v 模式类集合
+                // 文法未实现,整族留后续)。两个方向都查:\p{…}- 与 -\p{…}。
+                if (!modeV && inClass && (dashAsPrev ||
+                    (pattern.charAt(j) === "-" &&
+                     pattern.charAt(j + 1) !== "]" && pattern.charAt(j + 1) !== ""))) {
                     return "Invalid character class";
                 }
                 if (inClass) atomSeen = true;   // 属性转义是类集原子
+                dashAsPrev = false;
                 i = j;
                 continue;
             }
@@ -201,10 +201,11 @@ function _scanProps(pattern, modeV) {
             classNeg = pattern.charAt(i + 1) === "^";
             negPending = classNeg;
             atomSeen = false;   // 新类从零计:类首(及 [^ 后)尚无原子
+            dashAsPrev = false;
             i = i + 1;
             continue;
         }
-        if (ch === "]") { inClass = false; classNeg = false; negPending = false; atomSeen = false; i = i + 1; continue; }
+        if (ch === "]") { inClass = false; classNeg = false; negPending = false; atomSeen = false; dashAsPrev = false; i = i + 1; continue; }
         if (inClass) {
             // 类首字符:若是否定 ^,只是标记,不是原子;处理完首字符后 negPending 复位,
             // 使类内后续 `^`(如 [^^a] 的第二个 ^)恢复为普通字面原子。
@@ -237,6 +238,13 @@ function _scanProps(pattern, modeV) {
             }
             if (modeV && ch === pattern.charAt(i + 1) && _isReservedDouble(ch)) {
                 return "Invalid character class";
+            }
+            // [test262 character-class-range-*] dash 原子追踪:a-\p{X} 形(此前仅查
+            // \p{X}-a 方向,漏 [--\p{Hex}] 等)。
+            if (ch === "-") {
+                if (atomSeen) dashAsPrev = true; else dashAsPrev = false;
+            } else {
+                dashAsPrev = false;
             }
             atomSeen = true;
             i = i + 1;

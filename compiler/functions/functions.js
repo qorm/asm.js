@@ -3219,9 +3219,11 @@ export const FunctionCompiler = {
 
             // String 静态方法
             if (obj.type === "Identifier" && obj.name === "String") {
-                // fromCodePoint 在 BMP(码点 < 0x10000)等价 fromCharCode;astral 需代理对/多字节
-                // (asm.js UTF-8 模型),记偏差。此前 fromCodePoint 未实现 → 崩。
+                // fromCodePoint:码点语义(astral → 4 字节 UTF-8、越界/代理 → RangeError);
+                // fromCharCode:ToUint16 码元语义。此前二者同走 _char_to_str(截 16 位)
+                // → fromCodePoint astral 丢高 16 位(property-escapes buildString 族根因)。
                 if (prop.name === "fromCharCode" || prop.name === "fromCodePoint") {
+                    const cpHelper = prop.name === "fromCodePoint" ? "_cp_to_str" : "_char_to_str";
                     if (expr.arguments.length === 0) {
                         this.vm.lea(VReg.A0, "_str_empty");
                         this.vm.call("_js_box_string");
@@ -3230,13 +3232,13 @@ export const FunctionCompiler = {
                     // 首字符 → 装箱串（RET = acc）
                     this.compileExpression(expr.arguments[0]);
                     this.vm.mov(VReg.A0, VReg.RET);
-                    this.vm.call("_char_to_str");
-                    // 其余每个 code → _char_to_str 后 _strconcat 累加（多参之前只取首个 → "HI" 得 "H"）
+                    this.vm.call(cpHelper);
+                    // 其余每个 code → helper 后 _strconcat 累加（多参之前只取首个 → "HI" 得 "H"）
                     for (let ci = 1; ci < expr.arguments.length; ci++) {
                         this.vm.push(VReg.RET);                 // 存 acc
                         this.compileExpression(expr.arguments[ci]);
                         this.vm.mov(VReg.A0, VReg.RET);
-                        this.vm.call("_char_to_str");
+                        this.vm.call(cpHelper);
                         this.vm.mov(VReg.A1, VReg.RET);         // A1 = 本字符
                         this.vm.pop(VReg.A0);                   // A0 = acc
                         this.vm.call("_strconcat");             // RET = acc + 本字符

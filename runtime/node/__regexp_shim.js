@@ -1272,6 +1272,58 @@ function __re_repAtom(mst, node, pos, cont) {
     return r;
 }
 
+// [iterative greedy] 简单原子(单字符 char/cls/up/str/any,无捕获组)的直接匹配:
+// 返回下一位置或 -1(不接 continuation,供 __re_mRep 迭代吃满用)。
+function __re_mNodeSimple(mst, node, pos) {
+    var k = node.k;
+    if (k === "char") {
+        var cic = node.fi !== undefined ? node.fi : mst.ic;
+        if (pos < mst.n && __re_charEq(cic, node.c, mst.s.charCodeAt(pos))) return pos + 1;
+        return -1;
+    }
+    if (k === "cls") {
+        var lic = node.fi !== undefined ? node.fi : mst.ic;
+        if (pos >= mst.n) return -1;
+        if (node.cp) {
+            var pk = __re_cpAt(mst.s, pos, mst.n);
+            var plen = pk % 8;
+            if (__re_clsMatch(lic, node, (pk - plen) / 8)) return pos + plen;
+            return -1;
+        }
+        if (__re_clsMatch(lic, node, mst.s.charCodeAt(pos))) return pos + 1;
+        return -1;
+    }
+    if (k === "up") {
+        if (pos >= mst.n) return -1;
+        var upk = __re_cpAt(mst.s, pos, mst.n);
+        var ulen = upk % 8;
+        var uic = node.fi !== undefined ? node.fi : mst.ic;
+        if (__re_uniMatch(node.ti, node.neg, uic, (upk - ulen) / 8)) return pos + ulen;
+        return -1;
+    }
+    if (k === "str") {
+        var cs = node.cs;
+        var cn = cs.length;
+        if (pos + cn > mst.n) return -1;
+        var si = 0;
+        while (si < cn) {
+            if (mst.s.charCodeAt(pos + si) !== cs.charCodeAt(si)) return -1;
+            si = si + 1;
+        }
+        return pos + cn;
+    }
+    if (k === "any") {
+        if (pos < mst.n) {
+            var ada = node.fs !== undefined ? node.fs : mst.da;
+            if (ada) return pos + 1;
+            var ca = mst.s.charCodeAt(pos);
+            if (ca !== 10 && ca !== 13 && ca !== 8232 && ca !== 8233) return pos + 1;
+        }
+        return -1;
+    }
+    return -1;
+}
+
 function __re_mRep(mst, node, ck, cont) {
     var pos = ck % __RE_PK;
     var count = (ck - pos) / __RE_PK;
@@ -1291,6 +1343,31 @@ function __re_mRep(mst, node, ck, cont) {
         });
     }
     if (canMore) {
+        // [iterative greedy] 简单原子且无捕获组:循环吃满、从最深往回试 cont。
+        // 此前每字符一层 CPS 递归,深度=串长;编译后单帧 ~8KB,10 万级长串直接
+        // 栈爆 SIGSEGV(property-escapes generated 族 88 CRASH 根因)。
+        if ((node.ge === undefined || node.ge < node.gs) &&
+            (node.atom.k === "char" || node.atom.k === "cls" || node.atom.k === "up" ||
+             node.atom.k === "str" || node.atom.k === "any")) {
+            var arr = [];
+            var cur2 = pos;
+            var cnt2 = count;
+            while (true) {
+                var nx = __re_mNodeSimple(mst, node.atom, cur2);
+                if (nx < 0 || nx === cur2) break; // 吃不动/零宽
+                arr.push(nx);
+                cur2 = nx;
+                cnt2 = cnt2 + 1;
+                if (node.max !== -1 && cnt2 >= node.max) break;
+            }
+            var k2 = arr.length - 1;
+            while (k2 >= 0) {
+                var rr = cont(arr[k2]);
+                if (rr >= 0) return rr;
+                k2 = k2 - 1;
+            }
+            return cont(pos);
+        }
         var r = __re_repAtom(mst, node, pos, function (e) {
             if (e === pos) return -1; // 零宽原子防死循环
             return __re_mRep(mst, node, (count + 1) * __RE_PK + e, cont);

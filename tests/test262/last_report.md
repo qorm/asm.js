@@ -1,10 +1,10 @@
 # asm.js test262 conformance report
 
-_Generated 2026-08-16T06:50:07.777Z — target macos-arm64_
+_Generated 2026-08-16T09:03:47.026Z — target macos-arm64_
 
 ## Headline
 
-**asm.js passes 5446 / 6313 = 86.27% of the run test262 subset**
+**asm.js passes 5535 / 6313 = 87.68% of the run test262 subset**
 (selected `language/` + core `built-ins/`), one variant per test.
 
 Of 33776 discovered test files in the selected dirs, 2213 were excluded up front (module=83, unsupported-feature=2130, intl/staging-dir=0); 31563 were eligible; 6313 were actually run (deterministic stride=5).
@@ -13,8 +13,8 @@ Of 33776 discovered test files in the selected dirs, 2213 were excluded up front
 
 | class | count | % of run |
 |-------|------:|---------:|
-| PASS         | 5446 | 86.27 |
-| FAIL         | 778 | 12.32 |
+| PASS         | 5535 | 87.68 |
+| FAIL         | 689 | 10.91 |
 | COMPILE_FAIL | 7 | 0.11 |
 | CRASH        | 82 | 1.30 |
 | **run**      | **6313** | 100 |
@@ -31,7 +31,7 @@ Of 33776 discovered test files in the selected dirs, 2213 were excluded up front
 | built-ins/Number | 67 | 59 | 8 | 0 | 0 | 88.1 |
 | built-ins/Object | 681 | 652 | 27 | 0 | 2 | 95.7 |
 | built-ins/Promise | 127 | 103 | 22 | 0 | 2 | 81.1 |
-| built-ins/RegExp | 374 | 242 | 132 | 0 | 0 | 64.7 |
+| built-ins/RegExp | 374 | 331 | 43 | 0 | 0 | 88.5 |
 | built-ins/Set | 76 | 68 | 8 | 0 | 0 | 89.5 |
 | built-ins/String | 243 | 215 | 28 | 0 | 0 | 88.5 |
 | built-ins/Symbol | 16 | 12 | 4 | 0 | 0 | 75.0 |
@@ -61,12 +61,12 @@ Excluded-by-feature detail:
 
 ## Top failing patterns (FAIL / COMPILE_FAIL / CRASH detail strings)
 
-- **567×** FAIL: assertion mismatch (Test262Error / wrong value)
+- **479×** FAIL: assertion mismatch (Test262Error / wrong value)
 - **63×** FAIL: async ($DONE not signalled / promise rejected)
 - **48×** FAIL: TypedArray/ArrayBuffer semantics
 - **43×** CRASH: run signal SIGBUS
 - **39×** FAIL: array contents mismatch (compareArray)
-- **29×** FAIL: negative test wrong outcome (phase=parse)
+- **28×** FAIL: negative test wrong outcome (phase=parse)
 - **26×** FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)
 - **20×** CRASH: run timeout
 - **19×** CRASH: run signal SIGSEGV
@@ -76,7 +76,6 @@ Excluded-by-feature detail:
 
 ## Failures correlated with features (top tags among failing tests)
 
-- `regexp-unicode-property-escapes`: 100
 - `TypedArray`: 100
 - `class`: 90
 - `Symbol.iterator`: 59
@@ -96,6 +95,7 @@ Excluded-by-feature detail:
 - `class-static-fields-public`: 15
 - `class-static-methods-private`: 15
 - `arrow-function`: 14
+- `default-parameters`: 13
 
 ## Methodology / reproducibility
 
@@ -127,4 +127,4 @@ mkdir -p .test262-corpus && tar xzf /tmp/t262.tgz -C .test262-corpus --strip-com
 node tests/test262/run.mjs --stride 5 --jobs 8 --target macos-arm64
 ```
 
-_Run wall-clock: 695.7s._
+_Run wall-clock: 830.9s._
