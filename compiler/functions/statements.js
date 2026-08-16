@@ -3255,11 +3255,21 @@ export const StatementCompiler = {
         // 方法体,均内联在本 compileClassDeclaration 期间编译)解析到正确声明。
         const classInfoLabel = this._classInfoLabelForDecl(className, labelId);
 
-        // 表达式父类 `extends (expr)`(非裸标识符):父类无编译期名字。其 classinfo 指针在
+        // 表达式父类 `extends (expr)`(非裸标识符,或裸标识符但非函数表成员——如
+        // `var A = class {}; class C extends A`):父类无编译期名字/槽。其 classinfo 指针在
         // 类声明处求值一次并存入本声明专属全局 superInfoLabel;super()/super.m()/super.prop
-        // 运行时从该全局解析父类(emitLoadSuperClassInfo)。标识符父类 superIsExpr=false →
-        // 全程走名字快路径,与旧实现逐字节一致。
-        const superIsExpr = !!(superClass && superClass.type !== "Identifier");
+        // 运行时从该全局解析父类(emitLoadSuperClassInfo)。函数表成员标识符父类
+        // superIsExpr=false → 全程走名字快路径,与旧实现逐字节一致(编译器自举的
+        // extends Backend 等皆函数表成员,产物不变)。
+        const superIsFn = !!(superClass && superClass.type === "Identifier" &&
+            this.ctx.getFunctionSymbol && this.ctx.getFunctionSymbol(superClass.name));
+        // 仅当裸标识符是**局部/模块 var**(如 `var A = class {}; class C extends A`)
+        // 才改走表达式父类路径。内建名(extends Error 的 Error——ERR_CTOR 闭包非
+        // classinfo)与导入名保持旧标识符路径(emitLoadClassInfo 的既有语义),
+        // 编译器自举产物逐字节不变。
+        const superIsVar = !!(superClass && superClass.type === "Identifier" && !superIsFn &&
+            this.ctx.getLocal && this.ctx.getLocal(superClass.name));
+        const superIsExpr = !!(superClass && superClass.type !== "Identifier") || superIsVar;
         const superInfoLabel = superIsExpr ? `_superinfo_${className}__${labelId}` : null;
         if (superInfoLabel) {
             if (!this._addedSuperInfoLabels) this._addedSuperInfoLabels = new Set();

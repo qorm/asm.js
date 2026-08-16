@@ -1206,9 +1206,12 @@ export const ExpressionParser = {
                 // [test262 S12.9 语境] 对象方法体是函数体:fnDepth++ 使 return 合法
                 // (此前对象方法不经函数深度,return 被 top-level 早期错误误拒)。
                 this.fnDepth++;
+                // [test262] super.x 在对象方法内合法(parseSuperExpression 判 _inObjMethod)
+                this._inObjMethod = (this._inObjMethod || 0) + 1;
                 let params = this.parseFunctionParams();
                 if (!this.expectPeek(TokenType.LBRACE)) {
                     this.fnDepth--;
+                    this._inObjMethod = this._inObjMethod - 1;
                     if (isGenMethod) this.fnGenDepth--;
                     if (isAsyncMethod) this.fnAsyncDepth--;
                     this._immediateGen = prevImmediateGenObj;
@@ -1223,6 +1226,7 @@ export const ExpressionParser = {
                 this.checkInheritedStrictParams(params, isStrict);   // [test262 早期错误 C] 继承 strict 重参
                 let body = this.parseBlockStatement();
                 this.fnDepth--;
+                this._inObjMethod = this._inObjMethod - 1;
                 if (isStrict) this.fnStrictDepth--;
                 if (isGenMethod) this.fnGenDepth--;
                 if (isAsyncMethod) this.fnAsyncDepth--;
@@ -1432,8 +1436,12 @@ export const ExpressionParser = {
     },
 
     parseSuperExpression() {
-        // 零误拒: super 关键字始终接受(类体和对象方法内均合法)。
-        // 编译器在 codegen 阶段对不支持的模式做降级处理。
+        // [test262 indirect-eval-contains-superproperty] super 仅类体/对象方法内合法:
+        // eval 片段/顶层/普通函数内 `super.x` 是早期错误(此前"零误拒"静默接受,
+        // 运行期才抛 ReferenceError/TypeError)。类字段箭头等 classDepth>0 位放行。
+        if (!this.classDepth && !this._inObjMethod) {
+            this.errors.push(`super is only valid inside classes or object methods at line ${this.curToken.line}`);
+        }
         // [Wave 8] 字段初始化器 ContainsSuperCall:init 上下文(穿透箭头)内 `super(...)`
         // 是早期错误;`super.prop` 属性访问合法(Node 对拍)。函数边界已复位 _inFieldInit。
         if (this._inFieldInit && this.peekTokenIs(TokenType.LPAREN)) {

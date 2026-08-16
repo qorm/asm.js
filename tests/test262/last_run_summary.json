@@ -1,6 +1,6 @@
 {
-  "generated": "2026-08-16T10:07:53.487Z",
-  "runnerSha": "9a2aeab3e8b81b7ea12ce169bb085242401d2c56",
+  "generated": "2026-08-16T11:27:14.392Z",
+  "runnerSha": "a3f4242fae1eeb42b5636695ccef6d0f151d75eb",
   "corpusPin": "9e61c12835c5e4a3bdba93850427e6742c4f64c4",
   "config": {
     "corpus": ".test262-corpus",
@@ -48,12 +48,12 @@
   "eligible": 31563,
   "run": 6313,
   "totals": {
-    "PASS": 5542,
-    "FAIL": 680,
+    "PASS": 5561,
+    "FAIL": 660,
     "COMPILE_FAIL": 9,
-    "CRASH": 82
+    "CRASH": 83
   },
-  "passRatePct": 87.79,
+  "passRatePct": 88.09,
   "byArea": {
     "built-ins/Array": {
       "PASS": 527,
@@ -134,14 +134,14 @@
       "CRASH": 39
     },
     "language/expressions": {
-      "PASS": 1731,
-      "FAIL": 222,
+      "PASS": 1744,
+      "FAIL": 208,
       "COMPILE_FAIL": 6,
-      "CRASH": 16
+      "CRASH": 17
     },
     "language/statements": {
-      "PASS": 1637,
-      "FAIL": 172,
+      "PASS": 1643,
+      "FAIL": 166,
       "COMPILE_FAIL": 3,
       "CRASH": 10
     }
@@ -149,7 +149,7 @@
   "topFailPatterns": [
     {
       "pattern": "FAIL: assertion mismatch (Test262Error / wrong value)",
-      "count": 477
+      "count": 457
     },
     {
       "pattern": "FAIL: async ($DONE not signalled / promise rejected)",
@@ -161,7 +161,7 @@
     },
     {
       "pattern": "CRASH: run signal SIGBUS",
-      "count": 43
+      "count": 44
     },
     {
       "pattern": "FAIL: array contents mismatch (compareArray)",

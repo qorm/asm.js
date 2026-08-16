@@ -4498,6 +4498,19 @@ export const MemberCompiler = {
                 // (with S12.10_A1.* / 大量 noStrict 全局属性读)。typeof 已在 operators.js
                 // 对同形名做 globalThis 查找;读路径在此对齐。
                 // 内建名与已知全局全部在上方 return,此处只服务编译期 unresolvable 名。
+                // [test262 indirect-eval-err-contains-*] 裸 eval 作**值**(`(0, eval)(x)`)
+                // → 物化 __eval shim 别名(与调用分派同符号;shim 注入见 index.js 的
+                // "eval)(" 词形检测)。此前 eval ∈ IDENT_BUILTIN_NAMES 落兜底 0 →
+                // "(0, eval)(...)" TypeError: not a function。**仅当 shim 已注入**
+                // (getFunction("__eval") 命中)才物化;未注入(eval 仅作比较值等形态,
+                // 如 `this === eval`)落旧兜底 0,否则 "__eval is not defined"。
+                if (name === "eval" &&
+                    !(this.ctx.getLocal && this.ctx.getLocal("eval")) &&
+                    !(this.ctx.getFunction && this.ctx.getFunction("eval")) &&
+                    this.ctx.getFunction && this.ctx.getFunction("__eval")) {
+                    this.compileIdentifier({ type: "Identifier", name: "__eval" });
+                    return;
+                }
                 if (this.isUnresolvableIdentifier &&
                     this.isUnresolvableIdentifier({ type: "Identifier", name: name })) {
                     const missL = this.ctx.newLabel("gident_miss");

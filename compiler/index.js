@@ -1561,6 +1561,10 @@ export class Compiler {
         // 内含整个编译器(route B),故只有用 eval/Function 的程序才付代价;编译器自身源码不含
         // 下列检测串 → 自举不注入(gate 零影响)。(检测串拆开拼接,免本文件自命中。)
         const evalCallText = "eval" + "(";
+        // [test262 indirect-eval] 间接 eval 值调用形态 `(0, eval)(x)`(词形 "eval)("),
+        // 同样注入 shim(值位物化见 compileIdentifier 的 eval 分支)。编译器自身源码
+        // 不含该词形(上方 grep 全绿)→ 自举不注入(gate 零影响)。
+        const evalIndirectText = "eval" + ")(";
         const newFnText = "new Func" + "tion(";
         // 裸 Function 构造器调用常见形态(不含注释里的 Function(...)/Function(0x…))
         const bareFnEmpty = "Func" + "tion()";
@@ -1568,7 +1572,8 @@ export class Compiler {
         const bareFnSQuote = "Func" + "tion('";
         if (filePath.indexOf("__eval_shim.js") === -1 &&
             src.indexOf("__eval_shim") === -1 &&
-            (src.indexOf(evalCallText) !== -1 || src.indexOf(newFnText) !== -1 ||
+            (src.indexOf(evalCallText) !== -1 || src.indexOf(evalIndirectText) !== -1 ||
+             src.indexOf(newFnText) !== -1 ||
              src.indexOf(bareFnEmpty) !== -1 || src.indexOf(bareFnDQuote) !== -1 ||
              src.indexOf(bareFnSQuote) !== -1)) {
             const inj = 'import { __eval, __makeFunction, __eval_direct } from "__eval_shim";\n';
