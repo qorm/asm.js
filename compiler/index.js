@@ -1534,10 +1534,15 @@ export class Compiler {
         // 注释处理是安全的)。
         const reCtorText = "new Reg" + "Exp(";
         const reEscText = "RegExp" + ".escape";
+        // [test262 isregexp-called-once / get-order 族] `RegExp.prototype[Symbol.xxx]`
+        // 直接调用/作值读取的测试不构造正则 → 旧触发词全不命中 → 占位闭包抛
+        // "incompatible receiver"。追加 "RegExp.prototype" 触发词(拆串拼接免自命中;
+        // 编译器自身源码无此词形 → 自举不注入,gate 零影响)。
+        const reProtoText = "Reg" + "Exp.prototype";
         if (filePath.indexOf("__regexp_shim.js") === -1 &&
             src.indexOf("__regexp_shim") === -1 &&
             (src.indexOf(reCtorText) !== -1 || sourceHasBareNewRegExp(src) ||
-             src.indexOf(reEscText) !== -1 ||
+             src.indexOf(reEscText) !== -1 || src.indexOf(reProtoText) !== -1 ||
              sourceHasRegexLiteral(src) || sourceHasRegExpCall(src))) {
             const inj = 'import { __RE_new, __RE_test, __RE_exec, __RE_match, __RE_matchAll, __RE_replace, __RE_split, __RE_escape, __RE_search, __RE_toString, __RE_compile, __RE_sym_match, __RE_sym_search, __RE_sym_split, __RE_sym_replace, __RE_sym_matchAll } from "__regexp_shim";\n';
             src = injectShimImport(src, inj);

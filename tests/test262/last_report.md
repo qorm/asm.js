@@ -1,10 +1,10 @@
 # asm.js test262 conformance report
 
-_Generated 2026-08-16T14:05:33.483Z — target macos-arm64_
+_Generated 2026-08-16T14:42:56.296Z — target macos-arm64_
 
 ## Headline
 
-**asm.js passes 5566 / 6313 = 88.17% of the run test262 subset**
+**asm.js passes 5568 / 6313 = 88.20% of the run test262 subset**
 (selected `language/` + core `built-ins/`), one variant per test.
 
 Of 33776 discovered test files in the selected dirs, 2213 were excluded up front (module=83, unsupported-feature=2130, intl/staging-dir=0); 31563 were eligible; 6313 were actually run (deterministic stride=5).
@@ -13,10 +13,10 @@ Of 33776 discovered test files in the selected dirs, 2213 were excluded up front
 
 | class | count | % of run |
 |-------|------:|---------:|
-| PASS         | 5566 | 88.17 |
-| FAIL         | 650 | 10.30 |
+| PASS         | 5568 | 88.20 |
+| FAIL         | 647 | 10.25 |
 | COMPILE_FAIL | 12 | 0.19 |
-| CRASH        | 85 | 1.35 |
+| CRASH        | 86 | 1.36 |
 | **run**      | **6313** | 100 |
 
 ## By area
@@ -31,7 +31,7 @@ Of 33776 discovered test files in the selected dirs, 2213 were excluded up front
 | built-ins/Number | 67 | 59 | 8 | 0 | 0 | 88.1 |
 | built-ins/Object | 681 | 652 | 27 | 0 | 2 | 95.7 |
 | built-ins/Promise | 127 | 104 | 21 | 0 | 2 | 81.9 |
-| built-ins/RegExp | 374 | 331 | 43 | 0 | 0 | 88.5 |
+| built-ins/RegExp | 374 | 333 | 40 | 0 | 1 | 89.0 |
 | built-ins/Set | 76 | 70 | 6 | 0 | 0 | 92.1 |
 | built-ins/String | 243 | 215 | 28 | 0 | 0 | 88.5 |
 | built-ins/Symbol | 16 | 12 | 4 | 0 | 0 | 75.0 |
@@ -61,14 +61,14 @@ Excluded-by-feature detail:
 
 ## Top failing patterns (FAIL / COMPILE_FAIL / CRASH detail strings)
 
-- **452×** FAIL: assertion mismatch (Test262Error / wrong value)
+- **450×** FAIL: assertion mismatch (Test262Error / wrong value)
 - **63×** FAIL: async ($DONE not signalled / promise rejected)
 - **47×** FAIL: TypedArray/ArrayBuffer semantics
 - **44×** CRASH: run signal SIGBUS
 - **38×** FAIL: array contents mismatch (compareArray)
-- **25×** FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)
+- **24×** FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)
 - **22×** CRASH: run timeout
-- **19×** CRASH: run signal SIGSEGV
+- **20×** CRASH: run signal SIGSEGV
 - **19×** FAIL: negative test wrong outcome (phase=parse)
 - **12×** COMPILE_FAIL: asm.js could not compile (unsupported syntax / parser gap)
 - **4×** FAIL: constructor-ness reflection (isConstructor / not-a-constructor)
@@ -84,8 +84,8 @@ Excluded-by-feature detail:
 - `generators`: 40
 - `computed-property-names`: 28
 - `destructuring-binding`: 28
-- `Symbol.species`: 26
 - `class-fields-public`: 25
+- `Symbol.species`: 24
 - `class-fields-private`: 24
 - `Symbol.asyncIterator`: 23
 - `Proxy`: 21
@@ -127,4 +127,4 @@ mkdir -p .test262-corpus && tar xzf /tmp/t262.tgz -C .test262-corpus --strip-com
 node tests/test262/run.mjs --stride 5 --jobs 8 --target macos-arm64
 ```
 
-_Run wall-clock: 820.9s._
+_Run wall-clock: 851.3s._

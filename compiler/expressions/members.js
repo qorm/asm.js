@@ -1584,11 +1584,12 @@ export const MemberCompiler = {
             vm.lea(VReg.V0, tmpSlot);
             vm.store(VReg.V0, 0, VReg.RET);
             // Create method closure
+            // [test262 Symbol.match/name] 规范 name = "[Symbol.match]"(非裸名)。
             if (this.getFunctionLabel(sm[1])) {
-                this.emitRegExpMethodClosure(sm[0], sm[1], sm[2]); // RET = method value (boxed closure)
+                this.emitRegExpMethodClosure("[Symbol." + sm[0] + "]", sm[1], sm[2]); // RET = method value (boxed closure)
             } else {
                 this.emitSynthStaticRef("re_sym_" + sm[0],
-                    this._rePlaceholderSynthAst(sm[0]), sm[0], sm[2], true);
+                    this._rePlaceholderSynthAst(sm[0]), "[Symbol." + sm[0] + "]", sm[2], true);
             }
             // Set property on prototype: _object_set(proto, symKey, methodValue)
             vm.mov(VReg.A2, VReg.RET);
