@@ -5863,8 +5863,8 @@ export class ArrayGenerator {
         // 迭代器对象
         vm.call("_object_new");
         vm.mov(VReg.S1, VReg.RET); // obj(裸)
-        // next 闭包块(40B)
-        vm.movImm(VReg.A0, 40);
+        // next 闭包块(48B;+40 done 旗标——耗尽即终态,Node 对拍)
+        vm.movImm(VReg.A0, 48);
         vm.call("_alloc");
         vm.mov(VReg.S2, VReg.RET);
         vm.movImm(VReg.V1, 0xc105); // CLOSURE_MAGIC
@@ -5875,6 +5875,7 @@ export class ArrayGenerator {
         vm.movImm(VReg.V1, 0);
         vm.store(VReg.S2, 24, VReg.V1); // index = 0
         vm.store(VReg.S2, 32, VReg.S3); // kind
+        vm.store(VReg.S2, 40, VReg.V1); // done = 0
         // obj["next"] = 闭包(函数 tag 0x7fff)
         vm.mov(VReg.A0, VReg.S1);
         vm.lea(VReg.A1, this.vm.asm.addString("next"));
@@ -5912,6 +5913,11 @@ export class ArrayGenerator {
         vm.label("_array_iterator_next");
         vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
         vm.mov(VReg.S3, VReg.S0); // 保住闭包指针(后续 call 会覆 S0? 否——callee 存 S0;仍显式留一份)
+        // [test262 keys/values/entries iteration-mutable] 耗尽即终态:done 旗标置位后
+        // 再 push 也不复活(Node 对拍;此前每次现读 live len → 耗尽后 push 会多产出)。
+        vm.load(VReg.V0, VReg.S0, 40); // done
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_arriter_done");
         vm.load(VReg.S1, VReg.S0, 16); // target(boxed 数组)
         vm.load(VReg.S2, VReg.S0, 24); // index(裸 int)
         // len
@@ -5963,8 +5969,10 @@ export class ArrayGenerator {
         vm.movImm64(VReg.A1, 0x7ff9000000000000n); // done = false
         vm.call("_generator_make_result");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
-        // 耗尽:{value: undefined, done: true}
+        // 耗尽:{value: undefined, done: true}(置 done 旗标 → 终态)
         vm.label("_arriter_done");
+        vm.movImm(VReg.V0, 1);
+        vm.store(VReg.S3, 40, VReg.V0); // done = 1
         vm.movImm64(VReg.A0, 0x7ffb000000000000n); // undefined
         vm.movImm64(VReg.A1, 0x7ff9000000000001n); // true
         vm.call("_generator_make_result");

@@ -1,10 +1,10 @@
 # asm.js test262 conformance report
 
-_Generated 2026-08-16T13:34:21.608Z — target macos-arm64_
+_Generated 2026-08-16T14:05:33.483Z — target macos-arm64_
 
 ## Headline
 
-**asm.js passes 5564 / 6313 = 88.14% of the run test262 subset**
+**asm.js passes 5566 / 6313 = 88.17% of the run test262 subset**
 (selected `language/` + core `built-ins/`), one variant per test.
 
 Of 33776 discovered test files in the selected dirs, 2213 were excluded up front (module=83, unsupported-feature=2130, intl/staging-dir=0); 31563 were eligible; 6313 were actually run (deterministic stride=5).
@@ -13,8 +13,8 @@ Of 33776 discovered test files in the selected dirs, 2213 were excluded up front
 
 | class | count | % of run |
 |-------|------:|---------:|
-| PASS         | 5564 | 88.14 |
-| FAIL         | 652 | 10.33 |
+| PASS         | 5566 | 88.17 |
+| FAIL         | 650 | 10.30 |
 | COMPILE_FAIL | 12 | 0.19 |
 | CRASH        | 85 | 1.35 |
 | **run**      | **6313** | 100 |
@@ -23,7 +23,7 @@ Of 33776 discovered test files in the selected dirs, 2213 were excluded up front
 
 | area | run | PASS | FAIL | COMPILE_FAIL | CRASH | pass% |
 |------|----:|-----:|-----:|-------------:|------:|------:|
-| built-ins/Array | 594 | 527 | 55 | 0 | 12 | 88.7 |
+| built-ins/Array | 594 | 529 | 53 | 0 | 12 | 89.1 |
 | built-ins/Boolean | 10 | 10 | 0 | 0 | 0 | 100.0 |
 | built-ins/JSON | 31 | 21 | 9 | 0 | 1 | 67.7 |
 | built-ins/Map | 41 | 32 | 9 | 0 | 0 | 78.0 |
@@ -61,7 +61,7 @@ Excluded-by-feature detail:
 
 ## Top failing patterns (FAIL / COMPILE_FAIL / CRASH detail strings)
 
-- **454×** FAIL: assertion mismatch (Test262Error / wrong value)
+- **452×** FAIL: assertion mismatch (Test262Error / wrong value)
 - **63×** FAIL: async ($DONE not signalled / promise rejected)
 - **47×** FAIL: TypedArray/ArrayBuffer semantics
 - **44×** CRASH: run signal SIGBUS
@@ -127,4 +127,4 @@ mkdir -p .test262-corpus && tar xzf /tmp/t262.tgz -C .test262-corpus --strip-com
 node tests/test262/run.mjs --stride 5 --jobs 8 --target macos-arm64
 ```
 
-_Run wall-clock: 760.6s._
+_Run wall-clock: 820.9s._
