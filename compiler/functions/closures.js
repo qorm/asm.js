@@ -144,7 +144,11 @@ export const ClosureCompiler = {
             }
             return false;
         };
-        return walk(expr.body);
+        // [test262 params-dflt-ref-arguments] 默认值表达式里的 arguments 引用
+        // (x = arguments[2]) 也要建 arguments 对象(构造先于默认值求值,见
+        // compileFunctionBody 顺序)。此前只扫 body → usesArguments=false →
+        // arguments[2] 落 globalThis 读 undefined。
+        return walk(expr.body) || walk(expr.params);
     },
 
     // 在函数入口把实参(A0..A4,A5=this 不计入)收集成数组存入局部 `arguments`。
@@ -400,8 +404,10 @@ export const ClosureCompiler = {
         const prevInAsyncGenerator = this.ctx.inAsyncGenerator;
         const prevInCoroBody = this.ctx.inCoroBody;
         const prevInStrictFunction = this.ctx.inStrictFunction;
+        const prevPreboundFnDecls = this.ctx._preboundFnDecls;
 
         this.ctx.locals = {};
+        this.ctx._preboundFnDecls = new Set();
         this.ctx.stackOffset = 0;
         this.ctx.inAsyncFunction = isAsync;
         this.ctx.inAsyncGenerator = isAsync && isGenerator;
@@ -539,6 +545,16 @@ export const ClosureCompiler = {
                 // [L2-③ TDZ] 默认值表达式求值前,当前及之后所有形参名入 tdzParams
                 if (!this.ctx.tdzParams) this.ctx.tdzParams = new Set();
                 for (let j = i; j < tdzParamNames.length; j++) this.ctx.tdzParams.add(tdzParamNames[j]);
+                // [L2-④] 默认值求值经任意 JS 调用踩 A0-A4;后续形参仍要从实参寄存器
+                // 绑定(identifier/pattern/rest 皆然),故先快照、求值后恢复(镜像
+                // emitArgumentsArray 的 A 寄存器卫生)。此前不恢复 → 第二及以后默认
+                // 形参的实参绑定读垃圾(params-dflt-ref-arguments: y 读成 1e-323)。
+                const argSnap = [];
+                for (let ai = 0; ai < 5; ai++) {
+                    const so = this.ctx.allocLocal(`__argsnap_${this.nextLabelId()}_${ai}`);
+                    vm.store(VReg.FP, so, vm.getArgReg(ai));
+                    argSnap.push(so);
+                }
                 // 实参为 undefined 时取默认值（默认表达式可引用前序参数，已入槽）
                 // x64: V1/V2 别名 RCX/RDX = A3/A2，会踩掉尚未入槽的后续实参；
                 // 改用 V5/V6(R10/R11)。arm64 保持 V1/V2，产物逐字节不变。
@@ -552,10 +568,18 @@ export const ClosureCompiler = {
                 this.compileExpression(defaultExpr);
                 vm.store(VReg.FP, offset, VReg.RET);
                 vm.label(skip);
+                for (let ai = 0; ai < 5; ai++) {
+                    vm.load(vm.getArgReg(ai), VReg.FP, argSnap[ai]);
+                }
                 // 当前形参默认值评估完毕,从 TDZ 移除
                 if (paramName) this.ctx.tdzParams.delete(paramName);
             }
         }
+        // [L2-③ TDZ] 全部形参初始化完毕,清空 TDZ 集:无默认值的后续形参(z)在默认值
+        // 评估期间被标记、但从未走 delete 分支,残留标记令**函数体**读 z 误抛
+        // ReferenceError(params-dflt-ref-arguments / pa4 形态)。规范:TDZ 仅覆盖
+        // 默认值评估期,形参全部绑定后全体可用。
+        if (this.ctx.tdzParams) this.ctx.tdzParams.clear();
 
         // 保存 this 指针（通过 A5 传入的隐藏参数）到 __this 局部变量
         const thisOffset = this.ctx.allocLocal("__this");
@@ -646,10 +670,30 @@ export const ClosureCompiler = {
             }
         }
 
+        // [ES5.1 10.5 / Annex B] 函数体**直接子级** FunctionDeclaration 入口预绑定(hoist):
+        // `function f(){ return g(); function g(){...} }`、S13_A19_T2(var 不覆盖 fn 声明)。
+        // 声明语句位变 no-op(体循环按 _preboundFnDecls 跳过)。**必须在 prebox 之后**:
+        // 被嵌套闭包捕获的 fn 名已预建 box(compileNestedFunctionDeclaration 复用同一
+        // box,前向闭包捕获不失效);且 var 初始化(emitHoistedVarInits)见已有槽即跳过。
+        // 单循环无嵌套(规避 P1 录制器对嵌套循环发射的重放问题)。
+        if (expr.body.type === "BlockStatement") {
+            for (let fi = 0; fi < expr.body.body.length; fi++) {
+                const fd = expr.body.body[fi];
+                if (fd && fd.type === "FunctionDeclaration" && fd.id && fd.id.name) {
+                    this.compileNestedFunctionDeclaration(fd);
+                    this.ctx._preboundFnDecls.add(fd.id.name);
+                }
+            }
+        }
+
         // 编译函数体
         let hasImplicitReturn = false;
         if (expr.body.type === "BlockStatement") {
             for (const stmt of expr.body.body) {
+                // [ES5.1 10.5] 入口已预绑定的直接子级函数声明 → 语句 no-op。
+                // 嵌套块内的声明不受影响(仍就地绑定,Annex B 块级语义)。
+                if (stmt && stmt.type === "FunctionDeclaration" && stmt.id && stmt.id.name &&
+                    this.ctx._preboundFnDecls.has(stmt.id.name)) continue;
                 this.compileStatement(stmt);
             }
         } else {
@@ -688,5 +732,6 @@ export const ClosureCompiler = {
         this.ctx.inCoroBody = prevInCoroBody;
         this.ctx.inStrictFunction = prevInStrictFunction;
         this.ctx.exceptionLabel = prevExceptionLabel;
+        this.ctx._preboundFnDecls = prevPreboundFnDecls;
     },
 };

@@ -1567,10 +1567,10 @@ export const MemberCompiler = {
         // Uses emitRegExpMethodClosure (24B {magic, _aref_generic, helper}) which puts
         // `this` in A0 and shifts user args up -- the __RE_sym_* wrappers accept
         // (re, str, ...) to match this calling convention.
-        // shim 未注入时跳过(函数标签不存在)。
+        // shim 未注入时挂**合成占位**方法(同上方方法族口径):仅反射位可见的 prop-desc
+        // 测试需要 own property 存在(typeof function + 规范 attrs),占位体抛 TypeError。
         for (let i = 0; i < REGEXP_PROTO_SYMBOL_METHODS.length; i = i + 1) {
             const sm = REGEXP_PROTO_SYMBOL_METHODS[i];
-            if (!this.getFunctionLabel(sm[1])) continue;
             // Get the well-known symbol
             vm.lea(VReg.A0, "_symwk_" + sm[0]);
             vm.lea(VReg.A1, this.asm.addString("Symbol." + sm[0]));
@@ -1581,7 +1581,12 @@ export const MemberCompiler = {
             vm.lea(VReg.V0, tmpSlot);
             vm.store(VReg.V0, 0, VReg.RET);
             // Create method closure
-            this.emitRegExpMethodClosure(sm[0], sm[1], sm[2]); // RET = method value (boxed closure)
+            if (this.getFunctionLabel(sm[1])) {
+                this.emitRegExpMethodClosure(sm[0], sm[1], sm[2]); // RET = method value (boxed closure)
+            } else {
+                this.emitSynthStaticRef("re_sym_" + sm[0],
+                    this._rePlaceholderSynthAst(sm[0]), sm[0], sm[2], true);
+            }
             // Set property on prototype: _object_set(proto, symKey, methodValue)
             vm.mov(VReg.A2, VReg.RET);
             vm.lea(VReg.V0, protoSlot);
@@ -1881,9 +1886,41 @@ export const MemberCompiler = {
         this._reSetProtoProp(protoSlot, "call", BUILTIN_PROP_ATTR);
         this.emitMemoizedBuiltinRef("fnproto_apply", "_fp_apply_tramp", "apply");
         this._reSetProtoProp(protoSlot, "apply", BUILTIN_PROP_ATTR);
+        // [test262] caller / arguments:accessor({get:%ThrowTypeError%, set:%ThrowTypeError%},
+        // enumerable:false, configurable:true)(ES 18.2.1.1.3 / 18.2.1.1.4)。严格函数与
+        // 普通函数的 .caller/.arguments 读写经原型链派发 → 恒 TypeError。
+        this._reSetThrowAccessorProp(protoSlot, "caller");
+        this._reSetThrowAccessorProp(protoSlot, "arguments");
         vm.lea(VReg.V0, protoSlot);
         vm.load(VReg.RET, VReg.V0, 0);
         vm.label(doneL);
+    },
+
+    // [test262] 在 protoSlot 指向的对象上以 TYPE_GETTER 标记块安装 {get,set}=_fp_throw_accessor
+    // 的访问器属性,attr=4(configurable, non-enumerable)。_object_define 落原始块(不经
+    // setter 分派),后续读写由 _maybe_getter/_object_set_acc_dispatch 派发到抛错蹦床。
+    // 形态镜像 Object.prototype.__proto__ 安装(object/index.js),两键逐块展开(无循环,
+    // 规避 P1 录制器对循环发射的重放问题)。
+    _reSetThrowAccessorProp(protoSlot, key) {
+        const vm = this.vm;
+        vm.movImm(VReg.A0, 24);
+        vm.call("_alloc");               // RET = raw 24B TYPE_GETTER block
+        vm.mov(VReg.V1, VReg.RET);
+        vm.movImm(VReg.V0, 60);          // TYPE_GETTER
+        vm.store(VReg.V1, 0, VReg.V0);
+        vm.lea(VReg.V0, "_fp_throw_accessor");
+        vm.store(VReg.V1, 8, VReg.V0);   // getter@8
+        vm.store(VReg.V1, 16, VReg.V0);  // setter@16
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        vm.mov(VReg.A2, VReg.V1);       // A2 = TYPE_GETTER block(_tag_key_a1 clobber V1)
+        this.emitBoxedStringKey(key, VReg.A1);
+        vm.call("_object_define");       // Define(不触发访问器分派)
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey(key, VReg.A1);
+        vm.movImm(VReg.A2, 4);           // ATTR_CONFIGURABLE
+        vm.call("_object_set_prop_attr");
     },
 
     // [gOPD 补全] 裸 `Function` 一等值合成体:**安全 stub,体即抛 TypeError**——
@@ -3576,6 +3613,7 @@ export const MemberCompiler = {
     // 数组原型,仍 false,与改造前一致;真值链修正随缺陷 B)。`Array(...)`/`new Array(...)`/
     // Array.isArray(...) 快路先命中,不经此 → 字节不变。
     emitArrayCtorObject() {
+        const vm = this.vm;
         // 每站点走 emitCollectionCtorObject(内含运行时 ctorSlot==0 守卫)。
         // 禁止编译期 `_emittedArrayCtor` once-flag:pending FE 体在 main 之后才
         // 编译,若 main 稍后出现 `Array`/`Array.prototype` 会只在 main 物化,
@@ -3589,6 +3627,21 @@ export const MemberCompiler = {
             speciesTmpSlot: "_nsobj_array_tmp",
             methodMemoPrefix: "apm_", // 与 Array.prototype.<m> 值读同槽(身份恒等)
         });
+        // [test262 Array/prop-desc] globalThis.Array === Array 恒等:物化后把单例挂回
+        // globalThis(运行时 _process_init 已先落占位,此处覆盖为同一对象;attr 5)。
+        vm.lea(VReg.V0, "_nsobj_array");
+        vm.load(VReg.A2, VReg.V0, 0);
+        vm.lea(VReg.V0, "_global_this");
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("Array", VReg.A1); // _tag_key_a1 clobber V1,A2 已就绪
+        vm.call("_object_set");
+        vm.lea(VReg.V0, "_global_this");
+        vm.load(VReg.A0, VReg.V0, 0);
+        this.emitBoxedStringKey("Array", VReg.A1);
+        vm.movImm(VReg.A2, 5); // {w:1,e:0,c:1}
+        vm.call("_object_set_prop_attr");
+        vm.lea(VReg.V0, "_nsobj_array");
+        vm.load(VReg.RET, VReg.V0, 0); // RET = 装箱构造器(上述调用已覆 RET)
     },
     // [底层A] `Array.prototype` 值读:原型槽已填则直接用,否则整体物化。
     emitArrayProtoObject() {

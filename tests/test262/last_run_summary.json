@@ -1,6 +1,6 @@
 {
-  "generated": "2026-08-16T04:17:45.114Z",
-  "runnerSha": "12716aa071e6a29c26f4dd430dbd50befd2dae61",
+  "generated": "2026-08-16T06:03:08.813Z",
+  "runnerSha": "8312b482d88bc3c725f7dd90080563765f8600ff",
   "corpusPin": "9e61c12835c5e4a3bdba93850427e6742c4f64c4",
   "config": {
     "corpus": ".test262-corpus",
@@ -48,22 +48,22 @@
   "eligible": 31563,
   "run": 6313,
   "totals": {
-    "PASS": 5400,
-    "FAIL": 825,
+    "PASS": 5432,
+    "FAIL": 793,
     "COMPILE_FAIL": 6,
     "CRASH": 82
   },
-  "passRatePct": 85.54,
+  "passRatePct": 86.04,
   "byArea": {
     "built-ins/Array": {
-      "PASS": 526,
-      "FAIL": 56,
+      "PASS": 527,
+      "FAIL": 55,
       "COMPILE_FAIL": 0,
       "CRASH": 12
     },
     "built-ins/Boolean": {
-      "PASS": 9,
-      "FAIL": 1,
+      "PASS": 10,
+      "FAIL": 0,
       "COMPILE_FAIL": 0,
       "CRASH": 0
     },
@@ -86,8 +86,8 @@
       "CRASH": 0
     },
     "built-ins/Number": {
-      "PASS": 58,
-      "FAIL": 9,
+      "PASS": 59,
+      "FAIL": 8,
       "COMPILE_FAIL": 0,
       "CRASH": 0
     },
@@ -104,8 +104,8 @@
       "CRASH": 2
     },
     "built-ins/RegExp": {
-      "PASS": 240,
-      "FAIL": 134,
+      "PASS": 242,
+      "FAIL": 132,
       "COMPILE_FAIL": 0,
       "CRASH": 0
     },
@@ -116,8 +116,8 @@
       "CRASH": 0
     },
     "built-ins/String": {
-      "PASS": 213,
-      "FAIL": 30,
+      "PASS": 215,
+      "FAIL": 28,
       "COMPILE_FAIL": 0,
       "CRASH": 0
     },
@@ -140,8 +140,8 @@
       "CRASH": 16
     },
     "language/statements": {
-      "PASS": 1598,
-      "FAIL": 212,
+      "PASS": 1623,
+      "FAIL": 187,
       "COMPILE_FAIL": 2,
       "CRASH": 10
     }
@@ -149,7 +149,7 @@
   "topFailPatterns": [
     {
       "pattern": "FAIL: assertion mismatch (Test262Error / wrong value)",
-      "count": 592
+      "count": 567
     },
     {
       "pattern": "FAIL: async ($DONE not signalled / promise rejected)",
@@ -169,11 +169,11 @@
     },
     {
       "pattern": "FAIL: array contents mismatch (compareArray)",
-      "count": 40
+      "count": 39
     },
     {
       "pattern": "FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)",
-      "count": 33
+      "count": 27
     },
     {
       "pattern": "CRASH: run timeout",

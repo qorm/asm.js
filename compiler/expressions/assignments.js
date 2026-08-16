@@ -122,13 +122,28 @@ export const AssignmentCompiler = {
             const globalLabel = this.ctx.getMainCapturedVar(name);
 
             if (!offset && !globalLabel) {
-                // [L2-②] 对**真正未解析**的标识符赋值 → 抛 ReferenceError。此前静默 no-op
-                // (sloppy 全局创建不支持,strict 该抛未抛),令 dstr 赋值测试
-                // `[unresolvable] = []`/`{x: unresolvable} = {}`(onlyStrict)判负。判别复用
-                // typeof 的 isUnresolvableIdentifier:内建/已知全局(console/Buffer/…)不算,
-                // 维持原 no-op;仅对编译期完全解析不到的名抛。规范:strict 下对 unresolvable
-                // reference 赋值抛 ReferenceError;sloppy 创建全局(本编译器不支持,抛 ReferenceError
-                // 亦比静默丢弃更可见,记偏差)。复合赋值(+= 等)同样先读再写 → 读即抛,正确。
+                // [L2-②] 对**真正未解析**的标识符赋值:strict → ReferenceError(规范
+                // PutValue 对 unresolvable reference);sloppy `=` → 在全局对象上
+                // CreateDataProperty(读路径已在 members.js 对同形名做 globalThis 查找,
+                // 此前写路径直接抛,令 S13_A15_T5/S13_A12_T1 等隐式全局族 FAIL)。
+                // 判别复用 typeof 的 isUnresolvableIdentifier:内建/已知全局不算 ——
+                // 但 sloppy `=` 一律走全局 set(规范即如此;此前静默 no-op 且不 eval RHS)。
+                // 复合赋值(+= 等)先 GetValue 再写:miss 时读路径抛 ReferenceError,
+                // 正确;已隐式创建的全局读路径命中、写回仍走词法(此处),记偏差。
+                const strictSet = (this.ctx && this.ctx.inStrictFunction) ||
+                    (this._currentModuleAst && this._currentModuleAst._bsStrict);
+                if (!strictSet && expr.operator === "=") {
+                    this.compileExpression(expr.right);      // RET = RHS
+                    this.vm.push(VReg.RET);                  // [SP] = RHS(跨 call 保活)
+                    this.vm.lea(VReg.V0, "_global_this");
+                    this.vm.load(VReg.A0, VReg.V0, 0);
+                    this.vm.call("_box_obj_r");              // A0 = boxed globalThis
+                    this.emitBoxedStringKey(name, VReg.A1);  // _tag_key_a1 clobber V1
+                    this.vm.load(VReg.A2, VReg.SP, 0);       // A2 = RHS
+                    this.vm.call("_object_set");             // RET = 赋值表达式之值
+                    this.vm.pop(VReg.V0);                    // 还栈
+                    return;
+                }
                 if (this.isUnresolvableIdentifier &&
                     this.isUnresolvableIdentifier({ type: "Identifier", name: name })) {
                     this.emitThrowReferenceError(name + " is not defined");

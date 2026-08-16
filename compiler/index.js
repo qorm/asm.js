@@ -1312,7 +1312,9 @@ export class Compiler {
         const parser = new Parser(lexer);
         const ast = parser.parseProgram();
         if (parser.errors && parser.errors.length > 0) {
-            throw new Error("Syntax errors:\n  " + parser.errors.join("\n  "));
+            // [test262] 早期错误/语法错误须以 SyntaxError 品牌抛出(eval/new Function 路径
+            // 直接把此处异常传播到 assert.throws(SyntaxError, ...);此前裸 Error 记 FAIL)。
+            throw new SyntaxError("Syntax errors:\n  " + parser.errors.join("\n  "));
         }
         // [批次D] 块级改名延后到 _collectFnNameHints 之后(见 _renameModulesBlockScope):
         // NamedEvaluation 在用户原名上采集 hints,避免 indexOf("$blk$") 在自举下
@@ -3118,6 +3120,15 @@ export class Compiler {
                 // 自引用(x=x)/后向引用(x=y,y=1)→compileIdentifier 以 ReferenceError 守卫
                 if (!this.ctx.tdzParams) this.ctx.tdzParams = new Set();
                 for (let j = i; j < tdzParamNames.length; j++) this.ctx.tdzParams.add(tdzParamNames[j]);
+                // [L2-④] 默认值求值经任意 JS 调用踩 A0-A4;后续形参仍要从实参寄存器
+                // 绑定(identifier/pattern/rest 皆然),故先快照、求值后恢复。此前不恢复
+                // → 第二及以后形参绑定读垃圾(params-dflt-ref-arguments: y 读成 5e-324)。
+                const argSnap = [];
+                for (let ai = 0; ai < 5; ai++) {
+                    const so = this.ctx.allocLocal(`__argsnap_${this.nextLabelId()}_${ai}`);
+                    vm.store(VReg.FP, so, vm.getArgReg(ai));
+                    argSnap.push(so);
+                }
                 // x64: V1/V2 别名 RCX/RDX = A3/A2，此检查会踩掉尚未入槽的后续实参
                 // （带默认值的 3+ 参函数丢参 → gen1 编译器行为分歧）；改用 V5/V6(R10/R11)。
                 // arm64 保持 V1/V2，产物逐字节不变。
@@ -3131,10 +3142,16 @@ export class Compiler {
                 this.compileExpression(defaultExpr);
                 vm.store(VReg.FP, offset, VReg.RET);
                 vm.label(skip);
+                for (let ai = 0; ai < 5; ai++) {
+                    vm.load(vm.getArgReg(ai), VReg.FP, argSnap[ai]);
+                }
                 // 当前形参默认值评估完毕,从 TDZ 移除
                 if (paramName) this.ctx.tdzParams.delete(paramName);
             }
         }
+        // [L2-③ TDZ] 全部形参初始化完毕,清空 TDZ 集(同 closures.js compileFunctionBody):
+        // 无默认值的后续形参被标记但从未走 delete 分支,残留令函数体读它误抛 ReferenceError。
+        if (this.ctx.tdzParams) this.ctx.tdzParams.clear();
 
         // [#36] 顶层函数声明也存 __this(A5):此前该路径不落 __this 槽 →
         // 函数声明被当方法/经 call,apply,bind 调用时 this 恒 0(闭包路径早有)

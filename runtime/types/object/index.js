@@ -628,6 +628,17 @@ export class ObjectGenerator {
         // 键 miss:若 key==="name" 反射元数据名、key==="length" 反射元数据 arity(否则 undefined)。
         // [W-41] key==="prototype":惰性创建 F.prototype + constructor 回链(仅闭包 magic 0xc105)。
         vm.label("_cpg_miss");
+        // [test262] caller/arguments 继承读(ES 18.2.1.1.3/1.4):侧表 miss 意味着
+        // Function.prototype 上的 %ThrowTypeError% 访问器应派发——闭包侧表 proto=0
+        // 无原型链,故按键显式拦截(S0=key)。
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.V0, VReg.S0, VReg.V1);        // V0 = key payload
+        vm.lea(VReg.V1, vm.asm.addString("caller"));
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jeq("_cpg_forbidden");
+        vm.lea(VReg.V1, vm.asm.addString("arguments"));
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jeq("_cpg_forbidden");
         // [W-27 守卫] 元数据反射要**解引用** fn 的载荷([P] 读 magic),故先验形态:
         // 只有装箱函数(高16=0x7FFF)与裸堆/代码指针(高16=0)可解引用。数字等非指针值
         // 的载荷是尾数位,当地址解会 SIGSEGV——静态解析成函数、运行期却被重新赋成数字的
@@ -701,6 +712,15 @@ export class ObjectGenerator {
         vm.or(VReg.A1, VReg.A1, VReg.V1);           // A1 = boxed "prototype"
         vm.mov(VReg.A2, VReg.S0);                   // A2 = boxed prototype
         vm.call("_closure_prop_set");
+        // [test262 13.2-18-1] F.prototype 描述符 = {writable:true, enumerable:false,
+        // configurable:false}(attr 1 = 仅 writable)。此前默认 attr 7 → verifyProperty
+        // enumerable/configurable 判负。
+        vm.mov(VReg.A0, VReg.S1);                   // A0 = boxed fn
+        vm.lea(VReg.A1, vm.asm.addString("prototype"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);           // A1 = boxed "prototype"
+        vm.movImm(VReg.A2, 1);                      // ATTR_WRITABLE
+        vm.call("_closure_prop_set_attr");
         // 5. return boxed prototype
         vm.mov(VReg.RET, VReg.S0);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
@@ -759,6 +779,14 @@ export class ObjectGenerator {
         vm.load(VReg.RET, VReg.RET, 0);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
 
+        // caller/arguments 读拦截落点(见 _cpg_miss 头部按键分流)。抛错即解退,
+        // 无需 epilogue。
+        vm.label("_cpg_forbidden");
+        vm.lea(VReg.A0, vm.asm.addString("'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+
         // _closure_prop_set(A0=fn, A1=key, A2=val) -> val(赋值表达式之值)。
         // [I6] 函数值 name/length 的 [[Set]] 守卫:规范形状恒 {writable:false,
         // enumerable:false, configurable:true}(_ogopd_fn 硬编),属性**有效存在**
@@ -791,7 +819,7 @@ export class ObjectGenerator {
         vm.lea(VReg.A1, vm.asm.addString("length"));
         vm.call("_strcmp");
         vm.cmpImm(VReg.RET, 0);
-        vm.jne("_cps_set");                    // 非 name/length → 常规写
+        vm.jne("_cps_chk_forbidden");              // 非 name/length → 查 caller/arguments
         vm.label("_cps_nl_len");
         vm.lea(VReg.S3, vm.asm.addString("length"));
         vm.jmp("_cps_nl");
@@ -822,6 +850,29 @@ export class ObjectGenerator {
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.S3, VReg.V1);
         vm.call("_object_delete");             // 移除墓碑槽(装箱布尔返回值弃)
+        // [test262] caller/arguments 赋值拦:Function.prototype 上的 %ThrowTypeError%
+        // setter(ES 18.2.1.1.3/1.4)。_closure_prop_define(defineProperty 路由)不经此,
+        // 故 defineProperty(fn,"caller",{value:1}) 的 own-prop 覆盖仍有效(侧表命中
+        // 读回,forbidden-ext 族依赖)。
+        vm.label("_cps_chk_forbidden");
+        vm.mov(VReg.A0, VReg.S0);             // A0 = key(装箱串;跨调用后 V3 已失效)
+        vm.call("_getStrContent");
+        vm.mov(VReg.V3, VReg.RET);            // V3 = 内容指针(重取)
+        vm.mov(VReg.A0, VReg.V3);
+        vm.lea(VReg.A1, vm.asm.addString("caller"));
+        vm.call("_strcmp");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_cps_forbidden");
+        vm.mov(VReg.A0, VReg.V3);
+        vm.lea(VReg.A1, vm.asm.addString("arguments"));
+        vm.call("_strcmp");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_cps_set");
+        vm.label("_cps_forbidden");
+        vm.lea(VReg.A0, vm.asm.addString("'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
         vm.label("_cps_set");
         vm.mov(VReg.A0, VReg.S2);
         vm.call("_closure_props_ensure"); // A0=fn → RET=props(装箱)
@@ -7669,6 +7720,15 @@ export class ObjectGenerator {
         boxStr(VReg.A0);
         vm.call("_throw_type_error");
         vm.epilogue([VReg.S0, VReg.S1], 16);
+
+        // [test262] %ThrowTypeError% 落点:Function.prototype.caller / .arguments 的
+        // getter+setter 共用(ES 18.2.1.1.3)——无论读写一律抛 TypeError。调用方
+        // (_maybe_getter / _object_set_acc_dispatch)经 callIndirect 以 (A0=A5=this,
+        // argc=0/1) 进入;直接抛、永不返回,无需 prologue/epilogue。
+        vm.label("_fp_throw_accessor");
+        vm.lea(VReg.A0, vm.asm.addString("'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them"));
+        boxStr(VReg.A0);
+        vm.call("_throw_type_error");
 
         vm.asm.registerRuntimeString("_str_proto_key", "__proto__");
     }

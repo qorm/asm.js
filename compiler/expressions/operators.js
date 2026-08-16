@@ -1535,8 +1535,34 @@ export const OperatorCompiler = {
                     this.vm.movImm64(VReg.RET, 0x7ff9000000000000n);
                     return;
                 }
-                // 未解析的标识符(全局/未知):delete 返回 true(ES sloppy 语义)
-                this.vm.movImm64(VReg.RET, 0x7ff9000000000001n);
+                if (!(this.isUnresolvableIdentifier &&
+                      this.isUnresolvableIdentifier(darg))) {
+                    // 模块级可解析(顶层函数声明/顶层 var/导入/内建名,isUnresolvableIdentifier
+                    // 与读路径同一把尺子):绑定不可删 → false(S13_A12_T1)。
+                    this.vm.movImm64(VReg.RET, 0x7ff9000000000000n);
+                    return;
+                }
+                // 未解析的标识符(隐式全局/未知):ES sloppy 语义
+                // HasProperty(globalThis, name) ? [[Delete]] : true。
+                const missL = this.ctx.newLabel("del_g_miss");
+                const doneL = this.ctx.newLabel("del_g_done");
+                this.vm.lea(VReg.V0, "_global_this");
+                this.vm.load(VReg.A0, VReg.V0, 0);
+                this.vm.call("_box_obj_r");             // A0 = boxed globalThis
+                this.vm.push(VReg.RET);                 // [SP] = global(跨 call 保活)
+                this.emitBoxedStringKey(darg.name, VReg.A1);
+                this.vm.load(VReg.A0, VReg.SP, 0);
+                this.vm.call("_object_has");
+                this.vm.cmpImm(VReg.RET, 0);
+                this.vm.jeq(missL);
+                this.vm.load(VReg.A0, VReg.SP, 0);
+                this.emitBoxedStringKey(darg.name, VReg.A1);
+                this.vm.call("_object_delete");         // RET = 装箱布尔(configurable?)
+                this.vm.jmp(doneL);
+                this.vm.label(missL);
+                this.vm.movImm64(VReg.RET, 0x7ff9000000000001n); // true
+                this.vm.label(doneL);
+                this.vm.pop(VReg.V0);
                 return;
             }
             // CallExpression / NewExpression / 其他表达式:先求值以触发副作用,

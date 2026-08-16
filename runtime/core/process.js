@@ -878,6 +878,78 @@ export class ProcessGenerator {
         vm.movImm(VReg.A2, 5); // {w:1,e:0,c:1}
         vm.call("_object_set_prop_attr");
 
+        // [test262 prop-desc] 全局构造器 own props(Array/Boolean/Number 的
+        // built-ins/<X>/prop-desc.js 查 verifyProperty(this, "X", {w:1,e:0,c:1}))。
+        // 值 = 24B 静态引用闭包 {CLOSURE_MAGIC, _aref_static_tramp, tramp}(可调用;
+        // 与裸标识符物化的 _nsobj_* 单例身份不同,规范外 === 读法记偏差,测试无此读)。
+        // 逐块展开(无循环,规避 P1 录制器对循环发射的重放问题)。
+        {
+            vm.movImm(VReg.A0, 24);
+            vm.call("_alloc");
+            vm.movImm(VReg.V1, 0xc105); // CLOSURE_MAGIC
+            vm.store(VReg.RET, 0, VReg.V1);
+            vm.lea(VReg.V1, "_aref_static_tramp");
+            vm.store(VReg.RET, 8, VReg.V1);
+            vm.lea(VReg.V1, "_builtin_boolean");
+            vm.store(VReg.RET, 16, VReg.V1);
+            vm.mov(VReg.A0, VReg.RET);
+            vm.call("_js_box_function");
+            vm.mov(VReg.A2, VReg.RET);
+            vm.lea(VReg.V1, "_global_this");
+            vm.load(VReg.A0, VReg.V1, 0);
+            vm.lea(VReg.A1, this.vm.asm.addString("Boolean"));
+            vm.call("_object_set");
+            vm.lea(VReg.V1, "_global_this");
+            vm.load(VReg.A0, VReg.V1, 0);
+            vm.lea(VReg.A1, this.vm.asm.addString("Boolean"));
+            vm.movImm(VReg.A2, 5);
+            vm.call("_object_set_prop_attr");
+        }
+        {
+            vm.movImm(VReg.A0, 24);
+            vm.call("_alloc");
+            vm.movImm(VReg.V1, 0xc105); // CLOSURE_MAGIC
+            vm.store(VReg.RET, 0, VReg.V1);
+            vm.lea(VReg.V1, "_aref_static_tramp");
+            vm.store(VReg.RET, 8, VReg.V1);
+            vm.lea(VReg.V1, "_builtin_number");
+            vm.store(VReg.RET, 16, VReg.V1);
+            vm.mov(VReg.A0, VReg.RET);
+            vm.call("_js_box_function");
+            vm.mov(VReg.A2, VReg.RET);
+            vm.lea(VReg.V1, "_global_this");
+            vm.load(VReg.A0, VReg.V1, 0);
+            vm.lea(VReg.A1, this.vm.asm.addString("Number"));
+            vm.call("_object_set");
+            vm.lea(VReg.V1, "_global_this");
+            vm.load(VReg.A0, VReg.V1, 0);
+            vm.lea(VReg.A1, this.vm.asm.addString("Number"));
+            vm.movImm(VReg.A2, 5);
+            vm.call("_object_set_prop_attr");
+        }
+        {
+            vm.movImm(VReg.A0, 24);
+            vm.call("_alloc");
+            vm.movImm(VReg.V1, 0xc105); // CLOSURE_MAGIC
+            vm.store(VReg.RET, 0, VReg.V1);
+            vm.lea(VReg.V1, "_aref_static_tramp");
+            vm.store(VReg.RET, 8, VReg.V1);
+            vm.lea(VReg.V1, "_array_ctor_call");
+            vm.store(VReg.RET, 16, VReg.V1);
+            vm.mov(VReg.A0, VReg.RET);
+            vm.call("_js_box_function");
+            vm.mov(VReg.A2, VReg.RET);
+            vm.lea(VReg.V1, "_global_this");
+            vm.load(VReg.A0, VReg.V1, 0);
+            vm.lea(VReg.A1, this.vm.asm.addString("Array"));
+            vm.call("_object_set");
+            vm.lea(VReg.V1, "_global_this");
+            vm.load(VReg.A0, VReg.V1, 0);
+            vm.lea(VReg.A1, this.vm.asm.addString("Array"));
+            vm.movImm(VReg.A2, 5);
+            vm.call("_object_set_prop_attr");
+        }
+
         // 返回 process 对象 (从全局加载，确保是正确的装箱值或指针)
         vm.lea(VReg.V1, "_process_global");
         vm.load(VReg.RET, VReg.V1, 0);

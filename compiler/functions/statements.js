@@ -1349,7 +1349,12 @@ export const StatementCompiler = {
             if (!this.ctx.boxedVars) this.ctx.boxedVars = new Set();
             this.ctx.boxedVars.add(name);
             // 预建 box（值=0），offset 指向它
-            this.vm.call("_box_alloc");
+            if (this.ctx.preboxedVars && this.ctx.preboxedVars.has(name)) {
+                // [L2-②] 复用函数入口预建 box(前向闭包已捕获同 box,不得另建)
+                this.vm.load(VReg.RET, VReg.FP, offset);
+            } else {
+                this.vm.call("_box_alloc");
+            }
             this.vm.movImm(VReg.V1, 0);
             this.vm.store(VReg.RET, BOX_VALUE_OFFSET, VReg.V1);
             this.vm.store(VReg.FP, offset, VReg.RET);
@@ -1380,7 +1385,12 @@ export const StatementCompiler = {
         } else if (needsBox) {
             // 创建 box 并存储函数指针
             this.vm.mov(VReg.V1, VReg.RET); // 保存函数指针/闭包
-            this.vm.call("_box_alloc");
+            if (this.ctx.preboxedVars && this.ctx.preboxedVars.has(name)) {
+                // [L2-②] 复用函数入口预建 box(前向闭包已捕获同 box,不得另建)
+                this.vm.load(VReg.RET, VReg.FP, offset);
+            } else {
+                this.vm.call("_box_alloc");
+            }
             this.vm.store(VReg.FP, offset, VReg.RET); // 存储 box 指针
             this.vm.store(VReg.RET, BOX_VALUE_OFFSET, VReg.V1); // 存入函数指针
         } else {

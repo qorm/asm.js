@@ -6593,6 +6593,7 @@ export class StringGenerator {
         vm.mov(VReg.S3, VReg.RET);   // S3 = match_index
         vm.cmpImm(VReg.S3, 0);
         vm.jlt("_sm_null_v2");       // no match -> null
+        vm.push(VReg.S3);            // [SP] = match_index(跨后续调用保活)
         // Load pattern_ptr from re+8, get pattern_len
         vm.load(VReg.V0, VReg.S1, 8);   // V0 = pattern_ptr
         vm.mov(VReg.A0, VReg.V0);
@@ -6612,11 +6613,39 @@ export class StringGenerator {
         vm.movImm(VReg.A1, 0);
         vm.mov(VReg.A2, VReg.S3);
         vm.call("_array_set");
+        // [test262 S15.5.4.10_A1_T6] 非全局 RegExp:match 结果 = exec 结果,
+        // 须带 index/input 属性(此前缺 → __matched.index 恒 undefined)。
+        vm.mov(VReg.A0, VReg.S2);   // A0 = raw array
+        vm.lea(VReg.A1, vm.asm.addString("index"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.load(VReg.A2, VReg.SP, 0);   // A2 = match index (raw int)
+        vm.scvtf(0, VReg.A2);
+        vm.fmovToInt(VReg.A2, 0);       // canonical number
+        vm.call("_object_set");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.lea(VReg.A1, vm.asm.addString("input"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.mov(VReg.A2, VReg.S0);       // A2 = boxed this string
+        vm.call("_object_set");
+        vm.pop(VReg.V0);
         vm.mov(VReg.RET, VReg.S2);
         vm.call("_box_arr_r");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
         // Non-RegExp path: fall back to _str_indexOf
         vm.label(smNotRe);
+        // [test262 S15.5.4.10_A1_T6] undefined 参 ≡ RegExp(undefined) ≡ 空模式(匹配
+        // 空串,index 0);此前 ToString(undefined)="undefined" 错配 "undefined" 子串。
+        // null 仍走 ToString → "null"(RegExp(null) 同)。
+        vm.lea(VReg.V0, "_js_undefined");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmp(VReg.S1, VReg.V0);
+        vm.jne("_sm_tostr");
+        vm.lea(VReg.S1, "_str_empty");
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.S1, VReg.S1, VReg.V1);
+        vm.label("_sm_tostr");
         // Non-RegExp: convert search value to string, find first match via indexOf,
         // extract matched substring (not the full this string as before).
         this._emitArgStrInline(VReg.S1, "_sm_search");
@@ -6627,6 +6656,7 @@ export class StringGenerator {
         vm.mov(VReg.S3, VReg.RET);             // S3 = match index
         vm.cmpImm(VReg.S3, 0);
         vm.jlt("_sm_null_v2");
+        vm.push(VReg.S3);                       // [SP] = match index(跨调用保活)
         // Extract matched substring: this[start..start+searchLen]
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_getStrContent");             // RET = str_ptr
@@ -6649,6 +6679,22 @@ export class StringGenerator {
         vm.movImm(VReg.A1, 0);
         vm.mov(VReg.A2, VReg.S3);
         vm.call("_array_set");
+        // [test262] match(非 RegExp 参)同样带 index/input(RegExp(arg).exec 语义)。
+        vm.mov(VReg.A0, VReg.S2);
+        vm.lea(VReg.A1, vm.asm.addString("index"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.load(VReg.A2, VReg.SP, 0);
+        vm.scvtf(0, VReg.A2);
+        vm.fmovToInt(VReg.A2, 0);
+        vm.call("_object_set");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.lea(VReg.A1, vm.asm.addString("input"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.mov(VReg.A2, VReg.S0);
+        vm.call("_object_set");
+        vm.pop(VReg.V0);
         vm.mov(VReg.A0, VReg.S2);
         vm.call("_box_arr_r");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
