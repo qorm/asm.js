@@ -4,6 +4,5 @@
     "parse": false,
     "compile": false,
     "run": false
-  },
-  "knownFailure": "Pre-existing issue - not caused by current changes"
+  }
 }

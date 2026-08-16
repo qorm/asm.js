@@ -4,6 +4,7 @@
 import { TokenType } from "../lexer/token.js";
 import * as AST from "./ast.js";
 import { Precedence } from "./precedence.js";
+import { collectPatternNames, collectVarDeclarations } from "../analysis/closure.js";
 
 // rest 形参绑定模式(`function f(...[a,b])`)的临时 rest 局部名序号。仅在该语法出现时
 // 自增,故不影响任何既有产物(编译器自身源码不用该语法,自举逐字节不变)。
@@ -201,6 +202,11 @@ export const StatementParser = {
             } else if (this.curTokenIs(TokenType.LBRACKET)) {
                 id = this.parseArrayPattern(lexical);
             } else if (this.curTokenIsIdentifier()) {
+                // [test262] 词法声明位(let/const)的 "let" 绑定名恒拒(sloppy 亦拒;
+                // 与模式路径 lexical 透传口径一致。var 位 sloppy 合法不动)。
+                if (lexical && this.curToken.literal === "let") {
+                    this.errors.push("'let' is not allowed as a lexical binding name");
+                }
                 this.checkYieldAwaitBinding(this.curToken.literal);   // [test262 S1] var yield/await
                 this.checkReservedBinding(this.curToken.literal);     // [test262 早期错误 A] 保留字
                 id = new AST.Identifier(this.curToken.literal);
@@ -222,6 +228,54 @@ export const StatementParser = {
         } while (this.peekTokenIs(TokenType.COMMA) && (this.nextToken(), true));
         if (this.peekTokenIs(TokenType.SEMICOLON)) this.nextToken();
         return decl;
+    },
+
+    // [test262 早期错误] for-in/of 头部词法声明(let/const)的早期错误:
+    // 1) BoundNames 含重复(`for (let [x, x] in {})`);
+    // 2) 头部绑定名与 body VarDeclaredNames 冲突(`for (let x of []) { var x; }`,
+    //    `for (const x in {}) { var x; }`)。仅 let/const 头触发(var 头重复/遮蔽合法)。
+    checkForHeadDeclaration(init, body) {
+        if (!init || init.type !== "VariableDeclaration") return;
+        if (init.kind !== "let" && init.kind !== "const") return;
+        // 数组收集(保留重复):Object.keys 会折叠同 key,检测不到单模式内重名
+        // `for (let [x, x] in {})`。
+        const pn = [];
+        const collect = (node) => {
+            if (!node) return;
+            if (node.type === "Identifier") { pn.push(node.name); return; }
+            if (node.type === "ObjectPattern") {
+                for (const pr of (node.properties || [])) {
+                    if (pr.type === "SpreadElement" || pr.type === "RestElement") collect(pr.argument);
+                    else if (pr.value) collect(pr.value);
+                    else if (pr.key) collect(pr.key);
+                }
+                return;
+            }
+            if (node.type === "ArrayPattern") {
+                for (const el of (node.elements || [])) if (el) collect(el);
+                return;
+            }
+            if (node.type === "AssignmentPattern") { collect(node.left); return; }
+            if (node.type === "RestElement" || node.type === "SpreadElement") collect(node.argument);
+        };
+        for (const d of init.declarations) collect(d.id);
+        const seen = Object.create(null);
+        for (const n of pn) {
+            if (seen[n]) {
+                this.errors.push("Duplicate binding name '" + n + "' in for-of/in head");
+                return;
+            }
+            seen[n] = 1;
+        }
+        if (!body) return;
+        const bv = {};
+        collectVarDeclarations(body, bv);
+        for (const n of pn) {
+            if (Object.prototype.hasOwnProperty.call(bv, n)) {
+                this.errors.push("Var declaration '" + n + "' conflicts with for-of/in head lexical binding");
+                return;
+            }
+        }
     },
 
     parseFunctionDeclaration(defaultName) {
@@ -664,6 +718,7 @@ export const StatementParser = {
                 this._markBreakableLabels();
                 let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
                 this.checkStatementBody(body);   // [test262 早期错误] for-body 单语句位
+                this.checkForHeadDeclaration(init, body); // [test262] 头部词法绑定重名/与 body var 冲突
                 this.loopDepth--;
                 return new AST.ForInStatement(init, right, body);
             }
@@ -684,13 +739,17 @@ export const StatementParser = {
                 }
                 this.nextToken();
                 this.nextToken();
-                let right = this.parseExpression(Precedence.LOWEST);
+                // [test262 head-var-no-expr] for-of 右侧是 AssignmentExpression:顶层逗号
+                // 序列非法(`for (var x of [], [])`)。COMMA 优先级停逗号 → expectPeek 报错;
+                // `(a, b)` 有 _parenthesized 标志不受影响。
+                let right = this.parseExpression(Precedence.COMMA);
                 if (!this.expectPeek(TokenType.RPAREN)) return null;
                 this.nextToken();
                 this.loopDepth++;
                 this._markBreakableLabels();
                 let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
                 this.checkStatementBody(body);   // [test262 早期错误] for-body 单语句位
+                this.checkForHeadDeclaration(init, body); // [test262] 头部词法绑定重名/与 body var 冲突
                 this.loopDepth--;
                 return new AST.ForOfStatement(init, right, body, isAwait);
             }
@@ -709,7 +768,7 @@ export const StatementParser = {
                 // for-of:of 非运算符,parseExpression 在其前已停。
                 this.nextToken();
                 this.nextToken();
-                let right = this.parseExpression(Precedence.LOWEST);
+                let right = this.parseExpression(Precedence.COMMA); // [test262 head-var-no-expr] 顶层逗号非法
                 if (!this.expectPeek(TokenType.RPAREN)) return null;
                 this.nextToken();
                 this.loopDepth++;

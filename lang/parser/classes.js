@@ -87,6 +87,15 @@ export const ClassParser = {
             let member = this.parseClassMember();
             if (member !== null) {
                 body.push(member);
+                // [test262 fields-asi-same-line / privatenames-same-line] 字段元素
+                // 之后必须跟 `;` 或 LineTerminator 才能接下一个元素:`field = 1 /*c*/ method(){}`
+                // 与 `#x #y` 皆 SyntaxError(同行 ASI 不生效;`;` 已被 parseClassField 消费)。
+                if (member.type === "PropertyDefinition" &&
+                    !this.curTokenIs(TokenType.SEMICOLON) &&
+                    !this.peekTokenIs(TokenType.RBRACE) &&
+                    this.curToken.line === this.peekToken.line) {
+                    this.errors.push("Fields must be separated by a semicolon or line terminator");
+                }
             }
             this.nextToken();
         }
@@ -197,6 +206,18 @@ export const ClassParser = {
         // 检查私有字段 (#name)
         if (this.curTokenIs(TokenType.HASH) || (this.curToken.literal && this.curToken.literal.startsWith("#"))) {
             return this.parsePrivateFieldOrMethod(isStatic);
+        }
+
+        // [test262 grammar-field-identifier-invalid-zwnj/ues-error] 类成员名位
+        // (字段/方法)的标识符不得以转义的 ZWNJ/ZWJ/NUL **开头**:`\u200C_ZWNJ;` /
+        // `\u0000;` 皆 SyntaxError(ES 12.1:ZWNJ/ZWJ 仅在 IdentifierName 原字允许,
+        // 转义形态不作 IdentifierStart;NUL 非 ID_Continue)。中段转义(`Z\u200C`)
+        // 合法(fixture class-valid-escaped-identifiers)。cook 按 latin1 UTF-8 字节串。
+        if (this.curToken.escaped && typeof this.curToken.literal === "string" &&
+            (this.curToken.literal === "" ||  // \u0000 → cook ""
+             this.curToken.literal.indexOf("\u00e2\u0080\u008c") === 0 ||
+             this.curToken.literal.indexOf("\u00e2\u0080\u008d") === 0)) {
+            this.errors.push("Class member names may not start with an escaped ZWNJ/ZWJ or NUL");
         }
 
         // 检查 getter/setter
@@ -396,6 +417,23 @@ export const ClassParser = {
     },
 
     parsePrivateFieldOrMethod(isStatic, kind = "method", isGenerator = false, isAsyncMethod = false) {
+        // [test262] 私有名转义规则(ES 12.5.1.1 PrivateIdentifier 不含转义):
+        // 1) `async * \u0023m(){}`——# 本身被转义(整 token .escaped)→ 恒拒;
+        // 2) 名字首字符转义成 ZWNJ/ZWJ/NUL(`#\u200C_ZWNJ` / `#\u0000`)→ 拒;
+        // 名字中段转义(`#ZW_\u200C_NJ`)合法(fixture class-valid-escaped-identifiers)。
+        if (this.curToken.escaped &&
+            (this.curTokenIs(TokenType.HASH) ||
+             (this.curToken.literal && this.curToken.literal.startsWith("#")))) {
+            this.errors.push("Private names may not contain escaped characters");
+        }
+        if (this.curToken.identEscaped && typeof this.curToken.literal === "string") {
+            const nm = this.curToken.literal.slice(1); // 剥 '#'
+            if (nm === "" ||
+                nm.indexOf("\u00e2\u0080\u008c") === 0 ||
+                nm.indexOf("\u00e2\u0080\u008d") === 0) {
+                this.errors.push("Private names may not start with an escaped ZWNJ/ZWJ or NUL");
+            }
+        }
         // 获取私有名称。词法上 `#x`(# 紧邻名字)合成单个 IDENT("#x");`# x`(# 与名字间有
         // 空白/换行)则产出裸 HASH token + 独立标识符。ES 要求 # 紧邻 IdentifierName,故见到
         // 裸 HASH 必为早期错误(此前会静默把 `# x` 当两个成员编译)。

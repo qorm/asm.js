@@ -173,6 +173,10 @@ export class Lexer {
             }
             let n = this._atUnicodeWhitespace();
             if (n > 0) {
+                // U+2028/U+2029(3 字节)是 LineTerminator:行号须推进,否则
+                // lineBreakBefore / 后缀 ++ 换行守卫(postfix-increment/line-terminator-*
+                // 族)判不出换行。NBSP(1/2 字节)非行终止符,行号不动。
+                if (n === 3) this.line = this.line + 1;
                 let i = 0;
                 while (i < n) { this.readChar(); i = i + 1; }
                 continue;
@@ -826,7 +830,11 @@ export class Lexer {
             this.readChar(); // 跳过 #
             if (this.isLetter(this.ch) || (this.ch === "\\" && this.peekChar() === "u")) {
                 let ident = this.readIdentifier();
-                return newToken(TokenType.IDENT, "#" + ident, startLine, startColumn);
+                // [test262] 名字部分的转义(`#\u200C_x`)单记 identEscaped(# 本身未转义;
+                // 与 `\u0023m` 整 token 转义区分——后者经通用标识符路径置 .escaped)。
+                let ptok = newToken(TokenType.IDENT, "#" + ident, startLine, startColumn);
+                if (this._identEscaped) ptok.identEscaped = true;
+                return ptok;
             }
             tok = newToken(TokenType.HASH, "#", startLine, startColumn);
         } else if (this.ch === '"' || this.ch === "'") {
