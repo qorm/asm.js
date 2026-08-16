@@ -1608,9 +1608,11 @@ export const FunctionCompiler = {
                     this.vm.load(VReg.A2, VReg.FP, eSlot);
                     this.vm.call("_object_set");
                 }
-                // message = 指定参数(无则空串)
+                // message = 指定参数(无则空串);undefined/非串走 _error_msg_norm 归一
                 if (expr.arguments.length > msgIdx && expr.arguments[msgIdx]) {
                     this.compileExpression(expr.arguments[msgIdx]);
+                    this.vm.mov(VReg.A0, VReg.RET);
+                    this.vm.call("_error_msg_norm");
                 } else {
                     this.vm.lea(VReg.RET, this.asm.addString(""));
                     this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
@@ -1644,7 +1646,8 @@ export const FunctionCompiler = {
                     const noCause = this.ctx.newLabel("superr_nocause");
                     this.vm.load(VReg.A0, VReg.FP, optSlot);
                     this.emitBoxedStringKey("cause", VReg.A1);
-                    this.vm.call("_object_has");
+                    // 非 Object 的 options(含合成默认构造器转发来的 undefined)静默跳过
+                    this.vm.call("_error_opt_has_cause");
                     this.vm.cmpImm(VReg.RET, 0);
                     this.vm.jeq(noCause);
                     this.vm.load(VReg.A0, VReg.FP, optSlot);

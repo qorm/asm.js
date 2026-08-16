@@ -19,6 +19,20 @@ import { isAsyncFunction, isGeneratorFunction } from "../async/index.js";
 // emitBuiltinMethodRefClosureMeta 逐闭包挂 .name/.length(code_ptr 共享 _aref_generic,
 // 元数据侧表按 code_ptr 查不出逐方法身份,必须落闭包属性侧表)。#32 命中判据相应从
 // typeof==="string" 改 Array.isArray(Object.prototype 上无数组值属性,污染-safe)。
+// 内建构造器的规范 Function.length(name 即键名)。asm.js 把这些构造器编译期内联,没有
+// 闭包/属性容器,故 `X.name` / `X.length` 在访问点静态求值(见 compileMemberExpression)。
+// 命名空间对象(Math/JSON/Reflect)不是函数,不入表。
+const BUILTIN_CTOR_META = {
+    Object: 1, Function: 1, Array: 1, String: 1, Number: 1, Boolean: 1, Symbol: 0,
+    Error: 1, TypeError: 1, RangeError: 1, SyntaxError: 1, ReferenceError: 1,
+    EvalError: 1, URIError: 1, AggregateError: 2,
+    Promise: 1, Map: 0, Set: 0, WeakMap: 0, WeakSet: 0, WeakRef: 1,
+    RegExp: 2, Date: 7, Proxy: 2,
+    ArrayBuffer: 1, SharedArrayBuffer: 1, DataView: 1,
+    Int8Array: 3, Uint8Array: 3, Uint8ClampedArray: 3, Int16Array: 3, Uint16Array: 3,
+    Int32Array: 3, Uint32Array: 3, Float32Array: 3, Float64Array: 3,
+};
+
 const ArefMethodRef = {
     // 直连 helper 型:helper 自身正确处理装箱实参/undefined 缺参,generic 蹦床可直接透传。
     // 需**裸 int** 下标/fromIndex 的方法(indexOf/charAt/at/array slice/lastIndexOf 等)不在此
@@ -808,8 +822,38 @@ export const MemberCompiler = {
     // ClassName 前缀保证跨类同名 #x 互不可见（含继承：子类访问父类 #x 天然不可见）。
     // 运行时不做 brand check（偏差：错误类实例访问得 undefined 而非 TypeError）。
     manglePrivateName(name) {
+        // 私有名是词法绑定:从内层类作用域向外找**声明该私有名的类**(嵌套类访问外层
+        // 类的 #x 必须用外层类名改写)。找不到声明者时退回当前类名(旧行为)。
+        const scopes = this._privateScopes;
+        if (scopes) {
+            for (let i = scopes.length - 1; i >= 0; i--) {
+                const sc = scopes[i];
+                if (sc && sc.names && sc.names.has(name)) return "#" + sc.className + name;
+            }
+        }
         const cls = (this.ctx && this.ctx.className) ? this.ctx.className : "";
         return "#" + cls + name;
+    },
+
+    // 私有成员键判定:PrivateIdentifier,或解析器某些分支产出的 Identifier{name:"#x"}
+    // (`o?.#x` / `*#m(){}`);"#" 非法标识符字符,公有键撞不上。
+    _isPrivateMemberKey(property) {
+        if (!property) return false;
+        if (property.type === "PrivateIdentifier") return true;
+        return property.type === "Identifier" && typeof property.name === "string" &&
+            property.name[0] === "#";
+    },
+
+    // 私有成员品牌检查:接收者(装箱)在 RET,检查后 RET 原样保留。
+    // mode 0=读(缺私有名/无 getter 抛),1=写(缺私有名/私有方法/无 setter 抛)。
+    emitPrivateBrandCheck(mangledName, mode) {
+        this.vm.push(VReg.RET);
+        this.emitBoxedStringKey(mangledName, VReg.A1);
+        this.vm.pop(VReg.A0);
+        this.vm.push(VReg.A0);
+        this.vm.movImm(VReg.A2, mode);
+        this.vm.call("_private_brand_check");
+        this.vm.pop(VReg.RET);
     },
 
     getMemberPropertyName(property) {
@@ -4750,6 +4794,24 @@ export const MemberCompiler = {
             this.vm.label(endLabel);
             return;
         }
+        // [私有品牌] `o.#x` 读:先按品牌判定(接收者链上无该改写键 → TypeError;只 set 的
+        // 访问器读 → TypeError),再走通用取值 + 访问器解包。此前私有读混在公有属性各条
+        // 快路里,缺私有名一律读成 undefined。
+        if (!expr.computed && this._isPrivateMemberKey(expr.property) &&
+            !(expr.object && expr.object.type === "SuperExpression")) {
+            const mangled = this.manglePrivateName(expr.property.name);
+            this.compileExpression(expr.object);
+            const pobjSlot = this.ctx.allocLocal(`__pmr_obj_${this.nextLabelId()}`);
+            this.vm.store(VReg.FP, pobjSlot, VReg.RET);
+            this.emitPrivateBrandCheck(mangled, 0);
+            this.vm.load(VReg.A0, VReg.FP, pobjSlot);
+            this.emitBoxedStringKey(mangled, VReg.A1);
+            this.vm.call("_object_get");
+            this.vm.mov(VReg.A0, VReg.RET);
+            this.vm.load(VReg.A1, VReg.FP, pobjSlot);
+            this.vm.call("_maybe_getter"); // 私有访问器:以接收者调用 getter
+            return;
+        }
         if (expr.computed && expr.object && expr.object.type === "SuperExpression" && this.ctx.superClass) {
             const prop = expr.property;
             let keyName = null;
@@ -5485,6 +5547,26 @@ export const MemberCompiler = {
                     this.vm.load(VReg.RET, VReg.RET, 0);
                     this.vm.label(fmDone);
                     return;
+                }
+                // 内建构造器的 name/length(Int8Array.name==="Int8Array"、Array.length===1…)。
+                // 这些构造器在 asm.js 里是编译期内联的,不是闭包也无属性容器 → 通用读得
+                // undefined;test262 的 testTypedArray harness 用 `constructor.name` 组装
+                // 断言消息(此前全打成 "undefined"),另有多例直接断言 name/length。
+                if (expr.object.type === "Identifier") {
+                    const bn = expr.object.name;
+                    const bi = BUILTIN_CTOR_META[bn];
+                    const shadowed = (this.ctx.getLocal && this.ctx.getLocal(bn)) ||
+                        (this.ctx.getFunctionSymbol && this.ctx.getFunctionSymbol(bn));
+                    if (bi && !shadowed) {
+                        if (propName === "name") {
+                            this.vm.lea(VReg.A0, this.asm.addString(bn));
+                            this.vm.call("_js_box_string");
+                        } else {
+                            this.vm.movImm(VReg.RET, bi);
+                            this.intToFloat64Bits(VReg.RET);
+                        }
+                        return;
+                    }
                 }
             }
 

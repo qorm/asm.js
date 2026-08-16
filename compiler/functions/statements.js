@@ -496,8 +496,11 @@ export const StatementCompiler = {
                         this.vm.store(VReg.V1, BOX_VALUE_OFFSET, VReg.RET);
                         this.syncModuleExportBinding(name, VReg.RET);
                     } else {
-                        // 初始化为 0
-                        this.vm.movImm(VReg.V1, 0);
+                        // 无初始化器 → JS_UNDEFINED(与下方非装箱路径一致)。此前装箱路径存
+                        // 裸 0:`let x;` 被闭包捕获后读回裸 0,而裸 0 现只代表数值 0.0
+                        // (null/undefined 恒 tagged),于是 `x ?? d` 判非 nullish 返 0、
+                        // `typeof x` 报 number —— 凡捕获的未初始化 let/var 全错。
+                        this.vm.movImm64(VReg.V1, 0x7ffb000000000000n);
                         this.vm.store(VReg.RET, BOX_VALUE_OFFSET, VReg.V1);
                         this.syncModuleExportBinding(name, VReg.V1);
                     }
@@ -3094,6 +3097,21 @@ export const StatementCompiler = {
             field.key.type !== "NumericLiteral");
     },
 
+    // 静态字段名归一(与 _classMethodKeyName 同构):标识符名 / 字符串字面量(含空串)/
+    // 数字字面量 / null / 布尔 → 字符串键。此前站点用 `key.name || key.value`:
+    // `[0]`/`[""]`/`[false]` 的键是 falsy → 当无效键**整条字段丢弃**;数字键还以
+    // number 传进 addStringConstant(静态字段路径漏 String() → 键错)。
+    _classFieldKeyName(field) {
+        const k = field && field.key;
+        if (!k) return null;
+        if (typeof k.name === "string") return k.name;
+        if (k.value === null) return "null"; // `[null] = v` → 键 "null"
+        const t = typeof k.value;
+        if (t === "string") return k.value;
+        if (t === "number" || t === "boolean") return String(k.value);
+        return null;
+    },
+
     // 私有类成员键:PrivateIdentifier,或解析器 `*` 分支产出的 Identifier{name:"#m"}
     // (与 emitClassMethodTable / getMemberPropertyName 的 W-34 判据一致)。
     _isPrivateClassKey(key) {
@@ -3162,7 +3180,7 @@ export const StatementCompiler = {
         let cfKeyIdx = 0;
         for (const field of instanceFields) {
             const cfRuntimeKey = this._isRuntimeComputedFieldKey(field);
-            const fieldName = cfRuntimeKey ? null : (field.key && (field.key.name || field.key.value));
+            const fieldName = cfRuntimeKey ? null : this._classFieldKeyName(field);
             if (cfRuntimeKey) {
                 const thisKeyIdx = cfKeyIdx++;
                 this.vm.lea(VReg.A0, cfkeysLabel);
@@ -3378,6 +3396,35 @@ export const StatementCompiler = {
                     instanceFields.push(member);
                 }
             }
+        }
+
+        // [私有名词法作用域] 私有名按**声明它的类**改写("#类名#x")。嵌套类体里引用外层类的
+        // `#x`(inner class 访问 Outer 的私有字段)此前用内层类名改写 → 键不匹配 → 读 undefined /
+        // 写成新属性。这里入一层私有作用域(本类声明的私有名集合),manglePrivateName 从内向外
+        // 找**声明者**;延迟编译的箭头/函数体在 pendingFunctions 里带走整条链的快照。
+        {
+            const privNames = new Set();
+            for (const member of stmt.body) {
+                if (!member || !member.key) continue;
+                if (member.type !== "MethodDefinition" && member.type !== "PropertyDefinition") continue;
+                if (!this._isPrivateClassKey(member.key)) continue;
+                const pn = member.key.name || member.key.value;
+                if (typeof pn === "string") privNames.add(pn);
+            }
+            if (!this._privateScopes) this._privateScopes = [];
+            this._privateScopes.push({ className: className, names: privNames });
+        }
+
+        // [任意计算键成员] `[a+b](){}` / `get [x||1](){}`:键是运行期值,方法体 label 无静态
+        // 名可用,此前 _classMethodKeyName 返 null → 方法体与表项**一并跳过**(读回 undefined /
+        // "not a function")。这里按声明序发一个全局唯一的合成名(编译单元级 labelId,不会与
+        // 真实方法名相撞),方法体与表项共用同一节点上的该名字,键仍在运行期求值。
+        for (const member of stmt.body) {
+            if (member.type !== "MethodDefinition") continue;
+            if (!member.computed || member.kind === "constructor") continue;
+            if (this._classMethodKeyName(member) !== null) continue;
+            if (this._wellKnownSymbolMethodName(member)) continue;
+            if (!member.__ckName) member.__ckName = "ck$" + this.nextLabelId();
         }
 
         // 实例计算键在类定义时求值,结果存 `_cfkeys_<类>__<id>`(数据段 GC 根)。
@@ -3871,7 +3918,7 @@ export const StatementCompiler = {
         // 初始化静态字段
         for (const field of staticFields) {
             const sfRuntimeKey = this._isRuntimeComputedFieldKey(field);
-            let fieldName = sfRuntimeKey ? null : (field.key && (field.key.name || field.key.value));
+            let fieldName = sfRuntimeKey ? null : this._classFieldKeyName(field);
             if (sfRuntimeKey) {
                 // 计算键静态字段 `static [k] = v`:类定义时求键(含无 initializer)。
                 // symbol → _js_prop_key;非 symbol → _valueToStr。
@@ -3976,6 +4023,7 @@ export const StatementCompiler = {
             this.vm.store(VReg.V1, 0, VReg.S0); // box 值 = 类信息对象 (raw)
         }
         this.syncModuleExportBinding(className, VReg.S0);
+        this._privateScopes.pop(); // 出私有名作用域(与函数开头的 push 配对)
     },
 
     // 发射类方法表：把方法/访问器写入目标对象（targetReg = S1 prototype 或 S0 类对象）。
@@ -4009,7 +4057,71 @@ export const StatementCompiler = {
         if (typeof k.name === "string") return k.name;
         if (typeof k.value === "string") return k.value; // Literal 键兜底(含空串键)
         if (typeof k.value === "number") return String(k.value);
+        // `[null](){}` / `[true](){}`:ToPropertyKey 得 "null"/"true"(字面量键,编译期已知)
+        if (k.type === "Literal" && k.value === null) return "null";
+        if (typeof k.value === "boolean") return String(k.value);
         return null;
+    },
+
+    // 任意计算键类成员的表项发射:键在类定义时求值一次(ToPropertyKey),方法体 label 用
+    // compileClassDeclaration 预分配的合成名。访问器经 _accessor_define 合并(同键 get/set
+    // 是两个成员,键相同只在运行期可知)。
+    emitClassRuntimeKeyMember(method, className, prefix, methodName, labelId, isStatic, targetReg) {
+        const isAccessor = method.kind === "get" || method.kind === "set";
+        const kindPrefix = method.kind === "get" ? "get_" : (method.kind === "set" ? "set_" : "");
+        const memberLabel = `_class_${className}_${prefix}${kindPrefix}${methodName}_${labelId}`;
+
+        this.vm.push(targetReg);
+        this.compileExpression(method.key);
+        this.vm.mov(VReg.A0, VReg.RET);
+        this.vm.call("_js_prop_key"); // ToPropertyKey:数字→字符串键,Symbol 原样
+        const kSlot = this.ctx.allocLocal(`__ckk_${this.nextLabelId()}`);
+        this.vm.store(VReg.FP, kSlot, VReg.RET);
+
+        if (isAccessor) {
+            // 标记对象 {TYPE_GETTER@0, getter@8, setter@16};另半边留 0 由 _accessor_define 保留
+            this.vm.movImm(VReg.A0, 24);
+            this.vm.call("_alloc");
+            this.vm.mov(VReg.V2, VReg.RET);
+            this.vm.movImm(VReg.V1, TYPE_GETTER);
+            this.vm.store(VReg.V2, 0, VReg.V1);
+            this.vm.lea(VReg.V1, memberLabel);
+            if (method.kind === "get") {
+                this.vm.store(VReg.V2, 8, VReg.V1);
+                this.vm.movImm(VReg.V1, 0);
+                this.vm.store(VReg.V2, 16, VReg.V1);
+            } else {
+                this.vm.store(VReg.V2, 16, VReg.V1);
+                this.vm.movImm(VReg.V1, 0);
+                this.vm.store(VReg.V2, 8, VReg.V1);
+            }
+            this.vm.pop(VReg.A0);
+            this.vm.load(VReg.A1, VReg.FP, kSlot);
+            this.vm.mov(VReg.A2, VReg.V2);
+            this.vm.call("_accessor_define");
+        } else {
+            this.vm.pop(VReg.A0);
+            this.vm.load(VReg.A1, VReg.FP, kSlot);
+            this.vm.lea(VReg.A2, memberLabel);
+            this.vm.movImm64(VReg.V0, 0x7fff000000000000n);
+            this.vm.or(VReg.A2, VReg.A2, VReg.V0);
+            this.vm.call("_object_define");
+        }
+        // prototype 上的方法/访问器按规范不可枚举(静态成员落 classinfo,置 flags 会坏对象)
+        if (!isStatic) {
+            this.vm.mov(VReg.A0, targetReg);
+            this.vm.load(VReg.A1, VReg.FP, kSlot);
+            this.vm.movImm(VReg.A2, 5); // writable+configurable, not enumerable
+            this.vm.call("_object_set_prop_attr");
+        }
+    },
+
+    // 访问器归组键:只有标识符计算键 `get [k]()` 的键是运行期值,须与同名静态键分隔;
+    // 计算字面量键 `get ["g"]()` 编译期即知名字,与 `get g()` 同组。
+    _classAccessorGroupKey(method, keyName) {
+        const runtimeKey = !!(method.computed && method.key &&
+            method.key.type === "Identifier");
+        return (runtimeKey ? "@c@" : "") + keyName;
     },
 
     emitClassMethodTable(methods, className, labelId, isStatic, targetReg) {
@@ -4022,7 +4134,11 @@ export const StatementCompiler = {
             if (mn === null) continue;
             // 计算键访问器 `get [k]()`(k 为标识符)与同名静态访问器 `get k()` 归组分隔:
             // 前者键为运行时值,不可与静态字符串键合并。非计算键分组键 === mn(自举字节不变)。
-            const grpKey = (method.computed ? "@c@" : "") + mn;
+            // 判据须与下方发射处一致(只有**标识符**计算键走运行时键):此前这里按
+            // `method.computed` 分组、发射处按 `computed && key 是 Identifier` 查组,
+            // 于是 `get ["g"](){}` 这类计算**字面量**键存进 "@c@g" 却按 "g" 查 → 查不到
+            // → 整个访问器不发射(C.prototype["g"] 读 undefined)。
+            const grpKey = this._classAccessorGroupKey(method, mn);
             let g = accessorGroups.get(grpKey);
             if (!g) {
                 g = { getterLabel: null, setterLabel: null, emitted: false,
@@ -4038,10 +4154,22 @@ export const StatementCompiler = {
         for (const method of methods) {
             let methodName = this._classMethodKeyName(method);
             let wkName = null;
+            let ckName = null;
             if (methodName === null) {
                 wkName = this._wellKnownSymbolMethodName(method); // [Symbol.X](){}
-                if (!wkName) continue; // 其余计算键仍跳过
-                methodName = wkName;   // 方法体 label 用同名(与 compileClassMethod 一致)
+                if (!wkName) {
+                    // 任意计算键成员:合成名做 label,键运行期 ToPropertyKey 求值
+                    ckName = method.__ckName || null;
+                    if (!ckName) continue;
+                    methodName = ckName;
+                } else {
+                    methodName = wkName; // 方法体 label 用同名(与 compileClassMethod 一致)
+                }
+            }
+            if (ckName) {
+                this.emitClassRuntimeKeyMember(method, className, prefix, methodName,
+                    labelId, isStatic, targetReg);
+                continue;
             }
             // well-known symbol 计算键方法:运行时求 Symbol.X 值 → _js_prop_key(与 obj[Symbol.X]
             // 读路径一致)→ 以该 symbol 键 define 方法。get/set 型极罕见,不特判(落下方跳过)。
@@ -4107,18 +4235,18 @@ export const StatementCompiler = {
             if (method.kind === "get" || method.kind === "set") {
                 const isComputedAccessor = method.computed && method.key &&
                     method.key.type === "Identifier";
-                const grpKey = (isComputedAccessor ? "@c@" : "") + methodName;
+                const grpKey = this._classAccessorGroupKey(method, methodName);
                 const group = accessorGroups.get(grpKey);
                 if (!group || group.emitted) continue; // 同名第二个访问器已合并
                 group.emitted = true;
-                // 计算键访问器 `get [k]()`:先求键值→_valueToStr,暂存 FP 槽(marker 构造在
+                // 计算键访问器 `get [k]()`:先求键值→ToPropertyKey,暂存 FP 槽(marker 构造在
                 // _alloc/store 间无调用,V2 存活;pop/load 不毁 V2)。非计算键走静态字符串键。
                 let ckSlot = null;
                 if (isComputedAccessor) {
                     this.vm.push(targetReg);
                     this.compileExpression(method.key);
                     this.vm.mov(VReg.A0, VReg.RET);
-                    this.vm.call("_valueToStr");
+                    this.vm.call("_js_prop_key");
                     ckSlot = this.ctx.allocLocal(`__cacck_${this.nextLabelId()}`);
                     this.vm.store(VReg.FP, ckSlot, VReg.RET);
                 }
@@ -4177,7 +4305,9 @@ export const StatementCompiler = {
                 this.vm.push(targetReg);
                 this.compileExpression(method.key);      // 求变量 k 的值
                 this.vm.mov(VReg.A0, VReg.RET);
-                this.vm.call("_valueToStr");
+                // ToPropertyKey:`class E { [s](){} }`(s 为 Symbol)此前经 _valueToStr
+                // 直接抛 "Cannot convert a Symbol value to a string"
+                this.vm.call("_js_prop_key");
                 const kt = this.ctx.allocLocal(`__cmk_${this.nextLabelId()}`);
                 this.vm.store(VReg.FP, kt, VReg.RET);
                 this.vm.pop(VReg.A0);                     // targetReg 值
@@ -4220,7 +4350,9 @@ export const StatementCompiler = {
         let methodName = this._classMethodKeyName(method);
         if (methodName === null) {
             methodName = this._wellKnownSymbolMethodName(method); // [Symbol.X](){}
-            if (!methodName) return; // 其余计算键仍跳过
+            // 任意计算键(`[a+b](){}`):用 compileClassDeclaration 预分配的合成名当 label
+            if (!methodName) methodName = method.__ckName || null;
+            if (!methodName) return;
         }
         const prefix = isStatic ? "static_" : "";
         const kindPrefix = method.kind === "get" ? "get_" : (method.kind === "set" ? "set_" : "");

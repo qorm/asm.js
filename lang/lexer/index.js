@@ -360,6 +360,15 @@ export class Lexer {
                     result = result + String.fromCharCode(12);
                 } else if (this.ch === "v") {
                     result = result + String.fromCharCode(11);
+                } else if (this.ch === "\n" || this.ch === "\u2028" || this.ch === "\u2029") {
+                    // LineContinuation(ES 12.9.4.2):反斜杠 + 行终结符**不产字符**。
+                    // 此前落通用兜底,把换行本身塞进串 → `"a\<换行>b"` 得 "a\nb"
+                    // (键/字面量与规范不符;accessor-name 行连接族的根因)。
+                    result = result + "";
+                } else if (this.ch === "\r") {
+                    // CR / CRLF 行连接:CRLF 视为单个行终结符,一并消费
+                    if (this.peekChar() === "\n") this.readChar();
+                    result = result + "";
                 } else if (this.ch === "x" || this.ch === "u") {
                     // \xNN / \uNNNN / \u{...} / 代理对 → 码点 → UTF-8 字节(_peekHexEscape 前瞻校验,
                     // 合法才消费,绝不越过结束引号)。不合法(缺十六进制)→ 宽松按字面 'x'/'u'。
@@ -417,6 +426,12 @@ export class Lexer {
                 } else if (this.ch === "0") {
                     // \0 null character escape (cook = NUL, raw = "\\0")
                     result = result + "\0";
+                } else if (this.ch === "\n" || this.ch === "\u2028" || this.ch === "\u2029") {
+                    // 模板里的 LineContinuation:cooked 不产字符(raw 已原样保留)
+                    result = result + "";
+                } else if (this.ch === "\r") {
+                    if (this.peekChar() === "\n") { this.readChar(); raw = raw + this.ch; }
+                    result = result + "";
                 } else if (this.ch === "x" || this.ch === "u") {
                     // \xNN / \uNNNN / \u{...} / 代理对 → cook 成 UTF-8 字节;raw 保留原样(String.raw/
                     // tagged)。raw 已含 "\\x"/"\\u"(见上);合法时补消费的字符到 raw。_peekHexEscape

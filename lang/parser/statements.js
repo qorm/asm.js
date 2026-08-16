@@ -779,19 +779,38 @@ export const StatementParser = {
                 const topIn = init && init.type === "BinaryExpression" && init.operator === "in" &&
                     this.peekTokenIs(TokenType.RPAREN);
                 if (!topIn) {
+                    // [~In] 只沿**顶层表达式链**传播:进括号、方括号(计算键/下标)、实参、
+                    // 数组/对象字面量、模板替换、函数/类体、三元的两个分支后,语法参数按
+                    // 规范复位为 [+In](CoverParenthesizedExpression / ComputedPropertyName /
+                    // ArgumentList …)。此前是无差别全树搜索,把 `class { get ['x' in o](){} }`
+                    // 这类合法写法误判为早期错误(整份源码 COMPILE_FAIL)。
                     const findIn = (node) => {
                         if (!node || typeof node !== "object") return false;
-                        if (Array.isArray(node)) {
-                            for (let k = 0; k < node.length; k++) if (findIn(node[k])) return true;
+                        if (node._parenthesized) return false; // ( Expression[+In] )
+                        const t = node.type;
+                        if (t === "BinaryExpression") {
+                            if (node.operator === "in") return true;
+                            return findIn(node.left) || findIn(node.right);
+                        }
+                        if (t === "LogicalExpression") return findIn(node.left) || findIn(node.right);
+                        if (t === "SequenceExpression") {
+                            const xs = node.expressions || [];
+                            for (let k = 0; k < xs.length; k++) if (findIn(xs[k])) return true;
                             return false;
                         }
-                        if (node.type === "BinaryExpression" && node.operator === "in") return true;
-                        for (const key in node) {
-                            if (key === "type" || key === "loc" || key === "range" ||
-                                key === "start" || key === "end") continue;
-                            if (findIn(node[key])) return true;
+                        if (t === "AssignmentExpression") return findIn(node.left) || findIn(node.right);
+                        if (t === "ConditionalExpression") return findIn(node.test); // 分支为 [+In]
+                        if (t === "UnaryExpression" || t === "UpdateExpression" ||
+                            t === "AwaitExpression" || t === "YieldExpression" ||
+                            t === "SpreadElement") return findIn(node.argument);
+                        if (t === "MemberExpression" || t === "OptionalMemberExpression") {
+                            // 下标/计算键内为 [+In];静态属性名不含表达式
+                            return findIn(node.object);
                         }
-                        return false;
+                        if (t === "CallExpression" || t === "NewExpression" ||
+                            t === "OptionalCallExpression") return findIn(node.callee); // 实参 [+In]
+                        if (t === "TaggedTemplateExpression") return findIn(node.tag);
+                        return false; // 字面量/函数/类/数组/对象/模板等:内部一律 [+In]
                     };
                     if (findIn(init)) {
                         this.errors.push("'in' is not allowed in for-loop initialization");

@@ -577,7 +577,16 @@ export class SubscriptGenerator {
         // 其内 type guard 对非对象类型安全返回 0,避免落下方的数组路径把类型字节当
         // TYPE_ARRAY 解引用 array 头 → SIGSEGV(test262 Array/reduce 21 崩根因)。
         vm.cmpImm(VReg.V0, 1); // TYPE_ARRAY
-        vm.jne("_subscript_set_object"); // 非数组 → 委托对象写路径安全 bail
+        vm.jeq("_sss_idx_path");
+        // TypedArray(类型字节 [0x40,0x7f])须留在下标写路径:下方 _subscript_set_idx_ok
+        // 已有 _typed_array_set 分支,但上面这条"非数组一律 bail"守卫把它整段吞掉 →
+        // `ta[i] = v` **静默丢弃**(`new Int8Array(3)` 后写入全不生效,元素恒 0;
+        // 只有构造时的初值可见)。这里放行 TA,其余非属性容器仍走 _object_set 安全 bail。
+        vm.cmpImm(VReg.V0, 0x40);
+        vm.jlt("_subscript_set_object");
+        vm.cmpImm(VReg.V0, 0x7f);
+        vm.jgt("_subscript_set_object");
+        vm.label("_sss_idx_path");
 
         // 数组/TypedArray：把键归一化为整数下标
         // 字符串键(0x7FFC)走冷分支 _subscript_set_strkey(与 _subscript_get 同一裁决:

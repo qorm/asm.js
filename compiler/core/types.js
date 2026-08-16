@@ -316,7 +316,11 @@ export function inferType(node, ctx) {
                 // 转同型;slice/subarray/fill 经 _ta_*)。缺此则链式 `ta.map(..).join()` 把
                 // typed 结果推 UNKNOWN → .join 落 _array_* 读 data_ptr@24 越块崩。
                 if (prop) {
-                    const taReturns = ["map", "filter", "slice", "subarray", "fill", "reverse", "sort"];
+                    // with/toReversed/toSorted 亦返回**同型 typed array**(编译期经
+                    // _ta_slice 拷贝后原地改)。此前漏收 → 结果推 UNKNOWN → Array.from/
+                    // 展开走普通数组路径读 data_ptr@24(typed 布局元素在 @16)→ 得空数组。
+                    const taReturns = ["map", "filter", "slice", "subarray", "fill", "reverse", "sort",
+                        "with", "toReversed", "toSorted"];
                     if (taReturns.includes(prop.name) && inferType(obj, ctx) === Type.TYPED_ARRAY) {
                         return Type.TYPED_ARRAY;
                     }

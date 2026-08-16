@@ -3300,6 +3300,23 @@ export class ArrayGenerator {
         vm.mov(VReg.RET, VReg.A0); // 真数组:恒等
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
         vm.label("_agen_norm_slow");
+        // TypedArray 接收者(裸堆指针,类型字节 [0x40,0x7f]):没有 length 属性容器,
+        // 走下方对象路径会得 len=0 → 泛型 `Array.prototype.slice/at/…​.call(ta)` 全空。
+        // 取 _ta_to_array 快照(逐元素 canonical 数字)交给普通数组实现。
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_agen_norm_notta");
+        vm.movImm64(VReg.V2, vm.ptrFloor);
+        vm.cmp(VReg.A0, VReg.V2);
+        vm.jlt("_agen_norm_notta");
+        vm.loadByte(VReg.V3, VReg.A0, 0);
+        vm.cmpImm(VReg.V3, 0x40);
+        vm.jlt("_agen_norm_notta");
+        vm.cmpImm(VReg.V3, 0x7f);
+        vm.jgt("_agen_norm_notta");
+        vm.call("_ta_to_array"); // A0=ta → RET = 装箱普通数组
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+        vm.label("_agen_norm_notta");
         vm.call("_agen_toobject"); // nullish TypeError; num/bool → wrapper
         vm.mov(VReg.S0, VReg.RET); // recv (可能已装箱)
         vm.shrImm(VReg.V0, VReg.S0, 48);
@@ -3429,6 +3446,29 @@ export class ArrayGenerator {
         // TypedArray 亦由此取 length（resizable / OOB 由 getter 抛 RangeError）。
         vm.cmpImm(VReg.V0, 0x7FFF);
         vm.jeq("_agen_tol_get");
+        // TypedArray 值是**裸堆指针**(高16=0):此前落 _agen_tol_zero → 泛型
+        // `Array.prototype.map.call(ta, …)` / indexOf / join 全部当 len=0 空转
+        // (test262 harness 的 compareArray.format 正是这条路 → 断言消息里 TA 一律印 "[]")。
+        // TA 布局 [type@0, length@8, 内联元素@16] 与 length@8 同址,直接读。
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_agen_tol_notraw");
+        vm.movImm64(VReg.V2, vm.ptrFloor);
+        vm.cmp(VReg.S0, VReg.V2);
+        vm.jlt("_agen_tol_zero");
+        vm.loadByte(VReg.V3, VReg.S0, 0);
+        vm.cmpImm(VReg.V3, 1); // TYPE_ARRAY(裸数组头)
+        vm.jeq("_agen_tol_arr_raw");
+        vm.cmpImm(VReg.V3, 0x40);
+        vm.jlt("_agen_tol_notraw");
+        vm.cmpImm(VReg.V3, 0x7f);
+        vm.jgt("_agen_tol_notraw");
+        vm.load(VReg.RET, VReg.S0, 8); // TypedArray length
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_agen_tol_arr_raw");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_length");
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_agen_tol_notraw");
         vm.cmpImm(VReg.V0, 0x7FFD);
         vm.jne("_agen_tol_zero");
         vm.movImm64(VReg.V2, 0x0000ffffffffffffn);
@@ -4211,6 +4251,25 @@ export class ArrayGenerator {
         vm.movImm64(VReg.V0, 0x7ffc000000000000n);
         vm.or(VReg.S1, VReg.S1, VReg.V0);
         vm.label("_agen_join_sep_ok");
+        // TypedArray 接收者(裸堆指针,类型字节 [0x40,0x7f]):typed 布局元素内联在 @16,
+        // _array_join 按 data_ptr@24 读 → `Array.prototype.join.call(ta)` 恒得空串。
+        // 委托 typed 专用 _ta_join(test262 用它拼断言消息,也是 toString/toLocaleString 的底)。
+        vm.shrImm(VReg.V0, VReg.S0, 48);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_agen_join_notta");
+        vm.movImm64(VReg.V4, vm.ptrFloor);
+        vm.cmp(VReg.S0, VReg.V4);
+        vm.jlt("_agen_join_notta");
+        vm.loadByte(VReg.V0, VReg.S0, 0);
+        vm.cmpImm(VReg.V0, 0x40);
+        vm.jlt("_agen_join_notta");
+        vm.cmpImm(VReg.V0, 0x7f);
+        vm.jgt("_agen_join_notta");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_ta_join");
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+        vm.label("_agen_join_notta");
         // 真数组 → _array_join;类数组 → 活读拼串
         vm.shrImm(VReg.V0, VReg.S0, 48);
         vm.cmpImm(VReg.V0, 0x7FFE);

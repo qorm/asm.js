@@ -342,6 +342,13 @@ export const ClosureCompiler = {
             mainCapturedVars: this.ctx.mainCapturedVars,
             functionAliases: this.ctx.functionAliases,
             sourcePath: this.sourcePath,
+            // 定义处的**类名**:私有名改写 `#x` → "#ClassName#x" 靠它。函数体在
+            // generatePendingFunctions 里延迟编译,那时 ctx 已是 main(className 空),
+            // 于是方法内箭头/函数表达式里的 `this.#x` 编成键 "##x" → 与实例上的
+            // "#C#x" 不匹配 → 读 undefined / 方法调用 "not a function"。
+            className: this.ctx.className,
+            // 私有名作用域链快照(词法):嵌套类里的箭头体也须按声明者类名改写
+            privateScopes: this._privateScopes ? this._privateScopes.slice() : null,
         });
     },
 
@@ -364,10 +371,14 @@ export const ClosureCompiler = {
             const savedMCV = this.ctx.mainCapturedVars;
             const savedFA = this.ctx.functionAliases;
             const savedSP = this.sourcePath;
+            const savedClassName = this.ctx.className;
+            const savedPrivScopes = this._privateScopes;
             if (func.moduleAst) this._currentModuleAst = func.moduleAst;
             if (func.mainCapturedVars) this.ctx.mainCapturedVars = func.mainCapturedVars;
             if (func.functionAliases) this.ctx.functionAliases = func.functionAliases;
             if (func.sourcePath) this.sourcePath = func.sourcePath;
+            if (func.className) this.ctx.className = func.className;
+            if (func.privateScopes) this._privateScopes = func.privateScopes;
             // [批次D] 生成器函数表达式：标签处先落 stub（建协程+生成器对象后即返回），
             // 真正函数体在 <label>_gbody，由 _coroutine_entry 首次 resume 时进入。
             let fdiList = null;
@@ -387,6 +398,8 @@ export const ClosureCompiler = {
             this.ctx.mainCapturedVars = savedMCV;
             this.ctx.functionAliases = savedFA;
             this.sourcePath = savedSP;
+            this.ctx.className = savedClassName;
+            this._privateScopes = savedPrivScopes;
         }
 
         this.pendingFunctions = [];

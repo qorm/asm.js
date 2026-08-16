@@ -721,7 +721,9 @@ export const DataStructureCompiler = {
         this.vm.label(keyDoneL);
         this.vm.store(VReg.FP, kOff, VReg.RET);
 
-        // _object_define(装箱 obj, 运行时键, 标记对象裸指针)
+        // _accessor_define(装箱 obj, 运行时键, 标记对象裸指针):键相同的 get/set 是两个
+        // 独立成员(`{get [k](){}, set [k](v){}}` 编译期按下标分组,同键只在运行期可知),
+        // 走合并定义保住另半边;此前后发的 marker 直接覆盖 → getter 或 setter 丢一半。
         this.vm.load(VReg.V0, VReg.FP, objOffset);
         this.vm.emitMaskLoad(VReg.V1);
         this.vm.andMaskReg(VReg.V0, VReg.V0, VReg.V1);
@@ -729,6 +731,6 @@ export const DataStructureCompiler = {
         this.vm.or(VReg.A0, VReg.V0, VReg.V1);
         this.vm.load(VReg.A1, VReg.FP, kOff);
         this.vm.load(VReg.A2, VReg.FP, markerOffset);
-        this.vm.call("_object_define");
+        this.vm.call("_accessor_define");
     },
 };

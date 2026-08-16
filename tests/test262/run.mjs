@@ -129,6 +129,8 @@ function parseArgs(argv) {
     compileTimeout: 30000,
     runTimeout: 10000,
     quiet: false,
+    filters: null,
+    noReport: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -143,6 +145,8 @@ function parseArgs(argv) {
       case "--compile-timeout": o.compileTimeout = parseInt(next(), 10); break;
       case "--run-timeout": o.runTimeout = parseInt(next(), 10); break;
       case "--quiet": o.quiet = true; break;
+      case "--filter": o.filters = (o.filters || []).concat(next().split(",").map((s) => s.trim()).filter(Boolean)); break;
+      case "--no-report": o.noReport = true; break;
       case "-h": case "--help":
         console.log("See header of tests/test262/run.mjs for usage."); process.exit(0);
       default:
@@ -442,8 +446,12 @@ async function main() {
     eligible.push({ file: f, rel, src, meta });
   }
 
-  // Deterministic stride + cap.
-  let selected = eligible.filter((_, i) => i % opt.stride === 0);
+  // Deterministic stride + cap. --filter narrows to matching paths first (ad-hoc
+  // iteration on one family; combine with --no-report so the committed headline
+  // report is not overwritten by a partial run).
+  let pool = eligible;
+  if (opt.filters) pool = pool.filter((t) => opt.filters.some((f) => t.rel.includes(f)));
+  let selected = pool.filter((_, i) => i % opt.stride === 0);
   if (opt.max > 0 && selected.length > opt.max) selected = selected.slice(0, opt.max);
 
   // Assemble sources. Non-strict variant unless onlyStrict; strict if onlyStrict.
@@ -514,6 +522,14 @@ async function main() {
     eligible: eligible.length, run: runCount, totals, pct, byArea, failPatterns,
     failByFeature, elapsed,
   });
+  // 部分/过滤运行(--no-report)不落地委托报告:否则 headline 被局部样本覆盖。
+  if (opt.noReport) {
+    const bad = results.filter((r) => r.status !== "PASS");
+    for (const r of bad) console.error(`${r.status} ${r.rel}  ${r.detail}`);
+    console.error(`\nrun=${runCount} PASS=${totals.PASS} FAIL=${totals.FAIL} ` +
+      `COMPILE_FAIL=${totals.COMPILE_FAIL} CRASH=${totals.CRASH} (${pct(totals.PASS)}%, ${elapsed}s)`);
+    return;
+  }
   writeFileSync(join(__dirname, "last_report.md"), report);
   const summary = {
     generated: new Date().toISOString(),

@@ -127,6 +127,7 @@ export class PromiseGenerator {
         this.generateThenableAdopt();
         this.generateReactionQueue();
         this.generateIsPromise();
+        this.generateIsPromiseOrThenable();
         this.generateResolverTrampolines();
         this.generatePromiseNew();
         this.generatePromiseResolve();
@@ -435,6 +436,65 @@ export class PromiseGenerator {
         vm.movImm(VReg.RET, 1);
         vm.epilogue([VReg.S0], 16);
         vm.label("_isp_no");
+        vm.movImm(VReg.RET, 0);
+        vm.epilogue([VReg.S0], 16);
+    }
+
+    // _is_promise_or_thenable(A0=value) -> RET 1/0
+    // Promise 节点(0x7FFD+TYPE_PROMISE)或 thenable(对象 + 自有可调 then)。
+    // await resolve/Promise.resolve 共用统一判定。
+    generateIsPromiseOrThenable() {
+        const vm = this.vm;
+        vm.label("_is_promise_or_thenable");
+        vm.prologue(16, [VReg.S0]);
+        vm.mov(VReg.S0, VReg.A0);
+        // Promise 快路
+        vm.shrImm(VReg.V1, VReg.S0, 48);
+        vm.cmpImm(VReg.V1, 0x7ffd);
+        vm.jne("_ipoth_obj");
+        vm.movImm64(VReg.V1, MASK48);
+        vm.and(VReg.V0, VReg.S0, VReg.V1);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_ipoth_obj");
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.cmpImm(VReg.V1, TYPE_PROMISE);
+        vm.jne("_ipoth_obj");
+        vm.movImm(VReg.RET, 1);
+        vm.epilogue([VReg.S0], 16);
+        // 对象:tag==0x7FFD 且 node 非 0,检自有可调 then。函数/prototype 链上 toString/
+        // hasOwnProperty 等取不到 fn(非函数 tag)。
+        vm.label("_ipoth_obj");
+        vm.shrImm(VReg.V1, VReg.S0, 48); // 重新加载 tag(Promise 快路用过后 V1 已是 stale)
+        vm.cmpImm(VReg.V1, 0x7ffd);
+        vm.jne("_ipoth_no");
+        vm.movImm64(VReg.V1, MASK48);
+        vm.and(VReg.V0, VReg.S0, VReg.V1);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_ipoth_no");
+        // own 'then' lookup
+        vm.mov(VReg.A0, VReg.V0);
+        vm.lea(VReg.A1, vm.asm.addString("then"));
+        vm.call("_object_get"); // RET = own prop or undefined
+        // 可调判定:0x7FFF 裸函数标签,或 0x7FFD 闭包(0xc105/0xa51c 魔数)——
+        // 后者覆盖 `then:function(){}` 对象字面量(函数表达式编译为闭包)族。
+        vm.shrImm(VReg.V1, VReg.RET, 48);
+        vm.cmpImm(VReg.V1, 0x7fff);
+        vm.jeq("_ipoth_yes");
+        vm.cmpImm(VReg.V1, 0x7ffd);
+        vm.jne("_ipoth_no");
+        vm.movImm64(VReg.V1, MASK48);
+        vm.and(VReg.V2, VReg.RET, VReg.V1);
+        vm.load(VReg.V2, VReg.V2, 0); // magic
+        vm.movImm(VReg.V1, 0xc105);
+        vm.cmp(VReg.V2, VReg.V1);
+        vm.jeq("_ipoth_yes");
+        vm.movImm(VReg.V1, 0xa51c);
+        vm.cmp(VReg.V2, VReg.V1);
+        vm.jne("_ipoth_no");
+        vm.label("_ipoth_yes");
+        vm.movImm(VReg.RET, 1);
+        vm.epilogue([VReg.S0], 16);
+        vm.label("_ipoth_no");
         vm.movImm(VReg.RET, 0);
         vm.epilogue([VReg.S0], 16);
     }

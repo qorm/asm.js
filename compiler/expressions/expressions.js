@@ -833,6 +833,9 @@ export const ExpressionCompiler = {
                 }
                 if (args.length > msgArgIdx) {
                     this.compileExpression(args[msgArgIdx]); // message
+                    // undefined → ""、非串 → ToString(规范 Error 构造的 message 语义)
+                    this.vm.mov(VReg.A0, VReg.RET);
+                    this.vm.call("_error_msg_norm");
                 } else {
                     this.vm.lea(VReg.RET, this.asm.addString(""));
                     this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
@@ -891,7 +894,8 @@ export const ExpressionCompiler = {
                     // options.hasOwnProperty("cause")? 有才取值,否则保持 undefined
                     this.vm.load(VReg.A0, VReg.FP, optSlot);
                     this.emitBoxedStringKey("cause", VReg.A1);
-                    this.vm.call("_object_has");
+                    // new Error(msg, undefined/原始值):非 Object 的 options 不查 cause
+                    this.vm.call("_error_opt_has_cause");
                     this.vm.cmpImm(VReg.RET, 0);
                     this.vm.jeq(noCauseLbl);
                     this.vm.load(VReg.A0, VReg.FP, optSlot);
@@ -1780,6 +1784,37 @@ export const ExpressionCompiler = {
     // 故转换/原地方法改走 _ta_* 运行时。返回 true=已处理;false=委托 compileArrayMethod
     // (map/filter/forEach/reduce/some/every/find 等基于 _subscript_get 的方法已 typed-aware)。
     // 参数约定镜像 compileArrayMethod 各 case。
+    // TypedArray 回调型方法(forEach/some/every/find/findIndex)的统一派发:TA 先经
+    // _ta_to_array 转普通数组交给 _array_*_rt_t 驱动回调,但**回调可见的身份必须是 TA**
+    // ——origRecv(A2) 传原 TA 使 cb 第三参是 TA 本身(规范如此;此前传的是临时数组,
+    // `assert.sameValue(args[2], sample)` 全败),A3 传 thisArg(此前整个丢掉 → 回调里
+    // this 恒 undefined)。中间值一律落 FP 帧槽(GC 扫栈可见,且免去 caller-saved 破坏)。
+    emitTaCbDelegate(obj, args, rtLabel) {
+        const vm = this.vm;
+        const id = this.nextLabelId();
+        const taSlot = this.ctx.allocLocal(`__tacb_ta_${id}`);
+        const cbSlot = this.ctx.allocLocal(`__tacb_fn_${id}`);
+        const thisSlot = this.ctx.allocLocal(`__tacb_this_${id}`);
+        this.compileExpression(obj);
+        vm.store(VReg.FP, taSlot, VReg.RET);
+        this.compileExpression(args[0]);
+        vm.store(VReg.FP, cbSlot, VReg.RET);
+        if (args.length >= 2 && args[1]) {
+            this.compileExpression(args[1]);
+        } else {
+            vm.movImm64(VReg.RET, 0x7ffb000000000000n); // undefined
+        }
+        vm.store(VReg.FP, thisSlot, VReg.RET);
+        vm.load(VReg.A0, VReg.FP, cbSlot);
+        vm.call("_ta_need_fn");                 // IsCallable(TypeError if not)
+        vm.load(VReg.A0, VReg.FP, taSlot);
+        vm.call("_ta_to_array");                // RET(=A0) = 装箱普通数组
+        vm.load(VReg.A1, VReg.FP, cbSlot);
+        vm.load(VReg.A2, VReg.FP, taSlot);      // origRecv = 原 TA
+        vm.load(VReg.A3, VReg.FP, thisSlot);
+        vm.call(rtLabel);
+    },
+
     compileTypedArrayMethod(obj, name, args) {
         const vm = this.vm;
         if (name === "join") {
@@ -1966,49 +2001,46 @@ export const ExpressionCompiler = {
         }
         if (name === "forEach") {
             if (args.length === 0) return true;
-            this.compileExpression(obj);
-            vm.push(VReg.RET);                    // [sp] = boxed ta
-            this.compileExpression(args[0]);
-            vm.push(VReg.RET);                    // [sp] = callback, [sp+8] = boxed ta
-            vm.pop(VReg.A1);                      // A1 = callback(save)
-            vm.pop(VReg.A0);                      // A0 = boxed ta
-            vm.push(VReg.A1);                     // [sp] = callback(save across call)
-            vm.mov(VReg.A0, VReg.A1);             // A0 = callback
-            vm.call("_ta_need_fn");               // validate callable(TypeError if not)
-            vm.pop(VReg.A1);                      // A1 = callback(restore)
-            vm.call("_ta_to_array");              // RET = boxed regular array
-            vm.mov(VReg.A0, VReg.RET);            // A0 = boxed arr
-            vm.call("_array_forEach_rt");
+            this.emitTaCbDelegate(obj, args, "_array_forEach_rt_t");
             return true;
         }
         if ((name === "map" || name === "filter" || name === "flatMap") && args.length >= 1) {
-            // map/filter/flatMap:TA→arr→cb→result_arr→TA(同类型回填)
+            // map/filter/flatMap:TA→arr→cb→result_arr→TA(同类型回填)。中间值落 FP 帧槽
+            // (此前用 push/pop 交错且在 _ta_need_fn 后错位:`_ta_to_array` 收到回调、回调
+            // 收到垃圾 → map/filter 崩)。回调仍按规范拿到 TA 身份(origRecv)与 thisArg。
+            const mid = this.nextLabelId();
+            const mTa = this.ctx.allocLocal(`__tam_ta_${mid}`);
+            const mCb = this.ctx.allocLocal(`__tam_fn_${mid}`);
+            const mThis = this.ctx.allocLocal(`__tam_this_${mid}`);
+            const mType = this.ctx.allocLocal(`__tam_ty_${mid}`);
             this.compileExpression(obj);
-            vm.push(VReg.RET);                    // [sp] = boxed ta
-            vm.loadByte(VReg.V5, VReg.RET, 0);    // V5 = type byte
-            vm.push(VReg.V5);                     // [sp] = type byte, [sp+8] = boxed ta
+            vm.store(VReg.FP, mTa, VReg.RET);
+            vm.loadByte(VReg.V5, VReg.RET, 0);    // 类型字节(TA 值是裸指针)
+            vm.store(VReg.FP, mType, VReg.V5);
             this.compileExpression(args[0]);
-            vm.push(VReg.RET);                    // [sp] = callback, [sp+8] = type byte, [sp+16] = boxed ta
-            vm.pop(VReg.A2);                      // A2 = callback
-            vm.pop(VReg.V5);                      // V5 = type byte
-            vm.pop(VReg.A0);                      // A0 = boxed ta
-            vm.push(VReg.V5);                     // [sp] = type byte(save across call)
-            vm.push(VReg.A2);                     // [sp] = callback, [sp+8] = type byte
-            vm.mov(VReg.A0, VReg.A2);             // A0 = callback
-            vm.call("_ta_need_fn");               // validate callable(TypeError if not)
-            vm.pop(VReg.A1);                      // A1 = callback(restore)
-            vm.call("_ta_to_array");              // RET = boxed regular array
-            vm.mov(VReg.A0, VReg.RET);            // A0 = boxed arr
-            if (name === "flatMap") {
-                vm.call("_array_flatMap_rt");
-            } else if (name === "filter") {
-                vm.call("_array_filter_rt");
+            vm.store(VReg.FP, mCb, VReg.RET);
+            if (args.length >= 2 && args[1]) {
+                this.compileExpression(args[1]);
             } else {
-                vm.call("_array_map_rt");
+                vm.movImm64(VReg.RET, 0x7ffb000000000000n); // undefined
             }
-            vm.pop(VReg.V5);                      // V5 = type byte
+            vm.store(VReg.FP, mThis, VReg.RET);
+            vm.load(VReg.A0, VReg.FP, mCb);
+            vm.call("_ta_need_fn");               // validate callable(TypeError if not)
+            vm.load(VReg.A0, VReg.FP, mTa);
+            vm.call("_ta_to_array");              // RET(=A0) = boxed regular array
+            vm.load(VReg.A1, VReg.FP, mCb);
+            vm.load(VReg.A2, VReg.FP, mTa);       // origRecv = 原 TA(回调第三参)
+            vm.load(VReg.A3, VReg.FP, mThis);
+            if (name === "flatMap") {
+                vm.call("_array_flatMap_rt");     // flatMap 无 _t 变体:保持既有语义
+            } else if (name === "filter") {
+                vm.call("_array_filter_rt_t");
+            } else {
+                vm.call("_array_map_rt_t");
+            }
             vm.mov(VReg.A1, VReg.RET);            // A1 = boxed result array
-            vm.mov(VReg.A0, VReg.V5);             // A0 = type byte
+            vm.load(VReg.A0, VReg.FP, mType);     // A0 = type byte
             vm.call("_typed_array_from");
             return true;
         }
@@ -2040,70 +2072,50 @@ export const ExpressionCompiler = {
         }
         if (name === "some" || name === "every") {
             if (args.length === 0) return true;
-            this.compileExpression(obj);
-            vm.push(VReg.RET);                    // [sp] = boxed ta
-            this.compileExpression(args[0]);
-            vm.push(VReg.RET);                    // [sp] = callback, [sp+8] = boxed ta
-            vm.pop(VReg.A1);                      // A1 = callback(save)
-            vm.pop(VReg.A0);                      // A0 = boxed ta
-            vm.push(VReg.A1);                     // [sp] = callback(save across call)
-            vm.mov(VReg.A0, VReg.A1);             // A0 = callback
-            vm.call("_ta_need_fn");               // validate callable(TypeError if not)
-            vm.pop(VReg.A1);                      // A1 = callback(restore)
-            vm.call("_ta_to_array");
-            vm.mov(VReg.A0, VReg.RET);
-            vm.call(name === "some" ? "_array_some_rt" : "_array_every_rt");
+            this.emitTaCbDelegate(obj, args,
+                name === "some" ? "_array_some_rt_t" : "_array_every_rt_t");
             return true;
         }
         if (name === "reduce" || name === "reduceRight") {
             if (args.length === 0) return true;
+            // 此前这段栈操作是坏的:有 initialValue 时把 init **pop 两次**(第二次把回调
+            // 当 init 取走,继而 A0/A1 全错位);无 init 时 `_ta_to_array` 收到的 A0 是回调。
+            // 结果 `ta.reduce(cb)` 跳进垃圾地址。重排为:实参全部落栈 → 校验可调用 →
+            // 只在跨调用点把值压栈保活。
+            const hasInit = args.length >= 2;
             this.compileExpression(obj);
-            vm.push(VReg.RET);                    // [sp] = boxed ta
+            vm.push(VReg.RET);                    // ta
             this.compileExpression(args[0]);
-            vm.push(VReg.RET);                    // [sp] = callback, [sp+8] = boxed ta
-            if (args.length >= 2) {
+            vm.push(VReg.RET);                    // cb
+            if (hasInit) {
                 this.compileExpression(args[1]);
-                vm.push(VReg.RET);                // [sp] = init, [sp+8] = callback, [sp+16] = boxed ta
-                vm.pop(VReg.A2);                  // A2 = init
+                vm.push(VReg.RET);                // init(实参求值序在校验可调用之前)
+                vm.pop(VReg.A2);
             }
-            if (args.length >= 2) {
-                vm.pop(VReg.A2);                  // A2 = init
-            }
-            vm.pop(VReg.A1);                      // A1 = callback
-            vm.pop(VReg.A0);                      // A0 = boxed ta
-            vm.push(VReg.A1);                     // [sp] = callback
-            if (args.length >= 2) {
-                vm.push(VReg.A2);                 // [sp] = init, [sp+8] = callback
-            }
-            vm.mov(VReg.A0, VReg.A1);             // A0 = callback
+            vm.pop(VReg.A1);                      // A1 = cb
+            vm.pop(VReg.A0);                      // A0 = ta
+            vm.push(VReg.A0);                     // ta 保活
+            if (hasInit) vm.push(VReg.A2);        // init 保活
+            vm.push(VReg.A1);                     // cb 保活
+            vm.mov(VReg.A0, VReg.A1);
             vm.call("_ta_need_fn");               // validate callable(TypeError if not)
-            vm.call("_ta_to_array");
+            vm.pop(VReg.A1);                      // cb
+            if (hasInit) vm.pop(VReg.A2); else vm.movImm64(VReg.A2, 0x7ffb000000000000n);
+            vm.pop(VReg.A0);                      // ta
+            vm.push(VReg.A1);
+            if (hasInit) vm.push(VReg.A2);
+            vm.call("_ta_to_array");              // A0=ta → RET = 装箱普通数组
+            if (hasInit) vm.pop(VReg.A2); else vm.movImm64(VReg.A2, 0x7ffb000000000000n);
+            vm.pop(VReg.A1);                      // A1 = cb
             vm.mov(VReg.A0, VReg.RET);            // A0 = boxed arr
-            if (args.length >= 2) {
-                vm.pop(VReg.A2);                  // A2 = init
-            } else {
-                vm.movImm64(VReg.A2, 0x7ffb000000000000n); // undefined(sentinel)
-            }
-            vm.pop(VReg.A1);                      // A1 = callback
             vm.movImm(VReg.A3, 0);                // A3 = 0 (no extra origRecv, _rt uses arr)
             vm.call(name === "reduce" ? "_array_reduce_rt" : "_array_reduceRight_rt");
             return true;
         }
         if (name === "find" || name === "findIndex") {
             if (args.length === 0) return true;
-            this.compileExpression(obj);
-            vm.push(VReg.RET);                    // [sp] = boxed ta
-            this.compileExpression(args[0]);
-            vm.push(VReg.RET);                    // [sp] = callback, [sp+8] = boxed ta
-            vm.pop(VReg.A1);                      // A1 = callback(save)
-            vm.pop(VReg.A0);                      // A0 = boxed ta
-            vm.push(VReg.A1);                     // [sp] = callback(save across call)
-            vm.mov(VReg.A0, VReg.A1);             // A0 = callback
-            vm.call("_ta_need_fn");               // validate callable(TypeError if not)
-            vm.pop(VReg.A1);                      // A1 = callback(restore)
-            vm.call("_ta_to_array");
-            vm.mov(VReg.A0, VReg.RET);
-            vm.call(name === "find" ? "_array_find_rt" : "_array_findIndex_rt");
+            this.emitTaCbDelegate(obj, args,
+                name === "find" ? "_array_find_rt_t" : "_array_findIndex_rt_t");
             return true;
         }
         if (name === "findLast" || name === "findLastIndex") {

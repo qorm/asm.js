@@ -121,10 +121,14 @@ export class ObjectGenerator {
         this.generateObjectSetIC();
         this.generateObjectDelete();
         this.generateMaybeGetter();
+        this.generateAccessorDefine();
+        this.generatePrivateBrandCheck();
         this.generateObjectSet();
         this.generateJsPropKey();
         this.generateObjectKeyEq();
         this.generateObjectHas();
+        this.generateErrorOptHasCause();
+        this.generateErrorMsgNorm();
         this.generatePropIn();
         this.generateObjectKeys();
         this.generateObjectGetOwnPropertyNames();
@@ -725,6 +729,77 @@ export class ObjectGenerator {
         vm.mov(VReg.RET, VReg.S0);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
         vm.label("_cpg_key_ck");
+        // [TA ctor 元数据] TA 构造器闭包 {0xc105, _ta_ctor_tramp, type@16} 作**值**传递时
+        // (`var C = Int8Array` / `ctors[i]`),name/length/BYTES_PER_ELEMENT 无从静态解析,
+        // 元数据侧表按 code_ptr 查也只得共享蹦床身份。这里按 type@16 逐型回答:
+        // name = 型名、length = 3(规范 TA 构造器 arity)、BYTES_PER_ELEMENT = 元素字节。
+        // test262 的 testTypedArray harness 正是经 `ctors[i].name` 组装断言消息、经
+        // `TA.BYTES_PER_ELEMENT` 算缓冲尺寸的。
+        vm.shrImm(VReg.V0, VReg.S1, 48);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_cpg_tactor_ck");
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jne("_cpg_plain_key");
+        vm.label("_cpg_tactor_ck");
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.V0, VReg.S1, VReg.V1);          // V0 = 闭包块
+        vm.load(VReg.V2, VReg.V0, 0);
+        vm.cmpImm(VReg.V2, 0xc105);
+        vm.jne("_cpg_plain_key");
+        vm.load(VReg.V2, VReg.V0, 8);               // code_ptr
+        vm.lea(VReg.V1, "_ta_ctor_tramp");
+        vm.cmp(VReg.V2, VReg.V1);
+        vm.jne("_cpg_plain_key");
+        vm.load(VReg.S2, VReg.V0, 16);              // S2 = TA 类型字节
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.V0, VReg.S0, VReg.V1);          // key payload
+        vm.lea(VReg.V1, vm.asm.addString("BYTES_PER_ELEMENT"));
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jeq("_cpg_ta_bpe");
+        vm.lea(VReg.V1, vm.asm.addString("length"));
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jeq("_cpg_ta_len");
+        vm.lea(VReg.V1, vm.asm.addString("name"));
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jne("_cpg_undef");
+        for (const [tag, nm] of [
+            [0x40, "Int8Array"], [0x41, "Int16Array"], [0x42, "Int32Array"],
+            [0x43, "BigInt64Array"], [0x50, "Uint8Array"], [0x51, "Uint16Array"],
+            [0x52, "Uint32Array"], [0x53, "BigUint64Array"], [0x54, "Uint8ClampedArray"],
+            [0x60, "Float32Array"], [0x61, "Float64Array"],
+        ]) {
+            const nx = "_cpg_tan_" + tag.toString(16);
+            vm.cmpImm(VReg.S2, tag);
+            vm.jne(nx);
+            vm.lea(VReg.A0, vm.asm.addString(nm));
+            vm.call("_js_box_string");
+            vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+            vm.label(nx);
+        }
+        // ArrayBuffer 等非 TA 型的构造器闭包(type 不在表内):名字未知 → undefined
+        vm.jmp("_cpg_undef");
+        vm.label("_cpg_ta_len");
+        vm.movImm(VReg.RET, 3);                     // 规范 %TypedArray% 构造器 length
+        vm.scvtf(0, VReg.RET);
+        vm.fmovToInt(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+        vm.label("_cpg_ta_bpe");
+        // 类型字节 → 元素字节数(与 _ta_elem_size 同表,但那支 helper 收的是 TA 实例指针)
+        for (const [sz, tags] of [[1, [0x40, 0x50, 0x54]], [2, [0x41, 0x51]],
+            [4, [0x42, 0x52, 0x60]], [8, [0x43, 0x53, 0x61]]]) {
+            for (const tag of tags) {
+                const nx = "_cpg_tabpe_" + tag.toString(16);
+                vm.cmpImm(VReg.S2, tag);
+                vm.jne(nx);
+                vm.movImm(VReg.RET, sz);
+                vm.scvtf(0, VReg.RET);
+                vm.fmovToInt(VReg.RET, 0);
+                vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+                vm.label(nx);
+            }
+        }
+        vm.jmp("_cpg_undef");
+        vm.label("_cpg_plain_key");
         // key 去壳 == addString("name")/addString("length") 地址?
         // (emitBoxedStringKey 经 addString dedup,同址)
         vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
@@ -3491,6 +3566,176 @@ export class ObjectGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
     }
 
+    // _private_brand_check(A0=obj, A1=改写后的私有键, A2=模式 0=读/1=写) -> RET 0
+    // 私有成员是「品牌」而非普通属性:接收者上找不到该私有名即 TypeError(不是 undefined);
+    // 私有方法不可写;只 get 的私有访问器写、只 set 的私有访问器读同样 TypeError。
+    // 私有字段/方法挂实例(或 classinfo)自有槽,私有访问器挂 prototype,故存在性判定
+    // 走原型链(_prop_in);非本类实例的任意对象链上没有该改写键 → 抛。
+    generatePrivateBrandCheck() {
+        const vm = this.vm;
+        const boxMsg = (reg, s) => {
+            vm.lea(reg, vm.asm.addString(s));
+            vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(reg, reg, VReg.V1);
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(reg, reg, VReg.V1);
+        };
+
+        vm.label("_private_brand_check");
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.mov(VReg.S0, VReg.A0); // obj
+        vm.mov(VReg.S1, VReg.A1); // key
+        vm.mov(VReg.S2, VReg.A2); // mode
+
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_prop_in");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_pbc_missing");
+
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_get"); // RET = 存储值(访问器返 TYPE_GETTER 标记,不触发调用)
+        // 标记对象?(堆内裸指针且 type@+0 == TYPE_GETTER)
+        vm.shrImm(VReg.V0, VReg.RET, 48);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_pbc_value");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_pbc_value");
+        vm.lea(VReg.V0, "_heap_base");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmp(VReg.RET, VReg.V0);
+        vm.jlt("_pbc_value");
+        vm.lea(VReg.V0, "_heap_ptr");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmp(VReg.RET, VReg.V0);
+        vm.jge("_pbc_value");
+        vm.load(VReg.V0, VReg.RET, 0);
+        vm.cmpImm(VReg.V0, TYPE_GETTER);
+        vm.jne("_pbc_value");
+        // 访问器:按模式取对应半边,缺者抛
+        vm.cmpImm(VReg.S2, 0);
+        vm.jne("_pbc_acc_write");
+        vm.load(VReg.V0, VReg.RET, 8);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_pbc_no_getter");
+        vm.jmp("_pbc_ok");
+        vm.label("_pbc_acc_write");
+        vm.load(VReg.V0, VReg.RET, 16);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_pbc_no_setter");
+        vm.jmp("_pbc_ok");
+
+        // 数据值:写模式下若是函数(裸函数标签 0x7FFF 或堆闭包 magic)即私有方法 → 不可写
+        vm.label("_pbc_value");
+        vm.cmpImm(VReg.S2, 0);
+        vm.jeq("_pbc_ok");
+        vm.shrImm(VReg.V0, VReg.RET, 48);
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jeq("_pbc_method_write");
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_pbc_ok");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_pbc_ok");
+        vm.lea(VReg.V0, "_heap_base");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmp(VReg.RET, VReg.V0);
+        vm.jlt("_pbc_ok");
+        vm.lea(VReg.V0, "_heap_ptr");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmp(VReg.RET, VReg.V0);
+        vm.jge("_pbc_ok");
+        vm.load(VReg.V0, VReg.RET, 0);
+        vm.cmpImm(VReg.V0, 0xc105);
+        vm.jeq("_pbc_method_write");
+        vm.cmpImm(VReg.V0, 0xa51c);
+        vm.jeq("_pbc_method_write");
+
+        vm.label("_pbc_ok");
+        vm.movImm(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
+
+        vm.label("_pbc_missing");
+        boxMsg(VReg.A0, "Cannot access private member on an object which does not have it");
+        vm.call("_throw_type_error");
+        vm.label("_pbc_no_getter");
+        boxMsg(VReg.A0, "'#x' was defined without a getter");
+        vm.call("_throw_type_error");
+        vm.label("_pbc_no_setter");
+        boxMsg(VReg.A0, "'#x' was defined without a setter");
+        vm.call("_throw_type_error");
+        vm.label("_pbc_method_write");
+        boxMsg(VReg.A0, "Private method is not writable");
+        vm.call("_throw_type_error");
+        vm.movImm(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
+    }
+
+    // _accessor_define(A0=obj, A1=key, A2=新标记对象裸指针) -> RET 0
+    // 访问器定义走 [[DefineOwnProperty]] 的**部分描述符合并**语义:同键已有访问器时
+    // 只覆盖本次给出的半边(getter 或 setter),另半边保留。编译期无法归组的运行时键
+    // (`get [x||1]()` 与 `set [x||1]()` 是两个独立成员,键值只在运行期才知同不同)
+    // 靠此合并;此前后者的 marker 直接 _object_define 覆盖前者 → 只剩一半访问器。
+    // 自有键判定用 _object_has(非 `in`):否则 `get [k]()` 中 k==="__proto__" 会合进
+    // Object.prototype 的 __proto__ 访问器 marker(全局投毒)。
+    generateAccessorDefine() {
+        const vm = this.vm;
+
+        vm.label("_accessor_define");
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.mov(VReg.S0, VReg.A0); // obj
+        vm.mov(VReg.S1, VReg.A1); // key
+        vm.mov(VReg.S2, VReg.A2); // 新 marker(裸指针)
+
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_accdef_plain");
+
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_get"); // RET = 自有旧值(访问器不触发调用,原样返回 marker)
+        // 旧值须是堆内裸指针且 type@+0 == TYPE_GETTER 才可合并
+        vm.shrImm(VReg.V0, VReg.RET, 48);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_accdef_plain");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_accdef_plain");
+        vm.lea(VReg.V0, "_heap_base");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmp(VReg.RET, VReg.V0);
+        vm.jlt("_accdef_plain");
+        vm.lea(VReg.V0, "_heap_ptr");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmp(VReg.RET, VReg.V0);
+        vm.jge("_accdef_plain");
+        vm.load(VReg.V0, VReg.RET, 0);
+        vm.cmpImm(VReg.V0, TYPE_GETTER);
+        vm.jne("_accdef_plain");
+
+        // 合并:新 marker 的非零槽写入旧 marker(旧 marker 留在属性槽里,身份不变)
+        vm.mov(VReg.V2, VReg.RET); // 旧 marker
+        vm.load(VReg.V0, VReg.S2, 8);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_accdef_merge_set");
+        vm.store(VReg.V2, 8, VReg.V0);
+        vm.label("_accdef_merge_set");
+        vm.load(VReg.V0, VReg.S2, 16);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_accdef_done");
+        vm.store(VReg.V2, 16, VReg.V0);
+        vm.label("_accdef_done");
+        vm.movImm(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
+
+        vm.label("_accdef_plain");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_object_define");
+        vm.movImm(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
+    }
+
     // _maybe_getter(value, this) -> value 或 getter 调用结果
     // 属性读取后调用：若 value 是 getter 标记对象
     // (裸堆指针且 [value-16] == TYPE_GETTER)，以 this 调用其函数并返回结果；
@@ -4393,6 +4638,80 @@ export class ObjectGenerator {
         vm.label("_object_key_eq_false");
         vm.movImm(VReg.RET, 0);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
+    }
+
+    // _error_opt_has_cause(options, boxed key) -> 0/1
+    // ES2022 InstallErrorCause 仅当 Type(options) 为 Object 才查 "cause";undefined/null/
+    // 原始值须静默跳过。此前 Error 族构造直接 _object_has(options,"cause"),而派生类
+    // **合成的默认构造器**转发 super(f0..f4) 会把 undefined 当 options 传进来 →
+    // nullish 抛 "Cannot convert undefined or null to object" → `class E extends Error {}`
+    // 的 new E() 全崩(subclass-builtins 族)。
+    generateErrorOptHasCause() {
+        const vm = this.vm;
+
+        vm.label("_error_opt_has_cause");
+        vm.prologue(16, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+
+        // 容器标签:裸堆指针(高16=0)/对象 0x7FFD/数组 0x7FFE/函数 0x7FFF;其余非 Object → 0
+        vm.shrImm(VReg.V1, VReg.S0, 48);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_eohc_obj");
+        vm.cmpImm(VReg.V1, 0x7FFD);
+        vm.jeq("_eohc_obj");
+        vm.cmpImm(VReg.V1, 0x7FFE);
+        vm.jeq("_eohc_obj");
+        vm.cmpImm(VReg.V1, 0x7FFF);
+        vm.jeq("_eohc_obj");
+        vm.movImm(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+
+        vm.label("_eohc_obj");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_has"); // 函数标签的 NaN 载荷由 _object_has 的 ptrFloor 守卫挡掉
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+    }
+
+    // _error_msg_norm(v) -> 装箱字符串
+    // Error 构造的 message 语义:undefined → ""(规范是"不落 own message",读经原型链得
+    // Error.prototype.message="";本实现按值语义落 "" 等价于读取结果),其余 ToString(v)
+    // (`new Error(42).message === "42"`、对象走 toString、Symbol 抛 TypeError)。
+    // 此前直接存原始参数值 → message 为 number/object,且派生类默认构造器转发的
+    // undefined 变成 `e.message === undefined`。
+    generateErrorMsgNorm() {
+        const vm = this.vm;
+
+        vm.label("_error_msg_norm");
+        vm.prologue(16, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0);
+
+        vm.shrImm(VReg.V1, VReg.S0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFB); // undefined → ""
+        vm.jeq("_emn_empty");
+        vm.cmpImm(VReg.V1, 0x7FFC); // 已是装箱字符串 → 原样返回
+        vm.jeq("_emn_same");
+
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_valueToStr"); // 裸字符串指针
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.RET, VReg.RET, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+
+        vm.label("_emn_same");
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+
+        vm.label("_emn_empty");
+        vm.lea(VReg.RET, vm.asm.addString(""));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.RET, VReg.RET, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1], 16);
     }
 
     // 检查对象是否有指定属性（不检查原型链）

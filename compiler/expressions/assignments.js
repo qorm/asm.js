@@ -593,6 +593,23 @@ export const AssignmentCompiler = {
                 let dsProp = member.property;
                 if (member.computed) {
                     this.compileExpression(member.property);
+                    // [求值序] `base[prop] op= rhs`,base 为 null/undefined:键**表达式**要求值
+                    // (其抛出可观测),但 ToPropertyKey 不做 —— GetValue 先 ToObject(base) 抛
+                    // TypeError。此前先 _js_prop_key,键对象的 toString 被调 → 抛出的是它的错
+                    // (S11.13.2_A7.x 族期待 TypeError)。
+                    const coercibleOk = this.ctx.newLabel("cma_base_ok");
+                    const coercibleBad = this.ctx.newLabel("cma_base_nullish");
+                    this.vm.push(VReg.RET); // 保住键值
+                    this.vm.load(VReg.V0, VReg.FP, dsObjSlot);
+                    this.vm.shrImm(VReg.V1, VReg.V0, 48);
+                    this.vm.cmpImm(VReg.V1, 0x7FFA); // null
+                    this.vm.jeq(coercibleBad);
+                    this.vm.cmpImm(VReg.V1, 0x7FFB); // undefined
+                    this.vm.jne(coercibleOk);
+                    this.vm.label(coercibleBad);
+                    this.emitThrowTypeError("Cannot read properties of null or undefined");
+                    this.vm.label(coercibleOk);
+                    this.vm.pop(VReg.RET);
                     this.vm.mov(VReg.A0, VReg.RET);
                     this.vm.call("_js_prop_key"); // ToPropertyKey 单次(对象键 toString 可观测)
                     const dsKeySlot = this.ctx.allocLocal(`__cma_key_${did}`);
@@ -775,6 +792,15 @@ export const AssignmentCompiler = {
             this.compileExpression(expr.right);
             const pvalOff = this.ctx.allocLocal(`__pval_assign_${this.nextLabelId()}`);
             this.vm.store(VReg.FP, pvalOff, VReg.RET); // 保存被赋值(IC call 后作表达式值)
+
+            // [私有品牌] `o.#x = v`:接收者无该私有名 → TypeError;私有方法、无 setter 的
+            // 私有访问器一律不可写(规范 PrivateSet)。此前静默当普通属性写(键 "#C#x"),
+            // 把品牌违规写成新增属性。
+            if (this._isPrivateMemberKey(member.property)) {
+                this.vm.load(VReg.RET, VReg.FP, objOffset);
+                this.emitPrivateBrandCheck(propName, 1);
+                this.vm.load(VReg.RET, VReg.FP, pvalOff);
+            }
 
             // 调用 _object_set_ic(obj, key, value, site)
             // 注意：RET 和 A0 都是 X0，所以要先 mov A2 再 load A0

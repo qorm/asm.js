@@ -6,6 +6,5 @@
     "run": true,
     "stdout": "12345678 78563412\n200 -5 251\n-1000\n50000\n3.14159\n1.5\n12345\n999",
     "exitCode": 0
-  },
-  "knownFailure": "Pre-existing failure - not in current task scope"
+  }
 }

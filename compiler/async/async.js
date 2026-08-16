@@ -27,17 +27,21 @@ export const AsyncCompiler = {
         this.compileExpression(expr.argument);
         // RET = 被 await 的值(可能是 Promise,也可能是普通值/thenable)
 
-        // await 非 Promise:值本身即结果,**不进** _promise_await(否则把非 promise 当 promise
-        // 解引 → 段错误,`await 7` 崩的根因)。thenable 暂不 adopt(返回对象本身,记偏差)。
+        // await 非 Promise/thenable:值本身即结果。Promise 与 thenable 都须经
+        // _Promise_resolve(已有 promise 直返,否则新建 promise 并 adopt thenable.then)
+        // 再 _promise_await;否则 `await 7` 返 7、`await thenable` 返对象本身
+        // (await-awaits-thenables 族:`await {then:fn}` 必须返 42)。
         const awaitDone = this.ctx.newLabel("await_done");
         vm.mov(VReg.A0, VReg.RET);
         vm.push(VReg.RET);
-        vm.call("_is_promise");     // RET = 1 若为 Promise
+        vm.call("_is_promise_or_thenable");
         vm.cmpImm(VReg.RET, 0);
         vm.pop(VReg.RET);           // RET = 被 await 的值(还原)
-        vm.jeq(awaitDone);          // 非 Promise → RET 即结果
+        vm.jeq(awaitDone);
 
-        // 调用 _promise_await
+        // [test262] Promise 直接 await;thenable 经 _Promise_resolve adopt 后再 await。
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_Promise_resolve"); // RET = 装箱 promise(原 promise 直返 / 新建+adopt)
         vm.mov(VReg.A0, VReg.RET);
         vm.call("_promise_await");
         // RET = resolved 值；若被 reject，_promise_await 已置 _exception_pending
