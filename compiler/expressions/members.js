@@ -4334,6 +4334,16 @@ export const MemberCompiler = {
             this.emitThrowReferenceError(name + " is not defined");
             return;
         }
+        // [L2-③ TDZ·AST 标点] 类方法默认值里引用本形参/其后形参的直接 Identifier
+        // (compileClassMethod 标 _tdzRefName)→ 求值期抛 ReferenceError。
+        if (expr._tdzRefName) {
+            const tdzMsg = this.asm.addString(name + " is not defined");
+            this.vm.lea(VReg.A0, tdzMsg);
+            this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+            this.vm.or(VReg.A0, VReg.A0, VReg.V1);
+            this.vm.call("_throw_reference_error"); // 不返回
+            return;
+        }
         const globalLabel = this.ctx.getMainCapturedVar(name);
         const hasFunc = this.ctx.hasFunction(name);
         if (offset) {
@@ -5270,7 +5280,6 @@ export const MemberCompiler = {
                 // [buffer-untyped] 接收者静态类型不可判(参数/别名 new TA(...) 的实例常被
                 // 推成 OBJECT)→ 无条件改派 buffer 到 _ta_buffer(其内部按头字节判别 TA,
                 // 非 TA 回落通用具名读,用户对象同名属性不被劫持)。
-                if (process.env.PROBE_DBG) console.log("PROBE buffer-read objType=", taObjType, "name=", expr.object && expr.object.name);
                 if (taObjType === "TypedArray" || taObjType === "unknown" || taObjType === "Object" || propName === "buffer") {
                     if (propName === "buffer") {
                         this.compileExpression(expr.object);

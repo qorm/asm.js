@@ -4230,6 +4230,23 @@ export const StatementCompiler = {
         const params = method.value.params || [];
         const patternParams = [];
         const methodParamOffsets = []; // 标识符参数 {name,offset},供 box-on-capture
+        // [L2-③ TDZ] 类方法默认值自引用/后向引用(直接 Identifier 形态 x = y)。两次单循环
+        // + indexOf(嵌套 for 形态在自举产物原生误编):tdzNames 收集形参名,第二遍把
+        // 引用「本形参及之后形参」的默认值标 _tdzRefName,compileIdentifier 据此抛
+        // ReferenceError。
+        const tdzNames = [];
+        for (let ti = 0; ti < params.length; ti++) {
+            const tp = params[ti];
+            if (tp && tp.type === "Identifier") tdzNames.push(tp.name);
+            else if (tp && tp.type === "AssignmentPattern" && tp.left && tp.left.type === "Identifier") tdzNames.push(tp.left.name);
+        }
+        for (let mi = 0; mi < params.length; mi++) {
+            const mp = params[mi];
+            if (mp && mp.type === "AssignmentPattern" && mp.right && mp.right.type === "Identifier" &&
+                tdzNames.indexOf(mp.right.name, mi) >= 0) {
+                mp.right._tdzRefName = mp.right.name;
+            }
+        }
         for (let i = 0; i < params.length; i++) {
             const param = params[i];
             if (param.type === "SpreadElement" && param.argument && param.argument.type === "Identifier") {
@@ -4251,6 +4268,12 @@ export const StatementCompiler = {
             }
             const paramName = param.name || (param.left && param.left.name);
             const defaultExpr = (param.type === "AssignmentPattern") ? param.right : null;
+            // [FDI ident] 生成器方法标识符默认值形参已在调用期(stub)求值,经 transfer
+            // 数组绑定,此处不落槽/不求默认。
+            if (isGenMethod && fdiList && paramName && fdiList.indexOf(paramName) !== -1) continue;
+            // [FDI ident] 生成器方法标识符默认值形参已在调用期(stub)求值,经 transfer
+            // 数组绑定,此处不落槽/不求默认。
+            if (isGenMethod && fdiList && paramName && fdiList.indexOf(paramName) !== -1) continue;
             if (paramName) {
                 const paramOffset = this.ctx.allocLocal(paramName);
                 methodParamOffsets.push({ name: paramName, offset: paramOffset });

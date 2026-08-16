@@ -1,6 +1,6 @@
 {
-  "generated": "2026-08-15T21:16:22.718Z",
-  "runnerSha": "cfde2a78a19e3264cc9fbd62cfd04ff35503008e",
+  "generated": "2026-08-16T03:49:17.492Z",
+  "runnerSha": "58cae25b2764a9db1225edf45fd8e9ee88a33b5a",
   "corpusPin": "9e61c12835c5e4a3bdba93850427e6742c4f64c4",
   "config": {
     "corpus": ".test262-corpus",
@@ -48,12 +48,12 @@
   "eligible": 31563,
   "run": 6313,
   "totals": {
-    "PASS": 5368,
-    "FAIL": 858,
+    "PASS": 5384,
+    "FAIL": 841,
     "COMPILE_FAIL": 6,
-    "CRASH": 81
+    "CRASH": 82
   },
-  "passRatePct": 85.03,
+  "passRatePct": 85.28,
   "byArea": {
     "built-ins/Array": {
       "PASS": 526,
@@ -128,20 +128,20 @@
       "CRASH": 0
     },
     "built-ins/TypedArray": {
-      "PASS": 70,
-      "FAIL": 82,
+      "PASS": 81,
+      "FAIL": 71,
       "COMPILE_FAIL": 0,
       "CRASH": 39
     },
     "language/expressions": {
-      "PASS": 1721,
-      "FAIL": 235,
+      "PASS": 1724,
+      "FAIL": 231,
       "COMPILE_FAIL": 4,
-      "CRASH": 15
+      "CRASH": 16
     },
     "language/statements": {
-      "PASS": 1580,
-      "FAIL": 230,
+      "PASS": 1582,
+      "FAIL": 228,
       "COMPILE_FAIL": 2,
       "CRASH": 10
     }
@@ -149,19 +149,15 @@
   "topFailPatterns": [
     {
       "pattern": "FAIL: assertion mismatch (Test262Error / wrong value)",
-      "count": 599
+      "count": 592
     },
     {
       "pattern": "FAIL: async ($DONE not signalled / promise rejected)",
-      "count": 75
+      "count": 79
     },
     {
       "pattern": "FAIL: TypedArray/ArrayBuffer semantics",
-      "count": 56
-    },
-    {
-      "pattern": "FAIL: array contents mismatch (compareArray)",
-      "count": 44
+      "count": 48
     },
     {
       "pattern": "CRASH: run signal SIGBUS",
@@ -172,8 +168,12 @@
       "count": 43
     },
     {
+      "pattern": "FAIL: array contents mismatch (compareArray)",
+      "count": 40
+    },
+    {
       "pattern": "FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)",
-      "count": 35
+      "count": 33
     },
     {
       "pattern": "CRASH: run timeout",
@@ -181,7 +181,7 @@
     },
     {
       "pattern": "CRASH: run signal SIGSEGV",
-      "count": 18
+      "count": 19
     },
     {
       "pattern": "COMPILE_FAIL: asm.js could not compile (unsupported syntax / parser gap)",

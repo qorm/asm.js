@@ -3054,6 +3054,22 @@ export class Compiler {
         const paramOffsets = [];
         const patternParams = [];
         // [L2-③ TDZ] 参数名收集(前序):默认值评估期自引用/后向引用须抛 ReferenceError
+        // 顶层声明的直接 Identifier 默认值标点(两单循环 + indexOf,嵌套 for 原生误编)。
+        {
+            const tdzN = [];
+            for (let ti = 0; ti < params.length && ti < 6; ti++) {
+                const tp = params[ti];
+                if (tp && tp.type === "Identifier") tdzN.push(tp.name);
+                else if (tp && tp.type === "AssignmentPattern" && tp.left && tp.left.type === "Identifier") tdzN.push(tp.left.name);
+            }
+            for (let mi = 0; mi < params.length && mi < 6; mi++) {
+                const mp = params[mi];
+                if (mp && mp.type === "AssignmentPattern" && mp.right && mp.right.type === "Identifier" &&
+                    tdzN.indexOf(mp.right.name, mi) >= 0) {
+                    mp.right._tdzRefName = mp.right.name;
+                }
+            }
+        }
         const tdzParamNames = [];
         for (let i = 0; i < params.length && i < 6; i++) {
             const p = params[i];
@@ -3088,6 +3104,12 @@ export class Compiler {
                 continue;
             }
             if (!paramName) continue;
+            // [FDI ident] 生成器标识符默认值形参已在调用期(stub)求值,经 transfer 数组
+            // 绑定,此处不落槽/不求默认。
+            if ((isGenerator || isAsyncGen) && fdiList && fdiList.indexOf(paramName) !== -1) continue;
+            // [FDI ident] 生成器标识符默认值形参已在调用期(stub)求值,经 transfer 数组
+            // 绑定,此处不落槽/不求默认。
+            if ((isGenerator || isAsyncGen) && fdiList && fdiList.indexOf(paramName) !== -1) continue;
             const offset = this.ctx.allocLocal(paramName);
             paramOffsets.push({ name: paramName, offset: offset });
             vm.store(VReg.FP, offset, vm.getArgReg(i));

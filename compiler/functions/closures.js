@@ -472,6 +472,23 @@ export const ClosureCompiler = {
 
         // 处理参数 - 先保存所有参数到栈（因为后续操作可能破坏参数寄存器）
         // 注意：先保存参数，再处理闭包捕获变量，避免寄存器冲突
+        // [L2-③ TDZ] 形参默认值自引用/后向引用标点(直接 Identifier 形态;两单循环 + indexOf,
+        // 嵌套 for 形态在自举产物原生误编)。compileIdentifier 按 _tdzRefName 抛 ReferenceError。
+        {
+            const tdzN = [];
+            for (let ti = 0; ti < params.length; ti++) {
+                const tp = params[ti];
+                if (tp && tp.type === "Identifier") tdzN.push(tp.name);
+                else if (tp && tp.type === "AssignmentPattern" && tp.left && tp.left.type === "Identifier") tdzN.push(tp.left.name);
+            }
+            for (let mi = 0; mi < params.length; mi++) {
+                const mp = params[mi];
+                if (mp && mp.type === "AssignmentPattern" && mp.right && mp.right.type === "Identifier" &&
+                    tdzN.indexOf(mp.right.name, mi) >= 0) {
+                    mp.right._tdzRefName = mp.right.name;
+                }
+            }
+        }
         const paramOffsets = [];
         const patternParams = [];
         // [L2-③ TDZ] 参数名收集(前序):默认值评估期自引用/后向引用须抛 ReferenceError
@@ -509,6 +526,12 @@ export const ClosureCompiler = {
                 continue;
             }
             if (!paramName) continue;
+            // [FDI ident] 生成器标识符默认值形参已在调用期(stub)求值,经 transfer 数组
+            // 绑定(见 patternParams 循环的 transfer 路径),此处不落槽/不求默认。
+            if (isGenerator && fdiList && fdiList.indexOf(paramName) !== -1) continue;
+            // [FDI ident] 生成器标识符默认值形参已在调用期(stub)求值,经 transfer 数组
+            // 绑定(见 patternParams 循环的 transfer 路径),此处不落槽/不求默认。
+            if (isGenerator && fdiList && fdiList.indexOf(paramName) !== -1) continue;
             const offset = this.ctx.allocLocal(paramName);
             paramOffsets.push({ name: paramName, offset: offset, argReg: vm.getArgReg(i) });
             vm.store(VReg.FP, offset, vm.getArgReg(i));

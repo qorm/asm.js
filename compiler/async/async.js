@@ -521,10 +521,33 @@ export const AsyncCompiler = {
         if (!params || params.length === 0) return null;
         const n = Math.min(params.length, 5);
         const patternIdxs = [];
+        const identDefaultIdxs = [];
         for (let i = 0; i < n; i++) {
-            if (this._isPatternParam(params[i])) patternIdxs.push(i);
+            const p = params[i];
+            if (this._isPatternParam(p)) patternIdxs.push(i);
+            else if (p && p.type === "AssignmentPattern" && p.left && p.left.type === "Identifier") {
+                identDefaultIdxs.push(i); // [FDI ident] 标识符默认值形参亦需调用期求值
+            }
         }
-        if (patternIdxs.length === 0) return null;
+        if (patternIdxs.length === 0 && identDefaultIdxs.length === 0) return null;
+        // [L2-③ TDZ] 形参默认值自引用/后向引用标点(直接 Identifier 形态;两单循环 + indexOf)。
+        // 须在**stub 发射前**完成:生成器的默认值在 stub 求值,体内 compileFunctionBody 的
+        // 同款标点在其后运行,晚于发射点则 stub 的求值看不到标记。
+        {
+            const tdzN = [];
+            for (let ti = 0; ti < n; ti++) {
+                const tp = params[ti];
+                if (tp && tp.type === "Identifier") tdzN.push(tp.name);
+                else if (tp && tp.type === "AssignmentPattern" && tp.left && tp.left.type === "Identifier") tdzN.push(tp.left.name);
+            }
+            for (let mi = 0; mi < n; mi++) {
+                const mp = params[mi];
+                if (mp && mp.type === "AssignmentPattern" && mp.right && mp.right.type === "Identifier" &&
+                    tdzN.indexOf(mp.right.name, mi) >= 0) {
+                    mp.right._tdzRefName = mp.right.name;
+                }
+            }
+        }
         const vm = this.vm;
         // 与 emitGenStubEagerDefaults 同法:探针帧不污染外层 locals/stackOffset。
         const savedStackOffset = this.ctx.stackOffset;
@@ -540,6 +563,11 @@ export const AsyncCompiler = {
         for (let i = 0; i < patternIdxs.length; i++) {
             collectPatternNames(params[patternIdxs[i]], bindingNames);
         }
+        // [FDI ident] 标识符默认值形参名同为转移名(体内据此跳过重复绑定)。
+        for (let i = 0; i < identDefaultIdxs.length; i++) {
+            bindingNames[params[identDefaultIdxs[i]].left.name] = true;
+        }
+
         const rec = Object.create(savedCtx);
         rec.locals = {};
         rec.stackOffset = 0;
@@ -594,12 +622,36 @@ export const AsyncCompiler = {
         // 指针 → 体内捕获变量载入解引用崩(与 emitGenStubIterGuard 同法;抛路径不返回
         // 无需弹)。
         vm.push(VReg.S0);
-        for (let k = 0; k < patternIdxs.length; k++) {
-            const i = patternIdxs[k];
-            const p = params[i];
-            const pat = p.type === "AssignmentPattern" ? p.left : p;
-            const dflt = p.type === "AssignmentPattern" ? p.right : null;
-            this.emitParamDestructure(pat, slots[i], dflt);
+        // [FDI ident] 标识符默认值形参:调用期求默认值(undefined→默认;TDZ 标点经
+        // compileIdentifier._tdzRefName 抛 ReferenceError),值入 transfer 数组。
+        const emitIdentFdi = (i, p) => {
+            const name = p.left.name;
+            const off = rec.allocLocal(name);
+            vm.load(VReg.V0, VReg.FP, slots[i]);
+            vm.store(VReg.FP, off, VReg.V0);
+            const skip = this.ctx.newLabel("fdi_id_dflt_skip");
+            vm.movImm64(VReg.V1, 0x7ffb000000000000n);
+            vm.cmp(VReg.V0, VReg.V1);
+            vm.jne(skip);
+            this.compileExpression(p.right);
+            vm.store(VReg.FP, off, VReg.RET);
+            vm.label(skip);
+        };
+        let pi = 0, di = 0;
+        while (pi < patternIdxs.length || di < identDefaultIdxs.length) {
+            const pn = pi < patternIdxs.length ? patternIdxs[pi] : Infinity;
+            const dn = di < identDefaultIdxs.length ? identDefaultIdxs[di] : Infinity;
+            if (pn < dn) {
+                const i = pn;
+                const p = params[i];
+                const pat = p.type === "AssignmentPattern" ? p.left : p;
+                const dflt = p.type === "AssignmentPattern" ? p.right : null;
+                this.emitParamDestructure(pat, slots[i], dflt);
+                pi = pi + 1;
+            } else {
+                emitIdentFdi(dn, params[dn]);
+                di = di + 1;
+            }
         }
         vm.pop(VReg.S0);
         // transfer 数组 [v0, v1, …](绑定序),存本帧槽;建协程后由 emitGeneratorStub 写
@@ -696,7 +748,8 @@ export const AsyncCompiler = {
         for (let i = 0; i < n; i++) {
             const p = params[i];
             if (!p) continue;
-            if (skipPatterns && this._isPatternParam(p)) continue; // [FDI eager] 免二重求值
+            // [FDI eager] 免二重求值:pattern 形参与标识符默认值形参都由完整 FDI 覆盖。
+            if (skipPatterns && (this._isPatternParam(p) || p.type === "AssignmentPattern")) continue;
             let pat = p, dflt = null;
             if (p.type === "AssignmentPattern") {
                 // 外层默认值:undefined → 求默认值(若安全),结果写回槽供内层探针/回填用
