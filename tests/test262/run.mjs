@@ -252,7 +252,14 @@ function assembleSource(corpus, body, meta, strict, hcache) {
   parts.push(HOST_SHIMS);
   parts.push(loadHarness(corpus, "assert.js", hcache));
   parts.push(loadHarness(corpus, "sta.js", hcache));
-  if (flags.includes("async")) parts.push(loadHarness(corpus, "doneprintHandle.js", hcache));
+  if (flags.includes("async")) {
+    parts.push(loadHarness(corpus, "doneprintHandle.js", hcache));
+    // asyncHelpers.js 的 asyncTest 判 `hasOwnProperty(globalThis,"$DONE")`:
+    // 顶层 function $DONE 声明在 asm.js 模块模型里是模块作用域、非 globalThis 自有
+    // 属性 → 恒抛 "asyncTest called without async flag"(async 族假 FAIL 根因)。
+    // 注入一行把模块函数挂到 globalThis(真属主对象,hasOwnProperty 命中)。
+    parts.push("globalThis.$DONE = $DONE;\n");
+  }
   for (const inc of meta.includes) parts.push(loadHarness(corpus, inc, hcache));
   parts.push(body);
   let out = parts.join("\n");

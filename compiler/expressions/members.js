@@ -2,6 +2,7 @@
 // 编译对象属性、数组索引访问
 
 import { VReg } from "../../vm/index.js";
+import { isAsyncFunction, isGeneratorFunction } from "../async/index.js";
 
 // [!! 本文件注释铁律 !!] 本文件自身用到正则字面量(见 import.meta.url 分支的
 // `.replace(...)`),自举时**依赖** compiler/index.js 把 RegExp shim 注入本文件。
@@ -62,6 +63,15 @@ const ArefMethodRef = {
         toSorted: ["_agen_toSorted", 1],
         toSpliced: ["_agen_toSpliced", 2],
         with: ["_agen_with", 2],
+        // [I5 补] 缺失的一等值方法(与 ARRAY_PROTO_METHODS 同 helper/arity)。
+        // includes 的 fromIndex 装箱(缺参 undefined 合法);join/toString/toLocaleString
+        // 委托 _agen_join(与原型表一致);shift/unshift 无下标参数、直接透传。
+        includes: ["_agen_includes", 1],
+        join: ["_agen_join", 1],
+        toString: ["_agen_join", 0],
+        toLocaleString: ["_agen_join", 0],
+        unshift: ["_agen_unshift", 1],
+        shift: ["_agen_shift", 0],
     },
     string: {
         toUpperCase: ["_str_toUpperCase", 0],
@@ -727,6 +737,18 @@ const SET_PROTO_METHODS = [
     ["isSupersetOf", "_aref_set_issuperset", 1],
     ["isDisjointFrom", "_aref_set_isdisjoint", 1],
 ];
+// [I7] 实例方法值读查表(与上表同源):{label, arity}。Set.keys 不在原型表
+// (经 aliases 落 values 同闭包),实例读也缺 → 记偏差。
+const MAP_PROTO_METHODS_REF = {};
+for (let _mi = 0; _mi < MAP_PROTO_METHODS.length; _mi++) {
+    const _m = MAP_PROTO_METHODS[_mi];
+    MAP_PROTO_METHODS_REF[_m[0]] = { label: _m[1], arity: _m[2] };
+}
+const SET_PROTO_METHODS_REF = {};
+for (let _si = 0; _si < SET_PROTO_METHODS.length; _si++) {
+    const _s = SET_PROTO_METHODS[_si];
+    SET_PROTO_METHODS_REF[_s[0]] = { label: _s[1], arity: _s[2] };
+}
 const PROMISE_PROTO_METHODS = [
     ["then", "_aref_promise_then", 2],
     ["catch", "_aref_promise_catch", 1],
@@ -1209,6 +1231,24 @@ export const MemberCompiler = {
             this.compileExpression(expr.object);
         }
         this.emitRegExpMethodClosure(propName, shimName, propName === "toString" ? 0 : 1);
+        return true;
+    },
+
+    // [I7] Map/Set 实例方法值读:m.set 作值(`const f=m.set; f.call(...)` 或
+    // `m.set.call(...)`)。Map/Set 实例无原型链,通用属性读恒 undefined
+    // (Map/prototype/set/replaces-a-value-returns-map 族"not a function"根因)。
+    // 静态 Map/Set 接收者 → 与原型物化同源的 _aref_map_*/_aref_set_* 守卫壳闭包
+    // (不绑定接收者,与 ES 一致)。接收者有副作用时仍需求值(结果丢弃)。
+    _tryEmitCollectionMethodRef(expr, propName) {
+        const t = this.inferObjectType && this.inferObjectType(expr.object);
+        let entry = null;
+        if (t === "Map") entry = MAP_PROTO_METHODS_REF[propName];
+        else if (t === "Set") entry = SET_PROTO_METHODS_REF[propName];
+        if (!entry) return false;
+        if (!(this.isPureExpr && this.isPureExpr(expr.object))) {
+            this.compileExpression(expr.object);
+        }
+        this.emitBuiltinMethodRefClosureMeta(entry.label, propName, entry.arity);
         return true;
     },
 
@@ -4489,7 +4529,14 @@ export const MemberCompiler = {
                     this.vm.movImm(VReg.A0, 16);
                     this.vm.call("_alloc");
                     this.vm.mov(VReg.S0, VReg.RET);
-                    this.vm.movImm(VReg.V1, 0xc105); // CLOSURE_MAGIC
+                    // [I10 async 一等值] async 函数声明作值须用 async 闭包魔数
+                    // (0xa51c):compileClosureCall 靠魔数走 compileAsyncClosureCall
+                    // (协程+Promise);此前一律 0xc105 → 普通闭包直调 async stub
+                    // → 协程序言读垃圾 → asyncTest(asyncFn)/经由形参调用 async
+                    // 声明函数族 SIGSEGV。async generator 与普通闭包同魔数
+                    // (见 closures.js compileFunctionExpression 注)。
+                    const _declIsAsync = isAsyncFunction(declNode) && !isGeneratorFunction(declNode);
+                    this.vm.movImm(VReg.V1, _declIsAsync ? 0xa51c : 0xc105);
                     this.vm.store(VReg.S0, 0, VReg.V1);
                     this.vm.lea(VReg.V1, funcLabel);
                     this.vm.store(VReg.S0, 8, VReg.V1);
@@ -5578,6 +5625,8 @@ export const MemberCompiler = {
                 // **深递归**热函数,自举时它的栈帧就是编译器自己的栈帧——在这里多加一个
                 // 局部槽就会把自举编译 cli.js 的递归推爆(实测 SIGSEGV),故此处零新局部。
                 if (this._tryEmitRegExpMethodRef(expr, propName)) return;
+                // [I7] Map/Set 实例方法值读(同 RegExp 判定下沉,零新局部槽)。
+                if (this._tryEmitCollectionMethodRef(expr, propName)) return;
 
                 // [I5] 表值 = [helper, 规范 length];命中判据 Array.isArray(表是字面量,
                 // 原型链上只可能撞 Object.prototype 的函数值属性 → 必非数组,污染-safe,#32)。

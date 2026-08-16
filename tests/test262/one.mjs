@@ -106,7 +106,10 @@ if (rawSrc) {
     parts.push(HOST_SHIMS);
     parts.push(readFileSync(join(CORPUS, "harness", "assert.js"), "utf8"));
     parts.push(readFileSync(join(CORPUS, "harness", "sta.js"), "utf8"));
-    if (meta.flags.includes("async")) parts.push(readFileSync(join(CORPUS, "harness", "doneprintHandle.js"), "utf8"));
+    if (meta.flags.includes("async")) {
+      parts.push(readFileSync(join(CORPUS, "harness", "doneprintHandle.js"), "utf8"));
+      parts.push("globalThis.$DONE = $DONE;\n"); // asyncTest 判 globalThis 自有 $DONE
+    }
     for (const inc of meta.includes) parts.push(readFileSync(join(CORPUS, "harness", inc), "utf8"));
   }
   parts.push(body);

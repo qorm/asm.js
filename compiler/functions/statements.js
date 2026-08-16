@@ -3295,7 +3295,8 @@ export const StatementCompiler = {
         // classinfo)与导入名保持旧标识符路径(emitLoadClassInfo 的既有语义),
         // 编译器自举产物逐字节不变。
         const superIsVar = !!(superClass && superClass.type === "Identifier" && !superIsFn &&
-            this.ctx.getLocal && this.ctx.getLocal(superClass.name));
+            (superClass.name === className || // [I8] 自引用 extends x:TDZ 读,走表达式路径
+                (this.ctx.getLocal && this.ctx.getLocal(superClass.name))));
         const superIsExpr = !!(superClass && superClass.type !== "Identifier") || superIsVar;
         const superInfoLabel = superIsExpr ? `_superinfo_${className}__${labelId}` : null;
         if (superInfoLabel) {
@@ -3314,6 +3315,30 @@ export const StatementCompiler = {
         // 是否多解一层 box(见其注释:同名既本地声明又被 boxedVars 标记时 boxedVars 不可靠)。
         if (!this.ctx.localDeclaredClasses) this.ctx.localDeclaredClasses = {};
         this.ctx.localDeclaredClasses[className] = true;
+
+        // [I8 类名 TDZ] extends 表达式里读本类名 → 绑定尚在 TDZ → ReferenceError
+        // (class x extends x {} 族)。extends 求值前把类名槽置 TDZ 哨兵、读点标 _tdz
+        // (compileIdentifier 读后发守卫退出);无自引用时零发射(编译器自举类全无此形)。
+        if (superClass) {
+            const selfRefs = [];
+            const visitTdz = (node) => {
+                if (!node || typeof node !== "object") return;
+                if (Array.isArray(node)) { for (let _ci = 0; _ci < node.length; _ci++) visitTdz(node[_ci]); return; }
+                if (node.type === "FunctionExpression" || node.type === "ArrowFunctionExpression" ||
+                    node.type === "ClassExpression" || node.type === "ClassDeclaration") return;
+                if (node.type === "Identifier" && node.name === className) selfRefs.push(node);
+                for (const _ck in node) {
+                    if (_ck === "type" || _ck === "loc" || _ck === "range" || _ck === "start" || _ck === "end") continue;
+                    visitTdz(node[_ck]);
+                }
+            };
+            visitTdz(superClass);
+            if (selfRefs.length > 0) {
+                this.vm.movImm64(VReg.V1, TDZ_SENTINEL);
+                this.vm.store(VReg.FP, classOffset, VReg.V1);
+                for (let _ri = 0; _ri < selfRefs.length; _ri++) selfRefs[_ri]._tdz = true;
+            }
+        }
 
         // 收集类成员
         let constructor = null;

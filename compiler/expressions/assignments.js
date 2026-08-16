@@ -580,15 +580,21 @@ export const AssignmentCompiler = {
             // 存帧槽(__WithPrecomputed,同逻辑复合赋值的机制),再脱糖——`o().v += x` 不再
             // 调 o() 两次、`a[i++] += 1` 不再 i++ 两次。纯基(标识符/this/字面量)保持原
             // 脱糖路径,编译器自身热点(this.x += …)codegen 不变。
+            // [I9] 计算键恒预求值并 ToPropertyKey 一次:即便键语法纯(base[prop]),
+            // 键的对象 ToPrimitive/toString 可观测——旧脱糖读写各转一次键,
+            // prop.toString 触发两次(S11.13.2_A7.1_T4 族)。非计算键不受影响;
+            // 编译器自身源码无计算键复合赋值(全仓 grep)→ 自举产物零变化。
             let dsMember = member;
-            if (!this.isPureExpr(member.object) || (member.computed && !this.isPureExpr(member.property))) {
+            if (!this.isPureExpr(member.object) || member.computed) {
                 const did = this.nextLabelId();
                 this.compileExpression(member.object);
                 const dsObjSlot = this.ctx.allocLocal(`__cma_obj_${did}`);
                 this.vm.store(VReg.FP, dsObjSlot, VReg.RET);
                 let dsProp = member.property;
-                if (member.computed && !this.isPureExpr(member.property)) {
+                if (member.computed) {
                     this.compileExpression(member.property);
+                    this.vm.mov(VReg.A0, VReg.RET);
+                    this.vm.call("_js_prop_key"); // ToPropertyKey 单次(对象键 toString 可观测)
                     const dsKeySlot = this.ctx.allocLocal(`__cma_key_${did}`);
                     this.vm.store(VReg.FP, dsKeySlot, VReg.RET);
                     dsProp = { type: "__WithPrecomputed", slot: dsKeySlot };

@@ -588,12 +588,44 @@ export const ExpressionCompiler = {
                     const mapNullishL = this.ctx.newLabel("mapnew_nullish");
                     const mapNonArrL = this.ctx.newLabel("mapnew_nonarr");
                     const mapEndL = this.ctx.newLabel("mapnew_end");
+                    const mapArrL = this.ctx.newLabel("mapnew_arr");
                     this.vm.load(VReg.V2, VReg.FP, srcOff);
                     this.vm.shrImm(VReg.V2, VReg.V2, 48);
                     this.vm.cmpImm(VReg.V2, 0x7FFA); this.vm.jeq(mapNullishL); // null
                     this.vm.cmpImm(VReg.V2, 0x7FFB); this.vm.jeq(mapNullishL); // undefined
-                    this.vm.cmpImm(VReg.V2, 0x7FFE); this.vm.jne(mapNonArrL);  // 非数组(含对象/字符串)→ 避 _array_length 段错
-                    this.vm.mov(VReg.A0, VReg.RET);
+                    this.vm.cmpImm(VReg.V2, 0x7FFE); this.vm.jeq(mapArrL); // 数组 → 快路
+                    // [I6 迭代器校验] 对象参数:先 GetIterator 校验(Symbol.iterator 非函数
+                    // → TypeError,iterator-is-undefined-throws 族),再 [...src] 展开进数组
+                    // 路径(迭代协议由 _array_spread_into 驱动;此前一律空 Map,且
+                    // iterator-next-failure 的错误传播丢失)。数字/串等 → 空 Map(记偏差)。
+                    this.vm.cmpImm(VReg.V2, 0x7FFD); this.vm.jne(mapNonArrL);
+                    {
+                        const mapObjOff = this.ctx.allocLocal(`__mapnew_obj_${this.nextLabelId()}`);
+                        this.vm.load(VReg.V1, VReg.FP, srcOff);
+                        this.vm.store(VReg.FP, mapObjOff, VReg.V1);
+                        this.vm.mov(VReg.A0, VReg.V1);
+                        this.emitBoxedStringKey("Symbol.iterator", VReg.A1);
+                        this.vm.call("_object_get");
+                        this.vm.shrImm(VReg.V0, VReg.RET, 48);
+                        this.vm.cmpImm(VReg.V0, 0x7FFF);
+                        const mapIterOkL = this.ctx.newLabel("mapnew_iter_ok");
+                        this.vm.jeq(mapIterOkL);
+                        this.emitThrowTypeError("iterable is not iterable");
+                        this.vm.label(mapIterOkL);
+                        // [...src]:空数组 + _array_spread_into 抽干迭代器(Array.from 同形)
+                        this.vm.movImm(VReg.A0, 0);
+                        this.vm.call("_array_new_with_size");
+                        this.vm.call("_box_arr_r");
+                        this.vm.store(VReg.FP, srcOff, VReg.RET);
+                        this.vm.load(VReg.A0, VReg.FP, srcOff);
+                        this.vm.load(VReg.A1, VReg.FP, mapObjOff);
+                        this.vm.movImm(VReg.A2, 0);
+                        this.vm.movImm(VReg.A3, 0);
+                        this.vm.call("_array_spread_into");
+                        this.vm.jmp(mapArrL);
+                    }
+                    this.vm.label(mapArrL);
+                    this.vm.load(VReg.A0, VReg.FP, srcOff); // 对象路径后 RET 已毁,统一从槽重载
                     this.vm.call("_array_length"); // RET = 原始整数长度
                     const lenOff = this.ctx.allocLocal(`__mapnew_len_${this.nextLabelId()}`);
                     this.vm.store(VReg.FP, lenOff, VReg.RET);
@@ -662,9 +694,32 @@ export const ExpressionCompiler = {
                     // 字符串、以及自定义可迭代对象(OBJECT)先 [...x] 展开成数组(spread 驱动
                     // Symbol.iterator 协议;非可迭代对象 spread 得空数组,不崩)。此前 OBJECT
                     // 被当数组读 _array_length/_array_get → 越界崩(new Set(自定义iterable) 崩根因)。
+                    // [I6] 对象参数追加 GetIterator 校验:Symbol.iterator 非函数 → TypeError
+                    // (iterator-is-undefined-throws 族)。参数只求值一次(先落槽,spread 读槽)。
+                    let setPreOff = null;
+                    let setPreName = null;
                     if (setArgT === Type.STRING || setArgT === Type.OBJECT) {
-                        setSrcArg = { type: "ArrayExpression",
-                            elements: [{ type: "SpreadElement", argument: args[0] }] };
+                        if (setArgT === Type.OBJECT) {
+                            this.compileExpression(args[0]);
+                            setPreName = `__setnew_pre_${this.nextLabelId()}`;
+                            setPreOff = this.ctx.allocLocal(setPreName);
+                            this.vm.store(VReg.FP, setPreOff, VReg.RET);
+                            this.vm.mov(VReg.A0, VReg.RET);
+                            this.emitBoxedStringKey("Symbol.iterator", VReg.A1);
+                            this.vm.call("_object_get");
+                            this.vm.shrImm(VReg.V0, VReg.RET, 48);
+                            this.vm.cmpImm(VReg.V0, 0x7FFF);
+                            const setIterOkL = this.ctx.newLabel("setnew_iter_ok");
+                            this.vm.jeq(setIterOkL);
+                            this.emitThrowTypeError("iterable is not iterable");
+                            this.vm.label(setIterOkL);
+                            setSrcArg = { type: "ArrayExpression",
+                                elements: [{ type: "SpreadElement",
+                                    argument: { type: "Identifier", name: setPreName } }] };
+                        } else {
+                            setSrcArg = { type: "ArrayExpression",
+                                elements: [{ type: "SpreadElement", argument: args[0] }] };
+                        }
                     }
                     this.compileExpression(setSrcArg); // RET = boxed 数组
                     const ssrcOff = this.ctx.allocLocal(`__setnew_src_${this.nextLabelId()}`);
