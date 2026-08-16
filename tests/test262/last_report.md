@@ -1,10 +1,10 @@
 # asm.js test262 conformance report
 
-_Generated 2026-08-16T03:49:17.487Z — target macos-arm64_
+_Generated 2026-08-16T04:17:45.112Z — target macos-arm64_
 
 ## Headline
 
-**asm.js passes 5384 / 6313 = 85.28% of the run test262 subset**
+**asm.js passes 5400 / 6313 = 85.54% of the run test262 subset**
 (selected `language/` + core `built-ins/`), one variant per test.
 
 Of 33776 discovered test files in the selected dirs, 2213 were excluded up front (module=83, unsupported-feature=2130, intl/staging-dir=0); 31563 were eligible; 6313 were actually run (deterministic stride=5).
@@ -13,8 +13,8 @@ Of 33776 discovered test files in the selected dirs, 2213 were excluded up front
 
 | class | count | % of run |
 |-------|------:|---------:|
-| PASS         | 5384 | 85.28 |
-| FAIL         | 841 | 13.32 |
+| PASS         | 5400 | 85.54 |
+| FAIL         | 825 | 13.07 |
 | COMPILE_FAIL | 6 | 0.10 |
 | CRASH        | 82 | 1.30 |
 | **run**      | **6313** | 100 |
@@ -37,7 +37,7 @@ Of 33776 discovered test files in the selected dirs, 2213 were excluded up front
 | built-ins/Symbol | 16 | 12 | 4 | 0 | 0 | 75.0 |
 | built-ins/TypedArray | 191 | 81 | 71 | 0 | 39 | 42.4 |
 | language/expressions | 1975 | 1724 | 231 | 4 | 16 | 87.3 |
-| language/statements | 1822 | 1582 | 228 | 2 | 10 | 86.8 |
+| language/statements | 1822 | 1598 | 212 | 2 | 10 | 87.7 |
 
 ## Excluded categories (counted, not scored)
 
@@ -62,7 +62,7 @@ Excluded-by-feature detail:
 ## Top failing patterns (FAIL / COMPILE_FAIL / CRASH detail strings)
 
 - **592×** FAIL: assertion mismatch (Test262Error / wrong value)
-- **79×** FAIL: async ($DONE not signalled / promise rejected)
+- **63×** FAIL: async ($DONE not signalled / promise rejected)
 - **48×** FAIL: TypedArray/ArrayBuffer semantics
 - **43×** CRASH: run signal SIGBUS
 - **43×** FAIL: negative test wrong outcome (phase=parse)
@@ -79,15 +79,15 @@ Excluded-by-feature detail:
 - `class`: 104
 - `regexp-unicode-property-escapes`: 100
 - `TypedArray`: 100
-- `async-iteration`: 68
 - `Symbol.iterator`: 59
 - `resizable-arraybuffer`: 58
+- `async-iteration`: 52
 - `class-fields-public`: 52
 - `class-fields-private`: 42
-- `destructuring-binding`: 41
 - `generators`: 40
 - `computed-property-names`: 28
 - `Symbol.species`: 27
+- `destructuring-binding`: 25
 - `Symbol.asyncIterator`: 23
 - `class-methods-private`: 22
 - `Proxy`: 21
@@ -127,4 +127,4 @@ mkdir -p .test262-corpus && tar xzf /tmp/t262.tgz -C .test262-corpus --strip-com
 node tests/test262/run.mjs --stride 5 --jobs 8 --target macos-arm64
 ```
 
-_Run wall-clock: 631.4s._
+_Run wall-clock: 732.1s._

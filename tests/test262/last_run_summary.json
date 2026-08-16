@@ -1,6 +1,6 @@
 {
-  "generated": "2026-08-16T03:49:17.492Z",
-  "runnerSha": "58cae25b2764a9db1225edf45fd8e9ee88a33b5a",
+  "generated": "2026-08-16T04:17:45.114Z",
+  "runnerSha": "12716aa071e6a29c26f4dd430dbd50befd2dae61",
   "corpusPin": "9e61c12835c5e4a3bdba93850427e6742c4f64c4",
   "config": {
     "corpus": ".test262-corpus",
@@ -48,12 +48,12 @@
   "eligible": 31563,
   "run": 6313,
   "totals": {
-    "PASS": 5384,
-    "FAIL": 841,
+    "PASS": 5400,
+    "FAIL": 825,
     "COMPILE_FAIL": 6,
     "CRASH": 82
   },
-  "passRatePct": 85.28,
+  "passRatePct": 85.54,
   "byArea": {
     "built-ins/Array": {
       "PASS": 526,
@@ -140,8 +140,8 @@
       "CRASH": 16
     },
     "language/statements": {
-      "PASS": 1582,
-      "FAIL": 228,
+      "PASS": 1598,
+      "FAIL": 212,
       "COMPILE_FAIL": 2,
       "CRASH": 10
     }
@@ -153,7 +153,7 @@
     },
     {
       "pattern": "FAIL: async ($DONE not signalled / promise rejected)",
-      "count": 79
+      "count": 63
     },
     {
       "pattern": "FAIL: TypedArray/ArrayBuffer semantics",

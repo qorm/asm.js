@@ -596,13 +596,60 @@ export const StatementCompiler = {
                     const keyName = prop.key && prop.key.name;
                     if (!keyName) continue;
                     excludedKeys.push(keyName);
-                    this.vm.load(VReg.A0, VReg.FP, srcSlot);
-                    this.emitBoxedStringKey(keyName, VReg.A1);
-                    this.vm.call("_object_get");
-                    // [test262 S1] getter 解包(同计算键路径)
-                    this.vm.mov(VReg.A0, VReg.RET);
-                    this.vm.load(VReg.A1, VReg.FP, srcSlot);
-                    this.vm.call("_maybe_getter");
+                    if (keyName === "constructor") {
+                        // [err-ctor 解构] `({constructor} = reason)`/异步拒绝回调形参解构:
+                        // __asmjs_err 品牌对象按 name 分派回 memoized 错误构造器闭包
+                        // (与 compileMemberExpression 的 .constructor 分支同构),使
+                        // constructor === TypeError 成立(assert 族命门)。非品牌对象退回通用读。
+                        const cid = this.nextLabelId();
+                        const ctorEnd = this.ctx.newLabel("destr_ctor_end");
+                        const ctorFb = this.ctx.newLabel("destr_ctor_fb");
+                        this.vm.load(VReg.V0, VReg.FP, srcSlot);
+                        this.vm.shrImm(VReg.V1, VReg.V0, 48);
+                        this.vm.cmpImm(VReg.V1, 0x7FFD);
+                        this.vm.jne(ctorFb);
+                        this.vm.load(VReg.A0, VReg.FP, srcSlot);
+                        this.emitBoxedStringKey("__asmjs_err", VReg.A1);
+                        this.vm.call("_object_has");
+                        this.vm.cmpImm(VReg.RET, 0);
+                        this.vm.jeq(ctorFb);
+                        const ctorName = this.ctx.allocLocal(`__dctor_name_${cid}`);
+                        this.vm.load(VReg.A0, VReg.FP, srcSlot);
+                        this.emitBoxedStringKey("name", VReg.A1);
+                        this.vm.call("_object_get");
+                        this.vm.store(VReg.FP, ctorName, VReg.RET);
+                        const ERR_CTOR_NAMES_L = ["Error", "TypeError", "RangeError", "SyntaxError",
+                            "ReferenceError", "EvalError", "URIError"];
+                        for (let ei = 0; ei < ERR_CTOR_NAMES_L.length; ei++) {
+                            const en = ERR_CTOR_NAMES_L[ei];
+                            const ctorNx = this.ctx.newLabel("dctor_nx");
+                            this.vm.load(VReg.A0, VReg.FP, ctorName);
+                            this.emitBoxedStringKey(en, VReg.A1);
+                            this.vm.call("_strict_eq");
+                            this.vm.movImm64(VReg.V1, 0x7ff9000000000001n);
+                            this.vm.cmp(VReg.RET, VReg.V1);
+                            this.vm.jne(ctorNx);
+                            this.emitErrorCtorRef(en);
+                            this.vm.jmp(ctorEnd);
+                            this.vm.label(ctorNx);
+                        }
+                        this.vm.label(ctorFb);
+                        this.vm.load(VReg.A0, VReg.FP, srcSlot);
+                        this.emitBoxedStringKey("constructor", VReg.A1);
+                        this.vm.call("_object_get");
+                        this.vm.mov(VReg.A0, VReg.RET);
+                        this.vm.load(VReg.A1, VReg.FP, srcSlot);
+                        this.vm.call("_maybe_getter");
+                        this.vm.label(ctorEnd);
+                    } else {
+                        this.vm.load(VReg.A0, VReg.FP, srcSlot);
+                        this.emitBoxedStringKey(keyName, VReg.A1);
+                        this.vm.call("_object_get");
+                        // [test262 S1] getter 解包(同计算键路径)
+                        this.vm.mov(VReg.A0, VReg.RET);
+                        this.vm.load(VReg.A1, VReg.FP, srcSlot);
+                        this.vm.call("_maybe_getter");
+                    }
                 }
                 if (dflt) {
                     // [L2-SameValue] _object_get 已对缺键返回 JS_UNDEFINED(0x7FFB),
