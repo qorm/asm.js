@@ -35,7 +35,21 @@ export const ClosureCompiler = {
             off = this.ctx.allocLocal(name);
             const needsBox = this.ctx.boxedVars && this.ctx.boxedVars.has(name);
             if (needsBox) {
-                vm.call("_box_alloc");
+                // [L1 box 统一] 模块顶层共享变量的全局 box 由 _main 序言预建(初值=TDZ
+                // 哨兵)。顶层 var 提升必须复用同一 box(var 语义:初值置 undefined),
+                // 不能另 _box_alloc:否则早建闭包(声明语句之前捕获)拿到这个新 box,
+                // 而声明初始化走 compileVariableDeclaration 的 globalLabel 分支复用
+                // 全局 box → 双 box 分叉,闭包永远读陈旧值("var f=()=>x; var x=…"
+                // 族:closure 读 undefined / 计数不更新)。仅模块顶层(funcName 形如
+                // module_N)复用;函数体内同名局部遮蔽时无此语义,仍自建 box。
+                const gl = (this.ctx.getMainCapturedVar && typeof this.ctx.funcName === "string" &&
+                    this.ctx.funcName.indexOf("module_") === 0) ? this.ctx.getMainCapturedVar(name) : null;
+                if (gl) {
+                    vm.lea(VReg.V1, gl);
+                    vm.load(VReg.RET, VReg.V1, 0); // RET = _main 预建的全局 box
+                } else {
+                    vm.call("_box_alloc");
+                }
                 vm.movImm64(VReg.V1, undef);
                 vm.store(VReg.RET, 0, VReg.V1);
                 vm.store(VReg.FP, off, VReg.RET);

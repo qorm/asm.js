@@ -1438,11 +1438,23 @@ function __re_checkFlags(f) {
 // 吐出 source/flags/.../__err(Node 为 [])。这里逐槽 defineProperty 落 enumerable:false,
 // 保持 writable:true(lastIndex/__prog/__bad/__err 后续会被改写)。__isRegExp 品牌检查
 // 走存在性(_object_has)而非可枚举性,不受影响;属性读写也不受可枚举性影响。
-function __re_hide(o, names) {
+function __re_defineRO(o, k, v) {
+    Object.defineProperty(o, k, { value: v, writable: false, enumerable: false, configurable: true });
+}
+
+function __re_hide(o, names, roNames) {
     var i = 0;
     while (i < names.length) {
         var k = names[i];
         Object.defineProperty(o, k, { value: o[k], writable: true, enumerable: false, configurable: true });
+        i = i + 1;
+    }
+    if (roNames === undefined || roNames === null) return;
+    i = 0;
+    while (i < roNames.length) {
+        k = roNames[i];
+        // 规范:source/flags/global/... 为不可写数据属性(S15.10.7.2_A10 族)。
+        Object.defineProperty(o, k, { value: o[k], writable: false, enumerable: false, configurable: true });
         i = i + 1;
     }
 }
@@ -1532,7 +1544,7 @@ export function __RE_new(pattern, flags) {
         __err: "",
     };
     // 内部槽落不可枚举(见 __re_hide 注):须在 __re_compile 前,__re_compile 会读写 __prog/__bad/__err。
-    __re_hide(re, ["source", "flags", "global", "ignoreCase", "multiline", "dotAll", "sticky", "unicode", "unicodeSets", "hasIndices", "lastIndex", "__isRegExp", "__pat", "__prog", "__bad", "__err"]);
+    __re_hide(re, ["source", "flags", "global", "ignoreCase", "multiline", "dotAll", "sticky", "unicode", "unicodeSets", "hasIndices", "lastIndex", "__isRegExp", "__pat", "__prog", "__bad", "__err"], ["source", "flags", "global", "ignoreCase", "multiline", "dotAll", "sticky", "unicode", "unicodeSets", "hasIndices"]);
     // 规范:模式在构造期编译,语法错立即抛 SyntaxError(此前是懒编译+静默不匹配)。
     __re_compile(re);
     if (re.__bad && re.__err !== "") {
@@ -1568,18 +1580,18 @@ export function __RE_compile(re, pattern, flags) {
     if (f === 0) f = "";
     if (typeof f !== "string") f = "" + f;
     __re_checkFlags(f);
-    // 更新属性
+    // 更新属性(不可写数据属性,须经 defineProperty 而非赋值)
     f = __re_canonFlags(f);
-    re.source = __re_escSource(src);
-    re.flags = f;
-    re.global = f.indexOf("g") !== -1;
-    re.ignoreCase = f.indexOf("i") !== -1;
-    re.multiline = f.indexOf("m") !== -1;
-    re.dotAll = f.indexOf("s") !== -1;
-    re.sticky = f.indexOf("y") !== -1;
-    re.unicode = f.indexOf("u") !== -1;
-    re.unicodeSets = f.indexOf("v") !== -1;
-    re.hasIndices = f.indexOf("d") !== -1;
+    __re_defineRO(re, "source", __re_escSource(src));
+    __re_defineRO(re, "flags", f);
+    __re_defineRO(re, "global", f.indexOf("g") !== -1);
+    __re_defineRO(re, "ignoreCase", f.indexOf("i") !== -1);
+    __re_defineRO(re, "multiline", f.indexOf("m") !== -1);
+    __re_defineRO(re, "dotAll", f.indexOf("s") !== -1);
+    __re_defineRO(re, "sticky", f.indexOf("y") !== -1);
+    __re_defineRO(re, "unicode", f.indexOf("u") !== -1);
+    __re_defineRO(re, "unicodeSets", f.indexOf("v") !== -1);
+    __re_defineRO(re, "hasIndices", f.indexOf("d") !== -1);
     re.lastIndex = 0;
     re.__pat = src;
     re.__prog = null;
@@ -2223,8 +2235,18 @@ export function __RE_matchAll(str, re) {
     if (typeof s !== "string") s = "" + s;
     // Use a working copy with g flag to drive exec scanning without mutating
     // the original regex's lastIndex (same pattern as __RE_split).
+    // [get-order] 规范 22.2.5.8:flags = ToString(Get(R,"flags")) 在 Construct 之前,
+    // 故此处先 ToString 再进 __RE_new(其 IsRegExp 读 @@match 在后面)——
+    // isregexp-called-once 族:flags toString 必须先于 get @@match。
     var flags = re.flags;
+    if (typeof flags !== "string") flags = "" + flags;
     if (flags.indexOf("g") < 0) flags = flags + "g";
+    // [get-order] 规范 22.2.5.8 经 Construct(C,«R,flags») 走 RegExp(R, flags) →
+    // IsRegExp(R) 读 R[Symbol.match](isregexp-called-once:须在 flags toString 之后、
+    // 恰好一次)。此处显式读一次(真 RegExp 走原型、无副作用;自定义 getter 可观测)。
+    if (re !== null && re !== undefined && typeof re !== "string") {
+        var _mm = re[Symbol.match];
+    }
     var g = __RE_new(typeof re.__pat === "string" ? re.__pat : re.source, flags);
     g.lastIndex = 0;
     var done = false;
