@@ -39,7 +39,6 @@ export class SetGenerator {
         // ============================================================
         vm.label("_set_new");
         vm.prologue(16, [VReg.S0]);
-
         vm.movImm(VReg.A0, SET_SIZE);
         vm.call("_alloc");
         vm.mov(VReg.S0, VReg.RET);
@@ -352,9 +351,13 @@ export class SetGenerator {
         vm.load(VReg.S3, VReg.S3, 8); // cur = node.next @8
         vm.jmp("_set_values_loop");
         vm.label("_set_values_done");
-        vm.movImm64(VReg.V1, 0x7FFE000000000000n); // TAG_ARRAY
-        vm.mov(VReg.RET, VReg.S1);
-        vm.or(VReg.RET, VReg.RET, VReg.V1);
+        // [test262 Set/prototype/values-iteration-mutable] 惰性迭代器(游标+初始 size
+        // 上限):盒回 set → _set_iterator_new(set, 0=values)。
+        vm.mov(VReg.A0, VReg.S0);
+        vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm(VReg.A1, 0);
+        vm.call("_set_iterator_new");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 48);
 
         // ============================================================
@@ -366,6 +369,7 @@ export class SetGenerator {
         vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.S0, VReg.A0, VReg.V1); // S0 = 裸 set
+        vm.push(VReg.S0); // [SP] = 裸 set(循环里 S0 复用为索引,跨调用保活)
         vm.load(VReg.A0, VReg.S0, 8); // size
         vm.call("_array_new_with_size"); // RET = 外层数组头
         vm.mov(VReg.S1, VReg.RET); // S1 = 外层头
@@ -397,9 +401,14 @@ export class SetGenerator {
         vm.load(VReg.S3, VReg.S3, 8); // cur = node.next @8
         vm.jmp("_set_entries_loop");
         vm.label("_set_entries_done");
-        vm.movImm64(VReg.V1, 0x7FFE000000000000n);
-        vm.mov(VReg.RET, VReg.S1);
-        vm.or(VReg.RET, VReg.RET, VReg.V1);
+        // [test262 Set/prototype/entries] 惰性迭代器 kind 1(entries → [v,v])。
+        // 裸 set 在 [SP](循环里 S0 复用为索引,此处从栈取)。
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm(VReg.A1, 1);
+        vm.call("_set_iterator_new");
+        vm.pop(VReg.V0);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 48);
 
         // ============================================================
@@ -1358,5 +1367,107 @@ export class SetGenerator {
         guarded("_aref_set_issubset", TYPE_SET, "_set_issubset", "Method Set.prototype.isSubsetOf called on incompatible receiver ");
         guarded("_aref_set_issuperset", TYPE_SET, "_set_issuperset", "Method Set.prototype.isSupersetOf called on incompatible receiver ");
         guarded("_aref_set_isdisjoint", TYPE_SET, "_set_isdisjoint", "Method Set.prototype.isDisjointFrom called on incompatible receiver ");
+
+        // ============================================================
+        // [test262 Set/prototype/values-iteration-mutable] 惰性 Set 迭代器:
+        // 游标节点 + 初始 size 上限(创建后新增仍可见;耗尽后恒 done)。节点
+        // value@0/next@8。kind: 0=values(=keys), 1=entries([v,v])。
+        // 闭包块 48B: +0 magic +8 _set_iter_next +16 set(裸) +24 node(裸)
+        //             +32 remaining +40 kind。对象: next 闭包 + Symbol.iterator 自迭代。
+        // ============================================================
+        vm.label("_set_iterator_new");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.mov(VReg.S2, VReg.A0); // boxed set
+        vm.mov(VReg.S3, VReg.A1); // kind
+        vm.call("_object_new");
+        vm.mov(VReg.S1, VReg.RET); // obj(裸)
+        vm.movImm(VReg.A0, 48);
+        vm.call("_alloc");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.movImm(VReg.V1, 0xc105);
+        vm.store(VReg.S0, 0, VReg.V1);
+        vm.lea(VReg.V1, "_set_iter_next");
+        vm.store(VReg.S0, 8, VReg.V1);
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V2, VReg.S2, VReg.V1); // 裸 set
+        vm.store(VReg.S0, 16, VReg.V2);
+        vm.load(VReg.V1, VReg.V2, 16); // head
+        vm.store(VReg.S0, 24, VReg.V1); // node = head
+        vm.load(VReg.V1, VReg.V2, 8); // size
+        vm.store(VReg.S0, 32, VReg.V1); // remaining = size
+        vm.store(VReg.S0, 40, VReg.S3); // kind
+        // obj["next"] = 闭包
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.A1, this.vm.asm.addString("next"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7fff000000000000n);
+        vm.or(VReg.A2, VReg.S0, VReg.V1);
+        vm.call("_object_set");
+        // Symbol.iterator 自迭代闭包
+        vm.movImm(VReg.A0, 16);
+        vm.call("_alloc");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.movImm(VReg.V1, 0xc105);
+        vm.store(VReg.S0, 0, VReg.V1);
+        vm.lea(VReg.V1, "_generator_self");
+        vm.store(VReg.S0, 8, VReg.V1);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.A1, this.vm.asm.addString("Symbol.iterator"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7fff000000000000n);
+        vm.or(VReg.A2, VReg.S0, VReg.V1);
+        vm.call("_object_set");
+        vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+        vm.mov(VReg.RET, VReg.S1);
+        vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+
+        vm.label("_set_iter_next");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.mov(VReg.S3, VReg.S0); // 闭包
+        // 活游标语义:node 指针随链表走(创建后新增可见;耗尽后 node=0 恒 done,
+        // 再 add 也不复活——ES 迭代器完成即终态)。
+        vm.load(VReg.S2, VReg.S0, 24); // node
+        vm.cmpImm(VReg.S2, 0);
+        vm.jeq("_set_iter_done");
+        vm.load(VReg.V0, VReg.S2, 8); // next
+        vm.store(VReg.S0, 24, VReg.V0);
+        vm.load(VReg.S0, VReg.S2, 0); // value(复用 S0)
+        vm.load(VReg.V1, VReg.S3, 40); // kind
+        vm.cmpImm(VReg.V1, 1);
+        vm.jeq("_set_iter_entries");
+        // values: value = node.value
+        vm.cmpImm(VReg.S0, 0);
+        vm.jne("_set_iter_emit");
+        vm.movImm64(VReg.S0, 0x7ff8000000000000n);
+        vm.jmp("_set_iter_emit");
+        vm.label("_set_iter_entries");
+        // entries: [v, v]
+        vm.movImm(VReg.A0, 2);
+        vm.call("_array_new_with_size");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.movImm(VReg.A1, 0);
+        vm.mov(VReg.A2, VReg.S0);
+        vm.call("_array_set");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.movImm(VReg.A1, 1);
+        vm.mov(VReg.A2, VReg.S0);
+        vm.call("_array_set");
+        vm.movImm64(VReg.V1, 0x7ffe000000000000n);
+        vm.mov(VReg.S0, VReg.S1);
+        vm.or(VReg.S0, VReg.S0, VReg.V1);
+        vm.label("_set_iter_emit");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.movImm64(VReg.A1, 0x7ff9000000000000n);
+        vm.call("_generator_make_result");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+        vm.label("_set_iter_done");
+        vm.movImm64(VReg.A0, 0x7ffb000000000000n);
+        vm.movImm64(VReg.A1, 0x7ff9000000000001n);
+        vm.call("_generator_make_result");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
     }
 }

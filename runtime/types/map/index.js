@@ -542,15 +542,28 @@ export class MapGenerator {
         vm.movImm64(VReg.V1, 0x7FFE000000000000n); // TAG_ARRAY
         vm.mov(VReg.RET, VReg.S1);
         vm.or(VReg.RET, VReg.RET, VReg.V1);
+        // [test262 Map/prototype/keys|values] 迭代器化(values 语义,元素即键/值)。
+        vm.mov(VReg.A0, VReg.RET);
+        vm.movImm(VReg.A1, 0);
+        vm.call("_array_iterator_new");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 48);
 
         // ============================================================
-        // _map_entries(A0 = map) -> boxed 真数组[[k,v]...]
+        // _map_entries(A0 = map) -> 迭代器(公开 .entries() 语义);_map_entries_raw
+        // 保旧数组形态供 for-of 快路(statements.js 按数组迭代)。
+        // ============================================================
+        vm.label("_map_entries");
+        vm.prologue(0, []);
+        vm.call("_map_entries_raw");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.movImm(VReg.A1, 0);
+        vm.call("_array_iterator_new");
+        vm.epilogue([], 0);
+        // _map_entries_raw(A0 = map) -> boxed 真数组[[k,v]...]
         // 每个元素是新建的 2 元真数组 [key, value](装箱)。内层 _array_new_with_size
         // 调用只存 S0-S3,故索引/外层头/外层 data_ptr/当前节点全放 S0-S3 跨调用保活;
         // 未处理的链表由 S3(当前节点,在其栈帧内)保守栈扫描保活。
-        // ============================================================
-        vm.label("_map_entries");
+        vm.label("_map_entries_raw");
         vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.S0, VReg.A0, VReg.V1); // S0 = 裸 map(跨 array_new 保活)

@@ -2169,10 +2169,11 @@ export const StatementCompiler = {
         this.vm.label(notSetLabel);
 
         // Map 特判：Map 是 48 字节头（type@0=4, head@16, tail@24, bucket_count@32,
-        // buckets_ptr@40）。for-of Map 迭代 [k,v] 条目——调 `_map_entries` 得 [[k,v]...]
-        // 真数组(插入序,m.entries() 同路径),脱壳存 arrTemp、idx=0,跳数组快路 loopLabel
-        // 复用其 [k,v] 元素迭代 + storeLoopBinding(整体 e 或 [k,v] 解构均由循环体处理)。
-        // 此前直接跳 endLabel(空迭代)。
+        // buckets_ptr@40;节点 key@0/value@8/next@16)。直接遍历链表(活视图:迭代中
+        // 增删可见,map-expand/map-contract 族),逐节点构 [k,v] 对交 storeLoopBinding。
+        // 此前调 _map_entries 快照成数组 → 迭代中 map.set 不可见。
+        const mapLoopLabel = this.ctx.newLabel("forof_map");
+        const mapContLabel = this.ctx.newLabel("forof_map_cont");
         const notMapLabel = this.ctx.newLabel("forof_notmap");
         this.vm.load(VReg.RET, VReg.FP, iterableTempOffset);
         this.vm.emitMaskLoad(VReg.V1);
@@ -2180,14 +2181,40 @@ export const StatementCompiler = {
         this.vm.loadByte(VReg.V1, VReg.V0, 0);
         this.vm.cmpImm(VReg.V1, 4);              // TYPE_MAP
         this.vm.jne(notMapLabel);
-        this.vm.load(VReg.A0, VReg.FP, iterableTempOffset); // boxed map
-        this.vm.call("_map_entries");            // RET = boxed [[k,v]...] 数组
-        this.vm.emitMaskLoad(VReg.V1);
-        this.vm.andMaskReg(VReg.V0, VReg.RET, VReg.V1); // 脱壳
-        this.vm.store(VReg.FP, arrTempOffset, VReg.V0);
-        this.vm.movImm(VReg.V0, 0);
-        this.vm.store(VReg.FP, idxTempOffset, VReg.V0);
-        this.vm.jmp(loopLabel);
+        this.vm.load(VReg.V0, VReg.V0, 16);      // node = head@16
+        this.vm.store(VReg.FP, iteratorTempOffset, VReg.V0);
+        this.vm.label(mapLoopLabel);
+        this.vm.load(VReg.V0, VReg.FP, iteratorTempOffset);
+        this.vm.cmpImm(VReg.V0, 0);
+        this.vm.jeq(endLabel);
+        // pair = [node.key, node.value]
+        this.vm.movImm(VReg.A0, 2);
+        this.vm.call("_array_new_with_size");
+        this.vm.mov(VReg.S0, VReg.RET);          // 裸对头(_array_set 保 S0-S3)
+        this.vm.load(VReg.V0, VReg.FP, iteratorTempOffset);
+        this.vm.load(VReg.V1, VReg.V0, 0);       // key@0
+        this.vm.mov(VReg.A0, VReg.S0);
+        this.vm.movImm(VReg.A1, 0);
+        this.vm.mov(VReg.A2, VReg.V1);
+        this.vm.call("_array_set");
+        this.vm.load(VReg.V0, VReg.FP, iteratorTempOffset);
+        this.vm.load(VReg.V1, VReg.V0, 8);       // value@8
+        this.vm.mov(VReg.A0, VReg.S0);
+        this.vm.movImm(VReg.A1, 1);
+        this.vm.mov(VReg.A2, VReg.V1);
+        this.vm.call("_array_set");
+        this.vm.movImm64(VReg.V1, 0x7ffe000000000000n);
+        this.vm.mov(VReg.RET, VReg.S0);
+        this.vm.or(VReg.RET, VReg.RET, VReg.V1); // RET = boxed [k,v]
+        this.storeLoopBinding(varName, varOffset, loopPattern, loopPatternMode, loopPatternSrcSlot);
+        this.ctx.continueLabel = mapContLabel;
+        this._bindLabelContinue(savedLabels); // [#60]
+        this.compileStatement(stmt.body);
+        this.vm.label(mapContLabel);
+        this.vm.load(VReg.V0, VReg.FP, iteratorTempOffset);
+        this.vm.load(VReg.V0, VReg.V0, 16);      // next@16
+        this.vm.store(VReg.FP, iteratorTempOffset, VReg.V0);
+        this.vm.jmp(mapLoopLabel);
         this.vm.label(notMapLabel);
 
         // [iterator-protocol] ES GetIterator §7.4.1:若 obj[Symbol.iterator] 缺失或非

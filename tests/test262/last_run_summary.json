@@ -1,6 +1,6 @@
 {
-  "generated": "2026-08-16T12:41:09.588Z",
-  "runnerSha": "01b4a80cba0ab34bd1ae1988efa7adfca8db0a1f",
+  "generated": "2026-08-16T13:34:21.610Z",
+  "runnerSha": "ca0448cc45c506b5dec334c87740ccc01fb4e6f9",
   "corpusPin": "9e61c12835c5e4a3bdba93850427e6742c4f64c4",
   "config": {
     "corpus": ".test262-corpus",
@@ -48,12 +48,12 @@
   "eligible": 31563,
   "run": 6313,
   "totals": {
-    "PASS": 5562,
-    "FAIL": 654,
+    "PASS": 5564,
+    "FAIL": 652,
     "COMPILE_FAIL": 12,
     "CRASH": 85
   },
-  "passRatePct": 88.1,
+  "passRatePct": 88.14,
   "byArea": {
     "built-ins/Array": {
       "PASS": 527,
@@ -110,8 +110,8 @@
       "CRASH": 0
     },
     "built-ins/Set": {
-      "PASS": 68,
-      "FAIL": 8,
+      "PASS": 70,
+      "FAIL": 6,
       "COMPILE_FAIL": 0,
       "CRASH": 0
     },
@@ -149,7 +149,7 @@
   "topFailPatterns": [
     {
       "pattern": "FAIL: assertion mismatch (Test262Error / wrong value)",
-      "count": 456
+      "count": 454
     },
     {
       "pattern": "FAIL: async ($DONE not signalled / promise rejected)",
