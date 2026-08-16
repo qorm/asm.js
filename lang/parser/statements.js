@@ -167,6 +167,11 @@ export const StatementParser = {
     parseLabeledStatement() {
         // [test262 标签重复] 同函数内不得有同名 label,但 Annex B 允许 sloppy 下重复。
         const name = this.curToken.literal;
+        // [test262 labeled/value-yield-strict] strict 下 yield/await 是保留字,不可作标签
+        // (onlyStrict 旗标把源包进 "use strict";sloppy 仍收,Node 对拍)。
+        if (this.inStrictMode() && (name === "yield" || name === "await")) {
+            this.errors.push("Cannot use '" + name + "' as a label in strict mode");
+        }
         if (this.inStrictMode() && this._usedLabels.has(name)) {
             this.errors.push("Label '" + name + "' has already been declared");
         }
@@ -1073,6 +1078,36 @@ export const StatementParser = {
 
     parseExpressionStatement() {
         let expr = this.parseExpression(Precedence.LOWEST);
+        // [test262 cover-initialized-name] CoverInitializedName(`{a = 1}`)仅在解构
+        // 目标位合法:表达式位(裸对象/实参等)是早期错误。AssignmentExpression 的
+        // LHS 是目标位(跳过);其余位置出现 _coverInit 属性即报。
+        {
+            const hasCover = (node) => {
+                if (!node || typeof node !== "object") return false;
+                if (Array.isArray(node)) {
+                    for (let k = 0; k < node.length; k++) if (hasCover(node[k])) return true;
+                    return false;
+                }
+                if (node.type === "AssignmentExpression") return hasCover(node.right);
+                if (node.type === "ObjectExpression") {
+                    const prs = node.properties || [];
+                    for (let k = 0; k < prs.length; k++) {
+                        if (prs[k] && prs[k]._coverInit) return true;
+                        if (prs[k] && hasCover(prs[k].value)) return true;
+                    }
+                    return false;
+                }
+                for (const key in node) {
+                    if (key === "type" || key === "loc" || key === "range" ||
+                        key === "start" || key === "end") continue;
+                    if (hasCover(node[key])) return true;
+                }
+                return false;
+            };
+            if (hasCover(expr)) {
+                this.errors.push("Invalid shorthand property initializer outside destructuring");
+            }
+        }
         if (this.peekTokenIs(TokenType.SEMICOLON)) this.nextToken();
         else {
             // [test262 let-newline-await-in-normal-function] 表达式语句必须由

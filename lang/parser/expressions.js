@@ -1190,7 +1190,9 @@ export const ExpressionParser = {
                 this.nextToken(); // cur = 默认表达式首 token
                 const dflt = this.parseExpression(Precedence.ASSIGN - 1);
                 const val = new AST.AssignmentPattern(new AST.Identifier(key.name), dflt);
-                properties.push(new AST.Property(key, val, "init", computed, true));
+                const covProp = new AST.Property(key, val, "init", computed, true);
+                covProp._coverInit = true; // [test262 cover-initialized-name] 表达式位非法
+                properties.push(covProp);
             } else if (this.peekTokenIs(TokenType.LPAREN)) {
                 this.nextToken();
                 // [Wave 8] 对象方法亦为函数/生成器/异步边界:置生成器/异步深度与复位字段上下文。
