@@ -808,10 +808,13 @@ export const MemberCompiler = {
         // 运行时创建的 async generator 把 Symbol.asyncIterator 存字符串键 "Symbol.asyncIterator",
         // for await 的 RIGHT[Symbol.asyncIterator] 计算读需同键才命中(否则走动态 _js_prop_key
         // 符号键 → 查不到 async-gen 的迭代器 → 空迭代)。iterator 行为不变。
+        // species 同协议:Map/Set/Promise/RegExp 构造器的 getter 块双键落位,
+        // X[Symbol.species] 读恒等于本构造器(此前动态符号键路径返残值)。
         if (property.type === "MemberExpression" &&
             property.object && property.object.type === "Identifier" && property.object.name === "Symbol" &&
             property.property && property.property.type === "Identifier" &&
-            (property.property.name === "iterator" || property.property.name === "asyncIterator")) {
+            (property.property.name === "iterator" || property.property.name === "asyncIterator" ||
+             property.property.name === "species")) {
             return "Symbol." + property.property.name;
         }
         return null;
@@ -1688,6 +1691,18 @@ export const MemberCompiler = {
             vm.lea(VReg.V0, ctorSlot);
             vm.load(VReg.A0, VReg.V0, 0);
             vm.mov(VReg.A1, VReg.S1);
+            vm.movImm(VReg.A2, ACCESSOR_PROP_ATTR);
+            vm.call("_closure_prop_set_attr");
+            // [test262] 双键协议:RegExp[Symbol.species] 计算读经 getMemberPropertyName
+            // 归一为字符串键 "Symbol.species",故同一 getter 块再落字符串键副本。
+            vm.lea(VReg.V0, ctorSlot);
+            vm.load(VReg.A0, VReg.V0, 0);
+            this.emitBoxedStringKey("Symbol.species", VReg.A1);
+            vm.mov(VReg.A2, VReg.S0);
+            vm.call("_closure_prop_set");
+            vm.lea(VReg.V0, ctorSlot);
+            vm.load(VReg.A0, VReg.V0, 0);
+            this.emitBoxedStringKey("Symbol.species", VReg.A1);
             vm.movImm(VReg.A2, ACCESSOR_PROP_ATTR);
             vm.call("_closure_prop_set_attr");
         })();
@@ -3587,6 +3602,20 @@ export const MemberCompiler = {
             vm.lea(VReg.V0, ctorSlot);
             vm.load(VReg.A0, VReg.V0, 0);
             vm.mov(VReg.A1, VReg.S1);
+            vm.movImm(VReg.A2, ACCESSOR_PROP_ATTR);
+            vm.call("_closure_prop_set_attr");
+            // [test262 Promise/Symbol.species] 双键协议(同 Array Symbol.iterator):
+            // 计算键读 X[Symbol.species] 经 IC 以**字符串** "Symbol.species" 为键,
+            // 仅符号键命中不到 → 读回恒非本构造器(此前得 [object WeakSet] 残值)。
+            // 同一 getter 块再落字符串键副本,读路径稳定命中。
+            vm.lea(VReg.V0, ctorSlot);
+            vm.load(VReg.A0, VReg.V0, 0);
+            this.emitBoxedStringKey("Symbol.species", VReg.A1);
+            vm.mov(VReg.A2, VReg.S0);
+            vm.call("_closure_prop_set");
+            vm.lea(VReg.V0, ctorSlot);
+            vm.load(VReg.A0, VReg.V0, 0);
+            this.emitBoxedStringKey("Symbol.species", VReg.A1);
             vm.movImm(VReg.A2, ACCESSOR_PROP_ATTR);
             vm.call("_closure_prop_set_attr");
         }

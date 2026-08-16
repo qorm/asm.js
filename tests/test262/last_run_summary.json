@@ -1,6 +1,6 @@
 {
-  "generated": "2026-08-16T11:53:33.604Z",
-  "runnerSha": "08ec54435a70f06ffdef261e483a6b3cea495099",
+  "generated": "2026-08-16T12:41:09.588Z",
+  "runnerSha": "01b4a80cba0ab34bd1ae1988efa7adfca8db0a1f",
   "corpusPin": "9e61c12835c5e4a3bdba93850427e6742c4f64c4",
   "config": {
     "corpus": ".test262-corpus",
@@ -48,12 +48,12 @@
   "eligible": 31563,
   "run": 6313,
   "totals": {
-    "PASS": 5561,
-    "FAIL": 657,
+    "PASS": 5562,
+    "FAIL": 654,
     "COMPILE_FAIL": 12,
-    "CRASH": 83
+    "CRASH": 85
   },
-  "passRatePct": 88.09,
+  "passRatePct": 88.1,
   "byArea": {
     "built-ins/Array": {
       "PASS": 527,
@@ -98,8 +98,8 @@
       "CRASH": 2
     },
     "built-ins/Promise": {
-      "PASS": 103,
-      "FAIL": 22,
+      "PASS": 104,
+      "FAIL": 21,
       "COMPILE_FAIL": 0,
       "CRASH": 2
     },
@@ -129,9 +129,9 @@
     },
     "built-ins/TypedArray": {
       "PASS": 81,
-      "FAIL": 71,
+      "FAIL": 69,
       "COMPILE_FAIL": 0,
-      "CRASH": 39
+      "CRASH": 41
     },
     "language/expressions": {
       "PASS": 1745,
@@ -157,7 +157,7 @@
     },
     {
       "pattern": "FAIL: TypedArray/ArrayBuffer semantics",
-      "count": 48
+      "count": 47
     },
     {
       "pattern": "CRASH: run signal SIGBUS",
@@ -165,15 +165,15 @@
     },
     {
       "pattern": "FAIL: array contents mismatch (compareArray)",
-      "count": 39
+      "count": 38
     },
     {
       "pattern": "FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)",
-      "count": 26
+      "count": 25
     },
     {
       "pattern": "CRASH: run timeout",
-      "count": 20
+      "count": 22
     },
     {
       "pattern": "CRASH: run signal SIGSEGV",

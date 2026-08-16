@@ -1,10 +1,10 @@
 # asm.js test262 conformance report
 
-_Generated 2026-08-16T11:53:33.602Z — target macos-arm64_
+_Generated 2026-08-16T12:41:09.586Z — target macos-arm64_
 
 ## Headline
 
-**asm.js passes 5561 / 6313 = 88.09% of the run test262 subset**
+**asm.js passes 5562 / 6313 = 88.10% of the run test262 subset**
 (selected `language/` + core `built-ins/`), one variant per test.
 
 Of 33776 discovered test files in the selected dirs, 2213 were excluded up front (module=83, unsupported-feature=2130, intl/staging-dir=0); 31563 were eligible; 6313 were actually run (deterministic stride=5).
@@ -13,10 +13,10 @@ Of 33776 discovered test files in the selected dirs, 2213 were excluded up front
 
 | class | count | % of run |
 |-------|------:|---------:|
-| PASS         | 5561 | 88.09 |
-| FAIL         | 657 | 10.41 |
+| PASS         | 5562 | 88.10 |
+| FAIL         | 654 | 10.36 |
 | COMPILE_FAIL | 12 | 0.19 |
-| CRASH        | 83 | 1.31 |
+| CRASH        | 85 | 1.35 |
 | **run**      | **6313** | 100 |
 
 ## By area
@@ -30,12 +30,12 @@ Of 33776 discovered test files in the selected dirs, 2213 were excluded up front
 | built-ins/Math | 65 | 63 | 2 | 0 | 0 | 96.9 |
 | built-ins/Number | 67 | 59 | 8 | 0 | 0 | 88.1 |
 | built-ins/Object | 681 | 652 | 27 | 0 | 2 | 95.7 |
-| built-ins/Promise | 127 | 103 | 22 | 0 | 2 | 81.1 |
+| built-ins/Promise | 127 | 104 | 21 | 0 | 2 | 81.9 |
 | built-ins/RegExp | 374 | 331 | 43 | 0 | 0 | 88.5 |
 | built-ins/Set | 76 | 68 | 8 | 0 | 0 | 89.5 |
 | built-ins/String | 243 | 215 | 28 | 0 | 0 | 88.5 |
 | built-ins/Symbol | 16 | 12 | 4 | 0 | 0 | 75.0 |
-| built-ins/TypedArray | 191 | 81 | 71 | 0 | 39 | 42.4 |
+| built-ins/TypedArray | 191 | 81 | 69 | 0 | 41 | 42.4 |
 | language/expressions | 1975 | 1745 | 207 | 6 | 17 | 88.4 |
 | language/statements | 1822 | 1642 | 164 | 6 | 10 | 90.1 |
 
@@ -63,11 +63,11 @@ Excluded-by-feature detail:
 
 - **456×** FAIL: assertion mismatch (Test262Error / wrong value)
 - **63×** FAIL: async ($DONE not signalled / promise rejected)
-- **48×** FAIL: TypedArray/ArrayBuffer semantics
+- **47×** FAIL: TypedArray/ArrayBuffer semantics
 - **44×** CRASH: run signal SIGBUS
-- **39×** FAIL: array contents mismatch (compareArray)
-- **26×** FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)
-- **20×** CRASH: run timeout
+- **38×** FAIL: array contents mismatch (compareArray)
+- **25×** FAIL: property-descriptor reflection (verifyProperty: length/name/writable/enumerable/configurable)
+- **22×** CRASH: run timeout
 - **19×** CRASH: run signal SIGSEGV
 - **19×** FAIL: negative test wrong outcome (phase=parse)
 - **12×** COMPILE_FAIL: asm.js could not compile (unsupported syntax / parser gap)
@@ -84,7 +84,7 @@ Excluded-by-feature detail:
 - `generators`: 40
 - `computed-property-names`: 28
 - `destructuring-binding`: 28
-- `Symbol.species`: 27
+- `Symbol.species`: 26
 - `class-fields-public`: 25
 - `class-fields-private`: 24
 - `Symbol.asyncIterator`: 23
@@ -127,4 +127,4 @@ mkdir -p .test262-corpus && tar xzf /tmp/t262.tgz -C .test262-corpus --strip-com
 node tests/test262/run.mjs --stride 5 --jobs 8 --target macos-arm64
 ```
 
-_Run wall-clock: 756.9s._
+_Run wall-clock: 854.4s._
