@@ -69,6 +69,11 @@ export const ExpressionParser = {
 
     parseIdentifier() {
         const ident = new AST.Identifier(this.curToken.literal);
+        // [test262 statements/debugger/expression] debugger 只能作语句,作标识符引用
+        // (`(debugger)`)是早期错误。语句位已在 parseStatementInner 专辟分支消费。
+        if (this.curToken.literal === "debugger" && !this.curToken.escaped) {
+            this.errors.push("Unexpected debugger in expression position");
+        }
         // [W-P9] 裸私有名引用(`#x in o` 品牌检查等;词法已把 `#x` 合并为单个 IDENT)。
         // 收集进引用表供类体收尾校验;类体外(classDepth===0)留既有缺口不处理。
         if (this.classDepth > 0 && this.curToken.literal && this.curToken.literal.charAt(0) === "#") {
@@ -1164,6 +1169,14 @@ export const ExpressionParser = {
                 return null;
             }
             if (this.peekTokenIs(TokenType.COMMA) || this.peekTokenIs(TokenType.RBRACE)) {
+                // [test262 S12.6.2_A15] 简写属性仅限标识符:`({1})`/`({"a"})` 的裸数字/字符串
+                // 键无冒号 → SyntaxError(node 对拍 "Unexpected number/string")。此前
+                // curTokenIsIdentifier 黑名单过宽,INT/FLOAT/STRING 被当简写键收下。
+                if (!computed && key.type === "Identifier" &&
+                    (this.curTokenIs(TokenType.INT) || this.curTokenIs(TokenType.FLOAT) ||
+                     this.curTokenIs(TokenType.STRING))) {
+                    this.errors.push("Unexpected number/string in shorthand property");
+                }
                 // [test262 早期错误 A] 简写属性 `{ x }` 的键即绑定引用,须过保留字校验;
                 // 带冒号的键 `{ if: 1 }`(PropertyName)走 COLON 分支,不校验(属性名可为保留字)。
                 if (!computed && key.type === "Identifier") this.checkReservedBinding(key.name);
@@ -1190,8 +1203,12 @@ export const ExpressionParser = {
                 this._immediateAsync = isAsyncMethod;
                 const prevInFieldInitM = this._inFieldInit;
                 this._inFieldInit = false;
+                // [test262 S12.9 语境] 对象方法体是函数体:fnDepth++ 使 return 合法
+                // (此前对象方法不经函数深度,return 被 top-level 早期错误误拒)。
+                this.fnDepth++;
                 let params = this.parseFunctionParams();
                 if (!this.expectPeek(TokenType.LBRACE)) {
+                    this.fnDepth--;
                     if (isGenMethod) this.fnGenDepth--;
                     if (isAsyncMethod) this.fnAsyncDepth--;
                     this._immediateGen = prevImmediateGenObj;
@@ -1205,6 +1222,7 @@ export const ExpressionParser = {
                 if (isStrict) { this.fnStrictDepth++; this.checkStrictParams(params); }
                 this.checkInheritedStrictParams(params, isStrict);   // [test262 早期错误 C] 继承 strict 重参
                 let body = this.parseBlockStatement();
+                this.fnDepth--;
                 if (isStrict) this.fnStrictDepth--;
                 if (isGenMethod) this.fnGenDepth--;
                 if (isAsyncMethod) this.fnAsyncDepth--;

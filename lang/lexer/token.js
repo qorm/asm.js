@@ -224,7 +224,29 @@ export function lookupIdent(ident, inTemplateExpression = false) {
             type !== TokenType.SUPER &&
             type !== TokenType.TRUE &&
             type !== TokenType.FALSE &&
-            type !== TokenType.NULL
+            type !== TokenType.NULL &&
+            // [test262 template middle-list-many-expr-abrupt] 语句关键词同样必须保留:
+            // `${function(){ return 1; }()}` 的 return 若成 IDENT,函数体解析崩塌。
+            type !== TokenType.RETURN &&
+            type !== TokenType.THROW &&
+            type !== TokenType.BREAK &&
+            type !== TokenType.CONTINUE &&
+            type !== TokenType.VAR &&
+            type !== TokenType.LET &&
+            type !== TokenType.CONST &&
+            type !== TokenType.IF &&
+            type !== TokenType.ELSE &&
+            type !== TokenType.FOR &&
+            type !== TokenType.WHILE &&
+            type !== TokenType.DO &&
+            type !== TokenType.SWITCH &&
+            type !== TokenType.CASE &&
+            type !== TokenType.DEFAULT &&
+            type !== TokenType.TRY &&
+            type !== TokenType.CATCH &&
+            type !== TokenType.FINALLY &&
+            type !== TokenType.DEBUGGER &&
+            type !== TokenType.WITH
         ) {
             return TokenType.IDENT;
         }

@@ -60,6 +60,12 @@ export const StatementParser = {
             // 空语句 `;`(#68):裸 `;`、`;;`、`class B{};`、`if(x);` 等。
             // for 循环头的 `;` 由 parseForStatement 单独消费,不经此路径。
             return new AST.EmptyStatement();
+        } else if (this.curTokenIs(TokenType.IDENT) && this.curToken.literal === "debugger" && !this.curToken.escaped) {
+            // [test262 statements/debugger] debugger 语句(no-op):语句位合法;
+            // 表达式位(`(debugger)`)由 parseIdentifier 拒。转义形态按标识符走。
+            this.nextToken();
+            if (this.peekTokenIs(TokenType.SEMICOLON)) this.nextToken();
+            return new AST.EmptyStatement();
         } else if (this.curTokenIs(TokenType.LET) || this.curTokenIs(TokenType.CONST) || this.curTokenIs(TokenType.VAR) || this.curTokenIs(TokenType.INT_TYPE)) {
             // [escaped-let] `l\\u0065t a;`:转义拼成的 let 不是词法声明关键词,按表达式标识符
             // 解析(其后 a 自然产生语法错误,或作 ASI 表达式语句)。
@@ -620,6 +626,11 @@ export const StatementParser = {
     },
 
     parseReturnStatement() {
+        // [test262 S12.9_A1_T3/T8] return 仅在函数体内合法(fnDepth>0;顶层/eval 片段
+        // fnDepth=0 → 早期错误)。此前不查 → `return 1;` 顶层被静默编译。
+        if (!this.fnDepth) {
+            this.errors.push("Illegal return statement");
+        }
         let stmt = new AST.ReturnStatement(null);
         // 裸 return(无实参):peek 为 } / ; / EOF 时不得越过 return——否则会把块的
         // 收尾 } 当成 return 自身的末 token 吞掉,吃掉其后一条语句(bare-return swallow)。
@@ -755,6 +766,33 @@ export const StatementParser = {
             }
         } else if (!this.curTokenIs(TokenType.SEMICOLON)) {
             init = this.parseExpression(Precedence.LOWEST);
+            // [test262 conditional/in-condition] for-init 是 Expression[~In]:
+            // 除 for-in 头形态(顶层 BinaryExpression('in') 且后随 `)`)外,头部含
+            // `in`(如三元条件内 `'' in {} ? 0 : 0`)是早期错误。AST 后验避免在
+            // 解析期误伤 for-in 的 `in`(head-lhs-let 族)。
+            {
+                const topIn = init && init.type === "BinaryExpression" && init.operator === "in" &&
+                    this.peekTokenIs(TokenType.RPAREN);
+                if (!topIn) {
+                    const findIn = (node) => {
+                        if (!node || typeof node !== "object") return false;
+                        if (Array.isArray(node)) {
+                            for (let k = 0; k < node.length; k++) if (findIn(node[k])) return true;
+                            return false;
+                        }
+                        if (node.type === "BinaryExpression" && node.operator === "in") return true;
+                        for (const key in node) {
+                            if (key === "type" || key === "loc" || key === "range" ||
+                                key === "start" || key === "end") continue;
+                            if (findIn(node[key])) return true;
+                        }
+                        return false;
+                    };
+                    if (findIn(init)) {
+                        this.errors.push("'in' is not allowed in for-loop initialization");
+                    }
+                }
+            }
             // [test262 S1] 非声明式 for-of/in 左值:for (a of x) / for ([a,b] of x) / for (a in x) /
             // for ([a,b] in obj)。左值为表达式(标识符/成员/数组-对象表达式);数组-对象表达式由
             // 编译器 reinterpretAsPattern 重解释为赋值形 pattern。修 ~90 个 "expected ;, got OF" COMPILE_FAIL。
@@ -864,7 +902,11 @@ export const StatementParser = {
         this.nextToken();
         this.loopDepth++;
                 this._markBreakableLabels();
+        // [test262] 体为表达式语句时,同行 `while` 是文法豁免(parseExpressionStatement
+        // 的终结符校验据此放行)。
+        this._allowWhileTerm = true;
         let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
+        this._allowWhileTerm = false;
         this.checkStatementBody(body);   // [test262 早期错误] while/do-body 单语句位
         this.loopDepth--;
         if (!this.expectPeek(TokenType.WHILE)) return null;
@@ -980,6 +1022,35 @@ export const StatementParser = {
                     param = new AST.Identifier(this.curToken.literal);
                 }
                 if (!this.expectPeek(TokenType.RPAREN)) return null;
+                // [test262 early-catch-duplicates] catch pattern 的 BoundNames 不得重复
+                // (`catch ([x, x])`)。数组收集保留重复(与 for-head 同口径)。
+                if (param && (param.type === "ObjectPattern" || param.type === "ArrayPattern")) {
+                    const cpn = [];
+                    const ccollect = (node) => {
+                        if (!node) return;
+                        if (node.type === "Identifier") { cpn.push(node.name); return; }
+                        if (node.type === "ObjectPattern") {
+                            for (const pr of (node.properties || [])) {
+                                if (pr.type === "SpreadElement" || pr.type === "RestElement") ccollect(pr.argument);
+                                else if (pr.value) ccollect(pr.value);
+                                else if (pr.key) ccollect(pr.key);
+                            }
+                            return;
+                        }
+                        if (node.type === "ArrayPattern") {
+                            for (const el of (node.elements || [])) if (el) ccollect(el);
+                            return;
+                        }
+                        if (node.type === "AssignmentPattern") { ccollect(node.left); return; }
+                        if (node.type === "RestElement" || node.type === "SpreadElement") ccollect(node.argument);
+                    };
+                    ccollect(param);
+                    const cseen = Object.create(null);
+                    for (const n of cpn) {
+                        if (cseen[n]) { this.errors.push("Duplicate binding name '" + n + "' in catch parameter"); break; }
+                        cseen[n] = 1;
+                    }
+                }
             }
             if (!this.expectPeek(TokenType.LBRACE)) return null;
             let catchBody = this.parseBlockStatement();
@@ -1003,6 +1074,18 @@ export const StatementParser = {
     parseExpressionStatement() {
         let expr = this.parseExpression(Precedence.LOWEST);
         if (this.peekTokenIs(TokenType.SEMICOLON)) this.nextToken();
+        else {
+            // [test262 let-newline-await-in-normal-function] 表达式语句必须由
+            // ;/}/EOF/换行(ASI)终结;do-while 体的同行 `while` 为文法豁免。此前
+            // 不查 → `x 0;` / `let\nawait 0` 被静默接受(await 落标识符引用)。
+            const lineBreak = this.peekToken.line !== this.curToken.line;
+            const okWhile = this._allowWhileTerm && this.peekTokenIs(TokenType.WHILE);
+            if (!lineBreak && !okWhile &&
+                !this.peekTokenIs(TokenType.RBRACE) && !this.peekTokenIs(TokenType.EOF) &&
+                !this.peekTokenIs(TokenType.TEMPLATE_MIDDLE) && !this.peekTokenIs(TokenType.TEMPLATE_TAIL)) {
+                this.errors.push("Unexpected token after expression statement at line " + this.curToken.line + ":" + this.curToken.column + " lit=" + JSON.stringify(this.peekToken.literal));
+            }
+        }
         return new AST.ExpressionStatement(expr);
     },
 };

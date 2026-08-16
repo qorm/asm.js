@@ -760,8 +760,15 @@ export class Lexer {
             tok = newToken(TokenType.BITNOT, "~", startLine, startColumn);
         } else if (this.ch === "?") {
             if (this.peekChar() === ".") {
-                this.readChar();
-                tok = newToken(TokenType.OPTIONAL, "?.", startLine, startColumn);
+                // [test262 punctuator-decimal-lookahead] `?.` 后跟十进制数字时不构成
+                // 可选链标点:`true ?.30` = `true ? .30`(三元 + 数字字面量)。仅当
+                // `.` 后非数字才合成 `?.`(peekCharN(2) 是 `.` 后一字符)。
+                if (this.peekCharN(2) >= "0" && this.peekCharN(2) <= "9") {
+                    tok = newToken(TokenType.QUESTION, "?", startLine, startColumn);
+                } else {
+                    this.readChar();
+                    tok = newToken(TokenType.OPTIONAL, "?.", startLine, startColumn);
+                }
             } else if (this.peekChar() === "?") {
                 this.readChar();
                 if (this.peekChar() === "=") {
