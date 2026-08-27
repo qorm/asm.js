@@ -20,6 +20,7 @@
 // 概率可忽略;`#` 虽不可能出现在用户名里,但为避免任何 label/符号管道
 // 对特殊字符的隐含假设,不用。
 
+import { bumpAnalysisCacheGen } from "./closure.js";
 // 可改名判定:合法字符串且不是 __proto__(见文件头注释)
 function bsRenameable(name) {
     return typeof name === "string" && name.length > 0 && name !== "__proto__";
@@ -137,10 +138,36 @@ function bsWalkPatternComputedKeys(pat, st) {
     }
 }
 
+// for-in/of 头部解构默认值在迭代环境求值(绑定已初始化)。须在登记绑定之后走,
+// 否则默认值里的闭包读不到改名后的迭代绑定(`probeDecl = function(){ return x }`)。
+function bsWalkPatternDefaults(pat, st) {
+    if (!pat || typeof pat !== "object") return;
+    const t = pat.type;
+    if (t === "AssignmentPattern") {
+        if (pat.right) bsWalkExpr(pat.right, st);
+        bsWalkPatternDefaults(pat.left, st);
+        return;
+    }
+    if (t === "ObjectPattern") {
+        const props = pat.properties || [];
+        for (let i = 0; i < props.length; i++) {
+            const p = props[i];
+            if (!p) continue;
+            if (p.type === "SpreadElement") bsWalkPatternDefaults(p.argument, st);
+            else bsWalkPatternDefaults(p.value, st);
+        }
+        return;
+    }
+    if (t === "ArrayPattern") {
+        const els = pat.elements || [];
+        for (let i = 0; i < els.length; i++) bsWalkPatternDefaults(els[i], st);
+    }
+}
+
 // ============ 函数作用域名字收集(恒等注册) ============
 // 进入函数时预注册:参数、全深度 var/int、函数顶层(depth 0)let/const、
 // 全深度 function/class 声明名。这些名字遮挡外层块改名映射,自身不改名。
-function bsCollectStmtNames(node, st, frame, depth) {
+function bsCollectStmtNames(node, st, frame, depth, owner) {
     if (!node) return;
     const t = node.type;
     if (t === "VariableDeclaration") {
@@ -152,12 +179,32 @@ function bsCollectStmtNames(node, st, frame, depth) {
             for (let i = 0; i < decls.length; i++) {
                 const ids = [];
                 bsPatternIdents(decls[i].id, ids);
-                for (let j = 0; j < ids.length; j++) bsRegIdentity(st, frame, ids[j].name, isConstDecl, isVarDecl);
+                for (let j = 0; j < ids.length; j++) {
+                    const name = ids[j].name;
+                    // 函数/程序顶层 let/const 先登记为未初始化(d:false),声明语句再置位。
+                    // 此前 bsRegIdentity 直接 d:true → `let x = x` 与闭包先读漏 TDZ。
+                    if (isLet && depth === 0 && bsRenameable(name)) {
+                        frame.m[name] = {
+                            bs: 1, n: null, d: false, f: st.fnDepth, blk: owner || null,
+                            t: 0, c: isConstDecl, v: false,
+                        };
+                    } else {
+                        bsRegIdentity(st, frame, name, isConstDecl, isVarDecl);
+                    }
+                }
             }
         }
         return;
     }
-    if (t === "FunctionDeclaration" || t === "ClassDeclaration") {
+    if (t === "ClassDeclaration") {
+        // class 恒块级:只有函数/程序顶层(depth 0)登记到本帧。嵌套于 switch/块的
+        // class 由 bsPrescanLets 挂在块帧,避免 `switch { class x {} } x` 外层仍可见。
+        if (depth === 0 && node.id && node.id.type === "Identifier") {
+            bsRegIdentity(st, frame, node.id.name);
+        }
+        return;
+    }
+    if (t === "FunctionDeclaration") {
         if (node.id && node.id.type === "Identifier") bsRegIdentity(st, frame, node.id.name);
         return; // 不进函数/类体
     }
@@ -200,7 +247,7 @@ function bsCollectStmtNames(node, st, frame, depth) {
         return;
     }
     if (t === "ExportDeclaration" || t === "ExportNamedDeclaration" || t === "ExportDefaultDeclaration") {
-        if (node.declaration) bsCollectStmtNames(node.declaration, st, frame, depth);
+        if (node.declaration) bsCollectStmtNames(node.declaration, st, frame, depth, owner);
         return;
     }
     if (t === "ImportDeclaration") {
@@ -277,8 +324,8 @@ function bsHandleVarDecl(node, st) {
             const idn = ids[j];
             if (!isLet) continue; // var/int:函数级,恒等(不改名)
             const rec = bsLookup(st, idn.name);
-            if (rec && rec.n) {
-                idn.name = rec.n;
+            if (rec) {
+                if (rec.n) idn.name = rec.n;
                 rec.d = true;
             }
         }
@@ -316,8 +363,33 @@ function bsWalkFor(node, st) {
 }
 
 function bsWalkForEach(node, st) {
-    // 迭代对象在外层作用域求值(`for (let x of x)` 的右侧 x 指外层)
-    bsWalkExpr(node.right, st);
+    // ForIn/OfHeadEvaluation:求值 RHS 时 BoundNames 在独立、永不初始化的 TDZ 环境。
+    // 其中创建的闭包捕获的是这个环境,与循环体每轮新环境不是同一个绑定
+    // (`scope-head-lex-close`:probeExpr 的 typeof x 必须 TDZ)。
+    // 规范上 `for (let x of x)` 的右侧也是这个 TDZ,不是外层 x。
+    const headNames = [];
+    if (node.left && node.left.type === "VariableDeclaration" &&
+        (node.left.kind === "let" || node.left.kind === "const")) {
+        const decls = node.left.declarations || [];
+        for (let i = 0; i < decls.length; i++) {
+            bsPatternIdents(decls[i].id, headNames);
+        }
+    }
+    if (headNames.length > 0) {
+        const tdz = bsPushFrame(st);
+        for (let i = 0; i < headNames.length; i++) {
+            const nm = headNames[i].name;
+            if (!bsRenameable(nm)) continue;
+            tdz.m[nm] = {
+                bs: 1, n: null, d: false, f: st.fnDepth, blk: null, t: 0,
+                c: false, v: false, headTdz: 1,
+            };
+        }
+        bsWalkExpr(node.right, st);
+        bsPopFrame(st);
+    } else {
+        bsWalkExpr(node.right, st);
+    }
     const frame = bsPushFrame(st);
     if (node.left && node.left.type === "VariableDeclaration") {
         const isLet = node.left.kind === "let" || node.left.kind === "const";
@@ -336,6 +408,7 @@ function bsWalkForEach(node, st) {
                     bsRegIdentity(st, frame, idn.name);
                 }
             }
+            if (isLet) bsWalkPatternDefaults(decls[i].id, st);
         }
     } else if (node.left) {
         // [const-reassign] 赋值形头部目标(for ([c] of x) / for ({a: c} in o))同属
@@ -481,7 +554,7 @@ function bsWalkFunction(fn, st) {
     }
     if (fn.body && fn.body.type === "BlockStatement") {
         const body = fn.body.body || [];
-        for (let i = 0; i < body.length; i++) bsCollectStmtNames(body[i], st, frame, 0);
+        for (let i = 0; i < body.length; i++) bsCollectStmtNames(body[i], st, frame, 0, fn.body);
         bsWalkStmts(body, st);
     } else if (fn.body) {
         bsWalkExpr(fn.body, st);
@@ -500,6 +573,14 @@ function bsWalkClass(cls, st) {
         if (m.computed && m.key) bsWalkExpr(m.key, st);
         if (m.type === "MethodDefinition") {
             if (m.value) bsWalkFunction(m.value, st);
+        } else if (m.type === "StaticBlock") {
+            // static {}:词法绑定块级(let/const/class),与外层同名不得共享槽
+            // (`static-init-scope-lex-*`)。var 仍是外层函数级,由编译期每块 shadow。
+            const frame = bsPushFrame(st);
+            const body = m.body || [];
+            bsPrescanLets(m, body, st, frame);
+            bsWalkStmts(body, st);
+            bsPopFrame(st);
         } else if (m.type === "PropertyDefinition") {
             // 字段初始化器在构造期执行:按嵌套函数深度处理,禁 TDZ 标记
             if (m.value) {
@@ -564,17 +645,20 @@ function bsWalkExpr(node, st) {
     const t = node.type;
     if (t === "Identifier") {
         const rec = bsLookup(st, node.name);
-        if (rec && rec.n) {
-            node.name = rec.n;
-            // 同函数深度、词法先于声明 → TDZ 读点(嵌套函数内引用运行序不可判,不标)
-            if (!rec.d && rec.f === st.fnDepth) {
+        if (rec) {
+            if (rec.headTdz) {
+                node._tdzHeadRhs = 1;
+                return;
+            }
+            if (rec.n) node.name = rec.n;
+            // 未初始化的 let/const:同深度早读登记块入口哨兵;嵌套函数只标读点
+            // (捕获 box 已是哨兵,勿写入 _tdzNames 以免块序言砸掉 box 指针)。
+            if (!rec.d && !rec.v) {
                 node._tdz = 1;
-                if (!rec.t) {
+                if (!rec.t && rec.f === st.fnDepth && rec.blk) {
                     rec.t = 1;
-                    if (rec.blk) {
-                        if (!rec.blk._tdzNames) rec.blk._tdzNames = [];
-                        rec.blk._tdzNames.push(rec.n);
-                    }
+                    if (!rec.blk._tdzNames) rec.blk._tdzNames = [];
+                    rec.blk._tdzNames.push(rec.n || node.name);
                 }
             }
         }
@@ -682,8 +766,11 @@ export function renameBlockScopedBindings(ast, strict) {
     const st = { c: 0, scopes: [], fnDepth: 0, fnScopeIdx: 0, strict: !!strict };
     const frame = bsPushFrame(st);
     const body = ast.body || [];
-    for (let i = 0; i < body.length; i++) bsCollectStmtNames(body[i], st, frame, 0);
+    for (let i = 0; i < body.length; i++) bsCollectStmtNames(body[i], st, frame, 0, ast);
     bsWalkStmts(body, st);
     bsPopFrame(st);
+    // 改名前若已跑过捕获分析,会把旧名写入 _rv/_or。改名后递增代数使缓存
+    // 失效(O(1));勿整树 for-in 清除(gen1 下极贵)。
+    bumpAnalysisCacheGen();
     return ast;
 }

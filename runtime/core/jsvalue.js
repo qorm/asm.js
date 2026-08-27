@@ -140,6 +140,7 @@ export class JSValueGenerator {
 
     generate() {
         this.generateValidateCallable();
+        this.generateMethodInvoke();
         this.generateIsFloat64();
         this.generateGetTag();
         this.generateGetPayload();
@@ -322,7 +323,9 @@ export class JSValueGenerator {
         vm.load(VReg.A5, VReg.SP, 40);
         vm.addImm(VReg.SP, VReg.SP, 48);
         vm.epilogue([VReg.S4], 0);
-        // 裸值:仅当落在 [heap_base, heap_ptr) 才是合法闭包对象
+        // 裸值:须落在 [heap_base, heap_ptr) 且头为闭包魔数。Symbol 等亦为裸堆指针
+        // (TYPE_SYMBOL@0),旧实现只查区间 → 把 Symbol 当可调用 → callIndirect 崩(SIGBUS)
+        // (yield*/for-of 的 @@iterator=Symbol.iterator、对 symbol 值做方法调用等)。
         vm.label("_vc_raw");
         vm.lea(VReg.S4, "_heap_base");
         vm.load(VReg.S4, VReg.S4, 0);
@@ -332,6 +335,12 @@ export class JSValueGenerator {
         vm.load(VReg.S4, VReg.S4, 0);
         vm.cmp(VReg.S0, VReg.S4);
         vm.jge("_vc_throw");
+        vm.load(VReg.S4, VReg.S0, 0);          // 块头 magic / type
+        vm.cmpImm(VReg.S4, 0xc105);            // CLOSURE_MAGIC
+        vm.jeq("_vc_raw_ok");
+        vm.cmpImm(VReg.S4, 0xa51c);            // ASYNC_CLOSURE_MAGIC(遗留)
+        vm.jne("_vc_throw");
+        vm.label("_vc_raw_ok");
         vm.epilogue([VReg.S4], 0);
         vm.label("_vc_throw");
         vm.call("_throw_not_a_function");      // 不返回(_throw_unwind)
@@ -345,6 +354,29 @@ export class JSValueGenerator {
         vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.V0, VReg.V0, VReg.V1); // box 堆串
         vm.mov(VReg.A0, VReg.V0);
         vm.call("_throw_type_error"); // 不返回(_throw_unwind)
+    }
+
+    // [m118] 方法调用闭包分派出线(frameless 尾调)。调用点在 validate 之后
+    // `bl _method_invoke` 取代内联 magic 探测(~6 insn + 2 label)×数万站。
+    // 入:S0=已 validate 可调用, S3=this, A0-A4 实参已就位,_call_argc 已写
+    // 出:RET=结果(jmpIndirect 保持 LR → 回到 bl 下一指令)
+    // 毁:S0,S1,S2,A5
+    generateMethodInvoke() {
+        const vm = this.vm;
+        vm.label("_method_invoke");
+        vm.mov(VReg.A5, VReg.S3);
+        vm.load(VReg.S1, VReg.S0, 0);
+        vm.cmpImm(VReg.S1, 0xc105); // CLOSURE_MAGIC
+        vm.jeq("_method_invoke_clos");
+        vm.cmpImm(VReg.S1, 0xa51c); // ASYNC_CLOSURE_MAGIC(声明作值遗留)
+        vm.jne("_method_invoke_bare");
+        vm.label("_method_invoke_clos");
+        vm.load(VReg.S1, VReg.S0, 8);
+        vm.jmpIndirect(VReg.S1);
+        vm.label("_method_invoke_bare");
+        vm.mov(VReg.S1, VReg.S0);
+        vm.movImm(VReg.S0, 0);
+        vm.jmpIndirect(VReg.S1);
     }
 
     generateBoxRetHelpers() {
@@ -378,6 +410,13 @@ export class JSValueGenerator {
         vm.label("_tag_key_a1");
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.ret();
+        // [m120] _tag_str_r: RET = RET | STRING_TAG(数据段串指针高位洁净)。
+        // 取代 compileStringValue 的 movImm64+or(每站省发射大立即数);scratch V1
+        // 与既有内联一致,额外 LR(后随使用点常再 call)。
+        vm.label("_tag_str_r");
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.RET, VReg.RET, VReg.V1);
         vm.ret();
     }
 
@@ -658,6 +697,21 @@ export class JSValueGenerator {
         vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
         vm.mov(VReg.S2, VReg.A0); // right(构造器)
         vm.mov(VReg.S3, VReg.A1); // left(实例)
+        // ES InstanceofOperator: Type(target) is not Object → TypeError。
+        // 对象: function/object/array tag,或高 16 位 0 的堆内 classinfo。
+        // 其余(bool/null/undef/string/number)一律抛,不能再塌成 false。
+        vm.shrImm(VReg.V0, VReg.S2, 48);
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jeq("_thi_objok");
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jeq("_thi_objok");
+        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jeq("_thi_objok");
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_thi_throw");
+        vm.cmpImm(VReg.S2, 0);
+        vm.jeq("_thi_throw");
+        vm.label("_thi_objok");
         vm.movImm64(VReg.V0, 0x0000ffffffffffffn);
         vm.and(VReg.S0, VReg.S2, VReg.V0); // 裸 right 指针
         // 堆界守卫:非堆对象(数字/内建码/null)→ 无 hasInstance
@@ -698,6 +752,11 @@ export class JSValueGenerator {
         vm.mov(VReg.A0, VReg.RET);
         vm.call("_to_boolean");       // 归一装箱布尔
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
+        vm.label("_thi_throw");
+        vm.lea(VReg.A0, vm.asm.addString("Right-hand side of 'instanceof' is not an object"));
+        vm.call("_js_box_string");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_throw_type_error"); // 不返回
         vm.label("_thi_none");
         vm.movImm(VReg.RET, 0);       // 裸 0 哨兵
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
@@ -716,23 +775,11 @@ export class JSValueGenerator {
 
         vm.cmpImm(VReg.A1, 1);
         vm.jne("_iof_chk_obj");
-        // Array:tag 0x7FFE,或裸堆指针且块 type==1
-        vm.shrImm(VReg.V1, VReg.S0, 48);
-        vm.cmpImm(VReg.V1, 0x7ffe);
-        vm.jeq("_iof_true");
-        vm.cmpImm(VReg.V1, 0);
-        vm.jne("_iof_false");
-        vm.lea(VReg.V2, "_heap_base");
-        vm.load(VReg.V2, VReg.V2, 0);
-        vm.cmp(VReg.S0, VReg.V2);
-        vm.jlt("_iof_false");
-        vm.lea(VReg.V2, "_heap_ptr");
-        vm.load(VReg.V2, VReg.V2, 0);
-        vm.cmp(VReg.S0, VReg.V2);
-        vm.jge("_iof_false");
-        vm.loadByte(VReg.V1, VReg.S0, 0);
-        vm.cmpImm(VReg.V1, 1);
-        vm.jeq("_iof_true");
+        // Array:IsArray(含 Proxy→target 递归)
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_is_array_value");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_iof_true");
         vm.jmp("_iof_false");
 
         vm.label("_iof_chk_obj");
@@ -857,6 +904,44 @@ export class JSValueGenerator {
         vm.load(VReg.V1, VReg.V1, 0);
         vm.cmp(VReg.S0, VReg.V1);
         vm.jge("_iof_false");
+        // TypedArray 布局:+16 是 data_ptr,不是 __proto__。优先查子类侧表,否则单例 proto。
+        vm.loadByte(VReg.V1, VReg.S0, 0);
+        vm.cmpImm(VReg.V1, 0x40);
+        vm.jlt("_iof_proto_ld16");
+        vm.cmpImm(VReg.V1, 0x61);
+        vm.jgt("_iof_proto_ld16");
+        vm.store(VReg.SP, 0, VReg.V2); // 保目标 prototype
+        vm.store(VReg.SP, 8, VReg.V1); // 保 type 字节
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_ta_lookup_instance_proto"); // RET = 子类 proto raw / 0
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_iof_ta_singleton");
+        vm.mov(VReg.V3, VReg.RET);
+        vm.load(VReg.V2, VReg.SP, 0);
+        vm.movImm(VReg.V4, 64);
+        vm.jmp("_iof_user_loop");
+        vm.label("_iof_ta_singleton");
+        vm.load(VReg.A0, VReg.SP, 8);  // type 字节
+        vm.call("_get_ctor_proto");   // RET = boxed TA.prototype
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.V3, VReg.RET, VReg.V1);
+        vm.load(VReg.V2, VReg.SP, 0);
+        vm.movImm(VReg.V4, 64);
+        vm.jmp("_iof_user_loop");
+        vm.label("_iof_proto_ld16");
+        vm.loadByte(VReg.V1, VReg.S0, 0);
+        vm.cmpImm(VReg.V1, 11); // TYPE_PROMISE:proto@48,非 value@16
+        vm.jne("_iof_proto_obj16");
+        vm.load(VReg.V3, VReg.S0, 48);
+        vm.shrImm(VReg.V1, VReg.V3, 48);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_iof_promise_loop");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V3, VReg.V3, VReg.V1);
+        vm.label("_iof_promise_loop");
+        vm.movImm(VReg.V4, 64);
+        vm.jmp("_iof_user_loop");
+        vm.label("_iof_proto_obj16");
         vm.load(VReg.V3, VReg.S0, 16); // cur = 首个 __proto__
         vm.movImm(VReg.V4, 64);        // 防环计数
         vm.label("_iof_user_loop");
@@ -930,13 +1015,11 @@ export class JSValueGenerator {
         vm.jmp("_iof_proto_walk"); // V2=目标prototype, S0=实例(待脱壳),复走上溯逻辑
 
         vm.label("_iof_true");
-        vm.lea(VReg.RET, "_js_true");
-        vm.load(VReg.RET, VReg.RET, 0);
+        vm.movImm64(VReg.RET, 0x7ff9000000000001n);
         vm.epilogue([VReg.S0, VReg.S1], 16);
 
         vm.label("_iof_false");
-        vm.lea(VReg.RET, "_js_false");
-        vm.load(VReg.RET, VReg.RET, 0);
+        vm.movImm64(VReg.RET, 0x7ff9000000000000n);
         vm.epilogue([VReg.S0, VReg.S1], 16);
 
         // [#69] _instanceof_proto(A0=实例, A1=目标 prototype 裸指针) → true/false。
@@ -1046,6 +1129,72 @@ export class JSValueGenerator {
         }
         vm.jmp("_fn_invoke_tail");
 
+        // ---- Function.prototype.bind 蹦床 ----
+        // 入口:A5=目标函数(this), A0=thisArg, A1-A4=预绑定参, _call_argc
+        // 产出与编译期 f.bind 同布局的绑定闭包。
+        vm.label("_fp_bind_tramp");
+        vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
+        vm.store(VReg.SP, 0, VReg.A1);
+        vm.store(VReg.SP, 8, VReg.A2);
+        vm.store(VReg.SP, 16, VReg.A3);
+        vm.store(VReg.SP, 24, VReg.A4);
+        vm.mov(VReg.S4, VReg.A5); // target
+        vm.mov(VReg.S2, VReg.A0); // thisArg
+        vm.lea(VReg.V0, "_call_argc");
+        vm.load(VReg.S3, VReg.V0, 0);
+        vm.cmpImm(VReg.S3, 1);
+        vm.jge("_fpb_have_this");
+        vm.movImm64(VReg.S2, UNDEF);
+        vm.movImm(VReg.S3, 0);
+        vm.jmp("_fpb_alloc");
+        vm.label("_fpb_have_this");
+        vm.subImm(VReg.S3, VReg.S3, 1); // nBound
+        vm.cmpImm(VReg.S3, 4);
+        vm.jle("_fpb_alloc");
+        vm.movImm(VReg.S3, 4);
+        vm.label("_fpb_alloc");
+        vm.mov(VReg.S0, VReg.S4);
+        vm.call("_validate_callable");
+        vm.mov(VReg.S4, VReg.S0);
+        vm.shlImm(VReg.V0, VReg.S3, 3);
+        vm.addImm(VReg.A0, VReg.V0, 40);
+        vm.call("_alloc");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.movImm(VReg.V1, 0xc105);
+        vm.store(VReg.S0, 0, VReg.V1);
+        vm.lea(VReg.V1, "_bound_tramp");
+        vm.store(VReg.S0, 8, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7fff000000000000n);
+        vm.or(VReg.V0, VReg.S4, VReg.V1);
+        vm.store(VReg.S0, 16, VReg.V0); // target boxed
+        vm.store(VReg.S0, 24, VReg.S2); // thisArg
+        vm.store(VReg.S0, 32, VReg.S3); // nBound
+        vm.movImm(VReg.S1, 0);
+        vm.label("_fpb_copy");
+        vm.cmp(VReg.S1, VReg.S3);
+        vm.jge("_fpb_box");
+        vm.shlImm(VReg.V0, VReg.S1, 3);
+        vm.add(VReg.V1, VReg.SP, VReg.V0);
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.add(VReg.V0, VReg.S0, VReg.V0);
+        vm.store(VReg.V0, 40, VReg.V1);
+        vm.addImm(VReg.S1, VReg.S1, 1);
+        vm.jmp("_fpb_copy");
+        vm.label("_fpb_box");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_js_box_function");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 48);
+
+        // Function.prototype.toString → NativeFunction 语法串。this 非可调用 → TypeError
+        // (S15.3.4.2_A12/A13/A14)。A5=this(方法蹦床 / .call 改 this)。
+        vm.label("_fp_toString");
+        vm.prologue(0, [VReg.S0]);
+        vm.mov(VReg.S0, VReg.A5);
+        vm.call("_validate_callable");
+        vm.lea(VReg.A0, vm.asm.addString("function () { [native code] }"));
+        vm.call("_js_box_string");
+        vm.epilogue([VReg.S0], 0);
+
         // ---- 共享尾段:真正发起调用 ----
         // 前置:帧 = prologue(64,[S0..S4]);SP+0..SP+32 = 实参槽 0..4(已 undefined 补齐);
         //       S2 = this(装箱)、S3 = argc(裸)、S4 = 被调值(未校验)。
@@ -1083,6 +1232,22 @@ export class JSValueGenerator {
         vm.mov(VReg.S0, VReg.S4);     // S0 = 闭包
         vm.load(VReg.V6, VReg.S4, 8); // 真函数指针
         vm.label("_fnit_go");
+        // [D1b OrdinaryCallBindThis] thisArg 为 undefined/null 时,已登记的非严格
+        // ECMAScript 函数拿 globalThis;内建入口与严格函数原样收(见 _ordinary_bind_this)。
+        // helper 会毁 V6,先落到帧内空槽(SP+0..32 是实参槽)。
+        vm.shrImm(VReg.V5, VReg.S2, 48);
+        vm.cmpImm(VReg.V5, 0x7ffb);
+        vm.jeq("_fnit_bindthis");
+        vm.cmpImm(VReg.V5, 0x7ffa);
+        vm.jne("_fnit_thisdone");
+        vm.label("_fnit_bindthis");
+        vm.store(VReg.SP, 40, VReg.V6);
+        vm.mov(VReg.A0, VReg.V6);
+        vm.mov(VReg.A1, VReg.S2);
+        vm.call("_ordinary_bind_this");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.load(VReg.V6, VReg.SP, 40);
+        vm.label("_fnit_thisdone");
         // A 寄存器最后装载(x64 上 A1/A2/A3/A4/A5 与 V7/V2/V1/V3/V4 别名,此后只用 V6/V0)
         vm.load(VReg.A0, VReg.SP, 0);
         vm.load(VReg.A1, VReg.SP, 8);

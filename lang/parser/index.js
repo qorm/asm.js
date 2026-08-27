@@ -207,6 +207,7 @@ export class Parser {
             td: this.lexer.templateDepth, bd: this.lexer.braceDepth,
             ts: this._copyNums(this.lexer.templateStack),
             cur: this.curToken, peek: this.peekToken, err: this.errors.length,
+            ltt: this.lexer.lastTokenType,
         };
     }
     restoreState(s) {
@@ -214,6 +215,7 @@ export class Parser {
         this.lexer.line = s.ln; this.lexer.column = s.col;
         this.lexer.templateDepth = s.td; this.lexer.braceDepth = s.bd;
         this.lexer.templateStack = this._copyNums(s.ts);
+        this.lexer.lastTokenType = s.ltt;
         this.curToken = s.cur; this.peekToken = s.peek;
         this.errors.length = s.err;
     }

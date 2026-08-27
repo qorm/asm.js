@@ -1,7 +1,7 @@
 // asm.js 编译器 - 数据结构编译
 // 编译数组表达式、对象表达式
 
-import { VReg } from "../../vm/index.js";
+import { VReg } from "../../vm/registers.js";
 import { Type, inferType } from "../core/types.js";
 
 // getter/setter 标记对象类型（与 runtime/core/allocator.js TYPE_GETTER 一致）
@@ -91,12 +91,17 @@ export const DataStructureCompiler = {
                 // 别名,保 RET=源给下方字符串分支的 tag 检查。
                 {
                     const iterOk = this.ctx.newLabel("arrsp_iter_ok");
+                    const iterBad = this.ctx.newLabel("arrsp_iter_bad");
                     this.vm.load(VReg.V2, VReg.FP, srcOff);
+                    // +0 / 未绑定 rest:high16=0 曾被当成裸堆指针 → loadByte[0] SIGSEGV
+                    this.vm.cmpImm(VReg.V2, 0);
+                    this.vm.jeq(iterBad);
                     this.vm.shrImm(VReg.V2, VReg.V2, 48);
                     this.vm.cmpImm(VReg.V2, 0); this.vm.jeq(iterOk);
                     this.vm.cmpImm(VReg.V2, 0x7FFC); this.vm.jeq(iterOk);
                     this.vm.cmpImm(VReg.V2, 0x7FFD); this.vm.jeq(iterOk);
                     this.vm.cmpImm(VReg.V2, 0x7FFE); this.vm.jeq(iterOk);
+                    this.vm.label(iterBad);
                     this.emitThrowTypeError("Spread source is not iterable");
                     this.vm.label(iterOk);
                 }
@@ -485,6 +490,10 @@ export const DataStructureCompiler = {
                 const vTmp = `__objv_${this.nextLabelId()}`;
                 const vOff = this.ctx.allocLocal(vTmp);
                 this.vm.store(VReg.FP, vOff, VReg.RET);
+                // NamedEvaluation:计算键匿名函数/方法 → SetFunctionName(propKey)
+                // (Symbol 描述 → "[desc]";无描述 → "";字符串键原样)。静态键已由
+                // _collectFnNameHints 写进元数据,此处只补计算键缺口。
+                this._emitObjLitSetFnName(prop.value, vOff, kOff);
                 this.vm.load(VReg.A1, VReg.FP, kOff);
                 this.vm.load(VReg.A2, VReg.FP, vOff);
                 this.vm.load(VReg.V0, VReg.FP, objOffset);
@@ -583,6 +592,90 @@ export const DataStructureCompiler = {
         if (key.type === "Literal" || key.type === "StringLiteral" ||
             key.type === "NumericLiteral") return "" + key.value;
         return null;
+    },
+
+    // ES SetFunctionName(fn, propKey):计算键对象属性上的匿名函数/方法简写/匿名类。
+    // 命名函数表达式(带 id)与具名类表达式(`class x {}`)跳过。
+    // 静态键匿名类的可见名由 compileClassDeclaration 读 _fnHint;计算键(含 Symbol)
+    // 只能在此运行时补。
+    _emitObjLitSetFnName(valueAst, fnSlot, keySlot) {
+        if (!valueAst || typeof valueAst !== "object") return;
+        const t = valueAst.type;
+        if (t === "FunctionExpression" || t === "ArrowFunctionExpression") {
+            if (valueAst.id && valueAst.id.name) return;
+            this._emitSetFunctionName(fnSlot, keySlot, false);
+            return;
+        }
+        if (t === "ClassExpression" || t === "ClassDeclaration") {
+            const rawId = (valueAst.id && valueAst.id.name) || "";
+            if (rawId && rawId.indexOf("__classexpr") !== 0) return;
+            if (valueAst.body && Array.isArray(valueAst.body)) {
+                for (const m of valueAst.body) {
+                    if (m && m.static && m.key && (m.key.name === "name" || m.key.value === "name")) {
+                        return;
+                    }
+                }
+            }
+            this._emitSetFunctionName(fnSlot, keySlot, true);
+        }
+    },
+
+    // SetFunctionName(fn, propKey)。Symbol → "[desc]" / "";字符串键原样。
+    // forClass:类值是 classinfo,attr 须写对象本身(_object_set_prop_attr),
+    // 不可走 _closure_prop_set_attr(那只改侧表,classinfo.name 描述符不变)。
+    _emitSetFunctionName(fnSlot, keySlot, forClass) {
+        const vm = this.vm;
+        const symL = this.ctx.newLabel("objlit_sfn_sym");
+        const emptyL = this.ctx.newLabel("objlit_sfn_empty");
+        const nameReadyL = this.ctx.newLabel("objlit_sfn_ready");
+        const nameSlot = this.ctx.allocLocal(`__sfn_${this.nextLabelId()}`);
+
+        vm.load(VReg.A0, VReg.FP, keySlot);
+        vm.call("_is_symbol");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne(symL);
+        // 字符串/数值键:规范化结果已是装箱字符串 → 直接作 name
+        vm.load(VReg.RET, VReg.FP, keySlot);
+        vm.jmp(nameReadyL);
+
+        vm.label(symL);
+        // Symbol → description;无描述 "" ,有描述 → "[" + desc + "]"
+        vm.load(VReg.A0, VReg.FP, keySlot);
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V0, VReg.A0, VReg.V1); // 裸 Symbol 块
+        vm.load(VReg.V0, VReg.V0, 8); // desc 裸串指针(0=无描述)
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq(emptyL);
+        vm.lea(VReg.A0, this.asm.addString("["));
+        vm.mov(VReg.A1, VReg.V0);
+        vm.call("_strconcat");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, this.asm.addString("]"));
+        vm.call("_strconcat");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_js_box_string");
+        vm.jmp(nameReadyL);
+
+        vm.label(emptyL);
+        vm.lea(VReg.A0, this.asm.addString(""));
+        vm.call("_js_box_string");
+
+        vm.label(nameReadyL);
+        vm.store(VReg.FP, nameSlot, VReg.RET);
+        // define(fn, "name", nameStr);函数值走 _closure_prop_define
+        vm.load(VReg.A0, VReg.FP, fnSlot);
+        this.emitBoxedStringKey("name", VReg.A1);
+        vm.load(VReg.A2, VReg.FP, nameSlot);
+        vm.call("_object_define");
+        // 规范 {writable:false,enumerable:false,configurable:true}=attr 4
+        vm.load(VReg.A0, VReg.FP, fnSlot);
+        this.emitBoxedStringKey("name", VReg.A1);
+        vm.movImm(VReg.A2, 4);
+        if (forClass) {
+            vm.call("_object_set_prop_attr");
+        } else {
+            vm.call("_closure_prop_set_attr");
+        }
     },
 
     // 发射对象字面量访问器：24B 标记对象 {TYPE_GETTER@0, getter@8, setter@16}，

@@ -70,6 +70,27 @@ export class SubscriptGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
 
         vm.label("_subscript_get_not_str");
+        // [code ptr] 函数值(0x7FFF)的载荷可能是**代码段标签**(类方法/顶层函数声明以裸
+        // label 存原型),不是堆块:按对象头 load [P] 会把指令字节当 type 读 → 具名键
+        // (`m[k]`,k="length"/"name")恒 undefined、数字键(`m[0]`)被当数组下标解引用
+        // 而 SIGSEGV。堆内指针(真闭包块/classinfo)仍按原路分派,字节不变。
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jne("_subscript_get_not_fnptr");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.S2, VReg.A0, VReg.V1);
+        vm.lea(VReg.V1, "_heap_base");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.S2, VReg.V1);
+        vm.jlt("_subscript_get_codeptr");
+        vm.lea(VReg.V1, "_heap_ptr");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.S2, VReg.V1);
+        vm.jlt("_subscript_get_not_fnptr");
+        vm.label("_subscript_get_codeptr");
+        vm.mov(VReg.S0, VReg.S2);
+        vm.jmp("_subscript_get_closure");
+        vm.label("_subscript_get_not_fnptr");
         // unbox arr：可能是裸指针或 0x7FFE/0x7FFD 装箱值（_js_unbox 保留 A1）
         vm.call("_js_unbox");
         vm.mov(VReg.S0, VReg.RET); // arr (裸指针)
@@ -115,6 +136,10 @@ export class SubscriptGenerator {
         vm.shrImm(VReg.V1, VReg.S1, 48);
         vm.cmpImm(VReg.V1, 0x7FFC);
         vm.jeq("_subscript_get_strkey");
+        // 对象键(Number/Boolean wrapper 等):ToPropertyKey → 字符串键路径
+        // (`x[new Number(0)]` ≡ `x["0"]`)
+        vm.cmpImm(VReg.V1, 0x7FFD);
+        vm.jeq("_subscript_get_objkey");
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_is_symbol");
         vm.cmpImm(VReg.RET, 0);
@@ -134,6 +159,18 @@ export class SubscriptGenerator {
         vm.jlt("_subscript_get_array"); // 小于 0x40，是普通 Array
 
         // ========== TypedArray 路径 ==========
+        // detached → 与 OOB 同:读 undefined
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_ta_is_detached");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_subscript_get_arr_oob");
+        // 固定长度视图 resize 后整视图越界 → undefined(勿信陈旧 length@8)
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_ta_is_oob");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_subscript_get_arr_oob");
+        // _ta_is_oob 打脏 V0;类型低字节须从 S3 重载(与 _syscall_arg 后同理)
+        vm.andImm(VReg.V0, VReg.S3, 0xff);
         // [H-1] 越界读返回 undefined(spec:OOB TypedArray 元素读 → undefined,不抛)。
         // 内联读此前不查界,`new Float64Array(1)[1e6]` 越界读数 MB → 信息泄露/段错误
         // (内联 OOB 读是剩余 TypedArray 段错误主因)。镜像 _typed_array_get 的 bounds
@@ -192,17 +229,7 @@ export class SubscriptGenerator {
         vm.jne("_subscript_get_check_int64");
         vm.shl(VReg.V1, VReg.S1, 2); // index * 4
         vm.add(VReg.V1, VReg.S0, VReg.V1);
-        // 加载 4 字节 (little-endian)
-        vm.loadByte(VReg.S2, VReg.V1, 16);
-        vm.loadByte(VReg.V2, VReg.V1, 17);
-        vm.shl(VReg.V2, VReg.V2, 8);
-        vm.or(VReg.S2, VReg.S2, VReg.V2);
-        vm.loadByte(VReg.V2, VReg.V1, 18);
-        vm.shl(VReg.V2, VReg.V2, 16);
-        vm.or(VReg.S2, VReg.S2, VReg.V2);
-        vm.loadByte(VReg.V2, VReg.V1, 19);
-        vm.shl(VReg.V2, VReg.V2, 24);
-        vm.or(VReg.S2, VReg.S2, VReg.V2);
+        vm.load32(VReg.S2, VReg.V1, 16);
         // 32 位符号扩展到 64 位
         vm.andImm(VReg.V2, VReg.S2, 0x80000000);
         vm.cmpImm(VReg.V2, 0);
@@ -214,15 +241,15 @@ export class SubscriptGenerator {
         vm.movImm(VReg.S4, NUM_INT32);
         vm.jmp("_subscript_get_box_int");
 
-        // Int64Array / BigInt64Array (0x43)
+        // Int64Array / BigInt64Array (0x43):存的是裸 int64,读出须装箱 BigInt(禁 scvtf→Number)
         vm.label("_subscript_get_check_int64");
         vm.cmpImm(VReg.V0, TYPE_INT64_ARRAY);
         vm.jne("_subscript_get_check_uint8");
         vm.shl(VReg.V1, VReg.S1, 3); // index * 8
         vm.add(VReg.V1, VReg.S0, VReg.V1);
-        vm.load(VReg.S2, VReg.V1, 16);
-        vm.movImm(VReg.S4, NUM_INT64);
-        vm.jmp("_subscript_get_box_int");
+        vm.load(VReg.A0, VReg.V1, 16);
+        vm.call("_bigint_box");
+        vm.jmp("_subscript_get_done");
 
         // Uint8Array (0x50)
         vm.label("_subscript_get_check_uint8");
@@ -253,29 +280,20 @@ export class SubscriptGenerator {
         vm.jne("_subscript_get_check_uint64");
         vm.shl(VReg.V1, VReg.S1, 2);
         vm.add(VReg.V1, VReg.S0, VReg.V1);
-        vm.loadByte(VReg.S2, VReg.V1, 16);
-        vm.loadByte(VReg.V2, VReg.V1, 17);
-        vm.shl(VReg.V2, VReg.V2, 8);
-        vm.or(VReg.S2, VReg.S2, VReg.V2);
-        vm.loadByte(VReg.V2, VReg.V1, 18);
-        vm.shl(VReg.V2, VReg.V2, 16);
-        vm.or(VReg.S2, VReg.S2, VReg.V2);
-        vm.loadByte(VReg.V2, VReg.V1, 19);
-        vm.shl(VReg.V2, VReg.V2, 24);
-        vm.or(VReg.S2, VReg.S2, VReg.V2);
+        vm.load32(VReg.S2, VReg.V1, 16);
         // Uint32 自动零扩展到 64 位
         vm.movImm(VReg.S4, NUM_UINT32);
         vm.jmp("_subscript_get_box_int");
 
-        // Uint64Array / BigUint64Array (0x53)
+        // Uint64Array / BigUint64Array (0x53):同 BigInt 装箱
         vm.label("_subscript_get_check_uint64");
         vm.cmpImm(VReg.V0, TYPE_UINT64_ARRAY);
         vm.jne("_subscript_get_check_uint8c");
         vm.shl(VReg.V1, VReg.S1, 3);
         vm.add(VReg.V1, VReg.S0, VReg.V1);
-        vm.load(VReg.S2, VReg.V1, 16);
-        vm.movImm(VReg.S4, NUM_UINT64);
-        vm.jmp("_subscript_get_box_int");
+        vm.load(VReg.A0, VReg.V1, 16);
+        vm.call("_bigint_box");
+        vm.jmp("_subscript_get_done");
 
         // Uint8ClampedArray (0x54)
         vm.label("_subscript_get_check_uint8c");
@@ -321,17 +339,16 @@ export class SubscriptGenerator {
 
         // Box 整数类型 - 将 raw int 转为 float64 位模式再存储
         vm.label("_subscript_get_box_int");
-        // TypedArray 整数元素:转 float64 位后**直接返回 canonical 裸 float64**(NaN-boxing
-        // 数字表示,同 _typed_array_get)。原实现分配堆 Number(type@0/value@8)但布局与
-        // 消费者(typeof/+/*/print 按 block-16 取类型)不一致 → ta[i] 算术/打印全返垃圾
-        // (既有 bug)。裸 float64 无需堆分配,所有数字消费路径天然正确。
+        // TypedArray 整数元素:转 float64 位后直接返回 canonical 裸 float64
+        // (同 _typed_array_get)。勿把 +0 改成 int0——TA 无 hole,且多参 print 会误打 NaN。
         vm.scvtf(0, VReg.S2);
         vm.fmovToInt(VReg.RET, 0); // RET = float64 位 = canonical JS number
         vm.jmp("_subscript_get_done");
 
-        // TypedArray 浮点元素:S2 已是 float64 位,直接作 canonical 裸 float64 返回
+        // TypedArray 浮点元素:S2 已是 float64 位。f32 升格的 qNaN(0x7ff8…)须 canon。
         vm.label("_subscript_get_box_float");
-        vm.mov(VReg.RET, VReg.S2);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_nan_canon");
         vm.jmp("_subscript_get_done");
 
         // ========== Array 路径 ==========
@@ -407,6 +424,20 @@ export class SubscriptGenerator {
         vm.movImm(VReg.RET, 0);
         vm.jmp("_subscript_get_done");
         vm.label("_subscript_get_arr_inlen");
+        // Arguments [[ParameterMap]]:有映射时读形参 box(侧表已优先于本路径)
+        vm.loadByte(VReg.V0, VReg.S0, 1);
+        vm.andImm(VReg.V0, VReg.V0, 32); // ARR_IS_ARGUMENTS
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_subscript_get_arr_cap");
+        vm.movImm64(VReg.V1, 0x7ffe000000000000n);
+        vm.or(VReg.A0, VReg.S0, VReg.V1);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_args_param_map_get_box");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_subscript_get_arr_cap");
+        vm.load(VReg.RET, VReg.RET, 0); // *box
+        vm.jmp("_subscript_get_done");
+        vm.label("_subscript_get_arr_cap");
         // 超出 capacity 的「逻辑」元素(稀疏大 length)→ 侧表已查过 → 原型
         vm.load(VReg.V0, VReg.S0, 16); // capacity
         vm.cmp(VReg.S1, VReg.V0);
@@ -451,6 +482,12 @@ export class SubscriptGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
 
         // ===== 数组/TypedArray 的字符串键(冷分支) =====
+        // 对象键 → ToPropertyKey 字符串后汇合 strkey
+        vm.label("_subscript_get_objkey");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_js_prop_key");
+        vm.mov(VReg.S1, VReg.RET);
+        // fall through
         // S0=裸接收者, S1=装箱字符串键, S3=完整类型。规范数组索引串(ES
         // CanonicalNumericIndexString:"0"/"1"/"42" 是;"01"/"1.0"/" 1"/"-0"/"1e2" 不是)
         // → 当整数下标走元素路径;其余 → 具名属性路径。判据复用 _canonical_array_index
@@ -477,6 +514,7 @@ export class SubscriptGenerator {
         vm.jlt("_subscript_get_arr_oob");
         vm.cmpImm(VReg.V0, 0x70);
         vm.jgt("_subscript_get_arr_oob");
+        vm.jmp("_subscript_get_ta_named");
         vm.label("_subscript_get_named_ok");
         vm.mov(VReg.A0, VReg.S1);
         vm.lea(VReg.V0, "_str_length_prop");
@@ -497,6 +535,17 @@ export class SubscriptGenerator {
         vm.call("_js_length"); // 裸整数长度
         vm.scvtf(0, VReg.RET);
         vm.fmovToInt(VReg.RET, 0); // canonical number(float64 位)
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
+
+        // TA 具名/symbol:OrdinaryGet(原型访问器 @@toStringTag/buffer/length + 侧表自有键)。
+        // 不可一律 undefined——detached 只影响整数索引。
+        vm.label("_subscript_get_ta_named");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.call("_maybe_getter");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
 
         // [fn props] 闭包属性侧表读:f[sym]/f[k]。键经 _js_prop_key 规范化(symbol/数值
@@ -529,8 +578,16 @@ export class SubscriptGenerator {
     generateSet() {
         const vm = this.vm;
 
+        vm.label("_subscript_set_strict");
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.movImm(VReg.V0, 2); // 与 _object_set_strict 同标志
+        vm.store(VReg.SP, 24, VReg.V0);
+        vm.jmp("_sss_after_flag");
         vm.label("_subscript_set");
         vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.movImm(VReg.V0, 0);
+        vm.store(VReg.SP, 24, VReg.V0);
+        vm.label("_sss_after_flag");
         // null/undefined 基对象下标写 `null[k]=v`/`undefined[k]=v`:抛可捕获 TypeError
         // (镜像 _subscript_get 的 nullish 守卫 :26-30),否则下方 _js_unbox 把小 tagged 值
         // 当裸指针解引用 → 段错误。A0 仍为原始基对象,A1=键。
@@ -539,6 +596,62 @@ export class SubscriptGenerator {
         vm.jeq("_subscript_set_nullish");
         vm.cmpImm(VReg.V0, 0x7FFB); // undefined
         vm.jeq("_subscript_set_nullish");
+        // Uint32/Int32[装箱 int] 快路。`chunk[i] = word >>> 0` 的值是 0x7FF8 标签,
+        // 旧路要经 _gc_remember/_js_unbox/_is_symbol/_syscall_arg/_typed_array_set/
+        // _number_coerce 再按字节写——自编译 66MB TEXT 上千万次 emit32 的主税。
+        // ToNumber 对已是数字的值恒等;内联 TA(buffer@24==0) 不 detach/resize。
+        // 未命中时 A0/A1/A2 仍是原实参,落入下方慢路。x64 禁用 V2(≡A2)。
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.S0, VReg.A0, VReg.V1);
+        vm.cmpImm(VReg.S0, 4095);
+        vm.jle("_sss_slow");
+        vm.loadByte(VReg.V0, VReg.S0, 0);
+        vm.cmpImm(VReg.V0, TYPE_INT32_ARRAY);
+        vm.jeq("_sss_fast_recv");
+        vm.cmpImm(VReg.V0, TYPE_UINT32_ARRAY);
+        vm.jne("_sss_slow");
+        vm.label("_sss_fast_recv");
+        vm.load(VReg.V3, VReg.S0, 24); // buffer@24;非 0 → 视图/可 resize,走慢路
+        vm.cmpImm(VReg.V3, 0);
+        vm.jne("_sss_slow");
+        vm.shrImm(VReg.V1, VReg.A1, 48);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_sss_fast_idx_raw");
+        vm.cmpImm(VReg.V1, 0x7FF8);
+        vm.jne("_sss_slow");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.S1, VReg.A1, VReg.V1);
+        vm.movImm64(VReg.V1, 0xFFFFFFFFn);
+        vm.and(VReg.S1, VReg.S1, VReg.V1);
+        vm.jmp("_sss_fast_idx_ok");
+        vm.label("_sss_fast_idx_raw");
+        vm.mov(VReg.S1, VReg.A1);
+        vm.label("_sss_fast_idx_ok");
+        vm.cmpImm(VReg.S1, 0);
+        vm.jlt("_sss_slow");
+        vm.load(VReg.V3, VReg.S0, 8); // length
+        vm.cmp(VReg.S1, VReg.V3);
+        vm.jge("_sss_slow");
+        vm.shrImm(VReg.V1, VReg.A2, 48);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_sss_fast_val_raw");
+        vm.cmpImm(VReg.V1, 0x7FF8);
+        vm.jne("_sss_slow");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.S2, VReg.A2, VReg.V1);
+        vm.movImm64(VReg.V1, 0xFFFFFFFFn);
+        vm.and(VReg.S2, VReg.S2, VReg.V1);
+        vm.jmp("_sss_fast_store");
+        vm.label("_sss_fast_val_raw");
+        vm.mov(VReg.S2, VReg.A2);
+        vm.label("_sss_fast_store");
+        vm.load(VReg.V3, VReg.S0, 16); // data_ptr
+        vm.shl(VReg.V0, VReg.S1, 2);
+        vm.add(VReg.V0, VReg.V3, VReg.V0);
+        vm.store32(VReg.V0, 0, VReg.S2);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
+
+        vm.label("_sss_slow");
         vm.call("_gc_remember"); // 分代写屏障(A0=容器,老容器记入记忆集;分代 GC 已是缺省)
 
         // 保存 value (JSValue) 到 S2
@@ -596,6 +709,9 @@ export class SubscriptGenerator {
         vm.shrImm(VReg.V1, VReg.S1, 48);
         vm.cmpImm(VReg.V1, 0x7FFC);
         vm.jeq("_subscript_set_strkey");
+        // 对象键 → ToPropertyKey → 字符串键(同 get)
+        vm.cmpImm(VReg.V1, 0x7FFD);
+        vm.jeq("_subscript_set_objkey");
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_is_symbol");
         vm.cmpImm(VReg.RET, 0);
@@ -624,10 +740,15 @@ export class SubscriptGenerator {
 
         // 对象路径
         vm.label("_subscript_set_object");
-        // [#39] 数值键规范化(同 _subscript_get_object):字符串键直通,其余转字符串
+        // [#39] 数值键规范化(同 _subscript_get_object):字符串键直通,Symbol 键原样
+        // (ToPropertyKey 恒等),其余转字符串。
         vm.shrImm(VReg.V0, VReg.S1, 48);
         vm.cmpImm(VReg.V0, 0x7FFC);
         vm.jeq("_subscript_set_obj_key_ok");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_is_symbol");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_subscript_set_obj_key_ok");
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_js_prop_key");
         vm.mov(VReg.S1, VReg.RET);
@@ -635,7 +756,13 @@ export class SubscriptGenerator {
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S1);
         vm.mov(VReg.A2, VReg.S2);
+        vm.load(VReg.V0, VReg.SP, 24);
+        vm.cmpImm(VReg.V0, 2);
+        vm.jeq("_sss_obj_strict");
         vm.call("_object_set");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
+        vm.label("_sss_obj_strict");
+        vm.call("_object_set_strict");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
 
         vm.label("_subscript_set_array");
@@ -671,9 +798,88 @@ export class SubscriptGenerator {
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S1);
         vm.mov(VReg.A2, VReg.S2);
-        vm.call("_array_side_elem_set"); // 0=继续稠密 / 1=已处理
+        vm.call("_array_side_elem_set"); // 0=继续稠密 / 1=已处理 / 2=getter-only 拒写
+        vm.cmpImm(VReg.RET, 2);
+        vm.jeq("_sss_frozen_reject");
         vm.cmpImm(VReg.RET, 0);
         vm.jne("_subscript_set_done");
+        // Object.freeze:稠密索引 [[Writable]]=false。seal 不置 EXT_FROZEN,索引仍可改写。
+        // 必须在侧表之后:冻结访问器仍走 setter;无侧表的 [0,1,2] 落到此拒写。
+        vm.loadByte(VReg.V1, VReg.S0, 1);
+        vm.andImm(VReg.V1, VReg.V1, 4); // EXT_FROZEN
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_sss_frozen_reject");
+        // 继承 Array.prototype 上的 setter(OrdinarySet):新建 own(越界/hole)前须触发。
+        // unshift 测例:defineProperty(Array.prototype,"0",{set}) 把 length 置非可写。
+        vm.load(VReg.V3, VReg.S0, 8); // length
+        vm.cmp(VReg.S1, VReg.V3);
+        vm.jge("_sss_try_proto_set");
+        vm.load(VReg.V1, VReg.S0, 24);
+        vm.shl(VReg.V0, VReg.S1, 3);
+        vm.add(VReg.V0, VReg.V1, VReg.V0);
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_sss_dense_ok"); // 既有稠密元素 → 直写
+        vm.label("_sss_try_proto_set");
+        // 同 _array_push:查 Array.prototype[idx] 访问器,命中 setter 则分派不建 own。
+        vm.lea(VReg.V0, "_nsobj_array_proto");
+        vm.load(VReg.A0, VReg.V0, 0);
+        vm.cmpImm(VReg.A0, 0);
+        vm.jeq("_sss_dense_ok");
+        vm.scvtf(0, VReg.S1);
+        vm.fmovToInt(VReg.A0, 0);
+        vm.call("_js_prop_key");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.lea(VReg.V0, "_nsobj_array_proto");
+        vm.load(VReg.A0, VReg.V0, 0);
+        vm.call("_object_get"); // 返 TYPE_GETTER 标记块(不调 getter)
+        vm.mov(VReg.V0, VReg.RET);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_sss_dense_ok");
+        vm.shrImm(VReg.V1, VReg.V0, 48);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_sss_dense_ok");
+        vm.lea(VReg.V1, "_heap_base");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jlt("_sss_dense_ok");
+        vm.lea(VReg.V1, "_heap_ptr");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jge("_sss_dense_ok");
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.cmpImm(VReg.V1, 60); // TYPE_GETTER
+        vm.jne("_sss_dense_ok");
+        vm.load(VReg.V0, VReg.V0, 16); // setter
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_sss_frozen_reject"); // getter-only:严格 TypeError
+        vm.movImm64(VReg.V1, 0x7ffb000000000000n);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jeq("_sss_frozen_reject");
+        vm.movImm64(VReg.V1, 0x7ffe000000000000n);
+        vm.or(VReg.A5, VReg.S0, VReg.V1); // this = boxed array
+        vm.mov(VReg.A0, VReg.S2); // value
+        vm.lea(VReg.V1, "_heap_base");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jlt("_sss_proto_set_call");
+        vm.lea(VReg.V1, "_heap_ptr");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jge("_sss_proto_set_call");
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.cmpImm(VReg.V1, 0xc105);
+        vm.jeq("_sss_proto_set_cl");
+        vm.cmpImm(VReg.V1, 0xa51c);
+        vm.jne("_sss_proto_set_call");
+        vm.label("_sss_proto_set_cl");
+        vm.mov(VReg.S0, VReg.V0); // callIndirect: S0=闭包(epilogue 还原)
+        vm.load(VReg.V0, VReg.S0, 8);
+        vm.label("_sss_proto_set_call");
+        vm.setCallArgcImm(1, VReg.V1, VReg.V2);
+        vm.callIndirect(VReg.V0);
+        vm.jmp("_subscript_set_done");
+        vm.label("_sss_dense_ok");
         vm.movImm(VReg.V0, 0x10000000); // 256M 上限(2^28)
         vm.cmp(VReg.S1, VReg.V0);
         vm.jge("_subscript_set_done");
@@ -716,15 +922,44 @@ export class SubscriptGenerator {
         vm.jne("_sss_store");
         vm.movImm64(VReg.S2, 0x7ff8000000000000n);
         vm.label("_sss_store");
+        // Arguments [[ParameterMap]]:写形参 box(与稠密槽同步)
+        vm.loadByte(VReg.V0, VReg.S0, 1);
+        vm.andImm(VReg.V0, VReg.V0, 32);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_sss_store_dense");
+        vm.movImm64(VReg.V1, 0x7ffe000000000000n);
+        vm.or(VReg.A0, VReg.S0, VReg.V1);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_args_param_map_get_box");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_sss_store_dense");
+        vm.store(VReg.RET, 0, VReg.S2); // *box = value
+        vm.label("_sss_store_dense");
         // 存 value 到 index（元素地址 = data_ptr(@24) + index * 8）
         vm.load(VReg.V1, VReg.S0, 24); // data_ptr（增长后可能已更新）
         vm.shl(VReg.V0, VReg.S1, 3); // index * 8
         vm.add(VReg.V0, VReg.V1, VReg.V0);
         vm.store(VReg.V0, 0, VReg.S2);
 
+        vm.label("_sss_frozen_reject");
+        vm.load(VReg.V0, VReg.SP, 24);
+        vm.cmpImm(VReg.V0, 2);
+        vm.jne("_subscript_set_done"); // sloppy:静默
+        vm.lea(VReg.A0, vm.asm.addString("Cannot assign to read only property"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
         vm.label("_subscript_set_done");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
 
+        // 对象键 → ToPropertyKey 字符串后汇合 strkey
+        vm.label("_subscript_set_objkey");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_js_prop_key");
+        vm.mov(VReg.S1, VReg.RET);
+        // fall through
         // ===== 数组/TypedArray 的字符串键(冷分支,镜像 _subscript_get_strkey) =====
         // S0=裸接收者, S1=装箱字符串键, S2=值。
         vm.label("_subscript_set_strkey");
@@ -745,7 +980,23 @@ export class SubscriptGenerator {
         vm.load(VReg.V0, VReg.S0, 0);
         vm.andImm(VReg.V0, VReg.V0, 0xff);
         vm.cmpImm(VReg.V0, 1); // TYPE_ARRAY
-        vm.jne("_subscript_set_done");
+        vm.jeq("_subscript_set_named_arr");
+        vm.cmpImm(VReg.V0, 0x40);
+        vm.jlt("_subscript_set_done");
+        vm.cmpImm(VReg.V0, 0x70);
+        vm.jgt("_subscript_set_done");
+        // TA:仅 symbol 键 OrdinarySet(侧表)。"1.1"/"-0" 等是 CanonicalNumericIndexString,
+        // IntegerIndexedElementSet(detached)→ 不建自有属性。
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_is_symbol");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_subscript_set_done");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_closure_prop_set");
+        vm.jmp("_subscript_set_done");
+        vm.label("_subscript_set_named_arr");
         vm.mov(VReg.A0, VReg.S1);
         vm.lea(VReg.V0, "_str_length_prop");
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
@@ -761,8 +1012,7 @@ export class SubscriptGenerator {
         vm.movImm64(VReg.V1, 0x7ffd000000000000n);
         vm.or(VReg.A0, VReg.S0, VReg.V1);
         vm.call("_closure_props_find");
-        vm.lea(VReg.V1, "_js_undefined");
-        vm.load(VReg.V1, VReg.V1, 0);
+        vm.movImm64(VReg.V1, 0x7ffb000000000000n);
         vm.cmp(VReg.RET, VReg.V1);
         vm.jeq("_subscript_set_done"); // 无侧表 → 拒
         vm.mov(VReg.A0, VReg.RET);
@@ -799,11 +1049,19 @@ export class SubscriptGenerator {
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_js_prop_key");
         vm.mov(VReg.S1, VReg.RET); // 规范化键
-        vm.mov(VReg.A0, VReg.S0);
+        vm.movImm64(VReg.V1, 0x7fff000000000000n);
+        vm.or(VReg.A0, VReg.S0, VReg.V1); // 装箱函数,走 OrdinarySet(继承访问器)
         vm.mov(VReg.A1, VReg.S1);
         vm.mov(VReg.A2, VReg.S2);
-        vm.call("_closure_prop_set");
-        vm.mov(VReg.RET, VReg.S2); // 赋值表达式之值
+        vm.load(VReg.V0, VReg.SP, 24);
+        vm.cmpImm(VReg.V0, 2);
+        vm.jeq("_sss_clo_strict");
+        vm.call("_object_set");
+        vm.mov(VReg.RET, VReg.S2);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
+        vm.label("_sss_clo_strict");
+        vm.call("_object_set_strict");
+        vm.mov(VReg.RET, VReg.S2);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
 
         // null/undefined 基对象:构造 `Cannot set properties of null|undefined (setting '<k>')`
@@ -841,12 +1099,124 @@ export class SubscriptGenerator {
     }
 
     generate() {
+        // Arguments [[ParameterMap]]:idx → 形参 box 指针。
+        // 编译器在 non-strict+简单形参+引用 arguments 时调用 install;
+        // Get/Set/defineProperty 经 get_box / after_define 同步形参绑定。
+        this.generateArgsParamMap();
         this.generateGet();
         this.generateSet();
         this.generateKeyInt();
         this.generateJsLength();
         this.generateJsSetLength();
         this.generateThrowRangeError();
+    }
+
+    // 登记表:_args_pmap_head → 链节点 {args_raw@0, map_ptr@8, count@16, next@24}
+    generateArgsParamMap() {
+        const vm = this.vm;
+        const asm = vm.asm;
+        asm.addDataLabel("_args_pmap_head");
+        asm.addDataQword(0);
+
+        // _args_param_map_install(A0=args_boxed, A1=map_ptr, A2=count)
+        vm.label("_args_param_map_install");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.mov(VReg.S1, VReg.A1); // map
+        vm.mov(VReg.S2, VReg.A2); // count
+        vm.emitMaskLoad(VReg.V0);
+        vm.andMaskReg(VReg.S0, VReg.A0, VReg.V0); // args raw
+        vm.movImm(VReg.A0, 32);
+        vm.call("_alloc");
+        vm.store(VReg.RET, 0, VReg.S0);
+        vm.store(VReg.RET, 8, VReg.S1);
+        vm.store(VReg.RET, 16, VReg.S2);
+        vm.lea(VReg.V0, "_args_pmap_head");
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.store(VReg.RET, 24, VReg.V1);
+        vm.store(VReg.V0, 0, VReg.RET);
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_gc_remember");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_gc_remember");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+
+        // _args_param_map_get_box(A0=args_boxed, A1=idx) -> box_ptr | 0
+        vm.label("_args_param_map_get_box");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.mov(VReg.S1, VReg.A1); // idx
+        vm.emitMaskLoad(VReg.V0);
+        vm.andMaskReg(VReg.S0, VReg.A0, VReg.V0); // args raw
+        vm.lea(VReg.V0, "_args_pmap_head");
+        vm.load(VReg.S2, VReg.V0, 0);
+        vm.label("_apmg_loop");
+        vm.cmpImm(VReg.S2, 0);
+        vm.jeq("_apmg_miss");
+        vm.load(VReg.V0, VReg.S2, 0);
+        vm.cmp(VReg.V0, VReg.S0);
+        vm.jeq("_apmg_hit");
+        vm.load(VReg.S2, VReg.S2, 24);
+        vm.jmp("_apmg_loop");
+        vm.label("_apmg_hit");
+        vm.load(VReg.V0, VReg.S2, 16); // count
+        vm.cmp(VReg.S1, VReg.V0);
+        vm.jge("_apmg_miss");
+        vm.cmpImm(VReg.S1, 0);
+        vm.jlt("_apmg_miss");
+        vm.load(VReg.V0, VReg.S2, 8); // map
+        vm.shl(VReg.V1, VReg.S1, 3);
+        vm.add(VReg.V0, VReg.V0, VReg.V1);
+        vm.load(VReg.RET, VReg.V0, 0); // box ptr
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+        vm.label("_apmg_miss");
+        vm.movImm(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+
+        // _args_param_map_after_define(A0=args_boxed, A1=idx, A2=value)
+        // defineProperty 写索引后同步 [[ParameterMap]] 形参 box。
+        vm.label("_args_param_map_after_define");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.mov(VReg.S2, VReg.A2); // value
+        vm.mov(VReg.S1, VReg.A1); // idx
+        vm.mov(VReg.S0, VReg.A0); // args
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_args_param_map_get_box");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_apmad_done");
+        vm.store(VReg.RET, 0, VReg.S2);
+        vm.label("_apmad_done");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+
+        // _args_param_map_unmap(A0=args_boxed, A1=idx):delete arguments[i] 后断开映射
+        // (15.2.3.6-4-289-1:删后再 define 不得回写形参)。
+        vm.label("_args_param_map_unmap");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.emitMaskLoad(VReg.V0);
+        vm.andMaskReg(VReg.S0, VReg.A0, VReg.V0);
+        vm.lea(VReg.V0, "_args_pmap_head");
+        vm.load(VReg.S2, VReg.V0, 0);
+        vm.label("_apmu_loop");
+        vm.cmpImm(VReg.S2, 0);
+        vm.jeq("_apmu_done");
+        vm.load(VReg.V0, VReg.S2, 0);
+        vm.cmp(VReg.V0, VReg.S0);
+        vm.jeq("_apmu_hit");
+        vm.load(VReg.S2, VReg.S2, 24);
+        vm.jmp("_apmu_loop");
+        vm.label("_apmu_hit");
+        vm.load(VReg.V0, VReg.S2, 16);
+        vm.cmp(VReg.S1, VReg.V0);
+        vm.jge("_apmu_done");
+        vm.cmpImm(VReg.S1, 0);
+        vm.jlt("_apmu_done");
+        vm.load(VReg.V0, VReg.S2, 8);
+        vm.shl(VReg.V1, VReg.S1, 3);
+        vm.add(VReg.V0, VReg.V0, VReg.V1);
+        vm.movImm(VReg.V1, 0);
+        vm.store(VReg.V0, 0, VReg.V1); // map[idx] = 0
+        vm.label("_apmu_done");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
     }
 
     // _subscript_key_int(key) -> 裸整数下标 | -1
@@ -859,6 +1229,12 @@ export class SubscriptGenerator {
         const vm = this.vm;
         vm.label("_subscript_key_int");
         vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0);
+        // Symbol 键不是数组索引(曾把符号裸指针当整数下标,空串 toStringTag Get 恒 miss)。
+        vm.call("_is_symbol");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_ski_neg1");
+        vm.mov(VReg.A0, VReg.S0);
         vm.shrImm(VReg.V1, VReg.A0, 48);
         vm.cmpImm(VReg.V1, 0x7FFC);
         vm.jne("_ski_not_str");
@@ -866,6 +1242,9 @@ export class SubscriptGenerator {
         vm.epilogue([VReg.S0, VReg.S1], 0);
         vm.label("_ski_not_str");
         vm.call("_syscall_arg");
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_ski_neg1");
+        vm.movImm64(VReg.RET, 0xFFFFFFFFFFFFFFFFn);
         vm.epilogue([VReg.S0, VReg.S1], 0);
     }
 
@@ -925,7 +1304,7 @@ export class SubscriptGenerator {
         const vm = this.vm;
 
         vm.label("_js_set_length");
-        vm.prologue(16, [VReg.S0, VReg.S1]);
+        vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
         vm.store(VReg.SP, 0, VReg.A0);  // 原 obj(fallback 用)
         vm.store(VReg.SP, 8, VReg.A1);  // 原 boxed value
         vm.mov(VReg.S0, VReg.A0); // obj
@@ -984,10 +1363,44 @@ export class SubscriptGenerator {
         vm.cmpImm(VReg.V0, 1);             // TYPE_ARRAY
         vm.jne("_js_set_length_fallback");
         vm.label("_js_set_length_trusted");
-        vm.load(VReg.V0, VReg.S0, 8);      // 当前 length
-        vm.cmp(VReg.S1, VReg.V0);
-        vm.jle("_js_set_length_set");      // n <= len：仅截断
-        vm.sub(VReg.V2, VReg.S1, VReg.V0); // V2 = n - len
+        vm.load(VReg.S2, VReg.S0, 8);      // S2 = 当前 length
+        vm.cmp(VReg.S1, VReg.S2);
+        vm.jeq("_js_set_length_done");     // 同值无操作
+        vm.jgt("_js_set_length_grow");     // n > len：扩展
+        // n < len：自高向低 DeleteProperty(含侧表 accessor)+清稠密槽。
+        // 旧路径只擦稠密 → length=0 后 `0 in arr` 仍 true(get_if_present_with_delete)。
+        vm.movImm64(VReg.V1, 0x7ffe000000000000n);
+        vm.or(VReg.S3, VReg.S0, VReg.V1);   // S3 = 装箱数组(供 _object_delete)
+        // i 从 min(oldLen, capacity)-1 起:skip-fill 抬 length 后 capacity 仍小,
+        // 从 oldLen-1 扫 2^32 槽会挂死(propertyHelper isWritable(length))。
+        vm.load(VReg.S4, VReg.S0, 16);      // capacity
+        vm.cmp(VReg.S2, VReg.S4);
+        vm.jle("_jssl_trim_from_old");
+        vm.jmp("_jssl_trim_i0");
+        vm.label("_jssl_trim_from_old");
+        vm.mov(VReg.S4, VReg.S2);
+        vm.label("_jssl_trim_i0");
+        vm.subImm(VReg.S4, VReg.S4, 1);     // i = min(oldLen,cap)-1
+        vm.label("_js_set_length_trim");
+        vm.cmp(VReg.S4, VReg.S1);
+        vm.jlt("_js_set_length_set");      // i < n → 完成
+        vm.scvtf(0, VReg.S4);
+        vm.fmovToInt(VReg.A0, 0);
+        vm.call("_js_prop_key");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S3);
+        vm.call("_object_delete");         // 尊重 configurable;清侧表+稠密
+        vm.movImm64(VReg.V1, 0x7ff9000000000000n);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jne("_js_set_length_trim_next");
+        // 不可配置索引:规范 length 停在 i+1(sloppy 不抛)
+        vm.addImm(VReg.S1, VReg.S4, 1);
+        vm.jmp("_js_set_length_set");
+        vm.label("_js_set_length_trim_next");
+        vm.subImm(VReg.S4, VReg.S4, 1);
+        vm.jmp("_js_set_length_trim");
+        vm.label("_js_set_length_grow");
+        vm.sub(VReg.V2, VReg.S1, VReg.S2); // V2 = n - len
         vm.movImm(VReg.V3, 0x1000000);     // 16M cap
         vm.cmp(VReg.V2, VReg.V3);
         vm.jgt("_js_set_length_set");      // too large: skip fill
@@ -1011,14 +1424,14 @@ export class SubscriptGenerator {
 
         vm.label("_js_set_length_done");
         vm.movImm(VReg.RET, 0);
-        vm.epilogue([VReg.S0, VReg.S1], 16);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 48);
 
         vm.label("_js_set_length_range_err");
         vm.lea(VReg.A0, vm.asm.addString("Invalid array length"));
         vm.call("_js_box_string");
         vm.mov(VReg.A0, VReg.RET);
         vm.call("_throw_range_error");
-        vm.epilogue([VReg.S0, VReg.S1], 16);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 48);
 
         // 回退：普通对象.length = 原 boxed value(可 Inf/负数)
         vm.label("_js_set_length_fallback");
@@ -1029,7 +1442,7 @@ export class SubscriptGenerator {
         vm.load(VReg.A2, VReg.SP, 8); // 原 boxed value
         vm.call("_object_set");
         vm.movImm(VReg.RET, 0);
-        vm.epilogue([VReg.S0, VReg.S1], 16);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 48);
     }
 
     // _js_length(value) -> 原始整数长度

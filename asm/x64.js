@@ -42,6 +42,7 @@ export class X64Assembler {
         // Object.keys 不可用 → addString 恒返回 0，全部字符串标签失效。
         this.strings = [];
         this._stringInternMap = new Map();
+        this._stringLabels = []; // labelIndex -> "_str_N"（命中免再拼串）
         this.dataLabels = []; // 用于存储数据标签和预分配空间
         // 外部符号支持 (macOS 动态链接)
         this.externalSymbols = {};
@@ -322,17 +323,8 @@ export class X64Assembler {
         }
     }
 
-    // 存储 4 字节到内存
+    // 存储 4 字节到内存 (不插入对齐填充,可进指令流)
     movStoreOffset32(dstAddr, offset, src) {
-        // 确保 8 字节对齐
-        const misalign = this.data.length & 7;
-        if (misalign !== 0) {
-            const pad = 8 - misalign;
-            for (let i = 0; i < pad; i++) {
-                this.data.push(0);
-            }
-        }
-
         let rexByte = this.rex(0, src >= 8, 0, dstAddr >= 8);
         if (rexByte !== 0x40) {
             this.emit(rexByte);
@@ -353,6 +345,33 @@ export class X64Assembler {
                 this.emit(36);
             } else {
                 this.emit(this.modrm(2, src & 7, dstAddr & 7));
+            }
+            this.emitImm32(offset);
+        }
+    }
+
+    // 加载 4 字节并零扩展到 64 位
+    movLoadOffset32(dst, srcAddr, offset) {
+        let rexByte = this.rex(0, dst >= 8, 0, srcAddr >= 8);
+        if (rexByte !== 0x40) {
+            this.emit(rexByte);
+        }
+        this.emit(139); // MOV r32, r/m32
+
+        if (offset >= -128 && offset <= 127) {
+            if ((srcAddr & 7) === 4) {
+                this.emit(this.modrm(1, dst & 7, 4));
+                this.emit(36);
+            } else {
+                this.emit(this.modrm(1, dst & 7, srcAddr & 7));
+            }
+            this.emit(offset & 255);
+        } else {
+            if ((srcAddr & 7) === 4) {
+                this.emit(this.modrm(2, dst & 7, 4));
+                this.emit(36);
+            } else {
+                this.emit(this.modrm(2, dst & 7, srcAddr & 7));
             }
             this.emitImm32(offset);
         }
@@ -1326,13 +1345,16 @@ export class X64Assembler {
     }
 
     addString(str) {
-        if (this._stringInternMap.has(str)) {
-            return "_str_" + this._stringInternMap.get(str);
+        let labelIndex = this._stringInternMap.get(str);
+        if (labelIndex !== undefined) {
+            return this._stringLabels[labelIndex];
         }
-        let labelIndex = this.strings.length;
+        labelIndex = this.strings.length;
+        const labelName = "_str_" + labelIndex;
         this.strings.push(str);
+        this._stringLabels.push(labelName);
         this._stringInternMap.set(str, labelIndex);
-        return "_str_" + labelIndex;
+        return labelName;
     }
 
     // 注册运行时字符串，使其与 addString 共享数据
@@ -1412,7 +1434,7 @@ export class X64Assembler {
         let dataOffset = 0;
         for (let si = 0; si < this.strings.length; si = si + 1) {
             let str = this.strings[si];
-            let labelName = "_str_" + si;
+            let labelName = this._stringLabels[si] || ("_str_" + si);
             this.labels.set(labelName, dataBase + dataOffset);
             // 逐字节透传(& 0xFF),不 UTF-8 重编码——见 arm64.js 同处注释(字符串已是 UTF-8
             // 字节;双重编码致非 ASCII 字面量 mojibake)。char==字节、str.length==字节数,

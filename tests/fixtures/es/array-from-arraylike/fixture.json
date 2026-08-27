@@ -6,6 +6,5 @@
     "run": true,
     "stdout": "[\"a\",\"b\",\"c\"]\n[\"a!\",\"b!\",\"c!\"]\n[null,null]\n[0,1,2,3]",
     "exitCode": 0
-  },
-  "knownFailure": "Pre-existing failure - not in current task scope"
+  }
 }

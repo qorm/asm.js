@@ -111,18 +111,10 @@ export class ARM64Backend extends Backend {
     }
 
     mapReg(vreg) {
-        // If vreg is a number (physical register constant like Reg.X0), return it directly
-        if (typeof vreg === 'number') {
-            return vreg;
-        }
         const phys = this.regMap[vreg];
-        if (phys === undefined) {
-            const stack = new Error().stack.split('\n').slice(1, 15).join('\n');
-            console.log('mapReg failed for vreg:', JSON.stringify(vreg), 'type:', typeof vreg);
-            console.log('Stack:', stack);
-            throw new Error("Unknown virtual register: " + vreg);
-        }
-        return phys;
+        if (phys !== undefined) return phys;
+        if (typeof vreg === "number") return vreg;
+        throw new Error("Unknown virtual register: " + vreg);
     }
 
     scratchReg(...regs) {
@@ -229,8 +221,49 @@ export class ARM64Backend extends Backend {
         this.asm.ldrb(rd, rb, offset);
     }
 
+    store32(base, offset, src) {
+        const rs = this.mapReg(src);
+        const rb = this.mapReg(base);
+        if ((offset >= 0 && (offset & 3) === 0 && offset < 16384) ||
+            (offset >= -256 && offset <= 255)) {
+            this.asm.strw(rs, rb, offset);
+            return;
+        }
+        if (offset >= -4095 && offset <= 4095) {
+            if (offset >= 0) this.asm.addImm(Reg.X16, rb, offset);
+            else this.asm.subImm(Reg.X16, rb, -offset);
+        } else {
+            this.asm.movImm(Reg.X16, offset);
+            this.asm.addReg(Reg.X16, rb, Reg.X16);
+        }
+        this.asm.strw(rs, Reg.X16, 0);
+    }
+
+    load32(dest, base, offset) {
+        const rd = this.mapReg(dest);
+        const rb = this.mapReg(base);
+        if ((offset >= 0 && (offset & 3) === 0 && offset < 16384) ||
+            (offset >= -256 && offset <= 255)) {
+            this.asm.ldrw(rd, rb, offset);
+            return;
+        }
+        if (offset >= -4095 && offset <= 4095) {
+            if (offset >= 0) this.asm.addImm(Reg.X16, rb, offset);
+            else this.asm.subImm(Reg.X16, rb, -offset);
+        } else {
+            this.asm.movImm(Reg.X16, offset);
+            this.asm.addReg(Reg.X16, rb, Reg.X16);
+        }
+        this.asm.ldrw(rd, Reg.X16, 0);
+    }
+
     lea(dest, label) {
         // [M2] per-M 执行态槽:寻址改为 x28(M 上下文)+ 偏移,而非 PC-relative 全局。
+        // _call_argc 最热:每调用点写,特判免 M_CTX_REDIRECT 查表。
+        if (label === "_call_argc") {
+            this.asm.addImm(this.mapReg(dest), Reg.X28, 40);
+            return;
+        }
         const mctxOff = M_CTX_REDIRECT[label];
         if (mctxOff !== undefined) {
             this.asm.addImm(this.mapReg(dest), Reg.X28, mctxOff);

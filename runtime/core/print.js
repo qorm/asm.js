@@ -141,8 +141,7 @@ export class PrintGenerator {
         // 检查是否为 _js_false (0x7ff9000000000000)，而不是数值 0
         // _js_false 不是 0，而是一个 NaN-boxed 的布尔值
         // 需要加载 _js_false 的内容 (0x7ff9000000000000)，而不是地址
-        vm.lea(VReg.V0, "_js_false");
-        vm.load(VReg.V0, VReg.V0, 0);  // 加载实际的 _js_false 值
+        vm.movImm64(VReg.V0, 0x7ff9000000000000n);
         vm.cmp(VReg.S0, VReg.V0);
         const falseLabel = "_print_bool_false";
         vm.jeq(falseLabel);
@@ -170,8 +169,7 @@ export class PrintGenerator {
         // 检查是否为 _js_false (0x7ff9000000000000)，而不是数值 0
         // _js_false 不是 0，而是一个 NaN-boxed 的布尔值
         // 需要加载 _js_false 的内容 (0x7ff9000000000000)，而不是地址
-        vm.lea(VReg.V0, "_js_false");
-        vm.load(VReg.V0, VReg.V0, 0);  // 加载实际的 _js_false 值
+        vm.movImm64(VReg.V0, 0x7ff9000000000000n);
         vm.cmp(VReg.S0, VReg.V0);
         const falseLabel = "_print_bool_no_nl_false";
         vm.jeq(falseLabel);

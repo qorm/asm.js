@@ -151,10 +151,11 @@ export class SetGenerator {
         vm.cmpImm(VReg.S4, 0);
         vm.jeq("_set_add_insert");
         vm.load(VReg.A0, VReg.S4, 0); // node.value
+        vm.cmp(VReg.A0, VReg.S1);
+        vm.jeq("_set_add_found");
         vm.mov(VReg.A1, VReg.S1);
         vm.call("_map_key_eq");
-        vm.lea(VReg.V1, "_js_true");
-        vm.load(VReg.V1, VReg.V1, 0);
+        vm.movImm64(VReg.V1, 0x7ff9000000000001n);
         vm.cmp(VReg.RET, VReg.V1);
         vm.jeq("_set_add_found");
         vm.load(VReg.S4, VReg.S4, 16); // hnext
@@ -221,21 +222,20 @@ export class SetGenerator {
         vm.cmpImm(VReg.S2, 0);
         vm.jeq("_set_has_notfound");
         vm.load(VReg.A0, VReg.S2, 0);
+        vm.cmp(VReg.A0, VReg.S1);
+        vm.jeq("_set_has_found");
         vm.mov(VReg.A1, VReg.S1);
         vm.call("_map_key_eq");
-        vm.lea(VReg.V1, "_js_true");
-        vm.load(VReg.V1, VReg.V1, 0);
+        vm.movImm64(VReg.V1, 0x7ff9000000000001n);
         vm.cmp(VReg.RET, VReg.V1);
         vm.jeq("_set_has_found");
         vm.load(VReg.S2, VReg.S2, 16); // hnext
         vm.jmp("_set_has_loop");
         vm.label("_set_has_found");
-        vm.lea(VReg.RET, "_js_true"); // 返回 JS 布尔（供 `+` 拼接/if 使用），非裸 1
-        vm.load(VReg.RET, VReg.RET, 0);
+        vm.movImm64(VReg.RET, 0x7ff9000000000001n);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 48);
         vm.label("_set_has_notfound");
-        vm.lea(VReg.RET, "_js_false");
-        vm.load(VReg.RET, VReg.RET, 0);
+        vm.movImm64(VReg.RET, 0x7ff9000000000000n);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 48);
 
         // ============================================================
@@ -259,10 +259,11 @@ export class SetGenerator {
         vm.cmpImm(VReg.S3, 0);
         vm.jeq("_set_del_notfound");
         vm.load(VReg.A0, VReg.S3, 0);
+        vm.cmp(VReg.A0, VReg.S1);
+        vm.jeq("_set_del_found");
         vm.mov(VReg.A1, VReg.S1);
         vm.call("_map_key_eq");
-        vm.lea(VReg.V1, "_js_true");
-        vm.load(VReg.V1, VReg.V1, 0);
+        vm.movImm64(VReg.V1, 0x7ff9000000000001n);
         vm.cmp(VReg.RET, VReg.V1);
         vm.jeq("_set_del_found");
         vm.mov(VReg.S4, VReg.S3);
@@ -307,12 +308,10 @@ export class SetGenerator {
         vm.store(VReg.S0, 8, VReg.V1);
         // 返回规范 JS 布尔(同 _set_has,非裸 1/0)——Set.prototype.delete 返 boolean:
         // 是否删除了成员。此前返裸 1/0,typeof 为 number 且裸 0 被误解释为真值。
-        vm.lea(VReg.RET, "_js_true");
-        vm.load(VReg.RET, VReg.RET, 0);
+        vm.movImm64(VReg.RET, 0x7ff9000000000001n);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
         vm.label("_set_del_notfound");
-        vm.lea(VReg.RET, "_js_false");
-        vm.load(VReg.RET, VReg.RET, 0);
+        vm.movImm64(VReg.RET, 0x7ff9000000000000n);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
 
         // _set_size - 获取 Set 大小
@@ -864,12 +863,10 @@ export class SetGenerator {
         vm.call("_throw_type_error");
 
         vm.label("_set_bool_true");
-        vm.lea(VReg.RET, "_js_true");
-        vm.load(VReg.RET, VReg.RET, 0);
+        vm.movImm64(VReg.RET, 0x7ff9000000000001n);
         vm.epilogue(COMB_SAVED, 64);
         vm.label("_set_bool_false");
-        vm.lea(VReg.RET, "_js_false");
-        vm.load(VReg.RET, VReg.RET, 0);
+        vm.movImm64(VReg.RET, 0x7ff9000000000000n);
         vm.epilogue(COMB_SAVED, 64);
 
         // ---- _set_union(A0=a, A1=b) -> 新 Set(a ∪ b) ----
@@ -898,6 +895,11 @@ export class SetGenerator {
         emitCombPrologue();
         emitKindDispatch("_si", "_set_int_like", "_set_int_fast");
         vm.label("_set_int_fast");
+        // 规范: this.size ≤ other.size 按 this 插入序,否则按 other。
+        vm.load(VReg.V5, VReg.S0, 8);
+        vm.load(VReg.V6, VReg.S1, 8);
+        vm.cmp(VReg.V5, VReg.V6);
+        vm.jgt("_set_int_walk_other");
         vm.call("_set_new");
         vm.mov(VReg.S2, VReg.RET);
         vm.load(VReg.S3, VReg.S0, 16);
@@ -907,8 +909,7 @@ export class SetGenerator {
         vm.load(VReg.A1, VReg.S3, 0);
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_set_has");
-        vm.lea(VReg.V5, "_js_true");
-        vm.load(VReg.V5, VReg.V5, 0);
+        vm.movImm64(VReg.V5, 0x7ff9000000000001n);
         vm.cmp(VReg.RET, VReg.V5);
         vm.jne("_set_int_next");
         vm.load(VReg.A1, VReg.S3, 0);
@@ -918,6 +919,27 @@ export class SetGenerator {
         vm.load(VReg.S3, VReg.S3, 8);
         vm.jmp("_set_int_loop");
         vm.label("_set_int_done");
+        emitCombRetSet(VReg.S2);
+        vm.label("_set_int_walk_other");
+        vm.call("_set_new");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.load(VReg.S3, VReg.S1, 16);
+        vm.label("_set_int_oloop");
+        vm.cmpImm(VReg.S3, 0);
+        vm.jeq("_set_int_odone");
+        vm.load(VReg.A1, VReg.S3, 0);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_set_has");
+        vm.movImm64(VReg.V5, 0x7ff9000000000001n);
+        vm.cmp(VReg.RET, VReg.V5);
+        vm.jne("_set_int_onext");
+        vm.load(VReg.A1, VReg.S3, 0);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_set_add");
+        vm.label("_set_int_onext");
+        vm.load(VReg.S3, VReg.S3, 8);
+        vm.jmp("_set_int_oloop");
+        vm.label("_set_int_odone");
         emitCombRetSet(VReg.S2);
         vm.label("_set_int_like");
         emitSizeLe(VReg.S0, VReg.S1, "_si_lk_has", "_si_lk_keys");
@@ -948,8 +970,7 @@ export class SetGenerator {
             vm.load(VReg.A1, VReg.SP, 8);
             vm.mov(VReg.A0, VReg.S0);
             vm.call("_set_has");
-            vm.lea(VReg.V5, "_js_true");
-            vm.load(VReg.V5, VReg.V5, 0);
+            vm.movImm64(VReg.V5, 0x7ff9000000000001n);
             vm.cmp(VReg.RET, VReg.V5);
             vm.jne("_si_k_skip");
             vm.load(VReg.A1, VReg.SP, 8);
@@ -973,8 +994,7 @@ export class SetGenerator {
         vm.load(VReg.A1, VReg.S3, 0);
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_set_has");
-        vm.lea(VReg.V5, "_js_true");
-        vm.load(VReg.V5, VReg.V5, 0);
+        vm.movImm64(VReg.V5, 0x7ff9000000000001n);
         vm.cmp(VReg.RET, VReg.V5);
         vm.jeq("_set_diff_next");
         vm.load(VReg.A1, VReg.S3, 0);
@@ -1032,8 +1052,7 @@ export class SetGenerator {
         vm.load(VReg.A1, VReg.S3, 0);
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_set_has");
-        vm.lea(VReg.V5, "_js_true");
-        vm.load(VReg.V5, VReg.V5, 0);
+        vm.movImm64(VReg.V5, 0x7ff9000000000001n);
         vm.cmp(VReg.RET, VReg.V5);
         vm.jeq("_set_sym_a_next");
         vm.load(VReg.A1, VReg.S3, 0);
@@ -1050,8 +1069,7 @@ export class SetGenerator {
         vm.load(VReg.A1, VReg.S3, 0);
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_set_has");
-        vm.lea(VReg.V5, "_js_true");
-        vm.load(VReg.V5, VReg.V5, 0);
+        vm.movImm64(VReg.V5, 0x7ff9000000000001n);
         vm.cmp(VReg.RET, VReg.V5);
         vm.jeq("_set_sym_b_next");
         vm.load(VReg.A1, VReg.S3, 0);
@@ -1072,8 +1090,7 @@ export class SetGenerator {
             vm.load(VReg.A1, VReg.SP, 8);
             vm.mov(VReg.A0, VReg.S0);
             vm.call("_set_has");
-            vm.lea(VReg.V5, "_js_true");
-            vm.load(VReg.V5, VReg.V5, 0);
+            vm.movImm64(VReg.V5, 0x7ff9000000000001n);
             vm.cmp(VReg.RET, VReg.V5);
             vm.jne("_ss_lk_add");
             vm.load(VReg.A1, VReg.SP, 8);
@@ -1100,8 +1117,7 @@ export class SetGenerator {
         vm.load(VReg.A1, VReg.S2, 0);
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_set_has");
-        vm.lea(VReg.V5, "_js_true");
-        vm.load(VReg.V5, VReg.V5, 0);
+        vm.movImm64(VReg.V5, 0x7ff9000000000001n);
         vm.cmp(VReg.RET, VReg.V5);
         vm.jne("_set_bool_false");
         vm.load(VReg.S2, VReg.S2, 8);
@@ -1134,8 +1150,7 @@ export class SetGenerator {
         vm.load(VReg.A1, VReg.S2, 0);
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_set_has");
-        vm.lea(VReg.V5, "_js_true");
-        vm.load(VReg.V5, VReg.V5, 0);
+        vm.movImm64(VReg.V5, 0x7ff9000000000001n);
         vm.cmp(VReg.RET, VReg.V5);
         vm.jne("_set_bool_false");
         vm.load(VReg.S2, VReg.S2, 8);
@@ -1153,8 +1168,7 @@ export class SetGenerator {
             vm.load(VReg.A1, VReg.SP, 8);
             vm.mov(VReg.A0, VReg.S0);
             vm.call("_set_has");
-            vm.lea(VReg.V5, "_js_true");
-            vm.load(VReg.V5, VReg.V5, 0);
+            vm.movImm64(VReg.V5, 0x7ff9000000000001n);
             vm.cmp(VReg.RET, VReg.V5);
             vm.jne("_sp_lk_miss");
         });
@@ -1176,8 +1190,7 @@ export class SetGenerator {
         vm.load(VReg.A1, VReg.S2, 0);
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_set_has");
-        vm.lea(VReg.V5, "_js_true");
-        vm.load(VReg.V5, VReg.V5, 0);
+        vm.movImm64(VReg.V5, 0x7ff9000000000001n);
         vm.cmp(VReg.RET, VReg.V5);
         vm.jeq("_set_bool_false");
         vm.load(VReg.S2, VReg.S2, 8);
@@ -1201,8 +1214,7 @@ export class SetGenerator {
             vm.load(VReg.A1, VReg.SP, 8);
             vm.mov(VReg.A0, VReg.S0);
             vm.call("_set_has");
-            vm.lea(VReg.V5, "_js_true");
-            vm.load(VReg.V5, VReg.V5, 0);
+            vm.movImm64(VReg.V5, 0x7ff9000000000001n);
             vm.cmp(VReg.RET, VReg.V5);
             vm.jeq("_dj_lk_hit");
         });
@@ -1299,6 +1311,129 @@ export class SetGenerator {
         vm.or(VReg.A1, VReg.A1, VReg.V1);
         vm.jmp("_aref_throw_incompat");
 
+        // _set_construct_fill(A0=裸 Set, A1=iterable) -> RET=A0。
+        // 规范 24.2.1.1:Get(set,"add") 后边迭代边 Call(adder,set,«next»)。
+        vm.label("_set_construct_fill");
+        {
+            const STR_TAG = 0x7ffc000000000000n;
+            const keyStr = (dst, s) => {
+                vm.lea(dst, vm.asm.addString(s));
+                vm.movImm64(VReg.V1, STR_TAG);
+                vm.or(dst, dst, VReg.V1);
+            };
+            const throwTE = (lab, msg) => {
+                vm.label(lab);
+                vm.lea(VReg.A0, vm.asm.addString(msg));
+                vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+                vm.and(VReg.A0, VReg.A0, VReg.V1);
+                vm.movImm64(VReg.V1, STR_TAG);
+                vm.or(VReg.A0, VReg.A0, VReg.V1);
+                vm.call("_throw_type_error");
+            };
+            vm.prologue(128, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+            vm.mov(VReg.S0, VReg.A0);
+            vm.mov(VReg.S1, VReg.A1);
+            vm.mov(VReg.A0, VReg.S0);
+            keyStr(VReg.A1, "add");
+            vm.call("_object_get");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.mov(VReg.A1, VReg.S0);
+            vm.call("_maybe_getter");
+            vm.mov(VReg.S4, VReg.RET);
+            vm.mov(VReg.A0, VReg.S4);
+            vm.call("_is_callable");
+            vm.cmpImm(VReg.RET, 0);
+            vm.jne("_scf_have_adder");
+            vm.movImm(VReg.S4, 0); // 0 = 内建 _set_add
+            vm.label("_scf_have_adder");
+            vm.mov(VReg.A0, VReg.S1);
+            keyStr(VReg.A1, "Symbol.iterator");
+            vm.call("_object_get");
+            vm.shrImm(VReg.V3, VReg.RET, 48);
+            vm.cmpImm(VReg.V3, 0x7FFF);
+            vm.jne("_scf_not_iter");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.mov(VReg.A1, VReg.S1);
+            vm.call("_spread_call0");
+            vm.mov(VReg.S3, VReg.RET);
+
+            vm.label("_scf_loop");
+            vm.mov(VReg.A0, VReg.S3);
+            keyStr(VReg.A1, "next");
+            vm.call("_object_get");
+            vm.shrImm(VReg.V3, VReg.RET, 48);
+            vm.cmpImm(VReg.V3, 0x7FFF);
+            vm.jne("_scf_done");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.mov(VReg.A1, VReg.S3);
+            vm.call("_spread_call0");
+            vm.mov(VReg.S5, VReg.RET);
+            vm.mov(VReg.A0, VReg.S5);
+            keyStr(VReg.A1, "done");
+            vm.call("_object_get");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.mov(VReg.A1, VReg.S5);
+            vm.call("_maybe_getter");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.call("_to_boolean");
+            vm.cmpImm(VReg.RET, 0);
+            vm.jne("_scf_done");
+            vm.mov(VReg.A0, VReg.S5);
+            keyStr(VReg.A1, "value");
+            vm.call("_object_get");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.mov(VReg.A1, VReg.S5);
+            vm.call("_maybe_getter");
+            vm.mov(VReg.S2, VReg.RET);
+            vm.lea(VReg.V0, "_exc_ctx_top");
+            vm.load(VReg.V1, VReg.V0, 0);
+            vm.store(VReg.SP, 32, VReg.V1);
+            vm.lea(VReg.V1, "_scf_catch");
+            vm.store(VReg.SP, 40, VReg.V1);
+            vm.mov(VReg.V1, VReg.SP);
+            vm.store(VReg.SP, 48, VReg.V1);
+            vm.store(VReg.SP, 56, VReg.FP);
+            vm.store(VReg.SP, 64, VReg.S0);
+            vm.store(VReg.SP, 72, VReg.S1);
+            vm.store(VReg.SP, 80, VReg.S2);
+            vm.store(VReg.SP, 88, VReg.S3);
+            vm.store(VReg.SP, 96, VReg.S4);
+            vm.store(VReg.SP, 104, VReg.S5);
+            vm.addImm(VReg.V1, VReg.SP, 32);
+            vm.store(VReg.V0, 0, VReg.V1);
+            vm.cmpImm(VReg.S4, 0);
+            vm.jeq("_scf_intrinsic_add");
+            vm.mov(VReg.A0, VReg.S4);
+            vm.mov(VReg.A1, VReg.S0);
+            vm.mov(VReg.A2, VReg.S2);
+            vm.movImm64(VReg.A3, 0x7ffb000000000000n);
+            vm.movImm(VReg.A4, 1);
+            vm.call("_promise_invoke2");
+            vm.jmp("_scf_after_add");
+            vm.label("_scf_intrinsic_add");
+            vm.mov(VReg.A0, VReg.S0);
+            vm.mov(VReg.A1, VReg.S2);
+            vm.call("_set_add");
+            vm.label("_scf_after_add");
+            vm.load(VReg.V1, VReg.SP, 32);
+            vm.lea(VReg.V0, "_exc_ctx_top");
+            vm.store(VReg.V0, 0, VReg.V1);
+            vm.jmp("_scf_loop");
+
+            vm.label("_scf_catch");
+            vm.load(VReg.V1, VReg.SP, 32);
+            vm.lea(VReg.V0, "_exc_ctx_top");
+            vm.store(VReg.V0, 0, VReg.V1);
+            vm.mov(VReg.A0, VReg.S3);
+            vm.call("_iterator_close_keep");
+            vm.call("_throw_unwind");
+
+            vm.label("_scf_done");
+            vm.mov(VReg.RET, VReg.S0);
+            vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 128);
+            throwTE("_scf_not_iter", "object is not iterable");
+        }
+
         // _set_ctor_call - `Set()` 不带 new(经值路径调用)→ TypeError
         // (规范 24.2.1.1:Constructor Set requires 'new')。
         vm.label("_set_ctor_call");
@@ -1309,6 +1444,14 @@ export class SetGenerator {
         vm.call("_throw_type_error");   // 不返回
         vm.epilogue([VReg.S0], 16);     // 理论不达
 
+        vm.label("_weakset_ctor_call");
+        vm.prologue(16, [VReg.S0]);
+        vm.lea(VReg.A0, vm.asm.addString("Constructor WeakSet requires 'new'"));
+        vm.call("_js_box_string");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_throw_type_error");
+        vm.epilogue([VReg.S0], 16);
+
         // ============================================================
         // [I2 红队] 接收者品牌守卫薄壳(契约/寄存器纪律/消息形状见 map/index.js
         // 同名守卫组注;_aref_throw_incompat 定义于 map 文件,标签全局解析)。
@@ -1317,6 +1460,10 @@ export class SetGenerator {
         // ============================================================
         // [I2 红队 F3] 原型单例槽运行时无条件登记(同 map 文件 _nsobj_map_proto 注)。
         vm.asm.addDataLabel("_nsobj_set_proto");
+        vm.asm.addDataQword(0);
+        vm.asm.addDataLabel("_nsobj_weakset_proto");
+        vm.asm.addDataQword(0);
+        vm.asm.addDataLabel("_nsobj_weakset");
         vm.asm.addDataQword(0);
         const STRTAG_I2 = 0x7ffc000000000000n;
         const guardHead = (tag, typeByte) => {
@@ -1419,6 +1566,12 @@ export class SetGenerator {
         vm.movImm64(VReg.V1, 0x7fff000000000000n);
         vm.or(VReg.A2, VReg.S0, VReg.V1);
         vm.call("_object_set");
+        vm.call("_ensure_set_iter_protos");
+        vm.lea(VReg.V0, "_nsobj_set_iter_proto");
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.emitMaskLoad(VReg.V2);
+        vm.andMaskReg(VReg.V1, VReg.V1, VReg.V2);
+        vm.store(VReg.S1, 16, VReg.V1);
         vm.movImm64(VReg.V1, 0x7ffd000000000000n);
         vm.mov(VReg.RET, VReg.S1);
         vm.or(VReg.RET, VReg.RET, VReg.V1);

@@ -183,8 +183,12 @@ export const ClassParser = {
         let isStatic = false;
         let isPrivate = false;
 
-        // 检查 static 修饰符
-        if (this.curTokenIs(TokenType.STATIC)) {
+        // static 修饰符:`static m(){}` / `static *g` / `static {…}`。仅当 static 后跟
+        // 成员名或 `{`(非 `(`/`=`/`;`/`}` — 那些是名为 "static" 的方法/字段)且未转义
+        // 时才当修饰符。`st\u0061tic()` 的转义形态是 IdentifierName,不是修饰符。
+        if (this.curTokenIs(TokenType.STATIC) && !this.curToken.escaped &&
+            !this.peekTokenIs(TokenType.LPAREN) && !this.peekTokenIs(TokenType.ASSIGN) &&
+            !this.peekTokenIs(TokenType.SEMICOLON) && !this.peekTokenIs(TokenType.RBRACE)) {
             isStatic = true;
             this.nextToken();
             // [ES2022] 静态初始化块 static { ... }:static 后紧跟 `{`(非方法名/字段)。
@@ -195,8 +199,13 @@ export const ClassParser = {
                 // —— 记深度,嵌套函数 fnDepth+1 → 不误拒(const await = 0 于箭头内合法)。
                 this.fnDepth++;
                 const prevStaticBlockDepth = this._staticBlockDepth;
+                const prevImmediateGen = this._immediateGen;
                 this._staticBlockDepth = this.fnDepth;
+                // ClassStaticBlockStatementList 是 [~Yield]:外层生成器的 yield 不穿透。
+                this._immediateGen = false;
                 const block = this.parseBlockStatement();
+                if (block) this.checkLexVarConflict(block.body);
+                this._immediateGen = prevImmediateGen;
                 this._staticBlockDepth = prevStaticBlockDepth;
                 this.fnDepth--;
                 return new AST.StaticBlock(block ? block.body : []);
@@ -257,11 +266,12 @@ export const ClassParser = {
             return this.parsePrivateFieldOrMethod(isStatic, kind, false, isAsyncMethod);
         }
 
-        // [test262 早期错误 F] 记录方法是否以访问器(get/set)声明:下面的 constructor 判定会
-        // 把 kind 覆写成 "constructor",丢失访问器信息;SpecialMethod 校验需要它。
+        // [test262 早期错误 F] 记录方法是否以访问器(get/set)声明:SpecialMethod 校验需要它。
         const isAccessorMethod = (kind === "get" || kind === "set");
-        // 检查 constructor
-        if (this.curToken.literal === "constructor") {
+        // 仅**实例**普通方法名 constructor 才是 ClassConstructor(kind="constructor")。
+        // `static get/set constructor`、`static constructor()`、`async constructor` 等
+        // 必须保留原 kind,否则进不了 staticMethods 表(grammar-static-ctor-*-valid)。
+        if (this.curToken.literal === "constructor" && !isStatic && !isAccessorMethod && !isAsyncMethod) {
             kind = "constructor";
         }
 

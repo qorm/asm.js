@@ -225,6 +225,22 @@ export class X64Backend extends Backend {
         }
     }
 
+    store32(base, offset, src) {
+        const rb = this._getReg(base, Reg.R10);
+        const rs = this._getReg(src, Reg.R11);
+        this.asm.movStoreOffset32(rb, offset, rs);
+    }
+
+    load32(dest, base, offset) {
+        const rb = this._getReg(base, Reg.R10);
+        if (this.isS5(dest)) {
+            this.asm.movLoadOffset32(Reg.R11, rb, offset);
+            this.asm.movStoreOffset(Reg.RBP, this.s5StackOffset, Reg.R11);
+        } else {
+            this.asm.movLoadOffset32(this.mapReg(dest), rb, offset);
+        }
+    }
+
     lea(dest, label) {
         if (this.isS5(dest)) {
             this.asm.leaRipRel(Reg.RAX, label);

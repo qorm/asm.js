@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // asm.js 命令行编译工具
 
-import { existsSync, readFileSync, writeFileSync, statSync, mkdirSync, mkdtempSync, rmSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, renameSync, statSync, mkdirSync, mkdtempSync, rmSync } from "fs";
 import { dirname, basename, join, resolve } from "path";
 import { tmpdir } from "os";
 import { fileURLToPath } from "url";
@@ -15,6 +15,14 @@ const __dirname = dirname(__filename);
 
 // 版本号：公开仓库重新初始化后自 0.1 起算（能力基线 = 原 v1.5.52,非功能回退）
 const VERSION = "0.3.65";
+
+function writeCacheStatus(filename, status) {
+    if (!filename) return;
+    const target = resolve(filename);
+    const temp = target + ".tmp-" + process.pid;
+    writeFileSync(temp, JSON.stringify(status) + "\n");
+    renameSync(temp, target);
+}
 
 function printUsage() {
     console.log(`
@@ -31,6 +39,11 @@ Options:
   --shared              Build shared library (.dylib/.so/.dll)
   --static              Build static library (.a/.lib)
   --no-jslib            Don't generate .jslib declaration file
+  --no-cache            Disable the compilation action cache
+  --cache-dir <dir>     Override the action cache directory
+  --cache-status-file <file>
+                        Atomically write machine-readable cache status JSON
+  --no-daemon           Compile in this process instead of the resident build service
   --export <name>       Export symbol (can be used multiple times)
   --lib <name>          Link with library (NOT supported yet - errors out)
   --lib-path <path>     Add library search path (NOT supported yet - errors out)
@@ -94,8 +107,15 @@ function runSubcommand(args) {
     try {
         const compiler = new Compiler(target);
         compiler.setSourcePath(inputFile);
-        compiler.compileFile(inputFile, tmpOut);
-    } catch (e) {
+        const compileResult = compiler.compileFile(inputFile, tmpOut);
+        writeCacheStatus(process.env.ASMJS_CACHE_STATUS_FILE, {
+            cacheHit: false,
+            cacheKey: null,
+            buildId: null,
+            disabled: true,
+            size: compileResult.size,
+        });
+        } catch (e) {
         console.error(`Compilation error: ${e.message}`);
         if (process.env.DEBUG) console.error(e.stack);
         process.exit(1);
@@ -129,6 +149,22 @@ function rejectLibLinking(flag) {
     process.exit(1);
 }
 
+function requestResidentBuild(job) {
+    // 自宿主 native CLI 的 child_process 是 execve 语义，不可作为请求客户端；仅 Node
+    // 驱动默认使用常驻服务。失败返回 null，调用方无条件回退原编译路径。
+    if (!process.release || process.env.ASMJS_DAEMON === "0") return null;
+    const helper = join(__dirname, "compiler", "build", "request-cli.mjs");
+    const result = spawnSync(process.execPath, [helper, JSON.stringify(job)], {
+        encoding: "utf8",
+        maxBuffer: 4 * 1024 * 1024,
+    });
+    if (result.status !== 0) {
+        if (process.env.DEBUG) console.error(result.stderr || "build service unavailable");
+        return null;
+    }
+    try { return JSON.parse(result.stdout); } catch (_) { return null; }
+}
+
 function parseArgs(args) {
     const result = {
         input: null,
@@ -143,6 +179,10 @@ function parseArgs(args) {
         shared: false,
         static: false,
         noJslib: false,
+        noCache: false,
+        noDaemon: false,
+        cacheDir: null,
+        cacheStatusFile: null,
         exports: [],
         libs: [],
         libPaths: [],
@@ -166,6 +206,16 @@ function parseArgs(args) {
             result.static = true;
         } else if (arg === "--no-jslib") {
             result.noJslib = true;
+        } else if (arg === "--no-cache") {
+            result.noCache = true;
+        } else if (arg === "--no-daemon") {
+            result.noDaemon = true;
+        } else if (arg === "--cache-dir") {
+            i++;
+            result.cacheDir = args[i];
+        } else if (arg === "--cache-status-file") {
+            i++;
+            result.cacheStatusFile = args[i];
         } else if (arg === "-o" || arg === "--output") {
             i++;
             result.output = args[i];
@@ -299,7 +349,36 @@ function main() {
 
     console.log(`Compiling ${inputFile} -> ${output} (${target}, ${outputTypeDesc})`);
 
+    const outputType = opts.shared ? "shared" : opts.static ? "static" : "executable";
     try {
+        if (!opts.noDaemon) {
+            const remote = requestResidentBuild({
+                repositoryRoot: __dirname,
+                inputFile,
+                outputFile: output,
+                target,
+                outputType,
+                noJslib: opts.noJslib,
+                noCache: opts.noCache,
+                cacheDirectory: opts.cacheDir ? resolve(process.cwd(), opts.cacheDir) : undefined,
+                exports: opts.exports,
+            });
+            if (remote) {
+                writeCacheStatus(
+                    opts.cacheStatusFile || process.env.ASMJS_CACHE_STATUS_FILE,
+                    {
+                        cacheHit: remote.cacheHit,
+                        cacheKey: remote.cacheKey,
+                        buildId: remote.buildId,
+                        disabled: remote.disabled === true,
+                        daemon: true,
+                    }
+                );
+                if (remote.cacheHit) console.log(`Cache hit: ${remote.cacheKey}`);
+                console.log(`Successfully compiled: ${output}`);
+                return;
+            }
+        }
         const compiler = new Compiler(target);
 
         // 设置源文件路径（用于解析相对路径的 jslib）
@@ -332,7 +411,25 @@ function main() {
             compiler.addLibraryPath(libPath);
         }
 
-        compiler.compileFile(inputFile, output);
+        const compileResult = compiler.compileFile(inputFile, output);
+        const cacheResult = {
+            hit: false,
+            disabled: true,
+            key: null,
+            buildId: null,
+            result: compileResult,
+        };
+        const status = {
+            cacheHit: cacheResult.hit,
+            cacheKey: cacheResult.key,
+            buildId: cacheResult.buildId,
+            disabled: cacheResult.disabled === true,
+        };
+        writeCacheStatus(
+            opts.cacheStatusFile || process.env.ASMJS_CACHE_STATUS_FILE,
+            status
+        );
+        if (cacheResult.hit) console.log(`Cache hit: ${cacheResult.key}`);
         console.log(`Successfully compiled: ${output}`);
     } catch (e) {
         console.error(`Compilation error: ${e.message}`);

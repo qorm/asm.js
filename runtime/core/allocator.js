@@ -26,6 +26,7 @@
 import { VReg } from "../../vm/registers.js";
 import { JS_TRUE, JS_FALSE, JS_NULL, JS_UNDEFINED } from "./jsvalue.js";
 // [M4] per-P mcache 布局(GOMAXPROCS>1 小对象 bump 走当前 M 的 P);仅 linux-arm64 发射。
+import { SYM_NAMES, SYM_LATE_LABELS } from "../../engine/symbols.js";
 import { P_MC_CUR, P_MC_END, P_SIZE, P_MAX, P_SAVED_SP, P_STACK_HI } from "./parallel_sched.js";
 
 // ==================== 常量定义 ====================
@@ -1119,6 +1120,16 @@ export class AllocatorGenerator {
         // 清 next（标记已分配）
         vm.movImm(VReg.V6, 0);
         vm.store(VReg.V4, HDR_NEXT, VReg.V6);
+        // 重写头低字节:大对象复用曾原样保留 flags。堆串 writeStringHeader 把
+        // TYPE_STRING=6 写进块头低字节;复用后若仍为 6,_gc_drain 会当叶子跳过
+        // 整块 payload → 数组 data/其它容器漏标 → UAF。保留旧 size(GC 扫区间),
+        // class 重置为 LARGE_CLASS(与 bump 大对象一致),清掉陈旧 type。
+        vm.load(VReg.V5, VReg.V4, HDR_FLAGS_SIZE);
+        vm.shrImm(VReg.V5, VReg.V5, SIZE_SHIFT);
+        vm.shl(VReg.V5, VReg.V5, SIZE_SHIFT);
+        vm.movImm(VReg.V6, LARGE_CLASS << CLASS_SHIFT);
+        vm.or(VReg.V5, VReg.V5, VReg.V6);
+        vm.store(VReg.V4, HDR_FLAGS_SIZE, VReg.V5);
         // 更新 alloc_count
         vm.lea(VReg.V2, "_heap_meta");
         vm.load(VReg.V5, VReg.V2, META_ALLOC_COUNT);
@@ -1843,6 +1854,8 @@ export class AllocatorGenerator {
         vm.jeq("_gcsc_chain");
         vm.cmpImm(VReg.V1, 12); // TYPE_ARRAY_BUFFER [Design B]
         vm.jeq("_gcsc_abuf");
+        vm.cmpImm(VReg.V1, 14); // TYPE_DATA_VIEW:buffer@32
+        vm.jeq("_gcsc_dv");
         vm.cmpImm(VReg.V1, 0x40); // [Design A] TypedArray 族(0x40-0x61)
         vm.jge("_gcsc_abuf");     // 同 abuf:标记 buffer@24(视图的底层 buffer,GC 根)
         vm.jmp("_gcsc_done");
@@ -1851,6 +1864,12 @@ export class AllocatorGenerator {
         // own-data buffer 与内联未缓存 TypedArray 的 @24 = 0(跳过)。
         vm.label("_gcsc_abuf");
         vm.load(VReg.A0, VReg.S0, 24); // owner / buffer
+        vm.cmpImm(VReg.A0, 0);
+        vm.jeq("_gcsc_done");
+        vm.call("_gc_mark_one");
+        vm.jmp("_gcsc_done");
+        vm.label("_gcsc_dv");
+        vm.load(VReg.A0, VReg.S0, 32); // DataView.buffer@32
         vm.cmpImm(VReg.A0, 0);
         vm.jeq("_gcsc_done");
         vm.call("_gc_mark_one");
@@ -2479,106 +2498,17 @@ export class AllocatorGenerator {
 
     // [引擎库 P1] _engine_symaddr(A0=symId) -> 宿主运行时符号地址(lea 经 PC-relative
     // 解析,post-ASLR 正确)。小符号表:id → 运行时 helper。fragment 的 bl 重定位据此
-    // 填 trampoline 的 addr_slot。新符号在此加 case + 同步 engine/compile.js 的 SYM_IDS。
+    // 填 trampoline 的 addr_slot。符号表在 engine/symbols.js(单一真源),只能末尾追加。
+    // 必须在运行时全部生成后调用:平台条件符号(如 _win_build_argv 在非 Windows 下无体)
+    // 靠已发射 label 表判存,缺失的 id 保留占位返回 0,以免整表 id 因平台而错位。
     generateEngineSymaddr() {
         const vm = this.vm;
-        const syms = [
-            "_number_coerce", "_js_add", "_valueToStr", "_strconcat",
-            "_object_get_ic", "_subscript_get", "_math_sqrt",
-            // 与 engine/compile.js SYM_IDS 严格同序:位运算 / 布尔强制 / 关系比较 / Math。
-            "_js_band", "_js_bor", "_js_bxor", "_js_bshl", "_js_bshr", "_js_bushr",
-            "_to_boolean", "_js_relcmp",
-            "_math_abs", "_math_floor", "_math_ceil", "_math_round", "_math_pow",
-            // 宿主可变数据全局:lea 取宿主地址(数据 label),供片段 ldr-literal 槽运行时填。
-            "_heap_base", "_heap_ptr",
-            // 抽象相等(动态 ==)、数值→字符串(concat 内联数字渲染)。
-            "_abstract_eq", "_floatToString",
-            // 分配类(数组/对象字面量,走宿主共享堆)。
-            "_array_new_with_size", "_array_set", "_object_new_sized", "_object_define",
-            // 长度 / typeof / 装箱字符串 / 数组 join。
-            "_js_length", "_js_box_string", "_js_typeof", "_array_join", "_array_to_string",
-            // 常用字符串方法。
-            "_str_toUpperCase", "_str_toLowerCase", "_str_slice", "_str_indexOf",
-            "_str_charCodeAt", "_str_split", "_str_trim", "_str_substring",
-            "_str_repeat", "_str_includes", "_str_replace",
-            "_js_unbox", "_array_length", "_getStrContent", "_typeof", "_to_int32",
-            // 对象属性读 NO_IC 形态(片段:站点回填写 RX 页崩,改走此二者无写回)。
-            "_object_get", "_maybe_getter",
-            // 关系比较 < <= > >=。
-            "_js_lt", "_js_le", "_js_gt", "_js_ge",
-            // 更多 Math。
-            "_math_trunc", "_math_cbrt",
-            // 更多字符串方法。
-            "_str_padStart", "_str_padEnd", "_str_at", "_str_charAt",
-            "_str_startsWith", "_str_endsWith", "_str_replaceAll",
-            "_str_replaceAll_fn",
-            // 更多数组方法(无闭包)。
-            "_array_push", "_array_get", "_array_reverse", "_array_slice",
-            "_array_includes", "_array_indexOf", "_array_at", "_array_flat",
-            // 对数/指数 Math;异常展开;数值解析/转换。
-            "_math_log", "_math_log2", "_math_log10", "_math_exp",
-            "_throw_unwind", "_js_parseInt", "_js_parseFloat", "_str_to_num",
-            // toString(radix)/toFixed;sort 比较;lastIndexOf;instanceof。
-            "_is_bigint", "_num_toFixed", "_strcmp", "_str_lastIndexOf", "_instanceof",
-            // toString(radix);sort/元素写回;异常状态全局(HOST_DATA,adrp 重定位)。
-            "_num_toString", "_subscript_set", "_exception_value", "_exception_pending",
-            // 闭包/回调类(P7:eval 内函数/箭头表达式)。
-            "_typed_array_new", "_alloc",
-            // 闭包调用/回调体内常见:async 分支、===、sort 比较器归一。
-            "_coroutine_create", "_strict_eq", "_syscall_arg",
-            // 直接闭包调用(IIFE)的 async 分支(dead 但内联发射)。
-            "_promise_new", "_scheduler_spawn",
-            // 闭包捕获外层 eval 局部(装箱共享 box);TDZ 未初始化读错误路径。
-            "_box_alloc", "_print_str",
-            // try/catch 异常上下文链头(HOST_DATA);for-of 字符串迭代 codePointAt。
-            "_exc_ctx_top", "_str_codepoint_at",
-            // throw new Error(建对象);for-of 迭代器的字符串/Map 分支(数组不取但内联发射)。
-            "_object_new", "_object_set", "_str_cp_bytes", "_map_entries",
-            // 属性键装箱 tag helper(成员写 o.k=v / 方法调用 a.push():emitBoxedStringKey 的
-            // A1 键 |= STRING_TAG)。片段捕获对象/数组经成员写/方法变异必经。
-            "_tag_str_a1", "_tag_key_a1",
-            // 动态方法调用可调用性校验(a.push()/o.f() 取属性后校验)。
-            "_validate_callable",
-            // 数组变异簇(捕获数组经方法变异;均为 array/index.js 恒发射 live 实现)。
-            "_array_pop", "_array_shift", "_array_unshift", "_array_splice",
-            "_array_concat",
-            // 数组结果装箱(eval 内数组方法闭包收尾装箱新数组)。
-            "_box_arr_r",
-            // for-of IteratorClose(提前 break/error 时调 iterator.return())
-            "_iterator_close",
-            "_box_obj_r",
-            "_object_normalize_order",
-            "_intToStr", "_is_symbol", "_array_spread_into",
-            // 数组 species 协议(concat/slice/map/filter 编译期内联引用)、泛型回退
-            "_array_species_check", "_agen_map", "_agen_filter",
-            // 数组 splice species 协议 + 泛型回退
-            "_agen_splice", "_array_splice_rt",
-            // argc ABI 全局(HOST_DATA):Function/eval 片段体内 arguments 构造读宿主值
-            "_call_argc",
-            // for-in 数组侧表具名键(与 SYM_IDS 同序)
-            "_closure_props_find",
-            // eval/with 片段：`in`/HasProperty、赋值前自有键
-            "_object_has",
-            // eval 数值规范化；生成器声明；闭包属性写；define attr
-            "_nan_canon", "_generator_new", "_closure_prop_set", "_object_set_prop_attr",
-            // eval 片段 globalThis 数据槽；Function [[Strict]] 元数据
-            "_global_this", "_func_meta_strict",
-            // 数组解构限量 spread + IteratorClose(与 SYM_IDS 同序,加在末尾)
-            "_array_spread_into_n",
-            // 片段内函数值装箱(与 SYM_IDS 同序,加在末尾)
-            "_js_box_function",
-            // 闭包属性侧表读/define/attr(与 SYM_IDS 同序,加在末尾)
-            "_closure_prop_get", "_closure_prop_define", "_closure_prop_set_attr",
-            // well-known Symbol 惰性单例(与 SYM_IDS 同序,加在末尾)
-            "_symbol_wellknown",
-            // 无原型对象创建(@@unscopables 等);对象属性删除(delete 片段)
-            "_object_new_raw", "_object_delete",
-            // 可捕获 ReferenceError(TDZ 读/写守卫;片段内 let 前读)
-            "_throw_reference_error",
-        ];
+        const syms = SYM_NAMES;
+        const defined = vm.asm.labels;
         vm.label("_engine_symaddr");
         vm.prologue(0, []);
         for (let i = 0; i < syms.length; i++) {
+            if (!defined.has(syms[i]) && !SYM_LATE_LABELS.has(syms[i])) continue;
             vm.cmpImm(VReg.A0, i);
             vm.jne("_esym_" + (i + 1));
             vm.lea(VReg.RET, syms[i]);
@@ -2643,6 +2573,11 @@ export class AllocatorGenerator {
         vm.loadByte(VReg.V1, VReg.V2, 5); vm.shl(VReg.V1, VReg.V1, 8); vm.or(VReg.A0, VReg.A0, VReg.V1);
         vm.loadByte(VReg.V1, VReg.V2, 6); vm.shl(VReg.V1, VReg.V1, 16); vm.or(VReg.A0, VReg.A0, VReg.V1);
         vm.loadByte(VReg.V1, VReg.V2, 7); vm.shl(VReg.V1, VReg.V1, 24); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        // 伪 symId 0xffffffff:数据区起点哨兵,不是符号(见 engine/compile.js RELOC_RW_SPLIT)。
+        // 不可送 _engine_symaddr(返 0 → 把 0 写进数据区首 8 字节),跳过即可。
+        vm.movImm64(VReg.V1, 0xffffffffn);
+        vm.cmp(VReg.A0, VReg.V1);
+        vm.jeq("_erx_relskip");
         vm.call("_engine_symaddr"); // RET = 符号地址
         // x64:V0=RAX=RET 别名(见 runtime-helper-reg-contracts),下面 pop V0 会覆盖
         // symaddr 返回值(RAX)→ 把 slotOff 当地址写进 slot → trampoline jmp slotOff 崩。
@@ -2653,14 +2588,40 @@ export class AllocatorGenerator {
         vm.store(VReg.V1, 0, VReg.V2);     // 写 8 字节地址
         vm.addImm(VReg.S3, VReg.S3, 8);
         vm.jmp("_erx_rel");
+        vm.label("_erx_relskip");
+        vm.pop(VReg.V0); // 丢弃暂存的 slotOff(哨兵项无槽可填)
+        vm.addImm(VReg.S3, VReg.S3, 8);
+        vm.jmp("_erx_rel");
         vm.label("_erx_reldone");
         // I-cache 刷新(写码后必需,防陈旧执行 SIGILL)
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S2);
         vm.call("_engine_iflush");
-        // mprotect RX —— 长度按 fragLen 向上取整到页倍数(多页片段;须与 mmap 同长)。
+        // 只把代码段设 RX:数据区起点由哨兵项(symId=0xffffffff)给出,缺失时退回整段 RX。
+        // V0 = 分界偏移(默认 fragLen);无 call 介入,V 寄存器可跨循环存活。
+        vm.mov(VReg.V0, VReg.S2);
+        vm.movImm(VReg.S3, 0);
+        vm.label("_erx_split");
+        vm.cmp(VReg.S3, VReg.S5);
+        vm.jge("_erx_splitdone");
+        vm.add(VReg.V2, VReg.S4, VReg.S3);
+        vm.loadByte(VReg.V1, VReg.V2, 4);
+        vm.cmpImm(VReg.V1, 0xff);
+        vm.jne("_erx_splitnext");
+        vm.loadByte(VReg.V1, VReg.V2, 5); vm.cmpImm(VReg.V1, 0xff); vm.jne("_erx_splitnext");
+        vm.loadByte(VReg.V1, VReg.V2, 6); vm.cmpImm(VReg.V1, 0xff); vm.jne("_erx_splitnext");
+        vm.loadByte(VReg.V1, VReg.V2, 7); vm.cmpImm(VReg.V1, 0xff); vm.jne("_erx_splitnext");
+        vm.loadByte(VReg.V0, VReg.V2, 0);
+        vm.loadByte(VReg.V1, VReg.V2, 1); vm.shl(VReg.V1, VReg.V1, 8); vm.or(VReg.V0, VReg.V0, VReg.V1);
+        vm.loadByte(VReg.V1, VReg.V2, 2); vm.shl(VReg.V1, VReg.V1, 16); vm.or(VReg.V0, VReg.V0, VReg.V1);
+        vm.loadByte(VReg.V1, VReg.V2, 3); vm.shl(VReg.V1, VReg.V1, 24); vm.or(VReg.V0, VReg.V0, VReg.V1);
+        vm.label("_erx_splitnext");
+        vm.addImm(VReg.S3, VReg.S3, 8);
+        vm.jmp("_erx_split");
+        vm.label("_erx_splitdone");
+        // mprotect RX —— 长度按分界偏移向上取整到页倍数(数据区已 16KB 对齐 → 恰好不含数据)。
         vm.mov(VReg.A0, VReg.S0);
-        vm.addImm(VReg.A1, VReg.S2, 4095);
+        vm.addImm(VReg.A1, VReg.V0, 4095);
         vm.movImm64(VReg.V0, 0xfffffffffffff000n);
         vm.and(VReg.A1, VReg.A1, VReg.V0);
         vm.movImm(VReg.A2, 5);
@@ -2729,6 +2690,10 @@ export class AllocatorGenerator {
         vm.loadByte(VReg.V1, VReg.V2, 5); vm.shl(VReg.V1, VReg.V1, 8); vm.or(VReg.A0, VReg.A0, VReg.V1);
         vm.loadByte(VReg.V1, VReg.V2, 6); vm.shl(VReg.V1, VReg.V1, 16); vm.or(VReg.A0, VReg.A0, VReg.V1);
         vm.loadByte(VReg.V1, VReg.V2, 7); vm.shl(VReg.V1, VReg.V1, 24); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        // 数据区起点哨兵(0xffffffff)不是符号,跳过(见 _engine_reloc_exec 同处注释)
+        vm.movImm64(VReg.V1, 0xffffffffn);
+        vm.cmp(VReg.A0, VReg.V1);
+        vm.jeq("_erxf_relskip");
         vm.call("_engine_symaddr");
         vm.mov(VReg.V2, VReg.RET); // V2 = 符号地址(躲开 pop V0 对 RET 的覆盖,x64 别名)
         vm.pop(VReg.V0);           // slotOff
@@ -2736,12 +2701,35 @@ export class AllocatorGenerator {
         vm.store(VReg.V1, 0, VReg.V2);
         vm.addImm(VReg.S3, VReg.S3, 8);
         vm.jmp("_erxf_rel");
+        vm.label("_erxf_relskip");
+        vm.pop(VReg.V0);
+        vm.addImm(VReg.S3, VReg.S3, 8);
+        vm.jmp("_erxf_rel");
         vm.label("_erxf_reldone");
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S2);
         vm.call("_engine_iflush");
+        // 分界偏移(哨兵项 slotOff;无则整段 RX)→ 只把代码段设 RX,数据区保持 RW
+        vm.mov(VReg.V0, VReg.S2);
+        vm.movImm(VReg.S3, 0);
+        vm.label("_erxf_split");
+        vm.cmp(VReg.S3, VReg.S5);
+        vm.jge("_erxf_splitdone");
+        vm.add(VReg.V2, VReg.S4, VReg.S3);
+        vm.loadByte(VReg.V1, VReg.V2, 4); vm.cmpImm(VReg.V1, 0xff); vm.jne("_erxf_splitnext");
+        vm.loadByte(VReg.V1, VReg.V2, 5); vm.cmpImm(VReg.V1, 0xff); vm.jne("_erxf_splitnext");
+        vm.loadByte(VReg.V1, VReg.V2, 6); vm.cmpImm(VReg.V1, 0xff); vm.jne("_erxf_splitnext");
+        vm.loadByte(VReg.V1, VReg.V2, 7); vm.cmpImm(VReg.V1, 0xff); vm.jne("_erxf_splitnext");
+        vm.loadByte(VReg.V0, VReg.V2, 0);
+        vm.loadByte(VReg.V1, VReg.V2, 1); vm.shl(VReg.V1, VReg.V1, 8); vm.or(VReg.V0, VReg.V0, VReg.V1);
+        vm.loadByte(VReg.V1, VReg.V2, 2); vm.shl(VReg.V1, VReg.V1, 16); vm.or(VReg.V0, VReg.V0, VReg.V1);
+        vm.loadByte(VReg.V1, VReg.V2, 3); vm.shl(VReg.V1, VReg.V1, 24); vm.or(VReg.V0, VReg.V0, VReg.V1);
+        vm.label("_erxf_splitnext");
+        vm.addImm(VReg.S3, VReg.S3, 8);
+        vm.jmp("_erxf_split");
+        vm.label("_erxf_splitdone");
         vm.mov(VReg.A0, VReg.S0);
-        vm.addImm(VReg.A1, VReg.S2, 4095);
+        vm.addImm(VReg.A1, VReg.V0, 4095);
         vm.movImm64(VReg.V0, 0xfffffffffffff000n);
         vm.and(VReg.A1, VReg.A1, VReg.V0);
         vm.movImm(VReg.A2, 5);
@@ -2792,8 +2780,11 @@ export class AllocatorGenerator {
     generate() {
         this.generateEngineSmoke();
         this.generateEngineExec();
-        this.generateEngineSymaddr();
         this.generateEngineIflush();
+        // 注意:不要在这里调 generateEngineSymaddr——此时 _alloc 等主体尚未发射,
+        // 且末尾 generateRuntime 会再调一次;两次共用 _esym_* 标签名会让第二次的
+        // 前向 jne 误绑到第一次的旧标签 → symId 查表落空返 0 → 片段 trampoline
+        // 跳到地址 0(eval/new Function 凡需 _alloc 即 SIGSEGV)。
         this.generateEngineRelocExec();
         this.generateEngineRelocExecFp();
         this.generateHeapInit();
@@ -3262,6 +3253,32 @@ export class AllocatorGenerator {
         vm.shl(VReg.V4, VReg.V1, 3);
         vm.add(VReg.V3, VReg.V3, VReg.V4);
         vm.load(VReg.S0, VReg.V3, 0); // S0 = user ptr
+        // 堆串:type 写在块头低字节(user-16),user+0 是首字符。
+        // TYPE_STRING 无外向指针;按 footprint 扫内容会把源码/拼接串的 UTF-8
+        // 当字误判成堆指针,自举 live 集顶到数 GB、drain 占满采样。
+        // 块头低字节==6 由 writeStringHeader 独占(分配器 class 位在 bits 6+,
+        // 不会写成 6)。跳过 payload,本体已在 mark_one 置位。
+        vm.subImm(VReg.V0, VReg.S0, HEADER_SIZE);
+        vm.load(VReg.V2, VReg.V0, 0);
+        vm.andImm(VReg.V2, VReg.V2, 0xff);
+        vm.cmpImm(VReg.V2, 6); // TYPE_STRING
+        vm.jeq("_gcd_loop");
+        // TypedArray / ArrayBuffer / DataView 的用户区在头之后是原始数值/字节,
+        // 不是堆指针。按 footprint 整块保守扫描会把指令字/浮点位误判成指针,
+        // 自编译 66MB TEXT 缓冲把堆顶到数 GB、full GC 扫载荷占满采样。
+        // 头里的 data_ptr/buffer/owner 仍扫(48B 覆盖 DataView.buffer@32)。
+        // 必须比对完整 type 字:数组 data 块首元素若是堆指针,低字节可能恰为
+        // 0x40/0x50/0x60(16 对齐地址),loadByte 会误判成 TA,只扫 48B → 漏标 → UAF。
+        vm.load(VReg.V1, VReg.S0, 0);
+        vm.cmpImm(VReg.V1, 12); // TYPE_ARRAY_BUFFER
+        vm.jeq("_gcd_hdr_only");
+        vm.cmpImm(VReg.V1, 14); // TYPE_DATA_VIEW
+        vm.jeq("_gcd_hdr_only");
+        vm.cmpImm(VReg.V1, 0x40);
+        vm.jlt("_gcd_full");
+        vm.cmpImm(VReg.V1, 0x61); // TYPE_FLOAT64_ARRAY
+        vm.jle("_gcd_hdr_only");
+        vm.label("_gcd_full");
         // 扫描整块用户区 [user, block+footprint)（用 footprint 而非记录 size，
         // 覆盖到 size class 对齐的全部字节，防某类型指针字段落在记录 size 之外被漏标）
         vm.subImm(VReg.V0, VReg.S0, HEADER_SIZE); // block
@@ -3277,6 +3294,12 @@ export class AllocatorGenerator {
         vm.cmp(VReg.S3, VReg.V1);
         vm.jle("_gcd_scan_setup");
         vm.mov(VReg.S3, VReg.V1); // clamp
+        vm.jmp("_gcd_scan_setup");
+        vm.label("_gcd_hdr_only");
+        vm.addImm(VReg.S3, VReg.S0, 48);
+        vm.cmp(VReg.S3, VReg.S5);
+        vm.jle("_gcd_scan_setup");
+        vm.mov(VReg.S3, VReg.S5);
         vm.label("_gcd_scan_setup");
         vm.mov(VReg.S2, VReg.S0); // cur = user ptr
 
@@ -3466,10 +3489,29 @@ export class AllocatorGenerator {
         vm.jeq("_gcro_advance"); // 未标记 → 跳过（将被 sweep 回收）
         // 已标记：扫描子对象。S2=cur user 指针，S4=scan_end（都用 callee-saved 跨 call 保活）
         vm.load(VReg.V0, VReg.S0, HDR_FLAGS_SIZE);
+        vm.andImm(VReg.V3, VReg.V0, 0xff);
+        vm.cmpImm(VReg.V3, 6); // TYPE_STRING:无外向指针,见 _gc_drain
+        vm.jeq("_gcro_advance");
         vm.shrImm(VReg.V1, VReg.V0, SIZE_SHIFT); // size
         vm.addImm(VReg.S2, VReg.S0, HEADER_SIZE); // cur = user ptr
+        vm.load(VReg.V3, VReg.S2, 0);
+        vm.cmpImm(VReg.V3, 12);
+        vm.jeq("_gcro_hdr_only");
+        vm.cmpImm(VReg.V3, 14);
+        vm.jeq("_gcro_hdr_only");
+        vm.cmpImm(VReg.V3, 0x40);
+        vm.jlt("_gcro_full");
+        vm.cmpImm(VReg.V3, 0x61);
+        vm.jle("_gcro_hdr_only");
+        vm.label("_gcro_full");
         vm.add(VReg.S4, VReg.S2, VReg.V1); // scan_end tentative
         vm.cmp(VReg.S4, VReg.S1); // clamp 到 heap_end
+        vm.jle("_gcro_scan");
+        vm.mov(VReg.S4, VReg.S1);
+        vm.jmp("_gcro_scan");
+        vm.label("_gcro_hdr_only");
+        vm.addImm(VReg.S4, VReg.S2, 48);
+        vm.cmp(VReg.S4, VReg.S1);
         vm.jle("_gcro_scan");
         vm.mov(VReg.S4, VReg.S1);
         vm.label("_gcro_scan");
@@ -4262,6 +4304,13 @@ export class AllocatorGenerator {
         asm.addDataLabel("_call_argc");
         asm.addDataQword(0);
 
+        // [argv 溢出槽] 寄存器窗口(A0-A4 = 实参 0-4,A5 = this)之外的实参 5..15。
+        // 调用点在**全部实参求值完毕后**(与 _call_argc 同一时刻)写入,被调方在 prologue
+        // 立即快照进本帧槽 —— 两者之间无分配,故槽内值不需要作 GC 根(被调方帧槽随栈扫描)。
+        // 与 _call_argc 同一"最后写、最先读"契约;超过 16 个实参仍按旧约定截断。
+        asm.addDataLabel("_call_argv");
+        for (let i = 0; i < 16; i = i + 1) asm.addDataQword(0);
+
         // [gen.return] 生成器 return(v) 注入通道:_generator_return 对挂起协程置
         // pending=1、value=v 后 resume;yield 恢复点(emitYieldValue)见 pending 即清零、
         // 取 value 作返回值、内联跑挂起点与函数出口间的 finalizer 后跳 returnLabel。
@@ -4269,6 +4318,51 @@ export class AllocatorGenerator {
         asm.addDataLabel("_gen_return_pending");
         asm.addDataQword(0);
         asm.addDataLabel("_gen_return_value");
+        asm.addDataQword(0);
+        // yield*:GeneratorYield(innerResult) 原样返回,不再包 {value,done}。
+        asm.addDataLabel("_gen_raw_yield");
+        asm.addDataQword(0);
+        // [async generator] .return(v) 在 yield 挂起点走 AsyncGeneratorUnwrapYieldResumption:
+        // 先 Await(v),再向内层 yield* 转发 return(勿用 _gen_return_pending 抢跑)。
+        asm.addDataLabel("_agen_unwrap_pending");
+        asm.addDataQword(0);
+        asm.addDataLabel("_agen_unwrap_value");
+        asm.addDataQword(0);
+        asm.addDataLabel("_agen_unwrap_coro");
+        asm.addDataQword(0);
+        asm.addDataLabel("_agen_unwrap_return_p");
+        asm.addDataQword(0);
+        asm.addDataLabel("_agen_raw_yield");
+        asm.addDataQword(0);
+        asm.addDataLabel("_agen_return_queued");
+        asm.addDataQword(0);
+        asm.addDataLabel("_paw_resume_cb");
+        asm.addDataQword(0);
+        asm.addDataLabel("_agen_unwrap_cb");
+        asm.addDataQword(0);
+        asm.addDataLabel("_agen_defer_returnl");
+        asm.addDataQword(0);
+        asm.addDataLabel("_agen_returnl_cb");
+        asm.addDataQword(0);
+        // AsyncGeneratorFunction / AsyncGenerator / AsyncIterator 原型链单例槽。
+        asm.addDataLabel("_asyncgenfunc_singleton");
+        asm.addDataQword(0);
+        asm.addDataLabel("_nsobj_asyncgenfunc_proto");
+        asm.addDataQword(0);
+        asm.addDataLabel("_nsobj_asyncgen_proto");
+        asm.addDataQword(0);
+        asm.addDataLabel("_nsobj_asynciterator_proto");
+        asm.addDataQword(0);
+        // GeneratorFunction.prototype / Generator.prototype / AsyncFunction.prototype 单例槽。
+        asm.addDataLabel("_nsobj_genfunc_proto");
+        asm.addDataQword(0);
+        asm.addDataLabel("_nsobj_gen_proto");
+        asm.addDataQword(0);
+        asm.addDataLabel("_nsobj_asyncfunc_proto");
+        asm.addDataQword(0);
+        asm.addDataLabel("_genfunc_singleton");
+        asm.addDataQword(0);
+        asm.addDataLabel("_asyncfunc_singleton");
         asm.addDataQword(0);
 
         // ---- GC 内部标量（都放在 [_heap_meta, _heap_meta_end) 跳过区内，
@@ -4405,7 +4499,20 @@ export class AllocatorGenerator {
         // 数据段锚槽 → 根扫描覆盖 → 表与堆上转移节点不被回收。见 SHAPE_TRANSITIONS_DESIGN.md §3/§4。
         asm.addDataLabel("_shape_transition_root");
         asm.addDataQword(0);  // NULL - 首次 _shape_transition_put 建表并写入
+        // 空形状静态描述符(仅 key_count=0);_object_new 初始 shape_ptr,供加键转移起点。
+        asm.addDataLabel("_shape_empty");
+        asm.addDataQword(0);
+        // for-in 快路缓存:Object.prototype 可枚举键是否为空(0未知/1空/2非空)
+        asm.addDataLabel("_ofk_op_enum_empty");
+        asm.addDataQword(0);
 
+        // [IC 审计] ASMJS_IC_STATS=1 编译进运行时时启用;退出前打印。
+        asm.addDataLabel("_ic_stat_legacy");
+        asm.addDataQword(0);
+        asm.addDataLabel("_ic_stat_shaped");
+        asm.addDataQword(0);
+        asm.addDataLabel("_ic_stat_slow");
+        asm.addDataQword(0);
         // 事件循环队列（微任务 / setImmediate / setTimeout(0)）的单链表头尾指针。
         // 节点由 _ev_* 运行时函数分配；根扫描覆盖这些槽 → 队列中的回调/句柄存活。
         asm.addDataLabel("_ev_micro_head");

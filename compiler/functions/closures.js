@@ -1,8 +1,8 @@
 // asm.js 编译器 - 闭包编译
 // 编译函数表达式、闭包、函数体
 
-import { VReg } from "../../vm/index.js";
-import { analyzeCapturedVariables, analyzeSharedVariables, analyzeDirectEvalBoxedVars, collectLocalDeclarations, collectVarDeclarations } from "../../lang/analysis/closure.js";
+import { VReg } from "../../vm/registers.js";
+import { analyzeCapturedVariables, analyzeSharedVariables, analyzeDirectEvalBoxedVars, collectLocalDeclarations, collectDirectFunctionDeclNames, collectVarDeclarations, collectLexicalDeclarations, collectParamEvalVarNames, collectBodyEvalVarNames, collectPatternNames, outerLocalsGet } from "../../lang/analysis/closure.js";
 import { ASYNC_CLOSURE_MAGIC, isAsyncFunction, isGeneratorFunction } from "../async/index.js";
 
 // 闭包魔数 - 用于区分普通函数指针和闭包对象
@@ -15,6 +15,149 @@ const TDZ_SENTINEL = 0x7ff70000deadbeefn;
 
 // 闭包编译方法混入
 export const ClosureCompiler = {
+    // 形参默认值求值前,把模块顶层共享 box 预装入当前帧局部槽。
+    emitSeedMainCapturedVars() {
+        const mcv = this.ctx.mainCapturedVars;
+        if (!mcv) return;
+        const vm = this.vm;
+        if (!this.ctx.boxedVars) this.ctx.boxedVars = new Set();
+        for (const mn in mcv) {
+            if (typeof mcv[mn] !== "string") continue;
+            if (this.ctx.paramEvalVarNames && this.ctx.paramEvalVarNames.has(mn)) continue;
+            if (this.ctx.getLocal(mn)) continue;
+            const off = this.ctx.allocLocal(mn);
+            vm.lea(VReg.V1, mcv[mn]);
+            vm.load(VReg.V1, VReg.V1, 0);
+            vm.store(VReg.FP, off, VReg.V1);
+            this.ctx.boxedVars.add(mn);
+        }
+    },
+
+    // hasParameterExpressions:默认值闭包已捕获外层同名 box;体 varEnv 须新建槽,
+    // 否则 emitHoistedVarInits / var 声明复用 seed 槽,写穿外层(paramsbody-var-open)。
+    unbindBodyBindingsAfterParamInit(body, params) {
+        if (!body || !this._paramsHaveExpressions || !this._paramsHaveExpressions(params)) return;
+        const bodyBinds = {};
+        collectLocalDeclarations(body, bodyBinds);
+        collectDirectFunctionDeclNames(body, bodyBinds);
+        const paramNames = {};
+        const list = params || [];
+        for (let i = 0; i < list.length; i++) {
+            if (list[i]) collectPatternNames(list[i], paramNames);
+        }
+        for (const nm in bodyBinds) {
+            if (bodyBinds[nm] !== true) continue;
+            if (paramNames[nm] === true) continue;
+            if (!this.ctx.getLocal(nm)) continue;
+            this.ctx.locals.delete(nm);
+        }
+        this.ctx._paramSplitBodyVarEnv = true;
+    },
+
+    markParamEvalVarBoxes() {
+        if (!this.ctx.paramEvalVarNames) return;
+        if (!this.ctx.boxedVars) this.ctx.boxedVars = new Set();
+        for (const nm of this.ctx.paramEvalVarNames) this.ctx.boxedVars.add(nm);
+    },
+
+    maybeEmitParamEvalVarSlots(skipWhenFdiTransfer) {
+        this.setupParamEvalVarNames(this._pendingParamEvalParams || []);
+        if (!this.ctx.paramEvalVarNames) return;
+        this.markParamEvalVarBoxes();
+        if (!skipWhenFdiTransfer) this.emitParamEvalVarSlots();
+    },
+
+    // 形参默认值 eval('var x') 须在独立 param 环境建 var;闭包共享 box,eval 后更新。
+    emitParamEvalVarSlots() {
+        const names = this.ctx.paramEvalVarNames;
+        if (!names || names.size === 0) return;
+        const vm = this.vm;
+        const undef = 0x7ffb000000000000n;
+        if (!this.ctx.boxedVars) this.ctx.boxedVars = new Set();
+        for (const name of names) {
+            if (this.ctx.getLocal(name)) continue;
+            const off = this.ctx.allocLocal(name);
+            vm.movImm(VReg.A0, 8);
+            vm.call("_alloc");
+            const mcv = this.ctx.getMainCapturedVar && this.ctx.getMainCapturedVar(name);
+            if (mcv) {
+                vm.lea(VReg.V1, mcv);
+                vm.load(VReg.V1, VReg.V1, 0);
+                vm.load(VReg.V0, VReg.V1, 0);
+            } else {
+                vm.movImm64(VReg.V0, undef);
+            }
+            vm.store(VReg.RET, 0, VReg.V0);
+            vm.store(VReg.FP, off, VReg.RET);
+            this.ctx.boxedVars.add(name);
+        }
+    },
+
+    setupParamEvalVarNames(params) {
+        const obj = collectParamEvalVarNames(params);
+        let any = false;
+        for (const k in obj) { any = true; break; }
+        this.ctx.paramEvalVarNames = any ? new Set(Object.keys(obj)) : null;
+        return any;
+    },
+
+    // 函数体 eval('var x') 与捕获同名:独立 var 槽(undefined),复合赋值 LHS 仍走 __cap_x。
+    emitBodyEvalVarSlots() {
+        const names = this.ctx.bodyEvalVarNames;
+        if (!names || names.size === 0) return;
+        const vm = this.vm;
+        const undef = 0x7ffb000000000000n;
+        if (!this.ctx.boxedVars) this.ctx.boxedVars = new Set();
+        for (const name of names) {
+            if (this.ctx.getLocal(name)) continue;
+            const off = this.ctx.allocLocal(name);
+            vm.movImm(VReg.A0, 8);
+            vm.call("_alloc");
+            vm.movImm64(VReg.V0, undef);
+            vm.store(VReg.RET, 0, VReg.V0);
+            vm.store(VReg.FP, off, VReg.RET);
+            this.ctx.boxedVars.add(name);
+        }
+    },
+
+    buildParamEvalDirectLayout() {
+        const parts = [];
+        const pushSlot = (key, off, boxed) => {
+            parts.push(key + ":" + off + (boxed ? ":b" : ""));
+        };
+        const pbn = this.ctx.paramBindingNames;
+        if (pbn) {
+            for (const nm in pbn) {
+                if (pbn[nm] !== true) continue;
+                const off = this.ctx.getLocal(nm);
+                if (!off) continue;
+                const boxed = this.ctx.boxedVars && this.ctx.boxedVars.has(nm);
+                pushSlot(nm, off, boxed);
+            }
+        }
+        if (this.ctx.paramEvalVarNames) {
+            for (const nm of this.ctx.paramEvalVarNames) {
+                const off = this.ctx.getLocal(nm);
+                if (off) pushSlot(nm, off, true);
+            }
+        }
+        const mcv = this.ctx.mainCapturedVars;
+        if (mcv) {
+            for (const mn in mcv) {
+                if (typeof mcv[mn] !== "string") continue;
+                if (this.ctx.paramEvalVarNames && this.ctx.paramEvalVarNames.has(mn)) continue;
+                const off = this.ctx.getLocal(mn);
+                if (off) pushSlot(mn, off, true);
+            }
+        }
+        if (this.ctx.paramLexNames) {
+            for (const pn of this.ctx.paramLexNames) {
+                parts.push("!lex:" + pn);
+            }
+        }
+        return parts.join(",");
+    },
+
     // [L1 var hoist] 进入 VariableEnvironment 时把所有 var 绑定写成 undefined。
     // body: BlockStatement / 表达式体 / Program body 数组之父节点均可。
     // 跳过已有槽的参数/捕获(保留其值);boxed 则预建 box(值=undefined)。
@@ -26,7 +169,7 @@ export const ClosureCompiler = {
         if (!this.ctx.preboxedVars) this.ctx.preboxedVars = new Set();
         const undef = 0x7ffb000000000000n; // JS_UNDEFINED
         for (const name in vars) {
-            if (!Object.prototype.hasOwnProperty.call(vars, name)) continue;
+            if (vars[name] !== true) continue; // 旗标字典:=== true 避开原型链
             if (name === "__this" || name === "arguments") continue;
             let off = this.ctx.getLocal(name);
             const already = !!off;
@@ -42,8 +185,8 @@ export const ClosureCompiler = {
                 // 全局 box → 双 box 分叉,闭包永远读陈旧值("var f=()=>x; var x=…"
                 // 族:closure 读 undefined / 计数不更新)。仅模块顶层(funcName 形如
                 // module_N)复用;函数体内同名局部遮蔽时无此语义,仍自建 box。
-                const gl = (this.ctx.getMainCapturedVar && typeof this.ctx.funcName === "string" &&
-                    this.ctx.funcName.indexOf("module_") === 0) ? this.ctx.getMainCapturedVar(name) : null;
+                const gl = (this.ctx.shouldReuseMainCapturedBox && this.ctx.shouldReuseMainCapturedBox())
+                    ? this.ctx.getMainCapturedVar(name) : null;
                 if (gl) {
                     vm.lea(VReg.V1, gl);
                     vm.load(VReg.RET, VReg.V1, 0); // RET = _main 预建的全局 box
@@ -61,9 +204,8 @@ export const ClosureCompiler = {
         }
     },
 
-    // 剩余参数 ...rest：把 A_pos..A4 中非 undefined 的实参收集为数组存入 rest 局部。
-    // A5 保留给 this（方法约定），故最多收 5 个。遇 undefined 停止（未提供实参已被
-    // 调用方填 JS_UNDEFINED）。用于 scratchReg(...regs) 等。
+    // 剩余参数 ...rest：A_pos..A4 + _argvSpill[5..] 中非 undefined 的实参收成数组。
+    // A5 为 this,不收。遇 undefined 停止(未提供实参已被调用方/快照填 JS_UNDEFINED)。
     emitRestParam(restName, pos) {
         const vm = this.vm;
         const restOff = this.ctx.allocLocal(restName);
@@ -72,6 +214,14 @@ export const ClosureCompiler = {
             const so = this.ctx.allocLocal(`__rest_a_${pos}_${k}`);
             vm.store(VReg.FP, so, vm.getArgReg(k));
             saved.push(so);
+        }
+        const spill = this.ctx._argvSpill;
+        if (spill) {
+            for (let k = 5; k < 16; k++) {
+                if (spill[k] === undefined) break;
+                if (k < pos) continue;
+                saved.push(spill[k]);
+            }
         }
         vm.movImm(VReg.A0, 0);
         vm.call("_array_new_with_size");
@@ -89,6 +239,94 @@ export const ClosureCompiler = {
             vm.store(VReg.FP, restOff, VReg.RET);
         }
         vm.label(done);
+    },
+
+    // 类构造器 rest:...params。约定 A0=this、实参 A1..A5(与方法 emitRestParam 的
+    // A0..A4 错位)。pos = rest 在形参表中的 0-based 下标 → 从 getArgReg(pos+1) 起收。
+    emitCtorRestParam(restName, pos) {
+        const vm = this.vm;
+        const restOff = this.ctx.allocLocal(restName);
+        const saved = [];
+        // 形参 i 对应实参寄存器 A(i+1);最多收到 A5。
+        for (let k = pos + 1; k <= 5; k++) {
+            const so = this.ctx.allocLocal(`__ctor_rest_a_${pos}_${k}`);
+            vm.store(VReg.FP, so, vm.getArgReg(k));
+            saved.push(so);
+        }
+        const spill = this.ctx._argvSpill;
+        if (spill) {
+            for (let k = 5; k < 16; k++) {
+                if (spill[k] === undefined) break;
+                if (k < pos + 1) continue;
+                saved.push(spill[k]);
+            }
+        }
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.call("_box_arr_r");
+        vm.store(VReg.FP, restOff, VReg.RET);
+        const done = this.ctx.newLabel("ctor_rest_done");
+        for (let k = 0; k < saved.length; k++) {
+            vm.load(VReg.V0, VReg.FP, saved[k]);
+            vm.movImm64(VReg.V1, 0x7ffb000000000000n);
+            vm.cmp(VReg.V0, VReg.V1);
+            vm.jeq(done);
+            vm.load(VReg.A0, VReg.FP, restOff);
+            vm.mov(VReg.A1, VReg.V0);
+            vm.call("_array_push");
+            vm.store(VReg.FP, restOff, VReg.RET);
+        }
+        vm.label(done);
+    },
+
+    // 类构造器入口的 arguments 对象:构造器约定 A0=this、实参 A1..A5(与方法/函数的
+    // A0..A4 相反),故不能复用 emitArgumentsArray。语义其余部分一致:先读 _call_argc、
+    // 实参落槽、再建数组并标 ARR_IS_ARGUMENTS。
+    emitCtorArgumentsArray() {
+        const vm = this.vm;
+        const argOff = this.ctx.allocLocal("arguments");
+        const argcOff = this.ctx.allocLocal("__argc_saved");
+        vm.lea(VReg.V0, "_call_argc");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.store(VReg.FP, argcOff, VReg.V0);
+        const saved = [];
+        for (let k = 1; k <= 5; k++) {
+            const so = this.ctx.allocLocal(`__ctor_args_a_${k}`);
+            vm.store(VReg.FP, so, vm.getArgReg(k));
+            saved.push(so);
+        }
+        const spill = this.ctx._argvSpill;
+        if (spill) {
+            for (let k = 5; k < 16; k++) {
+                if (spill[k] === undefined) break;
+                saved.push(spill[k]);
+            }
+        }
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.call("_box_arr_r");
+        vm.store(VReg.FP, argOff, VReg.RET);
+        const done = this.ctx.newLabel("ctor_args_done");
+        for (let k = 0; k < saved.length; k++) {
+            vm.load(VReg.V0, VReg.FP, argcOff);
+            vm.cmpImm(VReg.V0, k);
+            vm.jle(done);
+            vm.load(VReg.V0, VReg.FP, saved[k]);
+            vm.load(VReg.A0, VReg.FP, argOff);
+            vm.mov(VReg.A1, VReg.V0);
+            vm.call("_array_push");
+            vm.store(VReg.FP, argOff, VReg.RET);
+        }
+        vm.label(done);
+        vm.load(VReg.A0, VReg.FP, argOff);
+        vm.emitMaskLoad(VReg.V4);
+        vm.andMaskReg(VReg.V0, VReg.A0, VReg.V4);
+        vm.loadByte(VReg.V1, VReg.V0, 1);
+        vm.orImm(VReg.V1, VReg.V1, 32);
+        vm.storeByte(VReg.V0, 1, VReg.V1);
+        for (let k = 1; k <= 5; k++) {
+            vm.load(vm.getArgReg(k), VReg.FP, saved[k - 1]);
+        }
     },
 
     // [D1 L3b] 函数体指令序言是否含 "use strict"(含其它 leading 字符串指令之后)。
@@ -123,17 +361,91 @@ export const ClosureCompiler = {
     // 编译函数表达式
     // 检测函数体是否引用 this（决定箭头是否需要捕获外层 this）
     functionBodyUsesThis(expr) {
-        const seen = new Set();
         const walk = (node) => {
             if (!node || typeof node !== "object") return false;
-            if (Array.isArray(node)) { for (const n of node) if (walk(n)) return true; return false; }
-            if (node.type === "ThisExpression") return true;
+            if (Array.isArray(node)) {
+                for (let i = 0; i < node.length; i++) if (walk(node[i])) return true;
+                return false;
+            }
+            const t = node.type;
+            if (t === "ThisExpression") return true;
             // 不下钻嵌套的普通函数（它们有自己的 this）；箭头函数继续下钻
-            if (node.type === "FunctionExpression" || node.type === "FunctionDeclaration") return false;
+            if (t === "FunctionExpression" || t === "FunctionDeclaration") return false;
+            if (t === "Identifier" || t === "Literal" || t === "Super" ||
+                t === "PrivateIdentifier" || t === "EmptyStatement" || t === "DebuggerStatement" ||
+                t === "MetaProperty" || t === "TemplateElement") return false;
+            if (t === "MemberExpression") {
+                if (walk(node.object)) return true;
+                return node.computed ? walk(node.property) : false;
+            }
+            if (t === "CallExpression" || t === "NewExpression") {
+                if (walk(node.callee)) return true;
+                const args = node.arguments;
+                if (args) for (let i = 0; i < args.length; i++) if (walk(args[i])) return true;
+                return false;
+            }
+            if (t === "BinaryExpression" || t === "LogicalExpression" || t === "AssignmentExpression") {
+                return walk(node.left) || walk(node.right);
+            }
+            if (t === "UnaryExpression" || t === "UpdateExpression" || t === "AwaitExpression" ||
+                t === "YieldExpression" || t === "ThrowStatement" || t === "ReturnStatement" ||
+                t === "SpreadElement" || t === "RestElement" || t === "ExpressionStatement") {
+                return walk(node.argument || node.expression);
+            }
+            if (t === "ArrowFunctionExpression") {
+                // 箭头共享外层 this:继续下钻 body/params
+                if (walk(node.body)) return true;
+                const params = node.params;
+                if (params) for (let i = 0; i < params.length; i++) if (walk(params[i])) return true;
+                return false;
+            }
+            if (t === "BlockStatement" || t === "Program" || t === "ClassBody") {
+                const body = node.body;
+                if (body) for (let i = 0; i < body.length; i++) if (walk(body[i])) return true;
+                return false;
+            }
+            if (t === "IfStatement" || t === "ConditionalExpression") {
+                return walk(node.test) || walk(node.consequent) || walk(node.alternate);
+            }
+            if (t === "VariableDeclaration") {
+                const decls = node.declarations;
+                if (decls) for (let i = 0; i < decls.length; i++) if (walk(decls[i])) return true;
+                return false;
+            }
+            if (t === "VariableDeclarator") {
+                return walk(node.id) || walk(node.init);
+            }
+            if (t === "Property" || t === "PropertyDefinition" || t === "MethodDefinition") {
+                if (node.computed && walk(node.key)) return true;
+                return walk(node.value);
+            }
+            if (t === "ArrayExpression" || t === "ArrayPattern") {
+                const els = node.elements;
+                if (els) for (let i = 0; i < els.length; i++) if (walk(els[i])) return true;
+                return false;
+            }
+            if (t === "ObjectExpression" || t === "ObjectPattern") {
+                const prs = node.properties;
+                if (prs) for (let i = 0; i < prs.length; i++) if (walk(prs[i])) return true;
+                return false;
+            }
+            if (t === "SequenceExpression" || t === "TemplateLiteral") {
+                const xs = node.expressions;
+                if (xs) for (let i = 0; i < xs.length; i++) if (walk(xs[i])) return true;
+                return false;
+            }
+            if (t === "ForStatement") {
+                return walk(node.init) || walk(node.test) || walk(node.update) || walk(node.body);
+            }
+            if (t === "ForInStatement" || t === "ForOfStatement" || t === "WhileStatement" ||
+                t === "DoWhileStatement") {
+                return walk(node.left || node.test) || walk(node.right) || walk(node.body);
+            }
             for (const k in node) {
-                if (k === "type" || k === "loc" || k === "start" || k === "end") continue;
+                if (k === "type" || k === "loc" || k === "start" || k === "end" || k === "range") continue;
+                if (k.length && k.charCodeAt(0) === 95) continue;
                 const v = node[k];
-                if (v && typeof v === "object") { if (walk(v)) return true; }
+                if (v && typeof v === "object" && walk(v)) return true;
             }
             return false;
         };
@@ -143,18 +455,95 @@ export const ClosureCompiler = {
     // 函数体是否把 `arguments` 当值引用(非 obj.arguments 属性/对象字面量键)。
     // 不下钻嵌套普通函数(它们有各自的 arguments);箭头继续下钻(共享外层 arguments)。
     functionBodyUsesArguments(expr) {
+        if (!expr) return false;
         const walk = (node) => {
             if (!node || typeof node !== "object") return false;
-            if (Array.isArray(node)) { for (const n of node) if (walk(n)) return true; return false; }
-            if (node.type === "Identifier" && node.name === "arguments") return true;
-            if (node.type === "FunctionExpression" || node.type === "FunctionDeclaration") return false;
+            if (Array.isArray(node)) {
+                for (let i = 0; i < node.length; i++) if (walk(node[i])) return true;
+                return false;
+            }
+            const t = node.type;
+            if (t === "Identifier") return node.name === "arguments";
+            if (t === "FunctionExpression" || t === "FunctionDeclaration") return false;
+            if (t === "Literal" || t === "ThisExpression" || t === "Super" ||
+                t === "PrivateIdentifier" || t === "EmptyStatement" || t === "DebuggerStatement" ||
+                t === "MetaProperty" || t === "TemplateElement") return false;
+            if (t === "MemberExpression") {
+                if (walk(node.object)) return true;
+                // obj.arguments 的属性名不是引用
+                return node.computed ? walk(node.property) : false;
+            }
+            if (t === "CallExpression" || t === "NewExpression") {
+                if (walk(node.callee)) return true;
+                const args = node.arguments;
+                if (args) for (let i = 0; i < args.length; i++) if (walk(args[i])) return true;
+                return false;
+            }
+            if (t === "BinaryExpression" || t === "LogicalExpression" || t === "AssignmentExpression") {
+                return walk(node.left) || walk(node.right);
+            }
+            if (t === "UnaryExpression" || t === "UpdateExpression" || t === "AwaitExpression" ||
+                t === "YieldExpression" || t === "ThrowStatement" || t === "ReturnStatement" ||
+                t === "SpreadElement" || t === "RestElement" || t === "ExpressionStatement") {
+                return walk(node.argument || node.expression);
+            }
+            if (t === "ArrowFunctionExpression") {
+                if (walk(node.body)) return true;
+                const params = node.params;
+                if (params) for (let i = 0; i < params.length; i++) if (walk(params[i])) return true;
+                return false;
+            }
+            if (t === "BlockStatement" || t === "Program" || t === "ClassBody") {
+                const body = node.body;
+                if (body) for (let i = 0; i < body.length; i++) if (walk(body[i])) return true;
+                return false;
+            }
+            if (t === "IfStatement" || t === "ConditionalExpression") {
+                return walk(node.test) || walk(node.consequent) || walk(node.alternate);
+            }
+            if (t === "VariableDeclaration") {
+                const decls = node.declarations;
+                if (decls) for (let i = 0; i < decls.length; i++) if (walk(decls[i])) return true;
+                return false;
+            }
+            if (t === "VariableDeclarator") {
+                return walk(node.id) || walk(node.init);
+            }
+            if (t === "Property" || t === "PropertyDefinition" || t === "MethodDefinition") {
+                // {arguments:...} 的键名不是引用
+                if (node.computed && walk(node.key)) return true;
+                return walk(node.value);
+            }
+            if (t === "ArrayExpression" || t === "ArrayPattern") {
+                const els = node.elements;
+                if (els) for (let i = 0; i < els.length; i++) if (walk(els[i])) return true;
+                return false;
+            }
+            if (t === "ObjectExpression" || t === "ObjectPattern") {
+                const prs = node.properties;
+                if (prs) for (let i = 0; i < prs.length; i++) if (walk(prs[i])) return true;
+                return false;
+            }
+            if (t === "SequenceExpression" || t === "TemplateLiteral") {
+                const xs = node.expressions;
+                if (xs) for (let i = 0; i < xs.length; i++) if (walk(xs[i])) return true;
+                return false;
+            }
+            if (t === "ForStatement") {
+                return walk(node.init) || walk(node.test) || walk(node.update) || walk(node.body);
+            }
+            if (t === "ForInStatement" || t === "ForOfStatement" || t === "WhileStatement" ||
+                t === "DoWhileStatement") {
+                return walk(node.left || node.test) || walk(node.right) || walk(node.body);
+            }
+            if (t === "AssignmentPattern") {
+                return walk(node.left) || walk(node.right);
+            }
             for (const k in node) {
-                if (k === "type" || k === "loc" || k === "start" || k === "end") continue;
-                // obj.arguments 的属性名 / {arguments:...} 的键名不是引用
-                if (node.type === "MemberExpression" && k === "property" && !node.computed) continue;
-                if (node.type === "Property" && k === "key" && !node.computed) continue;
+                if (k === "type" || k === "loc" || k === "start" || k === "end" || k === "range") continue;
+                if (k.length && k.charCodeAt(0) === 95) continue;
                 const v = node[k];
-                if (v && typeof v === "object") { if (walk(v)) return true; }
+                if (v && typeof v === "object" && walk(v)) return true;
             }
             return false;
         };
@@ -183,6 +572,15 @@ export const ClosureCompiler = {
             const so = this.ctx.allocLocal(`__args_a_${k}`);
             vm.store(VReg.FP, so, vm.getArgReg(k));
             saved.push(so);
+        }
+        // [argv 溢出] 实参 5..15 在 _call_argv:快照槽已由 emitArgvSpillSnapshot 备好
+        // (未备则本函数只见前 5 个,同旧行为)。argc 守卫在下方收集循环里统一做。
+        const spill = this.ctx._argvSpill;
+        if (spill) {
+            for (let k = 5; k < 16; k++) {
+                if (spill[k] === undefined) break;
+                saved.push(spill[k]);
+            }
         }
         vm.movImm(VReg.A0, 0);
         vm.call("_array_new_with_size");
@@ -213,21 +611,217 @@ export const ClosureCompiler = {
         }
     },
 
+    // [argv 溢出] 寄存器窗口(实参 0-4)之外的实参 5..15 由调用点写 _call_argv 全局。
+    // 与 _call_argc 同契约:**进入函数体第一时间**快照进本帧槽,之后任何 JS 调用都会
+    // 覆盖该全局。argc <= i 的槽填真 JS_UNDEFINED —— 全局槽残留的是上一次调用的值,
+    // 不守卫会把陈旧实参当本次实参。n = 需要覆盖的实参上界(形参个数;体内用
+    // `arguments` 时取满 16)。返回 {索引: 帧内偏移} 并挂 ctx._argvSpill。
+    emitArgvSpillSnapshot(n) {
+        this.ctx._argvSpill = null;
+        if (!n || n <= 5) return null;
+        const vm = this.vm;
+        const cap = n > 16 ? 16 : n;
+        const argcOff = this.ctx.allocLocal(`__argv_argc_${this.nextLabelId()}`);
+        vm.lea(VReg.V5, "_call_argc");
+        vm.load(VReg.V6, VReg.V5, 0);
+        vm.store(VReg.FP, argcOff, VReg.V6);
+        const offs = {};
+        for (let i = 5; i < cap; i++) {
+            const off = this.ctx.allocLocal(`__argv_sp${i}_${this.nextLabelId()}`);
+            const done = this.ctx.newLabel("argv_sp_done");
+            vm.movImm64(VReg.V0, 0x7ffb000000000000n);
+            vm.store(VReg.FP, off, VReg.V0);
+            vm.load(VReg.V6, VReg.FP, argcOff);
+            vm.cmpImm(VReg.V6, i);
+            vm.jle(done);
+            vm.lea(VReg.V5, "_call_argv");
+            vm.load(VReg.V0, VReg.V5, i * 8);
+            vm.store(VReg.FP, off, VReg.V0);
+            vm.label(done);
+            offs[i] = off;
+        }
+        this.ctx._argvSpill = offs;
+        return offs;
+    },
+
+    // 把快照槽写回 _call_argv(转发 super(...)/FDI 求值可能踩脏全局槽)。
+    emitRestoreCallArgvFromSpill() {
+        const sp = this.ctx._argvSpill;
+        if (!sp) return;
+        const vm = this.vm;
+        for (let i = 5; i < 16; i++) {
+            if (sp[i] === undefined) break;
+            vm.load(VReg.V6, VReg.FP, sp[i]);
+            vm.lea(VReg.V5, "_call_argv");
+            vm.store(VReg.V5, i * 8, VReg.V6);
+        }
+    },
+
+    // 实参 i → 帧内槽 off。i<5 取寄存器(构造器约定 argBase=1,实参在 A1..A5);
+    // i>=5 取 emitArgvSpillSnapshot 的快照槽,无快照则 JS_UNDEFINED。
+    emitArgToSlot(i, off, argBase) {
+        const vm = this.vm;
+        const base = argBase || 0;
+        if (i < 5) {
+            vm.store(VReg.FP, off, vm.getArgReg(i + base));
+            return;
+        }
+        const sp = this.ctx._argvSpill;
+        if (sp && sp[i] !== undefined) {
+            vm.load(VReg.V0, VReg.FP, sp[i]);
+            vm.store(VReg.FP, off, VReg.V0);
+            return;
+        }
+        vm.movImm64(VReg.V0, 0x7ffb000000000000n);
+        vm.store(VReg.FP, off, VReg.V0);
+    },
+
+
+    // P1 录制税:仅对含 for/while 的函数录制(for-in/of 排除)。
+    // 体量不再用顶层语句数卡死——声明/方法/表达式已统一走此门,
+    // 过大由 REC_CAP 白冲兜底。显式 AST 遍历保证定点。
+    _fnNeedsP1Record(expr) {
+        const body = expr && expr.body;
+        if (!body) return false;
+        return this._nodeHasLoop(body);
+    },
+
+    _nodeHasLoop(n) {
+        if (!n || typeof n !== "object") return false;
+        const ty = n.type;
+        if (ty === "WhileStatement" || ty === "DoWhileStatement" || ty === "ForStatement") {
+            return true;
+        }
+        // for-in/of 在编译器里极多且晋升收益相对小,不触发录制。
+        // 不进入嵌套函数/类
+        if (ty === "FunctionExpression" || ty === "ArrowFunctionExpression" ||
+            ty === "FunctionDeclaration" || ty === "ClassExpression" || ty === "ClassDeclaration") {
+            return false;
+        }
+        if (ty === "BlockStatement") {
+            const list = n.body;
+            if (list) {
+                for (let i = 0; i < list.length; i++) {
+                    if (this._nodeHasLoop(list[i])) return true;
+                }
+            }
+            return false;
+        }
+        if (ty === "IfStatement") {
+            return this._nodeHasLoop(n.consequent) || this._nodeHasLoop(n.alternate);
+        }
+        if (ty === "TryStatement") {
+            if (this._nodeHasLoop(n.block)) return true;
+            if (n.handler && this._nodeHasLoop(n.handler.body)) return true;
+            return this._nodeHasLoop(n.finalizer);
+        }
+        if (ty === "SwitchStatement") {
+            const cases = n.cases;
+            if (cases) {
+                for (let i = 0; i < cases.length; i++) {
+                    const cons = cases[i].consequent;
+                    if (cons) {
+                        for (let j = 0; j < cons.length; j++) {
+                            if (this._nodeHasLoop(cons[j])) return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+        if (ty === "LabeledStatement" || ty === "WithStatement") {
+            return this._nodeHasLoop(n.body);
+        }
+        return false;
+    },
+
+
+    // RET = 装箱函数。挂自有 prototype({w:true,e:false,c:false})及
+    // proto.constructor=fn({w:true,e:false,c:true}),与 _cpg_lazy_proto 同形。
+    // 生成器函数值的 gOPD 只扫侧表、不触发惰性建,须在造值时落下。
+    emitFnOwnPrototype() {
+        const vm = this.vm;
+        const fnOff = this.ctx.allocLocal(`__fnown_${this.nextLabelId()}`);
+        vm.store(VReg.FP, fnOff, VReg.RET);
+        vm.call("_object_new");
+        vm.call("_box_obj_r");
+        const protoOff = this.ctx.allocLocal(`__fnownp_${this.nextLabelId()}`);
+        vm.store(VReg.FP, protoOff, VReg.RET);
+        vm.mov(VReg.A0, VReg.RET);
+        this.emitBoxedStringKey("constructor", VReg.A1);
+        vm.load(VReg.A2, VReg.FP, fnOff);
+        vm.call("_object_define");
+        vm.load(VReg.A0, VReg.FP, protoOff);
+        this.emitBoxedStringKey("constructor", VReg.A1);
+        vm.movImm(VReg.A2, 5);
+        vm.call("_object_set_prop_attr");
+        vm.load(VReg.A0, VReg.FP, fnOff);
+        this.emitBoxedStringKey("prototype", VReg.A1);
+        vm.load(VReg.A2, VReg.FP, protoOff);
+        vm.call("_closure_prop_set");
+        vm.load(VReg.A0, VReg.FP, fnOff);
+        this.emitBoxedStringKey("prototype", VReg.A1);
+        vm.movImm(VReg.A2, 1);
+        vm.call("_closure_prop_set_attr");
+        vm.load(VReg.RET, VReg.FP, fnOff);
+    },
+
     compileFunctionExpression(expr) {
         const outerLocals = this.ctx.locals || {};
         const outerBoxedVars = this.ctx.boxedVars || new Set();
         let captured = analyzeCapturedVariables(expr, outerLocals, this.ctx.functions);
+        // 纵深防御:普通函数的 arguments 永不从外层捕获(见 analyzeCapturedVariables)。
+        if (expr.type !== "ArrowFunctionExpression") {
+            const filtered = [];
+            for (let i = 0; i < captured.length; i++) {
+                if (captured[i] !== "arguments") filtered.push(captured[i]);
+            }
+            captured = filtered;
+        }
         // **仅箭头函数**捕获外层 this（使 () => this.x 访问词法 this）。普通函数表达式/
         // 对象字面量简写方法(`{ m(){ this.x } }`)是普通函数,应取**动态** this(A5 接收者,
         // 序言已置 __this=A5);此前误对所有用 this 的函数表达式捕获 → 函数内创建的对象字面量
         // 方法(如工厂 `function make(v){return {i:v,read(){return this.i}}}`)拿到词法/陈旧
-        // this 而非接收者(手写迭代器 `{next(){return this.i}}` 静默错的根因)。模块级 mixin
-        // 方法无外层 __this,本就不捕获,故编译器自身逐字节不变。
-        const outerHasThis = !!outerLocals["__this"];
-        const capturesThis = outerHasThis && expr.type === "ArrowFunctionExpression" &&
+        // this 而非接收者(手写迭代器 `{next(){return this.i}}` 静默错的根因)。
+        // 顶层无 __this 槽时仍捕获(存 globalThis),否则 forEach(arrow, thisArg) 会把
+        // thisArg 写进 A5 当成箭头 this。
+        const capturesThis = expr.type === "ArrowFunctionExpression" &&
             this.functionBodyUsesThis(expr);
-        if (capturesThis && captured.indexOf("__this") === -1) {
-            captured = captured.concat(["__this"]);
+        if (capturesThis) {
+            let hasThisCap = false;
+            for (let i = 0; i < captured.length; i++) {
+                if (captured[i] === "__this") { hasThisCap = true; break; }
+            }
+            if (!hasThisCap) captured = captured.concat(["__this"]);
+        }
+        // 箭头 lexical Super:捕获外层派生构造器的 __super_called box。
+        if (expr.type === "ArrowFunctionExpression" &&
+            this.ctx.superCalledOff != null && this.functionBodyUsesSuper(expr)) {
+            let hasSC = false;
+            for (let i = 0; i < captured.length; i++) {
+                if (captured[i] === "__super_called") { hasSC = true; break; }
+            }
+            if (!hasSC) captured = captured.concat(["__super_called"]);
+        }
+        // with(obj) 内创建的函数:[[Scope]] 含该对象环境。把当前 with 对象当
+        // `__with_N` 捕获进闭包,函数体再装回 withScopes(否则 p1='x1' 写到全局)。
+        const withCapSlots = [];
+        if (this.ctx.withScopes) {
+            for (let wi = 0; wi < this.ctx.withScopes.length; wi++) withCapSlots.push(this.ctx.withScopes[wi]);
+        }
+        if (this.ctx.outerWithScopes) {
+            for (let wi = 0; wi < this.ctx.outerWithScopes.length; wi++) withCapSlots.push(this.ctx.outerWithScopes[wi]);
+        }
+        if (withCapSlots.length > 0) {
+            for (let wi = 0; wi < withCapSlots.length; wi++) {
+                const wn = "__with_" + wi;
+                let hasW = false;
+                for (let i = 0; i < captured.length; i++) {
+                    if (captured[i] === wn) { hasW = true; break; }
+                }
+                if (!hasW) captured = captured.concat([wn]);
+            }
+            this._pendingWithCapSlots = withCapSlots;
         }
 
         const funcLabel = this.ctx.newLabel("fn");
@@ -269,7 +863,16 @@ export const ClosureCompiler = {
         // 因为 compileFunctionBody 总是期望 box 指针并解引用
         for (let i = 0; i < captured.length; i++) {
             const varName = captured[i];
-            const offset = outerLocals[varName];
+            let offset = outerLocalsGet(outerLocals, varName);
+            if (!(typeof offset === "number" && offset) &&
+                varName.length >= 7 && varName.charCodeAt(0) === 95 &&
+                varName.slice(0, 7) === "__with_") {
+                const wi = parseInt(varName.slice(7), 10);
+                const wslots = this._pendingWithCapSlots;
+                if (wslots && wi >= 0 && wi < wslots.length) {
+                    offset = wslots[wi];
+                }
+            }
             // [#32] 纵深防御:outerLocals 是裸字典,合法偏移恒为负数;typeof 守卫挡
             // 一切沿原型链命中的污染值(closure.js 修复后 captured 必为自有局部)。
             if (typeof offset === "number" && offset) {
@@ -314,8 +917,26 @@ export const ClosureCompiler = {
 
                 // 将闭包指针重新压栈（供下次迭代或后续使用）
                 this.vm.push(VReg.V2);
+            } else if (varName === "__this") {
+                // 顶层箭头:无外层 __this 槽,词法 this = globalThis。
+                this.vm.pop(VReg.V3);
+                this.vm.push(VReg.V3);
+                this.vm.lea(VReg.V0, "_global_this");
+                this.vm.load(VReg.RET, VReg.V0, 0);
+                this.vm.call("_box_obj_r");
+                this.vm.mov(VReg.V1, VReg.RET);
+                this.vm.pop(VReg.V3);
+                this.vm.push(VReg.V1);
+                this.vm.push(VReg.V3);
+                this.vm.call("_box_alloc");
+                this.vm.pop(VReg.V2);
+                this.vm.pop(VReg.V1);
+                this.vm.store(VReg.RET, 0, VReg.V1);
+                this.vm.store(VReg.V2, 16 + i * 8, VReg.RET);
+                this.vm.push(VReg.V2);
             }
         }
+        this._pendingWithCapSlots = null;
 
         this.vm.pop(VReg.RET);
 
@@ -326,6 +947,10 @@ export const ClosureCompiler = {
         this.vm.andMaskReg(VReg.V2, VReg.V2, VReg.V1);  // V2 = V2 & V1 = ptr & MASK
         this.vm.movImm64(VReg.V1, 0x7fff000000000000n);  // V1 = TAG (function)
         this.vm.or(VReg.RET, VReg.V2, VReg.V1);  // RET = (ptr & MASK) | TAG
+
+        // 生成器函数值自有 prototype({w:true,e:false,c:false})。gOPD 不走
+        // _cpg_miss 惰性建,须在造值时落下,否则 function*(){} 无该自有属性。
+        if (isGeneratorFunction(expr)) this.emitFnOwnPrototype();
 
         if (!this.pendingFunctions) {
             this.pendingFunctions = [];
@@ -347,8 +972,27 @@ export const ClosureCompiler = {
             // 于是方法内箭头/函数表达式里的 `this.#x` 编成键 "##x" → 与实例上的
             // "#C#x" 不匹配 → 读 undefined / 方法调用 "not a function"。
             className: this.ctx.className,
+            // 定义处的 super 绑定:箭头体延迟编译时 ctx 已是 main,不恢复则
+            // emitLoadSuperClassInfo(undefined)→S1=0→super() skip(count 不加)。
+            superClass: this.ctx.superClass,
+            superClassExpr: this.ctx.superClassExpr,
+            superInfoLabel: this.ctx.superInfoLabel,
+            classInfoLabel: this.ctx.classInfoLabel,
+            inStaticMethod: this.ctx.inStaticMethod,
             // 私有名作用域链快照(词法):嵌套类里的箭头体也须按声明者类名改写
             privateScopes: this._privateScopes ? this._privateScopes.slice() : null,
+            // 外层具名函数表达式的不可变绑定,被本闭包捕获时须继续禁写。
+            immutableFromParent: (this.ctx.immutableLocals
+                ? (() => {
+                    const out = [];
+                    const im = this.ctx.immutableLocals;
+                    for (let i = 0; i < captured.length; i++) {
+                        const n = captured[i];
+                        if (im.has(n)) out.push(n);
+                    }
+                    return out;
+                })()
+                : null),
         });
     },
 
@@ -358,6 +1002,9 @@ export const ClosureCompiler = {
             return;
         }
         for (const func of this.pendingFunctions) {
+            // [m121-fix] 恢复逐函数 IC 池隔离。m118 整批共用导致跨函数 shape 毒化,
+            // node/gen2 编出的自举产物在大图(cli/index)上 SEGV(把小整数当堆指针)。
+            this._resetIcPropMaps();
             this.vm.label(func.label);
             // [函数元数据] func.label 即闭包 func_ptr(见 compileFunctionExpression 存 +8)。
             // 登记函数种类(async/generator),供 Object.prototype.toString 品牌区分。
@@ -373,15 +1020,27 @@ export const ClosureCompiler = {
             const savedSP = this.sourcePath;
             const savedClassName = this.ctx.className;
             const savedPrivScopes = this._privateScopes;
+            const savedSuperClass = this.ctx.superClass;
+            const savedSuperClassExpr = this.ctx.superClassExpr;
+            const savedSuperInfoLabel = this.ctx.superInfoLabel;
+            const savedClassInfoLabel = this.ctx.classInfoLabel;
+            const savedInStaticMethod = this.ctx.inStaticMethod;
             if (func.moduleAst) this._currentModuleAst = func.moduleAst;
             if (func.mainCapturedVars) this.ctx.mainCapturedVars = func.mainCapturedVars;
             if (func.functionAliases) this.ctx.functionAliases = func.functionAliases;
             if (func.sourcePath) this.sourcePath = func.sourcePath;
             if (func.className) this.ctx.className = func.className;
             if (func.privateScopes) this._privateScopes = func.privateScopes;
+            this.ctx.superClass = func.superClass;
+            this.ctx.superClassExpr = func.superClassExpr;
+            this.ctx.superInfoLabel = func.superInfoLabel;
+            this.ctx.classInfoLabel = func.classInfoLabel;
+            this.ctx.inStaticMethod = func.inStaticMethod;
             // [批次D] 生成器函数表达式：标签处先落 stub（建协程+生成器对象后即返回），
             // 真正函数体在 <label>_gbody，由 _coroutine_entry 首次 resume 时进入。
             let fdiList = null;
+            this._genStubFnExpr = func.expr;
+            this.ctx._pendingImmutableFromParent = func.immutableFromParent;
             if (isGeneratorFunction(func.expr) && !isAsyncFunction(func.expr)) {
                 fdiList = this.emitGeneratorStub(func.label + "_gbody", true, undefined, func.captured);
             } else if (isGeneratorFunction(func.expr) && isAsyncFunction(func.expr)) {
@@ -394,12 +1053,19 @@ export const ClosureCompiler = {
                 this.emitAsyncMethodStub(func.label + "_gbody", true);
             }
             this.compileFunctionBody(func.expr, func.captured, fdiList);
+            this._genStubFnExpr = null;
+            this.ctx._pendingImmutableFromParent = null;
             this._currentModuleAst = savedModuleAst;
             this.ctx.mainCapturedVars = savedMCV;
             this.ctx.functionAliases = savedFA;
             this.sourcePath = savedSP;
             this.ctx.className = savedClassName;
             this._privateScopes = savedPrivScopes;
+            this.ctx.superClass = savedSuperClass;
+            this.ctx.superClassExpr = savedSuperClassExpr;
+            this.ctx.superInfoLabel = savedSuperInfoLabel;
+            this.ctx.classInfoLabel = savedClassInfoLabel;
+            this.ctx.inStaticMethod = savedInStaticMethod;
         }
 
         this.pendingFunctions = [];
@@ -420,10 +1086,17 @@ export const ClosureCompiler = {
         // [批次D] 生成器体同 async 跑在协程栈上,同理禁录。
         // (曾对 __regexp_shim 模块禁录规避"x64 晋升错编返回值"——实为 #37
         // 对齐垫 V0=RAX 冲返回值,已根修;#41 相等比较双求值也已根修,解除禁录。)
-        if (!isAsync && !isGenerator) vm.beginRecord();
-        vm.prologue(8192, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        // 片段 compileFragment 禁 IC,同样禁 P1 录制:pending 函数体里 lea 字符串标签/
+        // prologue 的 savedRegs 数组写入 _recB[](初值为 0 的稠密数字数组)会在 asm.js
+        // 自托管编译器上触发「Cannot assign to read only property」(类型槽拒写)。
+        // 顶层 Uint8Array 不经 beginRecord,故不受影响;new Function/eval 嵌套函数体才踩中。
+        const doP1 = !isAsync && !isGenerator && !this.engineNoIC && this._fnNeedsP1Record(expr);
+        if (doP1) vm.beginRecord();
+        const savedRegs = [VReg.S0, VReg.S1, VReg.S2, VReg.S3];
+        vm.prologue(8192, savedRegs);
 
         const prevLocals = this.ctx.locals;
+        const prevLocalsUndo = this.ctx._localsUndo;
         const prevStackOffset = this.ctx.stackOffset;
         const prevReturnLabel = this.ctx.returnLabel;
         const prevBoxedVars = this.ctx.boxedVars;
@@ -432,8 +1105,17 @@ export const ClosureCompiler = {
         const prevInCoroBody = this.ctx.inCoroBody;
         const prevInStrictFunction = this.ctx.inStrictFunction;
         const prevPreboundFnDecls = this.ctx._preboundFnDecls;
+        const prevImmutableLocals = this.ctx.immutableLocals;
+        const prevFnExprNameSlot = this.ctx.fnExprNameSlot;
+        const prevSuperCalledOff = this.ctx.superCalledOff;
+        const prevWithScopes = this.ctx.withScopes;
+        const prevOuterWithScopes = this.ctx.outerWithScopes;
 
-        this.ctx.locals = {};
+        this.ctx.locals = new Map();
+        this.ctx.withScopes = [];
+        this.ctx.outerWithScopes = [];
+        this.ctx.localTemps = null;
+        this.ctx._localsUndo = [];
         this.ctx._preboundFnDecls = new Set();
         this.ctx.stackOffset = 0;
         this.ctx.inAsyncFunction = isAsync;
@@ -446,9 +1128,40 @@ export const ClosureCompiler = {
 
         // 分析函数体中哪些变量会被内部闭包捕获
         const innerBoxedVars = analyzeSharedVariables(expr);
-        // [引擎库·直接 eval 逃逸捕获] 含直接 eval 的(嵌套)函数:全部局部升级为 box。
-        for (const _n of analyzeDirectEvalBoxedVars(expr)) innerBoxedVars.add(_n);
+        this._addDirectEvalBoxedVars(expr, innerBoxedVars);
         this.ctx.boxedVars = innerBoxedVars;
+        this.ctx.immutableLocals = new Set(this.ctx._pendingImmutableFromParent || []);
+        this.ctx.fnExprNameSlot = 0;
+        this.ctx.superCalledOff = null;
+        const prevInFunctionBody = this.ctx._inFunctionBody;
+        this.ctx._inFunctionBody = true;
+        const prevLexLocalNames = this.ctx.lexLocalNames;
+        const prevParamBindingNames = this.ctx.paramBindingNames;
+        const prevOwnBindingNames = this.ctx.ownBindingNames;
+        const prevBodyEvalVarNames = this.ctx.bodyEvalVarNames;
+        const prevTdzCleared = this.ctx._tdzClearedLocals;
+        // [m120] 声明点写完后记入:同函数体内后续读免值级哨兵(preboxed const vm=this.vm
+        // 曾对每次读空 cmp)。嵌套函数自有 Set,捕获读仍守卫。
+        this.ctx._tdzClearedLocals = new Set();
+        this.ctx.lexLocalNames = {};
+        if (!fnStrict && expr.body) {
+            collectLexicalDeclarations(expr.body, this.ctx.lexLocalNames);
+        }
+        this.ctx.paramBindingNames = {};
+        for (let _pi = 0; _pi < params.length; _pi++) {
+            collectPatternNames(params[_pi], this.ctx.paramBindingNames);
+        }
+        this.ctx.ownBindingNames = {};
+        if (expr.body) {
+            collectLocalDeclarations(expr.body, this.ctx.ownBindingNames);
+            collectDirectFunctionDeclNames(expr.body, this.ctx.ownBindingNames);
+        }
+        for (const _pn in this.ctx.paramBindingNames) {
+            if (this.ctx.paramBindingNames[_pn]) this.ctx.ownBindingNames[_pn] = true;
+        }
+        if (expr.type === "FunctionExpression" && expr.id && expr.id.name) {
+            this.ctx.immutableLocals.add(expr.id.name);
+        }
 
         const returnLabel = this.ctx.newLabel("fn_return");
         this.ctx.returnLabel = returnLabel;
@@ -456,37 +1169,15 @@ export const ClosureCompiler = {
         // async 函数体:未捕获异常拒绝其 Promise(而非退出)。设一个"外层"异常标签,
         // throw/await-reject 在无更内层 try 时跳此 → reject。save/restore 保护外层上下文。
         const prevExceptionLabel = this.ctx.exceptionLabel;
+        const prevAsyncExcFrameOff = this.ctx._asyncExcFrameOff;
+        const prevAsyncCoroOff = this.ctx._asyncCoroOff;
+        const prevAsyncPromiseOff = this.ctx._asyncPromiseOff;
         let asyncRejectLabel = null;
         // async generator 体走协程/生成器返回流(非 Promise resolve),不设 async_reject 落点。
         if (isAsync && !isGenerator) {
             asyncRejectLabel = this.ctx.newLabel("async_reject");
             this.ctx.exceptionLabel = asyncRejectLabel;
-
-            // [#async-exc-ctx] 在 _exc_ctx_top 链安装本 async 体的 catch 上下文,
-            // 使嵌套同步代码的 _throw_unwind(默认参数 IIFE 内的 throw 等)能路由到
-            // asyncRejectLabel。frame 布局与 try-catch 帧一致。
-            let asyncExcFrameOff = 0;
-            for (let i = 0; i < 10; i++) {
-                asyncExcFrameOff = this.ctx.allocLocal(this.ctx.newLabel("__asyncexcframe"));
-            }
-            this.ctx._asyncExcFrameOff = asyncExcFrameOff;
-            vm.lea(VReg.V0, "_exc_ctx_top");
-            vm.load(VReg.V1, VReg.V0, 0);
-            vm.store(VReg.FP, asyncExcFrameOff + 0, VReg.V1);
-            vm.lea(VReg.V1, asyncRejectLabel);
-            vm.store(VReg.FP, asyncExcFrameOff + 8, VReg.V1);
-            vm.mov(VReg.V1, VReg.SP);
-            vm.store(VReg.FP, asyncExcFrameOff + 16, VReg.V1);
-            vm.store(VReg.FP, asyncExcFrameOff + 24, VReg.FP);
-            vm.store(VReg.FP, asyncExcFrameOff + 32, VReg.S0);
-            vm.store(VReg.FP, asyncExcFrameOff + 40, VReg.S1);
-            vm.store(VReg.FP, asyncExcFrameOff + 48, VReg.S2);
-            vm.store(VReg.FP, asyncExcFrameOff + 56, VReg.S3);
-            vm.store(VReg.FP, asyncExcFrameOff + 64, VReg.S4);
-            vm.mov(VReg.V1, VReg.S5);
-            vm.store(VReg.FP, asyncExcFrameOff + 72, VReg.V1);
-            vm.subImm(VReg.V1, VReg.FP, -asyncExcFrameOff);
-            vm.store(VReg.V0, 0, VReg.V1);
+            this.emitInstallAsyncExcFrame(asyncRejectLabel);
         }
 
         // [#49] `arguments` 对象(数组近似):仅普通函数(箭头共享外层 arguments,不建)、
@@ -499,9 +1190,37 @@ export const ClosureCompiler = {
                 (p.type === "AssignmentPattern" && p.left && p.left.name === "arguments") ||
                 (p.type === "SpreadElement" && p.argument && p.argument.name === "arguments")) &&
             this.functionBodyUsesArguments(expr);
+        // [argv 溢出] 实参 5.. 的快照须是进入体后**第一件事**(任何 JS 调用都会覆盖
+        // _call_argv 全局);emitArgumentsArray / ...rest 也从该快照取第 6 个及以后的实参。
+        // rest 形参需要满窗快照(params.length 只计到 rest 自身,不够覆盖 rest 元素)。
+        let needFullArgv = usesArguments;
+        if (!needFullArgv) {
+            for (let ri = 0; ri < params.length; ri++) {
+                if (params[ri] && params[ri].type === "SpreadElement") { needFullArgv = true; break; }
+            }
+        }
+        this.emitArgvSpillSnapshot(needFullArgv ? 16 : params.length);
         if (usesArguments) {
             this.emitArgumentsArray();
         }
+        if (expr.type === "FunctionExpression" && expr.id && expr.id.name) {
+            vm.push(VReg.A0);
+            vm.push(VReg.A1);
+            vm.push(VReg.A2);
+            vm.push(VReg.A3);
+            vm.push(VReg.A4);
+            vm.push(VReg.A5);
+            this.emitNamedFunctionExprBinding(expr);
+            vm.pop(VReg.A5);
+            vm.pop(VReg.A4);
+            vm.pop(VReg.A3);
+            vm.pop(VReg.A2);
+            vm.pop(VReg.A1);
+            vm.pop(VReg.A0);
+        }
+        if (this._paramsHaveExpressions(params)) this.emitSeedMainCapturedVars();
+        this._pendingParamEvalParams = params;
+        this.maybeEmitParamEvalVarSlots(isGenerator && !!fdiList);
 
         // 处理参数 - 先保存所有参数到栈（因为后续操作可能破坏参数寄存器）
         // 注意：先保存参数，再处理闭包捕获变量，避免寄存器冲突
@@ -526,12 +1245,13 @@ export const ClosureCompiler = {
         const patternParams = [];
         // [L2-③ TDZ] 参数名收集(前序):默认值评估期自引用/后向引用须抛 ReferenceError
         const tdzParamNames = [];
-        for (let i = 0; i < params.length && i < 6; i++) {
+        for (let i = 0; i < params.length && i < 16; i++) {
             const tp = params[i];
             if (tp.type === "Identifier") tdzParamNames.push(tp.name);
             else if (tp.type === "AssignmentPattern" && tp.left && tp.left.type === "Identifier") tdzParamNames.push(tp.left.name);
         }
-        for (let i = 0; i < params.length && i < 6; i++) {
+        this.ctx.paramLexNames = new Set(tdzParamNames);
+        for (let i = 0; i < params.length && i < 16; i++) {
             const p = params[i];
             let paramName = null;
             let defaultExpr = null;
@@ -554,7 +1274,7 @@ export const ClosureCompiler = {
                 const pat = p.type === "AssignmentPattern" ? p.left : p;
                 const dexpr = p.type === "AssignmentPattern" ? p.right : null;
                 const pslot = this.ctx.allocLocal(`__parampat_${this.nextLabelId()}`);
-                vm.store(VReg.FP, pslot, vm.getArgReg(i));
+                this.emitArgToSlot(i, pslot);
                 patternParams.push({ pat: pat, slot: pslot, dflt: dexpr });
                 continue;
             }
@@ -566,8 +1286,8 @@ export const ClosureCompiler = {
             // 绑定(见 patternParams 循环的 transfer 路径),此处不落槽/不求默认。
             if (isGenerator && fdiList && fdiList.indexOf(paramName) !== -1) continue;
             const offset = this.ctx.allocLocal(paramName);
-            paramOffsets.push({ name: paramName, offset: offset, argReg: vm.getArgReg(i) });
-            vm.store(VReg.FP, offset, vm.getArgReg(i));
+            paramOffsets.push({ name: paramName, offset: offset, argReg: i < 5 ? vm.getArgReg(i) : null });
+            this.emitArgToSlot(i, offset);
             if (defaultExpr) {
                 // [L2-③ TDZ] 默认值表达式求值前,当前及之后所有形参名入 tdzParams
                 if (!this.ctx.tdzParams) this.ctx.tdzParams = new Set();
@@ -592,7 +1312,10 @@ export const ClosureCompiler = {
                 vm.movImm64(undReg, 0x7ffb000000000000n); // JS_UNDEFINED
                 vm.cmp(chkReg, undReg);
                 vm.jne(skip);
+                const _prevEvalParam = this.ctx._evalInParamInit;
+                this.ctx._evalInParamInit = true;
                 this.compileExpression(defaultExpr);
+                this.ctx._evalInParamInit = _prevEvalParam;
                 vm.store(VReg.FP, offset, VReg.RET);
                 vm.label(skip);
                 for (let ai = 0; ai < 5; ai++) {
@@ -607,6 +1330,14 @@ export const ClosureCompiler = {
         // ReferenceError(params-dflt-ref-arguments / pa4 形态)。规范:TDZ 仅覆盖
         // 默认值评估期,形参全部绑定后全体可用。
         if (this.ctx.tdzParams) this.ctx.tdzParams.clear();
+        // [m120] 形参已绑定 → 体读免值级哨兵
+        if (this.ctx._tdzClearedLocals) {
+            for (const pn in this.ctx.paramBindingNames) {
+                if (this.ctx.paramBindingNames[pn] === true) {
+                    this.ctx._tdzClearedLocals.add(pn);
+                }
+            }
+        }
 
         // 保存 this 指针（通过 A5 传入的隐藏参数）到 __this 局部变量
         const thisOffset = this.ctx.allocLocal("__this");
@@ -615,6 +1346,19 @@ export const ClosureCompiler = {
         // 处理闭包捕获变量 - 从闭包对象中加载 box 指针
         // S0 寄存器包含闭包对象指针（由 compileClosureCall 传入）
         // 闭包对象布局: [magic(8), func_ptr(8), box_ptr_0, box_ptr_1, ...]
+        const _bodyBinds = {};
+        if (expr.body) {
+            collectLocalDeclarations(expr.body, _bodyBinds);
+            collectDirectFunctionDeclNames(expr.body, _bodyBinds);
+        }
+        const _bodyEvalVars = collectBodyEvalVarNames(expr.body);
+        this.ctx.bodyEvalVarNames = null;
+        for (const _ev in _bodyEvalVars) {
+            if (_bodyEvalVars[_ev] !== true) continue;
+            _bodyBinds[_ev] = true;
+            if (!this.ctx.bodyEvalVarNames) this.ctx.bodyEvalVarNames = new Set();
+            this.ctx.bodyEvalVarNames.add(_ev);
+        }
         if (captured && captured.length > 0) {
             // 将闭包指针保存到 S1，因为 S0 可能在函数体中被覆盖
             vm.mov(VReg.S1, VReg.S0);
@@ -622,6 +1366,18 @@ export const ClosureCompiler = {
             for (let i = 0; i < captured.length; i++) {
                 const varName = captured[i];
                 const closureOffset = 16 + i * 8; // 跳过 magic 和 func_ptr
+                // 体 var/let 与捕获的外层同名:分离 varEnv,不把外层 box 别名进体槽
+                // (默认值闭包已在 stub 捕获外层;scope-paramsbody-var-open)。
+                if (varName !== "__this" &&
+                    _bodyBinds[varName] === true) {
+                    // [S11.13.2] eval('var x') 与捕获同名:复合赋值 LHS 仍写捕获 box。
+                    if (this.ctx.bodyEvalVarNames && this.ctx.bodyEvalVarNames.has(varName)) {
+                        const capOff = this.ctx.allocLocal(`__cap_${varName}`);
+                        vm.load(VReg.V1, VReg.S1, closureOffset);
+                        vm.store(VReg.FP, capOff, VReg.V1);
+                    }
+                    continue;
+                }
                 if (varName === "__this") {
                     // __this：闭包 slot 存的是 box 指针（存储侧统一 box 化），
                     // 解引用得到 this 值，恢复到已有 __this 槽（覆盖 A5 垃圾）
@@ -629,6 +1385,16 @@ export const ClosureCompiler = {
                     vm.load(VReg.V1, VReg.V1, 0);             // this 值
                     const thisOff = this.ctx.getLocal("__this");
                     vm.store(VReg.FP, thisOff, VReg.V1);
+                    continue;
+                }
+                if (varName.length >= 7 && varName.slice(0, 7) === "__with_") {
+                    // with 对象:闭包槽是 box,解引用得对象值(非 box 指针)再压 withScopes,
+                    // 使体内标识符走 Object Environment(_object_has / 赋值 / delete)。
+                    const wOff = this.ctx.allocLocal(varName);
+                    vm.load(VReg.V1, VReg.S1, closureOffset);
+                    vm.load(VReg.V1, VReg.V1, 0);
+                    vm.store(VReg.FP, wOff, VReg.V1);
+                    this.ctx.outerWithScopes.push(wOff);
                     continue;
                 }
                 // 从闭包对象加载 box 指针到新的局部变量
@@ -639,7 +1405,13 @@ export const ClosureCompiler = {
                 // 标记这个变量为装箱变量（因为它存储的是 box 指针）
                 this.ctx.boxedVars.add(varName);
             }
+            const scOff = this.ctx.getLocal("__super_called");
+            if (scOff && this.ctx.boxedVars.has("__super_called")) {
+                this.ctx.superCalledOff = scOff;
+            }
         }
+
+        this.emitBodyEvalVarSlots();
 
         // 为需要装箱的参数创建 box
         for (let i = 0; i < paramOffsets.length; i++) {
@@ -658,6 +1430,41 @@ export const ClosureCompiler = {
             }
         }
 
+        // Arguments [[ParameterMap]]:non-strict + 简单形参 + 引用 arguments
+        // (与 compiler/index.js 顶层声明同构;函数表达式/IIFE 此前只建数组不装映射
+        // → arguments[i]=x 不回写形参,15.2.3.6-4-294-1 等 FAIL)。
+        const mappedArgs = usesArguments && !fnStrict && this._isSimpleParamList(params);
+        if (mappedArgs && paramOffsets.length > 0) {
+            for (let i = 0; i < paramOffsets.length; i++) {
+                const param = paramOffsets[i];
+                if (innerBoxedVars.has(param.name)) continue;
+                vm.load(VReg.V1, VReg.FP, param.offset);
+                vm.push(VReg.V1);
+                vm.call("_box_alloc");
+                vm.store(VReg.FP, param.offset, VReg.RET);
+                vm.pop(VReg.V1);
+                vm.store(VReg.RET, 0, VReg.V1);
+                innerBoxedVars.add(param.name);
+                this.ctx.boxedVars.add(param.name);
+            }
+            const mapOff = this.ctx.allocLocal(`__argmap_${this.nextLabelId()}`);
+            vm.movImm(VReg.A0, paramOffsets.length * 8);
+            vm.call("_alloc");
+            vm.store(VReg.FP, mapOff, VReg.RET);
+            for (let i = 0; i < paramOffsets.length; i++) {
+                vm.load(VReg.V0, VReg.FP, paramOffsets[i].offset);
+                vm.load(VReg.V1, VReg.FP, mapOff);
+                vm.store(VReg.V1, i * 8, VReg.V0);
+            }
+            const argLocal = this.ctx.getLocal("arguments");
+            if (argLocal) {
+                vm.load(VReg.A0, VReg.FP, argLocal);
+                vm.load(VReg.A1, VReg.FP, mapOff);
+                vm.movImm(VReg.A2, paramOffsets.length);
+                vm.call("_args_param_map_install");
+            }
+        }
+
         // [#47] 解构参数:所有实参已落栈,此处安全解构到局部。
         // [FDI eager] 生成器 pattern 形参已在调用期(stub)绑定:从 coro+168 transfer 数组
         // 按绑定序取叶值,跳过重复解构(二重消费自定义迭代器会错值/错计)。
@@ -669,6 +1476,7 @@ export const ClosureCompiler = {
             }
         }
 
+        this.unbindBodyBindingsAfterParamInit(expr.body, params);
         // [L1 var hoist] 须在共享局部 TDZ 预建之前:var 绑=undefined;随后 prebox
         // 只补 let/const(已有槽的 var 跳过)。
         this.emitHoistedVarInits(expr.body);
@@ -684,8 +1492,9 @@ export const ClosureCompiler = {
         if (innerBoxedVars && innerBoxedVars.size > 0) {
             const bodyLocals = {};
             collectLocalDeclarations(expr.body, bodyLocals);
+            collectDirectFunctionDeclNames(expr.body, bodyLocals);
             for (const nm in bodyLocals) {
-                if (!Object.prototype.hasOwnProperty.call(bodyLocals, nm)) continue;
+                if (bodyLocals[nm] !== true) continue;
                 if (!innerBoxedVars.has(nm)) continue;
                 if (this.ctx.getLocal(nm)) continue; // 参数/已捕获外层变量 / 已 hoist 的 var
                 const off = this.ctx.allocLocal(nm);
@@ -716,6 +1525,7 @@ export const ClosureCompiler = {
         // 编译函数体
         let hasImplicitReturn = false;
         if (expr.body.type === "BlockStatement") {
+            this.emitTdzBlockPrologue(expr.body);
             for (const stmt of expr.body.body) {
                 // [ES5.1 10.5] 入口已预绑定的直接子级函数声明 → 语句 no-op。
                 // 嵌套块内的声明不受影响(仍就地绑定,Annex B 块级语义)。
@@ -746,11 +1556,12 @@ export const ClosureCompiler = {
         } else {
             // 普通函数 / 生成器 / async generator:epilogue 返回。
             // (生成器/async-gen 体经 _coroutine_entry 捕获返回 → _coroutine_return 置 COMPLETED。)
-            vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 8192);
+            vm.epilogue(savedRegs, 8192);
         vm.endRecord(); // [P1]
         }
 
         this.ctx.locals = prevLocals;
+        this.ctx._localsUndo = prevLocalsUndo;
         this.ctx.stackOffset = prevStackOffset;
         this.ctx.returnLabel = prevReturnLabel;
         this.ctx.boxedVars = prevBoxedVars;
@@ -758,7 +1569,43 @@ export const ClosureCompiler = {
         this.ctx.inAsyncGenerator = prevInAsyncGenerator;
         this.ctx.inCoroBody = prevInCoroBody;
         this.ctx.inStrictFunction = prevInStrictFunction;
+        this.ctx.immutableLocals = prevImmutableLocals;
+        this.ctx.fnExprNameSlot = prevFnExprNameSlot;
+        this.ctx.superCalledOff = prevSuperCalledOff;
+        this.ctx.withScopes = prevWithScopes;
+        this.ctx.outerWithScopes = prevOuterWithScopes;
+        this.ctx._inFunctionBody = prevInFunctionBody;
+        this.ctx.lexLocalNames = prevLexLocalNames;
+        this.ctx.paramBindingNames = prevParamBindingNames;
+        this.ctx.ownBindingNames = prevOwnBindingNames;
+        this.ctx.bodyEvalVarNames = prevBodyEvalVarNames;
+        this.ctx._tdzClearedLocals = prevTdzCleared;
         this.ctx.exceptionLabel = prevExceptionLabel;
+        this.ctx._asyncExcFrameOff = prevAsyncExcFrameOff;
+        this.ctx._asyncCoroOff = prevAsyncCoroOff;
+        this.ctx._asyncPromiseOff = prevAsyncPromiseOff;
         this.ctx._preboundFnDecls = prevPreboundFnDecls;
+    },
+
+    // 具名函数表达式 BindingIdentifier:CreateImmutableBinding,初值=本闭包(S0)。
+    // 形参/var 同名会 allocLocal 覆盖槽,写走新槽;不可变只约束 fnExprNameSlot。
+    emitNamedFunctionExprBinding(expr, forceBox) {
+        if (!expr || expr.type !== "FunctionExpression" || !expr.id || !expr.id.name) return;
+        const nm = expr.id.name;
+        const offset = this.ctx.allocLocal(nm);
+        this.ctx.fnExprNameSlot = offset;
+        this.vm.mov(VReg.A0, VReg.S0);
+        this.vm.call("_js_box_function");
+        const boxIt = forceBox || (this.ctx.boxedVars && this.ctx.boxedVars.has(nm));
+        if (boxIt) {
+            if (this.ctx.boxedVars) this.ctx.boxedVars.add(nm);
+            this.vm.push(VReg.RET);
+            this.vm.call("_box_alloc");
+            this.vm.pop(VReg.V1);
+            this.vm.store(VReg.RET, 0, VReg.V1);
+            this.vm.store(VReg.FP, offset, VReg.RET);
+        } else {
+            this.vm.store(VReg.FP, offset, VReg.RET);
+        }
     },
 };

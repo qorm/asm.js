@@ -560,6 +560,27 @@ export class ProcessGenerator {
         // A0 = code（方法约定：第一个参数）；归一化为整数后 syscall exit
         vm.call("_syscall_arg");
         vm.mov(VReg.A0, VReg.RET);
+        if (process.env.ASMJS_IC_STATS) {
+            vm.push(VReg.A0);
+            vm.lea(VReg.A0, vm.asm.addString("[ic] legacy="));
+            vm.call("_print_str_no_nl");
+            vm.lea(VReg.V0, "_ic_stat_legacy");
+            vm.load(VReg.A0, VReg.V0, 0);
+            vm.call("_print_int");
+            vm.lea(VReg.A0, vm.asm.addString(" shaped="));
+            vm.call("_print_str_no_nl");
+            vm.lea(VReg.V0, "_ic_stat_shaped");
+            vm.load(VReg.A0, VReg.V0, 0);
+            vm.call("_print_int");
+            vm.lea(VReg.A0, vm.asm.addString(" slow="));
+            vm.call("_print_str_no_nl");
+            vm.lea(VReg.V0, "_ic_stat_slow");
+            vm.load(VReg.A0, VReg.V0, 0);
+            vm.call("_print_int");
+            vm.lea(VReg.A0, vm.asm.addString(""));
+            vm.call("_print_str"); // newline
+            vm.pop(VReg.A0);
+        }
         if (this.os === "macos") {
             // Darwin arm64 uses the raw BSD number (1) in x16; x64 requires the
             // Unix-class prefix 0x2000000 in rax (0x2000001), or Rosetta traps
@@ -949,6 +970,85 @@ export class ProcessGenerator {
             vm.movImm(VReg.A2, 5);
             vm.call("_object_set_prop_attr");
         }
+
+        // Map/Set/Promise 同上(built-ins/Map/map.js、Set/set.js 的
+        // verifyProperty(this,"Map"/{w:1,e:0,c:1}) 只查 own 性与属性位)。程序若在源码
+        // 里提及 `Map` 等标识符,emitCollectionCtorObject 会把同名键覆盖为真单例
+        // (身份对齐);从不提及时保留此可调用占位。
+        const globalCtorRef = (key, tramp) => {
+            vm.movImm(VReg.A0, 24);
+            vm.call("_alloc");
+            vm.movImm(VReg.V1, 0xc105); // CLOSURE_MAGIC
+            vm.store(VReg.RET, 0, VReg.V1);
+            vm.lea(VReg.V1, "_aref_static_tramp");
+            vm.store(VReg.RET, 8, VReg.V1);
+            vm.lea(VReg.V1, tramp);
+            vm.store(VReg.RET, 16, VReg.V1);
+            vm.mov(VReg.A0, VReg.RET);
+            vm.call("_js_box_function");
+            vm.mov(VReg.A2, VReg.RET);
+            vm.lea(VReg.V1, "_global_this");
+            vm.load(VReg.A0, VReg.V1, 0);
+            vm.lea(VReg.A1, this.vm.asm.addString(key));
+            vm.call("_object_set");
+            vm.lea(VReg.V1, "_global_this");
+            vm.load(VReg.A0, VReg.V1, 0);
+            vm.lea(VReg.A1, this.vm.asm.addString(key));
+            vm.movImm(VReg.A2, 5);
+            vm.call("_object_set_prop_attr");
+        };
+        globalCtorRef("Map", "_map_ctor_call");
+        globalCtorRef("Set", "_set_ctor_call");
+        // RegExp prop-desc 只查 this.RegExp 的 own/属性位,源码不读标识符 RegExp
+        // → 不会走 emitRegExpCtorObject。占位可调用闭包(真单例在提及标识符时覆盖)。
+        globalCtorRef("RegExp", "_array_ctor_call");
+        // Object/Function 同形:this.Object 在标识符物化前可读;真单例覆盖同一键。
+        globalCtorRef("Object", "_object_ctor_call");
+        globalCtorRef("Function", "_object_ctor_call");
+        // [gOPN 15.2.3.4-4-1] Object.getOwnPropertyNames(this) 须含 ES5 全局自有键。
+        // 值可与裸标识符单例不同(规范外 ===);只要求 own 名存在。
+        globalCtorRef("String", "_builtin_string");
+        globalCtorRef("Date", "_date_new");
+        globalCtorRef("Error", "_object_ctor_call");
+        globalCtorRef("EvalError", "_object_ctor_call");
+        globalCtorRef("RangeError", "_object_ctor_call");
+        globalCtorRef("ReferenceError", "_object_ctor_call");
+        globalCtorRef("SyntaxError", "_object_ctor_call");
+        globalCtorRef("TypeError", "_object_ctor_call");
+        globalCtorRef("URIError", "_object_ctor_call");
+        globalCtorRef("parseFloat", "_js_parseFloat");
+        globalCtorRef("isNaN", "_object_ctor_call");
+        globalCtorRef("isFinite", "_object_ctor_call");
+        globalCtorRef("eval", "_object_ctor_call");
+        globalCtorRef("decodeURI", "_object_ctor_call");
+        globalCtorRef("decodeURIComponent", "_object_ctor_call");
+        globalCtorRef("encodeURI", "_object_ctor_call");
+        globalCtorRef("encodeURIComponent", "_object_ctor_call");
+        const globalData = (key, emitVal, attr) => {
+            emitVal();
+            vm.mov(VReg.A2, VReg.RET);
+            vm.lea(VReg.V1, "_global_this");
+            vm.load(VReg.A0, VReg.V1, 0);
+            vm.lea(VReg.A1, this.vm.asm.addString(key));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+            vm.or(VReg.A1, VReg.A1, VReg.V1);
+            vm.call("_object_define"); // Define:避免后续 attr 被默认 7 盖掉
+            if (attr !== undefined) {
+                vm.lea(VReg.V1, "_global_this");
+                vm.load(VReg.A0, VReg.V1, 0);
+                vm.lea(VReg.A1, this.vm.asm.addString(key));
+                vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+                vm.or(VReg.A1, VReg.A1, VReg.V1);
+                vm.movImm(VReg.A2, attr);
+                vm.call("_object_set_prop_attr");
+            }
+        };
+        // Global.NaN/Infinity/undefined:规范 {[[Writable]]:false,[[Enumerable]]:false,[[Configurable]]:false}
+        globalData("NaN", () => vm.movImm64(VReg.RET, 0x7FF0000000000001n), 0);
+        globalData("Infinity", () => vm.movImm64(VReg.RET, 0x7ff0000000000000n), 0);
+        globalData("undefined", () => vm.movImm64(VReg.RET, 0x7ffb000000000000n), 0);
+        globalData("Math", () => { vm.call("_object_new"); vm.call("_box_obj_r"); });
+        globalData("JSON", () => { vm.call("_object_new"); vm.call("_box_obj_r"); });
 
         // 返回 process 对象 (从全局加载，确保是正确的装箱值或指针)
         vm.lea(VReg.V1, "_process_global");

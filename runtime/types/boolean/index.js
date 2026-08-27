@@ -45,7 +45,8 @@ export class BooleanGenerator {
         vm.call("_object_new"); // RET = raw obj ptr
         vm.mov(VReg.S1, VReg.RET); // S1 = raw obj ptr
 
-        // Step 3: set proto from global slot (always present from generateDataSlots)
+        // Step 3: 惰性物化 Boolean.prototype(与 emitBooleanCtorObject 同槽)。
+        vm.call("_ensure_boolean_proto");
         vm.lea(VReg.V3, "_nsobj_boolean_proto");
         vm.load(VReg.V3, VReg.V3, 0); // V3 = boxed proto (0 if not yet materialized)
         // Unbox proto: __proto__ slot stores raw pointer, not boxed value

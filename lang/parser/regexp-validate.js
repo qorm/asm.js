@@ -114,6 +114,7 @@ function _checkFlags(f) {
 // 扫描 pattern,校验 u/v 模式下的 \p{}/\P{} 属性转义。返回错误消息或 null。
 function _scanProps(pattern, modeV) {
     var inClass = false;
+    var classDepth = 0;
     var classNeg = false;   // 类以 ^ 开头(否定类):字符串属性在否定类内非法
     var negPending = false; // 类的下一个字符是否可能是否定 ^(尚未消费首字符)
     var atomSeen = false;   // [W-P9] 自 `[` 或上一个 `&&` 以来是否已消费类集原子
@@ -197,15 +198,46 @@ function _scanProps(pattern, modeV) {
             continue;
         }
         if (ch === "[") {
+            if (inClass && modeV) {
+                classDepth = classDepth + 1;
+                atomSeen = true;
+                dashAsPrev = false;
+                i = i + 1;
+                continue;
+            }
+            if (inClass) {
+                atomSeen = true;
+                dashAsPrev = false;
+                i = i + 1;
+                continue;
+            }
             inClass = true;
+            classDepth = 1;
             classNeg = pattern.charAt(i + 1) === "^";
             negPending = classNeg;
-            atomSeen = false;   // 新类从零计:类首(及 [^ 后)尚无原子
+            atomSeen = false;
             dashAsPrev = false;
             i = i + 1;
             continue;
         }
-        if (ch === "]") { inClass = false; classNeg = false; negPending = false; atomSeen = false; dashAsPrev = false; i = i + 1; continue; }
+        if (ch === "]") {
+            if (inClass) {
+                classDepth = classDepth - 1;
+                if (classDepth <= 0) {
+                    inClass = false;
+                    classDepth = 0;
+                    classNeg = false;
+                    negPending = false;
+                    atomSeen = false;
+                    dashAsPrev = false;
+                } else {
+                    atomSeen = true;
+                    dashAsPrev = false;
+                }
+            }
+            i = i + 1;
+            continue;
+        }
         if (inClass) {
             // 类首字符:若是否定 ^,只是标记,不是原子;处理完首字符后 negPending 复位,
             // 使类内后续 `^`(如 [^^a] 的第二个 ^)恢复为普通字面原子。
@@ -228,14 +260,27 @@ function _scanProps(pattern, modeV) {
                 i = i + 1;
                 continue;
             }
-            // [Wave 8 续] v 模式类集合语法字符:{ } 恒为 ClassSetSyntaxCharacter → 裸用拒;
-            // 双保留符(;; @@ ** !! ## $$ %% ++ ,, .. :: << == >> ?? ^^ `` ~~)为
-            // ClassSetReservedDoublePunctuator → 恒拒。单个 ; @ * 等是**字面原子**(Node 对拍
-            // `[;]`/`[@]`/`[*]`/`[*a]`/`[a;b]` 皆收,仅 `[;;]`/`[@@]`/`[**]` 拒);& 是 `&&`
-            // 操作符(上方已处理)、- 是 `--` 差集操作符(未实现,留后续)。u 模式类内不查。
-            if (modeV && (ch === "{" || ch === "}")) {
+            if (modeV && (ch === "(" || ch === ")" || ch === "{" || ch === "}" ||
+                          ch === "/" || ch === "|")) {
                 return "Invalid character class";
             }
+            if (modeV && ch === "-") {
+                if (pattern.charAt(i + 1) === "-") {
+                    if (!atomSeen) return "Invalid character in character class";
+                    var nxt2 = pattern.charAt(i + 2);
+                    if (nxt2 === "]" || nxt2 === "") return "Invalid character in character class";
+                    i = i + 2;
+                    atomSeen = false;
+                    continue;
+                }
+                if (!atomSeen || pattern.charAt(i + 1) === "]") {
+                    return "Invalid character in character class";
+                }
+                i = i + 1;
+                dashAsPrev = true;
+                continue;
+            }
+            // 双保留符(;; @@ ** !! ## $$ %% ++ ,, .. :: << == >> ?? ^^ `` ~~)
             if (modeV && ch === pattern.charAt(i + 1) && _isReservedDouble(ch)) {
                 return "Invalid character class";
             }
@@ -272,6 +317,63 @@ function _scanProps(pattern, modeV) {
         if (ch === "}") return "Lone quantifier brackets";
         i = i + 1;
     }
+    if (inClass || classDepth > 0) return "Unterminated character class";
+    return null;
+}
+
+// lookbehind 从不可量化;u/v 下任何 lookaround 都不可量化。
+function _isQuantAt(pattern, j) {
+    var q = pattern.charAt(j);
+    if (q === "*" || q === "+" || q === "?") return true;
+    if (q !== "{") return false;
+    var k = j + 1;
+    if (k >= pattern.length) return false;
+    var d = pattern.charCodeAt(k);
+    return d >= 48 && d <= 57;
+}
+
+function _scanLookQuant(pattern, uni) {
+    var i = 0;
+    var n = pattern.length;
+    var inClass = false;
+    while (i < n) {
+        var ch = pattern.charAt(i);
+        if (ch === "\\") { i = i + 2; continue; }
+        if (ch === "[" && !inClass) { inClass = true; i = i + 1; continue; }
+        if (ch === "]" && inClass) { inClass = false; i = i + 1; continue; }
+        if (inClass) { i = i + 1; continue; }
+        if (ch === "(" && pattern.charAt(i + 1) === "?") {
+            var c2 = pattern.charAt(i + 2);
+            var behind = c2 === "<" && (pattern.charAt(i + 3) === "=" || pattern.charAt(i + 3) === "!");
+            var ahead = c2 === "=" || c2 === "!";
+            if (behind || ahead) {
+                var depth = 1;
+                var j = i + (behind ? 4 : 3);
+                while (j < n && depth > 0) {
+                    var c = pattern.charAt(j);
+                    if (c === "\\") { j = j + 2; continue; }
+                    if (c === "[") {
+                        j = j + 1;
+                        while (j < n) {
+                            if (pattern.charAt(j) === "\\") { j = j + 2; continue; }
+                            if (pattern.charAt(j) === "]") { j = j + 1; break; }
+                            j = j + 1;
+                        }
+                        continue;
+                    }
+                    if (c === "(") depth = depth + 1;
+                    else if (c === ")") depth = depth - 1;
+                    j = j + 1;
+                }
+                if (depth === 0 && _isQuantAt(pattern, j) && (behind || uni)) {
+                    return "Nothing to repeat";
+                }
+                i = j;
+                continue;
+            }
+        }
+        i = i + 1;
+    }
     return null;
 }
 
@@ -281,6 +383,8 @@ export function validateRegexLiteral(pattern, flags) {
     if (flagErr !== null) return flagErr;
     var modeU = flags.indexOf("u") >= 0;
     var modeV = flags.indexOf("v") >= 0;
-    if (!modeU && !modeV) return null;   // 非 u/v 模式 \p 是身份转义,不做量词/属性校验
+    var qerr = _scanLookQuant(pattern, modeU || modeV);
+    if (qerr !== null) return qerr;
+    if (!modeU && !modeV) return null;   // 非 u/v 模式 \p 是身份转义,不做属性校验
     return _scanProps(pattern, modeV);
 }

@@ -1125,6 +1125,22 @@ export class MathGenerator {
         vm.prologue(0, [VReg.S0, VReg.S1]);
         vm.mov(VReg.S0, VReg.A0);   // S0 = base 位
         vm.mov(VReg.S1, VReg.A1);   // S1 = exp 位
+        // NaN 底:exp==±0 → 1(规范);其余 → NaN。须先于 ±Inf 指数表,
+        // 否则 |NaN|>1 被当成普通底,NaN^(-Inf) 得 +0(A4 回归)。
+        vm.movImm64(VReg.V1, 0x7fffffffffffffffn);
+        vm.and(VReg.V2, VReg.S0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ff0000000000000n);
+        vm.cmp(VReg.V2, VReg.V1);
+        vm.jle("_mpow_base_notnan");
+        vm.movImm64(VReg.V1, 0x7fffffffffffffffn);
+        vm.and(VReg.V2, VReg.S1, VReg.V1); // |exp|;V1 刚被盖成 Inf 位,须重装符号掩码
+        vm.cmpImm(VReg.V2, 0);
+        vm.jeq("_mpow_nan0");
+        vm.jmp("_mpow_nan");
+        vm.label("_mpow_nan0");
+        vm.movImm64(VReg.RET, 0x3ff0000000000000n); // 1.0
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_mpow_base_notnan");
         vm.fmovToFloat(0, VReg.S0); // d0 = base
         vm.fmovToFloat(1, VReg.S1); // d1 = exp
         vm.ftrunc(2, 1);            // d2 = trunc(exp)
@@ -1137,6 +1153,11 @@ export class MathGenerator {
         vm.movImm64(VReg.V1, 0x7ff0000000000000n);
         vm.cmp(VReg.V2, VReg.V1);
         vm.jeq("_mpow_nonint");     // |exp| == Infinity → 非整数路径
+        // |exp|>=2^53 的整数皆为偶数(IEEE 在此精度下无法表示奇数)。
+        // fcvtzs 饱和成 INT64_MAX(奇)会把 (-0)^maxfinite 算成 -0。
+        vm.movImm64(VReg.V1, 0x4340000000000000n); // 2^53
+        vm.cmp(VReg.V2, VReg.V1);   // V2 仍是 |exp| bits
+        vm.jge("_mpow_large_int");
         vm.fcvtzs(VReg.V0, 1);      // V0 = n(整数指数)
         vm.movImm(VReg.V2, 0);      // 负指数标志
         vm.cmpImm(VReg.V0, 0);
@@ -1175,6 +1196,15 @@ export class MathGenerator {
         // sqrt/cbrt/exp·log 特路仅对 base>0 生效。NaN 用打印友好位 0x7FF0…0001
         // (0x7FF8…与 NaN-boxing int0 tag 别名会误打印 "0",见 members.js #44 详注)。
         vm.label("_mpow_nonint");
+        // |exp|==Inf:规范比「负底+非整→NaN」更具体。
+        //   |base|<1 ∧ +∞ → +0; |base|<1 ∧ −∞ → +∞
+        //   |base|>1 ∧ +∞ → +∞; |base|>1 ∧ −∞ → +0
+        //   |base|==1 → NaN(含 ±1)。±0 / ±Inf 底由下方 zerobase/infbase 先接。
+        vm.movImm64(VReg.V1, 0x7fffffffffffffffn);
+        vm.and(VReg.V2, VReg.S1, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ff0000000000000n);
+        vm.cmp(VReg.V2, VReg.V1);
+        vm.jeq("_mpow_infexp");
         // base 符号/零判定用整数位测(fcmpZero 在此上下文旗标不可靠):
         //   |bits|==0 → ±0;否则 sign(bit63)==1 → 负。
         vm.movImm64(VReg.V1, 0x7fffffffffffffffn);
@@ -1248,5 +1278,60 @@ export class MathGenerator {
         vm.label("_mpow_infbase_neg");
         vm.movImm(VReg.RET, 0);     // +0 (y<0)
         vm.epilogue([VReg.S0, VReg.S1], 0);
+
+        // |exp|==±Inf(非 NaN):按 |base| 与 1 比较。
+        vm.label("_mpow_infexp");
+        vm.movImm64(VReg.V1, 0x7fffffffffffffffn);
+        vm.and(VReg.V2, VReg.S0, VReg.V1); // |base|
+        vm.cmpImm(VReg.V2, 0);
+        vm.jeq("_mpow_zerobase");          // ±0^±Inf 走零底
+        vm.movImm64(VReg.V1, 0x7ff0000000000000n);
+        vm.cmp(VReg.V2, VReg.V1);
+        vm.jeq("_mpow_infbase");           // ±Inf^±Inf
+        vm.movImm64(VReg.V1, 0x3ff0000000000000n); // 1.0
+        vm.cmp(VReg.V2, VReg.V1);
+        vm.jeq("_mpow_nan");               // (±1)^±Inf → NaN
+        vm.shrImm(VReg.V3, VReg.S1, 63);   // exp 符号
+        vm.cmp(VReg.V2, VReg.V1);
+        vm.jlt("_mpow_infexp_small");      // |base| < 1
+        // |base| > 1:+Inf → +Inf; −Inf → +0
+        vm.cmpImm(VReg.V3, 1);
+        vm.jeq("_mpow_infexp_gt1_neg");
+        vm.movImm64(VReg.RET, 0x7ff0000000000000n);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_mpow_infexp_gt1_neg");
+        vm.movImm(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_mpow_infexp_small");    // |base| < 1:+Inf → +0; −Inf → +Inf
+        vm.cmpImm(VReg.V3, 1);
+        vm.jeq("_mpow_infexp_small_neg");
+        vm.movImm(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_mpow_infexp_small_neg");
+        vm.movImm64(VReg.RET, 0x7ff0000000000000n);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+
+        // 大偶数整数指数:±0^正 → +0; ±0^负 → +Inf;其余仍走平方-乘(n 当偶数)。
+        vm.label("_mpow_large_int");
+        vm.movImm64(VReg.V1, 0x7fffffffffffffffn);
+        vm.and(VReg.V2, VReg.S0, VReg.V1);
+        vm.cmpImm(VReg.V2, 0);
+        vm.jne("_mpow_large_int_nonzero");
+        vm.shrImm(VReg.V2, VReg.S1, 63);
+        vm.cmpImm(VReg.V2, 1);
+        vm.jeq("_mpow_zero_neg");          // (±0)^负大偶数 → +Inf
+        vm.movImm(VReg.RET, 0);            // (±0)^正大偶数 → +0
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_mpow_large_int_nonzero");
+        vm.fcvtzs(VReg.V0, 1);
+        vm.movImm(VReg.V1, 1);
+        vm.not(VReg.V1, VReg.V1);
+        vm.and(VReg.V0, VReg.V0, VReg.V1); // 清最低位 → 偶数
+        vm.movImm(VReg.V2, 0);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jge("_mpow_abs_done");
+        vm.movImm(VReg.V2, 1);
+        vm.neg(VReg.V0, VReg.V0);
+        vm.jmp("_mpow_abs_done");
     }
 }

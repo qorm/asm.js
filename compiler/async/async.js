@@ -1,8 +1,8 @@
 // asm.js 编译器 - 异步函数编译
 // 编译 async 函数和 await 表达式
 
-import { VReg } from "../../vm/index.js";
-import { collectPatternNames } from "../../lang/analysis/closure.js";
+import { VReg } from "../../vm/registers.js";
+import { collectPatternNames, collectParamEvalVarNames } from "../../lang/analysis/closure.js";
 
 // async 函数魔数 - 标记为异步闭包
 export const ASYNC_CLOSURE_MAGIC = 0xa51c;
@@ -40,7 +40,13 @@ export const AsyncCompiler = {
         vm.jeq(awaitDone);
 
         // [test262] Promise 直接 await;thenable 经 _Promise_resolve adopt 后再 await。
+        // [A5] _Promise_resolve 把 A5 当构造器 C。await 在方法/静态方法体内时 A5 仍是
+        // this(类对象或实例)→ 被误判为 Promise 子类 → NewPromiseCapability(C) 失败
+        // 「Promise resolve or reject function is not callable」
+        // (static async + await Promise / Promise.all([C.$()…]) 族)。显式置 %Promise%。
         vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A5, "_nsobj_promise");
+        vm.load(VReg.A5, VReg.A5, 0);
         vm.call("_Promise_resolve"); // RET = 装箱 promise(原 promise 直返 / 新建+adopt)
         vm.mov(VReg.A0, VReg.RET);
         vm.call("_promise_await");
@@ -133,8 +139,7 @@ export const AsyncCompiler = {
         const vm = this.vm;
         // 构造 {value:RET, done:false}
         vm.mov(VReg.A0, VReg.RET);
-        vm.lea(VReg.A1, "_js_false");
-        vm.load(VReg.A1, VReg.A1, 0);
+        vm.movImm64(VReg.A1, 0x7ff9000000000000n);
         vm.call("_generator_make_result"); // RET = boxed {value, done:false}
         // coro = _scheduler_current；resolve coro+88 = P
         vm.lea(VReg.V1, "_scheduler_current");
@@ -281,13 +286,21 @@ export const AsyncCompiler = {
         vm.jmp(arrLoopLabel);
         vm.label(notArrayLabel);
 
-        // 通用迭代器路:obj[Symbol.iterator]()
+        // 通用迭代器路:GetIterator — obj[Symbol.iterator] 缺失/null/undefined/非
+        // callable → TypeError(此前 cmpImm RET,0 漏掉 Symbol 等非 0 不可调用值 →
+        // compileMethodCall 崩 SIGBUS;数组耗尽仍走下方 undefLabel 返 undefined)。
+        const notIterableLabel = this.ctx.newLabel("ystar_not_iterable");
         vm.load(VReg.A0, VReg.FP, iterableTemp);
         this.emitBoxedStringKey("Symbol.iterator", VReg.A1);
         vm.call("_object_get");
-        vm.cmpImm(VReg.RET, 0);
-        vm.jeq(undefLabel);
         vm.mov(VReg.V6, VReg.RET);
+        vm.shrImm(VReg.V0, VReg.RET, 48);
+        vm.cmpImm(VReg.V0, 0x7ffb); // undefined
+        vm.jeq(notIterableLabel);
+        vm.cmpImm(VReg.V0, 0x7ffa); // null
+        vm.jeq(notIterableLabel);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq(notIterableLabel);
         vm.load(VReg.V5, VReg.FP, iterableTemp);
         this.compileMethodCall(VReg.V6, VReg.V5, []);
         vm.store(VReg.FP, iteratorTemp, VReg.RET);
@@ -327,6 +340,12 @@ export const AsyncCompiler = {
 
         vm.label(undefLabel);
         vm.movImm64(VReg.RET, 0x7ffb000000000000n); // was lea+load _js const
+        vm.jmp(endLabel);
+
+        // GetIterator 失败:缺失/null/undefined/非 callable @@iterator → TypeError
+        vm.label(notIterableLabel);
+        this.emitThrowTypeError("obj is not iterable");
+
         vm.label(endLabel);
         // RET = yield* 表达式值
     },
@@ -335,14 +354,17 @@ export const AsyncCompiler = {
     // 脱糖成合成 AST 复用现有 方法调用/await/while/yield 编译器(同 for-await-of 的
     // compileForAwaitDispatch 风格)。GetIterator(value, async) 语义:
     //   __am = __src[Symbol.asyncIterator]
-    //   if (typeof __am === "function") { __it = __am.call(__src) }        // async 迭代器
+    //   if (typeof __am === "function") { __it = Call(__am, __src) }
     //   else if (__am === null || typeof __am === "undefined") {
-    //     __it = __src[Symbol.iterator]()   // CreateAsyncFromSyncIterator:同步 next() 经 await 归一化
-    //   } else { throw new TypeError }      // GetMethod:非 callable 非 null/undefined → TypeError
+    //     __sm = GetMethod(__src, @@iterator); __it = Call(__sm, __src)
+    //     // CreateAsyncFromSyncIterator 近似:同步 next 结果经 await 归一化
+    //   } else { throw new TypeError }
+    //   __next = __it.next                 // 缓存 [[NextMethod]],勿每轮 get
+    //   __recv = undefined                 // 首次 / 后续外层 next(v) 注入值
     //   while (true) {
-    //     __r = await __it.next()
+    //     __r = await Call(__next, __it, « __recv »)
     //     if (__r.done) { __val = __r.value; break; }
-    //     yield __r.value
+    //     __recv = yield __r.value
     //   }
     //   RET = __val
     // yield 经 compileYieldExpression → inAsyncGenerator 走 emitAsyncYieldValue,
@@ -352,46 +374,64 @@ export const AsyncCompiler = {
         const id = this.nextLabelId();
         const srcName = `__ysa_src_${id}`;
         const amName = `__ysa_am_${id}`;
+        const smName = `__ysa_sm_${id}`;
         const itName = `__ysa_it_${id}`;
+        const nextName = `__ysa_next_${id}`;
+        const recvName = `__ysa_recv_${id}`;
         const resName = `__ysa_res_${id}`;
         const valName = `__ysa_val_${id}`;
         const idn = (n) => ({ type: "Identifier", name: n });
         const member = (o, p, computed) => ({ type: "MemberExpression", object: o, property: p, computed: !!computed });
+        const callWithThis = (fn, thisArg, args) => ({ type: "__CallWithThis", calleeFn: fn, thisArg: thisArg, callArgs: args || [] });
         const symAsyncIter = () => member(idn("Symbol"), idn("asyncIterator"), false);
         const symIter = () => member(idn("Symbol"), idn("iterator"), false);
         const asyncIterRef = member(idn(srcName), symAsyncIter(), true);
-        const getIt = (symKey) => ({ type: "CallExpression", callee: member(idn(srcName), symKey(), true), arguments: [] });
         const typeofIs = (val, s) => ({ type: "BinaryExpression", operator: "===", left: { type: "UnaryExpression", operator: "typeof", argument: val }, right: { type: "StringLiteral", value: s } });
-        // 循环体:while(true){ __r=await __it.next(); if(__r.done){__val=__r.value;break;} yield __r.value }
-        const loopBody = { type: "WhileStatement", test: { type: "BooleanLiteral", value: true }, body: { type: "BlockStatement", body: [
-            { type: "VariableDeclaration", kind: "const", declarations: [{ type: "VariableDeclarator", id: idn(resName), init: { type: "AwaitExpression", argument: { type: "CallExpression", callee: member(idn(itName), idn("next"), false), arguments: [] } } }] },
-            { type: "IfStatement",
-              test: member(idn(resName), idn("done"), false),
-              consequent: { type: "BlockStatement", body: [
-                  { type: "ExpressionStatement", expression: { type: "AssignmentExpression", operator: "=", left: idn(valName), right: member(idn(resName), idn("value"), false) } },
-                  { type: "BreakStatement" },
-              ] },
-              alternate: null },
-            { type: "ExpressionStatement", expression: { type: "YieldExpression", delegate: false, argument: member(idn(resName), idn("value"), false) } },
-        ] } };
-        // async 迭代器优先(null/undefined → 同步迭代器回退;其余非 callable → TypeError)。
-        // 调用形态 src[Symbol.asyncIterator]()(成员调用,this=src)与 for-await-of 的
-        // compileForAwaitDispatch 同构;typeof 分派已读过一次 getter,此分支再读一次
-        // —— 与 for-await-of 的既有双读行为一致(test262 不计数该 getter)。
+        // 取到迭代器后:缓存 next、转发 resume 值(yield-star-sync-next 等依赖)。
+        const afterIter = { type: "BlockStatement", body: [
+            { type: "VariableDeclaration", kind: "const", declarations: [{ type: "VariableDeclarator", id: idn(nextName), init: member(idn(itName), idn("next"), false) }] },
+            { type: "VariableDeclaration", kind: "let", declarations: [{ type: "VariableDeclarator", id: idn(recvName), init: idn("undefined") }] },
+            { type: "WhileStatement", test: { type: "BooleanLiteral", value: true }, body: { type: "BlockStatement", body: [
+                { type: "VariableDeclaration", kind: "const", declarations: [{ type: "VariableDeclarator", id: idn(resName), init: { type: "AwaitExpression", argument: callWithThis(idn(nextName), idn(itName), [idn(recvName)]) } }] },
+                { type: "IfStatement",
+                  test: member(idn(resName), idn("done"), false),
+                  consequent: { type: "BlockStatement", body: [
+                      { type: "ExpressionStatement", expression: { type: "AssignmentExpression", operator: "=", left: idn(valName), right: member(idn(resName), idn("value"), false) } },
+                      { type: "BreakStatement" },
+                  ] },
+                  alternate: null },
+                { type: "ExpressionStatement", expression: { type: "AssignmentExpression", operator: "=", left: idn(recvName), right: { type: "YieldExpression", delegate: false, argument: member(idn(resName), idn("value"), false) } } },
+            ] } },
+        ] };
+        // async 迭代器:typeof 已取过 __am,用 Call(__am,__src) 勿再 get。
         const asyncBlock = { type: "BlockStatement", body: [
-            { type: "VariableDeclaration", kind: "const", declarations: [{ type: "VariableDeclarator", id: idn(itName), init: { type: "CallExpression", callee: member(idn(srcName), symAsyncIter(), true), arguments: [] } }] },
-            loopBody,
+            { type: "VariableDeclaration", kind: "const", declarations: [{ type: "VariableDeclarator", id: idn(itName), init: callWithThis(idn(amName), idn(srcName), []) }] },
+            afterIter,
         ] };
         const syncBlock = { type: "BlockStatement", body: [
-            { type: "VariableDeclaration", kind: "const", declarations: [{ type: "VariableDeclarator", id: idn(itName), init: getIt(symIter) }] },
-            loopBody,
+            // GetMethod(@@iterator):读一次再 Call,勿二次 get(探测日志序敏感)。
+            { type: "VariableDeclaration", kind: "const", declarations: [{ type: "VariableDeclarator", id: idn(smName), init: member(idn(srcName), symIter(), true) }] },
+            { type: "IfStatement",
+              test: typeofIs(idn(smName), "function"),
+              consequent: { type: "BlockStatement", body: [
+                  { type: "VariableDeclaration", kind: "const", declarations: [{ type: "VariableDeclarator", id: idn(itName), init: callWithThis(idn(smName), idn(srcName), []) }] },
+                  afterIter,
+              ] },
+              alternate: { type: "ThrowStatement", argument: { type: "NewExpression", callee: { type: "Identifier", name: "TypeError" }, arguments: [{ type: "Literal", value: "obj[Symbol.iterator] is not a function" }] } } },
         ] };
         const typeErrorBlock = { type: "BlockStatement", body: [
             { type: "ThrowStatement", argument: { type: "NewExpression", callee: { type: "Identifier", name: "TypeError" }, arguments: [{ type: "Literal", value: "obj[Symbol.asyncIterator] is not a function" }] } },
         ] };
+        // 表达式结果槽必须在函数级预分配:dispatch 是含 let/const 的 BlockStatement,
+        // leaveScope 会摘掉块内绑定;若事后 getLocal(valName) 则恒 miss → 误返 undefined
+        // (yield* 收尾值丢,"after yield*".value 变 undefined)。
+        const valOff = this.ctx.allocLocal(valName);
+        vm.movImm64(VReg.RET, 0x7ffb000000000000n);
+        vm.store(VReg.FP, valOff, VReg.RET);
         const dispatch = { type: "BlockStatement", body: [
             { type: "VariableDeclaration", kind: "const", declarations: [{ type: "VariableDeclarator", id: idn(srcName), init: expr.argument }] },
             { type: "VariableDeclaration", kind: "const", declarations: [{ type: "VariableDeclarator", id: idn(amName), init: asyncIterRef }] },
+            // 复用上方预分配槽(块内 let 见已有 offset 不新开;leave 后槽仍在)
             { type: "VariableDeclaration", kind: "let", declarations: [{ type: "VariableDeclarator", id: idn(valName), init: idn("undefined") }] },
             { type: "IfStatement",
               test: typeofIs(idn(amName), "function"),
@@ -410,9 +450,7 @@ export const AsyncCompiler = {
         ] };
         this.compileStatement(dispatch);
         // RET = __val(yield* 表达式值 = 被委托者 return 值)
-        const valOff = this.ctx.getLocal(valName);
-        if (valOff) vm.load(VReg.RET, VReg.FP, valOff);
-        else vm.movImm64(VReg.RET, 0x7ffb000000000000n);
+        vm.load(VReg.RET, VReg.FP, valOff);
     },
 
     // [批次D] 生成器函数 stub：函数标签处不执行体，改为创建协程+生成器对象。
@@ -426,11 +464,11 @@ export const AsyncCompiler = {
     // [FDI eager] 必须透传 emitGeneratorStub 的返回值(pattern 叶名序):丢 return → 调用方
     // 拿 undefined → async-gen 体内误判未绑定而重复 emitParamDestructure → 与 stub 同前缀
     // 标签二次发射互相覆盖(跳转解析到错误落点,SIGBUS)。
-    emitAsyncGeneratorStub(bodyLabel, hasClosure, capturedNames) {
-        return this.emitGeneratorStub(bodyLabel, hasClosure, "_async_generator_new", capturedNames);
+    emitAsyncGeneratorStub(bodyLabel, hasClosure, capturedNames, funcSymbol, funcLabel) {
+        return this.emitGeneratorStub(bodyLabel, hasClosure, "_async_generator_new", capturedNames, funcSymbol, funcLabel);
     },
 
-    emitGeneratorStub(bodyLabel, hasClosure, ctorFn, capturedNames) {
+    emitGeneratorStub(bodyLabel, hasClosure, ctorFn, capturedNames, funcSymbol, funcLabel) {
         const vm = this.vm;
         if (!ctorFn) ctorFn = "_generator_new"; // 缺省=同步生成器(既有调用点字节不变)
         // 栈尺寸 0→8192:[L2-②] eager 默认值探针(emitGenStubDefaultProbes)要在本帧
@@ -505,6 +543,43 @@ export const AsyncCompiler = {
             vm.load(VReg.V1, VReg.FP, fdi.arrOff);
             vm.store(VReg.V6, 168, VReg.V1);
             }
+        // [[Prototype]] = Get(ctor,"prototype"):_generator_new 默认 Object.prototype,
+        // OrdinaryHasInstance 要比对 ctor.prototype。声明作值与 g() 共用
+        // _funcclosure_<sym> 侧表(index.js 已传 funcSymbol/funcLabel);表达式走 S0 闭包
+        // (compileFunctionExpression 已 emitFnOwnPrototype)。无 ctor 则回落
+        // %Generator.prototype% / %AsyncGenerator.prototype%。
+        vm.push(VReg.RET);
+        if (hasClosure) {
+            vm.mov(VReg.A0, VReg.S0);
+            vm.call("_js_box_function");
+            vm.mov(VReg.A1, VReg.RET);
+        } else if (funcSymbol && funcLabel) {
+            const slotLabel = this.ensureFuncClosureSlot(funcSymbol);
+            const haveFnL = this.ctx.newLabel("geninst_fn_have");
+            vm.lea(VReg.V0, slotLabel);
+            vm.load(VReg.RET, VReg.V0, 0);
+            vm.cmpImm(VReg.RET, 0);
+            vm.jne(haveFnL);
+            vm.movImm(VReg.A0, 16);
+            vm.call("_alloc");
+            vm.mov(VReg.S1, VReg.RET);
+            vm.movImm(VReg.V1, 0xc105);
+            vm.store(VReg.S1, 0, VReg.V1);
+            vm.lea(VReg.V1, funcLabel);
+            vm.store(VReg.S1, 8, VReg.V1);
+            vm.mov(VReg.A0, VReg.S1);
+            vm.call("_js_box_function");
+            vm.lea(VReg.V1, slotLabel);
+            vm.store(VReg.V1, 0, VReg.RET);
+            if (this.emitFnOwnPrototype) this.emitFnOwnPrototype();
+            vm.label(haveFnL);
+            vm.mov(VReg.A1, VReg.RET);
+        } else {
+            vm.movImm(VReg.A1, 0);
+        }
+        vm.pop(VReg.A0);
+        vm.movImm(VReg.A2, ctorFn === "_async_generator_new" ? 1 : 0);
+        vm.call("_generator_set_instance_proto");
         // 栈尺寸须与 prologue(8192) 配对(epilogue 用 stackSize 恢复 SP;0 会令 SP 停在
         // 帧中段 → ret 从错误地址取返回地址 → 调用生成器函数即崩)。
         vm.epilogue([VReg.S3], 8192); // ret：返回 genobj；恢复 S3
@@ -573,7 +648,8 @@ export const AsyncCompiler = {
         }
 
         const rec = Object.create(savedCtx);
-        rec.locals = {};
+        rec.locals = new Map();
+        rec.localTemps = null;
         rec.stackOffset = 0;
         rec.varTypes = {};
         // [标签隔离] rec 继承外层 labelPrefix/labelCounter,newLabel 的 ++ 落在 rec 自有
@@ -600,7 +676,22 @@ export const AsyncCompiler = {
         }
         this.ctx = rec;
 
-        // __this(默认值表达式可引用 this)
+        const pevObj = collectParamEvalVarNames(params);
+        const pevList = [];
+        for (const pk in pevObj) {
+            if (pevObj[pk] === true) pevList.push(pk);
+        }
+        if (pevList.length > 0) {
+            rec.paramEvalVarNames = new Set(pevList);
+            rec.paramLexNames = new Set();
+            for (let ti = 0; ti < n; ti++) {
+                const tp = params[ti];
+                if (tp && tp.type === "Identifier") rec.paramLexNames.add(tp.name);
+                else if (tp && tp.type === "AssignmentPattern" && tp.left &&
+                    tp.left.type === "Identifier") rec.paramLexNames.add(tp.left.name);
+            }
+            rec.paramBindingNames = bindingNames;
+        }
         const thisOff = rec.allocLocal("__this");
         vm.store(VReg.FP, thisOff, VReg.A5);
         // 捕获名:S0 闭包 box 指针预载入探针帧(与体内 closure 载入同法)
@@ -619,6 +710,88 @@ export const AsyncCompiler = {
         }
         const thisSlot = rec.allocLocal(`__fdithis`);
         vm.store(VReg.FP, thisSlot, VReg.A5);
+        // [params-dflt-ref-arguments] 默认值求值可引用 arguments;须在绑定前于探针帧建
+        // arguments 对象(与 compileFunctionBody 顺序同)。类生成器方法此前既无 override
+        // 形参表、stub 也不建 arguments → 默认值读垃圾崩。
+        // rest 形参(含 `...[a]` 影子模式)同样需要满窗 argv 快照,供 emitRestParam 收第 6+ 实参。
+        let fdiUsesArguments = this.functionBodyUsesArguments({ type: "FunctionExpression", params: params, body: null });
+        let fdiNeedFullArgv = fdiUsesArguments;
+        if (!fdiNeedFullArgv) {
+            for (let ri = 0; ri < params.length; ri++) {
+                if (params[ri] && params[ri].type === "SpreadElement") { fdiNeedFullArgv = true; break; }
+            }
+        }
+        if (fdiNeedFullArgv) this.emitArgvSpillSnapshot(16);
+        if (fdiUsesArguments) this.emitArgumentsArray();
+        // rest 绑定模式:parser 拆成 SpreadElement(__restpat_N) + 影子 pattern(.restSource)。
+        // 普通函数路径在形参循环里 emitRestParam;FDI 此前只跑 emitParamDestructure,
+        // getLocal(restSource) 失败 → 编译期 throw。先按 SpreadElement 下标收 rest 数组。
+        for (let ri = 0; ri < n; ri++) {
+            const rp = params[ri];
+            if (!rp || !this._isPatternParam(rp)) continue;
+            const rpat = rp.type === "AssignmentPattern" ? rp.left : rp;
+            if (!rpat || !rpat.restSource) continue;
+            let spreadIndex = -1;
+            for (let sj = 0; sj < ri; sj++) {
+                const sp = params[sj];
+                if (sp && sp.type === "SpreadElement" && sp.argument &&
+                    sp.argument.type === "Identifier" && sp.argument.name === rpat.restSource) {
+                    spreadIndex = sj;
+                    break;
+                }
+            }
+            if (spreadIndex >= 0) this.emitRestParam(rpat.restSource, spreadIndex);
+        }
+        if (pevList.length > 0) {
+            const undef = 0x7ffb000000000000n;
+            for (let pi = 0; pi < pevList.length; pi++) {
+                const nm = pevList[pi];
+                if (rec.getLocal(nm)) continue;
+                const pevOff = rec.allocLocal(nm);
+                rec.boxedVars.add(nm);
+                vm.movImm(VReg.A0, 8);
+                vm.call("_alloc");
+                const mcv = rec.getMainCapturedVar && rec.getMainCapturedVar(nm);
+                if (mcv) {
+                    vm.lea(VReg.V1, mcv);
+                    vm.load(VReg.V1, VReg.V1, 0);
+                    vm.load(VReg.V0, VReg.V1, 0);
+                } else {
+                    vm.movImm64(VReg.V0, undef);
+                }
+                vm.store(VReg.RET, 0, VReg.V0);
+                vm.store(VReg.FP, pevOff, VReg.RET);
+            }
+        }
+        // [NFE FDI] 具名生成器表达式 BindingIdentifier 须在形参默认值求值前可见
+        // (`function* g(_=(…g…))` 读 inner g,非外层同名 var)。须在 vm.push(S0) 前
+        // 完成(_alloc 等 helper 会踩 S0;push 后 S0 栈上保存)。gbody 仍
+        // emitNamedFunctionExprBinding,此处只服务 stub/FDI 阶段的 param env。
+        {
+            const fnExpr = this._genStubFnExpr;
+            if (fnExpr && fnExpr.type === "FunctionExpression" && fnExpr.id && fnExpr.id.name) {
+                const nm = fnExpr.id.name;
+                if (!rec.immutableLocals) rec.immutableLocals = new Set();
+                rec.immutableLocals.add(nm);
+                if (!rec.getLocal(nm)) {
+                    const nameOff = rec.allocLocal(nm);
+                    rec.fnExprNameSlot = nameOff;
+                    vm.mov(VReg.A0, VReg.S0);
+                    vm.call("_js_box_function");
+                    const boxIt = rec.boxedVars && rec.boxedVars.has(nm);
+                    if (boxIt) {
+                        rec.boxedVars.add(nm);
+                        vm.push(VReg.RET);
+                        vm.call("_box_alloc");
+                        vm.pop(VReg.V1);
+                        vm.store(VReg.RET, 0, VReg.V1);
+                        vm.store(VReg.FP, nameOff, VReg.RET);
+                    } else {
+                        vm.store(VReg.FP, nameOff, VReg.RET);
+                    }
+                }
+            }
+        }
         // 按形参序跑完整绑定(外层默认值 + 解构;emitParamDestructure 与体内同构)
         // [S0 保护] 阵列分支物化 Array.prototype 时 emitArrayProtoObject 内联体使用 S0
         // (emitCollectionCtorObject 的闭包构造码 mov S0,RET)——生成器 stub 的 S0 = 闭包
@@ -626,6 +799,16 @@ export const AsyncCompiler = {
         // 指针 → 体内捕获变量载入解引用崩(与 emitGenStubIterGuard 同法;抛路径不返回
         // 无需弹)。
         vm.push(VReg.S0);
+        // [FDI ident] 无默认值的 Identifier 形参须先于默认值求值入探针帧
+        // (`async function*(x, y=x)` / `function*(a,b,c,d,e,f=…)` 的 y=x 等)。
+        for (let bi = 0; bi < n; bi++) {
+            const bp = params[bi];
+            if (bp && bp.type === "Identifier") {
+                const boff = rec.allocLocal(bp.name);
+                vm.load(VReg.V0, VReg.FP, slots[bi]);
+                vm.store(VReg.FP, boff, VReg.V0);
+            }
+        }
         // [FDI ident] 标识符默认值形参:调用期求默认值(undefined→默认;TDZ 标点经
         // compileIdentifier._tdzRefName 抛 ReferenceError),值入 transfer 数组。
         const emitIdentFdi = (i, p) => {
@@ -637,7 +820,10 @@ export const AsyncCompiler = {
             vm.movImm64(VReg.V1, 0x7ffb000000000000n);
             vm.cmp(VReg.V0, VReg.V1);
             vm.jne(skip);
+            const _prevEvalParam = this.ctx._evalInParamInit;
+            this.ctx._evalInParamInit = true;
             this.compileExpression(p.right);
+            this.ctx._evalInParamInit = _prevEvalParam;
             vm.store(VReg.FP, off, VReg.RET);
             vm.label(skip);
         };
@@ -668,13 +854,21 @@ export const AsyncCompiler = {
         vm.call("_box_arr_r"); // box->helper
         vm.store(VReg.FP, arrOff, VReg.RET);
         for (let i = 0; i < recorded.length; i++) {
-            const off = rec.locals[recorded[i]];
+            const off = rec.getLocal(recorded[i]);
             vm.load(VReg.A0, VReg.FP, arrOff);
             vm.load(VReg.A1, VReg.FP, off);
             vm.call("_array_push");
             vm.store(VReg.FP, arrOff, VReg.RET);
         }
+        for (let pj = 0; pj < pevList.length; pj++) {
+            const pevOff = rec.getLocal(pevList[pj]);
+            vm.load(VReg.A0, VReg.FP, arrOff);
+            vm.load(VReg.A1, VReg.FP, pevOff);
+            vm.call("_array_push");
+            vm.store(VReg.FP, arrOff, VReg.RET);
+        }
         const list = recorded.slice();
+        for (let pj = 0; pj < pevList.length; pj++) list.push(pevList[pj]);
         const arrOffOut = arrOff;
         // 恢复外层 ctx + 回填参数寄存器(A0-A4、A5=this:绑定路径自由毁它们)
         this.ctx = savedCtx;
@@ -701,11 +895,14 @@ export const AsyncCompiler = {
         // 的 locals/stackOffset —— 外层函数后续语句的槽位分配必须不受影响。
         const savedStackOffset = this.ctx.stackOffset;
         const savedLocals = this.ctx.locals;
+        const savedLocalsUndo = this.ctx._localsUndo;
         const savedBoxed = this.ctx.boxedVars;
         const savedVarTypes = this.ctx.varTypes;
         const savedCtx = this.ctx;
         this.ctx.stackOffset = 0;
-        this.ctx.locals = {};
+        this.ctx.locals = new Map();
+        this.ctx.localTemps = null;
+        this.ctx._localsUndo = [];
         this.ctx.boxedVars = new Set();
         this.ctx.varTypes = {};
         const vm = this.vm;
@@ -780,6 +977,7 @@ export const AsyncCompiler = {
         }
         this.ctx.stackOffset = savedStackOffset;
         this.ctx.locals = savedLocals;
+        this.ctx._localsUndo = savedLocalsUndo;
         this.ctx.boxedVars = savedBoxed;
         this.ctx.varTypes = savedVarTypes;
         return slots;
@@ -1066,9 +1264,12 @@ export const AsyncCompiler = {
         if (!anyArray) return; // 无阵列 pattern:零发射
         const savedStackOffset = this.ctx.stackOffset;
         const savedLocals = this.ctx.locals;
+        const savedLocalsUndo = this.ctx._localsUndo;
         const savedCtx = this.ctx;
         this.ctx.stackOffset = 0;
-        this.ctx.locals = {};
+        this.ctx.locals = new Map();
+        this.ctx.localTemps = null;
+        this.ctx._localsUndo = [];
         const n = pats.length < 5 ? pats.length : 5;
         const slots = [];
         for (let i = 0; i < n; i++) {
@@ -1127,15 +1328,19 @@ export const AsyncCompiler = {
         }
         this.ctx.stackOffset = savedStackOffset;
         this.ctx.locals = savedLocals;
+        this.ctx._localsUndo = savedLocalsUndo;
         this.ctx = savedCtx;
     },
 
     // stub 只拿到 bodyLabel(=<函数标签>_gbody),形参表按标签反查:
+    //  0) compileClassMethod 经 _genStubParamsOverride 直传(匿名 class 表达式无 id,
+    //     扫描索引扫不到 → 此前 FDI/守卫全漏、解构 TypeError 拖到 .next())
     //  1) 函数表达式/闭包(含对象字面量方法):pendingFunctions[i].label + "_gbody"
     //  2) 顶层函数声明:"_user_" + name + "_gbody"
     //  3) 类生成器方法:标签形如 _class_<类名>_[static_]<方法名>_<labelId>(见 compileClassMethod)
     // 反查不到(计算键方法、未登记形态)→ null,即不发守卫,保持既有行为。
     _genStubParams(bodyLabel) {
+        if (this._genStubParamsOverride) return this._genStubParamsOverride;
         if (typeof bodyLabel !== "string") return null;
         const suf = "_gbody";
         if (bodyLabel.length <= suf.length) return null;
@@ -1305,8 +1510,16 @@ export const AsyncCompiler = {
         vm.call("_promise_new");
         vm.mov(VReg.S1, VReg.RET); // S1 = Promise
         vm.store(VReg.S2, 88, VReg.S1); // coro.promise
+        // +168=1 标记普通 async(非 async-gen):_coroutine_return 不得再
+        // _generator_make_result 包一层 {value,done} 去结算这个 Promise。
+        vm.movImm(VReg.V1, 1);
+        vm.store(VReg.S2, 168, VReg.V1);
         vm.mov(VReg.A0, VReg.S2);
         vm.call("_scheduler_spawn");
+        // [AsyncFunctionStart] 同步执行至首个 await/return(见 compileAsyncClosureCall)。
+        vm.mov(VReg.A0, VReg.S2);
+        vm.movImm64(VReg.A1, 0x7ffb000000000000n);
+        vm.call("_coroutine_resume");
         vm.mov(VReg.RET, VReg.S1); // 返回 Promise
         vm.epilogue([VReg.S1, VReg.S2, VReg.S3], 0);
         vm.label(bodyLabel);
@@ -1421,6 +1634,8 @@ export const AsyncCompiler = {
 
         // 将协程与 Promise 关联
         vm.store(VReg.S2, 88, VReg.S3); // coro.promise = Promise
+        vm.movImm(VReg.V1, 1);
+        vm.store(VReg.S2, 168, VReg.V1);
 
         // 将协程加入调度队列
         vm.mov(VReg.A0, VReg.S2);
@@ -1458,6 +1673,92 @@ export const AsyncCompiler = {
         vm.jmp(this.ctx.returnLabel);
     },
 
+    // 安装 async 体 catch 帧,并在入口把当前协程 / coro+88 Promise 落到 FP 槽。
+    // 结算时优先读这两槽,避免 _scheduler_current 在体末已不是本协程时打到错误 Promise,
+    // 随后 _coroutine_return 再把真 Promise 结算成 {value,done:true}。
+    emitInstallAsyncExcFrame(rejectLabel) {
+        const vm = this.vm;
+        let asyncExcFrameOff = 0;
+        for (let i = 0; i < 10; i++) {
+            asyncExcFrameOff = this.ctx.allocLocal(this.ctx.newLabel("__asyncexcframe"));
+        }
+        this.ctx._asyncExcFrameOff = asyncExcFrameOff;
+        vm.lea(VReg.V0, "_exc_ctx_top");
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.store(VReg.FP, asyncExcFrameOff + 0, VReg.V1);
+        vm.lea(VReg.V1, rejectLabel);
+        vm.store(VReg.FP, asyncExcFrameOff + 8, VReg.V1);
+        vm.mov(VReg.V1, VReg.SP);
+        vm.store(VReg.FP, asyncExcFrameOff + 16, VReg.V1);
+        vm.store(VReg.FP, asyncExcFrameOff + 24, VReg.FP);
+        vm.store(VReg.FP, asyncExcFrameOff + 32, VReg.S0);
+        vm.store(VReg.FP, asyncExcFrameOff + 40, VReg.S1);
+        vm.store(VReg.FP, asyncExcFrameOff + 48, VReg.S2);
+        vm.store(VReg.FP, asyncExcFrameOff + 56, VReg.S3);
+        vm.store(VReg.FP, asyncExcFrameOff + 64, VReg.S4);
+        vm.mov(VReg.V1, VReg.S5);
+        vm.store(VReg.FP, asyncExcFrameOff + 72, VReg.V1);
+        vm.subImm(VReg.V1, VReg.FP, -asyncExcFrameOff);
+        vm.store(VReg.V0, 0, VReg.V1);
+
+        const coroOff = this.ctx.allocLocal(this.ctx.newLabel("__async_coro"));
+        const promiseOff = this.ctx.allocLocal(this.ctx.newLabel("__async_promise"));
+        this.ctx._asyncCoroOff = coroOff;
+        this.ctx._asyncPromiseOff = promiseOff;
+        vm.lea(VReg.V1, "_scheduler_current");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.store(VReg.FP, coroOff, VReg.V1);
+        vm.load(VReg.V2, VReg.V1, 88);
+        vm.store(VReg.FP, promiseOff, VReg.V2);
+    },
+
+    _emitAsyncPopExcChain() {
+        const vm = this.vm;
+        const asyncFrameOff = this.ctx._asyncExcFrameOff;
+        if (!asyncFrameOff) return;
+        vm.load(VReg.V3, VReg.FP, asyncFrameOff + 0);
+        vm.lea(VReg.V2, "_exc_ctx_top");
+        vm.store(VReg.V2, 0, VReg.V3);
+    },
+
+    _emitAsyncClearCoroPromise() {
+        const vm = this.vm;
+        const coroOff = this.ctx._asyncCoroOff;
+        if (coroOff) {
+            vm.load(VReg.V1, VReg.FP, coroOff);
+            vm.cmpImm(VReg.V1, 0);
+            const skip = this.ctx.newLabel("async_clr_no_coro");
+            vm.jeq(skip);
+            vm.movImm(VReg.V2, 0);
+            vm.store(VReg.V1, 88, VReg.V2);
+            vm.label(skip);
+            return;
+        }
+        vm.lea(VReg.V1, "_scheduler_current");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmpImm(VReg.V1, 0);
+        const skip2 = this.ctx.newLabel("async_clr_no_cur");
+        vm.jeq(skip2);
+        vm.movImm(VReg.V2, 0);
+        vm.store(VReg.V1, 88, VReg.V2);
+        vm.label(skip2);
+    },
+
+    _emitAsyncLoadPromise(destReg) {
+        const vm = this.vm;
+        const done = this.ctx.newLabel("async_p_done");
+        const promiseOff = this.ctx._asyncPromiseOff;
+        if (promiseOff) {
+            vm.load(destReg, VReg.FP, promiseOff);
+            vm.cmpImm(destReg, 0);
+            vm.jne(done);
+        }
+        vm.lea(VReg.V1, "_scheduler_current");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.load(destReg, VReg.V1, 88);
+        vm.label(done);
+    },
+
     // async 函数体内**未捕获**的异常(throw / await 到 reject):拒绝该函数关联的 Promise
     // 而非 emitUnhandledExceptionExit(退出)。异常值在 _exception_value(compileThrowStatement/
     // compileAwaitExpression 已置),清 _exception_pending 后 reject(coro.promise, value)、epilogue。
@@ -1465,26 +1766,17 @@ export const AsyncCompiler = {
     emitAsyncRejectFromException() {
         const vm = this.vm;
 
-        // [#async-exc-ctx] 弹出本 async 体的 catch 上下文帧(若安装),
-        // 把 _exc_ctx_top 恢复至入口前的链头。_throw_unwind 到达时已
-        // 从帧恢复 SP/FP/S 寄存器,此处只需弹链。
-        const asyncFrameOff = this.ctx._asyncExcFrameOff;
-        if (asyncFrameOff) {
-            vm.load(VReg.V3, VReg.FP, asyncFrameOff + 0);
-            vm.lea(VReg.V2, "_exc_ctx_top");
-            vm.store(VReg.V2, 0, VReg.V3);
-        }
+        this._emitAsyncPopExcChain();
 
         const skip = this.ctx.newLabel("async_rej_no_promise");
-        vm.lea(VReg.V1, "_scheduler_current");
-        vm.load(VReg.V1, VReg.V1, 0);      // 当前协程
-        vm.load(VReg.V2, VReg.V1, 88);     // 关联 Promise
+        this._emitAsyncLoadPromise(VReg.V2);
         vm.cmpImm(VReg.V2, 0);
         vm.jeq(skip);
         vm.lea(VReg.V0, "_exception_value");
         vm.load(VReg.A1, VReg.V0, 0);      // 拒因
         vm.mov(VReg.A0, VReg.V2);
         vm.call("_promise_reject");
+        this._emitAsyncClearCoroPromise();
         vm.lea(VReg.V0, "_exception_pending");
         vm.movImm(VReg.V1, 0);
         vm.store(VReg.V0, 0, VReg.V1);     // 清 pending(已作为拒因交给 Promise)
@@ -1499,13 +1791,7 @@ export const AsyncCompiler = {
     emitAsyncResolveAndReturnFromRet() {
         const vm = this.vm;
 
-        // [#async-exc-ctx] 弹出本 async 体的 catch 上下文帧(若安装)。
-        const asyncFrameOff_resolve = this.ctx._asyncExcFrameOff;
-        if (asyncFrameOff_resolve) {
-            vm.load(VReg.V3, VReg.FP, asyncFrameOff_resolve + 0);
-            vm.lea(VReg.V2, "_exc_ctx_top");
-            vm.store(VReg.V2, 0, VReg.V3);
-        }
+        this._emitAsyncPopExcChain();
 
         // 清 _exception_pending:finally 块的 return 覆盖任何在途异常
         // (try { await reject() } finally { return X } / try { throw } finally { return X })
@@ -1516,12 +1802,7 @@ export const AsyncCompiler = {
         // 保存返回值
         vm.push(VReg.RET);
 
-        // 获取当前协程
-        vm.lea(VReg.V1, "_scheduler_current");
-        vm.load(VReg.V1, VReg.V1, 0);
-
-        // 获取关联的 Promise
-        vm.load(VReg.V2, VReg.V1, 88);
+        this._emitAsyncLoadPromise(VReg.V2);
 
         // 如果有 Promise，resolve 它
         vm.cmpImm(VReg.V2, 0);
@@ -1532,6 +1813,7 @@ export const AsyncCompiler = {
         vm.push(VReg.A1); // 保留一份
         vm.mov(VReg.A0, VReg.V2);
         vm.call("_promise_resolve");
+        this._emitAsyncClearCoroPromise();
 
         vm.label(noPromiseLabel);
         // 恢复返回值，然后正常 epilogue

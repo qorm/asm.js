@@ -1,7 +1,7 @@
 // asm.js 编译器 - 内置类型方法编译
 // 编译 Math、Array、Map、Set、Date、RegExp 等内置类型的方法
 
-import { VReg } from "../../vm/index.js";
+import { VReg } from "../../vm/registers.js";
 
 // 内置方法编译方法混入
 export const BuiltinMethodCompiler = {
@@ -14,7 +14,8 @@ export const BuiltinMethodCompiler = {
         this.compileExpression({
             type: "CallExpression",
             callee: { type: "Identifier", name: "__RE_" + method },
-            arguments: [obj, args.length > 0 ? args[0] : { type: "Literal", value: "" }],
+            arguments: [obj, args.length > 0 ? args[0]
+                : { type: "UnaryExpression", operator: "void", argument: { type: "Literal", value: 0 }, prefix: true }],
         });
         return true;
     },
@@ -135,17 +136,10 @@ export const BuiltinMethodCompiler = {
                     this.vm.push(VReg.V1);
                 }
 
-                // 编译 end 参数
+                // 编译 end 参数。禁止预 _to_int32：undefined 必须原样传入，
+                // 由 _str_slice 判 end===undefined → len（预转会变成 0 → 空串）。
                 if (args.length > 1) {
                     this.compileExpression(args[1]);
-                    // x64: 同上, RET->A0 显式搬运
-                    if (this.vm.backend.name === "x64") this.vm.mov(VReg.A0, VReg.RET);
-                    // 确保是 Int32 (NaN-boxed) - 使用 V1 避免覆盖 RET
-                    this.vm.call("_to_int32");
-                    this.vm.movImm64(VReg.V1, 0xFFFFFFFFn);
-                    this.vm.and(VReg.RET, VReg.RET, VReg.V1);
-                    this.vm.movImm64(VReg.V1, 0x7FF8000000000000n);
-                    this.vm.or(VReg.RET, VReg.RET, VReg.V1);
                     this.vm.mov(VReg.A2, VReg.RET);
                 } else {
                     this.vm.movImm64(VReg.A2, 0x7ffb000000000000n); // JS_UNDEFINED
@@ -218,12 +212,28 @@ export const BuiltinMethodCompiler = {
                 return true;
 
             case "replace":
-            case "replaceAll":
-                // str.replace/replaceAll(search, repl) —— 仅支持字符串 search（非正则）。
-                // 接收者(装箱串)已在栈上;A0=str, A1=search(装箱串), A2=repl(装箱串)。
-                // 缺参(<2)退化为返回原串,避免把 undefined 传给 _strconcat。
+            case "replaceAll": {
+                // shim 在场 → 全算法(GetMethod(@@replace) / IsRegExp+g / 串回落)。
+                const shimName = method === "replaceAll" ? "__RE_string_replaceAll" : "__RE_string_replace";
+                if (this.ctx.hasFunction && this.ctx.hasFunction(shimName) && args.length >= 2) {
+                    const id = this.nextLabelId();
+                    const recvName = `__rpl_recv_${id}`;
+                    const recvOff = this.ctx.allocLocal(recvName);
+                    this.vm.pop(VReg.RET);
+                    this.vm.store(VReg.FP, recvOff, VReg.RET);
+                    this.compileExpression({
+                        type: "CallExpression",
+                        callee: { type: "Identifier", name: shimName },
+                        arguments: [
+                            { type: "Identifier", name: recvName },
+                            args[0],
+                            args[1],
+                        ],
+                    });
+                    return true;
+                }
+                // 无 shim：仅支持字符串 search。缺参(<2)退化为返回原串。
                 if (args.length >= 2) {
-                    // 函数替换:str.replace(search, fn) → 调 fn(matched) 取替换串(仅 replace 首个匹配)。
                     const replIsFn = args[1].type === "FunctionExpression" || args[1].type === "ArrowFunctionExpression";
                     this.compileExpression(args[0]);
                     this.vm.push(VReg.RET);          // search
@@ -232,8 +242,6 @@ export const BuiltinMethodCompiler = {
                     this.vm.pop(VReg.A1);            // search
                     this.vm.pop(VReg.A0);            // str
                     if (replIsFn) {
-                        // Function replacer: _str_replace_fn for single replacement,
-                        // _str_replaceAll_fn for replaceAll (loops all matches).
                         this.vm.call(method === "replaceAll" ? "_str_replaceAll_fn" : "_str_replace_fn");
                     } else {
                         this.vm.call(method === "replaceAll" ? "_str_replaceAll" : "_str_replace");
@@ -243,6 +251,7 @@ export const BuiltinMethodCompiler = {
                     this.vm.mov(VReg.RET, VReg.A0);  // 原串
                 }
                 return true;
+            }
 
             case "indexOf":
                 // str.indexOf(search, fromIndex?) - 返回索引或 -1
@@ -254,8 +263,9 @@ export const BuiltinMethodCompiler = {
                     if (args.length > 1) {
                         this.vm.push(VReg.A1);
                         this.compileExpression(args[1]);
-                        if (this.vm.backend.name === "x64") this.vm.mov(VReg.A0, VReg.RET);
-                        this.vm.call("_to_int32");
+                        // ToInteger(+Inf 哨兵),勿 _to_int32(Infinity→0 错成命中)
+                        this.vm.mov(VReg.A0, VReg.RET);
+                        this.vm.call("_aref_fromindex");
                         this.vm.mov(VReg.A2, VReg.RET);
                         this.vm.pop(VReg.A1);
                     } else {
@@ -477,6 +487,26 @@ export const BuiltinMethodCompiler = {
                 return true;
 
             case "match":
+                // str.match(regexp) → GetMethod(@@match) + RegExpCreate + Invoke(rx,@@match)。
+                if (this.ctx.hasFunction && this.ctx.hasFunction("__RE_string_match")) {
+                    const id = this.nextLabelId();
+                    const recvName = `__mtch_recv_${id}`;
+                    const recvOff = this.ctx.allocLocal(recvName);
+                    this.vm.pop(VReg.RET);
+                    this.vm.store(VReg.FP, recvOff, VReg.RET);
+                    const argNode = args.length > 0
+                        ? args[0]
+                        : { type: "UnaryExpression", operator: "void", argument: { type: "Literal", value: 0 }, prefix: true };
+                    this.compileExpression({
+                        type: "CallExpression",
+                        callee: { type: "Identifier", name: "__RE_string_match" },
+                        arguments: [
+                            { type: "Identifier", name: recvName },
+                            argNode,
+                        ],
+                    });
+                    return true;
+                }
                 if (args.length > 0) {
                     this.compileExpression(args[0]);
                     this.vm.mov(VReg.A1, VReg.RET);
@@ -488,6 +518,26 @@ export const BuiltinMethodCompiler = {
                 return true;
 
             case "matchAll":
+                // str.matchAll(regexp) → GetMethod(@@matchAll) + RegExpCreate(...,"g") + Invoke。
+                if (this.ctx.hasFunction && this.ctx.hasFunction("__RE_string_matchAll")) {
+                    const id = this.nextLabelId();
+                    const recvName = `__mtcha_recv_${id}`;
+                    const recvOff = this.ctx.allocLocal(recvName);
+                    this.vm.pop(VReg.RET);
+                    this.vm.store(VReg.FP, recvOff, VReg.RET);
+                    const argNode = args.length > 0
+                        ? args[0]
+                        : { type: "UnaryExpression", operator: "void", argument: { type: "Literal", value: 0 }, prefix: true };
+                    this.compileExpression({
+                        type: "CallExpression",
+                        callee: { type: "Identifier", name: "__RE_string_matchAll" },
+                        arguments: [
+                            { type: "Identifier", name: recvName },
+                            argNode,
+                        ],
+                    });
+                    return true;
+                }
                 // str.matchAll(regexp_or_str) -> array of match substrings
                 if (args.length > 0) {
                     this.compileExpression(args[0]);
@@ -500,7 +550,27 @@ export const BuiltinMethodCompiler = {
                 return true;
 
             case "search":
-                // str.search(regexp) → index or -1._str_search 内检测 RegExp/string 分派
+                // str.search(regexp) → GetMethod(@@search) + RegExpCreate 回落。
+                // shim 在场时走 __RE_string_search(全算法);否则旧 _str_search。
+                if (this.ctx.hasFunction && this.ctx.hasFunction("__RE_string_search")) {
+                    const id = this.nextLabelId();
+                    const recvName = `__srch_recv_${id}`;
+                    const recvOff = this.ctx.allocLocal(recvName);
+                    this.vm.pop(VReg.RET);
+                    this.vm.store(VReg.FP, recvOff, VReg.RET);
+                    const argNode = args.length > 0
+                        ? args[0]
+                        : { type: "UnaryExpression", operator: "void", argument: { type: "Literal", value: 0 }, prefix: true };
+                    this.compileExpression({
+                        type: "CallExpression",
+                        callee: { type: "Identifier", name: "__RE_string_search" },
+                        arguments: [
+                            { type: "Identifier", name: recvName },
+                            argNode,
+                        ],
+                    });
+                    return true;
+                }
                 if (args.length > 0) {
                     this.compileExpression(args[0]);
                     this.vm.mov(VReg.A1, VReg.RET);
@@ -509,7 +579,7 @@ export const BuiltinMethodCompiler = {
                 }
                 this.vm.pop(VReg.A0);
                 this.vm.call("_str_search");
-                this.boxIntAsNumber(VReg.RET); // 装箱裸 int→JS Number
+                this.boxIntAsNumber(VReg.RET);
                 return true;
 
             case "split":
@@ -544,7 +614,9 @@ export const BuiltinMethodCompiler = {
                     this.vm.load(VReg.RET, VReg.FP, s0boxed);
                     return true;
                 }
-                // str.split(separator[, limit]) - 返回数组
+                // str.split(separator[, limit]) - 返回数组。
+                // ES:实参 L→R 求值后，算法内 ToUint32(limit) 早于 ToString(separator)。
+                // 故 2 参时先求 limit 并 ToUint32，再调 _str_split（其内 ToString sep）。
                 if (args.length > 0) {
                     this.compileExpression(args[0]);
                     this.vm.mov(VReg.A1, VReg.RET);
@@ -553,26 +625,24 @@ export const BuiltinMethodCompiler = {
                 }
                 const _ss = this.ctx.allocLocal("__ss");
                 this.vm.store(VReg.FP, _ss, VReg.A1);
+                let splitLimSlot = null;
+                if (args.length >= 2) {
+                    // ToUint32(limit) 先于 sep ToString（可观测 abrupt 序）
+                    this.compileExpressionAsInt(args[1]);
+                    this.vm.movImm64(VReg.V1, 0xFFFFFFFFn);
+                    this.vm.and(VReg.RET, VReg.RET, VReg.V1);
+                    splitLimSlot = this.ctx.allocLocal(`__splitlim_${this.nextLabelId()}`);
+                    this.vm.store(VReg.FP, splitLimSlot, VReg.RET);
+                }
                 this.emitArrayCtorObject();
                 this.vm.load(VReg.A1, VReg.FP, _ss);
                 this.vm.pop(VReg.A0);
                 this.vm.movImm64(VReg.A2, 0x7ffb000000000000n); // 省略 limit;截断在下方 slice
                 this.vm.call("_str_split"); // RET = boxed 数组
-                if (args.length >= 2) {
+                if (splitLimSlot !== null) {
                     // [limit] 截断到 limit 个元素:_array_slice(unbox, 0, limit) 再装箱。
-                    // limit>len 自然不截、limit=0 得空数组。此前忽略 limit(记偏差已消)。
                     const splitResSlot = this.ctx.allocLocal(`__splitres_${this.nextLabelId()}`);
                     this.vm.store(VReg.FP, splitResSlot, VReg.RET);
-                    this.compileExpressionAsInt(args[1]);
-                    // Zero-extend to uint32 per ToUint32(limit) semantics:
-                    // negative limits like -1 → 0xFFFFFFFF (very large ≈ uncapped).
-                    // Without this, negative limits would be passed to _array_slice
-                    // which treats negative end as relative index, causing
-                    // "abc".split("a", -1) to truncate to len-1 instead of returning all.
-                    this.vm.movImm64(VReg.V1, 0xFFFFFFFFn);
-                    this.vm.and(VReg.RET, VReg.RET, VReg.V1);
-                    const splitLimSlot = this.ctx.allocLocal(`__splitlim_${this.nextLabelId()}`);
-                    this.vm.store(VReg.FP, splitLimSlot, VReg.RET);
                     this.vm.load(VReg.A0, VReg.FP, splitResSlot);
                     this.vm.call("_js_unbox");
                     this.vm.mov(VReg.A0, VReg.RET);
@@ -626,6 +696,16 @@ export const BuiltinMethodCompiler = {
                 }
                 this.vm.pop(VReg.A0);
                 this.vm.call("_str_localeCompare");
+                return true;
+
+            case "isWellFormed":
+                this.vm.pop(VReg.A0);
+                this.vm.call("_str_isWellFormed");
+                return true;
+
+            case "toWellFormed":
+                this.vm.pop(VReg.A0);
+                this.vm.call("_str_toWellFormed");
                 return true;
         }
 

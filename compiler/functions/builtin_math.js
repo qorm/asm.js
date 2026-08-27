@@ -2,7 +2,8 @@
 // 从 builtin_methods.js 按功能拆出(2026-07-14):compileMathMethod / emitMinMaxStep /
 // compileMathMinMaxSpread / compileMathHypot。方法通过 this 解析,与主 mixin 同一原型。
 
-import { VReg } from "../../vm/index.js";
+import { VReg } from "../../vm/registers.js";
+import { argsHasSpread } from "../expressions/expressions.js";
 
 // Math 方法编译 Mixin
 export const BuiltinMathMethodCompiler = {
@@ -62,7 +63,7 @@ export const BuiltinMathMethodCompiler = {
             //  - spread(Math.max(...arr)):构建 boxed 实参数组后逐元素折叠。
             //  操作数是 float64 位模式,必须用浮点比较(整数 cmp 对负数按位序会反转)。
             const isMin = methodName === "min";
-            const hasSpread = args.some((a) => a && a.type === "SpreadElement");
+            const hasSpread = argsHasSpread(args);
             if (hasSpread) {
                 this.compileMathMinMaxSpread(methodName, args);
             } else if (args.length === 0) {

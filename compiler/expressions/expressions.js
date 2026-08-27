@@ -1,8 +1,24 @@
 // asm.js 编译器 - 表达式编译（聚合模块）
 // 导入并组合所有表达式相关的编译器
 
-import { VReg } from "../../vm/index.js";
+import { VReg } from "../../vm/registers.js";
 import { Type, inferType } from "../core/types.js";
+
+// 实参列表是否含 SpreadElement。热路径勿用 args.some(箭头)——gen1 上每次分配闭包很贵。
+export function argsHasSpread(args, start) {
+    if (!args) return false;
+    const i0 = start || 0;
+    for (let i = i0; i < args.length; i++) {
+        const a = args[i];
+        if (a && a.type === "SpreadElement") return true;
+    }
+    return false;
+}
+
+// 构造器/调用装载用寄存器表:模块级只建一次(勿在每次 new/call 里 new 数组)。
+const CTOR_ARG_REGS_A0 = [VReg.A0, VReg.A1, VReg.A2, VReg.A3, VReg.A4];
+const CTOR_ARG_REGS_A1 = [VReg.A1, VReg.A2, VReg.A3, VReg.A4, VReg.A5];
+
 
 // number → IEEE 754 float32 位模式。纯算术实现(不依赖 TypedArray 多视图别名),
 // 与 literals.js 的 floatToInt64Bits 同一模式:归一化用 *2//2(2 的幂无精度损失)。
@@ -75,26 +91,6 @@ export const ExpressionCompiler = {
             return;
         }
         switch (expr.type) {
-            case "__WithPrecomputed":
-                // with 赋值合成节点:值已求值到帧槽,直接装入 RET(复用普通赋值全逻辑,免 RHS 重求值)
-                this.vm.load(VReg.RET, VReg.FP, expr.slot);
-                break;
-            case "NumericLiteral":
-                this.compileNumericLiteral(expr.value);
-                break;
-            case "StringLiteral":
-                this.compileStringLiteral(expr);
-                break;
-            case "BooleanLiteral":
-                // 使用 NaN-boxing 格式的布尔值
-                const boolLabel = expr.value ? "_js_true" : "_js_false";
-                this.vm.lea(VReg.RET, boolLabel);
-                this.vm.load(VReg.RET, VReg.RET, 0);
-                break;
-            case "NullLiteral":
-                // 使用 NaN-boxing 格式的 null
-                this.vm.movImm64(VReg.RET, 0x7ffa000000000000n); // was lea+load _js const
-                break;
             case "Literal":
                 this.compileLiteral(expr);
                 break;
@@ -116,11 +112,33 @@ export const ExpressionCompiler = {
             case "CallExpression":
                 this.compileCallExpression(expr);
                 break;
-            case "UpdateExpression":
-                this.compileUpdateExpression(expr);
-                break;
             case "MemberExpression":
                 this.compileMemberExpression(expr);
+                break;
+            case "ThisExpression":
+                this.compileThisExpression(expr);
+                break;
+
+            case "__WithPrecomputed":
+                // with 赋值合成节点:值已求值到帧槽,直接装入 RET(复用普通赋值全逻辑,免 RHS 重求值)
+                this.vm.load(VReg.RET, VReg.FP, expr.slot);
+                break;
+            case "NumericLiteral":
+                this.compileNumericLiteral(expr.value);
+                break;
+            case "StringLiteral":
+                this.compileStringLiteral(expr);
+                break;
+            case "BooleanLiteral":
+                // 使用 NaN-boxing 格式的布尔值
+                this.vm.movImm64(VReg.RET, expr.value ? 0x7ff9000000000001n : 0x7ff9000000000000n);
+                break;
+            case "NullLiteral":
+                // 使用 NaN-boxing 格式的 null
+                this.vm.movImm64(VReg.RET, 0x7ffa000000000000n); // was lea+load _js const
+                break;
+            case "UpdateExpression":
+                this.compileUpdateExpression(expr);
                 break;
             case "ArrayExpression":
                 this.compileArrayExpression(expr);
@@ -144,11 +162,24 @@ export const ExpressionCompiler = {
             case "AwaitExpression":
                 this.compileAwaitExpression(expr);
                 break;
+            case "__CallWithThis":
+                // yield* 缓存的 [[NextMethod]] / throw / return:Call(fn, this, args)
+                // 不经 fn.call(…),避免 class 方法里 Function.prototype.call 分派丢参。
+                this.compileExpression(expr.calleeFn);
+                this.vm.push(VReg.RET);
+                this.compileExpression(expr.thisArg);
+                this.vm.push(VReg.RET);
+                this.vm.pop(VReg.V5);
+                this.vm.pop(VReg.V6);
+                this.compileMethodCall(VReg.V6, VReg.V5, expr.callArgs || []);
+                break;
             case "YieldExpression":
                 // [批次D] 生成器 yield
                 this.compileYieldExpression(expr);
                 break;
-            case "ThisExpression":
+            case "SuperExpression":
+                // 裸 super 作 MemberExpression.object 求值时 ≡ GetThisBinding（未初始化抛 ReferenceError）。
+                // 真实 [[HomeObject]]/原型链取属性由 super.x / super[x] / super() 专用路径处理。
                 this.compileThisExpression(expr);
                 break;
             case "MetaProperty":
@@ -307,68 +338,23 @@ export const ExpressionCompiler = {
                 break;
 
             case "String": {
-                // new String(x) -> wrapper object with __value and length properties
-                // typeof returns "object", identity: new String("x") !== "x"
+                // new String(x) → 与 Object("str") / assign ToObject 同形(_string_new):
+                // __value + length + UTF-16 索引自有键(gOPN new String("abc") = 0,1,2,length)
+                // 须先物化 String 单例+proto.constructor:否则 `new String()` 早于标识符
+                // String 时 _ensure_string_proto 无 constructor → 读到 Object.prototype.constructor,
+                // `__str.constructor !== String`(S15.5.2.1_A1_T2)。
+                this.emitStringCtorObject();
                 if (args.length > 0) {
                     this.compileExpression(args[0]);
                     this.vm.mov(VReg.A0, VReg.RET);
-                    this.vm.call("_valueToStr"); // any value -> boxed string (0x7FFC-tagged)
+                    this.vm.call("_valueToStr");
                 } else {
                     this.vm.lea(VReg.RET, this.asm.addString(""));
                     this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
                     this.vm.or(VReg.RET, VReg.RET, VReg.V1);
                 }
-                // RET = boxed string -> save to FP-relative local
-                const strValOff = this.ctx.allocLocal(`__str_new_val_${this.nextLabelId()}`);
-                this.vm.store(VReg.FP, strValOff, VReg.RET);
-                // Create empty wrapper object
-                this.vm.call("_object_new"); // RET = raw obj pointer
-                const objPtrOff = this.ctx.allocLocal(`__str_new_obj_${this.nextLabelId()}`);
-                this.vm.store(VReg.FP, objPtrOff, VReg.RET);
-                // Set prototype: load String.prototype singleton
-                this.emitStringProtoObject(); // RET = boxed String.prototype (0x7FFD-tagged)
-                this.vm.load(VReg.V1, VReg.FP, objPtrOff);
-                // Unbox proto before storing: __proto__ slot expects raw pointer
-                this.vm.emitMaskLoad(VReg.V2);
-                this.vm.andMaskReg(VReg.RET, VReg.RET, VReg.V2);
-                this.vm.store(VReg.V1, 16, VReg.RET); // obj.__proto__ = raw String.prototype ptr
-                // Store __value property
-                this.vm.load(VReg.A0, VReg.FP, objPtrOff);
-                this.vm.load(VReg.A2, VReg.FP, strValOff);
-                this.vm.lea(VReg.A1, this.asm.addString("__value"));
-                this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
-                this.vm.or(VReg.A1, VReg.A1, VReg.V1);
-                this.vm.call("_object_set");
-                // Store "length" property
-                this.vm.load(VReg.A0, VReg.FP, objPtrOff);
-                this.vm.lea(VReg.A1, this.asm.addString("length"));
-                this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
-                this.vm.or(VReg.A1, VReg.A1, VReg.V1);
-                this.vm.load(VReg.A0, VReg.FP, strValOff);
-                this.vm.call("_strlen"); // RET = raw int length
-                this.vm.scvtf(0, VReg.RET);
-                this.vm.fmovToInt(VReg.RET, 0);
-                this.vm.mov(VReg.A2, VReg.RET); // A2 = boxed number
-                this.vm.load(VReg.A0, VReg.FP, objPtrOff);
-                this.vm.call("_object_set");
-                // 内部槽落不可枚举:__value(idx 0)、length(idx 1)按存储顺序。
-                // attr = ATTR_WRITABLE|ATTR_CONFIGURABLE (= 1|4 = 5),不含 ATTR_ENUMERABLE。
-                // _object_set_attr 自建 flags 表(_object_ensure_flags);保持 writable 以免破坏写槽代码。
-                this.vm.load(VReg.A0, VReg.FP, objPtrOff);
-                this.vm.movImm(VReg.A1, 0); // idx 0 = __value
-                this.vm.movImm(VReg.A2, 5); // writable|configurable, not enumerable
-                this.vm.call("_object_set_attr");
-                this.vm.load(VReg.A0, VReg.FP, objPtrOff);
-                this.vm.movImm(VReg.A1, 1); // idx 1 = length
-                // [String wrapper] ES 字符串异质对象的 length 自有属性
-                // {writable:false,enumerable:false,configurable:false}=attr 0(String/length.js
-                // verifyProperty 判负根因)。写槽代码经 _object_set(define=0)不查 writable,
-                // 不受影响;严格赋值 wrapper.length=x 抛 TypeError 恰是规范行为。
-                this.vm.movImm(VReg.A2, 0);
-                this.vm.call("_object_set_attr");
-                // Box the object
-                this.vm.load(VReg.RET, VReg.FP, objPtrOff);
-                this.vm.call("_box_obj_r"); // RET = 0x7FFD-tagged wrapper object
+                this.vm.mov(VReg.A0, VReg.RET);
+                this.vm.call("_string_new");
                 break;
             }
 
@@ -395,20 +381,23 @@ export const ExpressionCompiler = {
                 if (args.length === 0) {
                     // 空数组
                     this.compileArrayExpression({ elements: [] });
-                } else if (args.length === 1 && (args[0].type === "Literal" || args[0].type === "NumericLiteral") && typeof args[0].value === "number") {
-                    // new Array(len) - 指定长度的稀疏数组(真 hole,槽=0)。
-                    // 此前填 undefined 字面量 → dense-with-undefined,`0 in new Array(3)` 误 true。
-                    const len = Math.trunc(args[0].value);
-                    if (len < 0) {
-                        // ES RangeError;简化:空数组(与旧负长 trunc 行为接近即可)
-                        this.compileArrayExpression({ elements: [] });
-                    } else {
-                        this.vm.movImm(VReg.A0, len);
+                } else if (args.length === 1) {
+                    // 单参:Number ∧ ToUint32(n)===n → ArrayCreate;Number 否则 RangeError;
+                    // 非 Number → 单元素数组。字面量整数快路;其余走 _array_ctor_single。
+                    const lit = args[0];
+                    if ((lit.type === "Literal" || lit.type === "NumericLiteral") &&
+                        typeof lit.value === "number" &&
+                        lit.value === (lit.value >>> 0) && lit.value >= 0) {
+                        this.vm.movImm(VReg.A0, lit.value >>> 0);
                         this.vm.call("_array_new_with_size");
                         this.vm.emitMaskLoad(VReg.V1);
                         this.vm.andMaskReg(VReg.V2, VReg.RET, VReg.V1);
                         this.vm.movImm64(VReg.V1, 0x7ffe000000000000n);
                         this.vm.or(VReg.RET, VReg.V2, VReg.V1);
+                    } else {
+                        this.compileExpression(args[0]);
+                        this.vm.mov(VReg.A0, VReg.RET);
+                        this.vm.call("_array_ctor_single");
                     }
                 } else {
                     // new Array(a, b, c) - 等同于 [a, b, c]
@@ -445,6 +434,10 @@ export const ExpressionCompiler = {
 
             case "Date":
                 // new Date() - 创建 Date 对象
+                // [L1] 物化 Date.prototype 方法槽：否则仅 `new Date`+Object 路径接收者
+                // （推断为 Object）经 `_object_get_date_side` 读空 `_nsobj_date_proto`
+                // → getFullYear 等恒 undefined（S15.2.2.1_A2_T5）。与 new Array 同形。
+                if (this.emitDateCtorObject) this.emitDateCtorObject();
                 if (args.length >= 2) {
                     // [#35] new Date(y, mo, d?, h?, mi?, s?, ms?) —— Hinnant
                     // days-from-civil 历法(截断除法与 era 调整契合,全年代正确)。
@@ -576,204 +569,57 @@ export const ExpressionCompiler = {
             case "WeakMap": // WeakMap 路由到 Map:基础操作 set/get/has/delete 同,weakness
                             // 是 GC 优化非可观察语义;此前无分派 → new WeakMap() 崩(退出 1)。
             case "Map":
-                // new Map(entries?) —— [#28] 带 iterable(数组形态)时内联展开
-                // for 循环逐条 _map_set(模板同数组 SpreadElement 展开);
-                // 原实现完全忽略参数 → 静默空 Map。非数组 iterable(字符串/生成器)未支持。
+                // new Map(iterable?):物化原型(Get(map,"set") / @@toStringTag),再
+                // _map_new + 可选 _map_construct_fill(Call adder,懒迭代,IteratorClose)。
+                this.emitMapCtorObject();
+                this.emitArrayCtorObject();
+                this.vm.call("_map_new");
                 if (args.length >= 1) {
-                    this.compileExpression(args[0]); // RET = boxed entries 数组
-                    const srcOff = this.ctx.allocLocal(`__mapnew_src_${this.nextLabelId()}`);
-                    this.vm.store(VReg.FP, srcOff, VReg.RET);
-                    // null/undefined 参数 → 空 Map(ES:new Map(null)/new Map(undefined) 合法)。
-                    // 此前 _array_length(null) 读 null 的 length@8 → SIGSEGV。V2 避 x64 V0==RET 保 RET。
-                    const mapNullishL = this.ctx.newLabel("mapnew_nullish");
-                    const mapNonArrL = this.ctx.newLabel("mapnew_nonarr");
-                    const mapEndL = this.ctx.newLabel("mapnew_end");
-                    const mapArrL = this.ctx.newLabel("mapnew_arr");
-                    this.vm.load(VReg.V2, VReg.FP, srcOff);
-                    this.vm.shrImm(VReg.V2, VReg.V2, 48);
-                    this.vm.cmpImm(VReg.V2, 0x7FFA); this.vm.jeq(mapNullishL); // null
-                    this.vm.cmpImm(VReg.V2, 0x7FFB); this.vm.jeq(mapNullishL); // undefined
-                    this.vm.cmpImm(VReg.V2, 0x7FFE); this.vm.jeq(mapArrL); // 数组 → 快路
-                    // [I6 迭代器校验] 对象参数:先 GetIterator 校验(Symbol.iterator 非函数
-                    // → TypeError,iterator-is-undefined-throws 族),再 [...src] 展开进数组
-                    // 路径(迭代协议由 _array_spread_into 驱动;此前一律空 Map,且
-                    // iterator-next-failure 的错误传播丢失)。数字/串等 → 空 Map(记偏差)。
-                    this.vm.cmpImm(VReg.V2, 0x7FFD); this.vm.jne(mapNonArrL);
-                    {
-                        const mapObjOff = this.ctx.allocLocal(`__mapnew_obj_${this.nextLabelId()}`);
-                        this.vm.load(VReg.V1, VReg.FP, srcOff);
-                        this.vm.store(VReg.FP, mapObjOff, VReg.V1);
-                        this.vm.mov(VReg.A0, VReg.V1);
-                        this.emitBoxedStringKey("Symbol.iterator", VReg.A1);
-                        this.vm.call("_object_get");
-                        this.vm.shrImm(VReg.V0, VReg.RET, 48);
-                        this.vm.cmpImm(VReg.V0, 0x7FFF);
-                        const mapIterOkL = this.ctx.newLabel("mapnew_iter_ok");
-                        this.vm.jeq(mapIterOkL);
-                        this.emitThrowTypeError("iterable is not iterable");
-                        this.vm.label(mapIterOkL);
-                        // [...src]:空数组 + _array_spread_into 抽干迭代器(Array.from 同形)
-                        this.vm.movImm(VReg.A0, 0);
-                        this.vm.call("_array_new_with_size");
-                        this.vm.call("_box_arr_r");
-                        this.vm.store(VReg.FP, srcOff, VReg.RET);
-                        this.vm.load(VReg.A0, VReg.FP, srcOff);
-                        this.vm.load(VReg.A1, VReg.FP, mapObjOff);
-                        this.vm.movImm(VReg.A2, 0);
-                        this.vm.movImm(VReg.A3, 0);
-                        this.vm.call("_array_spread_into");
-                        this.vm.jmp(mapArrL);
-                    }
-                    this.vm.label(mapArrL);
-                    this.vm.load(VReg.A0, VReg.FP, srcOff); // 对象路径后 RET 已毁,统一从槽重载
-                    this.vm.call("_array_length"); // RET = 原始整数长度
-                    const lenOff = this.ctx.allocLocal(`__mapnew_len_${this.nextLabelId()}`);
-                    this.vm.store(VReg.FP, lenOff, VReg.RET);
-                    this.vm.call("_map_new");
                     const collOff = this.ctx.allocLocal(`__mapnew_coll_${this.nextLabelId()}`);
                     this.vm.store(VReg.FP, collOff, VReg.RET);
-                    const entOff = this.ctx.allocLocal(`__mapnew_ent_${this.nextLabelId()}`);
-                    const keyOff = this.ctx.allocLocal(`__mapnew_key_${this.nextLabelId()}`);
-                    const idxOff = this.ctx.allocLocal(`__mapnew_idx_${this.nextLabelId()}`);
-                    this.vm.movImm(VReg.V0, 0);
-                    this.vm.store(VReg.FP, idxOff, VReg.V0);
-                    const id = this.nextLabelId();
-                    const loopL = `_mapnew_loop_${id}`;
-                    const doneL = `_mapnew_done_${id}`;
-                    this.vm.label(loopL);
-                    this.vm.load(VReg.V0, VReg.FP, idxOff);
-                    this.vm.load(VReg.V1, VReg.FP, lenOff);
-                    this.vm.cmp(VReg.V0, VReg.V1);
-                    this.vm.jge(doneL);
-                    this.vm.load(VReg.A0, VReg.FP, srcOff);
-                    this.vm.load(VReg.A1, VReg.FP, idxOff);
-                    this.vm.call("_array_get"); // RET = entry(boxed [k,v])
-                    this.vm.store(VReg.FP, entOff, VReg.RET);
-                    this.vm.mov(VReg.A0, VReg.RET);
-                    this.vm.movImm(VReg.A1, 0);
-                    this.vm.call("_array_get"); // RET = key
-                    this.vm.store(VReg.FP, keyOff, VReg.RET);
-                    this.vm.load(VReg.A0, VReg.FP, entOff);
-                    this.vm.movImm(VReg.A1, 1);
-                    this.vm.call("_array_get"); // RET = value
-                    this.vm.mov(VReg.A2, VReg.RET);
-                    this.vm.load(VReg.A1, VReg.FP, keyOff);
+                    this.compileExpression(args[0]);
+                    const skipL = this.ctx.newLabel("mapnew_skipfill");
+                    const endL = this.ctx.newLabel("mapnew_end");
+                    this.vm.shrImm(VReg.V2, VReg.RET, 48);
+                    this.vm.cmpImm(VReg.V2, 0x7FFA); this.vm.jeq(skipL);
+                    this.vm.cmpImm(VReg.V2, 0x7FFB); this.vm.jeq(skipL);
+                    this.vm.mov(VReg.A1, VReg.RET);
                     this.vm.load(VReg.A0, VReg.FP, collOff);
-                    this.vm.call("_map_set");
-                    this.vm.load(VReg.V0, VReg.FP, idxOff);
-                    this.vm.addImm(VReg.V0, VReg.V0, 1);
-                    this.vm.store(VReg.FP, idxOff, VReg.V0);
-                    this.vm.jmp(loopL);
-                    this.vm.label(doneL);
+                    this.vm.call("_map_construct_fill");
+                    this.vm.jmp(endL);
+                    this.vm.label(skipL);
                     this.vm.load(VReg.RET, VReg.FP, collOff);
-                    this.vm.jmp(mapEndL);
-                    this.vm.label(mapNonArrL); // 非数组 iterable → 空 Map(暂;后续加 Iterator 协议)
-                    this.vm.call("_map_new");
-                    this.vm.jmp(mapEndL);
-                    this.vm.label(mapNullishL); // null/undefined → 空 Map
-                    this.vm.call("_map_new");
-                    this.vm.label(mapEndL);
-                } else {
-                    this.vm.call("_map_new");
+                    this.vm.label(endL);
                 }
-                if (typeName === "WeakMap") { // 置 weakness 标志区分 toStringTag/print
+                if (typeName === "WeakMap") {
                     this.vm.mov(VReg.A0, VReg.RET);
                     this.vm.call("_collection_mark_weak");
                 }
                 break;
 
-            case "WeakSet": // WeakSet 路由到 Set(基础操作 add/has/delete 同,同 WeakMap 理由)
+            case "WeakSet":
             case "Set":
-                // new Set(iterable?) —— [#28] 同 Map:数组形态内联展开逐个 _set_add
+                this.emitSetCtorObject();
+                this.emitArrayCtorObject();
+                this.vm.call("_set_new");
                 if (args.length >= 1) {
-                    // 字符串参数:`new Set("hello")` 须按字符迭代。此处逐个 _array_length/
-                    // _array_get 把字符串当数组读 → 越界崩。静态 STRING 时先 [...str] 展开成
-                    // 字符数组(字符串 spread 已支持),再走下方数组路径。
-                    let setSrcArg = args[0];
-                    const setArgT = inferType(args[0], this.ctx);
-                    // 字符串、以及自定义可迭代对象(OBJECT)先 [...x] 展开成数组(spread 驱动
-                    // Symbol.iterator 协议;非可迭代对象 spread 得空数组,不崩)。此前 OBJECT
-                    // 被当数组读 _array_length/_array_get → 越界崩(new Set(自定义iterable) 崩根因)。
-                    // [I6] 对象参数追加 GetIterator 校验:Symbol.iterator 非函数 → TypeError
-                    // (iterator-is-undefined-throws 族)。参数只求值一次(先落槽,spread 读槽)。
-                    let setPreOff = null;
-                    let setPreName = null;
-                    if (setArgT === Type.STRING || setArgT === Type.OBJECT) {
-                        if (setArgT === Type.OBJECT) {
-                            this.compileExpression(args[0]);
-                            setPreName = `__setnew_pre_${this.nextLabelId()}`;
-                            setPreOff = this.ctx.allocLocal(setPreName);
-                            this.vm.store(VReg.FP, setPreOff, VReg.RET);
-                            this.vm.mov(VReg.A0, VReg.RET);
-                            this.emitBoxedStringKey("Symbol.iterator", VReg.A1);
-                            this.vm.call("_object_get");
-                            this.vm.shrImm(VReg.V0, VReg.RET, 48);
-                            this.vm.cmpImm(VReg.V0, 0x7FFF);
-                            const setIterOkL = this.ctx.newLabel("setnew_iter_ok");
-                            this.vm.jeq(setIterOkL);
-                            this.emitThrowTypeError("iterable is not iterable");
-                            this.vm.label(setIterOkL);
-                            setSrcArg = { type: "ArrayExpression",
-                                elements: [{ type: "SpreadElement",
-                                    argument: { type: "Identifier", name: setPreName } }] };
-                        } else {
-                            setSrcArg = { type: "ArrayExpression",
-                                elements: [{ type: "SpreadElement", argument: args[0] }] };
-                        }
-                    }
-                    this.compileExpression(setSrcArg); // RET = boxed 数组
-                    const ssrcOff = this.ctx.allocLocal(`__setnew_src_${this.nextLabelId()}`);
-                    this.vm.store(VReg.FP, ssrcOff, VReg.RET);
-                    // null/undefined → 空 Set(同 Map,防 _array_length(null) 崩)
-                    const setNullishL = this.ctx.newLabel("setnew_nullish");
-                    const setNonArrL = this.ctx.newLabel("setnew_nonarr");
-                    const setEndL = this.ctx.newLabel("setnew_end");
-                    this.vm.load(VReg.V2, VReg.FP, ssrcOff);
-                    this.vm.shrImm(VReg.V2, VReg.V2, 48);
-                    this.vm.cmpImm(VReg.V2, 0x7FFA); this.vm.jeq(setNullishL);
-                    this.vm.cmpImm(VReg.V2, 0x7FFB); this.vm.jeq(setNullishL);
-                    this.vm.cmpImm(VReg.V2, 0x7FFE); this.vm.jne(setNonArrL);  // 非数组 → 避 _array_length 段错
-                    this.vm.mov(VReg.A0, VReg.RET);
-                    this.vm.call("_array_length");
-                    const slenOff = this.ctx.allocLocal(`__setnew_len_${this.nextLabelId()}`);
-                    this.vm.store(VReg.FP, slenOff, VReg.RET);
-                    this.vm.call("_set_new");
                     const scollOff = this.ctx.allocLocal(`__setnew_coll_${this.nextLabelId()}`);
                     this.vm.store(VReg.FP, scollOff, VReg.RET);
-                    const sidxOff = this.ctx.allocLocal(`__setnew_idx_${this.nextLabelId()}`);
-                    this.vm.movImm(VReg.V0, 0);
-                    this.vm.store(VReg.FP, sidxOff, VReg.V0);
-                    const sid = this.nextLabelId();
-                    const sloopL = `_setnew_loop_${sid}`;
-                    const sdoneL = `_setnew_done_${sid}`;
-                    this.vm.label(sloopL);
-                    this.vm.load(VReg.V0, VReg.FP, sidxOff);
-                    this.vm.load(VReg.V1, VReg.FP, slenOff);
-                    this.vm.cmp(VReg.V0, VReg.V1);
-                    this.vm.jge(sdoneL);
-                    this.vm.load(VReg.A0, VReg.FP, ssrcOff);
-                    this.vm.load(VReg.A1, VReg.FP, sidxOff);
-                    this.vm.call("_array_get"); // RET = elem
+                    this.compileExpression(args[0]);
+                    const skipL = this.ctx.newLabel("setnew_skipfill");
+                    const endL = this.ctx.newLabel("setnew_end");
+                    this.vm.shrImm(VReg.V2, VReg.RET, 48);
+                    this.vm.cmpImm(VReg.V2, 0x7FFA); this.vm.jeq(skipL);
+                    this.vm.cmpImm(VReg.V2, 0x7FFB); this.vm.jeq(skipL);
                     this.vm.mov(VReg.A1, VReg.RET);
                     this.vm.load(VReg.A0, VReg.FP, scollOff);
-                    this.vm.call("_set_add");
-                    this.vm.load(VReg.V0, VReg.FP, sidxOff);
-                    this.vm.addImm(VReg.V0, VReg.V0, 1);
-                    this.vm.store(VReg.FP, sidxOff, VReg.V0);
-                    this.vm.jmp(sloopL);
-                    this.vm.label(sdoneL);
+                    this.vm.call("_set_construct_fill");
+                    this.vm.jmp(endL);
+                    this.vm.label(skipL);
                     this.vm.load(VReg.RET, VReg.FP, scollOff);
-                    this.vm.jmp(setEndL);
-                    this.vm.label(setNonArrL); // 非数组 iterable → 空 Set(暂;后续加 Iterator 协议)
-                    this.vm.call("_set_new");
-                    this.vm.jmp(setEndL);
-                    this.vm.label(setNullishL); // null/undefined → 空 Set
-                    this.vm.call("_set_new");
-                    this.vm.label(setEndL);
-                } else {
-                    this.vm.call("_set_new");
+                    this.vm.label(endL);
                 }
-                if (typeName === "WeakSet") { // 置 weakness 标志区分 toStringTag/print
+                if (typeName === "WeakSet") {
                     this.vm.mov(VReg.A0, VReg.RET);
                     this.vm.call("_collection_mark_weak");
                 }
@@ -796,6 +642,44 @@ export const ExpressionCompiler = {
                 }
                 break;
 
+            case "WeakRef": {
+                // new WeakRef(target):Type(target) 须为 Object。实例暂为普通对象
+                // (无自有键),供 Object.seal/freeze 的 SetIntegrityLevel;deref 另案。
+                if (args.length === 0) {
+                    this.emitThrowTypeError("WeakRef: target must be an object");
+                    break;
+                }
+                this.compileExpression(args[0]);
+                const wrOk = this.ctx.newLabel("weakref_tgt_ok");
+                this.vm.shrImm(VReg.V0, VReg.RET, 48);
+                this.vm.cmpImm(VReg.V0, 0x7FFD); this.vm.jeq(wrOk);
+                this.vm.cmpImm(VReg.V0, 0x7FFE); this.vm.jeq(wrOk);
+                this.vm.cmpImm(VReg.V0, 0x7FFF); this.vm.jeq(wrOk);
+                this.emitThrowTypeError("WeakRef: target must be an object");
+                this.vm.label(wrOk);
+                this.vm.call("_object_new");
+                this.vm.call("_box_obj_r");
+                break;
+            }
+
+            case "FinalizationRegistry": {
+                // new FinalizationRegistry(cleanup):cleanup 须可调用。实例暂为普通对象。
+                if (args.length === 0) {
+                    this.emitThrowTypeError("FinalizationRegistry: cleanup must be callable");
+                    break;
+                }
+                this.compileExpression(args[0]);
+                const frOk = this.ctx.newLabel("fr_cb_ok");
+                this.vm.shrImm(VReg.V0, VReg.RET, 48);
+                this.vm.cmpImm(VReg.V0, 0x7FFF);
+                this.vm.jeq(frOk);
+                this.emitThrowTypeError("FinalizationRegistry: cleanup must be callable");
+                this.vm.label(frOk);
+                this.vm.call("_object_new");
+                this.vm.call("_box_obj_r");
+                break;
+            }
+
             case "RegExp":
                 // RegExp 构造(pattern, flags) → __RE_new(pattern, flags)(纯 JS shim,
                 // 路线同正则字面量,见 compileExpression 的 RegexLiteral case)。
@@ -805,6 +689,7 @@ export const ExpressionCompiler = {
                     arguments: [
                         args.length >= 1 ? args[0] : { type: "Literal", value: "" },
                         args.length >= 2 ? args[1] : { type: "Literal", value: "" },
+                        { type: "Literal", value: 0 },
                     ],
                 });
                 break;
@@ -858,11 +743,16 @@ export const ExpressionCompiler = {
                 this.emitBoxedStringKey("message", VReg.A1);
                 this.vm.load(VReg.A2, VReg.FP, errMsg);
                 this.vm.call("_object_set");
-                // instanceof 标记
+                // instanceof 标记(非 enumerable:勿进 Object.keys,否则 defineProperties
+                // 以 Error 作 Properties 会把品牌布尔当描述符 → TypeError,15.2.3.7-5-a-16)
                 this.vm.load(VReg.A0, VReg.FP, errObj);
                 this.emitBoxedStringKey("__asmjs_err", VReg.A1);
                 this.vm.movImm64(VReg.A2, 0x7ff9000000000001n); // was lea+load _js const
                 this.vm.call("_object_set");
+                this.vm.load(VReg.A0, VReg.FP, errObj);
+                this.emitBoxedStringKey("__asmjs_err", VReg.A1);
+                this.vm.movImm(VReg.A2, 5); // writable|configurable, !enumerable
+                this.vm.call("_object_set_prop_attr");
                 // AggregateError.errors = 第 1 参可迭代(node 语义;缺失则空数组)
                 if (isAggErr) {
                     this.vm.load(VReg.A0, VReg.FP, errObj);
@@ -879,35 +769,41 @@ export const ExpressionCompiler = {
                     }
                     this.vm.call("_object_set");
                 }
-                // cause:options.cause(若 options 提供了 cause,ES2022)否则 undefined。
-                // options 是 Error(msg, options) 的第 2 参;AggregateError(errs, msg, options)
-                // 的第 3 参。显式落属性,否则缺失属性访问返回 int 0 → === undefined 为 false。
+                // cause:仅当 options 自有 "cause" 时 InstallErrorCause(ES2022)。
+                // 此前恒落 cause:undefined 自有键 → Object.keys(Error) 污染 defineProperties。
                 const optIdx = typeName === "AggregateError" ? 2 : 1;
-                const causeSlot = this.ctx.allocLocal(`__errcause_${this.nextLabelId()}`);
-                this.vm.movImm64(VReg.V1, 0x7ffb000000000000n); // 默认 JS_UNDEFINED
-                this.vm.store(VReg.FP, causeSlot, VReg.V1);
                 if (args.length > optIdx) {
                     const optSlot = this.ctx.allocLocal(`__erropt_${this.nextLabelId()}`);
                     this.compileExpression(args[optIdx]); // options
                     this.vm.store(VReg.FP, optSlot, VReg.RET);
                     const noCauseLbl = this.ctx.newLabel("err_nocause");
-                    // options.hasOwnProperty("cause")? 有才取值,否则保持 undefined
                     this.vm.load(VReg.A0, VReg.FP, optSlot);
                     this.emitBoxedStringKey("cause", VReg.A1);
-                    // new Error(msg, undefined/原始值):非 Object 的 options 不查 cause
                     this.vm.call("_error_opt_has_cause");
                     this.vm.cmpImm(VReg.RET, 0);
                     this.vm.jeq(noCauseLbl);
                     this.vm.load(VReg.A0, VReg.FP, optSlot);
                     this.emitBoxedStringKey("cause", VReg.A1);
                     this.vm.call("_object_get");
+                    const causeSlot = this.ctx.allocLocal(`__errcause_${this.nextLabelId()}`);
                     this.vm.store(VReg.FP, causeSlot, VReg.RET);
+                    this.vm.load(VReg.A0, VReg.FP, errObj);
+                    this.emitBoxedStringKey("cause", VReg.A1);
+                    this.vm.load(VReg.A2, VReg.FP, causeSlot);
+                    this.vm.call("_object_set");
                     this.vm.label(noCauseLbl);
                 }
-                this.vm.load(VReg.A0, VReg.FP, errObj);
-                this.emitBoxedStringKey("cause", VReg.A1);
-                this.vm.load(VReg.A2, VReg.FP, causeSlot);
-                this.vm.call("_object_set");
+                // [[Prototype]] = Error.prototype / TypeError.prototype …
+                // (defineProperty(Error.prototype,"prop") 继承;getPrototypeOf===Error.prototype)
+                if (this.emitErrorCtorRef) {
+                    this.emitErrorCtorRef(typeName);
+                    this.vm.mov(VReg.A0, VReg.RET);
+                    this.emitBoxedStringKey("prototype", VReg.A1);
+                    this.vm.call("_closure_prop_get");
+                    this.vm.mov(VReg.A1, VReg.RET);
+                    this.vm.load(VReg.A0, VReg.FP, errObj);
+                    this.vm.call("_object_setPrototypeOf");
+                }
                 this.vm.load(VReg.RET, VReg.FP, errObj);
                 break;
             }
@@ -928,6 +824,24 @@ export const ExpressionCompiler = {
                 break;
             
             case "ArrayBuffer":
+                // new ArrayBuffer(byteLength[, {maxByteLength}]):给了 maxByteLength 即
+                // resizable buffer(一次按 max 分配,resize 只改 byteLength)。
+                if (args.length > 1 && args[1]) {
+                    const abLenOff = this.ctx.allocLocal(`__ab_len_${this.nextLabelId()}`);
+                    if (args.length > 0) { this.compileExpressionAsInt(args[0]); } else { this.vm.movImm(VReg.RET, 0); }
+                    this.vm.store(VReg.FP, abLenOff, VReg.RET);
+                    this.compileExpression(args[1]);
+                    this.vm.mov(VReg.A0, VReg.RET);
+                    this.vm.lea(VReg.A1, this.addStringConstant("maxByteLength"));
+                    this.vm.call("_tag_str_a1");
+                    this.vm.call("_object_get");
+                    this.vm.mov(VReg.A0, VReg.RET);
+                    this.vm.call("_to_int32");
+                    this.vm.mov(VReg.A1, VReg.RET);
+                    this.vm.load(VReg.A0, VReg.FP, abLenOff);
+                    this.vm.call("_arraybuffer_new_max");
+                    break;
+                }
                 // new ArrayBuffer(byteLength)
                 if (args.length > 0) {
                     this.compileExpressionAsInt(args[0]);
@@ -989,6 +903,20 @@ export const ExpressionCompiler = {
                 break;
             }
 
+            case "Math": {
+                // Math 是命名空间对象,无 [[Construct]]。`new Math` 此前落到
+                // compileUserClassNew("Math") 当用户类,不抛 TypeError。
+                const mathShadowed = (this.ctx.getLocal && this.ctx.getLocal("Math")) ||
+                    (this.ctx.getFunction && this.ctx.getFunction("Math")) ||
+                    (this.ctx.getMainCapturedVar && this.ctx.getMainCapturedVar("Math"));
+                if (!mathShadowed) {
+                    this.compileExpression(expr.callee);
+                    this.vm.mov(VReg.V6, VReg.RET);
+                    this.compileDynamicNew(VReg.V6, args);
+                    break;
+                }
+            }
+            // shadowed Math 落入 default
             default: {
                 // [#69] 普通函数(非 class)用 new:ES5 构造器语义,专路处理(this 在 A5,
                 // 与 class 的 A0 约定不同,见 index.js #36)。带展开实参退回旧路。
@@ -1017,8 +945,14 @@ export const ExpressionCompiler = {
                 } else if (declNode && declNode.type === "FunctionDeclaration") {
                     // 展开实参现由 compilePlainFunctionNew 内部处理(A0..A4 + A5=this)。
                     this.compilePlainFunctionNew(typeName, args, declNode);
-                } else {
+                } else if (declNode && declNode.type === "ClassDeclaration") {
                     this.compileUserClassNew(typeName, args);
+                } else {
+                    // 未解析标识符须先 GetValue:未声明 `new x` 抛 ReferenceError,
+                    // 不能走 compileUserClassNew 当类构造(会变成 TypeError / 空对象)。
+                    this.compileExpression(expr.callee);
+                    this.vm.mov(VReg.V6, VReg.RET);
+                    this.compileDynamicNew(VReg.V6, args);
                 }
                 break;
             }
@@ -1094,9 +1028,21 @@ export const ExpressionCompiler = {
     compilePlainFunctionNew(funcName, args, funcNode) {
         const funcLabel = this.getFunctionLabel(funcName);
         if (!funcLabel) { this.vm.movImm(VReg.RET, 0); return; }
+        // function*/async function 无 [[Construct]]:`new g()` 须 TypeError
+        // (statements/generators/invoke-as-constructor)。表达式形态走闭包
+        // _fn_construct_call 的 _func_meta_nonctor;声明形态走本专路。
+        if (funcNode && (funcNode.isGenerator === true || funcNode.generator === true ||
+            funcNode.async === true || funcNode.isAsync === true)) {
+            this.vm.lea(VReg.A0, this.asm.addString("value is not a constructor"));
+            this.vm.call("_js_box_string");
+            this.vm.mov(VReg.A0, VReg.RET);
+            this.vm.call("_throw_type_error");
+            return;
+        }
         const symbol = (this.ctx.getFunctionSymbol && this.ctx.getFunctionSymbol(funcName)) || funcName;
 
-        // 1. 新实例对象(裸;S0 callee-saved,跨调用与参数求值存活)
+        // 1. 新实例对象(先裸写 __proto__,再装箱 0x7FFD —— 与 Construct 返回值
+        //    SameValue,`function C(){ t=this } (new C())===t`)。
         this.vm.call("_object_new");
         this.vm.mov(VReg.S0, VReg.RET);
 
@@ -1106,44 +1052,74 @@ export const ExpressionCompiler = {
         //    裸指针存储,__proto__ 链按裸指针解读(同 class props[1].val)。
         this.emitUserFuncProtoRef(funcName, symbol); // RET = 裸 F.prototype(S1 scratch)
         this.vm.store(VReg.S0, 16, VReg.RET);
+        this.vm.emitMaskLoad(VReg.V1);
+        this.vm.andMaskReg(VReg.S0, VReg.S0, VReg.V1);
+        this.vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+        this.vm.or(VReg.S0, VReg.S0, VReg.V1);
 
         // 3. 备参:形参 A0..A4、this 在 A5(见 index.js [#36])。展开实参走专用
         //    helper(运行时按数组长度装 A0..A4);否则逐个求值压栈,再逆序弹回
-        //    (避免互踩),缺省填 undefined,最后置 A5=this。
-        if (args.some((a) => a && a.type === "SpreadElement")) {
+        //    (避免互踩),缺省填 undefined,最后置 A5=this(已装箱)。
+        if (argsHasSpread(args)) {
             this.compilePlainCtorArgsSpread(args); // 装 A0..A4 + A5=this,S0 保持
         } else {
-            const argRegs = [VReg.A0, VReg.A1, VReg.A2, VReg.A3, VReg.A4];
-            const argCount = Math.min(args.length, argRegs.length);
+            const argRegs = CTOR_ARG_REGS_A0;
+            const argCount = Math.min(args.length, 16);
             this.vm.push(VReg.S0);
             for (let i = 0; i < argCount; i++) {
                 this.compileExpression(args[i]);
                 this.vm.push(VReg.RET);
             }
+            // [argv 溢出] 第 6 个及以后的实参 → _call_argv(被调方 prologue 快照)
             for (let i = argCount - 1; i >= 0; i--) {
-                this.vm.pop(argRegs[i]);
+                if (i < argRegs.length) this.vm.pop(argRegs[i]);
+                else {
+                    this.vm.pop(VReg.V6);
+                    this.vm.lea(VReg.V5, "_call_argv");
+                    this.vm.store(VReg.V5, i * 8, VReg.V6);
+                }
             }
             this.vm.pop(VReg.S0);
             for (let i = argCount; i < argRegs.length; i++) {
                 this.vm.movImm64(argRegs[i], 0x7ffb000000000000n);
             }
             this.vm.mov(VReg.A5, VReg.S0);
-            this.emitSetCallArgc(argCount); // [argc ABI]
+            this.emitSetCallArgc(args.length > 16 ? 16 : args.length); // [argc ABI]
         }
         this.vm.call(funcLabel);
 
-        // 4. 返回:显式返回对象/数组(tag 0x7ffd/0x7ffe)覆盖,否则返回实例(装箱 0x7ffd)。
+        // 4. 返回:显式返回对象/数组/TypedArray(tag 0x7ffd/0x7ffe 或裸 TA)覆盖,
+        // 否则返回实例(S0 已装箱)。
         const retEnd = this.ctx.newLabel("fnnew_end");
+        const useThis = this.ctx.newLabel("fnnew_use_this");
         this.vm.mov(VReg.V1, VReg.RET);
         this.vm.shrImm(VReg.V1, VReg.V1, 48);
         this.vm.cmpImm(VReg.V1, 0x7ffd);
         this.vm.jeq(retEnd);
         this.vm.cmpImm(VReg.V1, 0x7ffe);
         this.vm.jeq(retEnd);
-        this.vm.emitMaskLoad(VReg.V1);
-        this.vm.andMaskReg(VReg.RET, VReg.S0, VReg.V1);
-        this.vm.movImm64(VReg.V1, 0x7ffd000000000000n);
-        this.vm.or(VReg.RET, VReg.RET, VReg.V1);
+        this.vm.cmpImm(VReg.V1, 0x7fff);
+        this.vm.jeq(retEnd);
+        // 裸 TypedArray(high16=0, type@0 ∈ [0x40,0x61]) / DataView(14) / AB(12)
+        this.vm.cmpImm(VReg.V1, 0);
+        this.vm.jne(useThis);
+        this.vm.cmpImm(VReg.RET, 0);
+        this.vm.jeq(useThis);
+        this.vm.loadByte(VReg.V1, VReg.RET, 0); // 勿用 V0:x64 V0≡RET
+        this.vm.cmpImm(VReg.V1, 4); // TYPE_MAP
+        this.vm.jeq(retEnd);
+        this.vm.cmpImm(VReg.V1, 5); // TYPE_SET
+        this.vm.jeq(retEnd);
+        this.vm.cmpImm(VReg.V1, 12); // TYPE_ARRAY_BUFFER
+        this.vm.jeq(retEnd);
+        this.vm.cmpImm(VReg.V1, 14); // TYPE_DATA_VIEW
+        this.vm.jeq(retEnd);
+        this.vm.cmpImm(VReg.V1, 0x40);
+        this.vm.jlt(useThis);
+        this.vm.cmpImm(VReg.V1, 0x61);
+        this.vm.jle(retEnd);
+        this.vm.label(useThis);
+        this.vm.mov(VReg.RET, VReg.S0);
         this.vm.label(retEnd);
     },
 
@@ -1165,7 +1141,9 @@ export const ExpressionCompiler = {
         const keyCount = this._classShapeKeyCount(cls, {}, new Set());
         let site = null;
         if (keyCount !== null) {
-            const label = `_shape_cls_${String(className).replace(/[^A-Za-z0-9_]/g, "_")}__${this.nextLabelId()}`;
+            // className 来自已解析的标识符/内部改名，本身可安全作为汇编 Map label。
+            // 避免 native 自举运行时的 RegExp.replace 错把局部值污染成 `_shape_cls_`。
+            const label = `_shape_cls_${String(className)}__${this.nextLabelId()}`;
             this.asm.addDataLabel(label);
             this.asm.addDataQword(keyCount);
             site = { label: label, keyCount: keyCount };
@@ -1319,30 +1297,12 @@ export const ExpressionCompiler = {
             // 构造函数调用约定: A0 = this, 参数依次在 A1-A5
             // 先保存 S0/S1/S2（参数表达式可能覆盖它们），
             // 再逐个编译参数压栈，最后逆序弹出到 A5..A1
-            if (args.some((a) => a && a.type === "SpreadElement")) {
+            if (argsHasSpread(args)) {
                 // new F(...args)：展开实参（此前 SpreadElement 落 default → 告警且丢参）
                 this.compileCtorArgsSpread(args);
             } else {
-                const ctorArgRegs = [VReg.A1, VReg.A2, VReg.A3, VReg.A4, VReg.A5];
-                const ctorArgCount = Math.min(args.length, ctorArgRegs.length);
-                this.vm.push(VReg.S0);
-                this.vm.push(VReg.S1);
-                this.vm.push(VReg.S2);
-                for (let i = 0; i < ctorArgCount; i++) {
-                    this.compileExpression(args[i]);
-                    this.vm.push(VReg.RET);
-                }
-                for (let i = ctorArgCount - 1; i >= 0; i--) {
-                    this.vm.pop(ctorArgRegs[i]);
-                }
-                this.vm.pop(VReg.S2);
-                this.vm.pop(VReg.S1);
-                this.vm.pop(VReg.S0);
                 // 未提供的构造函数实参填 JS_UNDEFINED，使被调用方默认参数生效
-                for (let i = ctorArgCount; i < ctorArgRegs.length; i++) {
-                    this.vm.movImm64(ctorArgRegs[i], 0x7ffb000000000000n);
-                }
-                this.emitSetCallArgc(ctorArgCount); // [argc ABI]
+                this.compileCtorArgsToRegs(args, [VReg.S0, VReg.S1, VReg.S2], true);
             }
 
             // 重新设置 A0 = this
@@ -1364,10 +1324,41 @@ export const ExpressionCompiler = {
                 this.vm.label(unewNoShpL);
             }
 
-            // 返回新对象（标记为 JS 对象）
-            // JSValue = (ptr & 0x0000ffffffffffff) | 0x7ffd000000000000
-            this.vm.movImm64(VReg.V1, 0x7ffd000000000000n);
-            this.vm.or(VReg.RET, VReg.S0, VReg.V1);
+            // 返回:构造器显式返回对象/数组/TypedArray/ArrayBuffer 则用之(super→_ta_construct
+            // 产裸 TA/AB,high16=0+type∈[0x40,0x61] 或 TYPE_ARRAY_BUFFER=12);否则回落初始实例 S0 装箱 0x7ffd。
+            {
+                const keepL = this.ctx.newLabel("unew_keep_ret");
+                const doneL = this.ctx.newLabel("unew_ret_done");
+                this.vm.shrImm(VReg.V1, VReg.RET, 48);
+                this.vm.cmpImm(VReg.V1, 0x7ffd);
+                this.vm.jeq(keepL);
+                this.vm.cmpImm(VReg.V1, 0x7ffe);
+                this.vm.jeq(keepL);
+                this.vm.cmpImm(VReg.V1, 0x7fff);
+                this.vm.jeq(keepL);
+                this.vm.cmpImm(VReg.V1, 0);
+                this.vm.jne(doneL); // 非对象类返回值 → 用 S0
+                this.vm.cmpImm(VReg.RET, 0);
+                this.vm.jeq(doneL);
+                this.vm.loadByte(VReg.V1, VReg.RET, 0); // 勿用 V0:x64 V0≡RET
+                this.vm.cmpImm(VReg.V1, 4); // TYPE_MAP
+                this.vm.jeq(keepL);
+                this.vm.cmpImm(VReg.V1, 5); // TYPE_SET
+                this.vm.jeq(keepL);
+                this.vm.cmpImm(VReg.V1, 12); // TYPE_ARRAY_BUFFER(super→_ta_construct)
+                this.vm.jeq(keepL);
+                this.vm.cmpImm(VReg.V1, 14); // TYPE_DATA_VIEW
+                this.vm.jeq(keepL);
+                this.vm.cmpImm(VReg.V1, 0x40);
+                this.vm.jlt(doneL);
+                this.vm.cmpImm(VReg.V1, 0x61);
+                this.vm.jgt(doneL);
+                this.vm.jmp(keepL);
+                this.vm.label(doneL);
+                this.vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+                this.vm.or(VReg.RET, VReg.S0, VReg.V1);
+                this.vm.label(keepL);
+            }
             this.vm.label(newProxyEndL); // [Proxy construct] 蹦床返回汇合点(RET 已是结果)
         } else {
             // 类不在局部变量/捕获 box 中（函数体内 new 顶层类）：
@@ -1385,25 +1376,10 @@ export const ExpressionCompiler = {
                 this.vm.store(VReg.S0, 16, VReg.V0);
                 this.vm.load(VReg.S2, VReg.V1, 8); // ctor = props[0].val
 
-                if (args.some((a) => a && a.type === "SpreadElement")) {
+                if (argsHasSpread(args)) {
                     this.compileCtorArgsSpread(args);
                 } else {
-                    const ctorArgRegs = [VReg.A1, VReg.A2, VReg.A3, VReg.A4, VReg.A5];
-                    const ctorArgCount = Math.min(args.length, ctorArgRegs.length);
-                    this.vm.push(VReg.S0);
-                    this.vm.push(VReg.S1);
-                    this.vm.push(VReg.S2);
-                    for (let i = 0; i < ctorArgCount; i++) {
-                        this.compileExpression(args[i]);
-                        this.vm.push(VReg.RET);
-                    }
-                    for (let i = ctorArgCount - 1; i >= 0; i--) {
-                        this.vm.pop(ctorArgRegs[i]);
-                    }
-                    this.vm.pop(VReg.S2);
-                    this.vm.pop(VReg.S1);
-                    this.vm.pop(VReg.S0);
-                    this.emitSetCallArgc(ctorArgCount); // [argc ABI]
+                    this.compileCtorArgsToRegs(args, [VReg.S0, VReg.S1, VReg.S2], false);
                 }
                 this.vm.mov(VReg.A0, VReg.S0);
                 this.vm.callIndirect(VReg.S2);
@@ -1418,28 +1394,49 @@ export const ExpressionCompiler = {
                     this.vm.store(VReg.S0, 48, VReg.V0);
                     this.vm.label(unewNoShpL2);
                 }
-                this.vm.movImm64(VReg.V1, 0x7ffd000000000000n);
-                this.vm.or(VReg.RET, VReg.S0, VReg.V1);
+                // 同主分支:保留 ctor 返回的对象/数组/TypedArray
+                {
+                    const keepL = this.ctx.newLabel("unew2_keep_ret");
+                    const doneL = this.ctx.newLabel("unew2_ret_done");
+                    this.vm.shrImm(VReg.V1, VReg.RET, 48);
+                    this.vm.cmpImm(VReg.V1, 0x7ffd);
+                    this.vm.jeq(keepL);
+                    this.vm.cmpImm(VReg.V1, 0x7ffe);
+                    this.vm.jeq(keepL);
+                    this.vm.cmpImm(VReg.V1, 0x7fff);
+                    this.vm.jeq(keepL);
+                    this.vm.cmpImm(VReg.V1, 0);
+                    this.vm.jne(doneL);
+                    this.vm.cmpImm(VReg.RET, 0);
+                    this.vm.jeq(doneL);
+                    this.vm.loadByte(VReg.V1, VReg.RET, 0); // 勿用 V0:x64 V0≡RET
+                    this.vm.cmpImm(VReg.V1, 4); // TYPE_MAP
+                    this.vm.jeq(keepL);
+                    this.vm.cmpImm(VReg.V1, 5); // TYPE_SET
+                    this.vm.jeq(keepL);
+                    this.vm.cmpImm(VReg.V1, 12); // TYPE_ARRAY_BUFFER
+                    this.vm.jeq(keepL);
+                    this.vm.cmpImm(VReg.V1, 14); // TYPE_DATA_VIEW
+                    this.vm.jeq(keepL);
+                    this.vm.cmpImm(VReg.V1, 0x40);
+                    this.vm.jlt(doneL);
+                    this.vm.cmpImm(VReg.V1, 0x61);
+                    this.vm.jgt(doneL);
+                    this.vm.jmp(keepL);
+                    this.vm.label(doneL);
+                    this.vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+                    this.vm.or(VReg.RET, VReg.S0, VReg.V1);
+                    this.vm.label(keepL);
+                }
                 return;
             }
 
             // 类不在局部变量中，尝试直接调用全局标签
             // 构造函数调用约定: A0 = this, 参数依次在 A1-A5
-            if (args.some((a) => a && a.type === "SpreadElement")) {
+            if (argsHasSpread(args)) {
                 this.compileCtorArgsSpread(args);
             } else {
-                const ctorArgRegs = [VReg.A1, VReg.A2, VReg.A3, VReg.A4, VReg.A5];
-                const ctorArgCount = Math.min(args.length, ctorArgRegs.length);
-                this.vm.push(VReg.S0);
-                for (let i = 0; i < ctorArgCount; i++) {
-                    this.compileExpression(args[i]);
-                    this.vm.push(VReg.RET);
-                }
-                for (let i = ctorArgCount - 1; i >= 0; i--) {
-                    this.vm.pop(ctorArgRegs[i]);
-                }
-                this.vm.pop(VReg.S0);
-                this.emitSetCallArgc(ctorArgCount); // [argc ABI]
+                this.compileCtorArgsToRegs(args, [VReg.S0, VReg.S1], false);
             }
 
             // 重新设置 A0 = this
@@ -1449,6 +1446,9 @@ export const ExpressionCompiler = {
             // 注意：这里需要在 collectFunctions 中注册类
             const funcLabel = this.getFunctionLabel(className);
             if (funcLabel) {
+                const classSymbolFb = (this.ctx.getFunctionSymbol && this.ctx.getFunctionSymbol(className)) || className;
+                this.vm.lea(VReg.S1, `_classinfo_${classSymbolFb}`);
+                this.vm.load(VReg.S1, VReg.S1, 0);
                 this.vm.call(funcLabel);
             }
 
@@ -1463,7 +1463,7 @@ export const ExpressionCompiler = {
     // 长度把前 5 个装入 A1..A5(越界填 JS_UNDEFINED),最后恢复 S0/S1/S2。受既有 5 参寄存器约束
     // (与非展开路径一致)。镜像 compileCallArgumentsWithSpread,但从 A1 起(A0 留给 this)。
     compileCtorArgsSpread(args) {
-        const ctorArgRegs = [VReg.A1, VReg.A2, VReg.A3, VReg.A4, VReg.A5];
+        const ctorArgRegs = CTOR_ARG_REGS_A1;
         this.vm.push(VReg.S0);
         this.vm.push(VReg.S1);
         this.vm.push(VReg.S2);
@@ -1494,6 +1494,9 @@ export const ExpressionCompiler = {
             this.vm.label(doneL);
             this.vm.push(VReg.RET);
         }
+        // [argv 溢出] 实参 5..15 从实参数组填 _call_argv(须在装 A1..A5 之前:helper 用 A0)
+        this.vm.load(VReg.A0, VReg.FP, argsArrOff);
+        this.vm.call("_call_argv_fill");
         // 依次弹出到 A1..A5（栈顶是 arg0）
         for (let i = 0; i < 5; i++) {
             this.vm.pop(ctorArgRegs[i]);
@@ -1510,7 +1513,7 @@ export const ExpressionCompiler = {
     // compilePlainFunctionNew)。与类版(A1..A5,this=A0)不同,故单独一版。进入时
     // S0=this(新实例,裸指针);返回后 A0..A4 已装好实参、A5=this、S0 保持不变。
     compilePlainCtorArgsSpread(args) {
-        const argRegs = [VReg.A0, VReg.A1, VReg.A2, VReg.A3, VReg.A4];
+        const argRegs = CTOR_ARG_REGS_A0;
         this.vm.push(VReg.S0); // 保 this 跨实参求值/辅助调用
         // RET = 全部实参组成的 boxed 数组
         this.compileArrayExpressionWithSpread(args);
@@ -1537,6 +1540,8 @@ export const ExpressionCompiler = {
             this.vm.label(doneL);
             this.vm.push(VReg.RET);
         }
+        this.vm.load(VReg.A0, VReg.FP, argsArrOff);
+        this.vm.call("_call_argv_fill");
         // 依次弹出到 A0..A4(栈顶是 arg0)
         for (let i = 0; i < 5; i++) {
             this.vm.pop(argRegs[i]);
@@ -1636,6 +1641,7 @@ export const ExpressionCompiler = {
 
             // 辅助函数：获取元素的数值（处理 Literal 和 UnaryExpression）
             const getElementValue = (elem) => {
+                if (!elem) return 0; // hole
                 if (elem.type === "Literal") {
                     return elem.value;
                 } else if (elem.type === "UnaryExpression" && elem.operator === "-") {
@@ -1654,8 +1660,31 @@ export const ExpressionCompiler = {
                     if (elem.name === "Infinity") return Infinity;
                     if (elem.name === "undefined") return undefined;
                 }
-                return 0; // 默认值
+                return 0; // 仅 const 路径使用
             };
+            const isConstTaElem = (elem) => {
+                if (!elem) return true;
+                if (elem.type === "Literal" && typeof elem.value === "number") return true;
+                if (elem.type === "UnaryExpression" && (elem.operator === "-" || elem.operator === "+") &&
+                    elem.argument && elem.argument.type === "Literal" &&
+                    typeof elem.argument.value === "number") return true;
+                if (elem.type === "Identifier" &&
+                    (elem.name === "NaN" || elem.name === "Infinity" || elem.name === "undefined")) return true;
+                return false;
+            };
+            // 含变量/调用的字面量不能按 0 填:new FA([aNaN]) 会把 NaN 编成 0,
+            // controls[i] !== controls[i] 恒假(fill-values-conversion consistent-nan)。
+            let allConst = true;
+            for (let ci = 0; ci < elements.length; ci++) {
+                if (!isConstTaElem(elements[ci])) { allConst = false; break; }
+            }
+            if (!allConst) {
+                this.compileExpression(args[0]);
+                this.vm.mov(VReg.A1, VReg.RET);
+                this.vm.movImm(VReg.A0, arrayType);
+                this.vm.call("_typed_array_from");
+                return;
+            }
 
             // 先创建 TypedArray
             this.vm.movImm(VReg.A0, arrayType);
@@ -1744,7 +1773,8 @@ export const ExpressionCompiler = {
             if (args.length >= 2) { this.compileExpressionAsInt(args[1]); }
             else { this.vm.movImm(VReg.RET, 0); }
             this.vm.store(VReg.FP, boOff, VReg.RET);   // byteOffset
-            if (args.length >= 3) {
+            const autoLen = args.length < 3;
+            if (!autoLen) {
                 this.compileExpressionAsInt(args[2]);
                 this.vm.mov(VReg.A3, VReg.RET);        // length
             } else {
@@ -1758,6 +1788,14 @@ export const ExpressionCompiler = {
             this.vm.load(VReg.A2, VReg.FP, boOff);     // byteOffset
             this.vm.movImm(VReg.A0, arrayType);        // type
             this.vm.call("_typed_array_view");
+            // 缺省长度 = length-tracking 视图:登记到跟踪表,buffer.resize 后长度跟随。
+            if (autoLen) {
+                this.vm.mov(VReg.A0, VReg.RET);
+                this.vm.load(VReg.A1, VReg.FP, bufOff);
+                this.vm.load(VReg.A2, VReg.FP, boOff);
+                this.vm.movImm(VReg.A3, elemSize);
+                this.vm.call("_ta_track_add");         // RET 原样返回视图
+            }
         } else if (args.length > 0) {
             // 变量/表达式参数:运行时判数组(拷贝元素)还是数字(当长度)。原一律当长度 →
             // `new Uint8Array(变量数组)` 把数组误当长度 → 空数组(bug,引擎库 P4 blocker)。
@@ -1784,11 +1822,8 @@ export const ExpressionCompiler = {
     // 故转换/原地方法改走 _ta_* 运行时。返回 true=已处理;false=委托 compileArrayMethod
     // (map/filter/forEach/reduce/some/every/find 等基于 _subscript_get 的方法已 typed-aware)。
     // 参数约定镜像 compileArrayMethod 各 case。
-    // TypedArray 回调型方法(forEach/some/every/find/findIndex)的统一派发:TA 先经
-    // _ta_to_array 转普通数组交给 _array_*_rt_t 驱动回调,但**回调可见的身份必须是 TA**
-    // ——origRecv(A2) 传原 TA 使 cb 第三参是 TA 本身(规范如此;此前传的是临时数组,
-    // `assert.sameValue(args[2], sample)` 全败),A3 传 thisArg(此前整个丢掉 → 回调里
-    // this 恒 undefined)。中间值一律落 FP 帧槽(GC 扫栈可见,且免去 caller-saved 破坏)。
+    // TypedArray 回调型方法:活读 TA(禁 toArr 快照),resize/OOB→undefined。
+    // rtLabel 映射到 _ta_forEach/_ta_every/_ta_some;find* 走 _tam_find_core。
     emitTaCbDelegate(obj, args, rtLabel) {
         const vm = this.vm;
         const id = this.nextLabelId();
@@ -1797,7 +1832,13 @@ export const ExpressionCompiler = {
         const thisSlot = this.ctx.allocLocal(`__tacb_this_${id}`);
         this.compileExpression(obj);
         vm.store(VReg.FP, taSlot, VReg.RET);
-        this.compileExpression(args[0]);
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_tam_throw_if_detached");
+        if (args.length >= 1 && args[0]) {
+            this.compileExpression(args[0]);
+        } else {
+            vm.movImm64(VReg.RET, 0x7ffb000000000000n); // undefined → needFn 抛
+        }
         vm.store(VReg.FP, cbSlot, VReg.RET);
         if (args.length >= 2 && args[1]) {
             this.compileExpression(args[1]);
@@ -1806,12 +1847,27 @@ export const ExpressionCompiler = {
         }
         vm.store(VReg.FP, thisSlot, VReg.RET);
         vm.load(VReg.A0, VReg.FP, cbSlot);
-        vm.call("_ta_need_fn");                 // IsCallable(TypeError if not)
+        vm.call("_ta_need_fn");
         vm.load(VReg.A0, VReg.FP, taSlot);
-        vm.call("_ta_to_array");                // RET(=A0) = 装箱普通数组
         vm.load(VReg.A1, VReg.FP, cbSlot);
-        vm.load(VReg.A2, VReg.FP, taSlot);      // origRecv = 原 TA
+        vm.load(VReg.A2, VReg.FP, thisSlot);
+        const live = {
+            "_array_forEach_rt_t": "_ta_forEach",
+            "_array_every_rt_t": "_ta_every",
+            "_array_some_rt_t": "_ta_some",
+        }[rtLabel];
+        if (live) {
+            vm.call(live);
+            return;
+        }
+        // find/findIndex 等:回落仍走原 rt(调用方应改走 find_core)
+        vm.load(VReg.A2, VReg.FP, taSlot);
         vm.load(VReg.A3, VReg.FP, thisSlot);
+        vm.call("_ta_to_array");
+        vm.load(VReg.A1, VReg.FP, cbSlot);
+        vm.load(VReg.A2, VReg.FP, taSlot);
+        vm.load(VReg.A3, VReg.FP, thisSlot);
+        vm.mov(VReg.A0, VReg.RET);
         vm.call(rtLabel);
     },
 
@@ -1820,8 +1876,14 @@ export const ExpressionCompiler = {
         if (name === "join") {
             this.compileExpression(obj);
             vm.push(VReg.RET);
+            vm.mov(VReg.A0, VReg.RET);
+            vm.call("_tam_throw_if_detached");
             if (args.length > 0) { this.compileExpression(args[0]); vm.mov(VReg.A1, VReg.RET); }
-            else { vm.lea(VReg.A1, "_str_comma_only"); }
+            else {
+                vm.lea(VReg.A1, "_str_comma_only");
+                vm.movImm64(VReg.V0, 0x7ffc000000000000n);
+                vm.or(VReg.A1, VReg.A1, VReg.V0);
+            }
             vm.pop(VReg.A0);
             vm.call("_ta_join");
             return true;
@@ -1830,27 +1892,39 @@ export const ExpressionCompiler = {
             if (args.length === 0) return true;
             this.compileExpression(obj);
             vm.push(VReg.RET);
+            vm.mov(VReg.A0, VReg.RET);
+            vm.call("_tam_throw_if_detached"); // ValidateTypedArray 在 ToInteger(fromIndex) 之前
             this.compileExpression(args[0]);
             vm.mov(VReg.A1, VReg.RET);
-            // fromIndex:default 0;负值由运行时归一
-            if (args.length >= 2) {
-                vm.push(VReg.A1);
-                this.compileExpressionAsInt(args[1]);
-                vm.mov(VReg.A2, VReg.RET);
-                vm.pop(VReg.A1);
-            } else {
-                vm.movImm(VReg.A2, 0);
-            }
-            vm.pop(VReg.A0);
+            // fromIndex:装箱传入;indexOf 在 _ta_indexof 内捕 origLen 后再 ToInteger。
+            // includes 仍走旧约定(裸 int,缺省 0)。
             if (name === "indexOf") {
+                if (args.length >= 2) {
+                    vm.push(VReg.A1);
+                    this.compileExpression(args[1]);
+                    vm.mov(VReg.A2, VReg.RET);
+                    vm.pop(VReg.A1);
+                } else {
+                    vm.movImm64(VReg.A2, 0x7ffb000000000000n);
+                }
+                vm.pop(VReg.A0);
                 vm.call("_ta_indexof");
                 this.boxIntAsNumber(VReg.RET);
             } else {
+                if (args.length >= 2) {
+                    vm.push(VReg.A1);
+                    this.compileExpressionAsInt(args[1]);
+                    vm.mov(VReg.A2, VReg.RET);
+                    vm.pop(VReg.A1);
+                } else {
+                    vm.movImm(VReg.A2, 0);
+                }
+                vm.pop(VReg.A0);
                 vm.call("_ta_includes");
                 const tL = `_ta_inc_t_${this.nextLabelId()}`, dL = `_ta_inc_d_${this.nextLabelId()}`;
                 vm.cmpImm(VReg.RET, 0); vm.jne(tL);
-                vm.lea(VReg.V0, "_js_false"); vm.load(VReg.RET, VReg.V0, 0); vm.jmp(dL);
-                vm.label(tL); vm.lea(VReg.V0, "_js_true"); vm.load(VReg.RET, VReg.V0, 0);
+                vm.movImm64(VReg.RET, 0x7ff9000000000000n); vm.jmp(dL);
+                vm.label(tL); vm.movImm64(VReg.RET, 0x7ff9000000000001n);
                 vm.label(dL);
             }
             return true;
@@ -1868,15 +1942,31 @@ export const ExpressionCompiler = {
         if (name === "slice" || name === "subarray") {
             // slice 拷贝;subarray 是**共享 buffer 的视图**(_ta_subarray 经 _ta_buffer +
             // _typed_array_view 建真视图,byteOffset = src.byteOffset + begin*elemSize)。
-            // 此前二者都走 _ta_slice,别名写回静默失效——`u.subarray(1,3)[0]=99` 不改 u。
+            // slice:ValidateTypedArray 在 ToInteger(start/end) 之前;装箱 start/end 交给
+            // _ta_slice(内部先捕 srcLength 再 ToInteger,以正确处理 mid-coerce resize)。
+            // subarray:**先** ToInteger,TypeError 来自随后 TypedArrayCreate(detached buffer)。
             this.compileExpression(obj);
             vm.push(VReg.RET);
+            if (name === "slice") {
+                vm.mov(VReg.A0, VReg.RET);
+                vm.call("_tam_throw_if_detached");
+                if (args.length >= 1) { this.compileExpression(args[0]); }
+                else vm.movImm64(VReg.RET, 0x7ffb000000000000n);
+                vm.push(VReg.RET);
+                if (args.length >= 2) { this.compileExpression(args[1]); }
+                else vm.movImm64(VReg.RET, 0x7ffb000000000000n);
+                vm.mov(VReg.A2, VReg.RET);
+                vm.pop(VReg.A1);
+                vm.pop(VReg.A0);
+                vm.call("_ta_slice");
+                return true;
+            }
             if (args.length >= 1) { this.compileExpressionAsInt(args[0]); vm.mov(VReg.A1, VReg.RET); }
             else vm.movImm(VReg.A1, 0);
             if (args.length >= 2) { vm.push(VReg.A1); this.compileExpressionAsInt(args[1]); vm.mov(VReg.A2, VReg.RET); vm.pop(VReg.A1); }
             else vm.movImm(VReg.A2, 2147483647);
             vm.pop(VReg.A0);
-            vm.call(name === "subarray" ? "_ta_subarray" : "_ta_slice");
+            vm.call("_ta_subarray");
             return true;
         }
         if (name === "fill") {
@@ -1898,6 +1988,8 @@ export const ExpressionCompiler = {
             // (typed 布局感知)。落 compileArrayMethod 会按 data_ptr@24 读 typed 布局崩。
             this.compileExpression(obj);
             vm.push(VReg.RET);
+            vm.mov(VReg.A0, VReg.RET);
+            vm.call("_tam_throw_if_detached");
             if (args.length >= 1) { this.compileExpressionAsInt(args[0]); vm.mov(VReg.A1, VReg.RET); }
             else vm.movImm(VReg.A1, 0);
             if (args.length >= 2) { vm.push(VReg.A1); this.compileExpressionAsInt(args[1]); vm.mov(VReg.A2, VReg.RET); vm.pop(VReg.A1); }
@@ -1914,8 +2006,10 @@ export const ExpressionCompiler = {
             vm.push(VReg.RET);
             this.compileExpression(args[0]);
             vm.mov(VReg.A1, VReg.RET); // src(装箱数组)
-            if (args.length >= 2) { vm.push(VReg.A1); this.compileExpressionAsInt(args[1]); vm.mov(VReg.A2, VReg.RET); vm.pop(VReg.A1); }
-            else vm.movImm(VReg.A2, 0);
+            // offset 保持装箱: _ta_set 内做 ToIntegerOrInfinity
+            // (compileExpressionAsInt 会把 -Infinity 收成 0,丢 RangeError)
+            if (args.length >= 2) { vm.push(VReg.A1); this.compileExpression(args[1]); vm.mov(VReg.A2, VReg.RET); vm.pop(VReg.A1); }
+            else vm.movImm64(VReg.A2, 0x7FFB000000000000n); // undefined → 0
             vm.pop(VReg.A0);
             vm.call("_ta_set");
             return true;
@@ -1938,53 +2032,48 @@ export const ExpressionCompiler = {
             return true;
         }
         if (name === "toReversed" || name === "toSorted") {
-            // 非原地版:先 _ta_slice 整段拷贝(得同类型新 typed array),再对副本原地 reverse/sort。
-            // 原数组不变(match spec)。委托 compileArrayMethod 会按 data_ptr@24 读 typed 布局崩。
+            // TypedArrayCreateSameType(忽略 species) + 拷贝 + 原地 reverse/sort。
             this.compileExpression(obj);
             vm.mov(VReg.A0, VReg.RET);
-            vm.movImm(VReg.A1, 0);
-            vm.movImm64(VReg.A2, 2147483647n);
-            vm.call("_ta_slice");            // RET = 拷贝(裸 typed array)
+            vm.call("_ta_clone_same_type");
             vm.mov(VReg.A0, VReg.RET);
-            vm.call(name === "toReversed" ? "_ta_reverse" : "_ta_sort");
+            if (name === "toReversed") {
+                vm.call("_ta_reverse");
+            } else {
+                if (args.length >= 1) {
+                    vm.push(VReg.A0);
+                    this.compileExpression(args[0]);
+                    vm.mov(VReg.A1, VReg.RET);
+                    vm.pop(VReg.A0);
+                } else {
+                    vm.movImm64(VReg.A1, 0x7ffb000000000000n);
+                }
+                vm.call("_ta_sort_cmp");
+            }
             return true;
         }
         if (name === "with") {
-            // arr.with(index, value):拷贝后写单元素。原数组不变。index 支持负数(加 len 归一)。
             if (args.length < 2) return true;
             this.compileExpression(obj);
+            vm.push(VReg.RET);
             vm.mov(VReg.A0, VReg.RET);
-            vm.movImm(VReg.A1, 0);
-            vm.movImm64(VReg.A2, 2147483647n);
-            vm.call("_ta_slice");            // RET = 拷贝
-            vm.push(VReg.RET);               // slot: 拷贝(最终返回值)
-            vm.push(VReg.RET);               // slot: 拷贝(供 _typed_array_set 的 A0)
-            this.compileExpressionAsInt(args[0]);
-            vm.push(VReg.RET);               // slot: index
+            vm.call("_tam_throw_if_detached");
+            this.compileExpression(args[0]);
+            vm.push(VReg.RET); // boxed index
             this.compileExpression(args[1]);
-            vm.mov(VReg.A2, VReg.RET);       // value(装箱)
-            vm.pop(VReg.A1);                 // index
-            vm.pop(VReg.A0);                 // 拷贝(裸)
-            const wDone = `_ta_with_idx_${this.nextLabelId()}`;
-            vm.cmpImm(VReg.A1, 0); vm.jge(wDone);
-            vm.load(VReg.V0, VReg.A0, 8);    // len(拷贝为裸指针,high16=0)
-            vm.add(VReg.A1, VReg.A1, VReg.V0);
-            vm.label(wDone);
-            vm.call("_typed_array_set");
-            vm.pop(VReg.RET);                // 拷贝(返回)
+            vm.mov(VReg.A2, VReg.RET); // boxed value
+            vm.pop(VReg.A1);
+            vm.pop(VReg.A0);
+            vm.call("_ta_with");
             return true;
         }
-        // 迭代器:values/entries/keys。typed 布局(元素@16)不能落 _array_values/entries
-        // (读 data_ptr@24 → 空/垃圾,是直接 ta.values()/entries() 出错的根因)。先
-        // _ta_to_array 转普通数组(逐元素 canonical 数字),再走普通数组迭代:values 即
-        // 数组本身、entries=[[i,v]]、keys=[0..len-1]。(asm.js 把迭代器建模为即时数组。)
+        // 迭代器:values/entries/keys → 真 TypedArray 迭代器(活读;OOB→TypeError)。
         if (name === "values" || name === "entries" || name === "keys") {
             this.compileExpression(obj);
             vm.mov(VReg.A0, VReg.RET);
-            vm.call("_ta_to_array"); // RET = 装箱普通数组(值序列)
-            if (name === "values") return true;
-            vm.mov(VReg.A0, VReg.RET);
-            vm.call(name === "entries" ? "_array_entries" : "_array_keys");
+            vm.call("_tam_throw_if_detached");
+            vm.movImm(VReg.A1, name === "values" ? 0 : name === "keys" ? 1 : 2);
+            vm.call("_ta_iterator_new");
             return true;
         }
         // ---- 回调型方法:转普通数组后委托 _array_*_rt ----
@@ -1994,20 +2083,51 @@ export const ExpressionCompiler = {
         // 注意:所有实参(callback 等)须 push 落栈后才调 _ta_to_array,因 A1..A7 caller-saved。
         if (name === "toString" || name === "toLocaleString") {
             this.compileExpression(obj);
+            vm.push(VReg.RET);
             vm.mov(VReg.A0, VReg.RET);
+            vm.call("_tam_throw_if_detached");
+            vm.pop(VReg.A0);
+            if (name === "toLocaleString") {
+                vm.call("_ta_to_array");
+                vm.mov(VReg.A0, VReg.RET);
+                vm.call("_agen_toLocaleString");
+                return true;
+            }
             vm.lea(VReg.A1, "_str_comma_only");
+            vm.movImm64(VReg.V0, 0x7ffc000000000000n);
+            vm.or(VReg.A1, VReg.A1, VReg.V0);
             vm.call("_ta_join");
             return true;
         }
         if (name === "forEach") {
-            if (args.length === 0) return true;
             this.emitTaCbDelegate(obj, args, "_array_forEach_rt_t");
             return true;
         }
-        if ((name === "map" || name === "filter" || name === "flatMap") && args.length >= 1) {
-            // map/filter/flatMap:TA→arr→cb→result_arr→TA(同类型回填)。中间值落 FP 帧槽
-            // (此前用 push/pop 交错且在 _ta_need_fn 后错位:`_ta_to_array` 收到回调、回调
-            // 收到垃圾 → map/filter 崩)。回调仍按规范拿到 TA 身份(origRecv)与 thisArg。
+        if ((name === "map" || name === "filter") && args.length >= 1) {
+            // 走运行时 _tam_map/_tam_filter:TypedArraySpeciesCreate 顺序与自定义
+            // @@species 由那两条路径统一处理(此前 _typed_array_from 跳过 species)。
+            const mid = this.nextLabelId();
+            const mTa = this.ctx.allocLocal(`__tam_ta_${mid}`);
+            const mCb = this.ctx.allocLocal(`__tam_fn_${mid}`);
+            const mThis = this.ctx.allocLocal(`__tam_this_${mid}`);
+            this.compileExpression(obj);
+            vm.store(VReg.FP, mTa, VReg.RET);
+            this.compileExpression(args[0]);
+            vm.store(VReg.FP, mCb, VReg.RET);
+            if (args.length >= 2 && args[1]) {
+                this.compileExpression(args[1]);
+            } else {
+                vm.movImm64(VReg.RET, 0x7ffb000000000000n);
+            }
+            vm.store(VReg.FP, mThis, VReg.RET);
+            vm.load(VReg.A0, VReg.FP, mTa);
+            vm.load(VReg.A1, VReg.FP, mCb);
+            vm.load(VReg.A2, VReg.FP, mThis);
+            vm.call(name === "filter" ? "_tam_filter" : "_tam_map");
+            return true;
+        }
+        if (name === "flatMap" && args.length >= 1) {
+            // TypedArray 无 flatMap;保留旧路径防遗漏调用点。
             const mid = this.nextLabelId();
             const mTa = this.ctx.allocLocal(`__tam_ta_${mid}`);
             const mCb = this.ctx.allocLocal(`__tam_fn_${mid}`);
@@ -2015,32 +2135,29 @@ export const ExpressionCompiler = {
             const mType = this.ctx.allocLocal(`__tam_ty_${mid}`);
             this.compileExpression(obj);
             vm.store(VReg.FP, mTa, VReg.RET);
-            vm.loadByte(VReg.V5, VReg.RET, 0);    // 类型字节(TA 值是裸指针)
+            vm.mov(VReg.A0, VReg.RET);
+            vm.call("_tam_throw_if_detached");
+            vm.load(VReg.RET, VReg.FP, mTa);
+            vm.loadByte(VReg.V5, VReg.RET, 0);
             vm.store(VReg.FP, mType, VReg.V5);
             this.compileExpression(args[0]);
             vm.store(VReg.FP, mCb, VReg.RET);
             if (args.length >= 2 && args[1]) {
                 this.compileExpression(args[1]);
             } else {
-                vm.movImm64(VReg.RET, 0x7ffb000000000000n); // undefined
+                vm.movImm64(VReg.RET, 0x7ffb000000000000n);
             }
             vm.store(VReg.FP, mThis, VReg.RET);
             vm.load(VReg.A0, VReg.FP, mCb);
-            vm.call("_ta_need_fn");               // validate callable(TypeError if not)
+            vm.call("_ta_need_fn");
             vm.load(VReg.A0, VReg.FP, mTa);
-            vm.call("_ta_to_array");              // RET(=A0) = boxed regular array
+            vm.call("_ta_to_array");
             vm.load(VReg.A1, VReg.FP, mCb);
-            vm.load(VReg.A2, VReg.FP, mTa);       // origRecv = 原 TA(回调第三参)
+            vm.load(VReg.A2, VReg.FP, mTa);
             vm.load(VReg.A3, VReg.FP, mThis);
-            if (name === "flatMap") {
-                vm.call("_array_flatMap_rt");     // flatMap 无 _t 变体:保持既有语义
-            } else if (name === "filter") {
-                vm.call("_array_filter_rt_t");
-            } else {
-                vm.call("_array_map_rt_t");
-            }
-            vm.mov(VReg.A1, VReg.RET);            // A1 = boxed result array
-            vm.load(VReg.A0, VReg.FP, mType);     // A0 = type byte
+            vm.call("_array_flatMap_rt");
+            vm.mov(VReg.A1, VReg.RET);
+            vm.load(VReg.A0, VReg.FP, mType);
             vm.call("_typed_array_from");
             return true;
         }
@@ -2071,13 +2188,20 @@ export const ExpressionCompiler = {
             return true;
         }
         if (name === "some" || name === "every") {
-            if (args.length === 0) return true;
             this.emitTaCbDelegate(obj, args,
                 name === "some" ? "_array_some_rt_t" : "_array_every_rt_t");
             return true;
         }
         if (name === "reduce" || name === "reduceRight") {
-            if (args.length === 0) return true;
+            if (args.length === 0) {
+                // 无参:ValidateTypedArray + IsCallable(undefined)→TypeError
+                this.compileExpression(obj);
+                vm.mov(VReg.A0, VReg.RET);
+                vm.call("_tam_throw_if_detached");
+                vm.movImm64(VReg.A0, 0x7ffb000000000000n);
+                vm.call("_ta_need_fn");
+                return true;
+            }
             // 此前这段栈操作是坏的:有 initialValue 时把 init **pop 两次**(第二次把回调
             // 当 init 取走,继而 A0/A1 全错位);无 init 时 `_ta_to_array` 收到的 A0 是回调。
             // 结果 `ta.reduce(cb)` 跳进垃圾地址。重排为:实参全部落栈 → 校验可调用 →
@@ -2085,6 +2209,8 @@ export const ExpressionCompiler = {
             const hasInit = args.length >= 2;
             this.compileExpression(obj);
             vm.push(VReg.RET);                    // ta
+            vm.mov(VReg.A0, VReg.RET);
+            vm.call("_tam_throw_if_detached");
             this.compileExpression(args[0]);
             vm.push(VReg.RET);                    // cb
             if (hasInit) {
@@ -2102,35 +2228,40 @@ export const ExpressionCompiler = {
             vm.pop(VReg.A1);                      // cb
             if (hasInit) vm.pop(VReg.A2); else vm.movImm64(VReg.A2, 0x7ffb000000000000n);
             vm.pop(VReg.A0);                      // ta
-            vm.push(VReg.A1);
-            if (hasInit) vm.push(VReg.A2);
-            vm.call("_ta_to_array");              // A0=ta → RET = 装箱普通数组
-            if (hasInit) vm.pop(VReg.A2); else vm.movImm64(VReg.A2, 0x7ffb000000000000n);
-            vm.pop(VReg.A1);                      // A1 = cb
-            vm.mov(VReg.A0, VReg.RET);            // A0 = boxed arr
-            vm.movImm(VReg.A3, 0);                // A3 = 0 (no extra origRecv, _rt uses arr)
-            vm.call(name === "reduce" ? "_array_reduce_rt" : "_array_reduceRight_rt");
+            vm.call(name === "reduce" ? "_ta_reduce" : "_ta_reduceRight");
             return true;
         }
-        if (name === "find" || name === "findIndex") {
-            if (args.length === 0) return true;
-            this.emitTaCbDelegate(obj, args,
-                name === "find" ? "_array_find_rt_t" : "_array_findIndex_rt_t");
-            return true;
-        }
-        if (name === "findLast" || name === "findLastIndex") {
-            if (args.length === 0) return true;
+        if (name === "find" || name === "findIndex" || name === "findLast" || name === "findLastIndex") {
             this.compileExpression(obj);
-            vm.push(VReg.RET);                    // [sp] = boxed ta
-            this.compileExpression(args[0]);
-            vm.push(VReg.RET);                    // [sp] = callback, [sp+8] = boxed ta
-            vm.pop(VReg.A1);                      // A1 = callback
-            vm.pop(VReg.A0);                      // A0 = boxed ta
-            vm.mov(VReg.S1, VReg.A0);             // S1 = boxed ta(save across guard)
-            vm.mov(VReg.A0, VReg.A1);             // A0 = callback
-            vm.call("_ta_need_fn");               // validate callable(TypeError if not)
-            vm.mov(VReg.A0, VReg.S1);             // A0 = boxed ta(restore)
-            vm.movImm(VReg.A2, name === "findLastIndex" ? 3 : 2); // mode:bit0=index,bit1=reverse
+            vm.push(VReg.RET);
+            vm.mov(VReg.A0, VReg.RET);
+            vm.call("_tam_throw_if_detached");
+            if (args.length >= 1 && args[0]) {
+                this.compileExpression(args[0]);
+            } else {
+                vm.movImm64(VReg.RET, 0x7ffb000000000000n);
+            }
+            vm.push(VReg.RET);
+            if (args.length >= 2 && args[1]) {
+                this.compileExpression(args[1]);
+                vm.mov(VReg.A3, VReg.RET);
+            } else {
+                vm.movImm64(VReg.A3, 0x7ffb000000000000n);
+            }
+            vm.pop(VReg.A1);
+            vm.pop(VReg.A0);
+            vm.mov(VReg.S1, VReg.A0);
+            vm.mov(VReg.S2, VReg.A1);
+            vm.mov(VReg.S3, VReg.A3);
+            vm.mov(VReg.A0, VReg.A1);
+            vm.call("_ta_need_fn");
+            vm.mov(VReg.A0, VReg.S1);
+            vm.mov(VReg.A1, VReg.S2);
+            const mode = name === "find" ? 0
+                : name === "findIndex" ? 1
+                : name === "findLast" ? 2 : 3;
+            vm.movImm(VReg.A2, mode);
+            vm.mov(VReg.A3, VReg.S3);
             vm.call("_tam_find_core");
             return true;
         }
@@ -2142,7 +2273,7 @@ export const ExpressionCompiler = {
      * @param {number} constructorReg - 存储构造函数闭包/类对象的寄存器
      * @param {Array} args - 构造函数参数
      */
-    compileDynamicNew(constructorReg, args) {
+    compileDynamicNew(constructorReg, args, newTargetOff) {
         // constructorReg 通常是 caller-saved 临时寄存器（V6=X14），下面的 _alloc
         // 调用会破坏它，之后再读 @48/@32 就是解引用垃圾 → 崩溃（new AST.Program()
         // 等命名空间成员实例化）。先存入 callee-saved S1，跨 _alloc 与参数求值都安全。
@@ -2220,6 +2351,11 @@ export const ExpressionCompiler = {
             this.compileArrayExpressionWithSpread(args); // RET = 实参 boxed 数组
             this.vm.mov(VReg.A1, VReg.RET); // 先取 RET(与 A0 同物理寄存器 X0/RAX!)
             this.vm.load(VReg.A0, VReg.FP, dnFnValSlot);
+            if (newTargetOff != null && newTargetOff !== undefined) {
+                this.vm.load(VReg.A2, VReg.FP, newTargetOff);
+            } else {
+                this.vm.movImm(VReg.A2, 0);
+            }
             this.vm.call("_fn_construct_call");
             this.vm.jmp(dynNewProxyEndL);
             this.vm.label(notClosureL);
@@ -2269,39 +2405,51 @@ export const ExpressionCompiler = {
         this.vm.load(VReg.S2, VReg.V1, 8); // ctor = props[0].val
 
         // 4. 准备参数（构造函数约定: A0 = this, 参数在 A1-A5）
-        {
-            const ctorArgRegs = [VReg.A1, VReg.A2, VReg.A3, VReg.A4, VReg.A5];
-            const ctorArgCount = Math.min(args.length, ctorArgRegs.length);
-            this.vm.push(VReg.S0);
-            this.vm.push(VReg.S2);
-            for (let i = 0; i < ctorArgCount; i++) {
-                this.compileExpression(args[i]);
-                this.vm.push(VReg.RET);
-            }
-            for (let i = ctorArgCount - 1; i >= 0; i--) {
-                this.vm.pop(ctorArgRegs[i]);
-            }
-            this.vm.pop(VReg.S2);
-            this.vm.pop(VReg.S0);
-            // 未提供的构造函数实参填 JS_UNDEFINED，使被调用方默认参数生效
-            for (let i = ctorArgCount; i < ctorArgRegs.length; i++) {
-                this.vm.movImm64(ctorArgRegs[i], 0x7ffb000000000000n);
-            }
-            this.emitSetCallArgc(ctorArgCount); // [argc ABI]
-        }
+        // 未提供的构造函数实参填 JS_UNDEFINED，使被调用方默认参数生效
+        this.compileCtorArgsToRegs(args, [VReg.S0, VReg.S1, VReg.S2], true);
 
         // 5. 调用构造函数 (A0 = this)
         this.vm.mov(VReg.A0, VReg.S0);
         this.vm.callIndirect(VReg.S2);
 
-        // 6. 返回新对象——装箱为对象 JSValue（0x7ffd），与 compileUserClassNew 一致。
-        // 原来返回裸指针(high16==0)：多数对象操作靠 mask 兼容，但 for-in 严格要求
-        // tag∈{0x7ffd,0x7ffe} → `new AST.X()` 造的 AST 节点 for-in 被跳过 0 次 →
-        // 闭包捕获分析 collectReferencedVariables 收集不到引用 → 闭包捕获全失效。
-        this.vm.emitMaskLoad(VReg.V1);
-        this.vm.andMaskReg(VReg.RET, VReg.S0, VReg.V1);
-        this.vm.movImm64(VReg.V1, 0x7ffd000000000000n);
-        this.vm.or(VReg.RET, VReg.RET, VReg.V1);
+        // 6. 返回:构造器显式返回对象/数组/TypedArray 则用之(super→_ta_construct
+        // 产裸 TA;new Function 子类经本路径 `new M(...)`),否则回落初始实例 S0
+        // 装箱 0x7ffd(for-in 等要求 tag∈{0x7ffd,0x7ffe})。
+        {
+            const keepL = this.ctx.newLabel("dnew_keep_ret");
+            const doneL = this.ctx.newLabel("dnew_ret_done");
+            this.vm.shrImm(VReg.V1, VReg.RET, 48);
+            this.vm.cmpImm(VReg.V1, 0x7ffd);
+            this.vm.jeq(keepL);
+            this.vm.cmpImm(VReg.V1, 0x7ffe);
+            this.vm.jeq(keepL);
+            this.vm.cmpImm(VReg.V1, 0x7fff);
+            this.vm.jeq(keepL);
+            this.vm.cmpImm(VReg.V1, 0);
+            this.vm.jne(doneL);
+            this.vm.cmpImm(VReg.RET, 0);
+            this.vm.jeq(doneL);
+            this.vm.loadByte(VReg.V1, VReg.RET, 0); // 勿用 V0:x64 V0≡RET
+            this.vm.cmpImm(VReg.V1, 4); // TYPE_MAP
+            this.vm.jeq(keepL);
+            this.vm.cmpImm(VReg.V1, 5); // TYPE_SET
+            this.vm.jeq(keepL);
+            this.vm.cmpImm(VReg.V1, 12); // TYPE_ARRAY_BUFFER
+            this.vm.jeq(keepL);
+            this.vm.cmpImm(VReg.V1, 14); // TYPE_DATA_VIEW
+            this.vm.jeq(keepL);
+            this.vm.cmpImm(VReg.V1, 0x40);
+            this.vm.jlt(doneL);
+            this.vm.cmpImm(VReg.V1, 0x61);
+            this.vm.jgt(doneL);
+            this.vm.jmp(keepL);
+            this.vm.label(doneL);
+            this.vm.emitMaskLoad(VReg.V1);
+            this.vm.andMaskReg(VReg.RET, VReg.S0, VReg.V1);
+            this.vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+            this.vm.or(VReg.RET, VReg.RET, VReg.V1);
+            this.vm.label(keepL);
+        }
         this.vm.label(dynNewProxyEndL); // [Proxy construct] 蹦床返回汇合点
     },
 };

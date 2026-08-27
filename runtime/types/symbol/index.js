@@ -34,6 +34,7 @@ export class SymbolGenerator {
         this.generateDataSlots();
         this.generateSymbolNew();
         this.generateIsSymbol();
+        this.generateSymbolThisValue();
         this.generateSymbolToString();
         this.generateSymbolFor();
         this.generateSymbolKeyFor();
@@ -134,6 +135,41 @@ export class SymbolGenerator {
         vm.epilogue([VReg.S0], 0);
     }
 
+    // _symbol_this_value(this) -> 裸 Symbol。原始值或 Object(sym) 包装
+    // (0x7FFD + __symbol_value) 皆可;否则 TypeError。
+    generateSymbolThisValue() {
+        const vm = this.vm;
+        vm.label("_symbol_this_value");
+        vm.prologue(0, [VReg.S0]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.call("_is_symbol");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_stv_ok");
+        vm.shrImm(VReg.V0, VReg.S0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jne("_stv_err");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.lea(VReg.A1, vm.asm.addString("__symbol_value"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_is_symbol");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_stv_err");
+        vm.label("_stv_ok");
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0], 0);
+        vm.label("_stv_err");
+        vm.lea(VReg.A0, vm.asm.addString("Symbol.prototype called on incompatible receiver"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+    }
+
     // _symbol_to_string(sym) -> boxed 堆字符串 "Symbol(desc)"
     // （String(sym)/_valueToStr 分派用；标准要求 String(sym) 合法而拼接
     //  TypeError——本实现拼接也得到该串，记偏差）
@@ -142,7 +178,8 @@ export class SymbolGenerator {
 
         vm.label("_symbol_to_string");
         vm.prologue(0, [VReg.S0]);
-        vm.mov(VReg.S0, VReg.A0);
+        vm.call("_symbol_this_value");
+        vm.mov(VReg.S0, VReg.RET);
         vm.lea(VReg.A0, "_str_symbol_open"); // "Symbol("
         vm.load(VReg.A1, VReg.S0, 8); // desc 裸指针（0 → _getStrContent 给空串）
         vm.call("_strconcat");
@@ -259,42 +296,7 @@ export class SymbolGenerator {
     generateSymbolValueOf() {
         const vm = this.vm;
         vm.label("_symbol_valueOf");
-        vm.prologue(0, [VReg.S0]);
-
-        // Check if this is a Symbol primitive (raw heap pointer, high16==0)
-        vm.shrImm(VReg.V0, VReg.A0, 48);
-        vm.cmpImm(VReg.V0, 0);
-        vm.jeq("_svo_check_symbol");
-        // Check if this is a Symbol wrapper (0x7FFD object)
-        vm.cmpImm(VReg.V0, 0x7FFD);
-        vm.jne("_svo_typeerr");
-
-        // 0x7FFD object: verify it's a Symbol wrapper by checking type byte
-        vm.emitMaskLoad(VReg.V1);
-        vm.andMaskReg(VReg.S0, VReg.A0, VReg.V1); // S0 = raw ptr
-        vm.loadByte(VReg.V0, VReg.S0, 0);
-        vm.cmpImm(VReg.V0, TYPE_SYMBOL); // TYPE_SYMBOL = 9?
-        vm.jne("_svo_typeerr");
-        // Extract symbol pointer from wrapper
-        vm.load(VReg.RET, VReg.S0, 8); // symbol ptr at +8
-        vm.epilogue([VReg.S0], 0);
-
-        // Raw pointer: verify it's a valid Symbol
-        vm.label("_svo_check_symbol");
-        vm.mov(VReg.S0, VReg.A0);
-        vm.call("_is_symbol"); // RET = 0 or 1
-        vm.cmpImm(VReg.RET, 0);
-        vm.jeq("_svo_typeerr");
-        vm.mov(VReg.RET, VReg.S0); // return original symbol
-        vm.epilogue([VReg.S0], 0);
-
-        vm.label("_svo_typeerr");
-        vm.lea(VReg.A0, vm.asm.addString("Symbol.prototype.valueOf called on incompatible receiver"));
-        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
-        vm.and(VReg.A0, VReg.A0, VReg.V1);
-        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
-        vm.or(VReg.A0, VReg.A0, VReg.V1);
-        vm.call("_throw_type_error");
+        vm.jmp("_symbol_this_value");
     }
 
     // _symbol_description(this) -> boxed description string or undefined
@@ -302,30 +304,8 @@ export class SymbolGenerator {
         const vm = this.vm;
         vm.label("_symbol_description");
         vm.prologue(0, [VReg.S0, VReg.S1]);
-
-        // Check if Symbol primitive (raw pointer, high16==0)
-        vm.shrImm(VReg.V0, VReg.A0, 48);
-        vm.cmpImm(VReg.V0, 0);
-        vm.jeq("_sdesc_check");
-        // Check if Symbol wrapper (0x7FFD)
-        vm.cmpImm(VReg.V0, 0x7FFD);
-        vm.jne("_sdesc_typeerr");
-
-        // Wrapper: extract symbol from __value
-        vm.emitMaskLoad(VReg.V1);
-        vm.andMaskReg(VReg.S0, VReg.A0, VReg.V1);
-        vm.loadByte(VReg.V0, VReg.S0, 0);
-        vm.cmpImm(VReg.V0, TYPE_SYMBOL);
-        vm.jne("_sdesc_typeerr");
-        vm.load(VReg.S0, VReg.S0, 8); // desc ptr
-        vm.jmp("_sdesc_emit");
-
-        // Symbol primitive: verify and extract desc
-        vm.label("_sdesc_check");
-        vm.mov(VReg.S0, VReg.A0);
-        vm.call("_is_symbol");
-        vm.cmpImm(VReg.RET, 0);
-        vm.jeq("_sdesc_typeerr");
+        vm.call("_symbol_this_value");
+        vm.mov(VReg.S0, VReg.RET);
         vm.load(VReg.S0, VReg.S0, 8); // desc ptr at sym+8
 
         // Emit description string or undefined
@@ -341,13 +321,5 @@ export class SymbolGenerator {
         vm.label("_sdesc_undef");
         vm.movImm64(VReg.RET, 0x7ffb000000000000n); // undefined
         vm.epilogue([VReg.S0, VReg.S1], 0);
-
-        vm.label("_sdesc_typeerr");
-        vm.lea(VReg.A0, vm.asm.addString("Symbol.prototype.description called on incompatible receiver"));
-        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
-        vm.and(VReg.A0, VReg.A0, VReg.V1);
-        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
-        vm.or(VReg.A0, VReg.A0, VReg.V1);
-        vm.call("_throw_type_error");
     }
 }

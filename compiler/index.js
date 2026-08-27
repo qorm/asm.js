@@ -16,7 +16,7 @@ import { execSync, execFileSync } from "child_process";
 
 // 语言前端
 import { Lexer, Parser } from "../lang/index.js";
-import { analyzeCapturedVariables, analyzeSharedVariables, analyzeTopLevelSharedVariables, analyzeDirectEvalBoxedVars, collectLocalDeclarations, collectVarDeclarations } from "../lang/analysis/closure.js";
+import { analyzeCapturedVariables, analyzeSharedVariables, analyzeTopLevelSharedVariables, analyzeDirectEvalBoxedVars, collectLocalDeclarations, collectLexicalDeclarations, collectVarDeclarations, collectPatternNames } from "../lang/analysis/closure.js";
 import { renameBlockScopedBindings } from "../lang/analysis/blockscope.js";
 
 // 虚拟机和汇编器
@@ -30,7 +30,7 @@ import { WASM_STACK_TOP, WASM_ARGV_BASE } from "../binary/wasm.js";
 import { AllocatorGenerator, RuntimeGenerator, NumberGenerator, StringConstantsGenerator, AsyncGenerator } from "../runtime/index.js";
 
 // 编译上下文和平台
-import { CompileContext, CompileOptions, CompileResult } from "./core/context.js";
+import { CompileContext, CompileOptions, CompileResult, copyMap } from "./core/context.js";
 import { detectPlatform, getTargetInfo, resolveTarget, listTargets, TARGETS } from "./core/platform.js";
 
 // 编译器模块
@@ -46,12 +46,34 @@ import { BinaryOutputGenerator } from "./output/generator.js";
 
 // 静态链接器
 import { StaticLinker } from "../binary/static_linker.js";
+import {
+    runtimeSnapshotKey, restoreRuntimeSnapshot, saveRuntimeSnapshot,
+    resolveRuntimeCodeFixups, markRuntimeBoundary
+} from "./runtime-snapshot.js";
 
 // 重新导出
 export { detectPlatform, getTargetInfo, resolveTarget, listTargets, TARGETS } from "./core/platform.js";
 export { CompileContext, CompileOptions, CompileResult } from "./core/context.js";
 export { BinaryGenerator, OutputType, pageAlign, align16, align } from "../binary/binary_format.js";
 export { parseJslibFile, LibraryManager } from "./output/library.js";
+
+
+function dictGet(obj, key) {
+    if (!obj) return undefined;
+    if (obj instanceof Map) return obj.get(key);
+    return obj[key];
+}
+function dictHas(obj, key) {
+    if (!obj) return false;
+    if (obj instanceof Map) return obj.has(key);
+    return Object.prototype.hasOwnProperty.call(obj, key);
+}
+function dictSet(obj, key, val) {
+    if (!obj) return;
+    if (obj instanceof Map) obj.set(key, val);
+    else obj[key] = val;
+}
+
 
 // Box 对象布局：存储被捕获变量的包装对象
 const BOX_VALUE_OFFSET = 0;
@@ -79,6 +101,16 @@ function runtimeNodeBase(pathMod, fsMod) {
         return _compilerRootDir;
     }
     return process.cwd(); // 兜底:保持旧行为
+}
+
+// 与历史「跳过正则字面量扫描」目录一致(readModuleSource 字面量扫描用)。
+function isToolchainSourcePath(filePath) {
+    return filePath.indexOf("compiler/") !== -1 ||
+        filePath.indexOf("lang/") !== -1 ||
+        filePath.indexOf("asm/") !== -1 ||
+        filePath.indexOf("backend/") !== -1 ||
+        filePath.indexOf("/vm/") !== -1 ||
+        filePath.indexOf("engine/") !== -1;
 }
 
 // [批次D] 生成器声明判定(本地副本,勿经 async/index.js 再导出链)
@@ -124,6 +156,11 @@ function isBareSubpath(s) {
     }
     return true;
 }
+
+// 入口 AST 隐式全局注入表(见 _injectImplicitGlobalImports)。
+const _IMPLICIT_GLOBALS = {
+    URL: "url", URLSearchParams: "url", btoa: "util", atob: "util", Buffer: "buffer",
+};
 // ---- CommonJS(require/module.exports)AOT 子集支持 ----
 // 只对「无 ESM import/export 语句、且用到 CJS 标志(module.exports/exports.\/裸
 // require())」的文件生效。编译器/运行时自身全部是 ESM,永不命中,故自举零影响。
@@ -145,20 +182,57 @@ function cjsHasBareRequire(src) {
 }
 function looksLikeCjsSource(src) {
     if (!src || src.length === 0) return false;
+    // 先廉价门控:绝大多数 ESM 模块无这些子串 → 直接否,免 sourceHasTopLevelEsmDecl/
+    // cjsHasBareRequire 的整文件扫描(gen1 上 resolve 读 111 模块时很贵)。
+    const hasMe = src.indexOf("module.exports") !== -1;
+    const hasEd = src.indexOf("exports.") !== -1;
+    const hasEb = src.indexOf("exports[") !== -1;
+    const hasReq = src.indexOf("require(") !== -1;
+    if (!hasMe && !hasEd && !hasEb && !hasReq) return false;
     if (sourceHasTopLevelEsmDecl(src)) return false;
-    return src.indexOf("module.exports") !== -1 ||
-        src.indexOf("exports.") !== -1 ||
-        src.indexOf("exports[") !== -1 ||
-        cjsHasBareRequire(src);
+    return hasMe || hasEd || hasEb || cjsHasBareRequire(src);
 }
 // 从 dirname(filePath) 逐级向上找第一个存在的 package.json,当且仅当其 "type"
 // 恰为字符串 "commonjs" 时返回 true。链上无 package.json、JSON 解析失败、无
 // type 字段或 type 为别的值("module" 等)→ false。每调用走一遍目录链即可
 // (模块数有限,不缓存)。用 readModuleSource 同款模块级 fs/path 绑定。
 // 自举安全:编译器/运行时模块都在根 package.json(无 type 字段)之下,恒 false。
+// AOT 子集门控:前缀 `require(` / `import(` 后(跳空白)须是字面量引号或 ASCII
+// 标识符起首。注释里的 `require(静态` / `动态 import(source)` 等不得开整树扫描。
+function sourceHasCallParenForm(src, prefix) {
+    let i = 0;
+    const plen = prefix.length;
+    while ((i = src.indexOf(prefix, i)) !== -1) {
+        let j = i + plen;
+        while (j < src.length) {
+            const c = src.charCodeAt(j);
+            if (c === 32 || c === 9 || c === 10 || c === 13) { j++; continue; }
+            break;
+        }
+        if (j >= src.length) { i += plen; continue; }
+        const c = src.charCodeAt(j);
+        // " ' ` 或 $/_/A-Z/a-z
+        if (c === 34 || c === 39 || c === 96 || c === 36 || c === 95 ||
+            (c >= 65 && c <= 90) || (c >= 97 && c <= 122)) return true;
+        i += plen;
+    }
+    return false;
+}
+
+const _pkgCjsMemo = new Map();
 function nearestPackageJsonExplicitCommonjs(filePath) {
-    let dir = path.dirname(filePath);
+    const startDir = path.dirname(filePath);
+    const cached = _pkgCjsMemo.get(startDir);
+    if (cached !== undefined) return cached;
+    let dir = startDir;
+    const walked = [];
     while (true) {
+        const hit = _pkgCjsMemo.get(dir);
+        if (hit !== undefined) {
+            for (let i = 0; i < walked.length; i++) _pkgCjsMemo.set(walked[i], hit);
+            return hit;
+        }
+        walked.push(dir);
         const pkgPath = path.join(dir, "package.json");
         if (fs.existsSync(pkgPath)) {
             let typeVal;
@@ -177,10 +251,15 @@ function nearestPackageJsonExplicitCommonjs(filePath) {
                 err.code = "ERR_INVALID_PACKAGE_CONFIG";
                 throw err;
             }
-            return typeVal === "commonjs";
+            const result = typeVal === "commonjs";
+            for (let i = 0; i < walked.length; i++) _pkgCjsMemo.set(walked[i], result);
+            return result;
         }
         const parent = path.dirname(dir);
-        if (parent === dir) return false; // 到文件系统根仍无 package.json
+        if (parent === dir) {
+            for (let i = 0; i < walked.length; i++) _pkgCjsMemo.set(walked[i], false);
+            return false; // 到文件系统根仍无 package.json
+        }
         dir = parent;
     }
 }
@@ -310,6 +389,7 @@ export class Compiler {
         // 创建虚拟机 (VM 内部创建 backend)
         this.vm = new VirtualMachine(this.arch, this.os, this.asm);
         this.ctx = new CompileContext("main");
+        this.ctx.raVm = this.vm;
 
         // 库管理器
         this.libManager = new LibraryManager();
@@ -419,7 +499,12 @@ export class Compiler {
         this._bindingKindCache = new Map();   // moduleAst -> Map<name, kind>
         this._importBindingCache = new Map(); // moduleAst -> Map<localName, binding>
         this._importCacheLen = -1;            // 建缓存时的 imports 长度
+        this._importStmtCache = null;         // stmt -> import rec(与 _importCacheLen 同步失效)
         this._propTargetIndex = null;         // "targetModuleIndex:localName" -> [{moduleIndex, exportName, srcIndex}]
+        this._genStubClassMeths = null;
+        this._esmCycleCached = undefined;     // _hasEsmImportCycle 记忆化
+        this._esmCycleLen = -1;
+        this._fnCtxPool = null;               // compileFunction CompileContext 池
     }
 
     getModuleMeta(moduleAst) {
@@ -431,25 +516,14 @@ export class Compiler {
     }
 
     createModuleMeta(moduleAst, index) {
-        const boxedVars = analyzeTopLevelSharedVariables(moduleAst);
-        const moduleBodyFunc = {
-            params: [],
-            body: {
-                type: "BlockStatement",
-                body: moduleAst.body.filter((stmt) => stmt.type !== "FunctionDeclaration"),
-            },
-        };
-        const nestedBoxedVars = analyzeSharedVariables(moduleBodyFunc);
-        for (const name of nestedBoxedVars) {
-            boxedVars.add(name);
-        }
-
+        // boxedVars 在改名后由 fillModuleBoxedVars 填充;改名后 bsClearAnalysisCaches
+        // 清掉改名前分析留下的 _rv/_or。
         const meta = {
             ast: moduleAst,
             index,
             symbolPrefix: "m" + index,
             functionAliases: {},
-            boxedVars,
+            boxedVars: new Set(),
             mainCapturedVars: {},
             exports: [],
         };
@@ -466,6 +540,10 @@ export class Compiler {
             }
         }
         meta.lexNames = lexNames;
+        const mfn = moduleAst.filename;
+        meta.scriptGlobalMirror = !!(mfn && this._scriptGlobalMirrorByFile &&
+            (this._scriptGlobalMirrorByFile[mfn] ||
+                this._scriptGlobalMirrorByFile[path.resolve(mfn)]));
         this._moduleMetaByAst.set(moduleAst, meta);
         if (moduleAst.filename) {
             this._moduleMetaByPath.set(moduleAst.filename, meta);
@@ -473,15 +551,34 @@ export class Compiler {
         return meta;
     }
 
+    fillModuleBoxedVars(moduleAst) {
+        const meta = this.getModuleMeta(moduleAst);
+        if (!meta) return;
+        const boxedVars = analyzeTopLevelSharedVariables(moduleAst);
+        // 避免 Array.filter 分配;跳过已单独编成 _user_* 的顶层函数声明
+        const stmts = moduleAst.body || [];
+        const body = [];
+        for (let i = 0; i < stmts.length; i++) {
+            if (stmts[i] && stmts[i].type !== "FunctionDeclaration") body.push(stmts[i]);
+        }
+        const moduleBodyFunc = {
+            params: [],
+            body: { type: "BlockStatement", body: body },
+        };
+        const nestedBoxedVars = analyzeSharedVariables(moduleBodyFunc);
+        for (const name of nestedBoxedVars) boxedVars.add(name);
+        meta.boxedVars = boxedVars;
+    }
+
     getFunctionSymbolForModule(moduleMeta, localName) {
         if (!moduleMeta) return localName;
         // [#32] 双语义守卫:别名恒为字符串。node 下 localName="constructor" 等
         // 会命中 Object.prototype(truthy 的 Function),须视为未分配
-        const fa = moduleMeta.functionAliases[localName];
+        const fa = dictGet(moduleMeta.functionAliases, localName);
         if (!fa || typeof fa !== "string") {
-            moduleMeta.functionAliases[localName] = `${moduleMeta.symbolPrefix}_${localName}`;
+            dictSet(moduleMeta.functionAliases, localName, `${moduleMeta.symbolPrefix}_${localName}`);
         }
-        return moduleMeta.functionAliases[localName];
+        return dictGet(moduleMeta.functionAliases, localName);
     }
 
     // [#50] JSON shim 绑定别名注册。readModuleSource 为引用 JSON.stringify/parse 的
@@ -515,8 +612,9 @@ export class Compiler {
         const isRawSym = this.getFunctionSymbolForModule(shimMeta, "__JSON_isRawJSON");
         // shim 导出的两个函数必须已在 collectFunctions 登记(否则别名指向空 → getFunction
         // 守卫判假,退化为原行为,不至误发)。
-        if (!this.ctx.functions[strSym] || !this.ctx.functions[parseSym]) return;
-        if (!this.ctx.functions[rawSym] || !this.ctx.functions[isRawSym]) return;
+        if (!dictGet(this.ctx.functions, strSym) || !dictGet(this.ctx.functions, parseSym)) return;
+        const haveRaw = !!(rawSym && isRawSym &&
+            dictGet(this.ctx.functions, rawSym) && dictGet(this.ctx.functions, isRawSym));
         for (const moduleAst of this._moduleOrder) {
             const meta = this.getModuleMeta(moduleAst);
             if (meta === shimMeta) continue;
@@ -529,17 +627,19 @@ export class Compiler {
                 }
             }
             if (!hasShimImport) continue;
-            if (!meta.functionAliases["__JSON_stringify"]) {
-                meta.functionAliases["__JSON_stringify"] = strSym;
+            if (!dictGet(meta.functionAliases, "__JSON_stringify")) {
+                dictSet(meta.functionAliases, "__JSON_stringify", strSym);
             }
-            if (!meta.functionAliases["__JSON_parse"]) {
-                meta.functionAliases["__JSON_parse"] = parseSym;
+            if (!dictGet(meta.functionAliases, "__JSON_parse")) {
+                dictSet(meta.functionAliases, "__JSON_parse", parseSym);
             }
-            if (!meta.functionAliases["__JSON_rawJSON"]) {
-                meta.functionAliases["__JSON_rawJSON"] = rawSym;
-            }
-            if (!meta.functionAliases["__JSON_isRawJSON"]) {
-                meta.functionAliases["__JSON_isRawJSON"] = isRawSym;
+            if (haveRaw) {
+                if (!dictGet(meta.functionAliases, "__JSON_rawJSON")) {
+                    dictSet(meta.functionAliases, "__JSON_rawJSON", rawSym);
+                }
+                if (!dictGet(meta.functionAliases, "__JSON_isRawJSON")) {
+                    dictSet(meta.functionAliases, "__JSON_isRawJSON", isRawSym);
+                }
             }
         }
     }
@@ -562,7 +662,7 @@ export class Compiler {
         const evalSym = this.getFunctionSymbolForModule(shimMeta, "__eval");
         const mkfnSym = this.getFunctionSymbolForModule(shimMeta, "__makeFunction");
         const evalDirectSym = this.getFunctionSymbolForModule(shimMeta, "__eval_direct");
-        if (!this.ctx.functions[evalSym] || !this.ctx.functions[mkfnSym]) return;
+        if (!dictGet(this.ctx.functions, evalSym) || !dictGet(this.ctx.functions, mkfnSym)) return;
         for (const moduleAst of this._moduleOrder) {
             const meta = this.getModuleMeta(moduleAst);
             if (meta === shimMeta) continue;
@@ -575,15 +675,15 @@ export class Compiler {
                 }
             }
             if (!hasShimImport) continue;
-            if (!meta.functionAliases["__eval"]) {
-                meta.functionAliases["__eval"] = evalSym;
+            if (!dictGet(meta.functionAliases, "__eval")) {
+                dictSet(meta.functionAliases, "__eval", evalSym);
             }
-            if (!meta.functionAliases["__makeFunction"]) {
-                meta.functionAliases["__makeFunction"] = mkfnSym;
+            if (!dictGet(meta.functionAliases, "__makeFunction")) {
+                dictSet(meta.functionAliases, "__makeFunction", mkfnSym);
             }
             // __eval_direct(直接 eval 词法捕获落点):同 __eval 别名到 shim 导出符号。
-            if (evalDirectSym && this.ctx.functions[evalDirectSym] && !meta.functionAliases["__eval_direct"]) {
-                meta.functionAliases["__eval_direct"] = evalDirectSym;
+            if (evalDirectSym && dictGet(this.ctx.functions, evalDirectSym) && !dictGet(meta.functionAliases, "__eval_direct")) {
+                dictSet(meta.functionAliases, "__eval_direct", evalDirectSym);
             }
         }
     }
@@ -604,7 +704,7 @@ export class Compiler {
         const expSym = this.getFunctionSymbolForModule(shimMeta, "__NUM_toExponential");
         const preSym = this.getFunctionSymbolForModule(shimMeta, "__NUM_toPrecision");
         const tlsSym = this.getFunctionSymbolForModule(shimMeta, "__NUM_toLocaleString");
-        if (!this.ctx.functions[expSym] || !this.ctx.functions[preSym]) return;
+        if (!dictGet(this.ctx.functions, expSym) || !dictGet(this.ctx.functions, preSym)) return;
         for (const moduleAst of this._moduleOrder) {
             const meta = this.getModuleMeta(moduleAst);
             if (meta === shimMeta) continue;
@@ -614,10 +714,10 @@ export class Compiler {
                     stmt.source.value === "__number_shim") { hasShimImport = true; break; }
             }
             if (!hasShimImport) continue;
-            if (!meta.functionAliases["__NUM_toExponential"]) meta.functionAliases["__NUM_toExponential"] = expSym;
-            if (!meta.functionAliases["__NUM_toPrecision"]) meta.functionAliases["__NUM_toPrecision"] = preSym;
-            if (tlsSym && this.ctx.functions[tlsSym] && !meta.functionAliases["__NUM_toLocaleString"]) {
-                meta.functionAliases["__NUM_toLocaleString"] = tlsSym;
+            if (!dictGet(meta.functionAliases, "__NUM_toExponential")) dictSet(meta.functionAliases, "__NUM_toExponential", expSym);
+            if (!dictGet(meta.functionAliases, "__NUM_toPrecision")) dictSet(meta.functionAliases, "__NUM_toPrecision", preSym);
+            if (tlsSym && dictGet(this.ctx.functions, tlsSym) && !dictGet(meta.functionAliases, "__NUM_toLocaleString")) {
+                dictSet(meta.functionAliases, "__NUM_toLocaleString", tlsSym);
             }
         }
     }
@@ -638,7 +738,7 @@ export class Compiler {
         const syms = {};
         for (const nm of names) {
             const sym = this.getFunctionSymbolForModule(shimMeta, nm);
-            if (!this.ctx.functions[sym]) return;
+            if (!dictGet(this.ctx.functions, sym)) return;
             syms[nm] = sym;
         }
         for (const moduleAst of this._moduleOrder) {
@@ -651,7 +751,7 @@ export class Compiler {
             }
             if (!hasShimImport) continue;
             for (const nm of names) {
-                if (!meta.functionAliases[nm]) meta.functionAliases[nm] = syms[nm];
+                if (!dictGet(meta.functionAliases, nm)) dictSet(meta.functionAliases, nm, syms[nm]);
             }
         }
     }
@@ -671,18 +771,60 @@ export class Compiler {
         const savedSourcePath = this.sourcePath;
         const savedModuleAst = this._currentModuleAst;
 
-        const moduleCtx = savedCtx.clone("module_" + moduleMeta.index);
-        moduleCtx.locals = {};
+        // 同模块多趟进入(functionsOnly / 环预链 / 体求值)复用 CompileContext 壳,
+        // 每趟仍换新 locals Map(TDZ 主帧语义依赖本趟累积槽;mainCtx 指向同一壳,
+        // 末趟 locals 自然留给后续查询)。跨模块不共享壳,避免踩 mainCtx。
+        let moduleCtx = moduleMeta._compileCtx;
+        if (!moduleCtx) {
+            // skipAliases/skipMainCaptured:下面立即挂上 moduleMeta 共享表,省两次 for-in 拷贝。
+            moduleCtx = savedCtx.clone("module_" + moduleMeta.index, {
+                skipAliases: true,
+                skipMainCaptured: true,
+            });
+            moduleMeta._compileCtx = moduleCtx;
+        } else {
+            moduleCtx.funcName = "module_" + moduleMeta.index;
+            moduleCtx.labelPrefix = moduleCtx.funcName + "_";
+            moduleCtx.labelCounter = 0;
+        }
+        moduleCtx.locals = new Map();
+        moduleCtx.localTemps = null;
         moduleCtx.varTypes = {};
         moduleCtx.varInitExprs = {};
+        moduleCtx.rawIntVars = {};
+        moduleCtx.fpAccumVars = {};
         moduleCtx.stackOffset = 0;
         moduleCtx.scopeDepth = 0;
         moduleCtx.breakLabel = null;
         moduleCtx.continueLabel = null;
         moduleCtx.returnLabel = savedCtx.returnLabel;
         moduleCtx.boxedVars = moduleMeta.boxedVars;
-        moduleCtx.mainCapturedVars = Object.assign({}, moduleMeta.mainCapturedVars);
-        moduleCtx.functionAliases = Object.assign({}, moduleMeta.functionAliases);
+        // 只读共享:每模块 Object.assign 在 gen1 上很贵(mainbody 每模块至少一次)。
+        // 别名/捕获表本就属于 moduleMeta,嵌套编译应看见同一表。
+        moduleCtx.mainCapturedVars = moduleMeta.mainCapturedVars;
+        moduleCtx.functionAliases = moduleMeta.functionAliases;
+        moduleCtx.tryFrames = null;
+        moduleCtx.breakTryLen = 0;
+        moduleCtx.continueTryLen = 0;
+        moduleCtx.iterCloseStack = null;
+        moduleCtx.breakIterCloseLen = 0;
+        moduleCtx.continueIterCloseLen = 0;
+        moduleCtx.labelMap = null;
+        moduleCtx.pendingLabels = null;
+        moduleCtx.sharedVars = null;
+        moduleCtx.envOffset = null;
+        moduleCtx.envPtrOffset = null;
+        moduleCtx.devirtVarTypes = null;
+        moduleCtx.preboxedVars = undefined;
+        moduleCtx._localsUndo = null;
+        moduleCtx.inClass = savedCtx.inClass;
+        moduleCtx.className = savedCtx.className;
+        moduleCtx.superClass = savedCtx.superClass;
+        moduleCtx.inStrictFunction = savedCtx.inStrictFunction;
+        moduleCtx.superClassExpr = savedCtx.superClassExpr;
+        moduleCtx.superInfoLabel = savedCtx.superInfoLabel;
+        moduleCtx.inStaticMethod = savedCtx.inStaticMethod;
+        moduleCtx._isModuleMain = true;
 
         this.ctx = moduleCtx;
         this.sourcePath = moduleMeta.ast.filename;
@@ -955,13 +1097,27 @@ export class Compiler {
     }
 
     getImportRecordForStatement(moduleAst, stmt, resolvedPath = null) {
-        if (!this.imports) return null;
-        return this.imports.find(
-            (rec) => rec.importInfo &&
-                rec.importInfo.stmt === stmt &&
-                rec.importInfo.moduleAst === moduleAst &&
-                (resolvedPath === null || rec.importInfo.resolvedPath === resolvedPath)
-        ) || null;
+        if (!this.imports || !stmt) return null;
+        // stmt → 首条匹配(与原 find 一致);imports 增长则与 binding 缓存一并失效。
+        if (this._importCacheLen !== this.imports.length) {
+            this._importBindingCache = new Map();
+            this._importCacheLen = this.imports.length;
+            this._importStmtCache = null;
+        }
+        if (!this._importStmtCache) {
+            const idx = new Map();
+            for (let i = 0; i < this.imports.length; i++) {
+                const rec = this.imports[i];
+                if (!rec.importInfo || !rec.importInfo.stmt) continue;
+                if (!idx.has(rec.importInfo.stmt)) idx.set(rec.importInfo.stmt, rec);
+            }
+            this._importStmtCache = idx;
+        }
+        const rec = this._importStmtCache.get(stmt);
+        if (!rec || !rec.importInfo) return null;
+        if (rec.importInfo.moduleAst !== moduleAst) return null;
+        if (resolvedPath !== null && rec.importInfo.resolvedPath !== resolvedPath) return null;
+        return rec;
     }
 
     getImportBindingForLocal(moduleAst, localName) {
@@ -971,6 +1127,7 @@ export class Compiler {
         if (this._importCacheLen !== this.imports.length) {
             this._importBindingCache = new Map();
             this._importCacheLen = this.imports.length;
+            this._importStmtCache = null; // 与 getImportRecordForStatement 共享长度哨兵
         }
         let m = this._importBindingCache.get(moduleAst);
         if (!m) {
@@ -1006,6 +1163,7 @@ export class Compiler {
         if (!moduleAst || !name) return null;
         // per-module 的 name -> kind 索引:首次调用扫一遍 body 建表,之后 O(1)
         // (原为每次调用全扫 body → O(body×names))。moduleAst 在一次编译内不变,故不失效。
+        // kind: "var"|"let"|"const"|"import"|"function"|"class"
         let m = this._bindingKindCache.get(moduleAst);
         if (!m) {
             m = new Map();
@@ -1020,8 +1178,9 @@ export class Compiler {
                 const decl = stmt.type === "ExportDeclaration" && stmt.declaration ? stmt.declaration : stmt;
                 if (!decl) continue;
                 if (decl.type === "VariableDeclaration") {
+                    const vk = decl.kind === "let" ? "let" : (decl.kind === "const" ? "const" : "var");
                     for (const item of decl.declarations || []) {
-                        if (item.id && item.id.type === "Identifier") put(item.id.name, "variable");
+                        if (item.id && item.id.type === "Identifier") put(item.id.name, vk);
                     }
                 } else if (decl.type === "FunctionDeclaration" && decl.id) {
                     put(decl.id.name, "function");
@@ -1035,8 +1194,39 @@ export class Compiler {
         return k === undefined ? null : k;
     }
 
+    // 装箱/主捕获读是否可能读到 TDZ 哨兵。function/class/var 永不;
+    // import 仅在 ESM 环上可能 TDZ;无环时跳过(自编译 import 读占绝大多数守卫)。
+    // let/const:模块顶层与 pending 嵌套闭包保留;类方法/顶层函数声明跳过。
+    // 函数/方法局部(无模块 kind):仅 preboxedVars(闭包先于声明捕获)需要值级哨兵,
+    // 同深度早读靠 expr._tdz;其余装箱读零守卫(自编译 ~1.6 万空 cmp)。
+    _bindingMayBeTdz(name) {
+        if (!name) return false;
+        const ctx = this.ctx;
+        if (!ctx) return false;
+        // 声明点已写过:调用方热路径免再算 kind(自编译函数体绝大多数读)。
+        if (ctx._tdzClearedLocals && ctx._tdzClearedLocals.has(name)) return false;
+        const pbn = ctx.paramBindingNames;
+        if (pbn && pbn[name] === true) return false;
+        const ast = this._currentModuleAst;
+        if (ast) {
+            const kind = this.getModuleBindingKind(ast, name);
+            if (kind === "function" || kind === "class" || kind === "var") return false;
+            // _isModuleMain 在 withModuleCompileContext 置位,免每次 indexOf。
+            const earlyCtx = !!ctx._isModuleMain || !!this._compilingPending;
+            if (kind === "import") {
+                return earlyCtx && this._hasEsmImportCycle();
+            }
+            if (kind === "let" || kind === "const") {
+                return earlyCtx;
+            }
+        }
+        const pb = ctx.preboxedVars;
+        return !!(pb && pb.has(name));
+    }
+
     isLiveLocalExportBinding(moduleMeta, localName) {
-        return this.getModuleBindingKind(moduleMeta && moduleMeta.ast, localName) === "variable";
+        const k = this.getModuleBindingKind(moduleMeta && moduleMeta.ast, localName);
+        return k === "variable" || k === "var" || k === "let" || k === "const";
     }
 
     resolveModuleExportReference(moduleMeta, exportName, seen = new Set()) {
@@ -1269,6 +1459,43 @@ export class Compiler {
         vm.pop(valueReg);
     }
 
+    // test262 脚本(无 export)的顶层 `var` 同时是全局对象绑定。内部按模块编译,
+    // 须镜像到 globalThis,否则 with(globalThis)/globalThis.v 读不到(unscopables-with)。
+    // 真 ESM(有 export)不镜像。只在模块顶层声明处调用(shouldReuseMainCapturedBox)。
+    _isScriptLikeModule() {
+        const ast = this._currentModuleAst;
+        if (!ast || !ast.body) return false;
+        for (let i = 0; i < ast.body.length; i++) {
+            const s = ast.body[i];
+            if (!s) continue;
+            const t = s.type;
+            if (t === "ExportDeclaration" || t === "ExportNamedDeclaration" ||
+                t === "ExportDefaultDeclaration" || t === "ExportAllDeclaration") {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    syncScriptGlobalVar(localName, valueReg = VReg.RET) {
+        if (!localName) return;
+        const meta = this.getModuleMeta(this._currentModuleAst);
+        if (!meta || !meta.scriptGlobalMirror) return;
+        if (!this.ctx.shouldReuseMainCapturedBox || !this.ctx.shouldReuseMainCapturedBox()) return;
+        if (!this._isScriptLikeModule()) return;
+        const vm = this.vm;
+        vm.push(valueReg);
+        vm.lea(VReg.V0, "_global_this");
+        vm.load(VReg.A0, VReg.V0, 0);
+        vm.call("_box_obj_r");
+        this.emitBoxedStringKey(localName, VReg.A1);
+        vm.load(VReg.A2, VReg.SP, 0);
+        // CreateGlobalVarBinding:DefineOwnProperty,不受原型不可写数据挡住
+        // (15.2.3.6-4-625gs:var prop 覆盖 Object.prototype.prop writable:false)。
+        vm.call("_object_define");
+        vm.pop(valueReg);
+    }
+
     isExternalSymbol(name) {
         // 检查动态库
         if (this.libManager.isExternalSymbol(name)) return true;
@@ -1308,7 +1535,9 @@ export class Compiler {
     }
 
     parse(source) {
-        const lexer = new Lexer(source);
+        const byteLen = this._nextParseByteLen;
+        this._nextParseByteLen = undefined;
+        const lexer = new Lexer(source, byteLen);
         const parser = new Parser(lexer);
         const ast = parser.parseProgram();
         if (parser.errors && parser.errors.length > 0) {
@@ -1320,36 +1549,102 @@ export class Compiler {
         // NamedEvaluation 在用户原名上采集 hints,避免 indexOf("$blk$") 在自举下
         // host/native 分叉(gen1 含原名、gen2 残留 name$blk$N → gen1!=gen2)。
         ast._bsStrict = parser.inStrictMode();
+        // 扫描门控布尔(resolve 期 import(/require();勿长期挂整份源码。
+        // require(/import( 须跟字面量或 ASCII 标识符(AOT 子集),避免注释
+        // `require(静态` / `import(source)` 误开整树 walk(functions.js 上很贵)。
+        // [L4.2] IP 原地拼接已关(曾误用 Map.hasOwnProperty 建索引浪费;见 git 历史)。
+        ast._mayDynImport = typeof source === "string" && sourceHasCallParenForm(source, "import(");
+        ast._mayRequire = typeof source === "string" && sourceHasCallParenForm(source, "require(");
         return ast;
     }
 
     compile(source) {
+        // ASMJS_COMPILE_PHASES=1 → 墙钟阶段(ms)。gen1 下 console.error 进 stdout、
+        // stderr.write 无效,故打带标记的 print 行供探针 grep。
+        const phasesOn = !!(typeof process !== "undefined" && process.env &&
+            process.env.ASMJS_COMPILE_PHASES === "1");
+        const phases = phasesOn ? {} : null;
+        this._compilePhases = phases;
+        this._compileSource = typeof source === "string" ? source : null;
+        this._envNoIC = !!(typeof process !== "undefined" && process.env && process.env.NO_IC);
+        this._envDevirtOff = !!(typeof process !== "undefined" && process.env &&
+            process.env.ASMJS_DEVIRT === "0");
+        const tick = () => Date.now();
+        const mark = (name, t0) => {
+            if (!phases) return;
+            phases[name] = (phases[name] || 0) + (tick() - t0);
+        };
+
+        let t0 = tick();
         const ast = this.parse(source);
-        // [支柱②] 去虚拟化全图预登记:任何代码发射前,沿 import 图只解析(不发射)登记
-        // 全部类——注册表完备,"子类覆写守卫"可证(this.m() 仅在类无已注册子类时去虚拟化)。
-        // x64 门:跳过(见 functions.js _devirtualizeCall 注;x64 下 prepass/分析/发射全关)。
-        if (this.arch !== "x64") {
-            this._devirtPrepass(ast, this.sourcePath || path.resolve("."));
-        }
+        mark("parse", t0);
+
+        // 去虚拟化预扫挪到 compileProgram(resolveImports 之后),复用已解析模块 AST,
+        // 避免对整图再 parse 一遍(gen1 上曾占 ~30s)。
 
         if (this.outputType === "shared" || this.outputType === "static") {
+            t0 = tick();
             this.generateSharedLibraryRuntime();
             this.compileProgramForLibrary(ast);
+            mark("program", t0);
         } else {
+            t0 = tick();
             this.generateEntry();
             this.generateRuntime();
+            mark("runtime", t0);
+
+            t0 = tick();
             this.compileProgram(ast);
+            mark("program", t0); // 含子阶段已单独记时;此为总包络(含漏记)
 
             if (this.staticLibs && this.staticLibs.length > 0) {
                 this.embedStaticLibraries();
             }
         }
 
-        return this.generateExecutable();
+        t0 = tick();
+        const result = this.generateExecutable();
+        mark("link", t0);
+        this._compilePhases = null;
+        this._compileSource = null;
+
+        if (phases) {
+            // program 总包络含子阶段;去掉以免双计误导
+            if (phases.prog_resolve != null || phases.prog_main_body != null ||
+                phases.prog_userfuncs != null || phases.imports != null ||
+                phases.mainbody != null || phases.userfns != null) {
+                delete phases.program;
+            }
+            const line = "__ASMJS_PHASES__" + JSON.stringify({ type: "asmjs-compile-phases", phases: phases });
+            // gen1 宿主提供 print(非常规 typeof function);Node 无 print 用 console.log
+            if (typeof print !== "undefined") print(line);
+            else console.log(line);
+        }
+        return result;
     }
 
     // [支柱②] 沿 import 图只解析不发射,登记全部类声明(_devirtRegisterClass)。
     // 同名类跨模块冲突一律投毒弃表(防跨模块同名类方法错配,v1.5.47 标签冲突同族风险)。
+    _devirtPrepassModules(moduleAsts) {
+        if (this.arch === "x64") return;
+        if (!this._devirtClasses) this._devirtClasses = {};
+        if (!this._devirtPoisoned) this._devirtPoisoned = {};
+        for (let i = 0; i < moduleAsts.length; i++) {
+            const moduleAst = moduleAsts[i];
+            if (!moduleAst || !moduleAst.body) continue;
+            const filePath = moduleAst.filename || "";
+            for (let j = 0; j < moduleAst.body.length; j++) {
+                const stmt = moduleAst.body[j];
+                if (stmt && stmt.type === "ClassDeclaration" && stmt.id && stmt.id.name) {
+                    this._devirtRegisterClass(stmt, filePath);
+                }
+            }
+            if (typeof this._devirtScanShadows === "function") {
+                this._devirtScanShadows(moduleAst);
+            }
+        }
+    }
+
     _devirtPrepass(mainAst, mainPath) {
         if (!this._devirtClasses) this._devirtClasses = {};
         if (!this._devirtPoisoned) this._devirtPoisoned = {};
@@ -1378,8 +1673,7 @@ export class Compiler {
         };
         seen.add(mainPath);
         visit(mainAst, mainPath);
-        // 全图实例属性遮蔽扫描(与登记共用同一批已解析 AST 之前按模块各自扫)
-        this._devirtScanShadows(mainAst);
+        // 实例属性遮蔽扫描并入 _collectFnNameHints(同树一遍),此处只登记类。
     }
 
     // 全图扫描实例属性遮蔽:任何 `<o>.X = <函数值>` 赋值把 X 记入全局遮蔽集——实例自有
@@ -1391,7 +1685,13 @@ export class Compiler {
             for (let i = 0; i < node.length; i++) this._devirtScanShadows(node[i]);
             return;
         }
-        if (node.type === "AssignmentExpression" && node.left &&
+        const t = node.type;
+        if (!t || t === "Identifier" || t === "Literal" || t === "ThisExpression" ||
+            t === "Super" || t === "PrivateIdentifier" || t === "EmptyStatement" ||
+            t === "DebuggerStatement" || t === "MetaProperty" || t === "TemplateElement") {
+            return;
+        }
+        if (t === "AssignmentExpression" && node.left &&
             node.left.type === "MemberExpression" && !node.left.computed &&
             node.left.property && node.left.property.type === "Identifier" &&
             node.right && (node.right.type === "FunctionExpression" ||
@@ -1403,7 +1703,52 @@ export class Compiler {
             if (!this._devirtShadowed) this._devirtShadowed = {};
             this._devirtShadowed[node.left.property.name] = true;
         }
+        // 类型化下钻:Assignment 已看过 left/right 形态,仍需下钻找嵌套赋值
+        if (t === "MemberExpression") {
+            this._devirtScanShadows(node.object);
+            if (node.computed) this._devirtScanShadows(node.property);
+            return;
+        }
+        if (t === "CallExpression" || t === "NewExpression") {
+            this._devirtScanShadows(node.callee);
+            const args = node.arguments;
+            if (args) for (let i = 0; i < args.length; i++) this._devirtScanShadows(args[i]);
+            return;
+        }
+        if (t === "BinaryExpression" || t === "LogicalExpression" || t === "AssignmentExpression") {
+            this._devirtScanShadows(node.left);
+            this._devirtScanShadows(node.right);
+            return;
+        }
+        if (t === "BlockStatement" || t === "Program" || t === "ClassBody") {
+            const body = node.body;
+            if (body) for (let i = 0; i < body.length; i++) this._devirtScanShadows(body[i]);
+            return;
+        }
+        if (t === "FunctionExpression" || t === "ArrowFunctionExpression" || t === "FunctionDeclaration") {
+            this._devirtScanShadows(node.body);
+            const params = node.params;
+            if (params) for (let i = 0; i < params.length; i++) this._devirtScanShadows(params[i]);
+            return;
+        }
+        if (t === "ExpressionStatement") {
+            this._devirtScanShadows(node.expression);
+            return;
+        }
+        if (t === "IfStatement") {
+            this._devirtScanShadows(node.test);
+            this._devirtScanShadows(node.consequent);
+            this._devirtScanShadows(node.alternate);
+            return;
+        }
+        if (t === "ReturnStatement" || t === "ThrowStatement" || t === "UnaryExpression" ||
+            t === "UpdateExpression" || t === "AwaitExpression" || t === "YieldExpression") {
+            this._devirtScanShadows(node.argument);
+            return;
+        }
         for (const k in node) {
+            if (k === "type" || k === "loc" || k === "range" || k === "start" || k === "end" || k === "filename") continue;
+            if (k.length > 0 && k.charCodeAt(0) === 95) continue;
             const v = node[k];
             if (v && typeof v === "object") this._devirtScanShadows(v);
         }
@@ -1477,15 +1822,31 @@ export class Compiler {
         // (asm/*.js),故源码字面量 UTF-8 字节原样进产物,node/g1 一致且正确、gen1==gen2==gen3。
         // ASCII 不受影响(字节==码点);编译器自身源 ASCII 干净(A 的 0da5ba69)。
         let src = fs.readFileSync(filePath, "latin1");
+        // gen1: readFileSync 已累计字节数 → 交给 Lexer 免二次扫长
+        let srcByteLen = (typeof fs.__lastReadByteLength === "number" &&
+            fs.__lastReadByteLength > 0) ? fs.__lastReadByteLength : 0;
+        const bumpSrc = (next) => { src = next; srcByteLen = 0; };
         // [W-35 Unicode 属性表按需发射] 每读一个模块就扫一遍「\ + p/P」;有则本次编译
         // 保留 __regexp_shim 的 Unicode 属性表(否则 compileProgram 里把表串置空)。
         // shim 自身除外:它的注释里就写着 \p{…}/\P{…},否则永远命中、优化恒不生效。
         // (表体只出现在 shim 里,用户模块的 \p 才是「程序可能用到属性转义」的证据。)
-        if (filePath.indexOf("__regexp_shim.js") === -1 && sourceHasPropEscapeText(src)) {
+        // 廉价门控:无 \p / \P 字面则跳过全文件扫描(注释里的 "\\ + p" 叙述不含连续 \p)。
+        if (filePath.indexOf("__regexp_shim.js") === -1 &&
+            (src.indexOf("\\p") !== -1 || src.indexOf("\\P") !== -1) &&
+            sourceHasPropEscapeText(src)) {
             this._reUniPropSeen = true;
         }
-        // CJS 检测在原始源码上(shim 注入会加 import 行、干扰判定)
-        const isCjs = looksLikeCjsSource(src);
+        // CJS 检测在原始源码上(shim 注入会加 import 行、干扰判定)。
+        // 编译器自举树几乎全是 ESM:含顶层 import/export 文本则跳过 looksLikeCjs
+        // 全文件扫描(imports 阶段热路径)。
+        let isCjs = false;
+        if (src.indexOf("exports") !== -1 || src.indexOf("require") !== -1 ||
+            src.indexOf("module") !== -1) {
+            if (src.indexOf("\nimport ") === -1 && src.indexOf("\nexport ") === -1 &&
+                src.indexOf("import ") !== 0 && src.indexOf("export ") !== 0) {
+                isCjs = looksLikeCjsSource(src);
+            }
+        }
         // [CJS cyclic require] 记录每个文件是否本地 CJS,供 markCjsRequireCycles
         // 判定「require 环里的本地 CJS 模块」→ 惰性初始化。键用解析后的绝对路径,
         // 与 moduleAst.filename / _requirePath 对齐。
@@ -1498,56 +1859,67 @@ export class Compiler {
         // 使用的原键不受影响。
         const _absFilePath = path.resolve(filePath);
         if (_absFilePath !== filePath) this._cjsFlags[_absFilePath] = isCjs;
-        // structuredClone(x) 在 functions.js 里被脱糖成 JSON.parse(JSON.stringify(x)),
-        // 这些 __JSON_* 调用是 codegen 合成的、源码里无 "JSON.*" 文本 → 不会触发下面的
-        // 注入,shim 缺失时合成调用静默失效(返回原对象别名,非深拷贝)。故把
-        // "structuredClone" 也作为 JSON shim 的注入触发词。
-        // [W7-2] 追加触发词 JSON.rawJSON/JSON.isRawJSON;含 raw 族文本的模块改注 4 名
-        // import,否则维持原 2 名 —— 既有触发模块注入文本逐字不变(字节中性;全仓无
-        // rawJSON 文本,grep 实证零命中)。
-        if (filePath.indexOf("__json_shim.js") === -1 &&
-            (src.indexOf("JSON.stringify") !== -1 || src.indexOf("JSON.parse") !== -1 ||
-             src.indexOf("JSON.rawJSON") !== -1 || src.indexOf("JSON.isRawJSON") !== -1 ||
-             src.indexOf("structuredClone") !== -1)) {
-            const hasRaw = src.indexOf("JSON.rawJSON") !== -1 ||
-                src.indexOf("JSON.isRawJSON") !== -1;
-            const inj = hasRaw
-                ? 'import { __JSON_stringify, __JSON_parse, __JSON_rawJSON, __JSON_isRawJSON } from "__json_shim";\n'
-                : 'import { __JSON_stringify, __JSON_parse } from "__json_shim";\n';
-            src = injectShimImport(src, inj);
+        // 仅当源码文本含 globalThis 才镜像顶层 var(unscopables-with)。
+        // harness 无此词,绝大多数测例不付 _object_define。
+        if (!this._scriptGlobalMirrorByFile) this._scriptGlobalMirrorByFile = {};
+        this._scriptGlobalMirrorByFile[filePath] = src.indexOf("globalThis") !== -1;
+        if (_absFilePath !== filePath) {
+            this._scriptGlobalMirrorByFile[_absFilePath] = this._scriptGlobalMirrorByFile[filePath];
         }
-        // [批次D RegExp shim 注入] 源码含正则字面量或 RegExp 构造调用文本时,前置
-        // __regexp_shim 的 import(路线同 JSON shim);二者由 expressions.js 编译为
-        // __RE_new 调用,.test/.exec/match/replace 由 functions.js 分派为 __RE_* 调用。
-        // 已显式 import __regexp_shim 的模块不重复注入。编译器自身源码刻意无正则字面量
-        // 且不含 RegExp 构造文本 → 自举不注入(ASMJS_SHIM_DEBUG=1 可验证)。
-        // (检测串拆开拼接,免得本文件自己命中。)
-        // 调用形式 `RegExp(p, f)`(无 new,ES 规范等价于 new RegExp)由 functions.js
-        // 改派成 __RE_new,但此前无注入触发词 → shim 未链入,构造既不校验也不抛错
-        // (RegExp("(", "u") 静默不抛、.exec 全 undefined)。故追加调用形式触发。
-        // 不用裸 indexOf("RegExp("):那会命中注释/字符串里的 "RegExp(" 文本(编译器
-        // 自身 types.js / functions.js 的注释里就有)以及 myRegExp( 这类标识符后缀,
-        // 让完全不用正则的程序白链入整个 regexp shim(纯体积损失)。改为
-        // sourceHasRegExpCall:手写扫描(§1.6 禁正则),跳过字符串/模板文本/注释,
-        // 只在代码位置按**整词**匹配 RegExp + 空白* + "("。放在 || 末位,故仅当前面
-        // 三个廉价触发词都不命中时才扫描(此时源码必无正则字面量,"/" 一律按除法/
-        // 注释处理是安全的)。
-        const reCtorText = "new Reg" + "Exp(";
-        const reEscText = "RegExp" + ".escape";
-        // [test262 isregexp-called-once / get-order 族] `RegExp.prototype[Symbol.xxx]`
-        // 直接调用/作值读取的测试不构造正则 → 旧触发词全不命中 → 占位闭包抛
-        // "incompatible receiver"。追加 "RegExp.prototype" 触发词(拆串拼接免自命中;
-        // 编译器自身源码无此词形 → 自举不注入,gate 零影响)。
-        const reProtoText = "Reg" + "Exp.prototype";
+        // [#15 JSON shim 注入] 模块源码在**代码位置**引用 JSON.stringify/parse/
+        // rawJSON/isRawJSON 或 structuredClone( 时前置合成 import。
+        // 禁止裸 indexOf("JSON.stringify")/indexOf("structuredClone"):functions.js
+        // 注释与 `name === "structuredClone"` 字符串比较曾误注入,白编 26KB shim。
+        // structuredClone 由 codegen 脱糖为 __JSON_*,用户模块出现 structuredClone(
+        // 调用时才需要注入。
+        // 「已注入」只认 from "__json_shim" 字面 import,勿认注释里的 shim 名
+        // (index.js 注释大量提及 __json_shim,但代码位有真 JSON.stringify → 必须注入,
+        // 否则自编译产物 phases/缓存键等 JSON.stringify 静默空串)。
+        if (filePath.indexOf("__json_shim.js") === -1 &&
+            !sourceHasTopShimImport(src, "__json_shim") &&
+            (src.indexOf("JSON") !== -1 || src.indexOf("structuredClone") !== -1)) {
+            const jsonKind = sourceHasJsonShimTrigger(src);
+            if (jsonKind) {
+                const hasRaw = jsonKind === "json-raw";
+                const inj = hasRaw
+                    ? 'import { __JSON_stringify, __JSON_parse, __JSON_rawJSON, __JSON_isRawJSON } from "__json_shim";\n'
+                    : 'import { __JSON_stringify, __JSON_parse } from "__json_shim";\n';
+                bumpSrc(injectShimImport(src, inj));
+            }
+        }
+        // [批次D RegExp shim 注入] 源码在**代码位置**含正则字面量或 RegExp
+        // 构造/原型/escape 时前置 __regexp_shim import。禁止裸 indexOf(
+        // "RegExp.prototype"/"RegExp.escape"/"new RegExp("):members.js/
+        // functions.js 注释里就有这些词形,曾误注入 360KB shim、拖垮 resolve。
+        // 手写扫描(sourceHasRegExpShimTrigger)跳过字符串/模板/注释,整词匹配。
+        // 廉价门控:仅当出现 RegExp(/RegExp./new RegExp 才跑全文件扫描(纯注释 "RegExp" 不触发)。
         if (filePath.indexOf("__regexp_shim.js") === -1 &&
-            src.indexOf("__regexp_shim") === -1 &&
-            (src.indexOf(reCtorText) !== -1 || sourceHasBareNewRegExp(src) ||
-             src.indexOf(reEscText) !== -1 || src.indexOf(reProtoText) !== -1 ||
-             sourceHasRegexLiteral(src) || sourceHasRegExpCall(src))) {
-            const inj = 'import { __RE_new, __RE_test, __RE_exec, __RE_match, __RE_matchAll, __RE_replace, __RE_split, __RE_escape, __RE_search, __RE_toString, __RE_compile, __RE_sym_match, __RE_sym_search, __RE_sym_split, __RE_sym_replace, __RE_sym_matchAll } from "__regexp_shim";\n';
-            src = injectShimImport(src, inj);
-            if (process.env.ASMJS_SHIM_DEBUG) {
-                console.error("[shim] regexp shim injected: " + filePath);
+            !sourceHasTopShimImport(src, "__regexp_shim")) {
+            let needReShim = false;
+            if (src.indexOf("RegExp(") !== -1 || src.indexOf("RegExp.") !== -1 ||
+                src.indexOf("new RegExp") !== -1 ||
+                src.indexOf("extends Reg" + "Exp") !== -1) {
+                needReShim = sourceHasRegExpShimTrigger(src);
+            }
+            // String#search/matchAll 在无字面量时仍须 GetMethod(@@*)+RegExpCreate。
+            // 只认代码位 `Symbol.search` / `Symbol.matchAll`(跳过字符串/注释);
+            // 禁对 `Symbol.match`/`Symbol.replace` 一律注入——IsRegExp 测例太多,
+            // 会把冷编译从 ~220ms 拖到 250ms+。工具链源不含这两词形作代码。
+            if (!needReShim && !isToolchainSourcePath(filePath) &&
+                (src.indexOf("Symbol.search") !== -1 || src.indexOf("Symbol.matchAll") !== -1)) {
+                needReShim = sourceHasRegExpCall(src);
+            }
+            // 工具链源(compiler/lang/asm/…)按约定无正则字面量 → 跳过字面量扫描。
+            if (!needReShim && src.indexOf("/") !== -1 &&
+                !isToolchainSourcePath(filePath)) {
+                needReShim = sourceHasRegexLiteral(src);
+            }
+            if (needReShim) {
+                const inj = 'import { __RE_new, __RE_test, __RE_exec, __RE_match, __RE_matchAll, __RE_replace, __RE_split, __RE_escape, __RE_search, __RE_toString, __RE_compile, __RE_sym_match, __RE_sym_search, __RE_sym_split, __RE_sym_replace, __RE_sym_matchAll, __RE_string_match, __RE_string_matchAll, __RE_string_search, __RE_string_replace, __RE_string_replaceAll } from "__regexp_shim";\n';
+                bumpSrc(injectShimImport(src, inj));
+                if (process.env.ASMJS_SHIM_DEBUG) {
+                    console.error("[shim] regexp shim injected: " + filePath);
+                }
             }
         }
         // [方言/Channel shim 注入] 源码含 Channel( 调用文本时前置
@@ -1557,32 +1929,20 @@ export class Compiler {
         if (filePath.indexOf("__channel_shim.js") === -1 &&
             src.indexOf("__channel_shim") === -1 &&
             src.indexOf(chCtorText) !== -1) {
-            src = injectShimImport(src, 'import { Channel } from "__channel_shim";\n');
+            bumpSrc(injectShimImport(src, 'import { Channel } from "__channel_shim";\n'));
         }
-        // [eval/new Function/裸 Function shim 注入] 源码引用全局 `eval(` / `new Function(` /
-        // 裸 `Function()`/`Function("`/`Function('` 时前置
-        // `import { __eval, __makeFunction } from "__eval_shim"`(路线同 JSON/RegExp shim);
-        // 调用点由 compileCallExpression / compileNewExpression 改派到这两个绑定。__eval_shim
-        // 内含整个编译器(route B),故只有用 eval/Function 的程序才付代价;编译器自身源码不含
-        // 下列检测串 → 自举不注入(gate 零影响)。(检测串拆开拼接,免本文件自命中。)
-        const evalCallText = "eval" + "(";
-        // [test262 indirect-eval] 间接 eval 值调用形态 `(0, eval)(x)`(词形 "eval)("),
-        // 同样注入 shim(值位物化见 compileIdentifier 的 eval 分支)。编译器自身源码
-        // 不含该词形(上方 grep 全绿)→ 自举不注入(gate 零影响)。
-        const evalIndirectText = "eval" + ")(";
-        const newFnText = "new Func" + "tion(";
-        // 裸 Function 构造器调用常见形态(不含注释里的 Function(...)/Function(0x…))
-        const bareFnEmpty = "Func" + "tion()";
-        const bareFnDQuote = "Func" + 'tion("';
-        const bareFnSQuote = "Func" + "tion('";
+        // [eval/new Function/裸 Function shim 注入] 源码在**代码位置**引用全局
+        // eval(/new Function(/Function( 时前置 import(路线同 JSON/RegExp shim)。
+        // __eval_shim 内含整个编译器(route B),误注入会把自编译 resolve 拉爆。
+        // 故禁止裸 indexOf:hasFunction("/generateBoxFunction()/注释里的 eval("x")
+        // 均曾误命中。手写扫描跳过字符串/模板/注释,整词匹配(与 sourceHasRegExpCall 同族)。
+        // 廉价门控:必须出现 eval(/Function( 才扫(裸 "Function"/"eval" 注释不再触发)。
         if (filePath.indexOf("__eval_shim.js") === -1 &&
-            src.indexOf("__eval_shim") === -1 &&
-            (src.indexOf(evalCallText) !== -1 || src.indexOf(evalIndirectText) !== -1 ||
-             src.indexOf(newFnText) !== -1 ||
-             src.indexOf(bareFnEmpty) !== -1 || src.indexOf(bareFnDQuote) !== -1 ||
-             src.indexOf(bareFnSQuote) !== -1)) {
+            !sourceHasTopShimImport(src, "__eval_shim") &&
+            (src.indexOf("eval(") !== -1 || src.indexOf("Function(") !== -1) &&
+            sourceHasEvalOrFunctionCtor(src)) {
             const inj = 'import { __eval, __makeFunction, __eval_direct } from "__eval_shim";\n';
-            src = injectShimImport(src, inj);
+            bumpSrc(injectShimImport(src, inj));
             // [W-35] eval/new Function 的源码在编译期不可见,里面可以有 \p{…};
             // 用 eval 的程序一律保留 Unicode 属性表(保守)。
             this._reUniPropSeen = true;
@@ -1600,7 +1960,7 @@ export class Compiler {
             src.indexOf("__number_shim") === -1 &&
             (src.indexOf(expMethodText) !== -1 || src.indexOf(preMethodText) !== -1 ||
              src.indexOf(tlsMethodText) !== -1)) {
-            src = injectShimImport(src, 'import { __NUM_toExponential, __NUM_toPrecision, __NUM_toLocaleString } from "__number_shim";\n');
+            bumpSrc(injectShimImport(src, 'import { __NUM_toExponential, __NUM_toPrecision, __NUM_toLocaleString } from "__number_shim";\n'));
         }
         // [Date shim] 源码用 toLocaleString/toLocaleDateString/toLocaleTimeString 方法时
         // 前置注入 __date_shim(路线同 Number shim);调用点由 compileCallExpression 在
@@ -1616,14 +1976,15 @@ export class Compiler {
             src.indexOf("__date_shim") === -1 &&
             (src.indexOf(locStrText) !== -1 || src.indexOf(locDateText) !== -1 || src.indexOf(locTimeText) !== -1 ||
              src.indexOf(utcStrText) !== -1 || src.indexOf(gmtStrText) !== -1 || src.indexOf(dateStrText) !== -1)) {
-            src = injectShimImport(src, 'import { __DATE_toLocaleString, __DATE_toLocaleDateString, __DATE_toLocaleTimeString, __DATE_toUTCString, __DATE_toDateString } from "__date_shim";\n');
+            bumpSrc(injectShimImport(src, 'import { __DATE_toLocaleString, __DATE_toLocaleDateString, __DATE_toLocaleTimeString, __DATE_toUTCString, __DATE_toDateString } from "__date_shim";\n'));
         }
         // CommonJS 包裹:注入 module/exports/__filename/__dirname 前导,尾部追加
         // `export default module.exports` 使 CJS 值经 ESM 默认导出通道暴露,
         // require(x) codegen 读取该模块的 default(见 compileCallExpression)。
         if (isCjs) {
-            src = this._wrapCjsSource(src, filePath);
+            bumpSrc(this._wrapCjsSource(src, filePath));
         }
+        this._nextParseByteLen = srcByteLen > 0 ? srcByteLen : undefined;
         return src;
     }
 
@@ -1683,8 +2044,9 @@ export class Compiler {
         fs.chmodSync(outputFile, 0o755);
 
         // [LABEL_MAP] env 门控诊断:导出 label→代码段偏移表(采样剖析符号化用)。
-        // 仅 gen0(node)诊断路径;asm.js 自举下 Map 无 forEach/keys,此诊断不触发。
-        if (process.env.LABEL_MAP && this.asm && this.asm.labels && this.asm.labels.forEach) {
+        // 仅 Node 诊断路径。native Map 已有 forEach,全量 join 会把 10GB+ RSS 打满
+        // 并卡死自编译(cli.js 标签表极大)。
+        if (process.release && process.env.LABEL_MAP && this.asm && this.asm.labels && this.asm.labels.forEach) {
             const lines = [];
             this.asm.labels.forEach((off, name) => { lines.push(off + "\t" + name); });
             lines.sort((a, b) => parseInt(a) - parseInt(b));
@@ -1715,7 +2077,7 @@ export class Compiler {
         const jslibPath = path.join(dirName, libName + ".jslib");
 
         // 获取导出的函数列表
-        const exportFuncs = this.exports.length > 0 ? this.exports : Object.keys(this.ctx.functions);
+        const exportFuncs = this.exports.length > 0 ? this.exports : this.ctx.functionNames();
 
         // [layout-determinism] 生成文件的注释用 ASCII(英文):源码内非 ASCII 串字面量在
         // node(UTF-8 解码)与 asm.js(按字节读、不解 UTF-8)间产不同字节 → 自举 g1≠g2。
@@ -1744,12 +2106,213 @@ export class Compiler {
 
     // ========== 运行时生成 ==========
 
+    // ASMJS_COMPILE_PHASES=1 时写入 this._compilePhases(由 compile() 注入)。
+    _phaseStart(_name) {
+        return Date.now();
+    }
+    _phaseEnd(_name, _t0) {
+        const phases = this._compilePhases;
+        if (!phases || _t0 == null) return;
+        phases[_name] = (phases[_name] || 0) + (Date.now() - _t0);
+    }
+
+    // 每函数/主体重置同 prop IC 站点池。置 null,由首次 emit 懒 new Map——
+    // clear() 大表在 gen1 上比弃掉重建更贵(实测 m89 中位回退)。
+    _resetIcPropMaps() {
+        this._icGetByProp = null;
+        this._icSetByProp = null;
+    }
+
+    // compileUserFunctions 顺序编译顶层函数:嵌套 pending 仍用同一壳上的字段切换,
+    // 函数间可池化 CompileContext(省 new + for-in 别名拷贝)。
+    _acquireUserFnCtx(savedCtx, name, ownerMeta) {
+        let fnCtx = null;
+        if (this._fnCtxPool && this._fnCtxPool.length > 0) {
+            fnCtx = this._fnCtxPool.pop();
+            fnCtx.funcName = name;
+            fnCtx.labelPrefix = name + "_";
+            fnCtx.labelCounter = 0;
+            fnCtx.locals = new Map();
+            fnCtx.localTemps = null;
+            fnCtx.varTypes = {};
+            fnCtx.varInitExprs = {};
+            fnCtx.rawIntVars = {};
+            fnCtx.fpAccumVars = {};
+            fnCtx.stackOffset = 0;
+            fnCtx.scopeDepth = 0;
+            fnCtx.breakLabel = null;
+            fnCtx.continueLabel = null;
+            fnCtx.tryFrames = null;
+            fnCtx.breakTryLen = 0;
+            fnCtx.continueTryLen = 0;
+            fnCtx.iterCloseStack = null;
+            fnCtx.breakIterCloseLen = 0;
+            fnCtx.continueIterCloseLen = 0;
+            fnCtx.labelMap = null;
+            fnCtx.pendingLabels = null;
+            fnCtx.sharedVars = null;
+            fnCtx.envOffset = null;
+            fnCtx.envPtrOffset = null;
+            fnCtx.devirtVarTypes = null;
+            fnCtx.preboxedVars = undefined;
+            fnCtx._localsUndo = null;
+            fnCtx.boxedVars = null;
+            fnCtx.lexLocalNames = null;
+            fnCtx.paramBindingNames = null;
+            fnCtx._tdzClearedLocals = null;
+            fnCtx.immutableLocals = null;
+            fnCtx.exceptionLabel = null;
+            fnCtx._asyncExcFrameOff = null;
+            fnCtx._asyncCoroOff = null;
+            fnCtx._asyncPromiseOff = null;
+            fnCtx.inAsyncFunction = false;
+            fnCtx.inAsyncGenerator = false;
+            fnCtx.inCoroBody = false;
+            fnCtx._inFunctionBody = false;
+            fnCtx._isModuleMain = false;
+            fnCtx.functions = savedCtx.functions;
+            fnCtx.globals = savedCtx.globals;
+            fnCtx.inClass = savedCtx.inClass;
+            fnCtx.className = savedCtx.className;
+            fnCtx.superClass = savedCtx.superClass;
+            fnCtx.inStrictFunction = savedCtx.inStrictFunction;
+            fnCtx.superClassExpr = savedCtx.superClassExpr;
+            fnCtx.superInfoLabel = savedCtx.superInfoLabel;
+            fnCtx.inStaticMethod = savedCtx.inStaticMethod;
+            if (ownerMeta) {
+                fnCtx.functionAliases = ownerMeta.functionAliases;
+                fnCtx.mainCapturedVars = ownerMeta.mainCapturedVars;
+            } else {
+                fnCtx.functionAliases = {};
+                for (const key in savedCtx.functionAliases) {
+                    fnCtx.functionAliases[key] = savedCtx.functionAliases[key];
+                }
+                fnCtx.mainCapturedVars = {};
+                for (const key in savedCtx.mainCapturedVars) {
+                    fnCtx.mainCapturedVars[key] = savedCtx.mainCapturedVars[key];
+                }
+            }
+            return fnCtx;
+        }
+        fnCtx = savedCtx.clone(name, ownerMeta
+            ? { skipAliases: true, skipMainCaptured: true }
+            : undefined);
+        if (ownerMeta) {
+            fnCtx.functionAliases = ownerMeta.functionAliases;
+            fnCtx.mainCapturedVars = ownerMeta.mainCapturedVars;
+        }
+        fnCtx._isModuleMain = false;
+        return fnCtx;
+    }
+
+    _releaseUserFnCtx(fnCtx) {
+        if (!fnCtx) return;
+        if (!this._fnCtxPool) this._fnCtxPool = [];
+        // 池深上限:顶层函数串行,1 格足够;嵌套 class 方法另走 clone,不入此池。
+        if (this._fnCtxPool.length < 4) this._fnCtxPool.push(fnCtx);
+    }
+
+    _hasEsmImportCycle() {
+        // codegen 热路径(_bindingMayBeTdz)会反复询问;resolve 完成后 imports 定长,
+        // 记忆化整图 DFS(自编译无环时几乎每次都是 false 快返)。
+        const n = this.imports ? this.imports.length : 0;
+        if (this._esmCycleCached !== undefined && this._esmCycleLen === n) {
+            return this._esmCycleCached;
+        }
+        if (!this.imports || !this._moduleOrder) {
+            this._esmCycleCached = false;
+            this._esmCycleLen = n;
+            return false;
+        }
+        const adj = new Map();
+        for (const rec of this.imports) {
+            const from = rec.fromAst && rec.fromAst.filename;
+            const to = rec.importInfo && rec.importInfo.resolvedPath;
+            if (!from || !to) continue;
+            let outs = adj.get(from);
+            if (!outs) { outs = []; adj.set(from, outs); }
+            outs.push(to); // 重复边不影响环判定,免 indexOf
+        }
+        const visiting = new Set();
+        const done = new Set();
+        const dfs = (node) => {
+            if (done.has(node)) return false;
+            if (visiting.has(node)) return true;
+            visiting.add(node);
+            const outs = adj.get(node) || [];
+            for (let i = 0; i < outs.length; i++) {
+                if (dfs(outs[i])) return true;
+            }
+            visiting.delete(node);
+            done.add(node);
+            return false;
+        };
+        let found = false;
+        for (const moduleAst of this._moduleOrder) {
+            const fn = moduleAst.filename;
+            if (fn && dfs(fn)) { found = true; break; }
+        }
+        this._esmCycleCached = found;
+        this._esmCycleLen = n;
+        return found;
+    }
+
+    _paramsHaveExpressions(params) {
+        const list = params || [];
+        for (let i = 0; i < list.length; i++) {
+            const p = list[i];
+            if (!p) continue;
+            if (p.type === "AssignmentPattern") return true;
+            if (this._isPatternParam && this._isPatternParam(p)) return true;
+            if ((p.type === "SpreadElement" || p.type === "RestElement") &&
+                p.argument && (p.argument.type === "ArrayPattern" || p.argument.type === "ObjectPattern")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    _isSimpleParamList(params) {
+        const list = params || [];
+        for (let i = 0; i < list.length; i++) {
+            const p = list[i];
+            if (!p) return false;
+            if (p.type !== "Identifier") return false;
+        }
+        return true;
+    }
+
     generateRuntime() {
+        if (this._runtimeSnapshotRestored) return;
         const allocGen = new AllocatorGenerator(this.vm);
         allocGen.generate();
         const runtimeGen = new RuntimeGenerator(this.vm, this.ctx);
         runtimeGen.generate();
+        // 片段重定位符号表放在最后:此时全部运行时 label 已发射,可跳过平台缺失符号
+        allocGen.generateEngineSymaddr();
         this.generateDataSection();
+        this._commitRuntimeSnapshot();
+    }
+
+    _tryRestoreRuntimeSnapshot() {
+        if (process.env.ASMJS_RUNTIME_SNAPSHOT === "0") return false;
+        try {
+            const key = runtimeSnapshotKey(this);
+            this._runtimeSnapshotKey = key;
+            this._runtimeSnapshotRestored = restoreRuntimeSnapshot(this, key);
+            return this._runtimeSnapshotRestored;
+        } catch (_e) {
+            this._runtimeSnapshotRestored = false;
+            return false;
+        }
+    }
+
+    _commitRuntimeSnapshot() {
+        if (process.env.ASMJS_RUNTIME_SNAPSHOT === "0" || this._runtimeSnapshotRestored) return;
+        const key = this._runtimeSnapshotKey || runtimeSnapshotKey(this);
+        if (!process.env.ASMJS_FULL_FIXUP) resolveRuntimeCodeFixups(this.asm);
+        markRuntimeBoundary(this.asm);
+        saveRuntimeSnapshot(this, key);
     }
 
     generateDataSection() {
@@ -1764,6 +2327,7 @@ export class Compiler {
     // ========== 入口点和程序编译 ==========
 
     generateEntry() {
+        if (this._tryRestoreRuntimeSnapshot()) return;
         const vm = this.vm;
         vm.label("_start");
 
@@ -1881,6 +2445,21 @@ export class Compiler {
             stat("GCSTATS live_bytes=", () => { vm.lea(VReg.V0, "_gc_live_bytes"); vm.load(VReg.A0, VReg.V0, 0); });
         }
 
+        if (process.env.ASMJS_IC_STATS) {
+            const icStat = (label, slot) => {
+                vm.lea(VReg.A0, this.asm.addString(label));
+                vm.call("_print_str_no_nl");
+                vm.lea(VReg.V0, slot);
+                vm.load(VReg.A0, VReg.V0, 0);
+                vm.call("_print_int_no_nl");
+            };
+            icStat("[ic] legacy=", "_ic_stat_legacy");
+            icStat(" shaped=", "_ic_stat_shaped");
+            icStat(" slow=", "_ic_stat_slow");
+            vm.lea(VReg.A0, this.asm.addString(""));
+            vm.call("_print_str");
+        }
+
         vm.movImm(VReg.A0, 0);
         if (this.os === "windows") {
             vm.callWindowsExitProcess();
@@ -1898,7 +2477,7 @@ export class Compiler {
     // 需要拿到"声明本身"的场景（如 JStoCstring 被同模块函数捕获时）。
     getDeclaredFunctionLabel(name) {
         const symbol = (this.ctx.getFunctionSymbol && this.ctx.getFunctionSymbol(name)) || name;
-        if (this.ctx.functions && this.ctx.functions[symbol]) {
+        if (this.ctx.functions && dictGet(this.ctx.functions, symbol)) {
             return "_user_" + symbol;
         }
         return null;
@@ -1958,7 +2537,8 @@ export class Compiler {
     // modules involved are not imported by the compiler itself → self-host safe.
     _injectImplicitGlobalImports(ast) {
         if (!ast || !Array.isArray(ast.body)) return;
-        const IMPLICIT_GLOBALS = { URL: "url", URLSearchParams: "url", btoa: "util", atob: "util", Buffer: "buffer" };
+        // 模块级常量表:热路径勿每次 new + Object.keys + indexOf。
+        const IMPLICIT_GLOBALS = _IMPLICIT_GLOBALS;
 
         // Top-level bindings that would shadow an implicit global.
         const bound = new Set();
@@ -1977,12 +2557,28 @@ export class Compiler {
             }
         }
 
+        // 全部候选已被顶层遮蔽 → 无需整树 walk 找 used。
+        let needWalk = false;
+        for (const name in IMPLICIT_GLOBALS) {
+            if (!bound.has(name)) { needWalk = true; break; }
+        }
+        if (!needWalk) return;
+
+        // 源码字面粗门控:候选名皆不出现 → 跳过 walk(注释误伤可接受,至多少注入)。
+        const src = this._compileSource;
+        if (typeof src === "string") {
+            let any = false;
+            for (const name in IMPLICIT_GLOBALS) {
+                if (src.indexOf(name) !== -1) { any = true; break; }
+            }
+            if (!any) return;
+        }
+
         // Which implicit globals are actually referenced as value identifiers?
         const used = new Set();
-        const names = Object.keys(IMPLICIT_GLOBALS);
         const walk = (node, parent, key) => {
             if (!node || typeof node !== "object") return;
-            if (node.type === "Identifier" && names.indexOf(node.name) !== -1) {
+            if (node.type === "Identifier" && IMPLICIT_GLOBALS[node.name]) {
                 // Skip non-value positions: non-computed member property, object property
                 // key, declaration id (those never denote the global binding).
                 const isMemberProp = parent && parent.type === "MemberExpression" &&
@@ -2004,7 +2600,7 @@ export class Compiler {
 
         // Group the injected names by source module, skipping shadowed ones.
         const byModule = {};
-        for (const name of names) {
+        for (const name in IMPLICIT_GLOBALS) {
             if (!used.has(name) || bound.has(name)) continue;
             const mod = IMPLICIT_GLOBALS[name];
             (byModule[mod] = byModule[mod] || []).push(name);
@@ -2085,7 +2681,16 @@ export class Compiler {
         this.resetModuleCompilationState();
         this.compiledFiles.add(ast.filename);
         this._injectImplicitGlobalImports(ast);
+        let sub = this._phaseStart("prog_resolve");
         this.resolveImports(ast, this._moduleOrder);
+        this._phaseEnd("prog_resolve", sub);
+        // 模块图已解析完毕:在已缓存 AST 上登记类,避免 _devirtPrepass 再读盘再 parse。
+        // shim 模块不登记(注入类会把去虚拟化放得过宽)。
+        if (this.arch !== "x64" && !this._envDevirtOff) {
+            const subD = this._phaseStart("prog_devirt");
+            this._devirtPrepassModules(this._moduleOrder);
+            this._phaseEnd("prog_devirt", subD);
+        }
         // [W-35] 全部模块都读完(_reUniPropSeen 已定型)后才决定 Unicode 属性表的去留。
         // 必须放在 resolveImports 之后:shim 的 import 是前置注入的,shim 模块常常比
         // 用户的其他模块**先**被读到,在 readModuleSource 里就地删表会漏掉后读模块的 \p。
@@ -2099,14 +2704,20 @@ export class Compiler {
         }
 
         // [W-24] 函数名推断预扫:须在块级改名之前(原名)且在任何函数体发射之前。
+        sub = this._phaseStart("prog_analysis");
+        this._genStubClassMeths = [];
         for (const moduleAst of this._moduleOrder) {
             this._collectFnNameHints(moduleAst);
         }
         this._renameModulesBlockScope();
+        for (const moduleAst of this._moduleOrder) {
+            this.fillModuleBoxedVars(moduleAst);
+        }
 
         for (const moduleAst of this._moduleOrder) {
             this.collectFunctions(moduleAst, this.getModuleMeta(moduleAst));
         }
+        this._phaseEnd("prog_analysis", sub);
 
         // [CJS cyclic require] 找出参与 require 环的本地 CJS 模块并登记惰性初始化函数。
         // 必须在 collectFunctions 之后(functionAliases 就绪)、body 内联之前。
@@ -2147,8 +2758,10 @@ export class Compiler {
             }
         }
 
+        sub = this._phaseStart("prog_main_body");
+        this._resetIcPropMaps();
         vm.label("_main");
-        vm.beginRecord(); // [P1]
+        // _main 是整程序入口,体量远超 REC_CAP,录制必白冲;不 beginRecord。
         vm.prologue(8192, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
         this.ctx.returnLabel = "_main_return";
 
@@ -2191,19 +2804,21 @@ export class Compiler {
             });
         }
 
-        // Link all static imports before any module top-level code runs.
-        // This gives cyclic function imports a stable value even when an
-        // earlier module's top-level side effects call into a later module
-        // before that later module reaches its own evaluation pass.
-        for (const moduleAst of this._moduleOrder) {
-            const moduleMeta = this.getModuleMeta(moduleAst);
-            this.withModuleCompileContext(moduleMeta, () => {
-                for (const stmt of moduleAst.body) {
-                    if (stmt.type === "ImportDeclaration") {
-                        this.compileImportBindingInitialization(stmt);
+        // Link function/class imports before any module top-level code runs.
+        // Variable imports stay for the per-module refresh (namespaces only have
+        // functions at this point). Covers cyclic function imports.
+        // 无环时跳过预链:拓扑序下依赖已先求值,二次 refresh 足够(省一整遍 import 发射)。
+        if (this._hasEsmImportCycle()) {
+            for (const moduleAst of this._moduleOrder) {
+                const moduleMeta = this.getModuleMeta(moduleAst);
+                this.withModuleCompileContext(moduleMeta, () => {
+                    for (const stmt of moduleAst.body) {
+                        if (stmt.type === "ImportDeclaration") {
+                            this.compileImportBindingInitialization(stmt, { functionsOnly: true });
+                        }
                     }
-                }
-            });
+                });
+            }
         }
 
         for (const moduleAst of this._moduleOrder) {
@@ -2221,33 +2836,9 @@ export class Compiler {
                     }
                 }
 
-                // [L4.2 字符串原地拼接] 模块顶层按可扫描"函数"处理:无形参;导出绑定
-                // 枚举出来供逃逸门控否决(import 侧可持有别名,顶层变量等价于全局)。
-                const _ipExported = new Set();
-                for (const _st of moduleAst.body) {
-                    if (_st.type !== "ExportDeclaration") continue;
-                    const _d = _st.declaration;
-                    if (_d && (_d.type === "FunctionDeclaration" || _d.type === "ClassDeclaration")) {
-                        if (_d.id && _d.id.name) _ipExported.add(_d.id.name);
-                    } else if (_d && _d.declarations) {
-                        for (const _dd of _d.declarations) {
-                            if (_dd.id && _dd.id.type === "Identifier") _ipExported.add(_dd.id.name);
-                        }
-                    } else if (_st.isDefault && _d && _d.type === "Identifier") {
-                        _ipExported.add(_d.name);
-                    }
-                    if (_st.specifiers) {
-                        for (const _sp of _st.specifiers) {
-                            if (_sp.local && _sp.local.name) _ipExported.add(_sp.local.name);
-                        }
-                    }
-                }
-                this.ctx._ipExportedNames = _ipExported;
-                this.ctx._ipScanRoot = { params: [], body: { type: "BlockStatement", body: moduleAst.body } };
-                this.ctx._ipIndex = null;
-
                 // [L1 var hoist] 模块顶层 VariableEnvironment:var → undefined
                 this.emitHoistedVarInits({ type: "BlockStatement", body: moduleAst.body });
+                this.emitTdzBlockPrologue(moduleAst);
 
                 for (const stmt of moduleAst.body) {
                     if (stmt.type === "ImportDeclaration") {
@@ -2271,17 +2862,23 @@ export class Compiler {
                     }
                 }
 
-                this.populateModuleNamespace(moduleMeta);
+                this.populateModuleNamespace(moduleMeta, { skipFunctions: true });
             });
         }
 
         vm.movImm(VReg.RET, 0);
         vm.label("_main_return");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 8192);
-        vm.endRecord(); // [P1]
+        this._phaseEnd("prog_main_body", sub);
 
+        sub = this._phaseStart("prog_userfuncs");
         this.compileUserFunctions();
+        this._phaseEnd("prog_userfuncs", sub);
+        sub = this._phaseStart("prog_pending");
+        this._compilingPending = true;
         this.generatePendingFunctions();
+        this._compilingPending = false;
+        this._phaseEnd("prog_pending", sub);
     }
 
     loadModuleNamespacePointer(moduleIndex, targetReg) {
@@ -2314,7 +2911,14 @@ export class Compiler {
         if (moduleExports.length === 0) return;
 
         const functionsOnly = options.functionsOnly === true;
-        const importSpecMap = this.buildImportSpecMap(moduleMeta.ast);
+        const skipFunctions = options.skipFunctions === true;
+        // 同模块两次 populate(functionsOnly / skipFunctions)共享规格表;imports 在
+        // populate 阶段已定,结果只依赖 moduleAst。
+        let importSpecMap = moduleMeta._importSpecMap;
+        if (!importSpecMap) {
+            importSpecMap = this.buildImportSpecMap(moduleMeta.ast);
+            moduleMeta._importSpecMap = importSpecMap;
+        }
 
         for (const exp of moduleExports) {
             const exportLocalName = exp.localName || exp.name;
@@ -2336,6 +2940,10 @@ export class Compiler {
                 if (declNode && declNode.type === "ClassDeclaration") isClassLike = true;
             }
             if (functionsOnly && !isFunctionLike) {
+                continue;
+            }
+            // 预填已写过函数导出;完整阶段只补值/类(_classinfo 覆盖)。
+            if (skipFunctions && isFunctionLike && !isClassLike) {
                 continue;
             }
 
@@ -2494,11 +3102,13 @@ export class Compiler {
         return null;
     }
 
-    // [L2 AOT 子集] 递归扫描 AST 里的 import(静态 specifier) 调用:解析目标模块路径、
-    // 入模块图(同静态 import),并在该 CallExpression 节点标注 _dynImportPath 供 codegen
-    // 读取。收集顶层 const 字面量绑定供 const-binding 形态解析。
-    _scanDynamicImports(ast, currentDir, moduleOrder) {
-        // 收集顶层 const NAME = "字面量" 供 import(NAME) 解析
+    // [L2/CJS AOT] 一次 AST 遍历处理动态 import( 与 require( 静态 specifier)。
+    // 源码门控 `_mayDynImport`/`_mayRequire` 为 false 时跳过对应分支;二者皆否则整树不扫。
+    _scanCallParenForms(ast, currentDir, moduleOrder) {
+        const wantImp = ast._mayDynImport !== false;
+        const wantReq = ast._mayRequire !== false;
+        if (!wantImp && !wantReq) return;
+
         const constEnv = {};
         for (const st of (ast.body || [])) {
             if (st.type === "VariableDeclaration" && st.kind === "const") {
@@ -2509,38 +3119,133 @@ export class Compiler {
                 }
             }
         }
+        const self = this;
         const walk = (node) => {
             if (!node || typeof node !== "object") return;
-            if (node.type === "CallExpression" && node.callee && node.callee.type === "Identifier" &&
-                node.callee.name === "import" && node.arguments && node.arguments.length === 1) {
-                const spec = this._extractStaticSpecifier(node.arguments[0], constEnv);
-                if (spec !== null) {
-                    node._dynImportSpec = spec; // 记录静态 specifier(供 missing 时 reject 用)
-                    const resolvedPath = resolveModulePath(spec, currentDir, this.nodeShimPath, path, fs);
-                    // 不存在的模块(missing-reject)→ 不入图/不标注 path → codegen 发
-                    // rejected Promise(reason = specifier 字符串,对齐 fixture)
-                    if (resolvedPath && fs.existsSync(resolvedPath)) {
-                        node._dynImportPath = resolvedPath;
-                        if (!this.compiledFiles.has(resolvedPath)) {
-                            this.compiledFiles.add(resolvedPath);
-                            const source = this.readModuleSource(resolvedPath);
-                            const moduleAst = this.parse(source);
-                            moduleAst.filename = resolvedPath;
-                            const oldPath = this.sourcePath;
-                            this.sourcePath = resolvedPath;
-                            this.resolveImports(moduleAst, moduleOrder);
-                            this.sourcePath = oldPath;
+            if (Array.isArray(node)) {
+                for (let i = 0; i < node.length; i++) walk(node[i]);
+                return;
+            }
+            const t = node.type;
+            if (t === "CallExpression" && node.callee && node.callee.type === "Identifier" &&
+                node.arguments && node.arguments.length === 1) {
+                const cname = node.callee.name;
+                if (wantImp && cname === "import") {
+                    const spec = self._extractStaticSpecifier(node.arguments[0], constEnv);
+                    if (spec !== null) {
+                        node._dynImportSpec = spec;
+                        const resolvedPath = resolveModulePath(spec, currentDir, self.nodeShimPath, path, fs);
+                        if (resolvedPath && fs.existsSync(resolvedPath)) {
+                            node._dynImportPath = resolvedPath;
+                            if (!self.compiledFiles.has(resolvedPath)) {
+                                self.compiledFiles.add(resolvedPath);
+                                const source = self.readModuleSource(resolvedPath);
+                                const moduleAst = self.parse(source);
+                                moduleAst.filename = resolvedPath;
+                                const oldPath = self.sourcePath;
+                                self.sourcePath = resolvedPath;
+                                self.resolveImports(moduleAst, moduleOrder);
+                                self.sourcePath = oldPath;
+                            }
+                        }
+                    }
+                } else if (wantReq && cname === "require") {
+                    const spec = self._extractStaticSpecifier(node.arguments[0], constEnv);
+                    if (spec !== null) {
+                        node._requireCall = true;
+                        const resolvedPath = resolveModulePath(spec, currentDir, self.nodeShimPath, path, fs, true);
+                        if (resolvedPath && fs.existsSync(resolvedPath)) {
+                            node._requirePath = resolvedPath;
+                            node._requireKind = self._requireExportKind(resolvedPath, spec);
+                            if (ast.filename) {
+                                if (!self._requireEdges) self._requireEdges = {};
+                                const from = ast.filename;
+                                if (!self._requireEdges[from]) self._requireEdges[from] = [];
+                                if (self._requireEdges[from].indexOf(resolvedPath) === -1) {
+                                    self._requireEdges[from].push(resolvedPath);
+                                }
+                            }
+                            if (!self.compiledFiles.has(resolvedPath)) {
+                                self.compiledFiles.add(resolvedPath);
+                                const source = self.readModuleSource(resolvedPath);
+                                const moduleAst = self.parse(source);
+                                moduleAst.filename = resolvedPath;
+                                const oldPath = self.sourcePath;
+                                self.sourcePath = resolvedPath;
+                                self.resolveImports(moduleAst, moduleOrder);
+                                self.sourcePath = oldPath;
+                            }
                         }
                     }
                 }
             }
+            if (t === "Identifier" || t === "Literal" || t === "ThisExpression" ||
+                t === "Super" || t === "EmptyStatement" || t === "PrivateIdentifier" ||
+                t === "DebuggerStatement" || t === "MetaProperty" || t === "TemplateElement") return;
+            if (t === "MemberExpression") {
+                walk(node.object);
+                if (node.computed) walk(node.property);
+                return;
+            }
+            if (t === "CallExpression" || t === "NewExpression") {
+                walk(node.callee);
+                const args = node.arguments;
+                if (args) for (let i = 0; i < args.length; i++) walk(args[i]);
+                return;
+            }
+            if (t === "BinaryExpression" || t === "LogicalExpression" || t === "AssignmentExpression") {
+                walk(node.left); walk(node.right); return;
+            }
+            if (t === "UnaryExpression" || t === "UpdateExpression" || t === "AwaitExpression" ||
+                t === "YieldExpression" || t === "ThrowStatement" || t === "ReturnStatement" ||
+                t === "SpreadElement" || t === "RestElement") {
+                walk(node.argument); return;
+            }
+            if (t === "ExpressionStatement") { walk(node.expression); return; }
+            if (t === "VariableDeclarator") { walk(node.id); walk(node.init); return; }
+            if (t === "VariableDeclaration") {
+                const decls = node.declarations;
+                if (decls) for (let i = 0; i < decls.length; i++) walk(decls[i]);
+                return;
+            }
+            if (t === "Property" || t === "PropertyDefinition" || t === "MethodDefinition") {
+                if (node.computed) walk(node.key);
+                walk(node.value); return;
+            }
+            if (t === "BlockStatement" || t === "Program" || t === "ClassBody") {
+                const body = node.body;
+                if (body) for (let i = 0; i < body.length; i++) walk(body[i]);
+                return;
+            }
+            if (t === "FunctionExpression" || t === "ArrowFunctionExpression" || t === "FunctionDeclaration") {
+                walk(node.body);
+                const params = node.params;
+                if (params) for (let i = 0; i < params.length; i++) walk(params[i]);
+                return;
+            }
+            if (t === "IfStatement" || t === "ConditionalExpression") {
+                walk(node.test); walk(node.consequent); walk(node.alternate); return;
+            }
+            if (t === "ArrayExpression" || t === "ArrayPattern") {
+                const els = node.elements;
+                if (els) for (let i = 0; i < els.length; i++) walk(els[i]);
+                return;
+            }
+            if (t === "ObjectExpression" || t === "ObjectPattern") {
+                const prs = node.properties;
+                if (prs) for (let i = 0; i < prs.length; i++) walk(prs[i]);
+                return;
+            }
+            if (t === "SequenceExpression" || t === "TemplateLiteral") {
+                const xs = node.expressions;
+                if (xs) for (let i = 0; i < xs.length; i++) walk(xs[i]);
+                return;
+            }
             for (const k in node) {
-                if (k === "type" || (k.length && k[0] === "_")) continue;
+                if (k === "type" || k === "loc" || k === "start" || k === "end" || k === "range") continue;
+                if (k.length && k.charCodeAt(0) === 95) continue;
                 const v = node[k];
-                if (v && typeof v === "object") {
-                    if (Array.isArray(v)) { for (let i = 0; i < v.length; i++) walk(v[i]); }
-                    else walk(v);
-                }
+                if (v && typeof v === "object") walk(v);
             }
         };
         walk(ast);
@@ -2548,7 +3253,8 @@ export class Compiler {
 
     resolveImports(ast, moduleOrder = []) {
         const modulePath = ast.filename || path.resolve(this.sourcePath || ".");
-        const currentDir = fs.statSync(modulePath).isDirectory() ? modulePath : path.dirname(modulePath);
+        const currentDir = (modulePath.endsWith(".js") || modulePath.endsWith(".mjs") ||
+            modulePath.endsWith(".cjs")) ? path.dirname(modulePath) : modulePath;
 
         if (modulePath && !this.compiledFiles.has(modulePath)) {
             this.compiledFiles.add(modulePath);
@@ -2566,7 +3272,7 @@ export class Compiler {
         // 合成真实 `export default module.exports;` 节点,而 _cjsFlags 在
         // 包装前已按原始源码把真 CJS 标为 true,故须排除,否则一切 CJS 模块
         // 在显式 type:commonjs 下都会误报。
-        if (modulePath.endsWith(".js") && !this._cjsFlags[modulePath] &&
+        if (modulePath.endsWith(".js") && !(this._cjsFlags && this._cjsFlags[modulePath]) &&
             nearestPackageJsonExplicitCommonjs(modulePath) && astHasRealTopLevelEsm(ast)) {
             throw new Error("Cannot use ESM import/export in a .js file whose package.json sets \"type\": \"commonjs\": " + modulePath);
         }
@@ -2634,77 +3340,15 @@ export class Compiler {
             }
         }
 
-        // [L2 AOT 子集] 扫描本模块内的动态 import(静态 specifier),把目标模块也纳入图。
-        // 置于静态导入之后、本模块入序之前:被动态导入的依赖先于本模块进入 moduleOrder。
-        this._scanDynamicImports(ast, currentDir, moduleOrder);
-        this._scanRequires(ast, currentDir, moduleOrder);
+        // [L2/CJS AOT] 一次遍历扫动态 import( 与 require(;门控见 _scanCallParenForms。
+        this._scanCallParenForms(ast, currentDir, moduleOrder);
 
-        if (!moduleOrder.find((mod) => mod.filename === ast.filename)) {
+        if (!this._moduleOrderPaths) this._moduleOrderPaths = new Set();
+        if (!this._moduleOrderPaths.has(ast.filename)) {
+            this._moduleOrderPaths.add(ast.filename);
             moduleOrder.push(ast);
         }
         return moduleOrder;
-    }
-
-    // [CJS AOT 子集] 扫描 require(静态 specifier) 调用:解析目标模块、入模块图
-    // (依赖先于本模块进 moduleOrder,与 CJS 首个 require 触发的执行序在无环情形一致),
-    // 并在 CallExpression 节点标注 _requirePath/_requireKind 供 codegen desugar 成
-    // _get_module_export。环形依赖(a<->b)因 AOT 静态执行序与 CJS 惰性序不同,暂不支持。
-    _scanRequires(ast, currentDir, moduleOrder) {
-        // 顶层 const NAME = "字面量" 供 require(NAME) 解析
-        const constEnv = {};
-        for (const st of (ast.body || [])) {
-            if (st.type === "VariableDeclaration" && st.kind === "const") {
-                for (const d of (st.declarations || [])) {
-                    if (d.id && d.id.type === "Identifier" && d.init && d.init.type === "Literal" && typeof d.init.value === "string") {
-                        constEnv[d.id.name] = d.init.value;
-                    }
-                }
-            }
-        }
-        const walk = (node) => {
-            if (!node || typeof node !== "object") return;
-            if (node.type === "CallExpression" && node.callee && node.callee.type === "Identifier" &&
-                node.callee.name === "require" && node.arguments && node.arguments.length === 1) {
-                const spec = this._extractStaticSpecifier(node.arguments[0], constEnv);
-                if (spec !== null) {
-                    node._requireCall = true;
-                    const resolvedPath = resolveModulePath(spec, currentDir, this.nodeShimPath, path, fs, true);
-                    if (resolvedPath && fs.existsSync(resolvedPath)) {
-                        node._requirePath = resolvedPath;
-                        node._requireKind = this._requireExportKind(resolvedPath, spec);
-                        // [CJS cyclic require] 记录 require 依赖边(当前模块 -> 目标),
-                        // 供 markCjsRequireCycles 找出环。ast.filename 在此已就绪。
-                        if (ast.filename) {
-                            if (!this._requireEdges) this._requireEdges = {};
-                            const from = ast.filename;
-                            if (!this._requireEdges[from]) this._requireEdges[from] = [];
-                            if (this._requireEdges[from].indexOf(resolvedPath) === -1) {
-                                this._requireEdges[from].push(resolvedPath);
-                            }
-                        }
-                        if (!this.compiledFiles.has(resolvedPath)) {
-                            this.compiledFiles.add(resolvedPath);
-                            const source = this.readModuleSource(resolvedPath);
-                            const moduleAst = this.parse(source);
-                            moduleAst.filename = resolvedPath;
-                            const oldPath = this.sourcePath;
-                            this.sourcePath = resolvedPath;
-                            this.resolveImports(moduleAst, moduleOrder);
-                            this.sourcePath = oldPath;
-                        }
-                    }
-                }
-            }
-            for (const k in node) {
-                if (k === "type" || (k.length && k[0] === "_")) continue;
-                const v = node[k];
-                if (v && typeof v === "object") {
-                    if (Array.isArray(v)) { for (let i = 0; i < v.length; i++) walk(v[i]); }
-                    else walk(v);
-                }
-            }
-        };
-        walk(ast);
     }
 
     // [CJS cyclic require] 找出参与 require 环的本地 CJS 模块,标记 meta.lazyCjs 并
@@ -2871,7 +3515,10 @@ export class Compiler {
     }
 
     compileProgramForLibrary(ast) {
-        this._collectFnNameHints(ast); // [W-24] 同 compileProgram:发射前预扫函数名
+        if (!ast.filename && this.sourcePath) ast.filename = this.sourcePath;
+        this._devirtPrepassModules([ast]);
+        // [W-24] _fnHint 已在 parse 盖章;单文件路径同样免预扫
+        // this._collectFnNameHints(ast);
         renameBlockScopedBindings(ast, !!ast._bsStrict);
         this.collectFunctions(ast);
         this.compileUserFunctions();
@@ -2901,11 +3548,11 @@ export class Compiler {
                 if (!localName || !importedName) continue;
                 // 仅当源绑定确是函数声明(shim 导出恒为纯函数)
                 if (this.getModuleBindingKind(sourceMeta.ast, importedName) !== "function") continue;
-                const sourceSymbol = sourceMeta.functionAliases[importedName];
+                const sourceSymbol = dictGet(sourceMeta.functionAliases, importedName);
                 if (!sourceSymbol || typeof sourceSymbol !== "string") continue;
                 // 不覆盖 importer 自己的声明/别名
-                if (importerMeta.functionAliases[localName]) continue;
-                importerMeta.functionAliases[localName] = sourceSymbol;
+                if (dictGet(importerMeta.functionAliases, localName)) continue;
+                dictSet(importerMeta.functionAliases, localName, sourceSymbol);
             }
         }
     }
@@ -2947,15 +3594,25 @@ export class Compiler {
     }
 
     compileUserFunctions() {
+        this._exportNameSet = new Set(this.exports || []);
         for (const name in this.ctx.functions) {
             this.compileFunction(name, this.ctx.functions[name]);
         }
+        this._exportNameSet = null;
+    }
+
+    _addDirectEvalBoxedVars(func, boxedVars) {
+        const ast = this._currentModuleAst;
+        if (ast && ast._hasDirectEval === 0) return;
+        for (const _n of analyzeDirectEvalBoxedVars(func)) boxedVars.add(_n);
     }
 
     compileFunction(name, func) {
         const vm = this.vm;
         const funcLabel = "_user_" + name;
         const returnLabel = funcLabel + "_return";
+        // 每函数重置同 prop IC 站点池(见 emitObjectGetIC)
+        this._resetIcPropMaps();
 
         if (func.type === "ClassDeclaration") {
             // 类不能按函数体编译（body 是成员列表而非语句块）。
@@ -2975,21 +3632,24 @@ export class Compiler {
         const savedCtx = this.ctx;
         const savedSourcePath = this.sourcePath;
         const savedModuleAst = this._currentModuleAst;
-        this.ctx = savedCtx.clone(name);
+        this.ctx = this._acquireUserFnCtx(savedCtx, name, ownerMeta);
         this.ctx.returnLabel = returnLabel;
         this.ctx.inAsyncFunction = isAsync;
         if (ownerMeta) {
-            this.ctx.functionAliases = Object.assign({}, ownerMeta.functionAliases);
-            this.ctx.mainCapturedVars = Object.assign({}, ownerMeta.mainCapturedVars);
             this.sourcePath = ownerMeta.ast.filename;
             this._currentModuleAst = ownerMeta.ast;
         }
 
         const boxedVars = analyzeSharedVariables(func);
-        // [引擎库·直接 eval 逃逸捕获] 含直接 eval 的函数:把全部局部升级为 box,使调用者与
-        // eval 片段闭包共享同一 cell(见 lang/analysis/closure.js analyzeDirectEvalBoxedVars)。
-        for (const _n of analyzeDirectEvalBoxedVars(func)) boxedVars.add(_n);
+        this._addDirectEvalBoxedVars(func, boxedVars);
         this.ctx.boxedVars = boxedVars;
+        this.ctx.lexLocalNames = {};
+        this.ctx.paramBindingNames = {};
+        this.ctx._tdzClearedLocals = new Set();
+        {
+            const _ps = func.params || [];
+            for (let _pi = 0; _pi < _ps.length; _pi++) collectPatternNames(_ps[_pi], this.ctx.paramBindingNames);
+        }
 
         vm.label(funcLabel);
         // [函数元数据] 顶层函数声明:funcLabel(=_user_<name>)即其值的 code_ptr(裸函数指针
@@ -3003,31 +3663,39 @@ export class Compiler {
         func._fnStrict = fnStrict;
         this.registerFuncMeta(funcLabel, func, name);
         this.ctx.inStrictFunction = fnStrict;
+        if (!fnStrict && func.body) {
+            collectLexicalDeclarations(func.body, this.ctx.lexLocalNames);
+        }
         // [批次D] 顶层生成器声明:标签处先落 stub(建协程+生成器对象即返回),
         // 真正函数体在 <label>_gbody(由 _coroutine_entry 首次 resume 进入)。
         // 顶层声明无闭包,stub 传 A2=0。
         const isGenerator = _isGenFuncDecl(func) && !isAsync;
         const isAsyncGen = _isGenFuncDecl(func) && isAsync;
-        // [L4.2 字符串原地拼接] 逃逸门控的函数级扫描根。async/generator 骑协程
-        // (协程栈 + 推迟 GC 语义),本期一律不参与;普通函数以 AST 节点为扫描范围。
-        this.ctx._ipScanRoot = (isAsync || isGenerator || isAsyncGen) ? null : func;
-        this.ctx._ipIndex = null;
         this.ctx.inAsyncGenerator = isAsyncGen;
         let fdiList = null;
         if (isGenerator) {
             // 顶层函数声明无闭包捕获 → capturedNames=null(eager 探针不排除名,但其默认值
             // 引用模块顶层 var 走 mainCapturedVars 解析,safeFn 已排除)。
             // [FDI eager] 含 pattern 形参时返回体内 transfer 用叶名序。
-            fdiList = this.emitGeneratorStub(funcLabel + "_gbody", false);
+            const _genSym = (this.ctx.getFunctionSymbol && this.ctx.getFunctionSymbol(name)) || name;
+            fdiList = this.emitGeneratorStub(funcLabel + "_gbody", false, undefined, undefined, _genSym, funcLabel);
         } else if (isAsyncGen) {
             // 顶层 async function*：async 生成器 stub
-            fdiList = this.emitAsyncGeneratorStub(funcLabel + "_gbody", false);
+            const _agenSym = (this.ctx.getFunctionSymbol && this.ctx.getFunctionSymbol(name)) || name;
+            fdiList = this.emitAsyncGeneratorStub(funcLabel + "_gbody", false, undefined, _agenSym, funcLabel);
+        } else if (isAsync) {
+            // 顶层 async function:标签处落 stub(建协程+Promise 即返回),真体在 _abody。
+            // 与方法/表达式同构——asy.call/apply/别名经 compileMethodCall 也能进 stub;
+            // 此前仅 compileAsyncFunctionCall 名调用建协程,间接调用直入函数体 → SIGBUS。
+            this.emitAsyncMethodStub(funcLabel + "_abody", false);
         }
         // [P1] async 禁录(S4 跨协程共享,见 closures.js 注);生成器体同理禁录;
-        // [批次D] __regexp_shim 模块禁录(x64 晋升错编,见 closures.js 注)
+        // 与闭包路径同用 _fnNeedsP1Record(中等 for/while 窗口)。
         const p1Skip = typeof this.sourcePath === "string" &&
             this.sourcePath.indexOf("__regexp_shim") !== -1;
-        if (!isAsync && !isGenerator && !p1Skip) vm.beginRecord();
+        if (!isAsync && !isGenerator && !p1Skip && this._fnNeedsP1Record(func)) {
+            vm.beginRecord();
+        }
         vm.prologue(8192, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
 
         const params = func.params || [];
@@ -3042,10 +3710,19 @@ export class Compiler {
         // try 时跳 asyncDeclRejectLabel → emitAsyncRejectFromException。save/restore 保护
         // 外层上下文。async generator(isAsyncGen)走生成器返回流,不设此落点。
         const prevDeclExcLabel = this.ctx.exceptionLabel;
+        const prevDeclAsyncExcFrameOff = this.ctx._asyncExcFrameOff;
+        const prevDeclAsyncCoroOff = this.ctx._asyncCoroOff;
+        const prevDeclAsyncPromiseOff = this.ctx._asyncPromiseOff;
         let asyncDeclRejectLabel = null;
         if (isAsync && !isAsyncGen) {
             asyncDeclRejectLabel = this.ctx.newLabel("async_decl_reject");
             this.ctx.exceptionLabel = asyncDeclRejectLabel;
+
+            // [#async-exc-ctx] 同 closures.js:把本 async 体登记进 _exc_ctx_top 链,
+            // 否则**被调用函数**里抛出的异常经 _throw_unwind 找不到落点,直接冒到调度器
+            // 变成 panic(而非 reject 本函数的 Promise)。ctx.exceptionLabel 只覆盖本体内
+            // 直接 throw,跨调用帧的 unwind 必须靠这条链。
+            this.emitInstallAsyncExcFrame(asyncDeclRejectLabel);
         }
 
         // [#49] `arguments` 对象(数组近似):顶层函数声明同样支持。生成器体经协程栈
@@ -3053,15 +3730,32 @@ export class Compiler {
         // 参数绑定前构造(emitArgumentsArray 内部存临时槽并末尾恢复 A0..A4)。
         // [argc] 协程体也可建 arguments:_coroutine_entry 已按 CORO_ARGC 快照恢复
         // _call_argc,且按 A0-A4 装实参 —— 与普通函数入口同构。
-        const declUsesArguments =
-            !params.some((p) =>
-                (p.type === "Identifier" && p.name === "arguments") ||
+        let paramsShadowArguments = false;
+        for (let pi = 0; pi < params.length; pi++) {
+            const p = params[pi];
+            if ((p.type === "Identifier" && p.name === "arguments") ||
                 (p.type === "AssignmentPattern" && p.left && p.left.name === "arguments") ||
-                (p.type === "SpreadElement" && p.argument && p.argument.name === "arguments")) &&
-            this.functionBodyUsesArguments(func);
+                (p.type === "SpreadElement" && p.argument && p.argument.name === "arguments")) {
+                paramsShadowArguments = true;
+                break;
+            }
+        }
+        const declUsesArguments =
+            !paramsShadowArguments && this.functionBodyUsesArguments(func);
+        // [argv 溢出] 实参 5.. 的快照须先于任何 JS 调用(见 emitArgvSpillSnapshot)。
+        let declNeedFullArgv = declUsesArguments;
+        if (!declNeedFullArgv) {
+            for (let ri = 0; ri < params.length; ri++) {
+                if (params[ri] && params[ri].type === "SpreadElement") { declNeedFullArgv = true; break; }
+            }
+        }
+        this.emitArgvSpillSnapshot(declNeedFullArgv ? 16 : params.length);
         if (declUsesArguments) {
             this.emitArgumentsArray();
         }
+        if (this._paramsHaveExpressions(params)) this.emitSeedMainCapturedVars();
+        this._pendingParamEvalParams = params;
+        this.maybeEmitParamEvalVarSlots((isGenerator || isAsyncGen) && !!fdiList);
 
         const paramOffsets = [];
         const patternParams = [];
@@ -3069,12 +3763,12 @@ export class Compiler {
         // 顶层声明的直接 Identifier 默认值标点(两单循环 + indexOf,嵌套 for 原生误编)。
         {
             const tdzN = [];
-            for (let ti = 0; ti < params.length && ti < 6; ti++) {
+            for (let ti = 0; ti < params.length && ti < 16; ti++) {
                 const tp = params[ti];
                 if (tp && tp.type === "Identifier") tdzN.push(tp.name);
                 else if (tp && tp.type === "AssignmentPattern" && tp.left && tp.left.type === "Identifier") tdzN.push(tp.left.name);
             }
-            for (let mi = 0; mi < params.length && mi < 6; mi++) {
+            for (let mi = 0; mi < params.length && mi < 16; mi++) {
                 const mp = params[mi];
                 if (mp && mp.type === "AssignmentPattern" && mp.right && mp.right.type === "Identifier" &&
                     tdzN.indexOf(mp.right.name, mi) >= 0) {
@@ -3083,12 +3777,14 @@ export class Compiler {
             }
         }
         const tdzParamNames = [];
-        for (let i = 0; i < params.length && i < 6; i++) {
+        for (let i = 0; i < params.length && i < 16; i++) {
             const p = params[i];
             if (p.type === "Identifier") tdzParamNames.push(p.name);
             else if (p.type === "AssignmentPattern" && p.left && p.left.type === "Identifier") tdzParamNames.push(p.left.name);
         }
-        for (let i = 0; i < params.length && i < 6; i++) {
+        // 形参默认值内 eval 的 !lex: 冲突表(仅形参名,不含外层捕获)
+        this.ctx.paramLexNames = new Set(tdzParamNames);
+        for (let i = 0; i < params.length && i < 16; i++) {
             const param = params[i];
             let paramName = null;
             let defaultExpr = null;
@@ -3111,7 +3807,7 @@ export class Compiler {
                 const pat = param.type === "AssignmentPattern" ? param.left : param;
                 const dexpr = param.type === "AssignmentPattern" ? param.right : null;
                 const pslot = this.ctx.allocLocal(`__parampat_${this.nextLabelId()}`);
-                vm.store(VReg.FP, pslot, vm.getArgReg(i));
+                this.emitArgToSlot(i, pslot);
                 patternParams.push({ pat: pat, slot: pslot, dflt: dexpr });
                 continue;
             }
@@ -3124,7 +3820,7 @@ export class Compiler {
             if ((isGenerator || isAsyncGen) && fdiList && fdiList.indexOf(paramName) !== -1) continue;
             const offset = this.ctx.allocLocal(paramName);
             paramOffsets.push({ name: paramName, offset: offset });
-            vm.store(VReg.FP, offset, vm.getArgReg(i));
+            this.emitArgToSlot(i, offset);
             if (defaultExpr) {
                 // [L2-③ TDZ] 默认值表达式求值前,当前及之后所有形参名入 tdzParams:
                 // 自引用(x=x)/后向引用(x=y,y=1)→compileIdentifier 以 ReferenceError 守卫
@@ -3149,7 +3845,10 @@ export class Compiler {
                 vm.movImm64(undReg, 0x7ffb000000000000n); // JS_UNDEFINED
                 vm.cmp(chkReg, undReg);
                 vm.jne(skip);
+                const _prevEvalParam = this.ctx._evalInParamInit;
+                this.ctx._evalInParamInit = true;
                 this.compileExpression(defaultExpr);
+                this.ctx._evalInParamInit = _prevEvalParam;
                 vm.store(VReg.FP, offset, VReg.RET);
                 vm.label(skip);
                 for (let ai = 0; ai < 5; ai++) {
@@ -3164,11 +3863,11 @@ export class Compiler {
         if (this.ctx.tdzParams) this.ctx.tdzParams.clear();
 
         // [#36] 顶层函数声明也存 __this(A5):此前该路径不落 __this 槽 →
-        // 函数声明被当方法/经 call,apply,bind 调用时 this 恒 0(闭包路径早有)
-        if (!isAsync) {
-            const declThisOff = this.ctx.allocLocal("__this");
-            vm.store(VReg.FP, declThisOff, VReg.A5);
-        }
+        // 函数声明被当方法/经 call,apply,bind 调用时 this 恒 0(闭包路径早有)。
+        // async 同构:经 stub → _coroutine_entry 恢复 A5=CORO_THIS 后再进体,须落槽
+        // (不可再 `if (!isAsync)` 跳过 —— asy.call/o.m=asy 会丢 this)。
+        const declThisOff = this.ctx.allocLocal("__this");
+        vm.store(VReg.FP, declThisOff, VReg.A5);
 
         for (let i = 0; i < paramOffsets.length; i++) {
             const param = paramOffsets[i];
@@ -3183,6 +3882,41 @@ export class Compiler {
             }
         }
 
+        // Arguments [[ParameterMap]]:non-strict + 简单形参 + 引用 arguments
+        // → 强制 box 形参,登记 idx→box。顶层 function/function* 声明此前只建
+        // arguments 数组、不装映射 → `arguments[0]=32; yield a` 仍吐原形参
+        // (formal-parameters-after-reassignment-non-strict)。
+        const mappedArgs = declUsesArguments && !fnStrict && this._isSimpleParamList(params);
+        if (mappedArgs && paramOffsets.length > 0) {
+            for (let i = 0; i < paramOffsets.length; i++) {
+                const param = paramOffsets[i];
+                if (boxedVars.has(param.name)) continue;
+                vm.load(VReg.V1, VReg.FP, param.offset);
+                vm.push(VReg.V1);
+                vm.call("_box_alloc");
+                vm.store(VReg.FP, param.offset, VReg.RET);
+                vm.pop(VReg.V1);
+                vm.store(VReg.RET, 0, VReg.V1);
+                boxedVars.add(param.name);
+            }
+            const mapOff = this.ctx.allocLocal(`__argmap_${this.nextLabelId()}`);
+            vm.movImm(VReg.A0, paramOffsets.length * 8);
+            vm.call("_alloc");
+            vm.store(VReg.FP, mapOff, VReg.RET);
+            for (let i = 0; i < paramOffsets.length; i++) {
+                vm.load(VReg.V0, VReg.FP, paramOffsets[i].offset);
+                vm.load(VReg.V1, VReg.FP, mapOff);
+                vm.store(VReg.V1, i * 8, VReg.V0);
+            }
+            const argLocal = this.ctx.getLocal("arguments");
+            if (argLocal) {
+                vm.load(VReg.A0, VReg.FP, argLocal);
+                vm.load(VReg.A1, VReg.FP, mapOff);
+                vm.movImm(VReg.A2, paramOffsets.length);
+                vm.call("_args_param_map_install");
+            }
+        }
+
         // [#47] 解构参数:所有实参已落栈,此处安全解构到局部(体内即可引用)。
         // [FDI eager] 生成器 pattern 形参已在调用期(stub)绑定:从 coro+168 transfer 数组
         // 按绑定序取叶值,跳过重复解构(二重消费自定义迭代器会错值/错计)。
@@ -3193,7 +3927,16 @@ export class Compiler {
                 this.emitParamDestructure(patternParams[i].pat, patternParams[i].slot, patternParams[i].dflt);
             }
         }
+        // [m120] 形参已绑定 → 体读免值级哨兵
+        if (this.ctx._tdzClearedLocals) {
+            for (const pn in this.ctx.paramBindingNames) {
+                if (this.ctx.paramBindingNames[pn] === true) {
+                    this.ctx._tdzClearedLocals.add(pn);
+                }
+            }
+        }
 
+        this.unbindBodyBindingsAfterParamInit(func.body, params);
         // [L1 var hoist] 须在共享局部 TDZ 预建之前(见 closures.js 同构注释)。
         this.emitHoistedVarInits(func.body);
 
@@ -3206,7 +3949,7 @@ export class Compiler {
             const bodyLocals = {};
             collectLocalDeclarations(func.body, bodyLocals);
             for (const nm in bodyLocals) {
-                if (!Object.prototype.hasOwnProperty.call(bodyLocals, nm)) continue;
+                if (bodyLocals[nm] !== true) continue;
                 if (!boxedVars.has(nm)) continue;
                 if (this.ctx.getLocal(nm)) continue; // 参数/已捕获外层变量 / 已 hoist 的 var
                 const off = this.ctx.allocLocal(nm);
@@ -3220,6 +3963,7 @@ export class Compiler {
 
         if (func.body) {
             if (func.body.type === "BlockStatement") {
+                this.emitTdzBlockPrologue(func.body);
                 for (const stmt of func.body.body) {
                     this.compileStatement(stmt);
                 }
@@ -3245,11 +3989,14 @@ export class Compiler {
         vm.endRecord(); // [P1]
         }
         this.ctx.exceptionLabel = prevDeclExcLabel;
+        this.ctx._asyncExcFrameOff = prevDeclAsyncExcFrameOff;
+        this.ctx._asyncCoroOff = prevDeclAsyncCoroOff;
+        this.ctx._asyncPromiseOff = prevDeclAsyncPromiseOff;
         this.ctx.inAsyncGenerator = false;
         this.ctx.inStrictFunction = prevInStrictFunction;
 
         // If this function is exported, store its address into the captured var box
-        if (this.exports && this.exports.includes(name)) {
+        if (this._exportNameSet ? this._exportNameSet.has(name) : (this.exports && this.exports.includes(name))) {
             const capturedLabel = this.ctx.getMainCapturedVar(name);
             if (capturedLabel) {
                 // Load box pointer from captured var label
@@ -3264,9 +4011,11 @@ export class Compiler {
         }
 
         this.generatePendingFunctions();
+        const doneFnCtx = this.ctx;
         this.ctx = savedCtx;
         this.sourcePath = savedSourcePath;
         this._currentModuleAst = savedModuleAst;
+        this._releaseUserFnCtx(doneFnCtx);
     }
 
     // ========== 静态库支持 ==========
@@ -3342,7 +4091,7 @@ export class Compiler {
     // members.js _fnNameLength 的编译期算法逐字同源)。供运行期函数值 .length 反射
     // (读取器 _func_meta_arity)。**布局变更须原子**:改条目宽度必须同时改
     // _func_meta_init / _func_meta_entry 的步长与数据段每条 qword 数(见下方三处)。
-    registerFuncMeta(label, expr, nameHint) {
+    registerFuncMeta(label, expr, nameHint, nonCtor) {
         if (!expr) return;
         const isAsync = isAsyncFunction(expr);
         const isGen = _isGenFuncDecl(expr);
@@ -3356,11 +4105,23 @@ export class Compiler {
             : false) {
             kind |= 0x100;
         }
+        // [IsConstructor] kind bit9 = 「非构造器」:箭头/方法/async/generator 都没有
+        // [[Construct]]。`class C extends (()=>{})` 必须在类定义处抛 TypeError
+        // (language/expressions/class/heritage-arrow-function)。
+        // 方法简写(类方法/对象字面量方法/访问器)由调用方以 nonCtor 标注:AST 上是
+        // 普通 FunctionExpression,无从自辨。
+        if (expr.type === "ArrowFunctionExpression" || isAsync || isGen || nonCtor ||
+            expr._nonCtorMethod) {
+            kind |= 0x200;
+        }
         let name = "";
         if (expr.id && expr.id.name) name = expr.id.name;
         else if (typeof nameHint === "string") name = nameHint;
-        else if (this._fnNameHints) {
-            // [W-24] 匿名函数/箭头:取推断名(ES NamedEvaluation 的廉价子集,见 _collectFnNameHints)
+        else if (typeof expr._fnHint === "string") {
+            // [W-24] 匿名函数/箭头:取推断名(写在 AST 节点上,免 Map.get)
+            name = expr._fnHint;
+        } else if (this._fnNameHints) {
+            // 兼容旧 Map 路径(若仍有写入)
             const h = this._fnNameHints.get(expr);
             if (typeof h === "string") name = h;
         }
@@ -3427,6 +4188,13 @@ export class Compiler {
                     const kn = keyName(node.key, node.computed);
                     if (kn !== null) hints.set(node.value, kn);
                 }
+                // 方法简写 `{ m(){} }` 与访问器没有 [[Construct]](无 .prototype);AST 上
+                // 与 `{ m: function(){} }` 同为 FunctionExpression,故在此盖章供
+                // registerFuncMeta 读(kind bit9)。
+                if ((node.method || node.kind === "get" || node.kind === "set") &&
+                    node.value && typeof node.value === "object") {
+                    node.value._nonCtorMethod = true;
+                }
             } else if (t === "MethodDefinition") {
                 if ((!node.kind || node.kind === "method") && isAnonFn(node.value)) {
                     const kn = keyName(node.key, node.computed);
@@ -3457,7 +4225,18 @@ export class Compiler {
         // _func_meta_init: 运行期把各函数标签地址填入 code_ptr 槽、名字串地址填入 name_ptr 槽
         // (二者 vaddr 运行期才定,故 lea);kind/arity 已静态写入数据。匿名(name="")的 name_ptr 留 0。
         vm.label("_func_meta_init");
-        vm.prologue(0, [VReg.S0]);
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        let fmCap = 16;
+        while (fmCap < entries.length * 2) fmCap = fmCap * 2;
+        if (entries.length > 0) {
+            vm.movImm(VReg.A0, fmCap);
+            vm.call("_cpr_make_table");
+            vm.mov(VReg.S1, VReg.RET);
+            vm.movImm(VReg.V0, entries.length);
+            vm.store(VReg.S1, 16, VReg.V0);
+            vm.lea(VReg.V0, "_func_meta_hash");
+            vm.store(VReg.V0, 0, VReg.S1);
+        }
         vm.lea(VReg.S0, "_func_meta_table");
         for (let i = 0; i < entries.length; i++) {
             vm.lea(VReg.V1, entries[i].label);
@@ -3466,14 +4245,56 @@ export class Compiler {
                 vm.lea(VReg.V1, this.asm.addString(entries[i].name));
                 vm.store(VReg.S0, 16, VReg.V1); // entry.name_ptr = &name_str
             }
+            vm.movImm(VReg.A0, 24);
+            vm.call("_alloc");
+            vm.mov(VReg.S2, VReg.RET);
+            vm.load(VReg.S3, VReg.S0, 0);       // code_ptr
+            vm.store(VReg.S2, 0, VReg.S3);
+            vm.store(VReg.S2, 8, VReg.S0);      // entry*
+            vm.load(VReg.V1, VReg.S1, 8);       // cap
+            vm.subImm(VReg.V1, VReg.V1, 1);
+            vm.shrImm(VReg.V0, VReg.S3, 4);
+            vm.and(VReg.V0, VReg.V0, VReg.V1);
+            vm.shlImm(VReg.V0, VReg.V0, 3);
+            vm.addImm(VReg.V2, VReg.S1, 24);
+            vm.add(VReg.V2, VReg.V2, VReg.V0);
+            vm.load(VReg.V3, VReg.V2, 0);
+            vm.store(VReg.S2, 16, VReg.V3);
+            vm.store(VReg.V2, 0, VReg.S2);
+            vm.mov(VReg.A0, VReg.S1);
+            vm.call("_gc_remember");
             vm.addImm(VReg.S0, VReg.S0, 32);    // 步长=条目宽度;走指针避免大 offset(§1.7)
         }
-        vm.epilogue([VReg.S0], 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
 
-        // _func_meta_entry(A0=code_ptr) -> RET=entry_ptr(0=未登记)。线性扫描,冷路径。
+        // _func_meta_entry(A0=code_ptr) -> RET=entry_ptr(0=未登记)。哈希主路,无表时线性兜底。
         vm.label("_func_meta_entry");
         vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
         vm.mov(VReg.S3, VReg.A0);                       // S3 = 目标 code_ptr
+        vm.lea(VReg.V0, "_func_meta_hash");
+        vm.load(VReg.S0, VReg.V0, 0);
+        vm.cmpImm(VReg.S0, 0);
+        vm.jeq("_fme_linear");
+        vm.load(VReg.V1, VReg.S0, 8);                   // cap
+        vm.subImm(VReg.V1, VReg.V1, 1);
+        vm.shrImm(VReg.V0, VReg.S3, 4);
+        vm.and(VReg.V0, VReg.V0, VReg.V1);
+        vm.shlImm(VReg.V0, VReg.V0, 3);
+        vm.addImm(VReg.V1, VReg.S0, 24);
+        vm.add(VReg.V1, VReg.V1, VReg.V0);
+        vm.load(VReg.S1, VReg.V1, 0);
+        vm.label("_fme_hloop");
+        vm.cmpImm(VReg.S1, 0);
+        vm.jeq("_fme_nf");
+        vm.load(VReg.V1, VReg.S1, 0);
+        vm.cmp(VReg.V1, VReg.S3);
+        vm.jeq("_fme_hhit");
+        vm.load(VReg.S1, VReg.S1, 16);
+        vm.jmp("_fme_hloop");
+        vm.label("_fme_hhit");
+        vm.load(VReg.RET, VReg.S1, 8);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+        vm.label("_fme_linear");
         vm.lea(VReg.S0, "_func_meta_count");
         vm.load(VReg.S0, VReg.S0, 0);                   // S0 = count
         vm.lea(VReg.S1, "_func_meta_table");            // S1 = 游标
@@ -3523,13 +4344,33 @@ export class Compiler {
         vm.movImm(VReg.RET, 0);
         vm.epilogue([], 0);
 
-        // _func_meta_name(A0=code_ptr) -> RET=name_ptr(裸数据串地址;0=未登记/匿名)。
+        // [IsConstructor] _func_meta_nonctor(A0=code_ptr) -> RET=0|1(kind bit9)。
+        // 未登记视为「可能是构造器」(0):内建入口不入表,不该被误判成非构造器。
+        vm.label("_func_meta_nonctor");
+        vm.prologue(0, []);
+        vm.call("_func_meta_entry");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_fmnc_nf");
+        vm.load(VReg.RET, VReg.RET, 8);                 // kind@8
+        vm.shrImm(VReg.RET, VReg.RET, 9);
+        vm.andImm(VReg.RET, VReg.RET, 1);
+        vm.epilogue([], 0);
+        vm.label("_fmnc_nf");
+        vm.movImm(VReg.RET, 0);
+        vm.epilogue([], 0);
+
+        // _func_meta_name(A0=code_ptr) -> RET=name_ptr(裸数据串地址)。
+        // 未登记 → 0;已登记但匿名(name="") → 空串地址(规范 .name === "")。
         vm.label("_func_meta_name");
         vm.prologue(0, []);
         vm.call("_func_meta_entry");
         vm.cmpImm(VReg.RET, 0);
         vm.jeq("_fmname_nf");
         vm.load(VReg.RET, VReg.RET, 16);                // name_ptr@16
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_fmname_ok");
+        vm.lea(VReg.RET, this.asm.addString(""));
+        vm.label("_fmname_ok");
         vm.epilogue([], 0);
         vm.label("_fmname_nf");
         vm.movImm(VReg.RET, 0);
@@ -3581,10 +4422,21 @@ export class Compiler {
         const runtimeGen = new RuntimeGenerator(this.vm, this.ctx);
         runtimeGen.generateAsyncDataSection(this.asm);
 
+        // 函数元数据哈希表根(堆指针):必须在 _data_gc_end 之前,否则 init 建的表会被回收。
+        this.asm.addDataLabel("_func_meta_hash");
+        this.asm.addDataQword(0);
+
         // GC 数据段根扫描的终点：置于所有 qword 数据之后、finalize 追加字符串常量之前。
         // 根扫描区间 = [_data_start, _data_gc_end)，覆盖全部 boxed 全局/模块导出/捕获变量。
         this.asm.addDataLabel("_data_gc_end");
         this.asm.addDataQword(0);
+
+        // Object.prototype.__proto__ get/set:规范 name 为 "get __proto__" / "set __proto__"。
+        this.registerFuncMeta("_object_proto_getter",
+            { type: "FunctionExpression", params: [] }, "get __proto__", true);
+        this.registerFuncMeta("_object_proto_setter",
+            { type: "FunctionExpression", params: [{ type: "Identifier", name: "v" }] },
+            "set __proto__", true);
 
         // 函数元数据侧表(code_ptr→kind);置于 _data_gc_end 之后不参与 GC 根扫描。
         this.emitFuncMetaTable();
@@ -3676,6 +4528,59 @@ function injectShimImport(src, inj) {
     return inj + src;
 }
 
+// 文件头是否已有 `import … from "<shimName>"`(用户手写或先前 inject)。
+// 只扫 shebang 后连续的 import/注释,遇首个非 import 语句即停——避免把注释里的
+// `from "__json_shim"` 示例串当成已注入(index.js 注释曾因此挡住真 JSON.stringify 注入)。
+function sourceHasTopShimImport(src, shimName) {
+    const n = src.length;
+    let i = 0;
+    if (src.charCodeAt(0) === 35 && src.charCodeAt(1) === 33) {
+        while (i < n && src.charCodeAt(i) !== 10) i++;
+        if (i < n) i++;
+    }
+    const dq = '"' + shimName + '"';
+    const sq = "'" + shimName + "'";
+    while (i < n) {
+        while (i < n) {
+            const c = src.charCodeAt(i);
+            if (c === 32 || c === 9 || c === 10 || c === 13) i++;
+            else break;
+        }
+        if (i >= n) return false;
+        if (src.charCodeAt(i) === 47 && i + 1 < n) {
+            const c2 = src.charCodeAt(i + 1);
+            if (c2 === 47) {
+                i += 2;
+                while (i < n && src.charCodeAt(i) !== 10) i++;
+                continue;
+            }
+            if (c2 === 42) {
+                i += 2;
+                while (i + 1 < n && !(src.charCodeAt(i) === 42 && src.charCodeAt(i + 1) === 47)) i++;
+                i += 2;
+                continue;
+            }
+        }
+        if (i + 6 <= n && src.charCodeAt(i) === 105 && src.charCodeAt(i + 1) === 109 &&
+            src.charCodeAt(i + 2) === 112 && src.charCodeAt(i + 3) === 111 &&
+            src.charCodeAt(i + 4) === 114 && src.charCodeAt(i + 5) === 116) {
+            const after = i + 6 < n ? src.charCodeAt(i + 6) : 0;
+            // import / import{/import"
+            if (after === 32 || after === 9 || after === 10 || after === 13 ||
+                after === 123 || after === 34 || after === 39 || after === 42) {
+                let j = i + 6;
+                while (j < n && src.charCodeAt(j) !== 10) j++;
+                const line = src.slice(i, j);
+                if (line.indexOf(dq) !== -1 || line.indexOf(sq) !== -1) return true;
+                i = j < n ? j + 1 : n;
+                continue;
+            }
+        }
+        return false;
+    }
+    return false;
+}
+
 // [W-35 Unicode 属性表按需发射] 判断源码里是否出现「反斜杠 + p/P」这两个字符的
 // 相邻序列(不区分它出现在正则字面量、字符串字面量还是注释里)。__regexp_shim 的
 // Unicode 属性表(__RE_UT 及四张名字表)约 84KB,只有真正用到属性转义的程序才需要;
@@ -3687,16 +4592,8 @@ function injectShimImport(src, inj) {
 // 唯一漏得掉的是把 "\" 与 "p" 分开再拼起来的动态模式(见 readModuleSource 注释)。
 // 手写扫描,不用正则(本代码在 gen1 运行,§1.6 禁正则)。
 function sourceHasPropEscapeText(src) {
-    const n = src.length;
-    let i = 0;
-    while (i + 1 < n) {
-        if (src.charCodeAt(i) === 92) { // '\'
-            const c = src.charCodeAt(i + 1);
-            if (c === 112 || c === 80) return true; // 'p' / 'P'
-        }
-        i++;
-    }
-    return false;
+    // indexOf 替代逐字节扫描(语义同:存在 \p / \P 子串)
+    return src.indexOf("\\p") !== -1 || src.indexOf("\\P") !== -1;
 }
 
 // [W-35] __regexp_shim 里那几张 Unicode 属性表的变量名(值被整串置空即省掉表体)。
@@ -3760,6 +4657,7 @@ function sourceHasRegexLiteral(src) {
 }
 
 // "/" 出现在 prevEnd 之后,能否是正则起始?(值结尾 → 除法;算符/开头 → 正则)
+
 function regexCanStartAfter(src, prevEnd) {
     if (prevEnd === -2) return false; // 字符串字面量之后 → 除法
     if (prevEnd < 0) return true; // 文件开头
@@ -3924,6 +4822,278 @@ function sourceHasBareNewRegExp(src) {
 // `new RegExp(` 也会命中,但那条路径已被 reCtorText 覆盖,重复无害。
 // 调用点仅在源码无正则字面量时才到达(见 readModuleSource 的 || 顺序),故
 // "/" 一律按行注释/块注释/除法处理,不必再做正则字面量启发式。
+
+function sourceHasJsonShimTrigger(src) {
+    const n = src.length;
+    let i = 0;
+    let inTplText = false;
+    const tplBrace = [];
+    let brace = 0;
+    let hit = null;
+    let hasRaw = false;
+    if (src.charCodeAt(0) === 35 && src.charCodeAt(1) === 33) {
+        while (i < n && src.charCodeAt(i) !== 10) i++;
+    }
+    while (i < n) {
+        const c = src.charCodeAt(i);
+        if (inTplText) {
+            if (c === 92) { i += 2; continue; }
+            if (c === 96) { inTplText = false; i++; continue; }
+            if (c === 36 && i + 1 < n && src.charCodeAt(i + 1) === 123) {
+                inTplText = false;
+                tplBrace.push(brace);
+                brace++;
+                i += 2;
+                continue;
+            }
+            i++;
+            continue;
+        }
+        if (c === 96) { inTplText = true; i++; continue; }
+        if (c === 39 || c === 34) {
+            const q = c;
+            i++;
+            while (i < n) {
+                const d = src.charCodeAt(i);
+                if (d === 92) { i += 2; continue; }
+                if (d === q) break;
+                if (d === 10) break;
+                i++;
+            }
+            i++;
+            continue;
+        }
+        if (c === 47) {
+            const c2 = i + 1 < n ? src.charCodeAt(i + 1) : 0;
+            if (c2 === 47) {
+                i += 2;
+                while (i < n && src.charCodeAt(i) !== 10) i++;
+                continue;
+            }
+            if (c2 === 42) {
+                i += 2;
+                while (i + 1 < n && !(src.charCodeAt(i) === 42 && src.charCodeAt(i + 1) === 47)) i++;
+                i += 2;
+                continue;
+            }
+            i++;
+            continue;
+        }
+        if (c === 123) { brace++; i++; continue; }
+        if (c === 125) {
+            brace--;
+            if (tplBrace.length > 0 && tplBrace[tplBrace.length - 1] === brace) {
+                tplBrace.pop();
+                inTplText = true;
+            }
+            i++;
+            continue;
+        }
+        if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95 || c === 36) {
+            const s = i;
+            while (i < n) {
+                const d = src.charCodeAt(i);
+                if ((d >= 48 && d <= 57) || (d >= 65 && d <= 90) ||
+                    (d >= 97 && d <= 122) || d === 95 || d === 36) i++;
+                else break;
+            }
+            const len = i - s;
+            let j = i;
+            while (j < n) {
+                const w = src.charCodeAt(j);
+                if (w === 32 || w === 9 || w === 13 || w === 10) j++;
+                else break;
+            }
+            // structuredClone(
+            if (len === 15 && src.charCodeAt(s) === 115 && src.charCodeAt(s + 1) === 116 &&
+                src.charCodeAt(s + 2) === 114 && src.charCodeAt(s + 3) === 117 &&
+                src.charCodeAt(s + 4) === 99 && src.charCodeAt(s + 5) === 116 &&
+                src.charCodeAt(s + 6) === 117 && src.charCodeAt(s + 7) === 114 &&
+                src.charCodeAt(s + 8) === 101 && src.charCodeAt(s + 9) === 100 &&
+                src.charCodeAt(s + 10) === 67 && src.charCodeAt(s + 11) === 108 &&
+                src.charCodeAt(s + 12) === 111 && src.charCodeAt(s + 13) === 110 &&
+                src.charCodeAt(s + 14) === 101) {
+                if (j < n && src.charCodeAt(j) === 40) {
+                    if (!hit) hit = "structuredClone(";
+                }
+                continue;
+            }
+            // JSON.stringify|parse|rawJSON|isRawJSON
+            if (len === 4 && src.charCodeAt(s) === 74 && src.charCodeAt(s + 1) === 83 &&
+                src.charCodeAt(s + 2) === 79 && src.charCodeAt(s + 3) === 78) {
+                if (j < n && src.charCodeAt(j) === 46) {
+                    j++;
+                    const ps = j;
+                    while (j < n) {
+                        const d = src.charCodeAt(j);
+                        if ((d >= 48 && d <= 57) || (d >= 65 && d <= 90) ||
+                            (d >= 97 && d <= 122) || d === 95 || d === 36) j++;
+                        else break;
+                    }
+                    const prop = src.slice(ps, j);
+                    if (prop === "stringify" || prop === "parse" ||
+                        prop === "rawJSON" || prop === "isRawJSON") {
+                        if (prop === "rawJSON" || prop === "isRawJSON") hasRaw = true;
+                        if (!hit) hit = "JSON." + prop;
+                    }
+                }
+                continue;
+            }
+            continue;
+        }
+        if (c >= 48 && c <= 57) {
+            while (i < n) {
+                const d = src.charCodeAt(i);
+                if ((d >= 48 && d <= 57) || (d >= 65 && d <= 90) ||
+                    (d >= 97 && d <= 122) || d === 95 || d === 46) i++;
+                else break;
+            }
+            continue;
+        }
+        i++;
+    }
+    if (!hit) return false;
+    return hasRaw ? "json-raw" : hit;
+}
+
+function sourceHasEvalOrFunctionCtor(src) {
+    const n = src.length;
+    let i = 0;
+    let inTplText = false;
+    const tplBrace = [];
+    let brace = 0;
+    if (src.charCodeAt(0) === 35 && src.charCodeAt(1) === 33) {
+        while (i < n && src.charCodeAt(i) !== 10) i++;
+    }
+    while (i < n) {
+        const c = src.charCodeAt(i);
+        if (inTplText) {
+            if (c === 92) { i += 2; continue; }
+            if (c === 96) { inTplText = false; i++; continue; }
+            if (c === 36 && i + 1 < n && src.charCodeAt(i + 1) === 123) {
+                inTplText = false;
+                tplBrace.push(brace);
+                brace++;
+                i += 2;
+                continue;
+            }
+            i++;
+            continue;
+        }
+        if (c === 96) { inTplText = true; i++; continue; }
+        if (c === 39 || c === 34) {
+            const q = c;
+            i++;
+            while (i < n) {
+                const d = src.charCodeAt(i);
+                if (d === 92) { i += 2; continue; }
+                if (d === q) break;
+                if (q !== 96 && d === 10) break;
+                i++;
+            }
+            i++;
+            continue;
+        }
+        if (c === 47) {
+            const c2 = i + 1 < n ? src.charCodeAt(i + 1) : 0;
+            if (c2 === 47) {
+                i += 2;
+                while (i < n && src.charCodeAt(i) !== 10) i++;
+                continue;
+            }
+            if (c2 === 42) {
+                i += 2;
+                while (i + 1 < n && !(src.charCodeAt(i) === 42 && src.charCodeAt(i + 1) === 47)) i++;
+                i += 2;
+                continue;
+            }
+            i++;
+            continue;
+        }
+        if (c === 123) { brace++; i++; continue; }
+        if (c === 125) {
+            brace--;
+            if (tplBrace.length > 0 && tplBrace[tplBrace.length - 1] === brace) {
+                tplBrace.pop();
+                inTplText = true;
+            }
+            i++;
+            continue;
+        }
+        if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95 || c === 36) {
+            const s = i;
+            while (i < n) {
+                const d = src.charCodeAt(i);
+                if ((d >= 48 && d <= 57) || (d >= 65 && d <= 90) ||
+                    (d >= 97 && d <= 122) || d === 95 || d === 36) i++;
+                else break;
+            }
+            const len = i - s;
+            const skipWs = (j) => {
+                while (j < n) {
+                    const w = src.charCodeAt(j);
+                    if (w === 32 || w === 9 || w === 13 || w === 10) j++;
+                    else break;
+                }
+                return j;
+            };
+            // eval( / eval)(
+            if (len === 4 && src.charCodeAt(s) === 101 && src.charCodeAt(s + 1) === 118 &&
+                src.charCodeAt(s + 2) === 97 && src.charCodeAt(s + 3) === 108) {
+                let j = skipWs(i);
+                if (j < n && src.charCodeAt(j) === 40) return true;
+                if (j < n && src.charCodeAt(j) === 41) {
+                    j = skipWs(j + 1);
+                    if (j < n && src.charCodeAt(j) === 40) return true;
+                }
+                continue;
+            }
+            // Function(
+            if (len === 8 && src.charCodeAt(s) === 70 && src.charCodeAt(s + 1) === 117 &&
+                src.charCodeAt(s + 2) === 110 && src.charCodeAt(s + 3) === 99 &&
+                src.charCodeAt(s + 4) === 116 && src.charCodeAt(s + 5) === 105 &&
+                src.charCodeAt(s + 6) === 111 && src.charCodeAt(s + 7) === 110) {
+                let j = skipWs(i);
+                if (j < n && src.charCodeAt(j) === 40) return true;
+                continue;
+            }
+            // new Function(
+            if (len === 3 && src.charCodeAt(s) === 110 && src.charCodeAt(s + 1) === 101 &&
+                src.charCodeAt(s + 2) === 119) {
+                let j = skipWs(i);
+                const fs = j;
+                while (j < n) {
+                    const d = src.charCodeAt(j);
+                    if ((d >= 48 && d <= 57) || (d >= 65 && d <= 90) ||
+                        (d >= 97 && d <= 122) || d === 95 || d === 36) j++;
+                    else break;
+                }
+                if (j - fs === 8 && src.charCodeAt(fs) === 70 &&
+                    src.charCodeAt(fs + 1) === 117 && src.charCodeAt(fs + 2) === 110 &&
+                    src.charCodeAt(fs + 3) === 99 && src.charCodeAt(fs + 4) === 116 &&
+                    src.charCodeAt(fs + 5) === 105 && src.charCodeAt(fs + 6) === 111 &&
+                    src.charCodeAt(fs + 7) === 110) {
+                    j = skipWs(j);
+                    if (j < n && src.charCodeAt(j) === 40) return true;
+                }
+                continue;
+            }
+            continue;
+        }
+        if (c >= 48 && c <= 57) {
+            while (i < n) {
+                const d = src.charCodeAt(i);
+                if ((d >= 48 && d <= 57) || (d >= 65 && d <= 90) ||
+                    (d >= 97 && d <= 122) || d === 95 || d === 46) i++;
+                else break;
+            }
+            continue;
+        }
+        i++;
+    }
+    return false;
+}
+
 function sourceHasRegExpCall(src) {
     const target = "Reg" + "Exp"; // 拆开拼接:免得本文件自己命中
     const n = src.length;
@@ -4005,6 +5175,96 @@ function sourceHasRegExpCall(src) {
                     else break;
                 }
                 if (j < n && src.charCodeAt(j) === 40) return true;
+                // RegExp.escape(...)：构造调用扫描看不到 `RegExp(`，但必须注入
+                // __regexp_shim，否则 __RE_escape 改派/静态属性都链不上。
+                if (j < n && src.charCodeAt(j) === 46) {
+                    let k = j + 1;
+                    while (k < n) {
+                        const w = src.charCodeAt(k);
+                        if (w === 32 || w === 9 || w === 13 || w === 10) k++;
+                        else break;
+                    }
+                    if (k + 6 <= n && src.slice(k, k + 6) === "escape") {
+                        const after = k + 6 < n ? src.charCodeAt(k + 6) : 0;
+                        if (!((after >= 48 && after <= 57) || (after >= 65 && after <= 90) ||
+                              (after >= 97 && after <= 122) || after === 95 || after === 36)) {
+                            return true;
+                        }
+                    }
+                    // RegExp.prototype[Symbol.*] 覆写/取值族:无字面量也须注入,
+                    // 否则 String#match 走 _str_match、@@split 走空壳。只认
+                    // `prototype[Symbol`——`RegExp.prototype.exec` 名/描述符测例
+                    // 不得灌 360KB shim(会改 .name 并拖慢编译)。
+                    if (k + 9 <= n && src.slice(k, k + 9) === "prototype") {
+                        const after = k + 9 < n ? src.charCodeAt(k + 9) : 0;
+                        if (!((after >= 48 && after <= 57) || (after >= 65 && after <= 90) ||
+                              (after >= 97 && after <= 122) || after === 95 || after === 36)) {
+                            let p = k + 9;
+                            while (p < n) {
+                                const w = src.charCodeAt(p);
+                                if (w === 32 || w === 9 || w === 13 || w === 10) p++;
+                                else break;
+                            }
+                            if (p < n && src.charCodeAt(p) === 91) {
+                                p++;
+                                while (p < n) {
+                                    const w = src.charCodeAt(p);
+                                    if (w === 32 || w === 9 || w === 13 || w === 10) p++;
+                                    else break;
+                                }
+                                if (p + 6 <= n && src.slice(p, p + 6) === "Symbol") return true;
+                            }
+                        }
+                    }
+                }
+                // heritage 为 RegExp 标识符(`class C extends` + 该名):无调用括号
+                // 也须注入,否则派生 super() 链不上 __RE_new。
+                let k = s;
+                while (k > 0) {
+                    const w = src.charCodeAt(k - 1);
+                    if (w === 32 || w === 9 || w === 13 || w === 10) k--;
+                    else break;
+                }
+                if (k >= 7 && src.slice(k - 7, k) === "extends") {
+                    const prev = k >= 8 ? src.charCodeAt(k - 8) : 0;
+                    if (!((prev >= 48 && prev <= 57) || (prev >= 65 && prev <= 90) ||
+                          (prev >= 97 && prev <= 122) || prev === 95 || prev === 36)) {
+                        return true;
+                    }
+                }
+            }
+            // Symbol.search / Symbol.matchAll:无 `RegExp(` / 字面量也须注入,
+            // 否则 `"ab3c".search({[Symbol.search]:null,toString:()=>"\\d"})`
+            // 与 `"a1b1c".matchAll(1)` 走原生 indexOf、无 .index。
+            if (i - s === 6 && src.slice(s, i) === "Symbol") {
+                let j = i;
+                while (j < n) {
+                    const w = src.charCodeAt(j);
+                    if (w === 32 || w === 9 || w === 13 || w === 10) j++;
+                    else break;
+                }
+                if (j < n && src.charCodeAt(j) === 46) {
+                    let k = j + 1;
+                    while (k < n) {
+                        const w = src.charCodeAt(k);
+                        if (w === 32 || w === 9 || w === 13 || w === 10) k++;
+                        else break;
+                    }
+                    if (k + 6 <= n && src.slice(k, k + 6) === "search") {
+                        const after = k + 6 < n ? src.charCodeAt(k + 6) : 0;
+                        if (!((after >= 48 && after <= 57) || (after >= 65 && after <= 90) ||
+                              (after >= 97 && after <= 122) || after === 95 || after === 36)) {
+                            return true;
+                        }
+                    }
+                    if (k + 8 <= n && src.slice(k, k + 8) === "matchAll") {
+                        const after = k + 8 < n ? src.charCodeAt(k + 8) : 0;
+                        if (!((after >= 48 && after <= 57) || (after >= 65 && after <= 90) ||
+                              (after >= 97 && after <= 122) || after === 95 || after === 36)) {
+                            return true;
+                        }
+                    }
+                }
             }
             continue;
         }
@@ -4025,6 +5285,11 @@ function sourceHasRegExpCall(src) {
 // 从 "/"(下标 i)起跳过正则字面量体,返回闭合 "/" 之后的下标;同一行内无合法
 // 闭合(或体为空)返回 -1。规则与 scanRegexLiteralBody 一一对应(后者只判有无、
 // 本函数给出终点,供 sourceHasTopLevelEsmDecl 整体跳过正则)。
+
+function sourceHasRegExpShimTrigger(src) {
+    return sourceHasBareNewRegExp(src) || sourceHasRegExpCall(src);
+}
+
 function skipRegexLiteralBody(src, i) {
     const n = src.length;
     let j = i + 1;
@@ -4063,6 +5328,7 @@ function skipRegexLiteralBody(src, i) {
 // 已知偏差(与原扫描同错或更准,不劣化):非 ASCII 字节紧邻的 "export" 子串仍
 // 可能误判(同原扫描);")" 之后的正则按除法处理(regexCanStartAfter 保守分支,
 // 与本编译器解析器自身对 ")" 后 "/" 的处理一致,不引入新分歧)。
+
 function sourceHasTopLevelEsmDecl(src) {
     const n = src.length;
     let i = 0;
@@ -4207,6 +5473,7 @@ function sourceHasTopLevelEsmDecl(src) {
 // 编译内不变(文件系统快照语义)。省掉每次重复的 path.resolve/normalize/existsSync/
 // statSync(每次 import 数个系统调用与一串串操作,自编译实测 resolveImports 簇 ~6.7%)。
 // 进程级 Map:CLI 单编译进程天然有界;route B 多次编译共享亦无碍(内容只增)。
+
 const _resolvePathMemo = new Map();
 
 function resolveModulePath(importSource, sourcePath, nodeShimPath, pathMod, fsMod, forRequire) {
@@ -4275,10 +5542,14 @@ function resolveModulePathUncached(importSource, sourcePath, nodeShimPath, pathM
 }
 
 // .js/.mjs 结尾的路径一般是文件,但**目录**也可能叫这名(仓库更名 asm.js 后,
-// clone 目录即 "asm.js")。node 下 statSync 实辨;自举运行时该 shim 恒返 false,
-// 调用方退回原后缀启发式(行为与旧版一致)。
+// clone 目录即 "asm.js")。node 下 statSync 实辨;native stat 的 isDirectory 恒
+// false,用 existsSync(p+"/.") 区分目录与文件,不能再靠后缀启发式 dirname。
 function pathIsDirectory(fsMod, p) {
-    try { return fsMod.statSync(p).isDirectory() === true; } catch (e) { return false; }
+    try { if (fsMod.statSync(p).isDirectory()) return true; } catch (e) {}
+    // native statSync 的 isDirectory 恒 false(把一切当文件)。仓库目录名是 asm.js,
+    // 不能靠 ".js 后缀=文件" 再 dirname,否则相对导入丢一层 → gen2 空壳。
+    // Unix:目录可 open("dir/."),文件 "file/." 失败。
+    try { return !!fsMod.existsSync(p + "/."); } catch (e) { return false; }
 }
 
 // 折叠路径里的 "." 与 ".."（不依赖 pathMod.normalize，其在自举运行时可能不可靠）

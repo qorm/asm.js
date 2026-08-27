@@ -1,11 +1,19 @@
 // asm.js 编译器 - 运算符编译
 // 编译二元运算、一元运算、逻辑运算等
 
-import { VReg } from "../../vm/index.js";
+import { VReg } from "../../vm/registers.js";
 import { Type, inferType, isIntType, isFloatType } from "../core/types.js";
 
 const TYPE_FLOAT64 = 29;
 const TYPE_NUMBER = 13;
+
+// 热路径算符表:模块级短数组,避免每次 BinaryExpression 都 new 数组。
+const ARITH_OPS_AS_INT = { "+": 1, "-": 1, "*": 1, "/": 1, "%": 1 };
+const ARITH_OPS_BIN = { "+": 1, "-": 1, "*": 1, "/": 1 };
+const FLOAT_DIV_OPS = { "/": 1, "%": 1 };
+const NAN_ARITH_OPS = { "-": 1, "*": 1, "/": 1, "%": 1 };
+const REL_OPS_NUM = { "<": 1, "<=": 1, ">": 1, ">=": 1 };
+const INT_BIN_OPS = { "+": 1, "-": 1, "*": 1 };
 
 // 将 JavaScript number 转换为 IEEE 754 double 的 64 位整数表示。
 // 纯算术实现（不用 ArrayBuffer/Float64Array/BigInt64Array 别名视图）——自举 gen1 里
@@ -205,11 +213,13 @@ export const OperatorCompiler = {
         // 对于二元表达式，递归处理
         if (expr.type === "BinaryExpression") {
             const op = expr.operator;
-            if (["+", "-", "*", "/", "%"].includes(op)) {
-                this.compileExpressionAsInt(expr.right);
-                this.vm.push(VReg.RET);
+            if (ARITH_OPS_AS_INT[op]) {
+                // 左→右求值序(规范 GetValue 顺序;抛错测例依赖)
                 this.compileExpressionAsInt(expr.left);
-                this.vm.pop(VReg.V1);
+                this.vm.push(VReg.RET);
+                this.compileExpressionAsInt(expr.right);
+                this.vm.mov(VReg.V1, VReg.RET); // V1 = right
+                this.vm.pop(VReg.RET);          // RET = left
 
                 switch (op) {
                     case "+":
@@ -309,10 +319,8 @@ export const OperatorCompiler = {
             }
             if (result !== null) {
                 if (typeof result === "boolean") {
-                    // 返回 JS 布尔值 _js_true 或 _js_false
-                    const boolLabel = result ? "_js_true" : "_js_false";
-                    this.vm.lea(VReg.RET, boolLabel);
-                    this.vm.load(VReg.RET, VReg.RET, 0);
+                    // 返回 JS 布尔值（NaN-box bool tag）
+                    this.vm.movImm64(VReg.RET, result ? 0x7ff9000000000001n : 0x7ff9000000000000n);
                 } else if (typeof result === "string") {
                     // 字符串折叠结果("" + 2.5 之类)按串字面量发射——曾误走
                     // compileNumericLiteral 把 "2.5" 编成数字 2.5(#15 实锤)
@@ -332,7 +340,7 @@ export const OperatorCompiler = {
         const isStaticNaN = (e) =>
             (e && e.type === "Literal" && e.value === undefined) ||
             (e && e.type === "Identifier" && e.name === "NaN");
-        if (["-", "*", "/", "%"].indexOf(op) >= 0 &&
+        if (NAN_ARITH_OPS[op] &&
             (isStaticNaN(expr.left) || isStaticNaN(expr.right))) {
             this.vm.movImm64(VReg.RET, 0x7ff0000000000001n);
             return;
@@ -367,11 +375,14 @@ export const OperatorCompiler = {
             // 否则 _number_coerce 后浮点加法）。
             // BIGINT 也走 _js_add（内部双 _is_bigint → i64 加；否则回落）。
             // 否则 10n+5n 两侧静态 BIGINT 会绕过动态分派落浮点得 "0."。
-            // ARRAY/OBJECT 也走 _js_add(其内 ToPrimitive:数组→逗号串、对象→valueOf/toString)。
+            // ARRAY/OBJECT/FUNCTION 也走 _js_add(其内 ToPrimitive:数组→逗号串、
+            // 对象/函数→valueOf/toString)。函数静态类型不是 OBJECT,字面量
+            // `fn+fn` / `1+fn` 否则落 fadd,NaN-box 函数标成 NaN。
             if (leftType === Type.UNKNOWN || rightType === Type.UNKNOWN ||
                 leftType === Type.BIGINT || rightType === Type.BIGINT ||
                 leftType === Type.ARRAY || rightType === Type.ARRAY ||
-                leftType === Type.OBJECT || rightType === Type.OBJECT) {
+                leftType === Type.OBJECT || rightType === Type.OBJECT ||
+                leftType === Type.FUNCTION || rightType === Type.FUNCTION) {
                 // [fix-stack-corrupt] 使用 FP 槽保存左值,避免 push/pop 异常路径栈失衡
                 this.compileExpression(expr.left);
                 const tmpSlot = this.ctx.allocLocal("__tmp_add_left");
@@ -390,11 +401,11 @@ export const OperatorCompiler = {
         const bitwiseFns = { "&": "_js_band", "|": "_js_bor", "^": "_js_bxor",
             "<<": "_js_bshl", ">>": "_js_bshr", ">>>": "_js_bushr" };
         if (bitwiseFns[op]) {
-            this.compileExpression(expr.right);
-            this.vm.push(VReg.RET);
             this.compileExpression(expr.left);
-            this.vm.mov(VReg.A0, VReg.RET); // left
-            this.vm.pop(VReg.A1); // right
+            this.vm.push(VReg.RET);
+            this.compileExpression(expr.right);
+            this.vm.mov(VReg.A1, VReg.RET); // right
+            this.vm.pop(VReg.A0);           // left
             this.vm.call(bitwiseFns[op]);
             return;
         }
@@ -406,19 +417,19 @@ export const OperatorCompiler = {
         const cmpBig = { "===": "seq", "!==": "sne", "==": "aeq", "!=": "ane",
             "<": "lt", "<=": "le", ">": "gt", ">=": "ge" };
         if (cmpBig[op] && (isBigOperand(expr.left) || isBigOperand(expr.right))) {
-            this.compileExpression(expr.right);
-            this.vm.push(VReg.RET);
             this.compileExpression(expr.left);
-            this.vm.mov(VReg.A0, VReg.RET);
-            this.vm.pop(VReg.A1);
+            this.vm.push(VReg.RET);
+            this.compileExpression(expr.right);
+            this.vm.mov(VReg.A1, VReg.RET);
+            this.vm.pop(VReg.A0);
             const kind = cmpBig[op];
-            const setTrue = () => { this.vm.lea(VReg.RET, "_js_true"); this.vm.load(VReg.RET, VReg.RET, 0); };
-            const setFalse = () => { this.vm.lea(VReg.RET, "_js_false"); this.vm.load(VReg.RET, VReg.RET, 0); };
+            const setTrue = () => { this.vm.movImm64(VReg.RET, 0x7ff9000000000001n); };
+            const setFalse = () => { this.vm.movImm64(VReg.RET, 0x7ff9000000000000n); };
             // 与 _js_true 比对后取反（!==/!= 用）
             const negate = () => {
                 const t = this.ctx.newLabel("bneg_t");
                 const e2 = this.ctx.newLabel("bneg_e");
-                this.vm.lea(VReg.V1, "_js_true"); this.vm.load(VReg.V1, VReg.V1, 0);
+                this.vm.movImm64(VReg.V1, 0x7ff9000000000001n);
                 this.vm.cmp(VReg.RET, VReg.V1);
                 this.vm.jeq(t);
                 setTrue(); this.vm.jmp(e2);
@@ -454,11 +465,11 @@ export const OperatorCompiler = {
         // _is_bigint 守卫，非 bigint 回落浮点。`+` 已走 _js_add 无需在此处理。
         const arithBig = { "-": "_js_bsub", "*": "_js_bmul", "/": "_js_bdiv", "%": "_js_bmod", "**": "_js_bpow" };
         if (arithBig[op] && (isBigOperand(expr.left) || isBigOperand(expr.right))) {
-            this.compileExpression(expr.right);
-            this.vm.push(VReg.RET);
             this.compileExpression(expr.left);
-            this.vm.mov(VReg.A0, VReg.RET); // left
-            this.vm.pop(VReg.A1); // right
+            this.vm.push(VReg.RET);
+            this.compileExpression(expr.right);
+            this.vm.mov(VReg.A1, VReg.RET); // right
+            this.vm.pop(VReg.A0);           // left
             this.vm.call(arithBig[op]);
             return;
         }
@@ -479,11 +490,11 @@ export const OperatorCompiler = {
             return isIntType(t) || isFloatType(t) || t === Type.NUMBER;
         };
         if (relHelper[op] && !(staticNumeric(expr.left) && staticNumeric(expr.right))) {
-            this.compileExpression(expr.right);
-            this.vm.push(VReg.RET);
             this.compileExpression(expr.left);
-            this.vm.mov(VReg.A0, VReg.RET); // left
-            this.vm.pop(VReg.A1);           // right
+            this.vm.push(VReg.RET);
+            this.compileExpression(expr.right);
+            this.vm.mov(VReg.A1, VReg.RET); // right
+            this.vm.pop(VReg.A0);           // left
             this.vm.call(relHelper[op]);
             return;
         }
@@ -494,7 +505,7 @@ export const OperatorCompiler = {
         // 比较,避免 induction 变量的循环条件 `i < N` 退回浮点 fcmp(N 字面量默认推断
         // 为 NUMBER 非 int)。仅限关系运算(<,<=,>,>=):值比较,对正负 int64 语义正确;
         // 不含 ==/=== —— 位相等语义 + NaN≡int0 别名(见 nan-int0-alias-trap)另论。
-        if (!isIntOp && ["<", "<=", ">", ">="].indexOf(op) >= 0) {
+        if (!isIntOp && REL_OPS_NUM[op]) {
             const isIntLit = (n) => (n.type === "Literal" || n.type === "NumericLiteral") && typeof n.value === "number" && n.value === Math.floor(n.value);
             const isRawId = (n) => n.type === "Identifier" && this.ctx.isRawIntVar(n.name);
             if ((isRawId(expr.left) && (isIntLit(expr.right) || isRawId(expr.right))) ||
@@ -505,16 +516,17 @@ export const OperatorCompiler = {
 
         // 对于 +, -, *, / 运算，根据类型选择浮点或整数运算
         // 注意: / 和 % 必须使用浮点运算，因为 JS 总是返回浮点数
-        const isArithOp = ["+", "-", "*", "/"].includes(op);
+        const isArithOp = ARITH_OPS_BIN[op];
         // 判断是否为需要浮点运算的操作（即使操作数是整数）
-        const needsFloatDiv = ["/", "%"].includes(op);
+        const needsFloatDiv = FLOAT_DIV_OPS[op];
 
         if (isIntOp && !needsFloatDiv) {
-            // int 类型：使用整数运算
-            this.compileExpressionAsInt(expr.right);
-            this.vm.push(VReg.RET);
+            // int 类型：使用整数运算(左→右求值)
             this.compileExpressionAsInt(expr.left);
-            this.vm.pop(VReg.V1);
+            this.vm.push(VReg.RET);
+            this.compileExpressionAsInt(expr.right);
+            this.vm.mov(VReg.V1, VReg.RET); // V1 = right
+            this.vm.pop(VReg.RET);          // RET = left
 
             // 注:compileBinaryExpression 是**装箱值**入口(int 上下文另走
             // compileExpressionAsInt 的独立递归,line 206)。故 +/-/* 的裸 int 结果必须
@@ -677,7 +689,7 @@ export const OperatorCompiler = {
                 // 分支**装箱**成 float64 位(不再裸 int),RET 即 float64 位模式 = 该数值,
                 // 无需再转。此前这里的 intToFloat64Bits 在装箱修复后变**双重转换**:把装箱
                 // float64 当整数再转 → `i*i-2*i`(此操作数走浮点路径,`i*i` 经此)得 i*i 位模式。
-                if (["+", "-", "*"].indexOf(bop) >= 0 && this.isIntExpression(operand)) {
+                if (INT_BIN_OPS[bop] && this.isIntExpression(operand)) {
                     return;
                 }
                 let rawFloat = (bop === "/" || bop === "%");
@@ -793,14 +805,12 @@ export const OperatorCompiler = {
 
         // 非整数类型的 == 和 != 需要使用 JSValue 抽象相等比较
         if (op === "==" || op === "!=") {
-            // 编译右操作数为 JSValue
-            compileOperandAsJSValue(expr.right);
-            this.vm.push(VReg.RET);
-            // 编译左操作数为 JSValue
+            // 左→右求值序
             compileOperandAsJSValue(expr.left);
-            this.vm.pop(VReg.V1);
-            this.vm.mov(VReg.A0, VReg.RET);
-            this.vm.mov(VReg.A1, VReg.V1);
+            this.vm.push(VReg.RET);
+            compileOperandAsJSValue(expr.right);
+            this.vm.mov(VReg.A1, VReg.RET);
+            this.vm.pop(VReg.A0);
             this.vm.call("_abstract_eq");
             // `!=` 是 `==` 的取反。此前对 `!=` 直接返回 _abstract_eq 结果**未取反**——
             // `x != null` 等恒返 `x == null`(倒置),破坏 `arr.filter(x=>x!=null)` 等常见
@@ -948,6 +958,9 @@ export const OperatorCompiler = {
             const bn = expr.right.name;
             if (bn === "Array") biWantType = 1;   // [底层A] 数组块 type 字节=1;裸 Array 已一等化,
                                                   // 内联短路避免把真闭包当 classinfo 走 _iof_user。
+                                                  // Proxy-of-Array:type=8 → biF → _instanceof;
+                                                  // 若 A1 为一等 Array 闭包则走原型链(IsArray
+                                                  // 请用 Array.isArray / 见 JSON reviver)。
             else if (bn === "Date") biWantType = 7;
             else if (bn === "Map") biWantType = 4;
             else if (bn === "Set") biWantType = 5;
@@ -968,7 +981,7 @@ export const OperatorCompiler = {
         }
         if (biWantType !== 0) {
             const wantType = biWantType;
-            const biF = this.ctx.newLabel("binst_f");
+            const biF = this.ctx.newLabel("binst_fall");
             const biEnd = this.ctx.newLabel("binst_end");
             compileOperandAsJSValue(expr.left);
             this.vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
@@ -987,8 +1000,39 @@ export const OperatorCompiler = {
             this.vm.jne(biF);
             this.vm.movImm64(VReg.RET, 0x7ff9000000000001n); // was lea+load _js const
             this.vm.jmp(biEnd);
+            // type 不匹配:不直接 false——`class C extends Promise{}` 的实例可能是
+            // TYPE_OBJECT(挂 C.prototype→Promise.prototype),须走下方原型链 instanceof。
+            // 越堆界/非堆值亦落此,再经泛型路径得 false。
             this.vm.label(biF);
-            this.vm.movImm64(VReg.RET, 0x7ff9000000000000n); // was lea+load _js const
+            // type 不匹配:
+            // - Array:再试 IsArray(Proxy-of-Array);仍否 → 原型链(class extends Array)
+            // - 其它内建:原型链 _instanceof(class C extends Promise 等 TYPE_OBJECT)
+            if (wantType === 1) {
+                const arrSlot = this.ctx.allocLocal(`__binst_arr_${this.nextLabelId()}`);
+                compileOperandAsJSValue(expr.left);
+                this.vm.store(VReg.FP, arrSlot, VReg.RET);
+                this.vm.mov(VReg.A0, VReg.RET);
+                this.vm.call("_is_array_value");
+                this.vm.cmpImm(VReg.RET, 0);
+                const arrChain = this.ctx.newLabel("binst_arr_chain");
+                this.vm.jeq(arrChain);
+                this.vm.movImm64(VReg.RET, 0x7ff9000000000001n);
+                this.vm.jmp(biEnd);
+                this.vm.label(arrChain);
+                this.vm.load(VReg.A0, VReg.FP, arrSlot);
+                this.compileExpression(expr.right);
+                this.vm.mov(VReg.A1, VReg.RET);
+                this.vm.load(VReg.A0, VReg.FP, arrSlot);
+                this.vm.call("_instanceof");
+                this.vm.jmp(biEnd);
+            }
+            compileOperandAsJSValue(expr.left); // 恢复 left(上方 V 寄存器可能被冲)
+            this.vm.mov(VReg.S0, VReg.RET);
+            this.vm.mov(VReg.A0, VReg.RET);
+            this.compileExpression(expr.right);
+            this.vm.mov(VReg.A1, VReg.RET);
+            this.vm.mov(VReg.A0, VReg.S0);
+            this.vm.call("_instanceof");
             this.vm.label(biEnd);
             return;
         }
@@ -1028,13 +1072,14 @@ export const OperatorCompiler = {
         if (op === "instanceof") {
             // [Symbol.hasInstance] 优先:right 定义了则以 right[Symbol.hasInstance](left) 定夺;
             // 否则(哨兵裸 0)回退常规原型链 _instanceof。用户类/对象经此路径,内建族在上方快路。
+            // 左→右求值序(规范 GetValue 顺序)。
             const iofROff = this.ctx.allocLocal(`__iof_r_${this.nextLabelId()}`);
             const iofLOff = this.ctx.allocLocal(`__iof_l_${this.nextLabelId()}`);
             const iofDone = this.ctx.newLabel("iof_hasinst_done");
-            compileOperandAsJSValue(expr.right);
-            this.vm.store(VReg.FP, iofROff, VReg.RET);
             compileOperandAsJSValue(expr.left);
             this.vm.store(VReg.FP, iofLOff, VReg.RET);
+            compileOperandAsJSValue(expr.right);
+            this.vm.store(VReg.FP, iofROff, VReg.RET);
             this.vm.load(VReg.A0, VReg.FP, iofROff); // right
             this.vm.load(VReg.A1, VReg.FP, iofLOff); // left
             this.vm.call("_try_hasinstance");
@@ -1051,28 +1096,30 @@ export const OperatorCompiler = {
         // 字符串 key 被转成 NaN → getStrContent 解引用 tag(0x7ff8)崩。此处提前处理:
         // RET=key、V1=obj,取 key content + obj 裸指针调 _prop_in,再把裸 0/1 装箱布尔。
         if (op === "in") {
-            // obj 裸指针先算好压栈(getStrContent/js_unbox 会 clobber 临时寄存器 V1/A1,
-            // 故用栈暂存,_prop_in 前才把 A0/A1 装好)。
-            compileOperandAsJSValue(expr.right); // obj → RET
-            this.vm.mov(VReg.A0, VReg.RET);
-            this.vm.call("_js_unbox");
-            this.vm.push(VReg.RET); // 栈: [obj 裸指针]
+            // 左→右求值序:先 key 后 obj(规范;`(NUMBER=Number,"MAX_VALUE") in NUMBER`)
+            const inObjOff = this.ctx.allocLocal(`__in_obj_${this.nextLabelId()}`);
             const inLeftIsPrivate = expr.left.type === "PrivateIdentifier" ||
                 (expr.left.type === "Identifier" && expr.left.name && expr.left.name.charAt(0) === "#");
             const inResultReady = this.ctx.newLabel("in_result_ready");
             if (inLeftIsPrivate) {
-                // [ES2022] #x in o:私有字段存在性检查。表达式位的 `#x` 解析为 Identifier
-                // (name="#x")或 PrivateIdentifier;键 = manglePrivateName("#x")= "#ClassName#x"
-                // (与 this.#x 访问端一致的存储键),直接查 _prop_in。
+                // [ES2022] #x in o:先求 obj,再查私有键。
+                compileOperandAsJSValue(expr.right);
+                this.vm.mov(VReg.A0, VReg.RET);
+                this.vm.call("_js_unbox");
+                this.vm.store(VReg.FP, inObjOff, VReg.RET);
                 this.emitBoxedStringKey(this.manglePrivateName(expr.left.name), VReg.A0);
                 this.vm.call("_getStrContent");
                 this.vm.mov(VReg.A1, VReg.RET);
-                this.vm.pop(VReg.A0);
+                this.vm.load(VReg.A0, VReg.FP, inObjOff);
                 this.vm.call("_prop_in");
             } else {
                 compileOperandAsJSValue(expr.left); // key → RET(装箱)
                 const inKeyOff = this.ctx.allocLocal(`__in_key_${this.nextLabelId()}`);
                 this.vm.store(VReg.FP, inKeyOff, VReg.RET);
+                compileOperandAsJSValue(expr.right); // obj → RET
+                this.vm.mov(VReg.A0, VReg.RET);
+                this.vm.call("_js_unbox");
+                this.vm.store(VReg.FP, inObjOff, VReg.RET);
                 // symbol 键:按身份判存在,走 _object_has(装箱键 + _object_key_eq,与 hasOwn
                 // 一致)。此前 _getStrContent(symbol)+_prop_in 逐字节比 → `sym in o` 恒 false。
                 // (own-only:继承的 symbol 键极罕见,记偏差)
@@ -1087,11 +1134,11 @@ export const OperatorCompiler = {
                 this.vm.mov(VReg.A0, VReg.RET);
                 this.vm.call("_getStrContent");
                 this.vm.mov(VReg.A1, VReg.RET);
-                this.vm.pop(VReg.A0);
+                this.vm.load(VReg.A0, VReg.FP, inObjOff);
                 this.vm.call("_prop_in");
                 this.vm.jmp(inResultReady);
                 this.vm.label(inSymKey);
-                this.vm.pop(VReg.A0); // obj 裸指针
+                this.vm.load(VReg.A0, VReg.FP, inObjOff);
                 this.vm.load(VReg.A1, VReg.FP, inKeyOff); // 装箱 symbol 键
                 this.vm.call("_object_has");
             }
@@ -1114,12 +1161,11 @@ export const OperatorCompiler = {
         // `while ((m = re.exec(s)) !== null)` 每轮吃掉两个匹配、
         // `if (f() === x)` 调 f 两次(副作用重放,长期潜伏)。
         if (op === "==" || op === "===" || op === "!=" || op === "!==") {
-            compileOperandAsJSValue(expr.right);
-            this.vm.push(VReg.RET);
             compileOperandAsJSValue(expr.left);
-            this.vm.pop(VReg.V1);
-            this.vm.mov(VReg.A0, VReg.RET);
-            this.vm.mov(VReg.A1, VReg.V1);
+            this.vm.push(VReg.RET);
+            compileOperandAsJSValue(expr.right);
+            this.vm.mov(VReg.A1, VReg.RET);
+            this.vm.pop(VReg.A0);
             this.vm.call(op === "==" || op === "!=" ? "_abstract_eq" : "_strict_eq");
             if (op === "==" || op === "===") return;
             // != / !==:对相等结果取反。
@@ -1149,14 +1195,38 @@ export const OperatorCompiler = {
         const mightBeNaN = !(numTy(inferType(expr.left, this.ctx)) &&
                              numTy(inferType(expr.right, this.ctx)));
 
-        // [fix-stack-corrupt] 使用 FP 槽保存右值,避免 push/pop 异常路径栈失衡
-        compileOperandAsFloat(expr.right);
-        const floatTmpSlot = this.ctx.allocLocal("__tmp_float_right");
+        // `**`:Evaluate lhs → Evaluate rhs → ToNumeric(lhs) → ToNumeric(rhs)。
+        // compileOperandAsFloat 会立刻 ToNumber,lhs.valueOf 会在 rhs 求值前抛
+        // (exponentiation/order-of-evaluation)。数值热路径(+-*/)不走此分支。
+        if (op === "**") {
+            this.compileExpression(expr.left);
+            const powL = this.ctx.allocLocal(`__pow_l_${this.nextLabelId()}`);
+            this.vm.store(VReg.FP, powL, VReg.RET);
+            this.compileExpression(expr.right);
+            const powR = this.ctx.allocLocal(`__pow_r_${this.nextLabelId()}`);
+            this.vm.store(VReg.FP, powR, VReg.RET);
+            this.vm.load(VReg.RET, VReg.FP, powL);
+            this.emitNumberCoerceFast();
+            this.vm.store(VReg.FP, powL, VReg.RET);
+            this.vm.load(VReg.RET, VReg.FP, powR);
+            this.emitNumberCoerceFast();
+            this.vm.mov(VReg.A1, VReg.RET);
+            this.vm.load(VReg.A0, VReg.FP, powL);
+            this.vm.call("_math_pow");
+            if (mightBeNaN) this.emitNaNCanon();
+            return;
+        }
+
+        // [fix-stack-corrupt] 使用 FP 槽保存左值,避免 push/pop 异常路径栈失衡
+        // 左→右求值序(规范;抛错测例依赖)
+        compileOperandAsFloat(expr.left);
+        const floatTmpSlot = this.ctx.allocLocal("__tmp_float_left");
         this.vm.store(VReg.FP, floatTmpSlot, VReg.RET);
 
-        // 计算左操作数
-        compileOperandAsFloat(expr.left);
-        this.vm.load(VReg.V1, VReg.FP, floatTmpSlot);
+        // 计算右操作数
+        compileOperandAsFloat(expr.right);
+        this.vm.mov(VReg.V1, VReg.RET); // V1 = right
+        this.vm.load(VReg.RET, VReg.FP, floatTmpSlot); // RET = left
 
         // 对于算术运算，使用浮点指令
         if (isArithOp) {
@@ -1492,6 +1562,15 @@ export const OperatorCompiler = {
         if (expr.operator === "delete") {
             const darg = expr.argument;
             if (darg && darg.type === "MemberExpression") {
+                // delete SuperProperty → ReferenceError(规范;不走 [[Delete]])。
+                // SuperProperty 会求值计算键,但不 ToPropertyKey(topropertykey 测例)。
+                if (darg.object && darg.object.type === "SuperExpression") {
+                    if (darg.computed && darg.property) {
+                        this.compileExpression(darg.property);
+                    }
+                    this.emitThrowReferenceError("Unsupported reference to 'super'");
+                    return;
+                }
                 // 静态键:computed 中只有字符串字面量与 well-known Symbol 成员
                 // (Symbol.iterator/asyncIterator → "Symbol.xxx",与读写侧归一一致)
                 // 是静态键——computed 的 Identifier 是变量必须走动态求值(镜像
@@ -1535,34 +1614,54 @@ export const OperatorCompiler = {
                     this.vm.movImm64(VReg.RET, 0x7ff9000000000000n);
                     return;
                 }
+                const delDone = this.ctx.newLabel("del_id_done");
+                // with 对象环境优先于全局/模块绑定:`delete p3` 须删 with 对象上的 p3。
+                if (this._hasAnyWithScope && this._hasAnyWithScope()) {
+                    const _delGroups = [this.ctx.withScopes || []];
+                    if (!(this._isOwnBinding && this._isOwnBinding(darg.name))) {
+                        _delGroups.push(this.ctx.outerWithScopes || []);
+                    }
+                    for (let _gi = 0; _gi < _delGroups.length; _gi++) {
+                        const _delList = _delGroups[_gi];
+                        for (let i = _delList.length - 1; i >= 0; i--) {
+                            const missL = this.ctx.newLabel("del_with_miss");
+                            this._emitObjectEnvHasBinding(_delList[i], darg.name, missL);
+                            this.vm.load(VReg.A0, VReg.FP, _delList[i]);
+                            this.emitBoxedStringKey(darg.name, VReg.A1);
+                            this.vm.call("_object_delete");
+                            this.vm.jmp(delDone);
+                            this.vm.label(missL);
+                        }
+                    }
+                }
                 if (!(this.isUnresolvableIdentifier &&
                       this.isUnresolvableIdentifier(darg))) {
                     // 模块级可解析(顶层函数声明/顶层 var/导入/内建名,isUnresolvableIdentifier
                     // 与读路径同一把尺子):绑定不可删 → false(S13_A12_T1)。
                     this.vm.movImm64(VReg.RET, 0x7ff9000000000000n);
-                    return;
+                    this.vm.jmp(delDone);
+                } else {
+                    // 未解析的标识符(隐式全局/未知):ES sloppy 语义
+                    // HasProperty(globalThis, name) ? [[Delete]] : true。
+                    const missL = this.ctx.newLabel("del_g_miss");
+                    this.vm.lea(VReg.V0, "_global_this");
+                    this.vm.load(VReg.A0, VReg.V0, 0);
+                    this.vm.call("_box_obj_r");             // A0 = boxed globalThis
+                    const gOff = this.ctx.allocLocal(`__delg_${this.nextLabelId()}`);
+                    this.vm.store(VReg.FP, gOff, VReg.RET);
+                    this.emitBoxedStringKey(darg.name, VReg.A1);
+                    this.vm.load(VReg.A0, VReg.FP, gOff);
+                    this.vm.call("_object_has");
+                    this.vm.cmpImm(VReg.RET, 0);
+                    this.vm.jeq(missL);
+                    this.vm.load(VReg.A0, VReg.FP, gOff);
+                    this.emitBoxedStringKey(darg.name, VReg.A1);
+                    this.vm.call("_object_delete");         // RET = 装箱布尔(configurable?)
+                    this.vm.jmp(delDone);
+                    this.vm.label(missL);
+                    this.vm.movImm64(VReg.RET, 0x7ff9000000000001n); // true
                 }
-                // 未解析的标识符(隐式全局/未知):ES sloppy 语义
-                // HasProperty(globalThis, name) ? [[Delete]] : true。
-                const missL = this.ctx.newLabel("del_g_miss");
-                const doneL = this.ctx.newLabel("del_g_done");
-                this.vm.lea(VReg.V0, "_global_this");
-                this.vm.load(VReg.A0, VReg.V0, 0);
-                this.vm.call("_box_obj_r");             // A0 = boxed globalThis
-                this.vm.push(VReg.RET);                 // [SP] = global(跨 call 保活)
-                this.emitBoxedStringKey(darg.name, VReg.A1);
-                this.vm.load(VReg.A0, VReg.SP, 0);
-                this.vm.call("_object_has");
-                this.vm.cmpImm(VReg.RET, 0);
-                this.vm.jeq(missL);
-                this.vm.load(VReg.A0, VReg.SP, 0);
-                this.emitBoxedStringKey(darg.name, VReg.A1);
-                this.vm.call("_object_delete");         // RET = 装箱布尔(configurable?)
-                this.vm.jmp(doneL);
-                this.vm.label(missL);
-                this.vm.movImm64(VReg.RET, 0x7ff9000000000001n); // true
-                this.vm.label(doneL);
-                this.vm.pop(VReg.V0);
+                this.vm.label(delDone);
                 return;
             }
             // CallExpression / NewExpression / 其他表达式:先求值以触发副作用,
@@ -1577,10 +1676,8 @@ export const OperatorCompiler = {
             const posValue = expr.argument.value;
             const posBits = floatToInt64Bits(posValue);
             const negBits = negateFloat64Bits(posBits);
-            // 直接调用 addFloat64 使用预计算的 bits
-            const label = this.asm.addFloat64(-posValue, negBits);
-            this.vm.lea(VReg.RET, label);
-            this.vm.load(VReg.RET, VReg.RET, 0);
+            // 预计算否定 bits，立即数装入（免数据池 lea+load）
+            this.vm.movImm64(VReg.RET, negBits);
             return;
         }
 
@@ -1627,15 +1724,20 @@ export const OperatorCompiler = {
             this.vm.load(VReg.V0, VReg.V0, 0);
             this.vm.mov(VReg.A0, VReg.V0);
             this.vm.call("_box_obj_r");          // RET = boxed globalThis
-            this.vm.mov(VReg.V1, VReg.RET);      // V1 = boxed globalThis
+            const tgOff = this.ctx.allocLocal(`__typeofg_${this.nextLabelId()}`);
+            this.vm.store(VReg.FP, tgOff, VReg.RET);
             // 2. key = boxed name string
             this.vm.lea(VReg.A0, nameLabel);
             this.vm.movImm64(VReg.V2, 0x7ffc000000000000n);
             this.vm.or(VReg.A0, VReg.A0, VReg.V2); // A0 = boxed key
             this.vm.mov(VReg.A1, VReg.A0);         // A1 = key
-            this.vm.mov(VReg.A0, VReg.V1);         // A0 = globalThis
+            this.vm.load(VReg.A0, VReg.FP, tgOff); // A0 = globalThis
             this.vm.call("_object_get");          // RET = found value or JS_UNDEFINED
-            // 3. 用 _object_get 结果调 _typeof
+            // 3. 访问器属性须触发 getter(typeof/get-value.js:y)
+            this.vm.mov(VReg.A0, VReg.RET);
+            this.vm.load(VReg.A1, VReg.FP, tgOff);
+            this.vm.call("_maybe_getter");
+            // 4. 用结果调 _typeof
             this.vm.mov(VReg.A0, VReg.RET);
             this.vm.call("_js_typeof");
             return;

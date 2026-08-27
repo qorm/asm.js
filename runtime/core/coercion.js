@@ -21,6 +21,7 @@ export class CoercionGenerator {
         this.generateStrictEq();
         this.generateToInt32();
         this.generateToUint32();
+        this.generateToInteger();
         this.generateJsAdd();
         this.generateSyscallArg();
         this.generateJsParseInt();
@@ -733,42 +734,39 @@ export class CoercionGenerator {
         vm.epilogue([VReg.S0, VReg.S1], 32);
 
         vm.label("_js_add_slow");
-        // 对象(0x7FFD)/数组(0x7FFE)/函数(0x7FFF)操作数先 ToPrimitive(default):
-        // 对象 valueOf→toString、数组→_valueToStr(逗号串)、函数→_valueToStr(函数源文本)。
-        // 结果(串/数)再走下方常规 string/numeric 分派。
-        // 此前对象/数组/函数直接落数值 → NaN(`1+[1,2]`、`{valueOf}+8`、`f+1` 等)。
+        // 对象(0x7FFD)/函数(0x7FFF)先 ToPrimitive(default):自有 valueOf→toString,
+        // 无则 _valueToStr。数组(0x7FFE)仍 _valueToStr(逗号串)。函数不可再直接
+        // _valueToStr:会丢掉 `f.valueOf=()=>1` 的 OrdinaryToPrimitive(`1+f`→2)。
         vm.shrImm(VReg.V0, VReg.S0, 48);
         vm.cmpImm(VReg.V0, 0x7FFD);
-        vm.jne("_js_add_x_not_obj");
-        vm.mov(VReg.A0, VReg.S0);
-        vm.call("_js_toprimitive");
-        vm.mov(VReg.S0, VReg.RET);
-        vm.jmp("_js_add_check_y_prim");
-        vm.label("_js_add_x_not_obj");
-        vm.cmpImm(VReg.V0, 0x7FFE);
-        vm.jeq("_js_add_x_arr_fn");
+        vm.jeq("_js_add_x_otp");
         vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jeq("_js_add_x_otp");
+        vm.cmpImm(VReg.V0, 0x7FFE);
         vm.jne("_js_add_check_y_prim");
-        vm.label("_js_add_x_arr_fn");
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_valueToStr");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.jmp("_js_add_check_y_prim");
+        vm.label("_js_add_x_otp");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_js_toprimitive");
         vm.mov(VReg.S0, VReg.RET);
         vm.label("_js_add_check_y_prim");
         vm.shrImm(VReg.V0, VReg.S1, 48);
         vm.cmpImm(VReg.V0, 0x7FFD);
-        vm.jne("_js_add_y_not_obj");
-        vm.mov(VReg.A0, VReg.S1);
-        vm.call("_js_toprimitive");
-        vm.mov(VReg.S1, VReg.RET);
-        vm.jmp("_js_add_slow_strchk");
-        vm.label("_js_add_y_not_obj");
-        vm.cmpImm(VReg.V0, 0x7FFE);
-        vm.jeq("_js_add_y_arr_fn");
+        vm.jeq("_js_add_y_otp");
         vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jeq("_js_add_y_otp");
+        vm.cmpImm(VReg.V0, 0x7FFE);
         vm.jne("_js_add_slow_strchk");
-        vm.label("_js_add_y_arr_fn");
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_valueToStr");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.jmp("_js_add_slow_strchk");
+        vm.label("_js_add_y_otp");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_js_toprimitive");
         vm.mov(VReg.S1, VReg.RET);
         vm.label("_js_add_slow_strchk");
         // --- x 是字符串? ---
@@ -948,12 +946,13 @@ export class CoercionGenerator {
         vm.cmp(VReg.S0, VReg.S1);
         vm.jne("_ae_not_same_bits");
 
-        // 位模式一致,检查是否是 float
+        // 位模式一致:tagged 仅 [0x7FF8,0x7FFF];负浮点/-NaN 走 fcmp(与 _strict_eq 同)。
         vm.shrImm(VReg.V0, VReg.S0, 48);
+        vm.cmpImm(VReg.V0, 0x8000);
+        vm.jge("_ae_same_bits_float");
         vm.cmpImm(VReg.V0, 0x7ff8);
         vm.jge("_ae_same_bits_not_float");
-
-        // 是 float 且位模式一致:检查是否是 NaN
+        vm.label("_ae_same_bits_float");
         vm.fmovToFloat(0, VReg.S0);
         vm.fcmp(0, 0); // NaN 检测 (NaN != NaN)
         vm.jeq("_abstract_eq_true");
@@ -1907,6 +1906,15 @@ export class CoercionGenerator {
         vm.cmp(VReg.V0, VReg.V1);
         vm.jeq("_num_coerce_int32");
 
+        // 函数(0x7FFF):须在堆扫描/cmpImm(0x7FFF)之前拦。cmpImm(0x7FFF) 的
+        // 12-bit 编码会把立即数截成 0xFFF,32767>4095 误落 _num_coerce_float,
+        // 把函数位当 IEEE NaN;fsub/打印再归一成 0x7FF8(=boxed int 0) →
+        // Number(fn) 印 "0"、`y=fn--` 得 0 且 isNaN(y) 假(S11.3.2_A4_T5)。
+        // ToPrimitive(default) 后递归 ToNumber(自有 valueOf 生效);仍是函数 → 规范 NaN。
+        vm.movImm(VReg.V1, 0x7FFF);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jeq("_num_coerce_function");
+
         // 检查是否是堆上的 Number 对象(block_ptr 或 user_ptr)
         vm.lea(VReg.V0, "_heap_base");
         vm.load(VReg.V0, VReg.V0, 0);
@@ -1954,15 +1962,33 @@ export class CoercionGenerator {
         vm.cmpImm(VReg.V1, 0x7FF8);
         vm.jlt("_num_coerce_float");
         // 装箱对象(0x7FFD):ToNumber via 用户 valueOf(有则调,结果再归一;无则 NaN)。
-        vm.cmpImm(VReg.V1, 0x7FFD);
+        vm.movImm(VReg.V0, 0x7FFD);
+        vm.cmp(VReg.V1, VReg.V0);
         vm.jeq("_num_coerce_object_valueof");
         // 装箱数组(0x7FFE):ToPrimitive → toString(逗号串)→ 解析。Number([5])=5、Number([1,2])=NaN、
         // Number([])=""→0。此前落 NaN 支路返 canonical → 打印 0。
-        vm.cmpImm(VReg.V1, 0x7FFE);
+        vm.movImm(VReg.V0, 0x7FFE);
+        vm.cmp(VReg.V1, VReg.V0);
         vm.jeq("_num_coerce_array");
-        vm.cmpImm(VReg.V1, 0x7FFF);
+        vm.movImm(VReg.V0, 0x7FFF);
+        vm.cmp(VReg.V1, VReg.V0);
+        vm.jeq("_num_coerce_function");
         vm.jgt("_num_coerce_float");
         vm.jmp("_num_coerce_nan");
+
+        vm.label("_num_coerce_function");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_js_toprimitive");
+        vm.shrImm(VReg.V2, VReg.RET, 48); // x64 勿用 V0≡RET
+        // cmpImm(0x7FFD/0x7FFF) 会截 12-bit,用 movImm+cmp
+        vm.movImm(VReg.V1, 0x7FFD);
+        vm.cmp(VReg.V2, VReg.V1);
+        vm.jlt("_num_coerce_fn_prim"); // 串/数等原语 → 再 ToNumber
+        vm.jmp("_num_coerce_nan");     // 仍是对象/数组/函数
+        vm.label("_num_coerce_fn_prim");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_number_coerce");
+        vm.epilogue([VReg.S0, VReg.S1], 64);
 
         vm.label("_num_coerce_array");
         vm.mov(VReg.A0, VReg.S0);
@@ -2149,14 +2175,17 @@ export class CoercionGenerator {
         vm.mov(VReg.S1, VReg.A1); // y
         
         // 直接比较原始值。位相等时:float NaN 须返 false(NaN!==NaN),其余返 true。
-        // 镜像 _abstract_eq(line ~752):此前一律 jeq true 使 NaN===NaN 误判真、
-        // Number.isNaN 外的 NaN 自反相等全错。tagged(high16>=0x7FF8,含负浮点简化)
-        // 位相等即真;float 位相等经 fcmp 自比较剔除 NaN。
+        // tagged 仅 high16∈[0x7FF8,0x7FFF]。旧 `>=0x7FF8 → true` 把 -NaN
+        // (high16≥0x8000,如 fneg(0/0)=0xFFF0…/0xFFF8…)当成 boxed tag,
+        // `x !== x` 恒假(fill-values-conversion consistent-nan index=5)。
         vm.cmp(VReg.S0, VReg.S1);
         vm.jne("_strict_eq_bits_differ");
         vm.shrImm(VReg.V0, VReg.S0, 48);
+        vm.cmpImm(VReg.V0, 0x8000);
+        vm.jge("_strict_eq_fcmp"); // 负浮点 / -NaN → fcmp
         vm.cmpImm(VReg.V0, 0x7ff8);
-        vm.jge("_strict_eq_true"); // tagged(与 _abstract_eq 同款负浮点简化)
+        vm.jge("_strict_eq_true"); // tagged
+        vm.label("_strict_eq_fcmp");
         vm.fmovToFloat(0, VReg.S0);
         vm.fcmp(0, 0); // NaN 检测(NaN != NaN)
         vm.jeq("_strict_eq_true"); // 非 NaN → true
@@ -2181,11 +2210,14 @@ export class CoercionGenerator {
         vm.cmp(VReg.V0, VReg.V3);
         vm.jge("_strict_eq_x_float");
 
-        // x 是 tagged，检查 y 是否为 float（不同类型 → false）
+        // x 是 tagged。y 为 float 时：仅 int32(0x7FF8) 与数字 ===（6.0===6）；
+        // 其余 tagged（bool/null/对象）!== 数字。旧逻辑一律 false →
+        // 数组字面量 [0]（int32 tag）与 TypedArray 读回的 +0.0 在 compareArray
+        // 的 _isSameValue 里恒败。
         vm.cmp(VReg.V1, VReg.V2);
-        vm.jlt("_strict_eq_false"); // y 正浮点
+        vm.jlt("_strict_eq_xint_yfloat");
         vm.cmp(VReg.V1, VReg.V3);
-        vm.jge("_strict_eq_false"); // y 负浮点
+        vm.jge("_strict_eq_xint_yfloat");
 
         // 两个都是 tagged，比较 tag (high16 & 7)
         vm.andImm(VReg.V0, VReg.V0, 7);
@@ -2269,7 +2301,28 @@ export class CoercionGenerator {
         vm.addImm(VReg.S3, VReg.S3, 1);
         vm.jmp("_seq_str_walk");
 
+        vm.label("_strict_eq_xint_yfloat");
+        vm.cmpImm(VReg.V0, 0x7FF8); // x 必须是 int32
+        vm.jne("_strict_eq_false");
+        vm.movImm64(VReg.V2, 0xFFFFFFFFn);
+        vm.and(VReg.V2, VReg.S0, VReg.V2);
+        vm.shlImm(VReg.V2, VReg.V2, 32);
+        vm.sarImm(VReg.V2, VReg.V2, 32);
+        vm.scvtf(0, VReg.V2);
+        vm.fmovToInt(VReg.S0, 0); // S0 = int32 的 float 位，与 y 走两端 float
+        // fall through
         vm.label("_strict_eq_x_float");
+        // y 可能是 int32 tag：转成 float 再比（x 已是 float）
+        vm.shrImm(VReg.V1, VReg.S1, 48);
+        vm.cmpImm(VReg.V1, 0x7FF8);
+        vm.jne("_strict_eq_both_float");
+        vm.movImm64(VReg.V2, 0xFFFFFFFFn);
+        vm.and(VReg.V2, VReg.S1, VReg.V2);
+        vm.shlImm(VReg.V2, VReg.V2, 32);
+        vm.sarImm(VReg.V2, VReg.V2, 32);
+        vm.scvtf(0, VReg.V2);
+        vm.fmovToInt(VReg.S1, 0);
+        vm.label("_strict_eq_both_float");
         // 两个都是 float，比较原始位
         vm.cmp(VReg.S0, VReg.S1);
         vm.jeq("_strict_eq_true");
@@ -2381,6 +2434,34 @@ export class CoercionGenerator {
         vm.epilogue([VReg.S0], 32);
 
         vm.label("_to_uint32_zero");
+        vm.movImm(VReg.RET, 0);
+        vm.epilogue([VReg.S0], 32);
+    }
+
+    /**
+     * _to_integer: ToIntegerOrInfinity → 有符号 int64。
+     * NaN → 0; ±Inf 走 fcvtzs 饱和( +Inf=INT64_MAX, -Inf=INT64_MIN )。
+     * 禁当 ToInt32:2^53 级下标会被截成低 32 位。
+     */
+    generateToInteger() {
+        const vm = this.vm;
+        vm.label("_to_integer");
+        vm.prologue(32, [VReg.S0]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.call("_number_coerce");
+        vm.fmovToFloat(0, VReg.RET);
+        vm.shrImm(VReg.V1, VReg.RET, 52);
+        vm.andImm(VReg.V1, VReg.V1, 0x7FF);
+        vm.cmpImm(VReg.V1, 0x7FF);
+        vm.jne("_to_integer_finite");
+        vm.movImm64(VReg.V1, 0x000FFFFFFFFFFFFFn);
+        vm.and(VReg.V1, VReg.RET, VReg.V1);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_to_integer_zero"); // NaN
+        vm.label("_to_integer_finite");
+        vm.fcvtzs(VReg.RET, 0);
+        vm.epilogue([VReg.S0], 32);
+        vm.label("_to_integer_zero");
         vm.movImm(VReg.RET, 0);
         vm.epilogue([VReg.S0], 32);
     }

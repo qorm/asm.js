@@ -38,10 +38,11 @@ export const ExpressionParser = {
             this.curToken.type !== TokenType.GET && this.curToken.type !== TokenType.SET &&
             this.curToken.type !== TokenType.OF && this.curToken.type !== TokenType.FROM &&
             this.curToken.type !== TokenType.AS &&
+            this.curToken.type !== TokenType.LET &&
+            this.curToken.type !== TokenType.STATIC &&
             this.curToken.type !== TokenType.UNDEFINED) {
-            // LET/STATIC 含在内:ES 规定 Identifier 的 StringValue 为 let/static 且源码
-            // 含转义即 SyntaxError(任何模式;escaped-let/escaped-static 族)。属性名位
-            // 不经 parseExpression,不受影响。
+            // 上下文关键字(含 let/static)的转义形态在表达式位是 Identifier
+            // (`l\u0065t` / `st\u0061tic`;escaped-let 族)。真保留字转义仍拒。
             this.errors.push("Keyword must not contain escaped characters");
         }
         let leftExp = prefix();
@@ -63,6 +64,11 @@ export const ExpressionParser = {
             this.nextToken();
             leftExp = infix(leftExp);
         }
+        // 裸 PrivateIdentifier 只能作 `in` 左操作数;作完整表达式(含 `in` 的 Shift
+        // 右操作数,因同级不结合而留下)是早期错误(`#x` / `#a in #b in o`)。
+        if (leftExp && leftExp.type === "PrivateIdentifier") {
+            this.errors.push("Private identifier is only valid as a member or left-hand side of 'in'");
+        }
         this.parseDepth = this.parseDepth - 1;
         return leftExp;
     },
@@ -74,10 +80,19 @@ export const ExpressionParser = {
         if (this.curToken.literal === "debugger" && !this.curToken.escaped) {
             this.errors.push("Unexpected debugger in expression position");
         }
-        // [W-P9] 裸私有名引用(`#x in o` 品牌检查等;词法已把 `#x` 合并为单个 IDENT)。
-        // 收集进引用表供类体收尾校验;类体外(classDepth===0)留既有缺口不处理。
-        if (this.classDepth > 0 && this.curToken.literal && this.curToken.literal.charAt(0) === "#") {
-            this._recordPrivateRef(this.curToken.literal);
+        // [W-P9] 裸私有名:`#x in o` 品牌检查(词法把 `#x` 合成单个 IDENT)。
+        // 仅类体内、且后随 `in` 合法;类外 / 非 `in` 左操作数一律早期错误。
+        if (this.curToken.literal && this.curToken.literal.charAt(0) === "#") {
+            const pname = this.curToken.literal;
+            if (this.classDepth <= 0) {
+                this.errors.push("Private identifier '" + pname + "' is not valid outside class");
+            } else {
+                this._recordPrivateRef(pname);
+            }
+            if (!this.peekTokenIs(TokenType.IN)) {
+                this.errors.push("Private identifier '" + pname + "' is only valid as a member or left-hand side of 'in'");
+            }
+            return new AST.PrivateIdentifier(pname);
         }
         // [Wave 8] 字段初始化器 ContainsArguments:init 上下文(穿透箭头)内 `arguments`
         // 标识符引用是早期错误(函数边界已复位 _inFieldInit)。
@@ -93,7 +108,9 @@ export const ExpressionParser = {
             this.errors.push("Cannot use 'await' as an identifier in an async function");
         }
         // 检查是否是无括号单参数箭头函数: x => expr
-        if (this.peekTokenIs(TokenType.ARROW)) {
+        // [no LineTerminator here] `x\n=>` 非法。
+        if (this.peekTokenIs(TokenType.ARROW) && !this.peekToken.lineBreakBefore &&
+            this.peekToken.line === this.curToken.line) {
             // [test262 早期错误 A] 裸箭头形参绑定位校验:strict 保留字/生成器/异步门控。
             this.checkYieldAwaitBinding(ident.name);
             this.checkReservedBinding(ident.name);
@@ -235,7 +252,20 @@ export const ExpressionParser = {
     // (解析期脱糖,零 codegen)。cooked 数组正常;但 strings.raw 需数组自定义属性,asm.js 数组
     // 暂不支持(赋任意字符串键会毁堆),故普通 tag 的 strings.raw 仍缺(记偏差,见报告)。
     // String.raw`...` 特化:脱糖为 raw quasi 与表达式的字符串拼接,不依赖数组 .raw,可用。
+    _chainHasOptional(node) {
+        while (node) {
+            if (node.optional === true) return true;
+            if (node.type === "MemberExpression") node = node.object;
+            else if (node.type === "CallExpression") node = node.callee;
+            else return false;
+        }
+        return false;
+    },
+
     parseTaggedTemplate(tag) {
+        if (tag && (tag.optional === true || this._chainHasOptional(tag))) {
+            this.errors.push("Tagged template cannot follow optional chain");
+        }
         let tpl;
         // [Wave 8 续] tagged 模板不校验转义:tag`\9` / String.raw`\9` raw 原样合法。
         this._taggedTemplate = this._taggedTemplate + 1;
@@ -310,8 +340,11 @@ export const ExpressionParser = {
                 if (raw.charAt(i + 2) === "{") {
                     let j = i + 3;
                     let any = false;
+                    let cp = 0;
                     while (j < n && raw.charAt(j) !== "}") {
                         if (!this._isHexDigit(raw.charAt(j))) return "Invalid Unicode escape sequence in template literal";
+                        cp = cp * 16 + this._hexVal(raw.charAt(j));
+                        if (cp > 0x10FFFF) return "Invalid Unicode escape sequence in template literal";
                         any = true;
                         j = j + 1;
                     }
@@ -344,6 +377,12 @@ export const ExpressionParser = {
     },
     _isHexDigit(c) {
         return (c >= "0" && c <= "9") || (c >= "a" && c <= "f") || (c >= "A" && c <= "F");
+    },
+    _hexVal(c) {
+        if (c >= "0" && c <= "9") return c.charCodeAt(0) - 48;
+        if (c >= "a" && c <= "f") return c.charCodeAt(0) - 87;
+        if (c >= "A" && c <= "F") return c.charCodeAt(0) - 55;
+        return 0;
     },
     _isDigitChar(c) {
         return c >= "0" && c <= "9";
@@ -485,7 +524,18 @@ export const ExpressionParser = {
         this.nextToken();
         // ** 右结合:右操作数用 precedence-1,使 2**3**2 解析为 2**(3**2)=512(非 (2**3)**2=64)。
         const rightPrec = operator === "**" ? precedence - 1 : precedence;
-        return new AST.BinaryExpression(operator, left, this.parseExpression(rightPrec));
+        const right = this.parseExpression(rightPrec);
+        // YieldExpression 只在 AssignmentExpression 位:`yield 3 + yield 4` 的右
+        // 操作数不得是未加括号的 yield(yield-weak-binding)。`(yield) + 1` 合法。
+        if (this.fnGenDepth > 0) {
+            if (right && right.type === "YieldExpression" && !right._parenthesized) {
+                this.errors.push("yield expression not allowed here");
+            }
+            if (left && left.type === "YieldExpression" && !left._parenthesized) {
+                this.errors.push("yield expression not allowed here");
+            }
+        }
+        return new AST.BinaryExpression(operator, left, right);
     },
 
     parseLogicalExpression(left) {
@@ -493,6 +543,14 @@ export const ExpressionParser = {
         let precedence = this.curPrecedence();
         this.nextToken();
         let right = this.parseExpression(precedence);
+        if (this.fnGenDepth > 0) {
+            if (right && right.type === "YieldExpression" && !right._parenthesized) {
+                this.errors.push("yield expression not allowed here");
+            }
+            if (left && left.type === "YieldExpression" && !left._parenthesized) {
+                this.errors.push("yield expression not allowed here");
+            }
+        }
         // [test262 早期错误 G] ?? 不得与 && / || 在无括号时混用(a ?? b && c / a && b ?? c 等)。
         // 仅当冲突侧操作数是「未加括号」的逻辑表达式(非 parseGroupedOrArrow 产出,无
         // _logicalGrouped 标记)时报错;(a ?? b) && c / a ?? (b && c) / a ?? b ?? c 皆合法。
@@ -619,6 +677,9 @@ export const ExpressionParser = {
         this.nextToken();
         if (this.curTokenIs(TokenType.RPAREN)) {
             if (this.peekTokenIs(TokenType.ARROW)) {
+                if (this.peekToken.lineBreakBefore || this.peekToken.line !== this.curToken.line) {
+                    this.errors.push("Unexpected newline before '=>'");
+                }
                 this.nextToken();
                 return this.parseArrowFunctionBody([]);
             }
@@ -646,7 +707,12 @@ export const ExpressionParser = {
                     depth++;
                 } else if (t === TokenType.RPAREN || t === TokenType.RBRACE || t === TokenType.RBRACKET) {
                     depth--;
-                    if (depth === 0) { looksArrow = this.peekTokenIs(TokenType.ARROW); break; }
+                    if (depth === 0) {
+                        looksArrow = this.peekTokenIs(TokenType.ARROW) &&
+                            !this.peekToken.lineBreakBefore &&
+                            this.peekToken.line === this.curToken.line;
+                        break;
+                    }
                 }
                 this.nextToken();
             }
@@ -682,6 +748,9 @@ export const ExpressionParser = {
                     // 尾逗号 (x, y,) =>:逗号后紧跟 ) → 参数列表结束,别把 ) 当形参。
                     if (this.curTokenIs(TokenType.RPAREN)) {
                         if (this.peekTokenIs(TokenType.ARROW)) {
+                            if (this.peekToken.lineBreakBefore || this.peekToken.line !== this.curToken.line) {
+                                this.errors.push("Unexpected newline before '=>'");
+                            }
                             this.nextToken();
                             return this.parseArrowFunctionBody(params);
                         }
@@ -689,6 +758,9 @@ export const ExpressionParser = {
                     }
                 } else if (this.curTokenIs(TokenType.RPAREN)) {
                     if (this.peekTokenIs(TokenType.ARROW)) {
+                        if (this.peekToken.lineBreakBefore || this.peekToken.line !== this.curToken.line) {
+                            this.errors.push("Unexpected newline before '=>'");
+                        }
                         this.nextToken(); // moves to =>
                         return this.parseArrowFunctionBody(params);
                     }
@@ -715,6 +787,7 @@ export const ExpressionParser = {
         }
 
         if (this.peekTokenIs(TokenType.ARROW) &&
+            !this.peekToken.lineBreakBefore && this.peekToken.line === this.curToken.line &&
             (expr.type === "Identifier" || expr.type === "SequenceExpression" || expr.type === "AssignmentExpression")) {
             // [#34 续] 单参默认 `(a=7)=>` / 首参默认 `(a=1,b=2)=>`:isArrowMode 检测
             // (curToken=IDENT 且 peek=COMMA/RPAREN)漏掉 peek=ASSIGN 的形态 → 落到这里
@@ -739,8 +812,44 @@ export const ExpressionParser = {
         return expr;
     },
 
+    // ArrowParameters Contains YieldExpression:扫形参树,遇函数/类边界停。
+    _containsYieldExpr(node) {
+        if (node === null || node === undefined || typeof node !== "object") return false;
+        if (node.type === "YieldExpression") return true;
+        if (node.type === "FunctionExpression" || node.type === "ArrowFunctionExpression" ||
+            node.type === "FunctionDeclaration" || node.type === "ClassExpression" ||
+            node.type === "ClassDeclaration") return false;
+        if (Array.isArray(node)) {
+            var ai = 0;
+            while (ai < node.length) {
+                if (this._containsYieldExpr(node[ai])) return true;
+                ai = ai + 1;
+            }
+            return false;
+        }
+        for (const k in node) {
+            if (!Object.prototype.hasOwnProperty.call(node, k)) continue;
+            if (k === "type" || k === "start" || k === "end" || k === "loc" || k === "range") continue;
+            const v = node[k];
+            if (v && typeof v === "object" && this._containsYieldExpr(v)) return true;
+        }
+        return false;
+    },
+
     parseArrowFunctionBody(params) {
         this.nextToken();
+        // ArrowParameters Contains YieldExpression:生成器内 `(x = yield) => {}` 早期错误。
+        // 不进入嵌套函数/类( `(x = function*(){ yield 1 }) => {}` 合法)。
+        if (this.fnGenDepth > 0) {
+            var yi = 0;
+            while (yi < params.length) {
+                if (this._containsYieldExpr(params[yi])) {
+                    this.errors.push("yield expression not allowed in arrow function parameters");
+                    break;
+                }
+                yi = yi + 1;
+            }
+        }
         // [params-duplicate] 箭头形参重复恒早期错误(ES 14.2.1 Static Semantics:Early
         // Errors:ArrowParameters 的 BoundNames 含重复即 SyntaxError,sloppy 亦拒——
         // `(a, a) => {}` / `([a], [a]) => {}`)。普通函数 sloppy 允许重参,不受此限。
@@ -775,6 +884,8 @@ export const ExpressionParser = {
             if (isStrict) { this.fnStrictDepth++; this.checkStrictParams(params); }
             this.checkInheritedStrictParams(params, isStrict);   // [test262 早期错误 C] 继承 strict 重参
             body = this.parseBlockStatement();
+            this.checkFormalLexicalConflict(params, body);
+            this.checkLexVarConflict(body && body.body);
             if (isStrict) this.fnStrictDepth--;
         } else {
             // [test262 早期错误 C] 简写体无指令,但继承 strict(程序级/外层 strict/类体)下形参
@@ -1164,6 +1275,12 @@ export const ExpressionParser = {
                 this.errors.push("expected property name");
                 return null;
             }
+            // [test262] 对象字面量 MethodDefinition 不得含 PrivateBoundNames
+            // (`{ #m(){} }` / `{ get #m(){} }` 等 → SyntaxError;类字段内嵌对象同禁)。
+            if (!computed && key && key.type === "Identifier" &&
+                typeof key.name === "string" && key.name.charAt(0) === "#") {
+                this.errors.push("Private names are not allowed in object literals");
+            }
             if (accessorKind !== null && !this.peekTokenIs(TokenType.LPAREN)) {
                 this.errors.push("expected ( after accessor name");
                 return null;
@@ -1179,19 +1296,27 @@ export const ExpressionParser = {
                 }
                 // [test262 早期错误 A] 简写属性 `{ x }` 的键即绑定引用,须过保留字校验;
                 // 带冒号的键 `{ if: 1 }`(PropertyName)走 COLON 分支,不校验(属性名可为保留字)。
-                if (!computed && key.type === "Identifier") this.checkReservedBinding(key.name);
+                // `{ yield }` 在生成器内是 IdentifierReference,非法(obj-id-identifier-yield-expr)。
+                if (!computed && key.type === "Identifier") {
+                    this.checkReservedBinding(key.name);
+                    this.checkYieldAwaitBinding(key.name);
+                }
                 properties.push(new AST.Property(key, key, "init", computed, true));
             } else if (this.peekTokenIs(TokenType.ASSIGN) && !computed && accessorKind === null) {
                 // CoverInitializedName `{a = 默认}`:简写属性带默认值,仅在解构目标位合法
                 // (`({a = 1} = obj)`)。产出 shorthand Property,value = AssignmentPattern
                 // (Identifier, 默认表达式),供 reinterpretAsPattern/emitDestructurePattern 消费。
-                if (key.type === "Identifier") this.checkReservedBinding(key.name);   // [test262 早期错误 A]
+                if (key.type === "Identifier") {
+                    this.checkReservedBinding(key.name);
+                    this.checkYieldAwaitBinding(key.name);
+                }
                 this.nextToken(); // cur = '='
                 this.nextToken(); // cur = 默认表达式首 token
                 const dflt = this.parseExpression(Precedence.ASSIGN - 1);
                 const val = new AST.AssignmentPattern(new AST.Identifier(key.name), dflt);
                 const covProp = new AST.Property(key, val, "init", computed, true);
                 covProp._coverInit = true; // [test262 cover-initialized-name] 表达式位非法
+                this._seenCoverInit = true; // 供 parseExpressionStatement 零税门控
                 properties.push(covProp);
             } else if (this.peekTokenIs(TokenType.LPAREN)) {
                 this.nextToken();
@@ -1296,12 +1421,10 @@ export const ExpressionParser = {
         if (this.peekTokenIsIdentifier() && this.peekToken.type !== TokenType.LPAREN) {
             this.nextToken();
             this.checkReservedBinding(this.curToken.literal);   // [test262 早期错误 A] 函数名保留字
-            // [static-block-await] 静态块直属函数表达式的名字位 await 也是保留字
-            // ((function await(await) {}) 族;fnDepth 已为本函数 ++,比对 staticDepth+1)。
-            if (this.curToken.literal === "await" && this._staticBlockDepth &&
-                this.fnDepth === this._staticBlockDepth + 1) {
-                this.errors.push("Cannot use 'await' as a binding name inside an async function");
-            }
+            // GeneratorBindingIdentifier 不得为 yield(`function* yield(){}`)。
+            if (isGenerator) this.checkYieldAwaitBinding(this.curToken.literal);
+            // 静态块内嵌套函数的 BindingIdentifier 可以是 await:ContainsAwait 不下钻
+            // 函数边界,`(function await(await) {})` 合法(static-init-await-binding)。
             let id = new AST.Identifier(this.curToken.literal);
             if (!this.expectPeek(TokenType.LPAREN)) { this.fnDepth--; if (isGenerator) this.fnGenDepth--; this._immediateGen = prevImmediateGen; this._inFieldInit = prevInFieldInit; this._inFormalParams = prevInFormalFE; return null; }
             let params = this.parseFunctionParams();
@@ -1314,6 +1437,8 @@ export const ExpressionParser = {
             const prevLabelStackFE1 = this._labelStack;
             this._labelStack = [];
             let body = this.parseBlockStatement();
+            this.checkFormalLexicalConflict(params, body);
+            this.checkLexVarConflict(body && body.body);
             this._usedLabels = prevLabelsFE1;
             this._labelStack = prevLabelStackFE1;
             if (isStrict) this.fnStrictDepth--;
@@ -1335,6 +1460,8 @@ export const ExpressionParser = {
         const prevLabelStackFE2 = this._labelStack;
         this._labelStack = [];
         let body = this.parseBlockStatement();
+        this.checkFormalLexicalConflict(params, body);
+        this.checkLexVarConflict(body && body.body);
         this._usedLabels = prevLabelsFE2;
         this._labelStack = prevLabelStackFE2;
         if (isStrict) this.fnStrictDepth--;
@@ -1354,7 +1481,9 @@ export const ExpressionParser = {
         const next = this.peekToken;
 
         // async function / async function*
-        if (next.type === TokenType.FUNCTION) {
+        // [no LineTerminator here] `async\nfunction` 不是异步函数,`async` 是标识符。
+        if (next.type === TokenType.FUNCTION &&
+            !next.lineBreakBefore && next.line === this.curToken.line) {
             // [escaped-async] `\u0061sync function f(){}`:修饰符位的 async 不得以转义书写。
             if (this.curToken.escaped) {
                 this.errors.push("Keyword must not contain escaped characters");
@@ -1408,7 +1537,8 @@ export const ExpressionParser = {
             const saved = this.saveState();
             this.nextToken(); // consume async, curToken now the param token
             const couldBeParam = this.isBindingWordToken(this.curToken);
-            const isArrow = couldBeParam && this.peekTokenIs(TokenType.ARROW);
+            const isArrow = couldBeParam && this.peekTokenIs(TokenType.ARROW) &&
+                !this.peekToken.lineBreakBefore && this.peekToken.line === this.curToken.line;
             if (!isArrow) {
                 this.restoreState(saved);
                 return this.parseIdentifier();
@@ -1566,6 +1696,11 @@ export const ExpressionParser = {
             return call;
         }
 
+        if (this.curTokenIs(TokenType.TEMPLATE_STRING) || this.curTokenIs(TokenType.TEMPLATE_HEAD)) {
+            this.errors.push("Optional chain cannot be followed by template literal");
+            return this.parseTaggedTemplate(object);
+        }
+
         // [#34] 可选下标 obj?.[expr]:computed MemberExpression + optional
         if (this.curTokenIs(TokenType.LBRACKET)) {
             this.nextToken();
@@ -1616,6 +1751,15 @@ export const ExpressionParser = {
         // [test262 S1] `:` 曾缺席 → `(yield) ? yield : yield` 里三元的中段 yield 会把
         // `: yield` 当实参吞掉,报 "no prefix parse function for :";TEMPLATE_MIDDLE/TAIL
         // 同理(`` `${yield}` ``)。这些 token 都不能起始 AssignmentExpression。
+        // yield 与 argument 之间禁换行(`yield\n1` ≡ `yield; 1`);但 yield* 的 * 之后
+        // 允许换行(`yield *\n expr`,yield-star-before-newline)。
+        if (!delegate && this.peekToken.lineBreakBefore) {
+            // yield\n* 不是 yield* — Pratt 否则把 * 当乘法中缀而漏拒。
+            if (this.peekTokenIs(TokenType.ASTERISK)) {
+                this.errors.push("No LineTerminator here between yield and *");
+            }
+            return new AST.YieldExpression(null, false);
+        }
         if (this.peekTokenIs(TokenType.SEMICOLON) || this.peekTokenIs(TokenType.RBRACE) ||
             this.peekTokenIs(TokenType.RPAREN) || this.peekTokenIs(TokenType.RBRACKET) ||
             this.peekTokenIs(TokenType.COMMA) || this.peekTokenIs(TokenType.COLON) ||

@@ -2,6 +2,10 @@
   "name": "asm.js",
   "version": "0.3.65",
   "scripts": {
+    "bench:compile": "node scripts/bench-compile.mjs",
+    "gate:compile-perf": "node scripts/compile-perf-gate.mjs",
+    "gate:gen1-compile-perf": "node scripts/gen1-compile-perf-gate.mjs",
+    "test:cache": "node tests/action_cache.mjs",
     "test:fixtures": "node scripts/run-fixtures.mjs",
     "gate": "bash scripts/bootstrap-gate.sh",
     "platform:contract": "node tests/platform_contract.mjs"

@@ -19,7 +19,7 @@ export const TYPE_COROUTINE = 10; // Coroutine
 export const TYPE_PROMISE = 11; // Promise
 export const TYPE_ARRAY_BUFFER = 12; // ArrayBuffer
 export const TYPE_NUMBER = 13; // Number (boxed, 默认 float64)
-export const TYPE_DATA_VIEW = 14; // DataView [type@0, data_ptr@8, byteOffset@16, byteLength@24]
+export const TYPE_DATA_VIEW = 14; // DataView [type@0, data_ptr@8, byteOffset@16, byteLength@24, buffer@32]
 export const TYPE_SHAPE = 15; // [shape v2] 动态形状转移节点(见 docs/SHAPE_TRANSITIONS_DESIGN.md)
 export const TYPE_SHAPE_DESC = 16; // [shape v2 · T2a] 原型带键形状描述符 {@0 count|flags63, @8 keys_ptr}
 

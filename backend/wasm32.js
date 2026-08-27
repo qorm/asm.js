@@ -41,8 +41,10 @@ const OP_I64_CONST = 0x42;
 const OP_F64_CONST = 0x44;
 const OP_I64_LOAD = 0x29;
 const OP_I64_LOAD8_U = 0x31;
+const OP_I64_LOAD32_U = 0x35;
 const OP_I64_STORE = 0x37;
 const OP_I64_STORE8 = 0x3c;
+const OP_I64_STORE32 = 0x3e;
 const OP_I32_SUB = 0x6b;
 const OP_I32_OR = 0x72;
 const OP_I64_EQZ = 0x50;
@@ -286,6 +288,22 @@ export class WasmBackend extends Backend {
         this._g(src);
         this.asm.emit(OP_I64_STORE8);
         this.asm.emit(0x00);
+        this.asm.uleb(mo);
+    }
+
+    load32(dest, base, offset) {
+        const mo = this._addr(base, offset);
+        this.asm.emit(OP_I64_LOAD32_U);
+        this.asm.emit(0x02); // align hint 4
+        this.asm.uleb(mo);
+        this._s(dest);
+    }
+
+    store32(base, offset, src) {
+        const mo = this._addr(base, offset);
+        this._g(src);
+        this.asm.emit(OP_I64_STORE32);
+        this.asm.emit(0x02);
         this.asm.uleb(mo);
     }
 

@@ -81,6 +81,41 @@ export class Node {
     }
 }
 
+// NamedEvaluation 廉价子集:parse 构造 AST 时盖章,_fnHint 供 registerFuncMeta。
+// 免 compile 期全图 _collectFnNameHints 预扫(gen1 上 ~3s)。
+export function stampFnHint(expr, name) {
+    if (!expr || typeof name !== "string" || name.length === 0) return;
+    const t = expr.type;
+    if (t === "FunctionExpression" || t === "ArrowFunctionExpression") {
+        if (!expr.id) expr._fnHint = name;
+        return;
+    }
+    // 匿名类表达式:parser 赋合成名 __classexprN,规范应取绑定名
+    if (t === "ClassDeclaration" && expr.id && typeof expr.id.name === "string" &&
+        expr.id.name.indexOf("__classexpr") === 0) {
+        expr._fnHint = name;
+    }
+}
+
+function isStampableCallable(expr) {
+    if (!expr) return false;
+    const t = expr.type;
+    return t === "FunctionExpression" || t === "ArrowFunctionExpression" ||
+        (t === "ClassDeclaration" && expr.id && typeof expr.id.name === "string" &&
+         expr.id.name.indexOf("__classexpr") === 0);
+}
+
+export function stampFnHintFromKey(expr, key) {
+    if (!isStampableCallable(expr) || !key || typeof key !== "object") return;
+    let name = null;
+    if (key.type === "Identifier") name = key.name;
+    else if (key.type === "Literal" &&
+        (typeof key.value === "string" || typeof key.value === "number")) {
+        name = String(key.value);
+    }
+    if (name !== null) stampFnHint(expr, name);
+}
+
 // ============ 程序 ============
 
 export class Program extends Node {
@@ -105,6 +140,8 @@ export class VariableDeclarator extends Node {
         super(NodeType.VariableDeclarator);
         this.id = id;
         this.init = init;
+        // NamedEvaluation:parse 时盖章,免 compile 期全图 hints 预扫
+        if (id && id.type === "Identifier" && isStampableCallable(init)) stampFnHint(init, id.name);
     }
 }
 
@@ -136,6 +173,7 @@ export class MethodDefinition extends Node {
         this.kind = kind; // "constructor", "method", "get", "set"
         this.static = isStatic || false;
         this.computed = computed || false;
+        if ((!kind || kind === "method") && !computed) stampFnHintFromKey(value, key);
     }
 }
 
@@ -421,6 +459,7 @@ export class Property extends Node {
         this.kind = kind || "init";
         this.computed = computed || false;
         this.shorthand = shorthand || false;
+        if ((!kind || kind === "init") && !computed) stampFnHintFromKey(value, key);
     }
 }
 
@@ -487,6 +526,10 @@ export class AssignmentExpression extends Node {
         this.operator = operator;
         this.left = left;
         this.right = right;
+        if (left && left.type === "Identifier" && isStampableCallable(right) &&
+            (operator === "=" || operator === "??=" || operator === "&&=" || operator === "||=")) {
+            stampFnHint(right, left.name);
+        }
     }
 }
 
@@ -588,6 +631,7 @@ export class AssignmentPattern extends Node {
         super(NodeType.AssignmentPattern);
         this.left = left;
         this.right = right;
+        if (left && left.type === "Identifier" && isStampableCallable(right)) stampFnHint(right, left.name);
     }
 }
 

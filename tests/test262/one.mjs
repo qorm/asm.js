@@ -11,10 +11,10 @@ import { spawn } from "child_process";
 import { join, resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 import { tmpdir } from "os";
+import { CompilePool } from "./compile-pool.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(__dirname, "..", "..");
-const CLI = join(REPO, "cli.js");
 const CORPUS = join(REPO, ".test262-corpus");
 
 const args = process.argv.slice(2);
@@ -85,7 +85,7 @@ const HOST_SHIMS = `
 function print(m){ console.log(String(m)); }
 var $262 = {
   createRealm: function(){ throw new Error("$262.createRealm unsupported"); },
-  detachArrayBuffer: function(buffer){ },
+  detachArrayBuffer: function(buffer){ __detachArrayBuffer(buffer); },
   evalScript: function(){ throw new Error("$262.evalScript unsupported"); },
   gc: function(){},
   global: this,
@@ -147,10 +147,24 @@ function run(cmd, args, timeoutMs) {
   });
 }
 
-const comp = await run(process.execPath, [CLI, srcPath, "-o", binPath, "--target", target], 60000);
-console.error("== compile: exit=" + comp.code + " signal=" + comp.signal + " timedOut=" + comp.timedOut);
-if (comp.stderr.trim()) console.error("== compile stderr:\n" + comp.stderr.trim());
-if (comp.code !== 0 || !existsSync(binPath)) {
+const compilePool = new CompilePool({ size: 1, repo: REPO });
+let comp;
+try {
+  await compilePool.start();
+  comp = await compilePool.compile({
+    sourcePath: srcPath,
+    outputPath: binPath,
+    target,
+    cacheIdentity: rel ? rel + (strict ? "#strict" : "#sloppy") : null,
+    timeoutMs: 60000,
+  });
+} finally {
+  await compilePool.close();
+}
+console.error("== compile: ok=" + comp.ok + " code=" + comp.code + " signal=" + comp.signal +
+  " timedOut=" + comp.timedOut + " compileMs=" + comp.compileMs + " cacheHit=" + comp.cacheHit);
+if (comp.stderr && String(comp.stderr).trim()) console.error("== compile stderr:\n" + String(comp.stderr).trim());
+if (!comp.ok || !existsSync(binPath)) {
   if (!keep) rmSync(dir, { recursive: true, force: true });
   process.exit(0);
 }
@@ -159,8 +173,10 @@ if (noRun) {
   console.error("--no-run: keeping " + dir);
   process.exit(0);
 }
+const tRun = Date.now();
 const r = await run(binPath, [], 15000);
-console.error("== run: exit=" + r.code + " signal=" + r.signal + " timedOut=" + r.timedOut);
+const runMs = Date.now() - tRun;
+console.error("== run: exit=" + r.code + " signal=" + r.signal + " timedOut=" + r.timedOut + " runMs=" + runMs);
 console.error("== stdout:\n" + r.stdout);
 console.error("== stderr:\n" + r.stderr);
 if (!keep) rmSync(dir, { recursive: true, force: true });

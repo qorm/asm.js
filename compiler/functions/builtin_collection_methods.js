@@ -1,9 +1,27 @@
 // asm.js 编译器 - Map/Set/Date 方法编译
 // 从 builtin_methods.js 按功能拆出(2026-07-14)。方法经 this 解析,与主 mixin 同一原型。
 
-import { VReg } from "../../vm/index.js";
+import { VReg } from "../../vm/registers.js";
 
 export const BuiltinCollectionMethodCompiler = {
+    // Map/Set.prototype.forEach 的回调前置处理(规范 24.1.3.5 步骤 3-4):
+    //   1) 迭代**前**做 IsCallable(空集合也须抛 TypeError);
+    //   2) 备好回调的 this —— 显式 thisArg 原样,缺省/undefined/null 按 callee 严格性
+    //      绑定(非严格 → globalThis)。内联循环直接 callIndirect,不经 _fn_invoke_tail,
+    //      故 A5 必须由此槽显式装入,否则回调内 this 是调用点残值。
+    _emitCollCbThisSlot(cbOffset, thisArgExpr, tag) {
+        const vm = this.vm;
+        this.emitCallbackGuard(cbOffset);
+        const explicit = this.emitThisArgSlot(thisArgExpr, tag);
+        const slot = this.ctx.allocLocal(`__${tag}_cbthis_${this.nextLabelId()}`);
+        vm.load(VReg.A0, VReg.FP, cbOffset);
+        if (explicit != null) vm.load(VReg.A1, VReg.FP, explicit);
+        else vm.movImm64(VReg.A1, 0x7ffb000000000000n);
+        vm.call("_coll_cb_this");
+        vm.store(VReg.FP, slot, VReg.RET);
+        this._pendingThisArgSlot = slot;
+    },
+
     // 编译 Map 方法调用
     // obj.set(key, value), obj.get(key), obj.has(key), obj.delete(key), obj.size
     compileMapMethod(obj, method, args) {
@@ -25,6 +43,27 @@ export const BuiltinCollectionMethodCompiler = {
                     return true;
                 }
                 break;
+
+            // [Upsert 提案] map.getOrInsert(key, value) / map.getOrInsertComputed(key, cb)
+            // 求值序:接收者 → key → 第二实参(规范序);缺省实参补 undefined。
+            case "getOrInsert":
+            case "getOrInsertComputed": {
+                let spread = false;
+                for (let i = 0; i < args.length; i++) {
+                    if (args[i].type === "SpreadElement") spread = true;
+                }
+                if (spread) break; // 交通用路径(栈由 switch 尾统一恢复)
+                if (args.length >= 1) this.compileExpression(args[0]);
+                else this.vm.movImm64(VReg.RET, 0x7ffb000000000000n);
+                this.vm.push(VReg.RET); // key
+                if (args.length >= 2) this.compileExpression(args[1]);
+                else this.vm.movImm64(VReg.RET, 0x7ffb000000000000n);
+                this.vm.mov(VReg.A2, VReg.RET); // value / callbackfn
+                this.vm.pop(VReg.A1);           // key
+                this.vm.pop(VReg.A0);           // map
+                this.vm.call(method === "getOrInsert" ? "_map_getOrInsert" : "_map_getOrInsertComputed");
+                return true;
+            }
 
             case "get":
                 // map.get(key)
@@ -119,7 +158,7 @@ export const BuiltinCollectionMethodCompiler = {
         // 回调
         this.compileExpression(callbackExpr);
         vm.store(VReg.FP, cbOffset, VReg.RET);
-        this.emitThisArgSlot(thisArgExpr, "mapfe");
+        this._emitCollCbThisSlot(cbOffset, thisArgExpr, "mapfe");
         // cur = map.head:脱壳裸指针后 load @16
         vm.load(VReg.RET, VReg.FP, mapOffset);
         vm.emitMaskLoad(VReg.V1);
@@ -129,10 +168,14 @@ export const BuiltinCollectionMethodCompiler = {
 
         const loopL = this.ctx.newLabel("mapfe_loop");
         const endL = this.ctx.newLabel("mapfe_end");
+        const skipL = this.ctx.newLabel("mapfe_skip");
         vm.label(loopL);
         vm.load(VReg.V0, VReg.FP, curOffset);
         vm.cmpImm(VReg.V0, 0);
         vm.jeq(endL);
+        vm.load(VReg.V1, VReg.V0, 32); // empty 墓碑
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne(skipL);
 
         // 加载闭包并 push(与 array.forEach 同序)
         vm.load(VReg.V6, VReg.FP, cbOffset);
@@ -148,12 +191,13 @@ export const BuiltinCollectionMethodCompiler = {
         this.emitClosureCallAfterSetup();
 
         // cur = node.next(@16)——调用毁寄存器,从 FP 槽重载节点指针
+        vm.label(skipL);
         vm.load(VReg.V0, VReg.FP, curOffset);
         vm.load(VReg.V0, VReg.V0, 16);
         vm.store(VReg.FP, curOffset, VReg.V0);
         vm.jmp(loopL);
         vm.label(endL);
-        vm.movImm(VReg.RET, 0); // forEach 返回 undefined
+        vm.movImm64(VReg.RET, 0x7ffb000000000000n); // forEach 返回 undefined(此前是裸 0 → 数字 0)
     },
 
     // Set.forEach:遍历插入序链表(head@16 → node.next@8,裸 0 结尾),对每个节点
@@ -172,7 +216,7 @@ export const BuiltinCollectionMethodCompiler = {
         // 回调
         this.compileExpression(callbackExpr);
         vm.store(VReg.FP, cbOffset, VReg.RET);
-        this.emitThisArgSlot(thisArgExpr, "setfe");
+        this._emitCollCbThisSlot(cbOffset, thisArgExpr, "setfe");
         // cur = set.head:脱壳后 load @16
         vm.load(VReg.RET, VReg.FP, setOffset);
         vm.emitMaskLoad(VReg.V1);
@@ -205,7 +249,7 @@ export const BuiltinCollectionMethodCompiler = {
         vm.store(VReg.FP, curOffset, VReg.V0);
         vm.jmp(loopL);
         vm.label(endL);
-        vm.movImm(VReg.RET, 0); // forEach 返回 undefined
+        vm.movImm64(VReg.RET, 0x7ffb000000000000n); // forEach 返回 undefined(此前是裸 0 → 数字 0)
     },
 
     // 编译 Set 方法调用

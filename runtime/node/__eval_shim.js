@@ -8,16 +8,56 @@
 // 词法作用域(独立里程碑)。
 
 import { compileFragment, relocsToBytes } from "../../engine/compile.js";
+import { __RE_new } from "./__regexp_shim.js";
 
 // 宿主 target(编译期常量,如 "macos-x64"/"macos-arm64"/"linux-x64")。片段编码按架构不同,
 // eval/new Function 编出的片段必须与运行架构一致,故不能硬编码 arm64。
 const HOST_TARGET = __engine_host_target();
+
+// 整段源若是 /pattern/flags 字面量,直接走宿主 __RE_new:compileFragment 不注入
+// regexp shim,编出来的 __RE_new 是未定义 → "not a function"(source/value-*.js)。
+function __evalRegexpLiteral(x) {
+    if (typeof x !== "string" || x.length < 2) return null;
+    if (x.charAt(0) !== "/") return null;
+    var n = 0;
+    while (true) {
+        var cc = x.charCodeAt(n);
+        if (typeof cc !== "number" || cc !== cc) break;
+        n = n + 1;
+    }
+    if (n < 2) return null;
+    var i = 1;
+    var slash = -1;
+    while (i < n) {
+        var ch = x.charAt(i);
+        if (ch === "\\") {
+            i = i + 2;
+            continue;
+        }
+        if (ch === "/") {
+            slash = i;
+            break;
+        }
+        i = i + 1;
+    }
+    if (slash < 0) return null;
+    var flags = x.slice(slash + 1);
+    var fi = 0;
+    while (fi < flags.length) {
+        var f = flags.charAt(fi);
+        if ("gimsuyvd".indexOf(f) < 0) return null;
+        fi = fi + 1;
+    }
+    return __RE_new(x.slice(1, slash), flags);
+}
 
 // __eval(x):间接 eval。非字符串原样返回(ES 规范);字符串则运行时编译成可重定位片段
 // + 进程内执行,返回结果(JSValue,与宿主共享堆)。arm64 片段有 256KB 上限(19 位 PC 相对),
 // 超限时 compileFragment 抛清晰错误,原样传播到 eval 调用点。
 export function __eval(x) {
     if (typeof x !== "string") return x;
+    var reLit = __evalRegexpLiteral(x);
+    if (reLit !== null) return reLit;
     const r = compileFragment(x, HOST_TARGET);
     const fragArr = new Uint8Array(r.bytes);
     const relocArr = new Uint8Array(relocsToBytes(r.relocs));
@@ -31,6 +71,8 @@ export function __eval(x) {
 // 非字符串实参按 ES 规范原样返回。
 export function __eval_direct(x, fp, layout) {
     if (typeof x !== "string") return x;
+    var reLit = __evalRegexpLiteral(x);
+    if (reLit !== null) return reLit;
     const r = compileFragment(x, HOST_TARGET, layout);
     const fragArr = new Uint8Array(r.bytes);
     const relocArr = new Uint8Array(relocsToBytes(r.relocs));
@@ -54,5 +96,24 @@ export function __makeFunction(names, body) {
     const r = compileFragment(wrapped, HOST_TARGET);
     const fragArr = new Uint8Array(r.bytes);
     const relocArr = new Uint8Array(relocsToBytes(r.relocs));
-    return __engine_exec_reloc(fragArr, relocArr);
+    const fn = __engine_exec_reloc(fragArr, relocArr);
+    // 片段函数的 func_meta 不在宿主进程表 → gOPD(fn,"length") 恒 undefined
+    // (15.2.3.3-4-187)。按形参列表粗算 arity 并 DefineOwnProperty 落侧表。
+    var arity = 0;
+    if (params.length > 0) {
+        var joined = params.join(",");
+        if (joined.length > 0) {
+            arity = 1;
+            for (var ci = 0; ci < joined.length; ci++) {
+                if (joined.charAt(ci) === ",") arity = arity + 1;
+            }
+        }
+    }
+    Object.defineProperty(fn, "length", {
+        value: arity,
+        writable: false,
+        enumerable: false,
+        configurable: true,
+    });
+    return fn;
 }

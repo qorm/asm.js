@@ -412,6 +412,135 @@ export class ArrayGenerator {
         vm.epilogue([], 0);
     }
 
+    // [argv 溢出] _call_argv_fill(A0=装箱实参数组):元素 5..15 → _call_argv 全局。
+    generateCallArgvFill() {
+        const vm = this.vm;
+        vm.label("_call_argv_fill");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.call("_array_length");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.movImm(VReg.S2, 5);
+        vm.label("_cavf_loop");
+        vm.cmp(VReg.S2, VReg.S1);
+        vm.jge("_cavf_done");
+        vm.cmpImm(VReg.S2, 16);
+        vm.jge("_cavf_done");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S2);
+        vm.call("_array_get");
+        vm.lea(VReg.V5, "_call_argv");
+        vm.shlImm(VReg.V6, VReg.S2, 3);
+        vm.add(VReg.V5, VReg.V5, VReg.V6);
+        vm.store(VReg.V5, 0, VReg.RET);
+        vm.addImm(VReg.S2, VReg.S2, 1);
+        vm.jmp("_cavf_loop");
+        vm.label("_cavf_done");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+    }
+
+    // _array_ctor_single(A0=arg): Number ∧ ToUint32(n)===n → ArrayCreate(n);
+    // Number 否则 RangeError;非 Number → 单元素数组。
+    generateArrayCtorSingle() {
+        const vm = this.vm;
+        vm.label("_array_ctor_single");
+        vm.prologue(16, [VReg.S0]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.shrImm(VReg.V0, VReg.S0, 48);
+        vm.cmpImm(VReg.V0, 0x7FF8);
+        vm.jeq("_acs_num");
+        vm.cmpImm(VReg.V0, 0x7FF9);
+        vm.jge("_acs_elem"); // tagged non-number → element
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_acs_num"); // 正 double(high16 1..0x7FF7)
+        // high16==0:denormal/+0/MIN_VALUE(<ptrFloor)是数字;堆/数据段指针才是单元素。
+        // 旧实现一律当裸指针 → new Array(Number.MIN_VALUE) 得 [5e-324] 而非 RangeError。
+        vm.movImm64(VReg.V1, vm.ptrFloor);
+        vm.cmp(VReg.S0, VReg.V1);
+        vm.jge("_acs_elem");
+        vm.label("_acs_num");
+        // ES: Number ∧ ToUint32(n)===n → ArrayCreate(n); 否则 RangeError。
+        // 旧实现只 ToUint32 后建数组:new Array(1.5) 得 length=1,
+        // new Array(MAX_VALUE) 甚至按错误整数分配(S15.4.2.2_A2.2_T3)。
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_number_coerce");
+        vm.store(VReg.SP, 0, VReg.RET); // n 的 float64 位
+        vm.shrImm(VReg.V1, VReg.RET, 52);
+        vm.andImm(VReg.V1, VReg.V1, 0x7FF);
+        vm.cmpImm(VReg.V1, 0x7FF);
+        vm.jeq("_acs_range"); // NaN/±Inf
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_to_uint32");
+        vm.store(VReg.SP, 8, VReg.RET); // u
+        // u==0 时用位测:MIN_VALUE 等 denormal 在 FTZ 下 fcmp 会当成 0。
+        // ±0 的绝对值位为 0 才合法;其余(MIN_VALUE/MAX_VALUE) RangeError。
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_acs_cmpf");
+        vm.load(VReg.V0, VReg.SP, 0);
+        vm.movImm64(VReg.V1, 0x7fffffffffffffffn);
+        vm.and(VReg.V0, VReg.V0, VReg.V1);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_acs_range");
+        vm.jmp("_acs_mk");
+        vm.label("_acs_cmpf");
+        vm.load(VReg.V0, VReg.SP, 0);
+        vm.fmovToFloat(0, VReg.V0);
+        vm.load(VReg.V1, VReg.SP, 8);
+        vm.scvtf(1, VReg.V1);
+        vm.fcmp(0, 1);
+        vm.jne("_acs_range"); // 含 1.5!==1;-0===0 走上方位测
+        vm.label("_acs_mk");
+        vm.load(VReg.A0, VReg.SP, 8);
+        vm.call("_array_new_with_size");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V2, VReg.RET, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffe000000000000n);
+        vm.or(VReg.RET, VReg.V2, VReg.V1);
+        vm.epilogue([VReg.S0], 16);
+        vm.label("_acs_range");
+        vm.lea(VReg.A0, vm.asm.addString("Invalid array length"));
+        vm.movImm64(VReg.V0, 0x0000ffffffffffffn); vm.and(VReg.A0, VReg.A0, VReg.V0);
+        vm.movImm64(VReg.V0, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V0);
+        vm.call("_throw_range_error");
+        vm.epilogue([VReg.S0], 16);
+        vm.label("_acs_elem");
+        vm.movImm(VReg.A0, 1);
+        vm.call("_array_new_with_size");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V2, VReg.RET, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffe000000000000n);
+        vm.or(VReg.RET, VReg.V2, VReg.V1);
+        vm.store(VReg.SP, 0, VReg.RET);
+        vm.mov(VReg.A0, VReg.RET);
+        vm.movImm(VReg.A1, 0);
+        vm.mov(VReg.A2, VReg.S0);
+        vm.call("_array_set");
+        vm.load(VReg.RET, VReg.SP, 0);
+        vm.epilogue([VReg.S0], 16);
+    }
+
+    // _flat_to_depth(A0=depthVal) -> 裸非负 int(ToIntegerOrInfinity 近似)
+    generateFlatToDepth() {
+        const vm = this.vm;
+        vm.label("_flat_to_depth");
+        vm.prologue(0, []);
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFB); // undefined → 1
+        vm.jeq("_ftd_one");
+        // ToIntegerOrInfinity:串/对象经 _number_coerce(NaN→0),禁 _syscall_arg
+        // 把 0x7FFC 串指针当正深度(flat("TestString") 会整树展开)。
+        vm.call("_aref_fromindex");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jlt("_ftd_zero");
+        vm.epilogue([], 0);
+        vm.label("_ftd_one");
+        vm.movImm(VReg.RET, 1);
+        vm.epilogue([], 0);
+        vm.label("_ftd_zero");
+        vm.movImm(VReg.RET, 0);
+        vm.epilogue([], 0);
+    }
+
     // 数组 at (支持负索引)
     // _array_at(arr, index) -> value
     generateArrayAt() {
@@ -1453,14 +1582,9 @@ export class ArrayGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
     }
 
-    // Array.prototype.sort 运行时。编译器快路曾一次读 length 后冒泡,getter/setter
-    // 改 length 时后续按下标野读 → SIGSEGV(precise-getter/setter-appends/pops)。
-    // 此处每轮重读 length、取值/交换前做 j+1<live 检查;增长不追(以首次 length 封顶),
-    // 避免 setter push 把冒泡变成无限扩容。比较语义对齐原快路:undefined 沉底,
-    // 有 comparefn 则调用,否则 ToString+strcmp。
-    // 读走稠密 _array_get:accessor getter 的 this 未装箱,`this.foo` 具名 miss
-    // 在 L1 object 原型回落上 SIGSEGV。写走 _subscript_set 以触发 setter。
-    // 真 hole/`in`/delete/accessor this 需 L1 object,本波不做。
+    // Array.prototype.sort 运行时。规范:固定 len → Has/Get 收集 → 排序 List →
+    // Set 0..itemCount-1 / Delete itemCount..len-1(不 Set length)。
+    // 比较:undefined 沉底;有 comparefn 则调用,否则 ToString+strcmp。
     generateArraySort() {
         const vm = this.vm;
         const UNDEF = 0x7ffb000000000000n;
@@ -1518,110 +1642,134 @@ export class ArrayGenerator {
         vm.call("_strcmp");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 16);
 
-        // _array_sort(A0=arr) / _array_sort_cmp(A0=arr, A1=comparefn) → arr
+        // 规范(tc39/ecma262#1585):固定 len;HasProperty 才 Get 进 List;排序 List;
+        // Set 回写 0..itemCount-1;Delete itemCount..len-1。不 Set length。
+        // getter/setter 改 length 只影响对象,不影响循环上界(precise-getter/setter-*)。
+        // 稠密快照(_array_sort_dense)只打已收集项,禁再 collect(会递归)。
         vm.label("_array_sort");
         vm.movImm64(VReg.A1, UNDEF);
         vm.label("_array_sort_cmp");
-        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
-        vm.mov(VReg.S0, VReg.A0); // arr
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.mov(VReg.S0, VReg.A0); // recv
         vm.mov(VReg.S1, VReg.A1); // comparefn
         vm.mov(VReg.A0, VReg.S0);
-        vm.call("_array_length");
-        vm.mov(VReg.S2, VReg.RET); // initialLen(封顶,不追增长)
+        vm.call("_agen_tolength");
+        vm.mov(VReg.S2, VReg.RET); // origLen(固定)
         vm.shrImm(VReg.V0, VReg.S1, 48);
         vm.cmpImm(VReg.V0, 0x7FFB);
         vm.jeq("_asort_cbok");
         vm.mov(VReg.A0, VReg.S1);
-        vm.call("_aref_require_cb"); // IsCallable after Length
+        vm.call("_aref_require_cb");
         vm.label("_asort_cbok");
-        vm.cmpImm(VReg.S2, 2);
-        vm.jlt("_asort_done");
-        vm.movImm(VReg.S3, 0); // i
-        vm.label("_asort_outer");
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.call("_box_arr_r");
+        vm.store(VReg.SP, 0, VReg.RET); // items
+        vm.movImm(VReg.S3, 0); // j
+        vm.label("_asort_collect");
+        vm.cmp(VReg.S3, VReg.S2);
+        vm.jge("_asort_sort_items");
         vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_agen_has_idx");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_asort_collect_next");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_agen_get_idx");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.call("_array_push");
+        vm.store(VReg.SP, 0, VReg.RET);
+        vm.label("_asort_collect_next");
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_asort_collect");
+        vm.label("_asort_sort_items");
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_array_sort_dense");
+        vm.load(VReg.A0, VReg.SP, 0);
         vm.call("_array_length");
-        vm.mov(VReg.S5, VReg.RET); // live
-        vm.cmpImm(VReg.S5, 2);
-        vm.jlt("_asort_done");
-        vm.mov(VReg.V1, VReg.S5);
-        vm.cmp(VReg.V1, VReg.S2);
-        vm.jle("_asort_lim_ok");
-        vm.mov(VReg.V1, VReg.S2);
-        vm.label("_asort_lim_ok");
-        vm.subImm(VReg.V1, VReg.V1, 1);
-        vm.cmp(VReg.S3, VReg.V1);
+        vm.mov(VReg.S4, VReg.RET); // itemCount
+        vm.movImm(VReg.S3, 0);
+        vm.label("_asort_setloop");
+        vm.cmp(VReg.S3, VReg.S4);
+        vm.jge("_asort_delloop");
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_array_get");
+        vm.mov(VReg.A2, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_subscript_set");
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_asort_setloop");
+        vm.label("_asort_delloop");
+        vm.cmp(VReg.S3, VReg.S2);
         vm.jge("_asort_done");
-        vm.movImm(VReg.S4, 0); // j
-        vm.label("_asort_inner");
+        vm.scvtf(0, VReg.S3);
+        vm.fmovToInt(VReg.A0, 0);
+        vm.call("_js_prop_key");
+        vm.mov(VReg.A1, VReg.RET);
         vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_delete");
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_asort_delloop");
+        vm.label("_asort_done");
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
+
+        // _array_sort_dense(A0=稠密 items, A1=comparefn):原地冒泡,不 collect。
+        vm.label("_array_sort_dense");
+        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
         vm.call("_array_length");
-        vm.mov(VReg.S5, VReg.RET);
-        vm.addImm(VReg.V0, VReg.S4, 1);
-        vm.cmp(VReg.V0, VReg.S5);
-        vm.jge("_asort_inner_end");
-        vm.cmp(VReg.V0, VReg.S2);
-        vm.jge("_asort_inner_end");
-        // 稠密 get:accessor 路径(_subscript_get→side_elem)会在 getter 里
-        // `this.foo` 具名 miss 上 SIGSEGV(L1 object 原型回落未做)。P0 先停崩。
+        vm.mov(VReg.S2, VReg.RET);
+        vm.cmpImm(VReg.S2, 2);
+        vm.jlt("_asortd_done");
+        vm.movImm(VReg.S3, 0); // i
+        vm.label("_asortd_outer");
+        vm.subImm(VReg.V1, VReg.S2, 1);
+        vm.cmp(VReg.S3, VReg.V1);
+        vm.jge("_asortd_done");
+        vm.movImm(VReg.S4, 0); // j
+        vm.label("_asortd_inner");
+        vm.sub(VReg.V0, VReg.S2, VReg.S3);
+        vm.subImm(VReg.V0, VReg.V0, 1);
+        vm.cmp(VReg.S4, VReg.V0);
+        vm.jge("_asortd_inner_end");
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S4);
         vm.call("_array_get");
-        vm.store(VReg.SP, 0, VReg.RET); // a
-        vm.mov(VReg.A0, VReg.S0);
-        vm.call("_array_length");
-        vm.mov(VReg.S5, VReg.RET);
-        vm.addImm(VReg.V0, VReg.S4, 1);
-        vm.cmp(VReg.V0, VReg.S5);
-        vm.jge("_asort_inner_end");
-        vm.cmp(VReg.V0, VReg.S2);
-        vm.jge("_asort_inner_end");
+        vm.store(VReg.SP, 0, VReg.RET);
         vm.mov(VReg.A0, VReg.S0);
         vm.addImm(VReg.A1, VReg.S4, 1);
         vm.call("_array_get");
-        vm.store(VReg.SP, 8, VReg.RET); // b
+        vm.store(VReg.SP, 8, VReg.RET);
         vm.load(VReg.A0, VReg.SP, 0);
         vm.load(VReg.A1, VReg.SP, 8);
         vm.mov(VReg.A2, VReg.S1);
         vm.call("_asort_compare");
         vm.cmpImm(VReg.RET, 0);
-        vm.jle("_asort_noswap");
-        vm.mov(VReg.A0, VReg.S0);
-        vm.call("_array_length");
-        vm.mov(VReg.S5, VReg.RET);
-        vm.addImm(VReg.V0, VReg.S4, 1);
-        vm.cmp(VReg.V0, VReg.S5);
-        vm.jge("_asort_inner_end");
-        vm.cmp(VReg.V0, VReg.S2);
-        vm.jge("_asort_inner_end");
-        // 写走 _subscript_set:触发 setter(this.foo=v),否则测例事后读
-        // array[2] getter 的 this.foo 具名 miss 仍 SIGSEGV。
+        vm.jle("_asortd_noswap");
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S4);
         vm.load(VReg.A2, VReg.SP, 8);
-        vm.call("_subscript_set");
-        vm.mov(VReg.A0, VReg.S0);
-        vm.call("_array_length");
-        vm.mov(VReg.S5, VReg.RET);
-        vm.addImm(VReg.V0, VReg.S4, 1);
-        vm.cmp(VReg.V0, VReg.S5);
-        vm.jge("_asort_inner_end");
-        vm.cmp(VReg.V0, VReg.S2);
-        vm.jge("_asort_inner_end");
+        vm.call("_array_set");
         vm.mov(VReg.A0, VReg.S0);
         vm.addImm(VReg.A1, VReg.S4, 1);
         vm.load(VReg.A2, VReg.SP, 0);
-        vm.call("_subscript_set");
-        vm.label("_asort_noswap");
+        vm.call("_array_set");
+        vm.label("_asortd_noswap");
         vm.addImm(VReg.S4, VReg.S4, 1);
-        vm.jmp("_asort_inner");
-        vm.label("_asort_inner_end");
+        vm.jmp("_asortd_inner");
+        vm.label("_asortd_inner_end");
         vm.addImm(VReg.S3, VReg.S3, 1);
-        vm.cmp(VReg.S3, VReg.S2);
-        vm.jge("_asort_done");
-        vm.jmp("_asort_outer");
-        vm.label("_asort_done");
+        vm.jmp("_asortd_outer");
+        vm.label("_asortd_done");
         vm.mov(VReg.RET, VReg.S0);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 16);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 16);
     }
 
     // _array_shift(A0 = boxed 数组) -> 移除并返回首元素(空则 undefined)。
@@ -1773,12 +1921,16 @@ export class ArrayGenerator {
         vm.store(VReg.SP, 0, VReg.V1);
         vm.jmp("_au_loop");
         vm.label("_au_insert");
+        // Set(0,value,true):须走 _subscript_set 以触发 Array.prototype[0] setter
+        // (unshift/set-length-array-length-is-non-writable);_array_set 只写稠密槽。
         vm.mov(VReg.A0, VReg.S3);
         vm.movImm(VReg.A1, 0);
         vm.mov(VReg.A2, VReg.S2);
-        vm.call("_array_set");
+        vm.call("_subscript_set");
         vm.addImm(VReg.S1, VReg.S1, 1);
-        vm.store(VReg.S0, 8, VReg.S1);
+        vm.mov(VReg.A0, VReg.S3);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_array_setlength_throw"); // Set("length",len+1,true)
         vm.scvtf(0, VReg.S1);
         vm.fmovToInt(VReg.RET, 0);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
@@ -1900,11 +2052,14 @@ export class ArrayGenerator {
         vm.addImm(VReg.V2, VReg.V2, 1);
         vm.jmp("_sp_items");
         vm.label("_sp_items_done");
-        // length = newLen = len - del + itemsLen
+        // Set(length, newLen, true):不可写 length 须 TypeError
+        // (S15.4.4.12_A6.1_T2)。禁盲写 @8。
         vm.load(VReg.V1, VReg.S0, 8);
         vm.sub(VReg.V1, VReg.V1, VReg.S2);
         vm.add(VReg.V1, VReg.V1, VReg.V3);
-        vm.store(VReg.S0, 8, VReg.V1);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.V1);
+        vm.call("_array_setlength_throw");
         vm.mov(VReg.RET, VReg.S4);         // 返回 removed
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
     }
@@ -2222,7 +2377,7 @@ export class ArrayGenerator {
         const vm = this.vm;
         const UNDEF = 0x7ffb000000000000n;
         vm.label("_array_spread_into_map");
-        vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.prologue(128, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
         vm.mov(VReg.S0, VReg.A0); // arr
         vm.mov(VReg.S1, VReg.A1); // src(boxed)
         vm.mov(VReg.S2, VReg.A2); // callback
@@ -2284,25 +2439,50 @@ export class ArrayGenerator {
         vm.mov(VReg.A0, VReg.RET);
         vm.mov(VReg.A1, VReg.S5);
         vm.call("_maybe_getter");
-        // mapped = callback(value, index, arr) with this=thisArg
+        // mapped = Call(mapfn, T, «value, k») — 两参。map 抛须 IteratorClose。
+        vm.lea(VReg.V0, "_exc_ctx_top");
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.store(VReg.SP, 32, VReg.V1);
+        vm.lea(VReg.V1, "_asimap_catch");
+        vm.store(VReg.SP, 40, VReg.V1);
+        vm.mov(VReg.V1, VReg.SP);
+        vm.store(VReg.SP, 48, VReg.V1);
+        vm.store(VReg.SP, 56, VReg.FP);
+        vm.store(VReg.SP, 64, VReg.S0);
+        vm.store(VReg.SP, 72, VReg.S1);
+        vm.store(VReg.SP, 80, VReg.S2);
+        vm.store(VReg.SP, 88, VReg.S3);
+        vm.store(VReg.SP, 96, VReg.S4);
+        vm.store(VReg.SP, 104, VReg.S5);
+        vm.addImm(VReg.V1, VReg.SP, 32);
+        vm.store(VReg.V0, 0, VReg.V1);
         vm.mov(VReg.A0, VReg.RET); // value
         vm.scvtf(0, VReg.S4);
         vm.fmovToInt(VReg.A1, 0);  // index as number
-        vm.mov(VReg.A2, VReg.S0);  // arr
         vm.mov(VReg.A3, VReg.S2);  // callback
         vm.load(VReg.A4, VReg.SP, 0); // thisArg
-        vm.call("_aref_invoke_cbt");
-        // push mapped
+        vm.call("_aref_invoke_from");
         vm.mov(VReg.A1, VReg.RET);
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_array_push");
         vm.mov(VReg.S0, VReg.RET);
+        vm.load(VReg.V1, VReg.SP, 32);
+        vm.lea(VReg.V0, "_exc_ctx_top");
+        vm.store(VReg.V0, 0, VReg.V1);
         vm.addImm(VReg.S4, VReg.S4, 1);
         vm.jmp("_asimap_loop");
 
+        vm.label("_asimap_catch");
+        vm.load(VReg.V1, VReg.SP, 32);
+        vm.lea(VReg.V0, "_exc_ctx_top");
+        vm.store(VReg.V0, 0, VReg.V1);
+        vm.mov(VReg.A0, VReg.S3);
+        vm.call("_iterator_close_keep");
+        vm.call("_throw_unwind");
+
         vm.label("_asimap_done");
         vm.mov(VReg.RET, VReg.S0);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 128);
     }
 
     // [Stage A 内置方法引用] 蹦床:数组/字符串方法作一等值(`const f=arr.push`、
@@ -2332,16 +2512,10 @@ export class ArrayGenerator {
     generateArefIntWrappers() {
         const vm = this.vm;
         // 装箱实参 → 裸 int(undefined→0)。A0=boxed → RET=裸 int。
+        // 走 _aref_fromindex:串/对象 ToNumber,禁把 "1" 当堆指针截 int
+        // (TA indexOf(43,"1") / slice 起点曾因此恒 miss)。
         vm.label("_aref_argint");
-        vm.prologue(0, []);
-        vm.shrImm(VReg.V1, VReg.A0, 48);
-        vm.cmpImm(VReg.V1, 0x7ffb); // JS_UNDEFINED
-        vm.jeq("_aref_argint_zero");
-        vm.call("_syscall_arg"); // A0(装箱)→ RET 裸 int
-        vm.epilogue([], 0);
-        vm.label("_aref_argint_zero");
-        vm.movImm(VReg.RET, 0);
-        vm.epilogue([], 0);
+        vm.jmp("_aref_fromindex");
 
         // _aref_fromindex(A0=boxed) → ToInteger 裸 int(undefined→0)。
         // 与 _aref_argint/_to_int32 不同:串/对象走 _number_coerce(+Inf/-Inf 保留哨兵),
@@ -2385,7 +2559,7 @@ export class ArrayGenerator {
         vm.shrImm(VReg.V1, VReg.A0, 48);
         vm.cmpImm(VReg.V1, 0x7ffb); // undefined
         vm.jeq("_aref_argint_d_def");
-        vm.call("_syscall_arg"); // A0 → RET 裸 int
+        vm.call("_aref_fromindex");
         vm.epilogue([VReg.S0], 0);
         vm.label("_aref_argint_d_def");
         vm.mov(VReg.RET, VReg.S0);
@@ -2490,7 +2664,17 @@ export class ArrayGenerator {
         vm.label("_aref_invoke_cb");
         vm.movImm64(VReg.A4, UNDEF); // 兼容入口:忽略调用方残留 A4
         vm.label("_aref_invoke_cbt");
-        vm.prologue(0, [VReg.S0]); // 保存 S0(闭包会占用;调用者的 S0 须还原)
+        vm.prologue(16, [VReg.S0]); // 保存 S0(闭包会占用;调用者的 S0 须还原)
+        vm.movImm(VReg.V0, 3);
+        vm.store(VReg.SP, 0, VReg.V0); // argc=3:callback(elem, idx, arr)
+        vm.jmp("_aref_icb_go");
+        // Array.from mapfn:Call(mapfn, T, «value, k») 仅两参(calling-from-valid-2 /
+        // iter-map-fn-args)。禁复用 cbt 的 argc=3。
+        vm.label("_aref_invoke_from");
+        vm.prologue(16, [VReg.S0]);
+        vm.movImm(VReg.V0, 2);
+        vm.store(VReg.SP, 0, VReg.V0);
+        vm.label("_aref_icb_go");
         vm.mov(VReg.V6, VReg.A3);
         // [C1] callback 可调用守卫(镜像 _validate_callable 判据):装箱函数(0x7FFF)/
         // 装箱对象(0x7FFD,可调用 Proxy 候选,下方 magic/TYPE_PROXY 分派)直通;
@@ -2587,9 +2771,11 @@ export class ArrayGenerator {
         // A4 保持 UNDEF
         vm.label("_aref_icb_this_ready");
         vm.mov(VReg.A5, VReg.A4);       // this = thisArg(cbt 传入;cb 入口已置 UNDEF;或 global)
-        vm.setCallArgcImm(3, VReg.V0, VReg.V1); // [argc ABI] callback(elem, idx, arr)
-        vm.callIndirect(VReg.V6);       // callback(A0,A1,A2)
-        vm.epilogue([VReg.S0], 0);
+        vm.lea(VReg.V0, "_call_argc");
+        vm.load(VReg.V1, VReg.SP, 0);   // 3(cbt) 或 2(from)
+        vm.store(VReg.V0, 0, VReg.V1);
+        vm.callIndirect(VReg.V6);       // callback(A0,A1[,A2])
+        vm.epilogue([VReg.S0], 16);
 
         // _aref_require_cb(A0=callback):IsCallable 检(须在 Length/ToLength 之后调用)。
         // 不调用回调。此前 0x7FFD 一律放行 → [].map({})/Array.from([],{}) 空长不抛
@@ -2651,10 +2837,9 @@ export class ArrayGenerator {
         vm.label("_aref_req_ok");
         vm.epilogue([], 0);
 
-        // _iterator_close(A0=iterator_boxed):for-of 提前 break 的 IteratorClose——若 iterator
-        // 有 return() 方法则以 this=iterator 无参调用(结果忽略);无则空操作。单一定点 helper
-        // (每个 for-of 只发一条 call,不内联方法调用 → 自举安全)。magic 分派同 _aref_invoke_cb,
-        // 但 this=iterator(A5)。
+        // _iterator_close(A0=iterator_boxed):for-of 提前 break / 解构未耗尽的 IteratorClose。
+        // 有 return() 则以 this=iterator 无参调用;无则空操作。return() 结果须是 Object,
+        // 否则 TypeError(7.4.6 step 9)。单一定点 helper(每个 for-of 只发一条 call)。
         vm.label("_iterator_close");
         vm.prologue(0, [VReg.S0, VReg.S1]);
         vm.mov(VReg.S1, VReg.A0);        // iterator(this)
@@ -2686,6 +2871,29 @@ export class ArrayGenerator {
         vm.label("_itc_do");
         vm.mov(VReg.A5, VReg.S1);         // this = iterator
         vm.callIndirect(VReg.V6);         // iterator.return()
+        // 7.4.6 IteratorClose step 9: Type(innerResult) 须是 Object,否则 TypeError。
+        // 完成值已是 throw 时由调用方 suppress(不经此检查)。null/undefined/原语全拒。
+        vm.shrImm(VReg.V0, VReg.RET, 48);
+        vm.cmpImm(VReg.V0, 0x7FFD);      // object
+        vm.jeq("_itc_done");
+        vm.cmpImm(VReg.V0, 0x7FFE);      // array
+        vm.jeq("_itc_done");
+        vm.cmpImm(VReg.V0, 0x7FFF);      // function
+        vm.jeq("_itc_done");
+        vm.cmpImm(VReg.V0, 0);           // 裸堆指针(未装箱对象/classinfo)
+        vm.jne("_itc_not_object");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_itc_not_object");
+        vm.movImm64(VReg.V1, vm.ptrFloor);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jge("_itc_done");
+        vm.label("_itc_not_object");
+        vm.lea(VReg.A0, vm.asm.addString("Iterator result is not an object"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
         vm.label("_itc_done");
         vm.epilogue([VReg.S0, VReg.S1], 0);
 
@@ -3462,7 +3670,10 @@ export class ArrayGenerator {
         vm.jlt("_agen_tol_notraw");
         vm.cmpImm(VReg.V3, 0x7f);
         vm.jgt("_agen_tol_notraw");
-        vm.load(VReg.RET, VReg.S0, 8); // TypedArray length
+        // 活长度:OOB/detached → 0;tracking 跟 resize。禁盲读 +8(固定视图
+        // resize 后仍留旧 length,Array.p.every.call(oobTA) 会假迭代)。
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_typed_array_length");
         vm.epilogue([VReg.S0, VReg.S1], 0);
         vm.label("_agen_tol_arr_raw");
         vm.mov(VReg.A0, VReg.S0);
@@ -3545,6 +3756,30 @@ export class ArrayGenerator {
         vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
         vm.mov(VReg.S0, VReg.A0); // recv
         vm.mov(VReg.S1, VReg.A1); // bare idx
+        // 裸 TypedArray:HasProperty(整数下标) ≡ 0<=i<活长度。
+        // OOB/detached → _typed_array_length=0 → 全假(Array.p.map.call 缩中迭代不再访洞)。
+        vm.shrImm(VReg.V0, VReg.S0, 48);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_agen_has_idx_tag");
+        vm.cmpImm(VReg.S0, 0);
+        vm.jeq("_agen_has_idx_tag");
+        vm.movImm64(VReg.V1, vm.ptrFloor);
+        vm.cmp(VReg.S0, VReg.V1);
+        vm.jlt("_agen_has_idx_tag");
+        vm.loadByte(VReg.V1, VReg.S0, 0);
+        vm.andImm(VReg.V1, VReg.V1, 0xff);
+        vm.cmpImm(VReg.V1, 0x40);
+        vm.jlt("_agen_has_idx_tag");
+        vm.cmpImm(VReg.V1, 0x7f);
+        vm.jgt("_agen_has_idx_tag");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_typed_array_length");
+        vm.cmpImm(VReg.S1, 0);
+        vm.jlt("_agen_has_no");
+        vm.cmp(VReg.S1, VReg.RET);
+        vm.jge("_agen_has_no");
+        vm.jmp("_agen_has_yes");
+        vm.label("_agen_has_idx_tag");
         vm.shrImm(VReg.V0, VReg.S0, 48);
         vm.cmpImm(VReg.V0, 0x7FFE); // 真数组或 TypedArray
         vm.jne("_agen_has_idx_not_arrtag");
@@ -3580,14 +3815,16 @@ export class ArrayGenerator {
         vm.call("_prop_in");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
         vm.label("_agen_has_arr");
-        // Array exotic HasProperty(integer index):越界→false;否则 own 稠密/侧表再原型。
+        // 普通数组 [[HasProperty]] 是 OrdinaryHasProperty:越界 own 已删,仍走原型。
+        // 不可按 IntegerIndexed 越界直接 false——reduce 缩 length 后须访
+        // Array.prototype[k](15.4.4.21-9-b-28 / reduceRight 9-b-15)。
         vm.emitMaskLoad(VReg.V4);
         vm.andMaskReg(VReg.S2, VReg.S0, VReg.V4); // raw arr
         vm.cmpImm(VReg.S1, 0);
         vm.jlt("_agen_has_no");
         vm.load(VReg.V0, VReg.S2, 8); // length
         vm.cmp(VReg.S1, VReg.V0);
-        vm.jge("_agen_has_no");
+        vm.jge("_agen_has_arr_proto");
         // 稠密槽!=0 → present
         vm.load(VReg.V1, VReg.S2, 24); // data_ptr
         vm.shl(VReg.V2, VReg.S1, 3);
@@ -3610,6 +3847,7 @@ export class ArrayGenerator {
         vm.call("_object_has");
         vm.cmpImm(VReg.RET, 0);
         vm.jne("_agen_has_yes");
+        vm.label("_agen_has_arr_proto");
         // Array.prototype(及更上) — `_prop_in` 对 TYPE_OBJECT 走原型链
         vm.lea(VReg.V0, "_nsobj_array_proto");
         vm.load(VReg.A0, VReg.V0, 0);
@@ -3694,7 +3932,7 @@ export class ArrayGenerator {
         vm.jlt("_agen_get_arr_undef");
         vm.load(VReg.V0, VReg.S2, 8);
         vm.cmp(VReg.S1, VReg.V0);
-        vm.jge("_agen_get_arr_undef");
+        vm.jge("_agen_get_arr_own_or_proto");
         vm.load(VReg.V1, VReg.S2, 24);
         vm.shl(VReg.V2, VReg.S1, 3);
         vm.add(VReg.V2, VReg.V1, VReg.V2);
@@ -3937,30 +4175,88 @@ export class ArrayGenerator {
             vm.epilogue(saved, frame);
         }
 
-        // flatMap: 仍走快照 norm(展开一层;活读收益低);A2=thisArg 透传
+        // flatMap:活读 FlattenIntoArray(+mapper)。禁 _agen_norm:洞被填成
+        // undefined 再 map 出 NaN;Proxy 丢失 has/get/constructor。
         vm.label("_agen_flatMap");
-        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
-        vm.mov(VReg.S1, VReg.A0); // recv
-        vm.mov(VReg.S0, VReg.A1); // cb
-        vm.mov(VReg.S2, VReg.A2); // thisArg
-        vm.shrImm(VReg.V0, VReg.S1, 48);
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.mov(VReg.S0, VReg.A0); // recv
+        vm.mov(VReg.S1, VReg.A1); // cb
+        vm.store(VReg.SP, 0, VReg.A2); // thisArg
+        vm.shrImm(VReg.V0, VReg.S0, 48);
         vm.cmpImm(VReg.V0, 0x7FFE);
-        vm.jne("__agen_flatMap_norm");
-        vm.mov(VReg.A0, VReg.S1);
-        vm.mov(VReg.A1, VReg.S0);
+        vm.jne("_agfm_live");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
         vm.movImm(VReg.A2, 0);
-        vm.mov(VReg.A3, VReg.S2);
+        vm.load(VReg.A3, VReg.SP, 0);
         vm.call("_array_flatMap_rt_t");
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
-        vm.label("__agen_flatMap_norm");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
+        vm.label("_agfm_live");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_agen_toobject");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_agen_tolength");
+        vm.mov(VReg.S2, VReg.RET);
         vm.mov(VReg.A0, VReg.S1);
-        vm.call("_agen_norm");
+        vm.call("_aref_require_cb");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.movImm(VReg.A1, 0);
+        vm.call("_array_species_create");
+        vm.mov(VReg.S4, VReg.RET);
+        vm.movImm(VReg.V0, 0);
+        vm.store(VReg.SP, 8, VReg.V0); // n
+        vm.movImm(VReg.S3, 0);
+        vm.label("_agfm_loop");
+        vm.cmp(VReg.S3, VReg.S2);
+        vm.jge("_agfm_done");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_agen_has_idx");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_agfm_next");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_agen_get_idx");
         vm.mov(VReg.A0, VReg.RET);
-        vm.mov(VReg.A1, VReg.S0);
-        vm.mov(VReg.A2, VReg.S1); // origRecv = 原始 recv
-        vm.mov(VReg.A3, VReg.S2); // thisArg
-        vm.call("_array_flatMap_rt_t");
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+        vm.scvtf(0, VReg.S3);
+        vm.fmovToInt(VReg.A1, 0);
+        vm.mov(VReg.A2, VReg.S0);
+        vm.mov(VReg.A3, VReg.S1);
+        vm.load(VReg.A4, VReg.SP, 0);
+        vm.call("_aref_invoke_cbt");
+        vm.mov(VReg.S5, VReg.RET);
+        vm.mov(VReg.A0, VReg.S5);
+        vm.call("_is_array_value");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_agfm_one");
+        vm.mov(VReg.A0, VReg.S5);
+        vm.call("_agen_tolength");
+        vm.mov(VReg.A2, VReg.RET);
+        vm.mov(VReg.A0, VReg.S4);
+        vm.mov(VReg.A1, VReg.S5);
+        vm.load(VReg.A3, VReg.SP, 8);
+        vm.movImm(VReg.A4, 0);
+        vm.call("_flatten_into_cdp");
+        vm.store(VReg.SP, 8, VReg.RET);
+        vm.jmp("_agfm_next");
+        vm.label("_agfm_one");
+        vm.mov(VReg.A0, VReg.S4);
+        vm.load(VReg.A1, VReg.SP, 8);
+        vm.mov(VReg.A2, VReg.S5);
+        vm.call("_array_cdp_or_throw");
+        vm.load(VReg.V0, VReg.SP, 8);
+        vm.addImm(VReg.V0, VReg.V0, 1);
+        vm.store(VReg.SP, 8, VReg.V0);
+        vm.label("_agfm_next");
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_agfm_loop");
+        vm.label("_agfm_done");
+        vm.mov(VReg.A0, VReg.S4);
+        vm.load(VReg.A1, VReg.SP, 8);
+        vm.call("_array_cdp_set_len");
+        vm.mov(VReg.RET, VReg.S4);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
 
         // 回调+seed 三参(recv, cb, seed):reduce/reduceRight — 非数组活读+跳 hole
         const _cb3Live = [
@@ -4220,6 +4516,33 @@ export class ArrayGenerator {
         vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
         vm.mov(VReg.S0, VReg.A1);
         vm.mov(VReg.S1, VReg.A2);
+        // TypedArray 裸指针:走 _ta_includes(活长度 + SameValueZero/bigint 值相等)。
+        // 禁 _agen_norm→_ta_to_array→_array_includes:快照会把 bigint 元素再盒一次,
+        // _array_includes 按位比 → BigInt64Array 的 includes(2n) 恒假。
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_agen_includes_norm");
+        vm.movImm64(VReg.V2, vm.ptrFloor);
+        vm.cmp(VReg.A0, VReg.V2);
+        vm.jlt("_agen_includes_norm");
+        vm.loadByte(VReg.V3, VReg.A0, 0);
+        vm.cmpImm(VReg.V3, 0x40);
+        vm.jlt("_agen_includes_norm");
+        vm.cmpImm(VReg.V3, 0x61);
+        vm.jgt("_agen_includes_norm");
+        vm.mov(VReg.S2, VReg.A0); // recv
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_aref_argint");
+        vm.mov(VReg.A2, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_ta_includes");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_agen_includes_true");
+        vm.lea(VReg.V0, "_js_false");
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+        vm.label("_agen_includes_norm");
         vm.call("_agen_norm");
         vm.mov(VReg.S2, VReg.RET);
         vm.mov(VReg.A0, VReg.S1);
@@ -4265,6 +4588,16 @@ export class ArrayGenerator {
         vm.jlt("_agen_join_notta");
         vm.cmpImm(VReg.V0, 0x7f);
         vm.jgt("_agen_join_notta");
+        // Array.p.join 用 ToLength(Get("length")):OOB/detached → 0 → 空串,不抛。
+        // _ta_join 是 TA.prototype.join(ValidateTypedArray 先抛)。
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_typed_array_length");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_agen_join_ta_live");
+        vm.lea(VReg.A0, "_str_empty");
+        vm.call("_js_box_string");
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+        vm.label("_agen_join_ta_live");
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S1);
         vm.call("_ta_join");
@@ -4291,17 +4624,89 @@ export class ArrayGenerator {
         vm.call("_array_join");
         vm.epilogue([VReg.S0, VReg.S1], 16);
 
-        // _agen_slice(A0=recv, A1=boxed start, A2=boxed end) → 新数组。
+        // _agen_slice(A0=recv, A1=boxed start, A2=boxed end) → ArraySpeciesCreate + CDP。
         vm.label("_agen_slice");
-        vm.prologue(0, [VReg.S0, VReg.S1]);
-        vm.mov(VReg.S0, VReg.A1);
-        vm.mov(VReg.S1, VReg.A2);
-        vm.call("_agen_norm");
-        vm.mov(VReg.A0, VReg.RET);
-        vm.mov(VReg.A1, VReg.S0);
-        vm.mov(VReg.A2, VReg.S1);
-        vm.call("_aref_arr_slice");
-        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.S2, VReg.A2);
+        vm.call("_agen_toobject");
+        vm.mov(VReg.S0, VReg.RET); // O
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_agen_tolength");
+        vm.mov(VReg.S3, VReg.RET); // len
+        // start
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_to_int32");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.cmpImm(VReg.S1, 0);
+        vm.jge("_agsl_start_pos");
+        vm.add(VReg.S1, VReg.S1, VReg.S3);
+        vm.cmpImm(VReg.S1, 0);
+        vm.jge("_agsl_start_ok");
+        vm.movImm(VReg.S1, 0);
+        vm.jmp("_agsl_start_ok");
+        vm.label("_agsl_start_pos");
+        vm.cmp(VReg.S1, VReg.S3);
+        vm.jle("_agsl_start_ok");
+        vm.mov(VReg.S1, VReg.S3);
+        vm.label("_agsl_start_ok");
+        // end: undefined → len
+        vm.shrImm(VReg.V0, VReg.S2, 48);
+        vm.cmpImm(VReg.V0, 0x7FFB);
+        vm.jne("_agsl_end_have");
+        vm.mov(VReg.S2, VReg.S3);
+        vm.jmp("_agsl_end_ok");
+        vm.label("_agsl_end_have");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_to_int32");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.cmpImm(VReg.S2, 0);
+        vm.jge("_agsl_end_pos");
+        vm.add(VReg.S2, VReg.S2, VReg.S3);
+        vm.cmpImm(VReg.S2, 0);
+        vm.jge("_agsl_end_ok");
+        vm.movImm(VReg.S2, 0);
+        vm.jmp("_agsl_end_ok");
+        vm.label("_agsl_end_pos");
+        vm.cmp(VReg.S2, VReg.S3);
+        vm.jle("_agsl_end_ok");
+        vm.mov(VReg.S2, VReg.S3);
+        vm.label("_agsl_end_ok");
+        vm.sub(VReg.S4, VReg.S2, VReg.S1); // count
+        vm.cmpImm(VReg.S4, 0);
+        vm.jge("_agsl_cnt_ok");
+        vm.movImm(VReg.S4, 0);
+        vm.label("_agsl_cnt_ok");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_array_species_create");
+        vm.store(VReg.SP, 0, VReg.RET); // A
+        vm.movImm(VReg.S3, 0); // n
+        vm.label("_agsl_loop");
+        vm.cmp(VReg.S1, VReg.S2);
+        vm.jge("_agsl_done");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_agen_has_idx");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_agsl_next");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_agen_get_idx");
+        vm.mov(VReg.A2, VReg.RET);
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_array_cdp_or_throw");
+        vm.label("_agsl_next");
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.addImm(VReg.S1, VReg.S1, 1);
+        vm.jmp("_agsl_loop");
+        vm.label("_agsl_done");
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_array_cdp_set_len");
+        vm.load(VReg.RET, VReg.SP, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 48);
 
         // _agen_at(A0=recv, A1=boxed idx) → 元素。
         vm.label("_agen_at");
@@ -4347,7 +4752,113 @@ export class ArrayGenerator {
             vm.call(target);
             vm.epilogue([VReg.S0], 0);
         };
-        agen0("_agen_reverse", "_array_reverse");
+        // reverse 活读:ToObject + ToLength(负 length→0,不回写),Has/Get/Set/Delete。
+        // 禁 _agen_norm:快照会 ToInt32 负 length、返回新数组。禁稠密 _array_reverse:
+        // 不触发 accessor、不 Delete(get_if_present_with_delete)。
+        vm.label("_agen_reverse");
+        vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.call("_agen_toobject");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_agen_tolength");
+        vm.mov(VReg.S1, VReg.RET); // len
+        vm.shrImm(VReg.V0, VReg.S1, 1); // middle = floor(len/2)
+        vm.store(VReg.SP, 32, VReg.V0);
+        vm.movImm(VReg.S2, 0); // lower
+        vm.label("_arev_loop");
+        vm.load(VReg.V0, VReg.SP, 32);
+        vm.cmp(VReg.S2, VReg.V0);
+        vm.jge("_arev_done");
+        vm.sub(VReg.S3, VReg.S1, VReg.S2);
+        vm.subImm(VReg.S3, VReg.S3, 1); // upper
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S2);
+        vm.call("_agen_has_idx");
+        vm.store(VReg.SP, 16, VReg.RET); // lowerExists
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_arev_no_lget");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S2);
+        vm.call("_agen_get_idx");
+        vm.store(VReg.SP, 0, VReg.RET); // lowerVal
+        vm.label("_arev_no_lget");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_agen_has_idx");
+        vm.store(VReg.SP, 24, VReg.RET); // upperExists
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_arev_no_uget");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_agen_get_idx");
+        vm.store(VReg.SP, 8, VReg.RET); // upperVal
+        vm.label("_arev_no_uget");
+        vm.load(VReg.V0, VReg.SP, 16);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_arev_no_lower");
+        vm.load(VReg.V0, VReg.SP, 24);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_arev_lower_only");
+        vm.scvtf(0, VReg.S2);
+        vm.fmovToInt(VReg.A1, 0);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.load(VReg.A2, VReg.SP, 8);
+        vm.call("_subscript_set");
+        vm.scvtf(0, VReg.S3);
+        vm.fmovToInt(VReg.A1, 0);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.load(VReg.A2, VReg.SP, 0);
+        vm.call("_subscript_set");
+        vm.jmp("_arev_step");
+        vm.label("_arev_lower_only");
+        vm.scvtf(0, VReg.S2);
+        vm.fmovToInt(VReg.A0, 0);
+        vm.call("_js_prop_key");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_delete");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_boolean");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_arev_del_err");
+        vm.scvtf(0, VReg.S3);
+        vm.fmovToInt(VReg.A1, 0);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.load(VReg.A2, VReg.SP, 0);
+        vm.call("_subscript_set");
+        vm.jmp("_arev_step");
+        vm.label("_arev_no_lower");
+        vm.load(VReg.V0, VReg.SP, 24);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_arev_step");
+        vm.scvtf(0, VReg.S2);
+        vm.fmovToInt(VReg.A1, 0);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.load(VReg.A2, VReg.SP, 8);
+        vm.call("_subscript_set");
+        vm.scvtf(0, VReg.S3);
+        vm.fmovToInt(VReg.A0, 0);
+        vm.call("_js_prop_key");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_delete");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_boolean");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_arev_del_err");
+        vm.label("_arev_step");
+        vm.addImm(VReg.S2, VReg.S2, 1);
+        vm.jmp("_arev_loop");
+        vm.label("_arev_del_err");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot delete property"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+        vm.label("_arev_done");
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 48);
 
         // ES2023 非破坏:toReversed / toSorted / with —— 先快照再变副本。
         // 真数组:_array_slice 全拷贝;类数组:_agen_norm 快照。
@@ -4379,7 +4890,16 @@ export class ArrayGenerator {
 
         vm.label("_agen_toSorted");
         vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0); // this(先于 ToObject 保住)
         vm.mov(VReg.S1, VReg.A1); // comparefn | undefined
+        // ES toSorted step 1:非 undefined 的 comparefn 须先 IsCallable,再读 length。
+        vm.shrImm(VReg.V0, VReg.S1, 48);
+        vm.cmpImm(VReg.V0, 0x7FFB);
+        vm.jeq("_agen_tosort_cbok");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_aref_require_cb");
+        vm.label("_agen_tosort_cbok");
+        vm.mov(VReg.A0, VReg.S0);
         vm.call("_agen_toobject");
         vm.mov(VReg.S0, VReg.RET);
         vm.shrImm(VReg.V0, VReg.S0, 48);
@@ -4435,14 +4955,86 @@ export class ArrayGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
 
         // _agen_toSpliced(A0=recv, A1=start, A2=delCount, A3..=items via argc 有限)
-        // 简化:norm/快照后委托 _array_toSpliced;items 仅 A3 单槽(与 compile 截断同形)。
+        // ES:ToObject → LengthOfArrayLike → 算 newLen → 超 2^53-1 TypeError /
+        // 超 2^32-1 RangeError(ArrayCreate),再快照。禁先 _agen_norm(会 Get 下标)。
         vm.label("_agen_toSpliced");
-        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
         vm.mov(VReg.S1, VReg.A1);
         vm.mov(VReg.S2, VReg.A2);
         vm.mov(VReg.S3, VReg.A3);
         vm.call("_agen_toobject");
         vm.mov(VReg.S0, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_agen_tolength");
+        vm.mov(VReg.S4, VReg.RET); // len
+        // insertCount:undefined→0;真数组→length;其余单值→1
+        vm.movImm(VReg.S5, 0);
+        vm.shrImm(VReg.V0, VReg.S3, 48);
+        vm.cmpImm(VReg.V0, 0x7FFB);
+        vm.jeq("_agen_tosplice_ic_done");
+        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jne("_agen_tosplice_ic_one");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.call("_array_length");
+        vm.mov(VReg.S5, VReg.RET);
+        vm.jmp("_agen_tosplice_ic_done");
+        vm.label("_agen_tosplice_ic_one");
+        vm.movImm(VReg.S5, 1);
+        vm.label("_agen_tosplice_ic_done");
+        // actualStart = clamp(ToInteger(start), 0, len)
+        vm.mov(VReg.A0, VReg.S1);
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFB);
+        vm.jne("_agen_tosplice_st_i");
+        vm.movImm(VReg.V0, 0);
+        vm.jmp("_agen_tosplice_st_cl");
+        vm.label("_agen_tosplice_st_i");
+        vm.call("_to_int32");
+        vm.mov(VReg.V0, VReg.RET);
+        vm.label("_agen_tosplice_st_cl");
+        vm.cmpImm(VReg.V0, 0);
+        vm.jge("_agen_tosplice_st_pos");
+        vm.add(VReg.V0, VReg.S4, VReg.V0);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jge("_agen_tosplice_st_ok");
+        vm.movImm(VReg.V0, 0);
+        vm.jmp("_agen_tosplice_st_ok");
+        vm.label("_agen_tosplice_st_pos");
+        vm.cmp(VReg.V0, VReg.S4);
+        vm.jle("_agen_tosplice_st_ok");
+        vm.mov(VReg.V0, VReg.S4);
+        vm.label("_agen_tosplice_st_ok");
+        vm.store(VReg.SP, 8, VReg.V0); // actualStart
+        // actualDeleteCount = clamp(ToInteger(skip), 0, len-actualStart)
+        vm.mov(VReg.A0, VReg.S2);
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFB);
+        vm.jne("_agen_tosplice_dc_i");
+        vm.movImm(VReg.V0, 0);
+        vm.jmp("_agen_tosplice_dc_cl");
+        vm.label("_agen_tosplice_dc_i");
+        vm.call("_to_int32");
+        vm.mov(VReg.V0, VReg.RET);
+        vm.label("_agen_tosplice_dc_cl");
+        vm.cmpImm(VReg.V0, 0);
+        vm.jge("_agen_tosplice_dc_nn");
+        vm.movImm(VReg.V0, 0);
+        vm.label("_agen_tosplice_dc_nn");
+        vm.load(VReg.V1, VReg.SP, 8);
+        vm.sub(VReg.V1, VReg.S4, VReg.V1);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jle("_agen_tosplice_dc_ok");
+        vm.mov(VReg.V0, VReg.V1);
+        vm.label("_agen_tosplice_dc_ok");
+        // newLen = len + insertCount - actualDeleteCount
+        vm.add(VReg.V1, VReg.S4, VReg.S5);
+        vm.sub(VReg.V1, VReg.V1, VReg.V0);
+        vm.movImm64(VReg.V2, 9007199254740991n); // 2^53-1
+        vm.cmp(VReg.V1, VReg.V2);
+        vm.jgt("_agen_tosplice_too_big");
+        vm.movImm64(VReg.V2, 4294967295n); // 2^32-1
+        vm.cmp(VReg.V1, VReg.V2);
+        vm.jgt("_agen_tosplice_range");
         vm.shrImm(VReg.V0, VReg.S0, 48);
         vm.cmpImm(VReg.V0, 0x7FFE);
         vm.jne("_agen_tosplice_norm");
@@ -4452,6 +5044,14 @@ export class ArrayGenerator {
         vm.cmpImm(VReg.V0, 1);
         vm.jne("_agen_tosplice_norm");
         vm.jmp("_agen_tosplice_do");
+        vm.label("_agen_tosplice_too_big");
+        vm.lea(VReg.A0, vm.asm.addString("Invalid array length"));
+        boxStr(VReg.A0);
+        vm.call("_throw_type_error");
+        vm.label("_agen_tosplice_range");
+        vm.lea(VReg.A0, vm.asm.addString("Invalid array length"));
+        boxStr(VReg.A0);
+        vm.call("_throw_range_error");
         vm.label("_agen_tosplice_norm");
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_agen_norm");
@@ -4504,7 +5104,7 @@ export class ArrayGenerator {
         vm.mov(VReg.A2, VReg.S2);
         vm.mov(VReg.A3, VReg.S3);
         vm.call("_array_toSpliced");
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
 
         // _agen_shift:真数组 → _array_shift;类数组活读左移(禁 _agen_norm 快照)。
         vm.label("_agen_shift");
@@ -4704,12 +5304,9 @@ export class ArrayGenerator {
         vm.call("_subscript_set");
         vm.addImm(VReg.S2, VReg.S2, 1);
         vm.mov(VReg.A0, VReg.S0);
-        vm.lea(VReg.A1, "_str_length_prop");
-        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
-        vm.or(VReg.A1, VReg.A1, VReg.V1);
         vm.scvtf(0, VReg.S2);
         vm.fmovToInt(VReg.A2, 0);
-        vm.call("_object_set");
+        vm.call("_agen_setlength_throw"); // Set("length",len+1,true)
         vm.scvtf(0, VReg.S2);
         vm.fmovToInt(VReg.RET, 0);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
@@ -4921,7 +5518,7 @@ export class ArrayGenerator {
         vm.label("_array_flatMap_rt");
         vm.movImm64(VReg.A3, UNDEF);
         vm.label("_array_flatMap_rt_t");
-        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
         vm.mov(VReg.S0, VReg.A0);
         vm.mov(VReg.S1, VReg.A1);
         vm.store(VReg.SP, 8, VReg.A3); // thisArg → [SP+8]
@@ -4930,13 +5527,21 @@ export class ArrayGenerator {
         vm.mov(VReg.S2, VReg.RET); // len
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_aref_require_cb"); // IsCallable after Length (ES)
-        vm.movImm(VReg.A0, 0);
-        vm.call("_array_new_with_size");
-        vm.mov(VReg.S4, VReg.RET); // result(裸头)
+        vm.mov(VReg.A0, VReg.S0);
+        vm.movImm(VReg.A1, 0);
+        vm.call("_array_species_create");
+        vm.mov(VReg.S4, VReg.RET); // A (boxed; 默认 ArrayCreate)
+        vm.movImm(VReg.V0, 0);
+        vm.store(VReg.SP, 16, VReg.V0); // n
         vm.movImm(VReg.S3, 0);     // i
         vm.label("_fm_loop");
         vm.cmp(VReg.S3, VReg.S2);
         vm.jge("_fm_done");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_agen_has_idx");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_fm_next");
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S3);
         vm.call("_array_get");
@@ -4948,44 +5553,38 @@ export class ArrayGenerator {
         vm.load(VReg.A4, VReg.SP, 8); // thisArg
         vm.call("_aref_invoke_cbt"); // RET = mapped
         vm.mov(VReg.S5, VReg.RET);
-        vm.shrImm(VReg.V0, VReg.S5, 48);
-        vm.cmpImm(VReg.V0, 0x7FFE);
-        vm.jne("_fm_push_one");
-        // mapped 是数组:展开一层
-        vm.emitMaskLoad(VReg.V4);
-        vm.andMaskReg(VReg.S5, VReg.S5, VReg.V4); // S5 = 内层(裸)
-        vm.movImm(VReg.V0, 0);
-        vm.store(VReg.SP, 0, VReg.V0); // j = 0
-        vm.label("_fm_inner");
-        vm.load(VReg.V0, VReg.S5, 8);      // 内层 len(每轮重载,S5 稳定)
-        vm.load(VReg.V1, VReg.SP, 0);      // j
-        vm.cmp(VReg.V1, VReg.V0);
-        vm.jge("_fm_next");
-        vm.load(VReg.V0, VReg.S5, 24);
-        vm.shl(VReg.V2, VReg.V1, 3);
-        vm.add(VReg.V0, VReg.V0, VReg.V2);
-        vm.load(VReg.A1, VReg.V0, 0);      // 内层元素
-        vm.mov(VReg.A0, VReg.S4);
-        vm.call("_array_push");
-        vm.mov(VReg.S4, VReg.RET);
-        vm.load(VReg.V0, VReg.SP, 0);
-        vm.addImm(VReg.V0, VReg.V0, 1);
-        vm.store(VReg.SP, 0, VReg.V0);     // j++
-        vm.jmp("_fm_inner");
-        vm.label("_fm_push_one");
+        vm.mov(VReg.A0, VReg.S5);
+        vm.call("_is_array_value");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_fm_push_one");
+        // mapped 是数组(含 Array Proxy):FlattenIntoArray depth=0
+        vm.mov(VReg.A0, VReg.S5);
+        vm.call("_agen_tolength");
+        vm.mov(VReg.A2, VReg.RET);
         vm.mov(VReg.A0, VReg.S4);
         vm.mov(VReg.A1, VReg.S5);
-        vm.call("_array_push");
-        vm.mov(VReg.S4, VReg.RET);
+        vm.load(VReg.A3, VReg.SP, 16);
+        vm.movImm(VReg.A4, 0);
+        vm.call("_flatten_into_cdp");
+        vm.store(VReg.SP, 16, VReg.RET);
+        vm.jmp("_fm_next");
+        vm.label("_fm_push_one");
+        vm.mov(VReg.A0, VReg.S4);
+        vm.load(VReg.A1, VReg.SP, 16);
+        vm.mov(VReg.A2, VReg.S5);
+        vm.call("_array_cdp_or_throw");
+        vm.load(VReg.V0, VReg.SP, 16);
+        vm.addImm(VReg.V0, VReg.V0, 1);
+        vm.store(VReg.SP, 16, VReg.V0);
         vm.label("_fm_next");
         vm.addImm(VReg.S3, VReg.S3, 1);
         vm.jmp("_fm_loop");
         vm.label("_fm_done");
-        vm.emitMaskLoad(VReg.V1);
-        vm.andMaskReg(VReg.RET, VReg.S4, VReg.V1);
-        vm.movImm64(VReg.V1, BOXARR);
-        vm.or(VReg.RET, VReg.RET, VReg.V1); // 装箱 0x7FFE
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 16);
+        vm.mov(VReg.A0, VReg.S4);
+        vm.load(VReg.A1, VReg.SP, 16);
+        vm.call("_array_cdp_set_len");
+        vm.mov(VReg.RET, VReg.S4);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
 
         // arr.flat(depth=1) -> 新数组。循环 _array_flat(深度 1)depth 次。depth 缺省
         // (undefined)→ 1;非数字经 _to_int32;depth<=0 → 返回原数组(记偏差:未浅拷贝)。
@@ -5074,19 +5673,23 @@ export class ArrayGenerator {
         vm.mov(VReg.RET, VReg.S0); // 返回接收者(boxed)
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
 
-        // arr.copyWithin(target, start=0, end=len) -> 原地拷贝 [start,end) 到 target,
-        // 返回接收者。count=min(end-start, len-target);重叠按方向复制避自覆盖。
-        // 镜像 compileArrayCopyWithin 的内联逻辑,状态落栈槽(callee-saved 不够)。
+        // copyWithin 活读(A0=recv, A1=target, A2=start, A3=end) → this。
+        // ToObject + 先捕获 ToLength,再 ToInteger 各参(副作用可改 length,不得重读
+        // 已算好的 tgt/from/count)。循环 HasProperty(from)? Get+Set(to) :
+        // DeletePropertyOrThrow(to)。禁 _agen_norm:快照会 Get 填洞、丢掉 Proxy
+        // has/delete 陷阱。_agen_copyWithin 与此同体(方法值 / .call)。
+        vm.label("_agen_copyWithin");
         vm.label("_array_copyWithin_rt");
-        // 栈帧须 16 对齐(arm64 bl 要求):5 槽 40B → 补足 48B([SP+40] 闲置)。
+        // 栈帧须 16 对齐:tgt/from/count/to/step/val = 48B。
         vm.prologue(48, [VReg.S0, VReg.S1]);
         vm.store(VReg.SP, 0, VReg.A1);  // [0] 装箱 target(后覆写为 tgt)
         vm.store(VReg.SP, 8, VReg.A2);  // [8] 装箱 start(后覆写为 from)
         vm.store(VReg.SP, 16, VReg.A3); // [16] 装箱 end(后覆写为 count)
-        vm.mov(VReg.S0, VReg.A0);       // arr
+        vm.call("_agen_toobject");
+        vm.mov(VReg.S0, VReg.RET);      // recv(ToObject)
         vm.mov(VReg.A0, VReg.S0);
-        vm.call("_array_length");
-        vm.mov(VReg.S1, VReg.RET);      // len
+        vm.call("_agen_tolength");
+        vm.mov(VReg.S1, VReg.RET);      // 捕获 len
         vm.load(VReg.A0, VReg.SP, 0);
         vm.mov(VReg.A1, VReg.S1);
         vm.movImm(VReg.A2, 0);
@@ -5099,7 +5702,7 @@ export class ArrayGenerator {
         vm.store(VReg.SP, 8, VReg.RET); // [8]=from
         vm.load(VReg.A0, VReg.SP, 16);
         vm.mov(VReg.A1, VReg.S1);
-        vm.mov(VReg.A2, VReg.S1);       // end 缺省 len
+        vm.mov(VReg.A2, VReg.S1);       // end 缺省捕获 len
         vm.call("_aref_relidx");        // RET=end
         vm.load(VReg.V0, VReg.SP, 8);   // from
         vm.sub(VReg.V0, VReg.RET, VReg.V0); // V0 = end-from
@@ -5142,11 +5745,40 @@ export class ArrayGenerator {
         vm.jle("_cw_done");
         vm.mov(VReg.A0, VReg.S0);
         vm.load(VReg.A1, VReg.SP, 8);   // from
-        vm.call("_array_get");          // RET = val
-        vm.mov(VReg.A2, VReg.RET);
+        vm.call("_agen_has_idx");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_cw_del");
         vm.mov(VReg.A0, VReg.S0);
-        vm.load(VReg.A1, VReg.SP, 24);  // to
-        vm.call("_array_set");
+        vm.load(VReg.A1, VReg.SP, 8);
+        vm.call("_agen_get_idx");
+        vm.store(VReg.SP, 40, VReg.RET); // [40]=fromVal
+        vm.load(VReg.V0, VReg.SP, 24);  // to → 装箱数字键
+        vm.scvtf(0, VReg.V0);
+        vm.fmovToInt(VReg.A1, 0);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.load(VReg.A2, VReg.SP, 40);
+        vm.call("_subscript_set");
+        vm.jmp("_cw_step");
+        vm.label("_cw_del");
+        vm.load(VReg.V0, VReg.SP, 24);
+        vm.scvtf(0, VReg.V0);
+        vm.fmovToInt(VReg.A0, 0);
+        vm.call("_js_prop_key");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_delete");
+        // DeletePropertyOrThrow: [[Delete]] 返 false → TypeError
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_boolean");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_cw_step");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot delete property"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+        vm.label("_cw_step");
         vm.load(VReg.V0, VReg.SP, 8);
         vm.load(VReg.V1, VReg.SP, 32);
         vm.add(VReg.V0, VReg.V0, VReg.V1);
@@ -5248,15 +5880,34 @@ export class ArrayGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 48);
 
         // ---- 泛型(.call 非数组接收者)norm 委托层 ----
-        // flat: _agen_flat(A0=recv, A1=depth)
+        // flat 慢路:ArraySpeciesCreate + FlattenIntoArray(CDPOrThrow)。
+        // 默认真数组仍走编译器 `_array_flat` 快路。
         vm.label("_agen_flat");
-        vm.prologue(0, [VReg.S0]);
-        vm.mov(VReg.S0, VReg.A1);
-        vm.call("_agen_norm");
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.mov(VReg.S1, VReg.A1); // depth boxed
+        vm.call("_agen_toobject");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_agen_tolength");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_flat_to_depth");
+        vm.mov(VReg.S3, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.movImm(VReg.A1, 0);
+        vm.call("_array_species_create");
+        vm.store(VReg.SP, 0, VReg.RET);
         vm.mov(VReg.A0, VReg.RET);
         vm.mov(VReg.A1, VReg.S0);
-        vm.call("_array_flat_rt");
-        vm.epilogue([VReg.S0], 0);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.movImm(VReg.A3, 0);
+        vm.mov(VReg.A4, VReg.S3);
+        vm.call("_flatten_into_cdp");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.call("_array_cdp_set_len");
+        vm.load(VReg.RET, VReg.SP, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
 
         // fill: _agen_fill(A0=recv, A1=value, A2=start, A3=end)。变异落快照(记偏差,
         // 同既有 _agen_* 的快照语义)。
@@ -5271,20 +5922,6 @@ export class ArrayGenerator {
         vm.mov(VReg.A2, VReg.S1);
         vm.mov(VReg.A3, VReg.S2);
         vm.call("_array_fill_rt");
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
-
-        // copyWithin: _agen_copyWithin(A0=recv, A1=target, A2=start, A3=end)。
-        vm.label("_agen_copyWithin");
-        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
-        vm.mov(VReg.S0, VReg.A1);
-        vm.mov(VReg.S1, VReg.A2);
-        vm.mov(VReg.S2, VReg.A3);
-        vm.call("_agen_norm");
-        vm.mov(VReg.A0, VReg.RET);
-        vm.mov(VReg.A1, VReg.S0);
-        vm.mov(VReg.A2, VReg.S1);
-        vm.mov(VReg.A3, VReg.S2);
-        vm.call("_array_copyWithin_rt");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
 
         // concat 泛型:_agen_concat(A0=recv, A1..A4)。IsConcatSpreadable 缺省时普通对象
@@ -5302,98 +5939,64 @@ export class ArrayGenerator {
         vm.store(VReg.SP, 0, VReg.V0); // argc
         vm.call("_agen_toobject");
         vm.store(VReg.SP, 8, VReg.RET); // recv(ToObject)
-        vm.movImm(VReg.A0, 0);
-        vm.call("_array_new_with_size");
-        vm.call("_box_arr_r"); // 须装箱: _array_push 保留入参 tag；裸头 → toString 成 Object
         vm.mov(VReg.A0, VReg.RET);
-        vm.load(VReg.A1, VReg.SP, 8);
-        vm.call("_concat_append_item"); // this: ICS 缺省不展开
-        vm.mov(VReg.S0, VReg.RET); // result
+        vm.movImm(VReg.A1, 0);
+        vm.call("_array_species_create");
+        vm.mov(VReg.S0, VReg.RET); // A
+        vm.mov(VReg.A0, VReg.S0);
+        vm.movImm(VReg.A1, 0);
+        vm.load(VReg.A2, VReg.SP, 8);
+        vm.call("_concat_append_cdp");
+        vm.store(VReg.SP, 16, VReg.RET); // n
         vm.load(VReg.V0, VReg.SP, 0);
         vm.cmpImm(VReg.V0, 1);
         vm.jlt("_agen_concat_done");
         vm.mov(VReg.A0, VReg.S0);
-        vm.mov(VReg.A1, VReg.S1);
-        vm.call("_concat_append_item");
-        vm.mov(VReg.S0, VReg.RET);
+        vm.load(VReg.A1, VReg.SP, 16);
+        vm.mov(VReg.A2, VReg.S1);
+        vm.call("_concat_append_cdp");
+        vm.store(VReg.SP, 16, VReg.RET);
         vm.load(VReg.V0, VReg.SP, 0);
         vm.cmpImm(VReg.V0, 2);
         vm.jlt("_agen_concat_done");
         vm.mov(VReg.A0, VReg.S0);
-        vm.mov(VReg.A1, VReg.S2);
-        vm.call("_concat_append_item");
-        vm.mov(VReg.S0, VReg.RET);
+        vm.load(VReg.A1, VReg.SP, 16);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_concat_append_cdp");
+        vm.store(VReg.SP, 16, VReg.RET);
         vm.load(VReg.V0, VReg.SP, 0);
         vm.cmpImm(VReg.V0, 3);
         vm.jlt("_agen_concat_done");
         vm.mov(VReg.A0, VReg.S0);
-        vm.mov(VReg.A1, VReg.S3);
-        vm.call("_concat_append_item");
-        vm.mov(VReg.S0, VReg.RET);
+        vm.load(VReg.A1, VReg.SP, 16);
+        vm.mov(VReg.A2, VReg.S3);
+        vm.call("_concat_append_cdp");
+        vm.store(VReg.SP, 16, VReg.RET);
         vm.load(VReg.V0, VReg.SP, 0);
         vm.cmpImm(VReg.V0, 4);
         vm.jlt("_agen_concat_done");
         vm.mov(VReg.A0, VReg.S0);
-        vm.mov(VReg.A1, VReg.S4);
-        vm.call("_concat_append_item");
-        vm.mov(VReg.S0, VReg.RET);
+        vm.load(VReg.A1, VReg.SP, 16);
+        vm.mov(VReg.A2, VReg.S4);
+        vm.call("_concat_append_cdp");
+        vm.store(VReg.SP, 16, VReg.RET);
         vm.label("_agen_concat_done");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.load(VReg.A1, VReg.SP, 16);
+        vm.call("_array_cdp_set_len");
         vm.mov(VReg.RET, VReg.S0);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 48);
 
         // sort 泛型:_agen_sort(A0=recv, A1=comparefn|undefined) → this。
-        // 真数组直通 _array_sort_cmp;array-like 活读 ToLength+Get/Set 写回 this。
+        // ToObject 后走 _array_sort_cmp(Has/Get 收集 → 稠密排序 → Set/Delete 写回)。
         vm.label("_agen_sort");
-        vm.prologue(16, [VReg.S0, VReg.S1]);
-        vm.mov(VReg.S1, VReg.A1); // comparefn
-        vm.shrImm(VReg.V0, VReg.A0, 48);
-        vm.cmpImm(VReg.V0, 0x7FFE);
-        vm.jne("_agen_sort_live");
-        vm.mov(VReg.A1, VReg.S1);
-        vm.call("_array_sort_cmp");
-        vm.epilogue([VReg.S0, VReg.S1], 16);
-        vm.label("_agen_sort_live");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S1, VReg.A1);
         vm.call("_agen_toobject");
-        vm.mov(VReg.S0, VReg.RET); // recv
-        // 复用真数组排序核:先快照成稠密数组、排序、再写回索引+length。
-        // 对无 accessor/Proxy 的普通 array-like(S15.4.4.11_A3_T2)语义正确且零回退。
-        vm.mov(VReg.A0, VReg.S0);
-        vm.call("_agen_norm");
-        vm.store(VReg.SP, 0, VReg.RET); // snapshot arr
         vm.mov(VReg.A0, VReg.RET);
         vm.mov(VReg.A1, VReg.S1);
         vm.call("_array_sort_cmp");
-        // 写回:for i in 0..len: Set(recv,i,arr[i]); Set(recv,"length",len)
-        vm.load(VReg.A0, VReg.SP, 0);
-        vm.call("_array_length");
-        vm.mov(VReg.S1, VReg.RET); // len
-        vm.movImm(VReg.V0, 0);
-        vm.store(VReg.SP, 8, VReg.V0); // i
-        vm.label("_agen_sort_wb_loop");
-        vm.load(VReg.V0, VReg.SP, 8);
-        vm.cmp(VReg.V0, VReg.S1);
-        vm.jge("_agen_sort_wb_len");
-        vm.load(VReg.A0, VReg.SP, 0);
-        vm.mov(VReg.A1, VReg.V0);
-        vm.call("_array_get");
-        vm.mov(VReg.A2, VReg.RET);
-        vm.mov(VReg.A0, VReg.S0);
-        vm.load(VReg.A1, VReg.SP, 8);
-        vm.call("_subscript_set");
-        vm.load(VReg.V0, VReg.SP, 8);
-        vm.addImm(VReg.V0, VReg.V0, 1);
-        vm.store(VReg.SP, 8, VReg.V0);
-        vm.jmp("_agen_sort_wb_loop");
-        vm.label("_agen_sort_wb_len");
-        vm.mov(VReg.A0, VReg.S0);
-        vm.lea(VReg.A1, vm.asm.addString("length"));
-        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
-        vm.or(VReg.A1, VReg.A1, VReg.V1);
-        vm.scvtf(0, VReg.S1);
-        vm.fmovToInt(VReg.A2, 0);
-        vm.call("_object_set");
-        vm.mov(VReg.RET, VReg.S0);
-        vm.epilogue([VReg.S0, VReg.S1], 16);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
 
         // splice 泛型方法值入口:_agen_splice(A0=recv, A1=start, A2=delCount, A3/A4=items…)
         // 按 _call_argc 把 A3.. 打成 items 数组后落 _agen_splice_items。
@@ -5454,15 +6057,8 @@ export class ArrayGenerator {
         vm.mov(VReg.S3, VReg.A3);
         vm.call("_agen_toobject");
         vm.mov(VReg.S0, VReg.RET); // recv
-        vm.shrImm(VReg.V0, VReg.S0, 48);
-        vm.cmpImm(VReg.V0, 0x7FFE);
-        vm.jne("_agen_splice_live");
-        vm.mov(VReg.A0, VReg.S0);
-        vm.mov(VReg.A1, VReg.S1);
-        vm.mov(VReg.A2, VReg.S2);
-        vm.mov(VReg.A3, VReg.S3);
-        vm.call("_array_splice_rt");
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 80);
+        // 真数组也走活读:removed 须 ArraySpeciesCreate + CDPOrThrow
+        // (自定义 species / constructor=null)。默认 species 由编译器快路消化。
 
         // ---- array-like 活读 splice ----
         // SP: 0 recv, 8 start, 16 del, 24 items, 32 len, 40 actualStart,
@@ -5482,9 +6078,9 @@ export class ArrayGenerator {
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_agen_tolength");
         vm.store(VReg.SP, 32, VReg.RET); // len
-        // start = ToInteger; 负 +len 钳 [0,len]
+        // start = ToIntegerOrInfinity(64 位;禁 _to_int32:2^53 级下标被截成 -3)
         vm.load(VReg.A0, VReg.SP, 8);
-        vm.call("_to_int32");
+        vm.call("_to_integer");
         vm.mov(VReg.S1, VReg.RET);
         vm.load(VReg.S4, VReg.SP, 32); // len
         vm.cmpImm(VReg.S1, 0);
@@ -5505,7 +6101,7 @@ export class ArrayGenerator {
         vm.shrImm(VReg.V0, VReg.A0, 48);
         vm.cmpImm(VReg.V0, 0x7FFB);
         vm.jeq("_aspl_del_max");
-        vm.call("_to_int32");
+        vm.call("_to_integer");
         vm.cmpImm(VReg.RET, 0);
         vm.jge("_aspl_del_nn");
         vm.movImm(VReg.RET, 0);
@@ -5527,9 +6123,10 @@ export class ArrayGenerator {
         vm.load(VReg.A0, VReg.SP, 24);
         vm.call("_array_length");
         vm.store(VReg.SP, 56, VReg.RET);
-        // removed = new Array; copy Get(recv, start+k)
-        vm.load(VReg.A0, VReg.SP, 48);
-        vm.call("_array_new_with_size");
+        // removed = ArraySpeciesCreate(O, actualDel); CDP 拷贝 HasProperty 的项
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.load(VReg.A1, VReg.SP, 48);
+        vm.call("_array_species_create");
         vm.store(VReg.SP, 64, VReg.RET);
         vm.movImm(VReg.S5, 0); // k
         vm.label("_aspl_rem_loop");
@@ -5539,11 +6136,18 @@ export class ArrayGenerator {
         vm.load(VReg.A0, VReg.SP, 0);
         vm.load(VReg.V1, VReg.SP, 40);
         vm.add(VReg.A1, VReg.V1, VReg.S5);
+        vm.call("_agen_has_idx");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_aspl_rem_next");
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.load(VReg.V1, VReg.SP, 40);
+        vm.add(VReg.A1, VReg.V1, VReg.S5);
         vm.call("_agen_get_idx");
         vm.mov(VReg.A2, VReg.RET);
         vm.load(VReg.A0, VReg.SP, 64);
         vm.mov(VReg.A1, VReg.S5);
-        vm.call("_array_set");
+        vm.call("_array_cdp_or_throw");
+        vm.label("_aspl_rem_next");
         vm.addImm(VReg.S5, VReg.S5, 1);
         vm.jmp("_aspl_rem_loop");
         vm.label("_aspl_rem_done");
@@ -5650,14 +6254,13 @@ export class ArrayGenerator {
         vm.load(VReg.V1, VReg.SP, 56);
         vm.add(VReg.S5, VReg.V0, VReg.V1); // newLen
         vm.load(VReg.A0, VReg.SP, 0);
-        vm.lea(VReg.A1, vm.asm.addString("length"));
-        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
-        vm.or(VReg.A1, VReg.A1, VReg.V1);
         vm.scvtf(0, VReg.S5);
         vm.fmovToInt(VReg.A2, 0);
-        vm.call("_object_set");
-        vm.load(VReg.RET, VReg.SP, 64); // removed（建时为裸头）
-        vm.call("_box_arr_r"); // 返回值须为 0x7FFE，否则 toString → [object Object]
+        vm.call("_agen_setlength_throw"); // Set(length, newLen, true)
+        vm.load(VReg.A0, VReg.SP, 64);
+        vm.load(VReg.A1, VReg.SP, 48);
+        vm.call("_array_cdp_set_len");
+        vm.load(VReg.RET, VReg.SP, 64); // species 结果已装箱
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 80);
 
         // 运行时 splice:从实参归一化后委托 _array_splice。
@@ -5730,6 +6333,9 @@ export class ArrayGenerator {
         this.generateArrayGet();
         this.generateArraySet();
         this.generateArrayLength();
+        this.generateCallArgvFill();
+        this.generateArrayCtorSingle();
+        this.generateFlatToDepth();
         this.generateArrayAt();
         this.generateArrayIndexOf();
         this.generateArrayLastIndexOf();
@@ -5741,6 +6347,7 @@ export class ArrayGenerator {
         this.generateArrayToString();
         this.generateArrayConcat();
         this.generateArrayJoin();
+        this.generateRecoveryStubs();
         this.generateArrayReverse();
         this.generateArraySort();
         this.generateArrayShift();
@@ -5755,6 +6362,7 @@ export class ArrayGenerator {
         this.generateArrayLikeCopy();
         this.generateGetThis();
         this.generateArraySpeciesCheck();
+        this.generateArraySpeciesOps();
         this.generateIsConcatSpreadable();
         this.generateConcatAppendItem();
         this.generateArrayFromRef();
@@ -5766,11 +6374,67 @@ export class ArrayGenerator {
     // 分派到本 helper。src 是 tagged 数组(0x7FFE)时快路 copy+map;否则走 spread 收迭代器。
     generateArrayFromRef() {
         const vm = this.vm;
+        // _construct_len(A0=ctor, A1=len 裸) → Construct(ctor, «len»)
+        vm.label("_construct_len");
+        vm.prologue(16, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.movImm(VReg.A0, 1);
+        vm.call("_array_new_with_size");
+        vm.call("_box_arr_r");
+        vm.store(VReg.SP, 0, VReg.RET);
+        vm.scvtf(0, VReg.S1);
+        vm.fmovToInt(VReg.A2, 0);
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.movImm(VReg.A1, 0);
+        vm.call("_array_set");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.load(VReg.A1, VReg.SP, 0);
+        vm.call("_fn_construct_call");
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+
+        // _construct_empty(A0=ctor) → Construct(ctor)
+        vm.label("_construct_empty");
+        vm.prologue(16, [VReg.S0]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.call("_box_arr_r");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_fn_construct_call");
+        vm.epilogue([VReg.S0], 16);
+
         vm.label("_array_from_ref");
-        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2]);
 
         vm.mov(VReg.S0, VReg.A0); // S0 = src (boxed)
         vm.mov(VReg.S1, VReg.A1); // S1 = mapFn (boxed, 可能 undefined/垃圾)
+        vm.store(VReg.SP, 8, VReg.A5); // this(C)
+        vm.store(VReg.SP, 16, VReg.A2); // thisArg
+
+        // Array.from.call(C, items):IsConstructor(C) 且 C!==Array → 先 Construct。
+        // 迭代路径规范是 Construct(C) 零参(ctor 抛错须在取迭代器之前)。
+        vm.mov(VReg.A0, VReg.A5);
+        vm.call("_is_callable");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_afr_default");
+        vm.lea(VReg.V0, "_nsobj_array");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.load(VReg.V1, VReg.SP, 8);
+        vm.cmp(VReg.V1, VReg.V0);
+        vm.jeq("_afr_default");
+        vm.load(VReg.A0, VReg.SP, 8);
+        vm.call("_construct_empty");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.mov(VReg.A2, VReg.S1);
+        vm.load(VReg.A3, VReg.SP, 16);
+        vm.call("_array_from_iter_into");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.jmp("_afr_done");
+
+        vm.label("_afr_default");
 
         // 数组快路:src 是 0x7FFE tagged → _array_slice 全拷贝
         vm.shrImm(VReg.V0, VReg.S0, 48);
@@ -5818,7 +6482,46 @@ export class ArrayGenerator {
 
         vm.label("_afr_done");
         vm.mov(VReg.RET, VReg.S2);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 16);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
+
+        // _array_from_map(A0=arr, A1=mapFn, A2=thisArg) — Array.from array-like 映射。
+        // Call(mapfn, T, «kValue, k») 两参;洞也 Get(得 undefined)再映射。
+        vm.label("_array_from_map");
+        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.cmpImm(VReg.A2, 0);
+        vm.jne("_afm_this_ok");
+        vm.movImm64(VReg.A2, 0x7ffb000000000000n);
+        vm.label("_afm_this_ok");
+        vm.store(VReg.SP, 0, VReg.A2);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_aref_require_cb");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_length");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.movImm(VReg.S3, 0);
+        vm.label("_afm_loop");
+        vm.cmp(VReg.S3, VReg.S2);
+        vm.jge("_afm_done");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_array_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.scvtf(0, VReg.S3);
+        vm.fmovToInt(VReg.A1, 0);
+        vm.mov(VReg.A3, VReg.S1);
+        vm.load(VReg.A4, VReg.SP, 0);
+        vm.call("_aref_invoke_from");
+        vm.mov(VReg.A2, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_array_set");
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_afm_loop");
+        vm.label("_afm_done");
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 16);
     }
 
     // _array_of_ref: Array.of 作一等值的运行时 helper。
@@ -5847,8 +6550,26 @@ export class ArrayGenerator {
         vm.mov(VReg.V2, VReg.V3);
         vm.label("_aof_argc_ok");
         vm.store(VReg.SP, 0, VReg.V2); // argc → [SP+0](local 槽,跨 call 保活)
+        vm.store(VReg.SP, 8, VReg.A5); // this(C)
+
+        // Array.of.call(C, ...):IsConstructor(C) 且 C!==Array → Construct(C, «argc»)
+        vm.mov(VReg.A0, VReg.A5);
+        vm.call("_is_callable");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_aof_create");
+        vm.lea(VReg.V0, "_nsobj_array");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.load(VReg.V1, VReg.SP, 8);
+        vm.cmp(VReg.V1, VReg.V0);
+        vm.jeq("_aof_create");
+        vm.load(VReg.A0, VReg.SP, 8);
+        vm.load(VReg.A1, VReg.SP, 0);
+        vm.call("_construct_len");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.jmp("_aof_done");
 
         // 创建空数组:S0 = result(boxed)
+        vm.label("_aof_create");
         vm.movImm(VReg.A0, 0);
         vm.call("_array_new_with_size");
         vm.call("_box_arr_r");
@@ -6176,22 +6897,28 @@ export class ArrayGenerator {
         vm.call("_object_get");
         vm.mov(VReg.S1, VReg.RET);
         vm.shrImm(VReg.V0, VReg.S1, 48);
-        vm.cmpImm(VReg.V0, 0x7FFA);
-        vm.jeq("_asc_default");
+        // constructor === undefined → ArrayCreate(默认快路)。null/原语不是 Object,
+        // ArraySpeciesCreate step 9 须 TypeError → 走慢路。
         vm.cmpImm(VReg.V0, 0x7FFB);
         vm.jeq("_asc_default");
         vm.cmpImm(VReg.S1, 0);
         vm.jeq("_asc_default");
-        vm.lea(VReg.A0, "_symwk_species");
-        vm.lea(VReg.A1, vm.asm.addString("Symbol.species"));
-        vm.movImm64(VReg.V0, 0x7ffc000000000000n);
-        vm.or(VReg.A1, VReg.A1, VReg.V0);
-        vm.call("_symbol_wellknown");
-        vm.mov(VReg.A1, VReg.RET);
-        vm.movImm64(VReg.V0, 0x7ffd000000000000n);
-        vm.or(VReg.A1, VReg.A1, VReg.V0);
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jeq("_asc_ctor_obj");
+        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jeq("_asc_ctor_obj");
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jeq("_asc_ctor_obj");
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_asc_ctor_raw");
+        vm.jmp("_asc_custom"); // null/bool/string/number
+        vm.label("_asc_ctor_raw");
+        vm.movImm64(VReg.V1, vm.ptrFloor);
+        vm.cmp(VReg.S1, VReg.V1);
+        vm.jlt("_asc_custom");
+        vm.label("_asc_ctor_obj");
         vm.mov(VReg.A0, VReg.S1);
-        vm.call("_object_get");
+        vm.call("_array_species_get");
         // Species === Array constructor itself -> default
         // (the @@species getter returns _get_this, so Array[Symbol.species]===Array
         //  which is the default. Without this check all default arrays fall to
@@ -6207,11 +6934,353 @@ export class ArrayGenerator {
         vm.jeq("_asc_default");
         vm.cmpImm(VReg.RET, 0);
         vm.jeq("_asc_default");
+        vm.label("_asc_custom");
         vm.movImm(VReg.RET, 1);
         vm.epilogue([VReg.S0, VReg.S1], 32);
         vm.label("_asc_default");
         vm.movImm(VReg.RET, 0);
         vm.epilogue([VReg.S0, VReg.S1], 32);
+    }
+
+    // ArraySpeciesCreate + CreateDataPropertyOrThrow。仅 species/泛型慢路调用,默认
+    // `_array_slice`/`_array_concat`/`_array_splice` 快路不经此。
+    generateArraySpeciesOps() {
+        const vm = this.vm;
+        const ATTR_CONFIGURABLE = 4;
+        const ATTR_DEFAULT = 7;
+        const EXT_NONEXT = 1;
+        const OBJECT_FLAGS_PTR_OFFSET = 40;
+        const OBJECT_PROPS_PTR_OFFSET = 32;
+
+        // Get(ctor, @@species):先字符串键(赋值 `obj[Symbol.species]=A` 双键协议),
+        // miss 再 well-known 裸指针(对象字面量 `get [Symbol.species]()`).
+        vm.label("_array_species_get");
+        vm.prologue(16, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.lea(VReg.A1, vm.asm.addString("Symbol.species"));
+        vm.movImm64(VReg.V0, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V0);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.call("_maybe_getter");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.shrImm(VReg.V0, VReg.S1, 48);
+        vm.cmpImm(VReg.V0, 0x7FFB);
+        vm.jeq("_asg_sym");
+        vm.mov(VReg.RET, VReg.S1);
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+        vm.label("_asg_sym");
+        vm.lea(VReg.A0, "_symwk_species");
+        vm.lea(VReg.A1, vm.asm.addString("Symbol.species"));
+        vm.movImm64(VReg.V0, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V0);
+        vm.call("_symbol_wellknown");
+        vm.mov(VReg.A1, VReg.RET); // 裸 Symbol 键,与 emitObjectLiteralSymWkAccessor 同形
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.call("_maybe_getter");
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+
+        // _array_species_create(A0=originalArray boxed, A1=length 裸 int) -> boxed A
+        vm.label("_array_species_create");
+        vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.movImm64(VReg.V0, 0x100000000n); // 2^32
+        vm.cmp(VReg.S1, VReg.V0);
+        vm.jge("_ascr_range");
+        vm.cmpImm(VReg.S1, 0);
+        vm.jge("_ascr_len_ok");
+        vm.movImm(VReg.S1, 0);
+        vm.label("_ascr_len_ok");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_is_array_value");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_ascr_array_create");
+        vm.lea(VReg.A1, "_str_constructor_prop");
+        vm.movImm64(VReg.V0, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V0);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_get");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.shrImm(VReg.V0, VReg.S2, 48);
+        vm.cmpImm(VReg.V0, 0x7FFB);
+        vm.jeq("_ascr_array_create");
+        vm.cmpImm(VReg.S2, 0);
+        vm.jeq("_ascr_array_create");
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jeq("_ascr_ctor_obj");
+        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jeq("_ascr_ctor_obj");
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jeq("_ascr_ctor_obj");
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_ascr_not_ctor"); // null/bool/string/number
+        vm.movImm64(VReg.V1, vm.ptrFloor);
+        vm.cmp(VReg.S2, VReg.V1);
+        vm.jlt("_ascr_not_ctor");
+        vm.label("_ascr_ctor_obj");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_array_species_get");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.shrImm(VReg.V0, VReg.S2, 48);
+        vm.cmpImm(VReg.V0, 0x7FFA);
+        vm.jeq("_ascr_array_create");
+        vm.cmpImm(VReg.V0, 0x7FFB);
+        vm.jeq("_ascr_array_create");
+        vm.lea(VReg.V0, "_nsobj_array");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmp(VReg.S2, VReg.V0);
+        vm.jeq("_ascr_array_create");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_is_callable");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_ascr_not_ctor");
+        // args = [length]
+        vm.movImm(VReg.A0, 1);
+        vm.call("_array_new_with_size");
+        vm.call("_box_arr_r");
+        vm.store(VReg.SP, 0, VReg.RET);
+        vm.scvtf(0, VReg.S1);
+        vm.fmovToInt(VReg.A2, 0);
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.movImm(VReg.A1, 0);
+        vm.call("_array_set");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.load(VReg.A1, VReg.SP, 0);
+        vm.call("_fn_construct_call");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 48);
+        vm.label("_ascr_array_create");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_array_new_with_size");
+        vm.call("_box_arr_r");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 48);
+        vm.label("_ascr_not_ctor");
+        vm.lea(VReg.A0, vm.asm.addString("value is not a constructor"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+        vm.label("_ascr_range");
+        vm.lea(VReg.A0, vm.asm.addString("Invalid array length"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_range_error");
+
+        // _array_cdp_or_throw(A0=O boxed, A1=index 裸, A2=value) — CreateDataPropertyOrThrow
+        vm.label("_array_cdp_or_throw");
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.S2, VReg.A2);
+        vm.shrImm(VReg.V0, VReg.S0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jeq("_cdp_arr");
+        // 普通对象:ToPropertyKey(index) 后查 own / configurable / extensible
+        vm.scvtf(0, VReg.S1);
+        vm.fmovToInt(VReg.A0, 0);
+        vm.call("_js_prop_key");
+        vm.mov(VReg.S3, VReg.RET); // key
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_cdp_miss");
+        // 已有键:找 idx 读 attr,!configurable → 失败
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.S4, VReg.S0, VReg.V1);
+        vm.load(VReg.V0, VReg.S4, 8); // count
+        vm.store(VReg.SP, 0, VReg.V0);
+        vm.movImm(VReg.S1, 0); // i
+        vm.label("_cdp_find");
+        vm.load(VReg.V0, VReg.SP, 0);
+        vm.cmp(VReg.S1, VReg.V0);
+        vm.jge("_cdp_fail");
+        vm.load(VReg.V2, VReg.S4, OBJECT_PROPS_PTR_OFFSET);
+        vm.shlImm(VReg.V0, VReg.S1, 4);
+        vm.add(VReg.V0, VReg.V2, VReg.V0);
+        vm.load(VReg.A0, VReg.V0, 0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_object_key_eq");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_cdp_hit");
+        vm.addImm(VReg.S1, VReg.S1, 1);
+        vm.jmp("_cdp_find");
+        vm.label("_cdp_hit");
+        vm.mov(VReg.A0, VReg.S4);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_get_attr");
+        vm.andImm(VReg.RET, VReg.RET, ATTR_CONFIGURABLE);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_cdp_fail");
+        vm.jmp("_cdp_define");
+        vm.label("_cdp_miss");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V0, VReg.S0, VReg.V1);
+        vm.loadByte(VReg.V1, VReg.V0, 1);
+        vm.andImm(VReg.V1, VReg.V1, EXT_NONEXT);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_cdp_fail");
+        vm.label("_cdp_define");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_object_define");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.movImm(VReg.A2, ATTR_DEFAULT);
+        vm.call("_object_set_prop_attr");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 32);
+        vm.label("_cdp_arr");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.S3, VReg.S0, VReg.V1);
+        vm.addImm(VReg.A1, VReg.S1, 1);
+        vm.mov(VReg.A0, VReg.S3);
+        vm.call("_array_ensure_cap");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_array_set");
+        vm.load(VReg.V0, VReg.S3, 8);
+        vm.cmp(VReg.S1, VReg.V0);
+        vm.jlt("_cdp_arr_ok");
+        vm.addImm(VReg.V0, VReg.S1, 1);
+        vm.store(VReg.S3, 8, VReg.V0);
+        vm.label("_cdp_arr_ok");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 32);
+        vm.label("_cdp_fail");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot create property"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+
+        // _concat_append_cdp(A0=acc, A1=n, A2=item) -> RET=new n
+        vm.label("_concat_append_cdp");
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.S2, VReg.A2);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_is_concat_spreadable");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_cac_one");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_agen_tolength");
+        vm.mov(VReg.S3, VReg.RET); // len
+        vm.store(VReg.SP, 0, VReg.S1); // n
+        vm.movImm(VReg.S1, 0); // k
+        vm.label("_cac_loop");
+        vm.cmp(VReg.S1, VReg.S3);
+        vm.jge("_cac_spread_done");
+        // 与 `_concat_append_item` 同:一律 Get+CDP。缺键读出 undefined 写入,
+        // 避免结果洞槽==0 被 compareArray 看成与 void 0 不同。
+        vm.mov(VReg.A0, VReg.S2);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_agen_get_idx");
+        vm.mov(VReg.A2, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.load(VReg.A1, VReg.SP, 0);
+        vm.call("_array_cdp_or_throw");
+        vm.load(VReg.V0, VReg.SP, 0);
+        vm.addImm(VReg.V0, VReg.V0, 1);
+        vm.store(VReg.SP, 0, VReg.V0);
+        vm.addImm(VReg.S1, VReg.S1, 1);
+        vm.jmp("_cac_loop");
+        vm.label("_cac_spread_done");
+        vm.load(VReg.RET, VReg.SP, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
+        vm.label("_cac_one");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_array_cdp_or_throw");
+        vm.addImm(VReg.RET, VReg.S1, 1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
+
+        // _array_cdp_set_len(A0=O boxed, A1=n 裸)
+        vm.label("_array_cdp_set_len");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.shrImm(VReg.V0, VReg.S0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jne("_cdpsl_obj");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V0, VReg.S0, VReg.V1);
+        vm.store(VReg.V0, 8, VReg.S1);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_cdpsl_obj");
+        vm.lea(VReg.A1, vm.asm.addString("length"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.scvtf(0, VReg.S1);
+        vm.fmovToInt(VReg.A2, 0);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_set");
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+
+        // FlattenIntoArray(target, source, sourceLen, start, depth) → new start
+        vm.label("_flatten_into_cdp");
+        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.S2, VReg.A2);
+        vm.mov(VReg.S3, VReg.A3);
+        vm.mov(VReg.S4, VReg.A4);
+        vm.movImm(VReg.V0, 0);
+        vm.store(VReg.SP, 0, VReg.V0);
+        vm.label("_fic_loop");
+        vm.load(VReg.V0, VReg.SP, 0);
+        vm.cmp(VReg.V0, VReg.S2);
+        vm.jge("_fic_done");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.mov(VReg.A1, VReg.V0);
+        vm.call("_agen_has_idx");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_fic_next");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.load(VReg.A1, VReg.SP, 0);
+        vm.call("_agen_get_idx");
+        vm.mov(VReg.S5, VReg.RET);
+        vm.cmpImm(VReg.S4, 0);
+        vm.jeq("_fic_cdp");
+        vm.mov(VReg.A0, VReg.S5);
+        vm.call("_is_array_value");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_fic_cdp");
+        vm.mov(VReg.A0, VReg.S5);
+        vm.call("_agen_tolength");
+        vm.mov(VReg.A2, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S5);
+        vm.mov(VReg.A3, VReg.S3);
+        vm.subImm(VReg.A4, VReg.S4, 1);
+        vm.call("_flatten_into_cdp");
+        vm.mov(VReg.S3, VReg.RET);
+        vm.jmp("_fic_next");
+        vm.label("_fic_cdp");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.mov(VReg.A2, VReg.S5);
+        vm.call("_array_cdp_or_throw");
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.label("_fic_next");
+        vm.load(VReg.V0, VReg.SP, 0);
+        vm.addImm(VReg.V0, VReg.V0, 1);
+        vm.store(VReg.SP, 0, VReg.V0);
+        vm.jmp("_fic_loop");
+        vm.label("_fic_done");
+        vm.mov(VReg.RET, VReg.S3);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 16);
     }
 
     // _is_concat_spreadable(A0=O boxed) -> 0/1 (not spreadable / spreadable)
@@ -6334,5 +7403,395 @@ export class ArrayGenerator {
         vm.label("_ccai_done");
         vm.mov(VReg.RET, VReg.S0);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
+    }
+
+
+
+
+
+    generateRecoveryStubs() {
+        const vm = this.vm;
+
+        vm.label("_is_array_value");
+        vm.prologue(0, [VReg.S0]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.shrImm(VReg.V0, VReg.S0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jeq("_isarr_yes");
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jne("_isarr_no");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V0, VReg.S0, VReg.V1);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_isarr_no");
+        vm.loadByte(VReg.V1, VReg.V0, 0);
+        vm.cmpImm(VReg.V1, 8); // TYPE_PROXY
+        vm.jne("_isarr_no");
+        vm.load(VReg.V1, VReg.V0, 16); // handler
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_isarr_revoked");
+        vm.shrImm(VReg.V2, VReg.V1, 48);
+        vm.cmpImm(VReg.V2, 0x7FFA);
+        vm.jeq("_isarr_revoked");
+        vm.cmpImm(VReg.V2, 0x7FFB);
+        vm.jeq("_isarr_revoked");
+        vm.load(VReg.A0, VReg.V0, 8); // target
+        vm.call("_is_array_value");
+        vm.epilogue([VReg.S0], 0);
+        vm.label("_isarr_revoked");
+        vm.lea(VReg.A0, vm.asm.addString("proxy revoked"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+        vm.label("_isarr_no");
+        vm.movImm(VReg.RET, 0);
+        vm.epilogue([VReg.S0], 0);
+        vm.label("_isarr_yes");
+        vm.movImm(VReg.RET, 1);
+        vm.epilogue([VReg.S0], 0);
+
+        // IteratorClose 且 completion 已是 throw:仍调 return(),但不因非 Object
+        // 结果再抛 TypeError(7.4.6:completion 为 throw 时直接返回原 completion)。
+        vm.label("_iterator_close_keep");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S1, VReg.A0);
+        vm.lea(VReg.A1, vm.asm.addString("return"));
+        vm.movImm64(VReg.V0, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V0);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_maybe_getter");
+        vm.mov(VReg.V6, VReg.RET);
+        vm.shrImm(VReg.V0, VReg.V6, 48);
+        vm.cmpImm(VReg.V0, 0x7fff);
+        vm.jne("_itck_done");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V6, VReg.V6, VReg.V1);
+        vm.load(VReg.V0, VReg.V6, 0);
+        vm.movImm(VReg.V1, 0xc105);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jne("_itck_bare");
+        vm.mov(VReg.S0, VReg.V6);
+        vm.load(VReg.V6, VReg.V6, 8);
+        vm.jmp("_itck_do");
+        vm.label("_itck_bare");
+        vm.movImm(VReg.S0, 0);
+        vm.label("_itck_do");
+        vm.mov(VReg.A5, VReg.S1);
+        vm.callIndirect(VReg.V6);
+        vm.label("_itck_done");
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+
+        // _array_from_iter_into(A0=A, A1=src, A2=mapFn, A3=thisArg)
+        // 迭代 src 并以 CDP 写入 A。无 @@iterator 则原样返回 A。
+        // map/CDP 抛错 → IteratorClose(keep)+rethrow。
+        vm.label("_array_from_iter_into");
+        vm.prologue(128, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.mov(VReg.S0, VReg.A0); // A
+        vm.mov(VReg.S1, VReg.A1); // src
+        vm.store(VReg.SP, 0, VReg.A2); // mapFn
+        vm.cmpImm(VReg.A3, 0);
+        vm.jne("_afii_this_ok");
+        vm.movImm64(VReg.A3, 0x7ffb000000000000n);
+        vm.label("_afii_this_ok");
+        vm.store(VReg.SP, 8, VReg.A3); // thisArg
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.A1, vm.asm.addString("Symbol.iterator"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.shrImm(VReg.V0, VReg.RET, 48);
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jne("_afii_done");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_spread_call0");
+        vm.mov(VReg.S3, VReg.RET); // iter
+        vm.movImm(VReg.S4, 0);     // k
+
+        vm.label("_afii_loop");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.lea(VReg.A1, vm.asm.addString("next"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.shrImm(VReg.V0, VReg.RET, 48);
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jne("_afii_finish");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_spread_call0");
+        vm.mov(VReg.S5, VReg.RET); // res
+        vm.mov(VReg.A0, VReg.S5);
+        vm.lea(VReg.A1, vm.asm.addString("done"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S5);
+        vm.call("_maybe_getter");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_boolean");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_afii_finish");
+        vm.mov(VReg.A0, VReg.S5);
+        vm.lea(VReg.A1, vm.asm.addString("value"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S5);
+        vm.call("_maybe_getter");
+        vm.mov(VReg.S2, VReg.RET); // value
+        // try { map?; CDP }
+        vm.lea(VReg.V0, "_exc_ctx_top");
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.store(VReg.SP, 32, VReg.V1);
+        vm.lea(VReg.V1, "_afii_catch");
+        vm.store(VReg.SP, 40, VReg.V1);
+        vm.mov(VReg.V1, VReg.SP);
+        vm.store(VReg.SP, 48, VReg.V1);
+        vm.store(VReg.SP, 56, VReg.FP);
+        vm.store(VReg.SP, 64, VReg.S0);
+        vm.store(VReg.SP, 72, VReg.S1);
+        vm.store(VReg.SP, 80, VReg.S2);
+        vm.store(VReg.SP, 88, VReg.S3);
+        vm.store(VReg.SP, 96, VReg.S4);
+        vm.store(VReg.SP, 104, VReg.S5);
+        vm.addImm(VReg.V1, VReg.SP, 32);
+        vm.store(VReg.V0, 0, VReg.V1);
+        vm.load(VReg.V0, VReg.SP, 0); // mapFn
+        vm.shrImm(VReg.V1, VReg.V0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFB);
+        vm.jeq("_afii_nomap");
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_afii_nomap");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.scvtf(0, VReg.S4);
+        vm.fmovToInt(VReg.A1, 0);
+        vm.mov(VReg.A3, VReg.V0);
+        vm.load(VReg.A4, VReg.SP, 8);
+        vm.call("_aref_invoke_from");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.label("_afii_nomap");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_array_cdp_or_throw");
+        vm.load(VReg.V1, VReg.SP, 32);
+        vm.lea(VReg.V0, "_exc_ctx_top");
+        vm.store(VReg.V0, 0, VReg.V1);
+        vm.addImm(VReg.S4, VReg.S4, 1);
+        vm.jmp("_afii_loop");
+
+        vm.label("_afii_catch");
+        vm.load(VReg.V1, VReg.SP, 32);
+        vm.lea(VReg.V0, "_exc_ctx_top");
+        vm.store(VReg.V0, 0, VReg.V1);
+        vm.mov(VReg.A0, VReg.S3);
+        vm.call("_iterator_close_keep");
+        vm.call("_throw_unwind");
+
+        vm.label("_afii_finish");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_array_cdp_set_len");
+        vm.label("_afii_done");
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 128);
+
+        vm.asm.addDataLabel("_nsobj_gen_proto");
+        vm.asm.addDataQword(0);
+        vm.asm.addDataLabel("_nsobj_asyncgen_proto");
+        vm.asm.addDataQword(0);
+
+        vm.label("_ensure_gen_proto");
+        vm.prologue(0, []);
+        vm.lea(VReg.V0, "_nsobj_gen_proto");
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_egp_done");
+        vm.call("_object_new");
+        vm.call("_box_obj_r");
+        vm.lea(VReg.V0, "_nsobj_gen_proto");
+        vm.store(VReg.V0, 0, VReg.RET);
+        vm.label("_egp_done");
+        vm.epilogue([], 0);
+
+        vm.label("_ensure_asyncgen_proto");
+        vm.prologue(0, []);
+        vm.lea(VReg.V0, "_nsobj_asyncgen_proto");
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_eagp_done");
+        vm.call("_object_new");
+        vm.call("_box_obj_r");
+        vm.lea(VReg.V0, "_nsobj_asyncgen_proto");
+        vm.store(VReg.V0, 0, VReg.RET);
+        vm.label("_eagp_done");
+        vm.epilogue([], 0);
+
+        // _agen_toLocaleString(A0=recv) → boxed string。
+        // 对每个非 null/undefined 元素 Invoke(el, "toLocaleString") 无参,再 ToString 拼接。
+        vm.label("_agen_toLocaleString");
+        vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
+        vm.call("_agen_toobject");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_agen_tolength");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.cmpImm(VReg.S2, 0);
+        vm.jeq("_atls_empty");
+        vm.lea(VReg.S1, "_str_comma_only");
+        vm.movImm64(VReg.V0, 0x7ffc000000000000n);
+        vm.or(VReg.S1, VReg.S1, VReg.V0); // sep=","
+        vm.movImm(VReg.S4, 0); // k
+        vm.lea(VReg.A0, "_str_empty");
+        vm.call("_js_box_string");
+        vm.store(VReg.SP, 0, VReg.RET); // acc
+        vm.label("_atls_loop");
+        vm.cmp(VReg.S4, VReg.S2);
+        vm.jge("_atls_done");
+        vm.cmpImm(VReg.S4, 0);
+        vm.jeq("_atls_nosep");
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_strconcat");
+        vm.store(VReg.SP, 0, VReg.RET);
+        vm.label("_atls_nosep");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_agen_get_idx");
+        vm.mov(VReg.S3, VReg.RET); // el (Call thisArg;可原语)
+        vm.shrImm(VReg.V0, VReg.S3, 48);
+        vm.cmpImm(VReg.V0, 0x7FFA);
+        vm.jeq("_atls_next");
+        vm.cmpImm(VReg.V0, 0x7FFB);
+        vm.jeq("_atls_next");
+        // 数字原语 + Number.prototype 未物化:默认 locale ≈ ToString(_numberToString)。
+        // 原型已物化(含测例覆写 toLocaleString)→ 完整 Invoke。
+        vm.cmpImm(VReg.V0, 0x7FF9);
+        vm.jeq("_atls_invoke");
+        vm.cmpImm(VReg.V0, 0x7FFC);
+        vm.jeq("_atls_invoke");
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jeq("_atls_invoke");
+        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jeq("_atls_invoke");
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jeq("_atls_invoke");
+        // 0x7FF8 tagged int / 裸 float / 其它数值
+        vm.lea(VReg.V1, "_nsobj_number_proto");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_atls_invoke");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.call("_numberToString");
+        vm.jmp("_atls_concat");
+        vm.label("_atls_try_numfast");
+        vm.label("_atls_invoke");
+        // GetV:ToObject(el) 再取 toLocaleString;Call this 仍为原 el。
+        // 不可用 _agen_toobject(串恒等):_object_get 对 0x7FFC 串只走索引/length,
+        // 方法名 miss → undefined → _spread_call0 解引用崩。
+        vm.shrImm(VReg.V0, VReg.S3, 48);
+        vm.cmpImm(VReg.V0, 0x7FFA);
+        vm.jeq("_atls_next");
+        vm.cmpImm(VReg.V0, 0x7FFB);
+        vm.jeq("_atls_next");
+        vm.cmpImm(VReg.V0, 0x7FF9);
+        vm.jeq("_atls_box_bool");
+        vm.cmpImm(VReg.V0, 0x7FFC);
+        vm.jeq("_atls_box_str");
+        vm.cmpImm(VReg.V0, 0x7FF8);
+        vm.jeq("_atls_box_num");
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jeq("_atls_box_id");
+        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jeq("_atls_box_id");
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jeq("_atls_box_id");
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_atls_box_hip0");
+        vm.cmpImm(VReg.V0, 0x7FF8);
+        vm.jlt("_atls_box_num");
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jgt("_atls_box_num");
+        vm.jmp("_atls_box_id");
+        vm.label("_atls_box_hip0");
+        vm.cmpImm(VReg.S3, 0);
+        vm.jeq("_atls_box_num");
+        vm.jmp("_atls_box_id");
+        vm.label("_atls_box_bool");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.call("_boolean_new");
+        vm.jmp("_atls_get");
+        vm.label("_atls_box_str");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.call("_string_new");
+        vm.jmp("_atls_get");
+        vm.label("_atls_box_num");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.call("_number_new");
+        vm.jmp("_atls_get");
+        vm.label("_atls_box_id");
+        vm.mov(VReg.RET, VReg.S3);
+        vm.label("_atls_get");
+        vm.store(VReg.SP, 8, VReg.RET); // O for Get
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, vm.asm.addString("toLocaleString"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.load(VReg.A1, VReg.SP, 8);
+        vm.call("_maybe_getter");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_spread_call0"); // toLocaleString.call(el)
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_valueToStr");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_js_box_string");
+        vm.label("_atls_concat");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.call("_strconcat");
+        vm.store(VReg.SP, 0, VReg.RET);
+        vm.label("_atls_next");
+        vm.addImm(VReg.S4, VReg.S4, 1);
+        vm.jmp("_atls_loop");
+        vm.label("_atls_done");
+        vm.load(VReg.RET, VReg.SP, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 48);
+        vm.label("_atls_empty");
+        vm.lea(VReg.A0, "_str_empty");
+        vm.call("_js_box_string");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 48);
+
+        // 单元素 Invoke(this, "toLocaleString") — Get 经 ToObject,Call this 保持原值
+        vm.label("_invoke_toLocaleString");
+        vm.prologue(16, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0); // thisArg
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_agen_toobject");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.A1, vm.asm.addString("toLocaleString"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_maybe_getter");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.call("_spread_call0");
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+
+        vm.label("_aref_invoke_cbt2");
+        vm.jmp("_aref_invoke_cbt");
     }
 }

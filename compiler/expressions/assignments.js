@@ -1,10 +1,96 @@
 // asm.js 编译器 - 赋值表达式编译
 // 编译各类赋值：简单赋值、复合赋值、成员赋值、更新表达式
 
-import { VReg } from "../../vm/index.js";
+import { VReg } from "../../vm/registers.js";
 import { Type, isIntType, isFloatType, inferType } from "../core/types.js";
+
+// 模块级算符表:热路径勿每次 new 短数组再 indexOf
+const FP_ARITH_OPS = { "+": 1, "-": 1, "*": 1, "/": 1, "%": 1 };
+const FP_ASSIGN_ARITH_OPS = { "+=": 1, "-=": 1, "*=": 1, "/=": 1, "%=": 1 };
+
 // 赋值编译方法混入
 export const AssignmentCompiler = {
+    // 非装箱局部:优先 T*(与 members 标识符读/简单赋值写同契约);否则 FP。
+    _loadLocalTemp(name, offset, dest) {
+        const lt = this.ctx.localTemps && this.ctx.localTemps.get(name);
+        if (lt && !this.ctx.isRawIntVar(name)) this.vm.mov(dest, lt);
+        else this.vm.load(dest, VReg.FP, offset);
+    },
+    _storeLocalTemp(name, offset, src) {
+        const lt = this.ctx.localTemps && this.ctx.localTemps.get(name);
+        if (lt && !this.ctx.isRawIntVar(name)) this.vm.mov(lt, src);
+        else this.vm.store(VReg.FP, offset, src);
+    },
+
+    // Object Environment SetMutableBinding:strict 且 !HasProperty(bindings, N) → ReferenceError。
+    _emitStrictObjectEnvPutGuard(objSlot, name) {
+        const goneL = this.ctx.newLabel("objenv_put_gone");
+        const okL = this.ctx.newLabel("objenv_put_ok");
+        this._emitObjectEnvHasProperty(objSlot, name, goneL);
+        this.vm.jmp(okL);
+        this.vm.label(goneL);
+        this.emitThrowReferenceError(name + " is not defined");
+        this.vm.label(okL);
+    },
+
+    // 装箱 globalThis 落帧槽。跨 call 只用 FP,避开 x64 V0≡RET / A0 别名。
+    _emitLoadBoxedGlobalThis() {
+        const off = this.ctx.allocLocal(`__gthis_${this.nextLabelId()}`);
+        this.vm.lea(VReg.V0, "_global_this");
+        this.vm.load(VReg.A0, VReg.V0, 0);
+        this.vm.call("_box_obj_r");
+        this.vm.store(VReg.FP, off, VReg.RET);
+        return off;
+    },
+
+    // 全局对象环境 GetBindingValue:HasProperty miss → ReferenceError;命中则 Get+getter。
+    _emitGlobalObjectEnvGet(gOff, name) {
+        const missL = this.ctx.newLabel("genv_get_miss");
+        const doneL = this.ctx.newLabel("genv_get_done");
+        this._emitObjectEnvHasProperty(gOff, name, missL);
+        this.vm.load(VReg.A0, VReg.FP, gOff);
+        this.emitBoxedStringKey(name, VReg.A1);
+        this.vm.call("_object_get");
+        this.vm.mov(VReg.A0, VReg.RET);
+        this.vm.load(VReg.A1, VReg.FP, gOff);
+        this.vm.call("_maybe_getter");
+        this.vm.jmp(doneL);
+        this.vm.label(missL);
+        this.emitThrowReferenceError(name + " is not defined");
+        this.vm.label(doneL);
+    },
+
+    // 编译期未解析名的复合赋值:GetValue(globalThis.N) → 算 → PutValue(HasProperty 守卫)。
+    // 只服务无词法槽的标识符;有局部/捕获的走原路径,热路径零税。
+    _emitGlobalObjectEnvCompoundAssign(name, binOp, right, strictSet) {
+        const gOff = this._emitLoadBoxedGlobalThis();
+        this._emitGlobalObjectEnvGet(gOff, name);
+        const leftSlot = this.ctx.allocLocal(`__genv_l_${this.nextLabelId()}`);
+        this.vm.store(VReg.FP, leftSlot, VReg.RET);
+        this.compileExpression(right);
+        const vSlot = this.ctx.allocLocal(`__genv_r_${this.nextLabelId()}`);
+        this.vm.store(VReg.FP, vSlot, VReg.RET);
+        if (strictSet) this._emitStrictObjectEnvPutGuard(gOff, name);
+        this._inWithResolve = true;
+        this.compileAssignmentExpression({
+            type: "AssignmentExpression",
+            operator: "=",
+            left: {
+                type: "MemberExpression",
+                object: { type: "__WithPrecomputed", slot: gOff },
+                property: { type: "Identifier", name: name },
+                computed: false,
+            },
+            right: {
+                type: "BinaryExpression",
+                operator: binOp,
+                left: { type: "__WithPrecomputed", slot: leftSlot },
+                right: { type: "__WithPrecomputed", slot: vSlot },
+            },
+        });
+        this._inWithResolve = false;
+    },
+
     // 编译赋值表达式
     // [解箱① P4.1] 把表达式编译为 float64 位模式(供浮点累加器更新的 E 操作数)。
     // 镜像 compileOperandAsFloat 的关键归一化:整数表达式(rawInt 变量/int 算术)编成
@@ -38,22 +124,75 @@ export const AssignmentCompiler = {
         if (expr.left.type === "Identifier") {
             const name = expr.left.name;
 
-            // with(obj) 作用域赋值:HasBinding 命中则 PutValue 恒写该 binding object
-            // （即便 GetValue 期间 getter 删了属性，仍 CreateDataProperty——S11.13.2_A5.*）。
-            // RHS 只求值一次。复合运算：GetValue → binop → PutValue（不再回退词法）。
-            if (this.ctx.withScopes && this.ctx.withScopes.length > 0 && !this._inWithResolve) {
-                this.compileExpression(expr.right);
-                const vSlot = this.ctx.allocLocal(`__withasgn_${this.nextLabelId()}`);
-                this.vm.store(VReg.FP, vSlot, VReg.RET);
+            // with(obj) 作用域赋值:HasBinding 命中则 PutValue 恒写该 binding object。
+            // 简单 `=` 仍先求 RHS 再 HasBinding:先钉 Reference 再 Set 会在
+            // TypedArray 原型 + 数值键("NaN")上误 CreateDataProperty
+            // (set-mutable-binding-binding-deleted-with-typed-array-in-proto-chain)。
+            // 复合:GetValue 后 strict 且 !HasProperty → ReferenceError。
+            if (this._hasAnyWithScope && this._hasAnyWithScope() && !this._inWithResolve) {
                 const doneL = this.ctx.newLabel("withasgn_done");
                 const strictSet = (this.ctx && this.ctx.inStrictFunction) ||
                     (this._currentModuleAst && this._currentModuleAst._bsStrict);
                 const setHelper = strictSet ? "_object_set_strict" : "_object_set";
                 const binOp = expr.operator !== "=" && expr.operator.length >= 2
                     ? expr.operator.slice(0, -1) : null;
-                for (let i = this.ctx.withScopes.length - 1; i >= 0; i--) {
+                const _asgnGroups = [this.ctx.withScopes || []];
+                if (!(this._isOwnBinding && this._isOwnBinding(name))) {
+                    _asgnGroups.push(this.ctx.outerWithScopes || []);
+                }
+                // [S11.13.1_A5_T3] 嵌套 with 内简单 `=` 须先钉住 LHS Reference 的 binding
+                // object,再求 RHS,再 PutValue(即使 RHS delete 了该属性仍写回原 object)。
+                // 单层 with 仍先 RHS 再 HasBinding(typed-array 原型链 + delete 场景须走
+                // [[Set]] 而非钉死后 _object_set 误 CreateDataProperty)。
+                const withScopes = this.ctx.withScopes || [];
+                const pinNestedWith = expr.operator === "=" && withScopes.length > 1;
+                const pinOff = pinNestedWith
+                    ? this.ctx.allocLocal(`__withasgn_pin_${this.nextLabelId()}`) : 0;
+                const pinHitOff = pinNestedWith
+                    ? this.ctx.allocLocal(`__withasgn_phit_${this.nextLabelId()}`) : 0;
+                const evalRhsL = this.ctx.newLabel("withasgn_eval_rhs");
+                const oldPutL = this.ctx.newLabel("withasgn_old_put");
+                if (pinNestedWith) {
+                    this.vm.movImm(VReg.V0, 0);
+                    this.vm.store(VReg.FP, pinHitOff, VReg.V0);
+                    for (let i = withScopes.length - 1; i >= 0; i--) {
+                        const missL = this.ctx.newLabel("withasgn_phit_miss");
+                        this._emitObjectEnvHasBinding(withScopes[i], name, missL);
+                        this.vm.load(VReg.V0, VReg.FP, withScopes[i]);
+                        this.vm.store(VReg.FP, pinOff, VReg.V0);
+                        this.vm.movImm(VReg.V1, 1);
+                        this.vm.store(VReg.FP, pinHitOff, VReg.V1);
+                        this.vm.jmp(evalRhsL);
+                        this.vm.label(missL);
+                    }
+                    this.vm.jmp(evalRhsL);
+                } else {
+                    this.vm.jmp(evalRhsL);
+                }
+                this.vm.label(evalRhsL);
+                this.compileExpression(expr.right);
+                const vSlot = this.ctx.allocLocal(`__withasgn_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, vSlot, VReg.RET);
+                if (pinNestedWith) {
+                    const pinnedPutL = this.ctx.newLabel("withasgn_pinned_put");
+                    this.vm.load(VReg.V0, VReg.FP, pinHitOff);
+                    this.vm.cmpImm(VReg.V0, 0);
+                    this.vm.jne(pinnedPutL);
+                    this.vm.jmp(oldPutL);
+                    this.vm.label(pinnedPutL);
+                    this.vm.load(VReg.A0, VReg.FP, pinOff);
+                    this.emitBoxedStringKey(name, VReg.A1);
+                    this.vm.load(VReg.A2, VReg.FP, vSlot);
+                    this.vm.call(setHelper);
+                    this.vm.load(VReg.RET, VReg.FP, vSlot);
+                    this.vm.jmp(doneL);
+                }
+                this.vm.label(oldPutL);
+                for (let _gi = 0; _gi < _asgnGroups.length; _gi++) {
+                const _asgnList = _asgnGroups[_gi];
+                for (let i = _asgnList.length - 1; i >= 0; i--) {
                     const missL = this.ctx.newLabel("withasgn_miss");
-                    const slot = this.ctx.withScopes[i];
+                    const slot = _asgnList[i];
                     this._emitObjectEnvHasBinding(slot, name, missL);
                     if (expr.operator === "=") {
                         this.vm.load(VReg.A0, VReg.FP, slot);
@@ -62,16 +201,15 @@ export const AssignmentCompiler = {
                         this.vm.call(setHelper);
                         this.vm.load(VReg.RET, VReg.FP, vSlot);
                     } else if (binOp) {
-                        // GetValue(with.x) — 须解 accessor
                         this.vm.load(VReg.A0, VReg.FP, slot);
                         this.emitBoxedStringKey(name, VReg.A1);
                         this.vm.call("_object_get");
                         this.vm.mov(VReg.A0, VReg.RET);
-                        this.vm.load(VReg.A1, VReg.FP, slot); // this = binding object
+                        this.vm.load(VReg.A1, VReg.FP, slot);
                         this.vm.call("_maybe_getter");
                         const leftSlot = this.ctx.allocLocal(`__withcv_l_${this.nextLabelId()}`);
                         this.vm.store(VReg.FP, leftSlot, VReg.RET);
-                        // result = left <binop> RHS（复用成员赋值脱糖，Put 恒写 with 对象）
+                        if (strictSet) this._emitStrictObjectEnvPutGuard(slot, name);
                         this._inWithResolve = true;
                         this.compileAssignmentExpression({
                             type: "AssignmentExpression",
@@ -91,7 +229,6 @@ export const AssignmentCompiler = {
                         });
                         this._inWithResolve = false;
                     } else {
-                        // <<= 等少见：回退词法（记偏差）
                         this._inWithResolve = true;
                         this.compileAssignmentExpression({
                             type: "AssignmentExpression", operator: expr.operator,
@@ -105,7 +242,7 @@ export const AssignmentCompiler = {
                     this.vm.jmp(doneL);
                     this.vm.label(missL);
                 }
-                // 全 miss → 词法
+                }
                 this._inWithResolve = true;
                 this.compileAssignmentExpression({
                     type: "AssignmentExpression", operator: expr.operator === "=" ? "=" : expr.operator,
@@ -116,7 +253,7 @@ export const AssignmentCompiler = {
                 return;
             }
 
-            const offset = this.ctx.getLocal(name);
+            let offset = this.ctx.getLocal(name);
 
             // 检查是否是主程序被捕获的变量（从全局位置访问）
             const globalLabel = this.ctx.getMainCapturedVar(name);
@@ -128,31 +265,50 @@ export const AssignmentCompiler = {
                 // 此前写路径直接抛,令 S13_A15_T5/S13_A12_T1 等隐式全局族 FAIL)。
                 // 判别复用 typeof 的 isUnresolvableIdentifier:内建/已知全局不算 ——
                 // 但 sloppy `=` 一律走全局 set(规范即如此;此前静默 no-op 且不 eval RHS)。
-                // 复合赋值(+= 等)先 GetValue 再写:miss 时读路径抛 ReferenceError,
-                // 正确;已隐式创建的全局读路径命中、写回仍走词法(此处),记偏差。
+                // 复合赋值(+= 等)/严格 `=`:未解析名走全局对象环境 GetValue+PutValue
+                // (defineProperty(this,"x",getter-deletes) 后 x+= / x-- 须先 Get 再
+                // HasProperty 守卫)。逻辑赋值仍早抛,不在本刀。
                 const strictSet = (this.ctx && this.ctx.inStrictFunction) ||
                     (this._currentModuleAst && this._currentModuleAst._bsStrict);
                 if (!strictSet && expr.operator === "=") {
+                    // FP 槽保 RHS:不可用 push/pop——嵌套在二元运算等已 push 左值的
+                    // 上下文里会掏错槽,且 arm64 stp 填充字使 SP+0 读值不可靠叠加。
                     this.compileExpression(expr.right);      // RET = RHS
-                    this.vm.push(VReg.RET);                  // [SP] = RHS(跨 call 保活)
+                    const rhsOff = this.ctx.allocLocal(`__gassign_${this.nextLabelId()}`);
+                    this.vm.store(VReg.FP, rhsOff, VReg.RET);
                     this.vm.lea(VReg.V0, "_global_this");
                     this.vm.load(VReg.A0, VReg.V0, 0);
                     this.vm.call("_box_obj_r");              // A0 = boxed globalThis
                     this.emitBoxedStringKey(name, VReg.A1);  // _tag_key_a1 clobber V1
-                    this.vm.load(VReg.A2, VReg.SP, 0);       // A2 = RHS
-                    this.vm.call("_object_set");             // RET = 赋值表达式之值
-                    this.vm.pop(VReg.V0);                    // 还栈
+                    this.vm.load(VReg.A2, VReg.FP, rhsOff);  // A2 = RHS
+                    this.vm.call("_object_set");
+                    this.vm.load(VReg.RET, VReg.FP, rhsOff); // 赋值表达式之值 = RHS
                     return;
                 }
                 if (this.isUnresolvableIdentifier &&
                     this.isUnresolvableIdentifier({ type: "Identifier", name: name })) {
+                    const binOp = expr.operator !== "=" && expr.operator.length >= 2
+                        ? expr.operator.slice(0, -1) : null;
+                    if (binOp && binOp !== "&&" && binOp !== "||" && binOp !== "??") {
+                        this._emitGlobalObjectEnvCompoundAssign(name, binOp, expr.right, strictSet);
+                        return;
+                    }
                     this.emitThrowReferenceError(name + " is not defined");
                 }
                 return;
             }
 
             const op = expr.operator;
-            const isBoxed = this.ctx.boxedVars && this.ctx.boxedVars.has(name);
+            let isBoxed = this.ctx.boxedVars && this.ctx.boxedVars.has(name);
+            // [S11.13.2] eval('var x') 与捕获同名:复合赋值 LHS Reference 仍指向
+            // 捕获 box(__cap_x),普通读/简单= 走 eval var 槽 x。
+            if (this.ctx.bodyEvalVarNames && this.ctx.bodyEvalVarNames.has(name) && op !== "=") {
+                const capOff = this.ctx.getLocal(`__cap_${name}`);
+                if (capOff) {
+                    offset = capOff;
+                    isBoxed = true;
+                }
+            }
 
             // [解箱① P4.1] 浮点累加器驻留 FP 寄存器:`s=s<op>E` / `s<op>=E` 直发
             // f<op> d_reg,d_reg,d_tmp,免 slot 往返/coerce 守卫/操作数压栈。
@@ -163,10 +319,10 @@ export const AssignmentCompiler = {
                     const r = expr.right;
                     if (r && r.type === "BinaryExpression" && r.left &&
                         r.left.type === "Identifier" && r.left.name === name &&
-                        ["+", "-", "*", "/", "%"].indexOf(r.operator) >= 0) {
+                        FP_ARITH_OPS[r.operator]) {
                         fop = r.operator; eExpr = r.right;
                     }
-                } else if (["+=", "-=", "*=", "/=", "%="].indexOf(op) >= 0) {
+                } else if (FP_ASSIGN_ARITH_OPS[op]) {
                     fop = op.charAt(0); eExpr = expr.right;
                 }
                 if (fop && eExpr) {
@@ -182,28 +338,24 @@ export const AssignmentCompiler = {
                 }
                 // 形态不符(detect 已排除,防御性):物化 FP→slot 后落通用路径,避免不一致
                 this.vm.fmovToInt(VReg.RET, fpReg);
-                this.vm.store(VReg.FP, offset, VReg.RET);
+                this._storeLocalTemp(name, offset, VReg.RET);
                 this.ctx.fpAccumVars[name] = 0;
             }
 
             // 简单赋值
             if (op === "=") {
-                // [L4.2 字符串原地拼接] 逃逸门控:`s = s + E`(含 `s += E` 解糖形态)。
-                // 门控通过时设 _ipConcatVar,compileStringConcat 发 _str_concat_ip(旧串为
-                // 堆串且容量足 → 就地追加返同指针;不满足则运行时尾委托 _strconcat,
-                // 逐字节等价旧语义)。静态非拼接路径(右侧非串 → _js_add)不受影响。
-                // 否决前置:装箱变量(闭包捕获)、主程序被捕获变量、with 作用域活跃、
-                // 右侧静态非串(数值累加等根本不进 compileStringConcat,免扫描)。
-                const _ipCand = expr.right && expr.right.type === "BinaryExpression" &&
-                    expr.right.operator === "+" && expr.right.left &&
-                    expr.right.left.type === "Identifier" && expr.right.left.name === name &&
-                    inferType(expr.right.right, this.ctx) === Type.STRING &&
-                    !isBoxed && !globalLabel &&
-                    !(this.ctx.withScopes && this.ctx.withScopes.length > 0) &&
-                    this._canIpStringAccum(name);
-                if (_ipCand) this.ctx._ipConcatVar = name;
+                // [L4.2] M1:IP 原地拼接已关(`_canIpStringAccum` 恒否);热路径不再跑门控。
                 this.compileExpression(expr.right);
-                if (_ipCand) this.ctx._ipConcatVar = null;
+                // 具名函数表达式 BindingIdentifier:CreateImmutableBinding。
+                // sloppy 静默忽略赋值(仍返 RHS);strict 抛 TypeError。
+                // 本函数形参/var 同名走 ownBindingNames,可写;箭头捕获外层名仍禁写。
+                if (this.ctx.immutableLocals && this.ctx.immutableLocals.has(name) &&
+                    !(this.ctx.ownBindingNames && this.ctx.ownBindingNames[name])) {
+                    if (this.ctx.inStrictFunction) {
+                        this.emitThrowTypeError("Assignment to constant variable.");
+                    }
+                    return;
+                }
 
                 // 二元表达式（算术运算和字符串连接）返回 raw bits 或 NaN-boxed，
                 // 不是 boxed Number，不需要 unbox
@@ -223,7 +375,11 @@ export const AssignmentCompiler = {
                     this.vm.movImm64(VReg.V4, 0x7ff70000deadbeefn);
                     this.vm.cmp(VReg.V3, VReg.V4);
                     this.vm.jne(gTdzOk);
-                    const gTdzMsg = this.asm.addString("Cannot access '" + name.replace(/\$blk\$.*$/, "") + "' before initialization");
+                    // 工具链禁正则字面量(否则 codegen 改写 __RE_replace 却不注入 shim)。
+                    let gDisp = name;
+                    const gBlk = typeof name === "string" ? name.indexOf("$blk$") : -1;
+                    if (gBlk !== -1) gDisp = name.slice(0, gBlk);
+                    const gTdzMsg = this.asm.addString("Cannot access '" + gDisp + "' before initialization");
                     this.vm.lea(VReg.A0, gTdzMsg);
                     this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
                     this.vm.or(VReg.A0, VReg.A0, VReg.V1);
@@ -243,7 +399,10 @@ export const AssignmentCompiler = {
                     this.vm.movImm64(VReg.V4, 0x7ff70000deadbeefn);
                     this.vm.cmp(VReg.V3, VReg.V4);
                     this.vm.jne(tdzOk);
-                    const tdzMsg = this.asm.addString("Cannot access '" + name.replace(/\$blk\$.*$/, "") + "' before initialization");
+                    let tDisp = name;
+                    const tBlk = typeof name === "string" ? name.indexOf("$blk$") : -1;
+                    if (tBlk !== -1) tDisp = name.slice(0, tBlk);
+                    const tdzMsg = this.asm.addString("Cannot access '" + tDisp + "' before initialization");
                     this.vm.lea(VReg.A0, tdzMsg);
                     this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
                     this.vm.or(VReg.A0, VReg.A0, VReg.V1);
@@ -252,7 +411,7 @@ export const AssignmentCompiler = {
                     this.vm.store(VReg.V2, 0, VReg.V1); // 存入 box
                     this.vm.mov(VReg.RET, VReg.V1); // 返回值
                 } else {
-                    this.vm.store(VReg.FP, offset, VReg.RET);
+                    this._storeLocalTemp(name, offset, VReg.RET);
                 }
                 this.syncModuleExportBinding(name, VReg.RET);
                 return;
@@ -273,7 +432,7 @@ export const AssignmentCompiler = {
                     this.vm.load(VReg.RET, VReg.V2, 0); // 值
                     this.emitUninitializedBindingGuard(name, VReg.RET);
                 } else {
-                    this.vm.load(VReg.RET, VReg.FP, offset);
+                    this._loadLocalTemp(name, offset, VReg.RET);
                 }
 
                 if (op === "&&=") {
@@ -324,7 +483,7 @@ export const AssignmentCompiler = {
                     this.vm.load(VReg.V2, VReg.FP, offset);
                     this.vm.store(VReg.V2, 0, VReg.RET);
                 } else {
-                    this.vm.store(VReg.FP, offset, VReg.RET);
+                    this._storeLocalTemp(name, offset, VReg.RET);
                 }
                 this.syncModuleExportBinding(name, VReg.RET);
 
@@ -351,9 +510,9 @@ export const AssignmentCompiler = {
                 this.emitUninitializedBindingGuard(name, VReg.RET);
             } else if (isUnboxedArith) {
                 // 无装箱的变量且是算术运算符：使用浮点运算
-                this.vm.load(VReg.V1, VReg.FP, offset); // V1 = 左操作数 raw bits
+                this._loadLocalTemp(name, offset, VReg.V1); // V1 = 左操作数 raw bits
             } else {
-                this.vm.load(VReg.RET, VReg.FP, offset);
+                this._loadLocalTemp(name, offset, VReg.RET);
             }
 
             if (isUnboxedArith && op === "+=") {
@@ -363,7 +522,7 @@ export const AssignmentCompiler = {
                 this.vm.mov(VReg.A1, VReg.RET);
                 this.vm.pop(VReg.A0);
                 this.vm.call("_js_add");
-                this.vm.store(VReg.FP, offset, VReg.RET);
+                this._storeLocalTemp(name, offset, VReg.RET);
             } else if (isUnboxedArith) {
                 // [#F64] 未装箱算术复合赋值:slot 值可能是 tagged 值(如 x=true 存为
                 // 0x7FF9.. tag、x=null 存为 0x7FFA.. tag)，直接 fmovToFloat 会误解
@@ -403,7 +562,7 @@ export const AssignmentCompiler = {
                 // 改写为 0x7FF0.. 安全 NaN(与 binary-expression 同形)。
                 this.emitNaNCanon();
                 // 存储回 slot
-                this.vm.store(VReg.FP, offset, VReg.RET);
+                this._storeLocalTemp(name, offset, VReg.RET);
             } else {
                 this.vm.push(VReg.RET);
                 this.compileExpression(expr.right);
@@ -489,7 +648,7 @@ export const AssignmentCompiler = {
                     this.vm.pop(VReg.V2); // 恢复 box 指针
                     this.vm.store(VReg.V2, 0, VReg.RET);
                 } else {
-                    this.vm.store(VReg.FP, offset, VReg.RET);
+                    this._storeLocalTemp(name, offset, VReg.RET);
                 }
                 this.syncModuleExportBinding(name, VReg.RET);
             }
@@ -818,15 +977,21 @@ export const AssignmentCompiler = {
         // with(obj) 内 n++/--n:HasBinding 只一次(含 @@unscopables getter),再 Get/Put
         // 同一 binding object——避免 read+assign 双次 HasBinding(unscopables-inc-dec)。
         if (expr.argument.type === "Identifier" && !this._inWithResolve &&
-            this.ctx.withScopes && this.ctx.withScopes.length > 0) {
+            this._hasAnyWithScope && this._hasAnyWithScope()) {
             const name = expr.argument.name;
             const doneL = this.ctx.newLabel("withupd_done");
             const strictSet = (this.ctx && this.ctx.inStrictFunction) ||
                 (this._currentModuleAst && this._currentModuleAst._bsStrict);
             const setHelper = strictSet ? "_object_set_strict" : "_object_set";
-            for (let i = this.ctx.withScopes.length - 1; i >= 0; i--) {
+            const _updGroups = [this.ctx.withScopes || []];
+            if (!(this._isOwnBinding && this._isOwnBinding(name))) {
+                _updGroups.push(this.ctx.outerWithScopes || []);
+            }
+            for (let _gi = 0; _gi < _updGroups.length; _gi++) {
+            const _updList = _updGroups[_gi];
+            for (let i = _updList.length - 1; i >= 0; i--) {
                 const missL = this.ctx.newLabel("withupd_miss");
-                const slot = this.ctx.withScopes[i];
+                const slot = _updList[i];
                 this._emitObjectEnvHasBinding(slot, name, missL);
                 // GetValue
                 this.vm.load(VReg.A0, VReg.FP, slot);
@@ -847,7 +1012,11 @@ export const AssignmentCompiler = {
                 if (expr.operator === "++") this.vm.fadd(0, 0, 1);
                 else this.vm.fsub(0, 0, 1);
                 this.vm.fmovToInt(VReg.A2, 0);
+                const newOff = this.ctx.allocLocal(`__withupd_new_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, newOff, VReg.A2);
                 // PutValue 恒写本 binding(不再 HasBinding)
+                if (strictSet) this._emitStrictObjectEnvPutGuard(slot, name);
+                this.vm.load(VReg.A2, VReg.FP, newOff);
                 this.vm.load(VReg.A0, VReg.FP, slot);
                 this.emitBoxedStringKey(name, VReg.A1);
                 this.vm.call(setHelper);
@@ -855,6 +1024,7 @@ export const AssignmentCompiler = {
                 else this.vm.load(VReg.RET, VReg.FP, oldSlot);
                 this.vm.jmp(doneL);
                 this.vm.label(missL);
+            }
             }
             // 全 miss → 词法 ++/--
             this._inWithResolve = true;
@@ -864,6 +1034,12 @@ export const AssignmentCompiler = {
             return;
         }
         if (expr.argument.type === "Identifier") {
+            // sloppy const ++/--:blockscope 标 _constWrite,运行期 TypeError
+            // (for (const i = 0; i < 1; i++) 族)。strict 已是解析期 SyntaxError。
+            if (expr.argument._constWrite) {
+                this.emitThrowTypeError("Assignment to constant variable.");
+                return;
+            }
             const name = expr.argument.name;
             const offset = this.ctx.getLocal(name);
             // [#56/A4] 顶层 hoisted function 体内对模块捕获变量(全局 box)的 ++/--：
@@ -939,13 +1115,16 @@ export const AssignmentCompiler = {
                                 this.vm.subImm(VReg.V1, VReg.V1, 1);
                             }
                         } else {
+                            // 后置表达式值 = ToNumber(old),不是原对象/函数。
+                            // 此前 push 未 coerce 的旧值:`y=fn--` 在 isNaN(y) 走
+                            // 第二次 ToNumber 时又撞 0x7FF8/int0 别名。
                             this.vm.push(VReg.V2); // box pointer
-                            this.vm.push(VReg.RET); // original expression result
                             this.vm.mov(VReg.A0, VReg.RET);
                             this.vm.call("_number_coerce");
+                            this.vm.push(VReg.RET); // ToNumber(old)=postfix ret
+                            this.vm.fmovToFloat(0, VReg.RET);
                             this.vm.movImm(VReg.V1, 0x3ff00000);
                             this.vm.shl(VReg.V1, VReg.V1, 32);
-                            this.vm.fmovToFloat(0, VReg.RET);
                             this.vm.fmovToFloat(1, VReg.V1);
                             if (expr.operator === "++") {
                                 this.vm.fadd(0, 0, 1);
@@ -953,22 +1132,21 @@ export const AssignmentCompiler = {
                                 this.vm.fsub(0, 0, 1);
                             }
                             this.vm.fmovToInt(VReg.RET, 0);
-                            this.vm.pop(VReg.V1); // original expression result
-                            this.vm.pop(VReg.V2); // box pointer
+                            this.emitNaNCanon();
+                            this.vm.mov(VReg.V1, VReg.RET); // new
+                            this.vm.pop(VReg.RET);          // postfix = ToNumber(old)
+                            this.vm.pop(VReg.V2);           // box pointer
                         }
-                        this.vm.store(VReg.V2, 0, isInt ? VReg.V1 : VReg.RET);
-                        this.syncModuleExportBinding(name, isInt ? VReg.V1 : VReg.RET);
-                        if (!isInt) {
-                            this.vm.mov(VReg.RET, VReg.V1);
-                        }
-                        // RET 保持原值
+                        this.vm.store(VReg.V2, 0, VReg.V1);
+                        this.syncModuleExportBinding(name, VReg.V1);
+                        // 非 int:RET 已是 ToNumber(old);int:RET 仍是原整数值
                     }
                 } else {
                     // 普通变量
                     // [#F65] slot 值可能是 tagged(boolean/null/undefined)或堆对象,
                     // 直接 fmovToFloat 会误解位模式 → NaN/垃圾。先 ToNumber 再浮点 ±1,
                     // 并加 NaN 规范化(同 compound-assignment [#nan-int0])。
-                    this.vm.load(VReg.RET, VReg.FP, offset);
+                    this._loadLocalTemp(name, offset, VReg.RET);
                     if (expr.prefix) {
                         if (isInt) {
                             if (expr.operator === "++") {
@@ -991,7 +1169,7 @@ export const AssignmentCompiler = {
                             this.vm.fmovToInt(VReg.RET, 0);
                             this.emitNaNCanon();
                         }
-                        this.vm.store(VReg.FP, offset, VReg.RET);
+                        this._storeLocalTemp(name, offset, VReg.RET);
                         this.syncModuleExportBinding(name, VReg.RET);
                     } else {
                         // 后置：表达式值 = ToNumber(old),写回值 = ToNumber(old) ± 1。
@@ -1022,11 +1200,42 @@ export const AssignmentCompiler = {
                             this.vm.mov(VReg.V1, VReg.RET);  // V1 = 规范化结果
                             this.vm.pop(VReg.RET);           // RET = postfix ret;SP+=16
                         }
-                        this.vm.store(VReg.FP, offset, VReg.V1);
+                        this._storeLocalTemp(name, offset, VReg.V1);
                         this.syncModuleExportBinding(name, VReg.V1);
                         // RET = postfix 表达式值(ToNumber(old))
                     }
                 }
+            } else if (this.isUnresolvableIdentifier &&
+                this.isUnresolvableIdentifier({ type: "Identifier", name: name })) {
+                // 全局对象环境 ++/--:GetValue(globalThis.N) 后 ±1,strict 再 HasProperty。
+                // 此前无词法槽时整段跳过 → 静默 no-op(putvalue x--/--x 不抛)。
+                const strictSet = (this.ctx && this.ctx.inStrictFunction) ||
+                    (this._currentModuleAst && this._currentModuleAst._bsStrict);
+                const setHelper = strictSet ? "_object_set_strict" : "_object_set";
+                const gOff = this._emitLoadBoxedGlobalThis();
+                this._emitGlobalObjectEnvGet(gOff, name);
+                const oldSlot = this.ctx.allocLocal(`__gupd_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, oldSlot, VReg.RET);
+                this.vm.load(VReg.RET, VReg.FP, oldSlot);
+                this.emitNumberCoerceFast();
+                const oldNumOff = this.ctx.allocLocal(`__gupd_oldn_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, oldNumOff, VReg.RET);
+                this.vm.fmovToFloat(0, VReg.RET);
+                this.vm.movImm(VReg.V1, 0x3ff00000);
+                this.vm.shl(VReg.V1, VReg.V1, 32);
+                this.vm.fmovToFloat(1, VReg.V1);
+                if (expr.operator === "++") this.vm.fadd(0, 0, 1);
+                else this.vm.fsub(0, 0, 1);
+                this.vm.fmovToInt(VReg.A2, 0);
+                const newOff = this.ctx.allocLocal(`__gupd_new_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, newOff, VReg.A2);
+                if (strictSet) this._emitStrictObjectEnvPutGuard(gOff, name);
+                this.vm.load(VReg.A2, VReg.FP, newOff);
+                this.vm.load(VReg.A0, VReg.FP, gOff);
+                this.emitBoxedStringKey(name, VReg.A1);
+                this.vm.call(setHelper);
+                if (expr.prefix) this.vm.load(VReg.RET, VReg.FP, newOff);
+                else this.vm.load(VReg.RET, VReg.FP, oldNumOff);
             }
         } else if (expr.argument.type === "MemberExpression") {
             // 成员自增/自减：obj.prop++ / obj[k]-- / arr[i]++ （原先未处理 → 静默 no-op，
@@ -1071,8 +1280,27 @@ export const AssignmentCompiler = {
             // 读错槽 → _object_set(NULL) FATAL，是 this.labelCounter++ 自举崩溃根因）。
             const updSlot = this.vm.backend.name === "x64" ? 8 : 16;
             if (dynKey) {
-                this.vm.load(VReg.A1, VReg.SP, 0);   // key
-                this.vm.load(VReg.A0, VReg.SP, updSlot);  // obj
+                // EvaluatePropertyAccessWithExpressionKey:RequireObjectCoercible(base)
+                // 先于 ToPropertyKey。_subscript_get_nullish 为拼 message 会
+                // _valueToStr(key) → 键对象 toString 抢先抛
+                // (S11.4.4_A6_T1 / S11.3.2_A6_T2)。ToPropertyKey 只一次,读写共用
+                // (S11.4.5_A6_T3)。热路径 this.n++ 非计算键,不受影响。
+                const okL = this.ctx.newLabel("upd_base_ok");
+                const badL = this.ctx.newLabel("upd_base_nullish");
+                this.vm.load(VReg.V0, VReg.SP, updSlot);
+                this.vm.shrImm(VReg.V1, VReg.V0, 48);
+                this.vm.cmpImm(VReg.V1, 0x7FFA);
+                this.vm.jeq(badL);
+                this.vm.cmpImm(VReg.V1, 0x7FFB);
+                this.vm.jne(okL);
+                this.vm.label(badL);
+                this.emitThrowTypeError("Cannot read properties of null or undefined");
+                this.vm.label(okL);
+                this.vm.load(VReg.A0, VReg.SP, 0);
+                this.vm.call("_js_prop_key");
+                this.vm.store(VReg.SP, 0, VReg.RET);
+                this.vm.load(VReg.A1, VReg.SP, 0);
+                this.vm.load(VReg.A0, VReg.SP, updSlot);
                 this.vm.call("_subscript_get");
             } else if (updFnProp) {
                 this.vm.load(VReg.A0, VReg.SP, 0);   // obj(函数值)
@@ -1148,115 +1376,4 @@ export const AssignmentCompiler = {
         this.boxNumber(VReg.S0);
     },
 
-    // [L4.2 字符串原地拼接] 逃逸门控:函数级保守语法分析(不做 SSA/活性)。
-    // 全部成立才允许把 `s = s + E` / `s += E` 发射为 _str_concat_ip(见 docs/STR_CONCAT_L4_DESIGN.md §2.3):
-    //   ① s 不是形参(含解构/默认值/rest 子树);② 模块顶层时 s 未被导出(import 侧可别名);
-    //   ③ 至少一个门控拼接形态;④ s 的每次写入均为 串字面量/模板字面量/门控拼接形态
-    //   (其他类型或来源否决;`let s;` 无初值允许——运行时守卫对非串旧值委托 _strconcat);
-    //   ⑤ 别名化引用(t=s / f(s) / return s / [s] / {x:s} / s.x / s() / typeof s …)只允许
-    //   出现在**活跃区之后**(活跃区 = 含末次门控拼接的最外层循环;无循环则到末次拼接止);
-    //   ⑥ 嵌套函数内引用 s 一律否决(捕获语义,与 boxedVars 检查双保险)。
-    // 正确性根基:④ 保证 s 持有的堆块要么来自全新拼接分配(唯一引用),要么是数据段
-    // 字面量(运行时守卫对只读数据段串恒委托 _strconcat);⑤ 保证唯一引用不被别名。
-    // 实现:扫描根(函数/模块 AST)**单次遍历建索引**(每名字收集 append/escape/写入事实
-    // + 循环区间表),按名裁决 O(该名引用数)——避免"每候选站点全函数走一遍"在模块级
-    // 大 AST 上退化成 O(规模 × 名字数)(曾使 gen0 自编译 1.55s → 3.13s)。
-    _canIpStringAccum(name) {
-        const root = this.ctx._ipScanRoot;
-        if (!root) return false;
-        if (this.ctx._ipExportedNames && this.ctx._ipExportedNames.has(name)) return false;
-        let index = this.ctx._ipIndex;
-        if (!index) index = this.ctx._ipIndex = this._buildIpIndex(root);
-        if (index.paramNames.has(name)) return false;
-        const e = index.per.get(name);
-        if (!e || e.appends.length === 0 || e.nestedRef || e.badWrite) return false;
-        // 活跃区终点:含末次拼接的最外层循环(前序入栈,外先内后 → 首个命中即最外);无循环取末次拼接
-        let lastAppend = e.appends[e.appends.length - 1];
-        let activeEnd = lastAppend;
-        for (let i = 0; i < index.loops.length; i++) {
-            const L = index.loops[i];
-            if (L[0] <= lastAppend && lastAppend <= L[1]) { activeEnd = L[1]; break; }
-        }
-        for (let i = 0; i < e.escapes.length; i++) if (e.escapes[i] <= activeEnd) return false;
-        return true;
-    },
-
-    _buildIpIndex(root) {
-        let idx = 0, fnDepth = 0;
-        const loops = []; // [入序, 出序]
-        const per = new Map(); // name -> { appends: [], escapes: [], badWrite, nestedRef }
-        const paramNames = new Set();
-        const entry = (nm) => {
-            let e = per.get(nm);
-            if (!e) { e = { appends: [], escapes: [], badWrite: false, nestedRef: false }; per.set(nm, e); }
-            return e;
-        };
-        const isStrLit = (n) => n != null && (n.type === "StringLiteral" ||
-            n.type === "TemplateLiteral" || (n.type === "Literal" && typeof n.value === "string"));
-        const isGatedFor = (n, nm) => n != null && n.type === "AssignmentExpression" &&
-            n.left && n.left.type === "Identifier" && n.left.name === nm &&
-            (n.operator === "+=" || (n.operator === "=" && n.right != null &&
-             n.right.type === "BinaryExpression" && n.right.operator === "+" &&
-             n.right.left && n.right.left.type === "Identifier" && n.right.left.name === nm));
-        // 形参子树内全部名字(覆盖解构/默认值/rest)→ 这些名字永不入原地拼接
-        const collectParams = (n) => {
-            if (!n || typeof n !== "object") return;
-            if (Array.isArray(n)) { for (let i = 0; i < n.length; i++) collectParams(n[i]); return; }
-            if (n.type === "Identifier" && n.name) paramNames.add(n.name);
-            for (const k in n) { if (k !== "type") collectParams(n[k]); }
-        };
-        collectParams(root.params || []);
-
-        const walk = (node, parent, grand) => {
-            if (!node || typeof node !== "object") return;
-            if (Array.isArray(node)) { for (let i = 0; i < node.length; i++) walk(node[i], parent, grand); return; }
-            const my = idx++;
-            const t = node.type;
-            if (typeof t === "string" && t.indexOf("Function") >= 0) {
-                fnDepth++;
-                for (const k in node) { if (k !== "type") walk(node[k], node, parent); }
-                fnDepth--;
-                return;
-            }
-            let loopRec = null;
-            if (t === "ForStatement" || t === "ForInStatement" || t === "ForOfStatement" ||
-                t === "WhileStatement" || t === "DoWhileStatement") {
-                loopRec = [my, my];
-                loops.push(loopRec);
-            }
-            if (t === "Identifier" && node.name) {
-                const nm = node.name;
-                if (fnDepth > 0) {
-                    entry(nm).nestedRef = true; // 嵌套函数内引用 → 捕获语义 → 否决
-                } else if (parent && ((parent.type === "VariableDeclarator" && parent.id === node) ||
-                    (parent.type === "FunctionDeclaration" && parent.id === node) ||
-                    (parent.type === "ClassDeclaration" && parent.id === node))) {
-                    // 绑定位置(声明 id),非引用 → 不计
-                } else if (parent && parent.type === "AssignmentExpression" && parent.left === node && isGatedFor(parent, nm)) {
-                    entry(nm).appends.push(my); // 门控拼接的赋值目标
-                } else if (grand && grand.type === "AssignmentExpression" && isGatedFor(grand, nm) &&
-                           grand.right === parent && parent && parent.type === "BinaryExpression" && parent.left === node) {
-                    // 门控拼接 `s = s + E` 的累加读(二元左侧的 s):允许,不计
-                } else {
-                    entry(nm).escapes.push(my); // 其余一切引用 = 潜在别名化
-                }
-            }
-            if (fnDepth === 0) {
-                if (t === "AssignmentExpression" && node.left && node.left.type === "Identifier" && node.left.name) {
-                    const nm = node.left.name;
-                    if (!isGatedFor(node, nm) && !(node.operator === "=" && isStrLit(node.right))) entry(nm).badWrite = true;
-                }
-                if (t === "VariableDeclarator" && node.id && node.id.type === "Identifier" && node.id.name) {
-                    if (node.init && !isStrLit(node.init)) entry(node.id.name).badWrite = true;
-                }
-                if (t === "UpdateExpression" && node.argument && node.argument.type === "Identifier" && node.argument.name) {
-                    entry(node.argument.name).badWrite = true; // s++/s-- → 非串写 → 否决
-                }
-            }
-            for (const k in node) { if (k !== "type") walk(node[k], node, parent); }
-            if (loopRec) loopRec[1] = idx;
-        };
-        walk(root.body, null, null);
-        return { per: per, loops: loops, paramNames: paramNames };
-    },
 };

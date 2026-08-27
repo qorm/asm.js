@@ -1,7 +1,7 @@
 // asm.js 编译器 - 字面量编译
 // 编译各类字面量：数字、字符串、布尔值等
 
-import { VReg } from "../../vm/index.js";
+import { VReg } from "../../vm/registers.js";
 
 // 将 JavaScript number 转换为 IEEE 754 double 的 64 位整数表示。
 // 纯算术实现（不依赖 TypedArray 多视图别名）——自举编译器 gen1 里
@@ -9,7 +9,7 @@ import { VReg } from "../../vm/index.js";
 // 导致原实现读字节全 0 → 数字全编成 0。对规格化 double 本算法精确：
 // 归一化用 *2//2（2 的幂，无精度损失），尾数 = (value-1)*2^52 恰为整数。
 function floatToInt64Bits(value) {
-    if (value !== value) return 0x7ff8000000000000n; // NaN
+    if (value !== value) return 0x7ff0000000000001n; // 与 NaN 标识符同位;勿用 0x7ff8(int0 别名)
     if (value === 0) {
         // 区分 +0 / -0
         return (1 / value === -Infinity) ? 0x8000000000000000n : 0n;
@@ -52,9 +52,8 @@ export function getFloat64Bits(value) {
 
 // 直接从 bits 创建数字字面量（用于常量折叠等优化）
 export function compileNumericLiteralWithBits(value, bits, asm, vm) {
-    const label = asm.addFloat64(value, bits);
-    vm.lea(VReg.RET, label);
-    vm.load(VReg.RET, VReg.RET, 0);
+    // 立即数装入，避免数据池 lea+load/_float_* adrp
+    vm.movImm64(VReg.RET, bits);
 }
 
 // 字面量编译方法混入
@@ -70,9 +69,7 @@ export const LiteralCompiler = {
             this.compileStringValue(value);
         } else if (typeof value === "boolean") {
             // 使用 NaN-boxing 格式的布尔值
-            const label = value ? "_js_true" : "_js_false";
-            this.vm.lea(VReg.RET, label);
-            this.vm.load(VReg.RET, VReg.RET, 0);
+            this.vm.movImm64(VReg.RET, value ? 0x7ff9000000000001n : 0x7ff9000000000000n);
         } else if (value === null) {
             // 使用 NaN-boxing 格式的 null
             this.vm.movImm64(VReg.RET, 0x7ffa000000000000n); // was lea+load _js const
@@ -94,10 +91,7 @@ export const LiteralCompiler = {
     // 编译数字字面量（直接使用 IEEE 754 double 格式）
     // 在 NaN-boxing 系统中，纯 double 值直接作为 64 位值存储
     compileNumericLiteral(value) {
-        const bits = floatToInt64Bits(value);
-        const label = this.asm.addFloat64(value, bits);
-        this.vm.lea(VReg.RET, label);
-        this.vm.load(VReg.RET, VReg.RET, 0);
+        this.vm.movImm64(VReg.RET, floatToInt64Bits(value));
     },
 
     // 编译整数字面量（用于 int 类型上下文，无头部）
@@ -107,10 +101,7 @@ export const LiteralCompiler = {
 
     // 编译原始数字值（不带头部，用于内部优化）
     compileRawNumericLiteral(value) {
-        const bits = floatToInt64Bits(value);
-        const label = this.asm.addFloat64(value, bits);
-        this.vm.lea(VReg.RET, label);
-        this.vm.load(VReg.RET, VReg.RET, 0);
+        this.vm.movImm64(VReg.RET, floatToInt64Bits(value));
     },
 
     // 编译字符串字面量
@@ -121,11 +112,22 @@ export const LiteralCompiler = {
     // 编译字符串值
     compileStringValue(str) {
         const label = this.asm.addString(str);
+        // 数据段是 C 串:_strlen 扫到 NUL 即停。含嵌入 0 字节的字面量
+        // (如 "\u0000")必须拷进带 length 头的堆串,否则 /\x00/.exec("\u0000") 对空输入。
+        // 用 charCodeAt===0 探测,勿写 "\0" 字面量(自举后该针本身会被截成空串)。
+        let hasNul = false;
+        for (let ni = 0; ni < str.length; ni = ni + 1) {
+            if (str.charCodeAt(ni) === 0) { hasNul = true; break; }
+        }
+        if (hasNul) {
+            this.vm.lea(VReg.A0, label);
+            this.vm.movImm(VReg.A1, str.length);
+            this.vm.call("_nstr_to_heap_str");
+            return;
+        }
         this.vm.lea(VReg.RET, label);
-        // 在 NaN-boxing 系统中，数据段字符串指针也需要装箱
-        // TAG_STRING_BASE = 0x7FFC000000000000
-        this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
-        this.vm.or(VReg.RET, VReg.RET, VReg.V1);
+        // [m120] 出线打 STRING_TAG(见 _tag_str_r),免每站 movImm64 大立即数
+        this.vm.call("_tag_str_r");
     },
 
     // 编译模板字符串

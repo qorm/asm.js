@@ -3,10 +3,51 @@
 
 import { TokenType, newToken, lookupIdent } from "./token.js";
 
+// native 下 s[i]/.length 走 UTF-16(每次从串头扫),charCodeAt 才是 O(1) 字节。
+// 字节码压进 Uint8Array(紧凑、填充快);读字符再查 BYTE_CHARS——避免「整文件
+// 单字符字符串数组」的分配/GC 税。
+const BYTE_CHARS = ["\0"];
+for (let _bi = 1; _bi < 256; _bi = _bi + 1) BYTE_CHARS.push(String.fromCharCode(_bi));
+
+// Unicode 空白 UTF-8 前缀(模块级常驻,勿在热路径 fromCharCode)
+const WS_NBSP = String.fromCharCode(0xA0);       // U+00A0 单码元 / C2 A0 第二字节
+const WS_C2 = String.fromCharCode(0xC2);
+const WS_E2 = String.fromCharCode(0xE2);
+const WS_80 = String.fromCharCode(0x80);
+const WS_A8 = String.fromCharCode(0xA8);
+const WS_A9 = String.fromCharCode(0xA9);
+
+function nativeInputLength(input, byteLength) {
+    if (byteLength !== undefined) return byteLength;
+    let n = 0;
+    while (true) {
+        const c = input.charCodeAt(n);
+        if (c !== c) break;
+        n = n + 1;
+    }
+    return n;
+}
+
+function nativeSourceCodes(input, byteLength) {
+    const n = nativeInputLength(input, byteLength);
+    const codes = new Uint8Array(n);
+    for (let i = 0; i < n; i = i + 1) {
+        codes[i] = input.charCodeAt(i) & 255;
+    }
+    return codes;
+}
+
 // 词法分析器类
 export class Lexer {
-    constructor(input) {
+    constructor(input, byteLength) {
         this.input = input;
+        this.codes = null;
+        if (!process.release) {
+            this.codes = nativeSourceCodes(input, byteLength);
+            this.inputLength = this.codes.length;
+        } else {
+            this.inputLength = byteLength === undefined ? input.length : byteLength;
+        }
         this.position = 0;
         this.readPosition = 0;
         this.ch = "";
@@ -28,12 +69,37 @@ export class Lexer {
         }
     }
 
+    _sliceInput(start, end) {
+        const codes = this.codes;
+        if (!codes) return this.input.slice(start, end);
+        if (end <= start) return "";
+        // 短切片(标识符/关键字)直接拼;长字面量再分块,避免二次方爆炸
+        if (end - start <= 64) {
+            let s = "";
+            for (let i = start; i < end; i = i + 1) s = s + BYTE_CHARS[codes[i]];
+            return s;
+        }
+        let out = "";
+        let i = start;
+        while (i < end) {
+            let chunk = "";
+            const lim = (i + 48 < end) ? (i + 48) : end;
+            while (i < lim) {
+                chunk = chunk + BYTE_CHARS[codes[i]];
+                i = i + 1;
+            }
+            out = out + chunk;
+        }
+        return out;
+    }
+
     // 读取下一个字符
     readChar() {
-        if (this.readPosition >= this.input.length) {
+        if (this.readPosition >= this.inputLength) {
             this.ch = "\0";
         } else {
-            this.ch = this.input[this.readPosition];
+            const codes = this.codes;
+            this.ch = codes ? BYTE_CHARS[codes[this.readPosition]] : this.input[this.readPosition];
         }
         this.position = this.readPosition;
         this.readPosition = this.readPosition + 1;
@@ -46,19 +112,21 @@ export class Lexer {
 
     // 查看下一个字符
     peekChar() {
-        if (this.readPosition >= this.input.length) {
+        if (this.readPosition >= this.inputLength) {
             return "\0";
         }
-        return this.input[this.readPosition];
+        const codes = this.codes;
+        return codes ? BYTE_CHARS[codes[this.readPosition]] : this.input[this.readPosition];
     }
 
     // 查看后面第 n 个字符
     peekCharN(n) {
         let pos = this.readPosition + n - 1;
-        if (pos >= this.input.length) {
+        if (pos >= this.inputLength) {
             return "\0";
         }
-        return this.input[pos];
+        const codes = this.codes;
+        return codes ? BYTE_CHARS[codes[pos]] : this.input[pos];
     }
 
     // 把码点编码为 UTF-8 字节串(每字节一个 char),供 \u / \x 转义解码。asm.js 字符串是逐字节
@@ -68,7 +136,8 @@ export class Lexer {
     // 发射器(asm/*.js)逐字节透传,故此处产出的 UTF-8 字节原样进产物,node/g1 一致且正确。
     // cp===0 或 NaN 产空串(A 的 NUL-drop:asm.js C-string 无法承载内嵌 NUL)。
     _cpToUtf8(cp) {
-        if (cp === 0 || cp !== cp) return "";
+        if (cp !== cp) return "";
+        if (cp === 0) return "";
         if (cp < 0x80) return String.fromCharCode(cp);
         if (cp < 0x800) {
             return String.fromCharCode(0xc0 | (cp >> 6)) +
@@ -143,20 +212,29 @@ export class Lexer {
     // 必须用 fromCharCode 产单字节:字面量 "\u00A0"/"\xC2" 经 _cpToUtf8 会变成多字节串,
     // 自托管 eval 路径里 this.ch === "\xC2" 恒假 → NBSP 落成 ILLEGAL。
     _atUnicodeWhitespace() {
-        let bA0 = String.fromCharCode(0xA0);
-        let bC2 = String.fromCharCode(0xC2);
-        let bE2 = String.fromCharCode(0xE2);
-        let b80 = String.fromCharCode(0x80);
-        let bA8 = String.fromCharCode(0xA8);
-        let bA9 = String.fromCharCode(0xA9);
         // 单码元 NBSP(少见于文件源;部分宿主串)
-        if (this.ch === bA0) return 1;
+        if (this.ch === WS_NBSP) return 1;
         // U+00A0 UTF-8: C2 A0
-        if (this.ch === bC2 && this.peekChar() === bA0) return 2;
+        if (this.ch === WS_C2 && this.peekChar() === WS_NBSP) return 2;
         // U+2028/U+2029 UTF-8: E2 80 A8 / E2 80 A9
-        if (this.ch === bE2 && this.peekChar() === b80 &&
-            (this.peekCharN(2) === bA8 || this.peekCharN(2) === bA9)) return 3;
+        if (this.ch === WS_E2 && this.peekChar() === WS_80 &&
+            (this.peekCharN(2) === WS_A8 || this.peekCharN(2) === WS_A9)) return 3;
         return 0;
+    }
+
+    // 把游标同步到字节下标 i(当前字符 = input[i];EOF 时 i>=len)。
+    _seek(i) {
+        const len = this.inputLength;
+        if (i >= len) {
+            this.ch = "\0";
+            this.position = len;
+            this.readPosition = len + 1;
+            return;
+        }
+        const codes = this.codes;
+        this.ch = codes ? BYTE_CHARS[codes[i]] : this.input[i];
+        this.position = i;
+        this.readPosition = i + 1;
     }
 
     // 跳过空白字符
@@ -165,8 +243,52 @@ export class Lexer {
     // 需以字节序列匹配而非单字符比较(单字符仅对 ASCII 空白有效)。
     skipWhitespace() {
         while (true) {
-            // 单字节空白:SP TAB LF CR VT FF
-            if (this.ch === " " || this.ch === "\t" || this.ch === "\n" || this.ch === "\r" ||
+            const codes = this.codes;
+            // native:按 Uint8Array 批量吞 ASCII 空白,免每字节 readChar/串比较
+            if (codes) {
+                let i = this.position;
+                const len = this.inputLength;
+                let line = this.line;
+                let column = this.column;
+                const start = i;
+                while (i < len) {
+                    const c = codes[i];
+                    // SP TAB VT FF
+                    if (c === 32 || c === 9 || c === 11 || c === 12) {
+                        i = i + 1;
+                        column = column + 1;
+                        continue;
+                    }
+                    if (c === 13) { // CR 或 CR LF(一个 LineTerminatorSequence)
+                        i = i + 1;
+                        if (i < len && codes[i] === 10) i = i + 1;
+                        line = line + 1;
+                        column = 0;
+                        continue;
+                    }
+                    if (c === 10) { // LF
+                        i = i + 1;
+                        line = line + 1;
+                        column = 0;
+                        continue;
+                    }
+                    break;
+                }
+                if (i !== start) {
+                    this.line = line;
+                    this.column = column;
+                    this._seek(i);
+                }
+            } else if (this.ch === "\r") {
+                this.readChar();
+                if (this.ch === "\n") {
+                    this.readChar();
+                } else {
+                    this.line = this.line + 1;
+                    this.column = 0;
+                }
+                continue;
+            } else if (this.ch === " " || this.ch === "\t" || this.ch === "\n" ||
                 this.ch === "\v" || this.ch === "\f") {
                 this.readChar();
                 continue;
@@ -191,8 +313,22 @@ export class Lexer {
             if (this.ch === "/") {
                 if (this.peekChar() === "/") {
                     // 单行注释
-                    while (this.ch !== "\n" && this.ch !== "\0") {
-                        this.readChar();
+                    // native:批量扫到行末,免逐字节 readChar
+                    const codes = this.codes;
+                    if (codes) {
+                        let i = this.position;
+                        const len = this.inputLength;
+                        let column = this.column;
+                        while (i < len && codes[i] !== 10) {
+                            i = i + 1;
+                            column = column + 1;
+                        }
+                        this.column = column;
+                        this._seek(i);
+                    } else {
+                        while (this.ch !== "\n" && this.ch !== "\0") {
+                            this.readChar();
+                        }
                     }
                     this.skipWhitespace();
                 } else if (this.peekChar() === "*") {
@@ -218,7 +354,16 @@ export class Lexer {
 
     // 标识符续读:字母/数字,但不得吞掉 Unicode 空白 UTF-8 前缀(否则 true+C2A0 变成 IDENT "trueÂ")
     _isIdentContinue() {
-        if (this._atUnicodeWhitespace() > 0) return false;
+        // ASCII 快路(标识符字符压倒多数):免 _atUnicodeWhitespace / isLetter 分派
+        const code = this.ch.charCodeAt(0);
+        if (code < 128) {
+            return (code >= 97 && code <= 122) || (code >= 65 && code <= 90) ||
+                code === 95 || code === 36 ||
+                (code >= 48 && code <= 57);
+        }
+        // 只拦多字节空白(NBSP=C2 A0 / LS/PS)。单字节 0xA0 是合法 UTF-8 续字节
+        // (ಠ = E0 B2 A0),不得当空白截断标识符。
+        if (this._atUnicodeWhitespace() >= 2) return false;
         return this.isLetter(this.ch) || this.isDigit(this.ch);
     }
 
@@ -227,19 +372,59 @@ export class Lexer {
     readIdentifier() {
         let startPos = this.position;
         this._identEscaped = false;
-        // 快路：无转义直接 slice（绝大多数标识符；自编译词法零额外开销）
-        while (this._isIdentContinue()) {
-            this.readChar();
-        }
-        if (this.ch !== "\\") {
-            return this.input.slice(startPos, this.position);
+        const codes = this.codes;
+        // native ASCII 批量续读:标识符几乎全 ASCII,免逐字节 _isIdentContinue/readChar
+        if (codes) {
+            let i = this.position;
+            const len = this.inputLength;
+            let column = this.column;
+            while (i < len) {
+                const c = codes[i];
+                if (c < 128) {
+                    if ((c >= 97 && c <= 122) || (c >= 65 && c <= 90) ||
+                        c === 95 || c === 36 ||
+                        (c >= 48 && c <= 57)) {
+                        i = i + 1;
+                        column = column + 1;
+                        continue;
+                    }
+                    break;
+                }
+                // 非 ASCII:同步后走慢路(Unicode 字母 / 空白守卫)
+                this.column = column;
+                this._seek(i);
+                while (this._isIdentContinue()) {
+                    this.readChar();
+                }
+                if (this.ch !== "\\") {
+                    return this._sliceInput(startPos, this.position);
+                }
+                // 落入下方转义慢路(startPos 已含 ASCII 前缀)
+                i = -1;
+                break;
+            }
+            if (i >= 0) {
+                this.column = column;
+                this._seek(i);
+                if (this.ch !== "\\") {
+                    return this._sliceInput(startPos, this.position);
+                }
+            }
+        } else {
+            // 快路：无转义直接 slice（绝大多数标识符；自编译词法零额外开销）
+            while (this._isIdentContinue()) {
+                this.readChar();
+            }
+            if (this.ch !== "\\") {
+                return this._sliceInput(startPos, this.position);
+            }
         }
         // 慢路：含 \u 转义 → 在已读片段后解码续接（\x 在标识符里非法，不处理，留给下轮 ILLEGAL）。
         // 解码后经 lookupIdent 照常判关键字；ES 规定转义拼成的 ReservedWord/关键字非法
         // (`\u0061sync function f(){}` 应为 SyntaxError)——由 nextToken 依 _identEscaped
         // 标志把「带转义且解码成关键字」的 token 改判 ILLEGAL。
         this._identEscaped = true;
-        let result = this.input.slice(startPos, this.position);
+        let result = this._sliceInput(startPos, this.position);
         while (this.ch === "\\" && this.peekChar() === "u") {
             this.readChar();                 // 消费 '\'，this.ch = 'u'
             let _esc = this._peekHexEscape();
@@ -324,7 +509,9 @@ export class Lexer {
         }
 
         // 移除数字分隔符后返回
-        return this.input.slice(startPos, this.position).split("_").join("");
+        const rawNum = this._sliceInput(startPos, this.position);
+        if (rawNum.indexOf("_") === -1) return rawNum;
+        return rawNum.split("_").join("");
     }
 
     // 读取字符串
@@ -332,7 +519,7 @@ export class Lexer {
         let result = "";
         this.readChar(); // 跳过开始引号
 
-        while (this.ch !== quote && !(this.position >= this.input.length)) {
+        while (this.ch !== quote && !(this.position >= this.inputLength)) {
             if (this.ch === "\\") {
                 this.readChar();
                 if (this.ch === "n") {
@@ -348,12 +535,10 @@ export class Lexer {
                 } else if (this.ch === "'") {
                     result = result + "'";
                 } else if (this.ch === "0") {
-                    // [layout-determinism] \0 转义产出空串,不产 NUL 字符。asm.js 的字符串是
-                    // C-string(NUL 结尾)语义,拼接 NUL 会截断整串 → node(保留 NUL)与 asm.js
-                    // (截断)对含 \0 的串字面量产不同字节 → 自举 g1≠g2 残差(雷区最后根因)。
-                    // 两端一致丢弃 NUL(asm.js 本就无法承载)→ 确定性。需要真 NUL 字节的二进制
-                    // 写入(ELF/Mach-O 串表)改用字节数组构建,不依赖串内 NUL。
-                    result = result + "";
+                    // 与 \x00/\u0000 一样走 _cpToUtf8(0)→空串。asm.js 字符串是
+                    // C-string:fromCharCode(0) 在 node 能做成 length-1 的 NUL 键,
+                    // 自举运行时拼接即截断成 "" → intern 池差 2 字节 → gen1≠gen2。
+                    result = result + this._cpToUtf8(0);
                 } else if (this.ch === "b") {
                     result = result + String.fromCharCode(8);
                 } else if (this.ch === "f") {
@@ -424,8 +609,8 @@ export class Lexer {
                 } else if (this.ch === "$") {
                     result = result + "$";
                 } else if (this.ch === "0") {
-                    // \0 null character escape (cook = NUL, raw = "\\0")
-                    result = result + "\0";
+                    // \0：cooked 与 \x00 相同丢弃 NUL(见 readString);raw 仍保留 \\0。
+                    result = result + this._cpToUtf8(0);
                 } else if (this.ch === "\n" || this.ch === "\u2028" || this.ch === "\u2029") {
                     // 模板里的 LineContinuation:cooked 不产字符(raw 已原样保留)
                     result = result + "";
@@ -499,8 +684,9 @@ export class Lexer {
     // 判断是否为字母 (ASCII字母或非ASCII Unicode字母)
     isLetter(ch) {
         let code = ch.charCodeAt(0);
-        // 单码元空白不得进标识符;UTF-8 空白前缀由 _isIdentContinue/_atUnicodeWhitespace 拦截
-        if (code === 0xA0 || code === 0xFEFF) return false; // NBSP / BOM
+        // 单码元空白不得进标识符。0xA0 是 UTF-8 续字节常见值,不在这里拒;
+        // 真 NBSP 由 _isIdentContinue 拦 C2 A0。
+        if (code === 0xFEFF) return false; // BOM
         if (code === 0x2028 || code === 0x2029) return false; // LS / PS
         // ASCII字母: a-z, A-Z
         // 下划线和美元符: _, $
@@ -516,10 +702,12 @@ export class Lexer {
     }
 
     _savePosition() {
-        return { pos: this.position, rpos: this.readPosition, ch: this.ch, line: this.line, column: this.column };
+        return { pos: this.position, rpos: this.readPosition, ch: this.ch, line: this.line, column: this.column,
+                 lastTokenType: this.lastTokenType };
     }
     _restorePosition(s) {
         this.position = s.pos; this.readPosition = s.rpos; this.ch = s.ch; this.line = s.line; this.column = s.column;
+        this.lastTokenType = s.lastTokenType;
     }
     // 判断是否为十六进制数字
     isHexDigit(ch) {
@@ -540,6 +728,7 @@ export class Lexer {
                t === tt.RETURN || t === tt.YIELD || t === tt.IF || t === tt.ELSE || t === tt.DO ||
                t === tt.WHILE || t === tt.FOR || t === tt.IN ||
                t === tt.TYPEOF || t === tt.VOID || t === tt.THROW || t === tt.DELETE ||
+               t === tt.NEW || t === tt.INSTANCEOF ||
                t === tt.CASE || t === tt.DEFAULT || t === tt.STRICT_EQ || t === tt.STRICT_NOT_EQ ||
                t === tt.EQ || t === tt.NOT_EQ || t === tt.LT || t === tt.GT ||
                t === tt.LTE || t === tt.GTE || t === tt.BITAND || t === tt.BITOR ||
@@ -556,14 +745,30 @@ export class Lexer {
         // EOF 哨兵是 "\0"(非 ""）——用 "" 会漏判文件尾,`/abc`（无闭合 /）时
         // readChar 恒返 "\0" 致 while 死循环(100% CPU DoS)。与 readString/readTemplate
         // 的 "\0" 守卫取齐:遇 EOF/换行退出,ch 非 "/" → 落到下方 ILLEGAL(未闭合正则)。
-        while (this.ch !== "/" && this.ch !== "\0" && this.ch !== "\n") {
+        // 字符类内的 / 是类字符,不是结束符(/[/]/ 合法)。
+        let inClass = false;
+        while (this.ch !== "\0" && this.ch !== "\n") {
             if (this.ch === "\\") {
                 result += this.ch;
                 this.readChar();
                 result += this.ch;
-            } else {
-                result += this.ch;
+                this.readChar();
+                continue;
             }
+            if (this.ch === "[" && !inClass) {
+                inClass = true;
+                result += this.ch;
+                this.readChar();
+                continue;
+            }
+            if (this.ch === "]" && inClass) {
+                inClass = false;
+                result += this.ch;
+                this.readChar();
+                continue;
+            }
+            if (this.ch === "/" && !inClass) break;
+            result += this.ch;
             this.readChar();
         }
 

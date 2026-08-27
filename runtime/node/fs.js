@@ -7,6 +7,7 @@ import { getSyscall } from "./constants.js";
 const _proc = __get_process();
 const platform = (_proc && _proc.platform) || "macos";
 const arch = (_proc && _proc.arch) || "arm64";
+export let __lastReadByteLength = 0;
 
 // File flags —— 按平台取真值:macOS O_CREAT=0x200/O_TRUNC=0x400/O_APPEND=0x8,
 // Linux O_CREAT=0x40/O_TRUNC=0x200/O_APPEND=0x400。此前统一用 Linux 数值:
@@ -125,17 +126,19 @@ class fs {
     }
 
     static readFileSync(p, enc) {
+        __lastReadByteLength = 0;
         if (platform === "win32") {
             const pathBuf = __alloc(p.length + 10);
             writeCString(p, pathBuf);
             const fd = __winfs_open(pathBuf, 0);
             if (fd < 0) return "";
-            const CHUNK = 65536;
+            const CHUNK = 1048576;
             const buf = __alloc(CHUNK + 1);
             let result = "";
             while (true) {
                 const n = __winfs_read(fd, buf, CHUNK);
                 if (n <= 0) break;
+                __lastReadByteLength += n;
                 __setChar(buf + n, 0);
                 result = result + __cstr_to_str(buf);
                 if (n < CHUNK) break;
@@ -163,12 +166,13 @@ class fs {
         // 分块读，支持任意大小文件（原固定 65536 buf + 无 null 终止 → >64KB 文件如
         // compiler/index.js(80KB) 被截断、且 cstringToJS 读越界 garbage/O(n²) 崩）。
         // 每块 null 终止后用 __cstr_to_str（O(n) 一次性建串）转换并拼接。
-        const CHUNK = 65536;
+        const CHUNK = 1048576;
         const buf = __alloc(CHUNK + 1);
         let result = "";
         while (true) {
             const n = __syscall(scRead, fd, buf, CHUNK);
             if (n <= 0) break;
+            __lastReadByteLength += n;
             __setChar(buf + n, 0); // 在实际读到的字节数处补 null
             result = result + __cstr_to_str(buf);
             if (n < CHUNK) break; // 短读 = EOF

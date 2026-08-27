@@ -1,5 +1,5 @@
-// ARM64 汇编器
-// 为 Apple Silicon 和其他 ARM64 平台生成机器码
+import { ByteBuffer } from "./byte-buffer.js";
+import { FixupBuffer, FIXUP_TYPE } from "./fixup-buffer.js";
 
 // ARM64 寄存器
 export let Reg = {
@@ -38,28 +38,39 @@ export let Reg = {
     XZR: 31, // Zero Register (same encoding, context dependent)
 };
 
+// scratchReg 候选:模块级常量表,避免每次调用分配数组。
+const SCRATCH_CANDS = [Reg.X16, Reg.X17, Reg.X9, Reg.X10, Reg.X11, Reg.X12];
 
-// 字符串方法都是代码段函数（label 形如 `_str_X` 或 `_str_X_...`），不是数据段字符串。
-// 该表在 fixupAll 每个 fixup 都要查，必须提到模块级只分配一次（曾在循环内重建，
-// 百万次数组分配 + 每次 27 组 `prefix + "_"` 拼接，是 fixupAll 的主要开销）。
-const STRING_METHOD_PREFIXES = [
-    "_str_toUpperCase", "_str_toLowerCase", "_str_charAt", "_str_charCodeAt",
-    "_str_trim", "_str_slice", "_str_indexOf", "_str_length", "_str_includes",
-    "_str_startsWith", "_str_endsWith", "_str_lastIndexOf", "_str_at",
-    "_str_repeat", "_str_concat", "_str_trimStart", "_str_trimEnd",
-    "_str_trimLeft", "_str_trimRight", "_str_padStart", "_str_padEnd",
-    "_str_split", "_str_replace", "_str_replaceAll", "_str_search", "_str_match",
-    "_str_matchAll", "_str_localCompare"
-];
+const FALLBACK_DATA_LABELS = new Set([
+    "_heap_base", "_heap_ptr", "_heap_initialized", "_heap_meta", "_print_buf",
+    "_exception_sp", "_exception_stack", "_task_queue_head", "_task_queue_tail",
+    "_task_queue", "_newline_char", "_str_uncaught", "_str_object", "_str_undefined",
+    "_str_null", "_str_true", "_str_false", "_js_true", "_js_false", "_js_null",
+    "_js_undefined", "_str_function", "_str_lbracket", "_str_rbracket", "_str_comma",
+    "_str_array", "_str_number", "_str_string", "_str_boolean", "_str_function_type",
+    "_str_object_type", "_random_seed"
+]);
+
+function isFallbackDataPrefix(labelName) {
+    if (!labelName || labelName.length < 6 || labelName.charCodeAt(0) !== 95) return false;
+    const c1 = labelName.charCodeAt(1);
+    if (c1 === 102) return labelName.startsWith("_float_");
+    if (c1 === 103) return labelName.startsWith("_global_");
+    if (c1 === 109) return labelName.startsWith("_main_captured_");
+    if (c1 === 100) return labelName.startsWith("_data_");
+    return false;
+}
 
 export class ARM64Assembler {
     constructor() {
-        this.code = [];
-        this.data = [];
+        this.code = new ByteBuffer();
+        this._byteCode = true;
+        this.data = new ByteBuffer();
+        this._byteData = true;
         this.strings = [];
         this.labels = new Map();
         this.labelAliases = new Map();
-        this.pendingFixups = [];
+        this.pendingFixups = new FixupBuffer();
         this.codeVAddr = 0;
         this.dataVAddr = 0;
         this.iatVAddr = 0; // Windows IAT 虚拟地址
@@ -69,8 +80,13 @@ export class ARM64Assembler {
         this.stubOffsets = {}; // 外部符号的 stub 偏移
         this.gotBaseOffset = 0; // GOT 在数据段的起始偏移
         this.undefinedSymbols = {}; // 未定义符号（静态库中的符号）
+        this.undefinedSymbolSet = new Set();
         this.undefinedSymbolList = []; // 未定义符号列表
         this.branchRelocations = []; // 需要重定位的分支指令
+        this._fwdB = null; // 前向 B:label → [codeOffset…]，定义时即时回填
+        this._stringInternMap = new Map(); // str -> labelIndex
+        this._stringLabels = []; // labelIndex -> "_str_N"
+        this.dataLabels = [];
     }
 
     // 注册外部符号，返回符号的槽索引
@@ -92,6 +108,7 @@ export class ARM64Assembler {
             return;
         }
         this.undefinedSymbols[fullName] = true;
+        this.undefinedSymbolSet.add(fullName);
         this.undefinedSymbolList.push(fullName);
     }
 
@@ -99,7 +116,7 @@ export class ARM64Assembler {
     // 用 truthy 而非 ===true：自举产物里 obj[missing] 返回裸 0 且 `x===true` 布尔严格
     // 比较不可靠，会漏判外部符号（如 pow）→ 当成 offset 0 代码 label → bl 跳入口崩。
     isUndefinedSymbol(name) {
-        return !!this.undefinedSymbols[name];
+        return this.undefinedSymbolSet.has(name);
     }
 
     // 获取分支重定位列表（用于生成 .o 文件）
@@ -122,19 +139,34 @@ export class ARM64Assembler {
     }
 
     emit32(word) {
-        // 单次 push 四参追加(1 次调用)代替四次单参 push——自编译 ~1200 万次调用降为 ~300 万。
-        this.code.push(word & 255, (word >> 8) & 255, (word >> 16) & 255, (word >> 24) & 255);
+        this.code.emit32(word);
+    }
+
+    _codeGet(offset) {
+        return this._byteCode ? this.code.get(offset) : this.code[offset];
+    }
+
+    _codeWrite32(offset, word) {
+        if (this._byteCode) {
+            this.code.write32(offset, word);
+            return;
+        }
+        this.code[offset] = word & 255;
+        this.code[offset + 1] = (word >> 8) & 255;
+        this.code[offset + 2] = (word >> 16) & 255;
+        this.code[offset + 3] = (word >> 24) & 255;
     }
 
     currentOffset() {
         return this.code.length;
     }
 
-    scratchReg(...avoid) {
-        for (const candidate of [Reg.X16, Reg.X17, Reg.X9, Reg.X10, Reg.X11, Reg.X12]) {
-            if (!avoid.includes(candidate)) {
-                return candidate;
-            }
+    scratchReg(a0, a1, a2, a3) {
+        // 固定最多 4 个避开寄存器,勿 rest(...avoid) 每次分配数组。
+        for (let i = 0; i < SCRATCH_CANDS.length; i++) {
+            const c = SCRATCH_CANDS[i];
+            if (c === a0 || c === a1 || c === a2 || c === a3) continue;
+            return c;
         }
         return Reg.X15;
     }
@@ -142,22 +174,56 @@ export class ARM64Assembler {
     label(name) {
         // 如果标签以 _ 开头，说明是全局标签，不加前缀
         let fullName = name;
-        if (name.charAt(0) !== "_" && this.labelPrefix !== "") {
+        if (name.charCodeAt(0) !== 95 && this.labelPrefix !== "") {
             // 前缀通常为空:空判前置,避免每标签一次字符串拼接(自编译 ~26 万标签)
             fullName = this.labelPrefix + name;
         }
-        this.labels.set(fullName, this.code.length);
+        const at = this.code.length;
+        this.labels.set(fullName, at);
+        // 回填此前对该标签的前向 B(免入 fixup 队列)
+        const fwd = this._fwdB;
+        if (fwd) {
+            const list = fwd.get(fullName);
+            if (list) {
+                for (let i = 0; i < list.length; i++) {
+                    const offset = list[i];
+                    const imm26 = ((at - offset) / 4) & 67108863;
+                    this._codeWrite32(offset, 335544320 | imm26);
+                }
+                fwd.delete(fullName);
+            }
+        }
     }
 
     resolveLabel(name) {
+        const aliases = this.labelAliases;
+        if (aliases.size === 0) return name;
         let resolved = name;
         let maxIterations = 10;
         let iterations = 0;
-        while (this.labelAliases.get(resolved) && iterations < maxIterations) {
-            resolved = this.labelAliases.get(resolved);
+        let next = aliases.get(resolved);
+        while (next && iterations < maxIterations) {
+            resolved = next;
             iterations = iterations + 1;
+            next = aliases.get(resolved);
         }
         return resolved;
+    }
+
+    // 热路径:绝大多数标签不是 runtime 串别名。别名仅来自 registerRuntimeString,
+    // 键恒 `_str_…` → 非此前缀直接返回,免 Map.get(自编译上百万次 b/bl/lea)。
+    _resolveLabelFast(name) {
+        const aliases = this.labelAliases;
+        if (aliases.size === 0) return name;
+        if (name.length < 5 ||
+            name.charCodeAt(0) !== 95 || name.charCodeAt(1) !== 115 ||
+            name.charCodeAt(2) !== 116 || name.charCodeAt(3) !== 114 ||
+            name.charCodeAt(4) !== 95) {
+            return name;
+        }
+        const hit = aliases.get(name);
+        if (hit === undefined) return name;
+        return this.resolveLabel(name);
     }
 
     // ==================== 数据移动指令 ====================
@@ -203,35 +269,29 @@ export class ARM64Assembler {
     movImm64(rd, imm) {
         // 支持 BigInt 和普通 Number
         if (typeof imm === "bigint") {
-            // BigInt 版本
-            const imm16 = Number(imm & 0xffffn);
-            const word = 3531603968 | (imm16 << 5) | rd; // 0xD2800000 MOVZ
-            this.emit32(word);
-
-            const high16 = Number((imm >> 16n) & 0xffffn);
-            if (high16 !== 0) {
-                const word2 = 4070572032 | (high16 << 5) | rd; // 0xF2A00000 MOVK lsl #16
-                this.emit32(word2);
+            // 按 16-bit 段：仅一段非零 → 单条 MOVZ（hw=0..3 → LSL 0/16/32/48）；
+            // 多段 → 最低非零段 MOVZ，其余 MOVK。MOVZ 已清零整寄存器，勿再发清零 MOVK。
+            const c0 = Number(imm & 0xffffn);
+            const c1 = Number((imm >> 16n) & 0xffffn);
+            const c2 = Number((imm >> 32n) & 0xffffn);
+            const c3 = Number((imm >> 48n) & 0xffffn);
+            let first = -1;
+            if (c0 !== 0) first = 0;
+            else if (c1 !== 0) first = 1;
+            else if (c2 !== 0) first = 2;
+            else if (c3 !== 0) first = 3;
+            if (first < 0) {
+                this.emit32(3531603968 | rd); // MOVZ rd, #0
+                return;
             }
-
-            const high32 = Number((imm >> 32n) & 0xffffn);
-            if (high32 !== 0) {
-                const word3 = 4072669184 | (high32 << 5) | rd; // 0xF2C00000 MOVK lsl #32
-                this.emit32(word3);
-            }
-
-            const high48 = Number((imm >> 48n) & 0xffffn);
-            if (high48 !== 0) {
-                // Emit MOVK with lsl #48 for non-zero upper 16 bits
-                const word4 = 4074766336 | (high48 << 5) | rd; // 0xF2E00000 MOVK lsl #48
-                this.emit32(word4);
-            } else {
-                // For 48-bit values where upper 16 bits are 0, we need to emit a MOVK that clears bits[63:48]
-                // Using MOVZ would CLEAR bits[0:47] which is wrong!
-                // MOVK only modifies its 16-bit field, preserving all other bits
-                // To set bits 48-63 to 0x0000, we use MOVK with immediate 0
-                const word4 = 4074766336 | rd; // 0xF2E00000 MOVK lsl #48 with imm=0
-                this.emit32(word4);
+            // 免每调用分配 chunks 数组(自编译大量 tagged 常量 movImm64)
+            const firstChunk = first === 0 ? c0 : (first === 1 ? c1 : (first === 2 ? c2 : c3));
+            this.emit32(3531603968 | (first << 21) | (firstChunk << 5) | rd);
+            for (let hw = first + 1; hw < 4; hw++) {
+                const c = hw === 1 ? c1 : (hw === 2 ? c2 : c3);
+                if (c !== 0) {
+                    this.emit32(4068474880 | (hw << 21) | (c << 5) | rd);
+                }
             }
         } else {
             this.movImm(rd, imm);
@@ -835,10 +895,28 @@ export class ARM64Assembler {
 
     b(labelName) {
         let fullName = labelName;
-        if (labelName.charAt(0) !== "_") {
+        // charCodeAt(0)===95 → '_'；免造临时串
+        if (labelName.charCodeAt(0) !== 95) {
             fullName = this.labelPrefix + labelName;
         }
-        this.pendingFixups.push({ type: "b", offset: this.code.length, label: fullName });
+        fullName = this._resolveLabelFast(fullName);
+        const offset = this.code.length;
+        // 后向/已定义标签:相对位移与 VAddr 无关,即时编码免入 fixup 队列
+        // (自编译 ~200 万条 bl 中绝大部分目标已在 labels 中)。
+        const labelOffset = this.labels.get(fullName);
+        if (labelOffset !== undefined) {
+            const imm26 = ((labelOffset - offset) / 4) & 67108863;
+            this.emit32(335544320 | imm26); // 0x14000000 | imm26
+            return;
+        }
+        // 前向 B:记入 _fwdB,等 label() 回填;未定义的在 fixupAll 开头转入 pendingFixups
+        if (!this._fwdB) this._fwdB = new Map();
+        let list = this._fwdB.get(fullName);
+        if (!list) {
+            list = [];
+            this._fwdB.set(fullName, list);
+        }
+        list.push(offset);
         this.emit32(335544320); // 0x14000000
     }
 
@@ -858,10 +936,18 @@ export class ARM64Assembler {
             throw new Error(`bl: labelName must be a string, got ${typeof labelName}: ${labelName}`);
         }
         let fullName = labelName;
-        if (labelName.charAt(0) !== "_") {
+        if (labelName.charCodeAt(0) !== 95) {
             fullName = this.labelPrefix + labelName;
         }
-        this.pendingFixups.push({ type: "bl", offset: this.code.length, label: fullName });
+        fullName = this._resolveLabelFast(fullName);
+        const offset = this.code.length;
+        const labelOffset = this.labels.get(fullName);
+        if (labelOffset !== undefined) {
+            const imm26 = ((labelOffset - offset) / 4) & 67108863;
+            this.emit32(2483027968 | imm26); // 0x94000000 | imm26
+            return;
+        }
+        this.pendingFixups.pushRaw(FIXUP_TYPE.bl, offset, fullName);
         this.emit32(2483027968); // 0x94000000
     }
 
@@ -936,10 +1022,22 @@ export class ARM64Assembler {
     // CBZ Xt, label
     cbz(rt, labelName) {
         let fullName = labelName;
-        if (labelName.charAt(0) !== "_") {
+        if (labelName.charCodeAt(0) !== 95) {
             fullName = this.labelPrefix + labelName;
         }
-        this.pendingFixups.push({ type: "cbz", offset: this.code.length, label: fullName });
+        if (this.labelAliases.size !== 0) {
+            fullName = this._resolveLabelFast(fullName);
+        }
+        const offset = this.code.length;
+        const labelOffset = this.labels.get(fullName);
+        if (labelOffset !== undefined) {
+            const delta = (labelOffset - offset) / 4;
+            if (delta >= -262144 && delta <= 262143) {
+                this.emit32(0xb4000000 | ((delta & 524287) << 5) | rt);
+                return;
+            }
+        }
+        this.pendingFixups.pushRaw(FIXUP_TYPE.cbz, offset, fullName);
         // CBZ X: 1011010 0 imm19 Rt = 0xB4000000
         this.emit32(0xb4000000 | rt);
     }
@@ -948,10 +1046,22 @@ export class ARM64Assembler {
     // CBNZ Xt, label
     cbnz(rt, labelName) {
         let fullName = labelName;
-        if (labelName.charAt(0) !== "_") {
+        if (labelName.charCodeAt(0) !== 95) {
             fullName = this.labelPrefix + labelName;
         }
-        this.pendingFixups.push({ type: "cbnz", offset: this.code.length, label: fullName });
+        if (this.labelAliases.size !== 0) {
+            fullName = this._resolveLabelFast(fullName);
+        }
+        const offset = this.code.length;
+        const labelOffset = this.labels.get(fullName);
+        if (labelOffset !== undefined) {
+            const delta = (labelOffset - offset) / 4;
+            if (delta >= -262144 && delta <= 262143) {
+                this.emit32(0xb5000000 | ((delta & 524287) << 5) | rt);
+                return;
+            }
+        }
+        this.pendingFixups.pushRaw(FIXUP_TYPE.cbnz, offset, fullName);
         // CBNZ X: 1011010 1 imm19 Rt = 0xB5000000
         this.emit32(0xb5000000 | rt);
     }
@@ -1034,11 +1144,7 @@ export class ARM64Assembler {
     // slotIndex: IAT 槽索引 (0=VirtualAlloc, 1=GetStdHandle, 2=WriteConsoleA, 3=ExitProcess)
     callIAT(slotIndex) {
         // 生成 ADRP + LDR + BLR 序列
-        this.pendingFixups.push({
-            type: "iat_stub",
-            offset: this.code.length,
-            slotIndex: slotIndex,
-        });
+        this.pendingFixups.pushRaw(FIXUP_TYPE.iat_stub, this.code.length, undefined, { slotIndex: slotIndex });
         // ADRP X16, <iat_page> - 占位符
         this.emit32(2415919120); // 0x90000010
         // LDR X16, [X16, #offset] - 占位符
@@ -1163,6 +1269,28 @@ export class ARM64Assembler {
         this.emit32(word);
     }
 
+    // STR Wt / LDR Wt (4 字节)。backend load32/store32 调用。
+    // 对齐正偏移走 unsigned scaled;[-256,255] 未对齐/负偏移走 STUR/LDUR。
+    strw(rt, rn, offset) {
+        if (offset >= 0 && (offset & 3) === 0 && offset < 16384) {
+            const imm12 = (offset >> 2) & 4095;
+            this.emit32((0xB9000000 | (imm12 << 10) | (rn << 5) | rt) >>> 0);
+            return;
+        }
+        const imm9 = offset & 511;
+        this.emit32((0xB8000000 | (imm9 << 12) | (rn << 5) | rt) >>> 0);
+    }
+
+    ldrw(rt, rn, offset) {
+        if (offset >= 0 && (offset & 3) === 0 && offset < 16384) {
+            const imm12 = (offset >> 2) & 4095;
+            this.emit32((0xB9400000 | (imm12 << 10) | (rn << 5) | rt) >>> 0);
+            return;
+        }
+        const imm9 = offset & 511;
+        this.emit32((0xB8400000 | (imm9 << 12) | (rn << 5) | rt) >>> 0);
+    }
+
     // LDURB (load byte with unscaled offset)
     ldurb(rt, rn, offset) {
         let imm9 = offset & 511;
@@ -1260,19 +1388,19 @@ export class ARM64Assembler {
 
     adr(rd, labelName) {
         let fullName = labelName;
-        if (labelName.charAt(0) !== "_") {
+        if (labelName.charCodeAt(0) !== 95) {
             fullName = this.labelPrefix + labelName;
         }
-        this.pendingFixups.push({ type: "adr", offset: this.code.length, label: fullName });
+        this.pendingFixups.pushRaw(FIXUP_TYPE.adr, this.code.length, fullName);
         this.emit32(0x10000000 | rd); // ADR opcode
     }
 
     adrp(rd, labelName) {
         let fullName = labelName;
-        if (labelName.charAt(0) !== "_") {
+        if (labelName.charCodeAt(0) !== 95) {
             fullName = this.labelPrefix + labelName;
         }
-        this.pendingFixups.push({ type: "adrp", offset: this.code.length, label: fullName });
+        this.pendingFixups.pushRaw(FIXUP_TYPE.adrp, this.code.length, fullName);
         this.emit32(2415919104 | rd); // 0x90000000
     }
 
@@ -1281,13 +1409,11 @@ export class ARM64Assembler {
         // ADRP: Xd = page of label
         // ADD: Xd = Xd + offset within page
         let fullName = labelName;
-        if (labelName.charAt(0) !== "_") {
+        if (labelName.charCodeAt(0) !== 95) {
             fullName = this.labelPrefix + labelName;
         }
-        // Generate ADRP fixup (2 instructions: adrp + add)
-        this.pendingFixups.push({ type: "adrp", offset: this.code.length, label: fullName, rd: rd });
+        this.pendingFixups.pushRaw(FIXUP_TYPE.adrp, this.code.length, fullName, rd);
         this.emit32(2415919104 | rd); // 0x90000000 | rd (ADRP)
-        // ADD Xd, Xd, #0 (offset will be fixed up)
         this.emit32(0x91000000 | (rd << 5) | rd); // ADD Xd, Xd, #0
     }
 
@@ -1312,9 +1438,6 @@ export class ARM64Assembler {
 
     // ==================== 数据段操作 ====================
 
-    // 字符串去重表
-    _stringInternMap = new Map(); // str -> labelIndex
-
     // 注册运行时字符串，使其与 addString 共享数据
     // runtimeLabel: 运行时使用的标签名（如 "_str_object_type"）
     // value: 字符串值（如 "object"）
@@ -1322,7 +1445,7 @@ export class ARM64Assembler {
         // 单次查找(has+get 两次全串哈希→一次;驻留热路径)
         let labelIndex = this._stringInternMap.get(value);
         if (labelIndex !== undefined) {
-            let actualLabel = "_str_" + labelIndex;
+            let actualLabel = this._stringLabels[labelIndex];
             // 创建别名：runtimeLabel -> actualLabel
             this.labelAliases.set(runtimeLabel, actualLabel);
             return;
@@ -1331,6 +1454,7 @@ export class ARM64Assembler {
         labelIndex = this.strings.length;
         let actualLabel = "_str_" + labelIndex;
         this.strings.push(value);
+        this._stringLabels.push(actualLabel);
         this._stringInternMap.set(value, labelIndex);
         // 创建别名
         this.labelAliases.set(runtimeLabel, actualLabel);
@@ -1340,20 +1464,22 @@ export class ARM64Assembler {
         // 单次查找(has+get 两次全串哈希→一次;驻留热路径)
         let labelIndex = this._stringInternMap.get(str);
         if (labelIndex !== undefined) {
-            return "_str_" + labelIndex;
+            return this._stringLabels[labelIndex];
         }
         // 新字符串，添加到列表
         labelIndex = this.strings.length;
         let labelName = "_str_" + labelIndex;
         this.strings.push(str);
+        this._stringLabels.push(labelName);
         this._stringInternMap.set(str, labelIndex);
         return labelName;
     }
 
     // 添加数据标签
     addDataLabel(name) {
-        // 标签将在 finalize 时设置为正确的偏移
         this.dataLabels = this.dataLabels || [];
+        this._dataLabelNameSet = this._dataLabelNameSet || new Set();
+        this._dataLabelNameSet.add(name);
         this.dataLabels.push({ name: name, offset: -1 });
     }
 
@@ -1385,7 +1511,26 @@ export class ARM64Assembler {
                 lastLabel.offset = this.data.length;
             }
         }
-        // 写入 8 字节（小端序），支持 BigInt
+        if (typeof value === "bigint") {
+            let val = value;
+            for (let i = 0; i < 8; i++) {
+                this.data.push(Number(val & 0xffn));
+                val = val >> 8n;
+            }
+            return;
+        }
+        if (value >= 0 && value <= 0xFFFFFFFF) {
+            const lo = value >>> 0;
+            this.data.push(lo & 255, (lo >>> 8) & 255, (lo >>> 16) & 255, (lo >>> 24) & 255);
+            this.data.push(0, 0, 0, 0);
+            return;
+        }
+        if (value < 0 && value >= -0x80000000) {
+            const lo = value | 0;
+            this.data.push(lo & 255, (lo >>> 8) & 255, (lo >>> 16) & 255, (lo >>> 24) & 255);
+            this.data.push(255, 255, 255, 255);
+            return;
+        }
         let val = BigInt(value);
         for (let i = 0; i < 8; i++) {
             this.data.push(Number(val & 0xffn));
@@ -1441,12 +1586,7 @@ export class ARM64Assembler {
             // 生成 stub 代码，使用 ADRP + LDR
             // 实际地址需要在 fixupAll 时根据 dataVAddr 计算
             // 这里先生成占位符
-            this.pendingFixups.push({
-                type: "got_stub",
-                offset: this.code.length,
-                slotIndex: symInfo.slot, // 保存 slot 索引而不是偏移
-                symbol: sym,
-            });
+            this.pendingFixups.pushRaw(FIXUP_TYPE.got_stub, this.code.length, undefined, { slotIndex: symInfo.slot });
             // ADRP X16, <got_page>  - 占位
             this.emit32(0x90000010);
             // LDR X16, [X16, <got_offset>]  - 占位
@@ -1461,7 +1601,7 @@ export class ARM64Assembler {
         // 先处理字符串
         this._dataLabelSet = this._dataLabelSet || new Set();
         for (let i = 0; i < this.strings.length; i = i + 1) {
-            let labelName = "_str_" + i;
+            let labelName = this._stringLabels[i] || ("_str_" + i);
             this.labels.set(labelName, this.data.length);
             this._dataLabelSet.add(labelName);  // Mark as data label so fixup resolves to dataVAddr
             let str = this.strings[i];
@@ -1472,8 +1612,20 @@ export class ARM64Assembler {
             // (`你好`→`ä½ å¥½`),这正是出厂/自编译器对含 CJK/emoji/重音字面量的用户程序
             // 全乱码的根因。逐字节透传令 UTF-8 字节原样进产物 → node/g1 一致且正确;ASCII
             // (< 0x80)透传即原样。不用 Buffer.from(...)[j](gen1 Buffer shim 的 buf[j] 取不到)。
-            for (let j = 0; j < str.length; j = j + 1) {
-                this.data.push(str.charCodeAt(j) & 0xff);
+            // Node: latin1 一字节一字符,codePointAt 即字节。native: s[j]/.length 是
+            // UTF-16(每次从串头扫 → 长串 O(n²));charCodeAt 才是 O(1) 字节,扫到 NaN 停。
+            if (process.release) {
+                for (let j = 0; j < str.length; j = j + 1) {
+                    this.data.push(str.codePointAt(j) & 0xff);
+                }
+            } else {
+                let j = 0;
+                while (true) {
+                    const cc = str.charCodeAt(j);
+                    if (cc !== cc) break;
+                    this.data.push(cc & 0xff);
+                    j = j + 1;
+                }
             }
             this.data.push(0);
         }
@@ -1496,238 +1648,163 @@ export class ARM64Assembler {
         // 清除之前的重定位记录（避免重复调用导致重复）
         this.branchRelocations = [];
 
-        // 设置数据段起始标签（偏移量为 0，因为它是数据段的开头）
-        this.labels.set("_data_start", 0);
-
-        // 调试
-
-        // Debug: print all _str_to_num related labels
-        const strLabels = [];
-        if (strLabels.length > 0) {
+        // 未回填的前向 B(外部/未定义标签)转入 fixup 队列
+        const fwd = this._fwdB;
+        if (fwd && fwd.size !== 0) {
+            const names = [];
+            fwd.forEach(function (_list, name) { names.push(name); });
+            for (let ni = 0; ni < names.length; ni++) {
+                const name = names[ni];
+                const list = fwd.get(name);
+                for (let i = 0; i < list.length; i++) {
+                    this.pendingFixups.pushRaw(FIXUP_TYPE.b, list[i], name);
+                }
+            }
+            this._fwdB = null;
         }
 
-        for (let i = 0; i < this.pendingFixups.length; i = i + 1) {
-            let fixup = this.pendingFixups[i];
+        // 设置数据段起始标签（偏移量为 0，因为它是数据段的开头）
+        this.labels.set("_data_start", 0);
+        const dataSet = this._dataLabelSet || (this._dataLabelSet = new Set());
+        dataSet.add("_data_start");
+        for (const name of FALLBACK_DATA_LABELS) dataSet.add(name);
 
-            // Debug: print all adr fixups
-            if (fixup.type === "adr") {
+        const buf = this.pendingFixups;
+        const n = buf.length;
+        const labels = this.labels;
+        const undefSet = this.undefinedSymbolSet;
+        const hasUndef = undefSet.size !== 0;
+        const codeVAddr = this.codeVAddr;
+        const dataVAddr = this.dataVAddr;
+        const PAGE = 4096;
+        const hasAliases = this.labelAliases.size !== 0;
+        const packed = !buf.nativeObjects;
+        const typeChunks = buf.typeChunks;
+        const offsetChunks = buf.offsetChunks;
+        const rdChunks = buf.rdChunks;
+        const condChunks = buf.condChunks;
+        const slotChunks = buf.slotChunks;
+        const labelArr = buf.labels;
+        const CHUNK_BITS = 20;
+        const CHUNK_MASK = 1048575;
+
+        for (let i = 0; i < n; i = i + 1) {
+            let type, offset, slotIndex, cond, packedRd, labelRaw;
+            if (packed) {
+                const chunk = i >> CHUNK_BITS;
+                const within = i & CHUNK_MASK;
+                type = typeChunks[chunk][within];
+                offset = offsetChunks[chunk][within];
+                slotIndex = slotChunks[chunk][within];
+                cond = condChunks[chunk][within];
+                packedRd = rdChunks[chunk][within];
+                labelRaw = labelArr[i];
+            } else {
+                // 自举:直读 item 字段(pushRaw 已填 typeCode),免 typeCodeAt/字符串表。
+                const item = buf.items[i];
+                type = item.typeCode;
+                offset = item.offset;
+                slotIndex = typeof item.slotIndex === "number" ? item.slotIndex >>> 0 : 0xFFFFFFFF;
+                cond = typeof item.cond === "number" ? item.cond : 255;
+                packedRd = typeof item.rd === "number" ? item.rd : 255;
+                labelRaw = item.label;
             }
 
-            // IAT stub (Windows)
-            if (fixup.type === "iat_stub") {
-                let iatSlotAddr = this.iatVAddr + fixup.slotIndex * 8;
-                let currentAddr = this.codeVAddr + fixup.offset;
-
-                // ADRP X16, <page>
-                let currentPage = Math.floor(currentAddr / 4096) * 4096;
-                let targetPage = Math.floor(iatSlotAddr / 4096) * 4096;
-                let pageOffset = (targetPage - currentPage) / 4096;
-
+            if (type === FIXUP_TYPE.iat_stub) {
+                let iatSlotAddr = this.iatVAddr + slotIndex * 8;
+                let currentAddr = codeVAddr + offset;
+                let currentPage = currentAddr - (currentAddr % PAGE);
+                let targetPage = iatSlotAddr - (iatSlotAddr % PAGE);
+                let pageOffset = (targetPage - currentPage) / PAGE;
                 let immlo = pageOffset & 3;
                 let immhi = (pageOffset >> 2) & 524287;
                 let adrpWord = 2415919104 | (immlo << 29) | (immhi << 5) | 16;
-                this.code[fixup.offset] = adrpWord & 255;
-                this.code[fixup.offset + 1] = (adrpWord >> 8) & 255;
-                this.code[fixup.offset + 2] = (adrpWord >> 16) & 255;
-                this.code[fixup.offset + 3] = (adrpWord >> 24) & 255;
-
-                // LDR X16, [X16, #offset]
+                this._codeWrite32(offset, adrpWord);
                 let pageInOffset = iatSlotAddr - targetPage;
                 let imm12 = Math.floor(pageInOffset / 8) & 4095;
-
                 let ldrWord = 4181721088 | (imm12 << 10) | (16 << 5) | 16;
-                this.code[fixup.offset + 4] = ldrWord & 255;
-                this.code[fixup.offset + 5] = (ldrWord >> 8) & 255;
-                this.code[fixup.offset + 6] = (ldrWord >> 16) & 255;
-                this.code[fixup.offset + 7] = (ldrWord >> 24) & 255;
+                this._codeWrite32(offset + 4, ldrWord);
                 continue;
             }
 
-            // GOT stub 不需要 label 解析
-            if (fixup.type === "got_stub") {
-                // 在 fixup 时计算实际的 GOT 槽偏移
-                let gotSlotOffset = this.gotBaseOffset + fixup.slotIndex * 8;
-
-                // 计算 GOT 槽的地址
-                let gotSlotAddr = this.dataVAddr + gotSlotOffset;
-                let currentAddr = this.codeVAddr + fixup.offset;
-
-                // ADRP X16, <page> - 计算页偏移
-                // 使用 Math.floor 来处理大数的页对齐
-                let currentPage = Math.floor(currentAddr / 4096) * 4096;
-                let targetPage = Math.floor(gotSlotAddr / 4096) * 4096;
-                let pageOffset = (targetPage - currentPage) / 4096;
-
+            if (type === FIXUP_TYPE.got_stub) {
+                let gotSlotOffset = this.gotBaseOffset + slotIndex * 8;
+                let gotSlotAddr = dataVAddr + gotSlotOffset;
+                let currentAddr = codeVAddr + offset;
+                let currentPage = currentAddr - (currentAddr % PAGE);
+                let targetPage = gotSlotAddr - (gotSlotAddr % PAGE);
+                let pageOffset = (targetPage - currentPage) / PAGE;
                 let immlo = pageOffset & 3;
                 let immhi = (pageOffset >> 2) & 524287;
-                let adrpWord = 2415919104 | (immlo << 29) | (immhi << 5) | 16; // rd = X16
-                this.code[fixup.offset] = adrpWord & 255;
-                this.code[fixup.offset + 1] = (adrpWord >> 8) & 255;
-                this.code[fixup.offset + 2] = (adrpWord >> 16) & 255;
-                this.code[fixup.offset + 3] = (adrpWord >> 24) & 255;
-
-                // LDR X16, [X16, #offset] - 页内偏移
+                let adrpWord = 2415919104 | (immlo << 29) | (immhi << 5) | 16;
+                this._codeWrite32(offset, adrpWord);
                 let pageInOffset = gotSlotAddr - targetPage;
-                let imm12 = Math.floor(pageInOffset / 8) & 4095; // LDR 64位用 8 字节为单位
-
-                let ldrWord = 4181721088 | (imm12 << 10) | (16 << 5) | 16; // 0xF9400000 | imm12 | Rn=X16 | Rt=X16
-                this.code[fixup.offset + 4] = ldrWord & 255;
-                this.code[fixup.offset + 5] = (ldrWord >> 8) & 255;
-                this.code[fixup.offset + 6] = (ldrWord >> 16) & 255;
-                this.code[fixup.offset + 7] = (ldrWord >> 24) & 255;
+                let imm12 = Math.floor(pageInOffset / 8) & 4095;
+                let ldrWord = 4181721088 | (imm12 << 10) | (16 << 5) | 16;
+                this._codeWrite32(offset + 4, ldrWord);
                 continue;
             }
 
-            let labelName = this.resolveLabel(fixup.label);
-            let labelOffset = this.labels.get(labelName);
-
-            // 外部/未定义符号（如 pow）：labels 里没有 → gen0 得 undefined、自举产物得
-            // 裸 0（obj/Map[missing]=0）。必须**先**按 isUndefinedSymbol 判定并按重定位
-            // 处理，否则 `labelOffset===undefined` 在 gen1 判假 → 把外部符号当 offset 0 的
-            // 代码 label → bl/b 跳到入口 → 无限递归栈溢出。数字格式化路径用 pow，故
-            // if-else 分支内的数字字面量必崩（本 bug 根因）。符号非本地定义即外部，
-            // 先判 isUndefinedSymbol 安全。
-            if (this.isUndefinedSymbol(labelName)) {
-                if (fixup.type === "bl") {
-                    this.branchRelocations.push({
-                        offset: fixup.offset,
-                        symbol: labelName,
-                        type: "ARM64_RELOC_BRANCH26",
-                    });
-                }
-                // 保持 BL 指令为 0 偏移（占位符）
-                continue;
+            // 无别名时免 resolve;有别名时绝大多数标签仍 miss,一次 get 即过。
+            // (曾试 `_str_<ident>` 门控跳过 Map.get:1.4M 次 charCodeAt 在 gen1 上
+            // 不比 Map miss 便宜,已撤回。)
+            let labelName = labelRaw;
+            if (hasAliases) {
+                const hit = this.labelAliases.get(labelRaw);
+                if (hit !== undefined) labelName = this.resolveLabel(labelRaw);
             }
-
+            // _map_get 缺键返 JS_UNDEFINED,0 是合法代码偏移。Node/native 都只 get 一次。
+            let labelOffset = labels.get(labelName);
             if (labelOffset === undefined) {
-                throw new Error("ERROR: Unknown label: " + fixup.label + " (resolved: " + labelName + ")");
+                // 可执行链接通常无 undef 集;空集时免 has。
+                if (hasUndef && undefSet.has(labelName)) {
+                    if (type === FIXUP_TYPE.bl) {
+                        this.branchRelocations.push({
+                            offset: offset,
+                            symbol: labelName,
+                            type: "ARM64_RELOC_BRANCH26",
+                        });
+                    }
+                    continue;
+                }
+                throw new Error("ERROR: Unknown label: " + labelRaw + " (resolved: " + labelName + ")");
             }
 
-            // 检查是否是数据段标签
-            // 优先用 finalize 收集到的 dataLabel 集合，其次用历史白名单启发式
-            // 注意: _str_toUpperCase 等是代码段函数，不是数据段字符串
-            // 快速拒绝：所有 string-method 前缀都以 `_str_` 开头，非 `_str_` label
-            // 直接跳过 27 组扫描（绝大多数 fixup 都非字符串方法）。
-            const isStringMethod = labelName.indexOf("_str_") === 0 &&
-                STRING_METHOD_PREFIXES.some((prefix) => labelName === prefix || labelName.startsWith(prefix + "_"));
-            let isDataLabel =
-                !isStringMethod &&
-                ((this._dataLabelSet && this._dataLabelSet.has(labelName)) ||
-                    labelName.indexOf("_float_") === 0 ||
-                    labelName === "_heap_base" ||
-                    labelName === "_heap_ptr" ||
-                    labelName === "_heap_initialized" ||
-                    labelName.indexOf("_data_") === 0 ||
-                    labelName === "_exception_sp" ||
-                    labelName === "_exception_stack" ||
-                    labelName === "_task_queue_head" ||
-                    labelName === "_task_queue_tail" ||
-                    labelName === "_task_queue" ||
-                    labelName === "_newline_char" ||
-                    labelName === "_str_uncaught" ||
-                    labelName === "_str_object" ||
-                    labelName === "_str_undefined" ||
-                    labelName === "_str_null" ||
-                    labelName === "_str_true" ||
-                    labelName === "_str_false" ||
-                    labelName === "_js_true" ||
-                    labelName === "_js_false" ||
-                    labelName === "_js_null" ||
-                    labelName === "_js_undefined" ||
-                    labelName === "_str_function" ||
-                    labelName === "_str_lbracket" ||
-                    labelName === "_str_rbracket" ||
-                    labelName === "_str_comma" ||
-                    labelName === "_str_array" ||
-                    labelName === "_str_number" ||
-                    labelName === "_str_string" ||
-                    labelName === "_str_boolean" ||
-                    labelName === "_str_function_type" ||
-                    labelName === "_str_object_type" ||
-                    labelName === "_heap_meta" ||
-                    labelName === "_print_buf" ||
-                    labelName.indexOf("_float_") === 0 ||
-                    labelName.indexOf("_global_") === 0 ||
-                    labelName.indexOf("_main_captured_") === 0 ||
-                    labelName === "_random_seed");
-            // Code labels that start with _str_ but are NOT data labels
-            // These should be treated as code labels, not data labels
-            const isCodeLabelStrPrefix = labelName === "_str_to_num" || labelName === "_strconcat" || labelName === "_abstract_eq";
-            if (isCodeLabelStrPrefix) {
-                isDataLabel = false;
-            }
-            let targetAddr = isDataLabel ? this.dataVAddr + labelOffset : this.codeVAddr + labelOffset;
-            let currentAddr = this.codeVAddr + fixup.offset;
-            if (fixup.type === "adr") {
-            }
+            const isDataLabel = dataSet.has(labelName) || isFallbackDataPrefix(labelName);
+            let targetAddr = isDataLabel ? dataVAddr + labelOffset : codeVAddr + labelOffset;
+            let currentAddr = codeVAddr + offset;
 
-            if (fixup.type === "b" || fixup.type === "bl") {
-                let offset = (targetAddr - currentAddr) / 4;
-                let imm26 = offset & 67108863;
-                let opcode = fixup.type === "bl" ? 2483027968 : 335544320; // 0x94000000 : 0x14000000
-                let word = opcode | imm26;
-                this.code[fixup.offset] = word & 255;
-                this.code[fixup.offset + 1] = (word >> 8) & 255;
-                this.code[fixup.offset + 2] = (word >> 16) & 255;
-                this.code[fixup.offset + 3] = (word >> 24) & 255;
-            } else if (fixup.type === "bcond") {
-                let offset = (targetAddr - currentAddr) / 4;
-                let imm19 = offset & 524287;
-                let word = 1409286144 | (imm19 << 5) | fixup.cond;
-                this.code[fixup.offset] = word & 255;
-                this.code[fixup.offset + 1] = (word >> 8) & 255;
-                this.code[fixup.offset + 2] = (word >> 16) & 255;
-                this.code[fixup.offset + 3] = (word >> 24) & 255;
-            } else if (fixup.type === "adr") {
-                // ARM64 uses PC+4 for ADR, so we need to add 4 to currentAddr
-                let offset = targetAddr - (currentAddr + 4);
-                let immlo = offset & 3;
-                let immhi = (offset >> 2) & 524287;
-                let rd = this.code[fixup.offset] & 31;
-                let word = 0x10000000 | (immhi << 5) | (immlo << 22) | rd;
-                this.code[fixup.offset] = word & 255;
-                this.code[fixup.offset + 1] = (word >> 8) & 255;
-                this.code[fixup.offset + 2] = (word >> 16) & 255;
-                this.code[fixup.offset + 3] = (word >> 24) & 255;
-            } else if (fixup.type === "adrp") {
-                // ADRP computes page address: Xd = PC[31:12] : imm << 12
-                // ADD adds the offset within the page: Xd = Xd + imm
-                // Use BigInt to avoid 32-bit overflow issues with addresses > 2GB
-                let currentPage = Number(BigInt(currentAddr) & ~4095n);
-                let targetPage = Number(BigInt(targetAddr) & ~4095n);
-                let pageOffset = (targetPage - currentPage) / 4096;
+            if (type === FIXUP_TYPE.b || type === FIXUP_TYPE.bl) {
+                let imm26 = ((targetAddr - currentAddr) / 4) & 67108863;
+                let opcode = type === FIXUP_TYPE.bl ? 2483027968 : 335544320;
+                this._codeWrite32(offset, opcode | imm26);
+            } else if (type === FIXUP_TYPE.bcond) {
+                let imm19 = ((targetAddr - currentAddr) / 4) & 524287;
+                this._codeWrite32(offset, 1409286144 | (imm19 << 5) | cond);
+            } else if (type === FIXUP_TYPE.adr) {
+                let adrOff = targetAddr - (currentAddr + 4);
+                let immlo = adrOff & 3;
+                let immhi = (adrOff >> 2) & 524287;
+                let rd = this._codeGet(offset) & 31;
+                this._codeWrite32(offset, 0x10000000 | (immhi << 5) | (immlo << 22) | rd);
+            } else if (type === FIXUP_TYPE.adrp) {
+                // 页对齐:用 % 代替 Math.floor(x/PAGE)*PAGE(自举下 floor/除法更重)。
+                let currentPage = currentAddr - (currentAddr % PAGE);
+                let targetPage = targetAddr - (targetAddr % PAGE);
+                let pageOffset = (targetPage - currentPage) / PAGE;
                 let immlo = pageOffset & 3;
                 let immhi = (pageOffset >> 2) & 524287;
-                let rd = fixup.rd || (this.code[fixup.offset] & 31);
-                // Fix up ADRP instruction
-                // ADRP encoding: opcode = 0x90000000, but with immlo adjustment
-                // Use unsigned arithmetic to avoid JavaScript 32-bit signed overflow
+                let rd = packedRd === 255 ? (this._codeGet(offset) & 31) : packedRd;
                 let adrpWord = (0x90000000 + (immhi << 5) + (immlo << 29) + rd) >>> 0;
-                this.code[fixup.offset] = adrpWord & 255;
-                this.code[fixup.offset + 1] = (adrpWord >> 8) & 255;
-                this.code[fixup.offset + 2] = (adrpWord >> 16) & 255;
-                this.code[fixup.offset + 3] = (adrpWord >> 24) & 255;
-                // Fix up ADD instruction (at offset + 4)
-                let offsetInPage = Number(BigInt(targetAddr) & 4095n);
-                let addImm = offsetInPage & 4095;
+                this._codeWrite32(offset, adrpWord);
+                let addImm = (targetAddr - targetPage) & 4095;
                 let addWord = (0x91000000 + (addImm << 10) + (rd << 5) + rd) >>> 0;
-                if (labelName === "_js_true" || labelName === "_js_false") {
-                }
-                this.code[fixup.offset + 4] = addWord & 255;
-                this.code[fixup.offset + 5] = (addWord >> 8) & 255;
-                this.code[fixup.offset + 6] = (addWord >> 16) & 255;
-                this.code[fixup.offset + 7] = (addWord >> 24) & 255;
-            } else if (fixup.type === "cbz" || fixup.type === "cbnz") {
-                // CBZ/CBNZ: imm19 偏移
-                let offset = (targetAddr - currentAddr) / 4;
-                let imm19 = offset & 524287;
-                let rt = this.code[fixup.offset] & 31;
-                let opcode = fixup.type === "cbz" ? 0xb4000000 : 0xb5000000;
-                let word = opcode | (imm19 << 5) | rt;
-                this.code[fixup.offset] = word & 255;
-                this.code[fixup.offset + 1] = (word >> 8) & 255;
-                this.code[fixup.offset + 2] = (word >> 16) & 255;
-                this.code[fixup.offset + 3] = (word >> 24) & 255;
+                this._codeWrite32(offset + 4, addWord);
+            } else if (type === FIXUP_TYPE.cbz || type === FIXUP_TYPE.cbnz) {
+                let imm19 = ((targetAddr - currentAddr) / 4) & 524287;
+                let rt = this._codeGet(offset) & 31;
+                let opcode = type === FIXUP_TYPE.cbz ? 0xb4000000 : 0xb5000000;
+                this._codeWrite32(offset, opcode | (imm19 << 5) | rt);
             }
         }
     }

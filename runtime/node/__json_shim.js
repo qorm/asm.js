@@ -287,11 +287,13 @@ export function __JSON_stringify(v, replacer, space) {
             if (it === "string") key = item;
             else if (it === "number") key = "" + item;
             else if (it === "object" && item !== null) {
-                // Number/String/Boolean 包装对象:调用 String(item) → toString
-                if (typeof item.__number_value !== "undefined" ||
-                    typeof item.__string_value !== "undefined" ||
-                    typeof item.__boolean_value !== "undefined") {
-                    key = String(item);
+                // [[StringData]]/[[NumberData]]:ToString → OrdinaryToPrimitive 优先
+                // toString(replacer-array-string-object 覆盖 toString)。包装槽名是
+                // __value(String)/__number_value(Number),不是 __string_value。
+                if (item instanceof String || item instanceof Number ||
+                    typeof item.__number_value !== "undefined" ||
+                    typeof item.__value !== "undefined") {
+                    key = item.toString();
                 } else continue;
             } else continue;
             let dup = false;
@@ -381,6 +383,8 @@ function __jpString() {
             } else __jsonErr("bad escape");
             __jp_i = __jp_i + 1;
         } else {
+            // JSON 串禁止未转义 U+0000..U+001F(15.12.2-2-1 属性名含裸控制符)。
+            if (c < 32) __jsonErr("unescaped control");
             out += __jp_s.charAt(__jp_i);
             __jp_i = __jp_i + 1;
         }
@@ -458,7 +462,9 @@ function __jpValue(depth) {
             __jpWs();
             if (__jp_s.charCodeAt(__jp_i) !== 58) __jsonErr("expected :");
             __jp_i = __jp_i + 1;
-            obj[k] = __jpValue(depth + 1);
+            // 不用 obj[k]= :k==="__proto__" 会改 [[Prototype]]。规范 CreateDataProperty
+            // 把 "__proto__" 当普通自有数据键。
+            __jpCreateDataProp(obj, k, __jpValue(depth + 1));
             __jpWs();
             const d = __jp_s.charCodeAt(__jp_i);
             if (d === 44) { __jp_i = __jp_i + 1; continue; }
@@ -489,14 +495,36 @@ function __jpValue(depth) {
 
 // InternalizeJSONProperty:自底向上遍历,对每个 (holder,name,value) 调 reviver
 // (this=holder)。子节点先于父节点处理;reviver 返回 undefined 的属性删除
-// (数组元素置 undefined,与 node 的空洞在再序列化时同为 "null")。
-// value 由调用方取好传入,原地改写容器。reviver 由用户提供 → typeof 守卫。
+// (数组:delete;对象:delete)。写回用 CreateDataProperty 语义:
+//   - 成功/失败(非 configurable)→ 规范不抛,继续
+//   - Proxy defineProperty 陷阱抛错 → 须冒泡(reviver-*-define-prop-err)
+// Object.defineProperty 在本运行时失败即抛 TypeError,故 try/catch 吞 TypeError
+// 以对齐 CreateDataProperty 的 boolean 返回;其它异常(Test262Error 等)原样抛。
+// 判数组用 Array.isArray(含 Proxy-of-Array),勿用 instanceof。
+function __jpCreateDataProp(obj, key, val) {
+    try {
+        Object.defineProperty(obj, key, {
+            value: val,
+            writable: true,
+            enumerable: true,
+            configurable: true
+        });
+    } catch (e) {
+        if (!(e instanceof TypeError)) throw e;
+    }
+}
+
 function __jpInternalize(holder, name, value, reviver) {
     if (value !== null && typeof value === "object") {
-        if (value instanceof Array) {
+        if (Array.isArray(value)) {
             for (let i = 0; i < value.length; i++) {
                 const nv = __jpInternalize(value, "" + i, value[i], reviver);
-                value[i] = nv; // undefined 亦写回(空洞语义近似)
+                const key = "" + i;
+                if (nv === undefined) {
+                    delete value[key];
+                } else {
+                    __jpCreateDataProp(value, key, nv);
+                }
             }
         } else {
             // 先快照键,避免遍历中删除键破坏迭代。
@@ -506,7 +534,7 @@ function __jpInternalize(holder, name, value, reviver) {
                 const k = keys[i];
                 const nv = __jpInternalize(value, k, value[k], reviver);
                 if (nv === undefined) delete value[k];
-                else value[k] = nv;
+                else __jpCreateDataProp(value, k, nv);
             }
         }
     }

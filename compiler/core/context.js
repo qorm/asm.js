@@ -12,11 +12,21 @@ import { Type } from "./types.js";
 // x64 V0==RAX==RET,若作垫会在 epilogue 把返回值冲掉(#37 根因)。
 export const CALLEE_SAVED_AREA = 48;
 
+// gen1 下 `new Map(iterable)` 经 Get(Map.prototype,"set") 取 adder——原型方法属性
+// 加载常得 undefined → "Map.prototype.set is not a function"。空 new Map + for-of set 安全。
+export function copyMap(src) {
+    const out = new Map();
+    if (src) {
+        for (const e of src) out.set(e[0], e[1]);
+    }
+    return out;
+}
+
 export class CompileContext {
     constructor(funcName) {
         this.funcName = funcName || "main";
-        this.locals = {}; // 变量名 -> 栈偏移量
-        this.varTypes = {}; // 变量名 -> 类型（静态类型系统）
+        this.locals = new Map(); // 动态键 O(1);{} 在 gen1 走线性 _object_get
+        this.varTypes = {}; // 小字典;Map 常数开销在 gen1 上更贵(实测)
         // [解箱①] 循环内被证明为裸 int 驻留的 induction 变量:slot 存裸 int(非
         // float64 位/0x7FF8),读写走整数路径免 _to_int32/fmov;仅在安全 for 循环
         // 体内有效,循环出口物化回 float64。见 unboxing-int-residency-design 记忆。
@@ -30,7 +40,7 @@ export class CompileContext {
         this.stackOffset = 0; // 当前栈偏移
         this.labelCounter = 0; // 标签计数器
         this.returnLabel = ""; // 当前函数的返回标签
-        this.functions = {}; // 函数声明: 符号名 -> AST 节点
+        this.functions = {}; // 函数声明: 符号名 -> AST 节点(Map 在 gen1 上常数税更重,实测慢于 {})
         this.functionAliases = {}; // 当前编译单元中的函数别名: 本地名 -> 符号名
         this.isAsync = false; // 是否是异步函数
 
@@ -75,6 +85,10 @@ export class CompileContext {
         //   随后的循环/块消费)。
         this.labelMap = null;
         this.pendingLabels = null;
+
+        // 用户函数 LSRA:局部名 → T*(与 spill home 同槽)。raVm 在 beginRecord 期间挂上。
+        this.raVm = null;
+        this.localTemps = null;
     }
 
     // 兼容旧接口
@@ -127,19 +141,51 @@ export class CompileContext {
         return mcv;
     }
 
+    // 模块顶层 var 提升必须复用 _main 预建的全局 box。否则早建闭包
+    // (`var f=()=>n; var n=0`)捕获 hoist 新建的局部 box,而声明初始化
+    // 走 compileVariableDeclaration 的 globalLabel 切到全局 box → 双 box
+    // 分叉(闭包读创建时快照,外层读声明值)。仅模块主帧可复用:嵌套函数体
+    // 与用户函数 ctx 若复用,内层同名 var 会误别名到模块捕获槽。
+    shouldReuseMainCapturedBox() {
+        return this._isModuleMain === true && this._inFunctionBody !== true;
+    }
+
     // 分配局部变量（带类型）
     allocLocal(name, type = Type.UNKNOWN) {
         this.stackOffset = this.stackOffset + 8;
-        this.locals[name] = -CALLEE_SAVED_AREA - this.stackOffset;
+        const off = -CALLEE_SAVED_AREA - this.stackOffset;
+        if (this._localsUndo && this._localsUndo.length > 0) {
+            const frame = this._localsUndo[this._localsUndo.length - 1];
+            // 每名每层只记一次:首次写入的旧值(或 undefined=新增)
+            let seen = false;
+            for (let i = 0; i < frame.length; i++) {
+                if (frame[i][0] === name) { seen = true; break; }
+            }
+            if (!seen) {
+                // Map.get miss ≡ undefined，免再 has
+                frame.push([name, this.locals.get(name)]);
+            }
+        }
+        this.locals.set(name, off);
         this.varTypes[name] = type;
-        return this.locals[name];
+        // 录制中 / 在线 RA 为普通局部绑 T*(跳过 __ 合成名);装箱/裸 int 读路径仍走 FP,忽略 T*。
+        // 关:RA_NO_TEMP=1
+        if (!(typeof process !== "undefined" && process.env && process.env.RA_NO_TEMP) &&
+            this.raVm && (this.raVm._raOnline || this.raVm._recN >= 0) && name &&
+            !(name.length >= 2 && name.charCodeAt(0) === 95 && name.charCodeAt(1) === 95)) {
+            const t = this.raVm.newTemp(off);
+            if (t) {
+                if (!this.localTemps) this.localTemps = new Map();
+                this.localTemps.set(name, t);
+            }
+        }
+        return off;
     }
 
     // 获取局部变量偏移
-    // [#32] 双语义守卫:合法偏移恒为数值(负数)。node 下字典 miss 可能沿原型链
-    // 返回函数(如 name="constructor"),asm.js 下返回 raw 0 —— 统一归一为 0(未分配)。
+    // [#32] 双语义守卫:合法偏移恒为数值(负数)。Map miss 为 undefined。
     getLocal(name) {
-        const v = this.locals[name];
+        const v = this.locals.get(name);
         if (v && typeof v !== "number") return 0;
         return v;
     }
@@ -182,16 +228,12 @@ export class CompileContext {
         return this.getLocal(name) || this.getGlobal(name);
     }
 
-    // 进入新作用域
+    // 进入新作用域(O(1)):不拷贝 Map;allocLocal 记 undo,leave 时回滚本层写入。
     enterScope() {
-        // 手动复制 locals 对象
-        let copyLocals = {};
-        for (let key in this.locals) {
-            copyLocals[key] = this.locals[key];
-        }
+        if (!this._localsUndo) this._localsUndo = [];
+        this._localsUndo.push([]);
         this.scopeDepth = (this.scopeDepth || 0) + 1;
         return {
-            locals: copyLocals,
             stackOffset: this.stackOffset,
             scopeDepth: this.scopeDepth - 1,
             breakLabel: this.breakLabel,
@@ -199,9 +241,18 @@ export class CompileContext {
         };
     }
 
-    // 离开作用域
+    // 离开作用域:按 undo 回滚本层对 locals 的 set/新增。
     leaveScope(saved) {
-        this.locals = saved.locals;
+        const frame = this._localsUndo && this._localsUndo.length
+            ? this._localsUndo.pop()
+            : null;
+        if (frame) {
+            for (let i = frame.length - 1; i >= 0; i--) {
+                const e = frame[i];
+                if (e[1] === undefined) this.locals.delete(e[0]);
+                else this.locals.set(e[0], e[1]);
+            }
+        }
         this.stackOffset = saved.stackOffset;
         this.scopeDepth = saved.scopeDepth;
         this.breakLabel = saved.breakLabel;
@@ -249,8 +300,8 @@ export class CompileContext {
                 return false;
             }
             // 也检查是否有同名导出
-            if (this.functionAliases && this.functionAliases[name] && 
-                this.functions[this.functionAliases[name]] && 
+            if (this.functionAliases && this.functionAliases[name] &&
+                this.functions[this.functionAliases[name]] &&
                 this.mainCapturedVars[name]) {
                 // 如果既是函数别名又同时被主程序捕获，那很可能是 namespace import 冲突
                 // 这种情况下，对于特定名称我们选择不视为函数
@@ -277,23 +328,26 @@ export class CompileContext {
         return undefined;
     }
 
-    // 克隆上下文（用于编译嵌套函数）
-    clone(newFuncName) {
+    // 克隆上下文（用于编译嵌套函数 / 模块帧）
+    // opts.skipAliases: 调用方将立即覆盖 functionAliases(省一次 for-in 拷贝)
+    // opts.skipMainCaptured: 同上,覆盖 mainCapturedVars
+    clone(newFuncName, opts) {
+        opts = opts || {};
         let newCtx = new CompileContext(newFuncName);
-        // 复制函数注册表
-        for (let key in this.functions) {
-            newCtx.functions[key] = this.functions[key];
+        // functions/globals 在 collectFunctions 之后基本只读:共享引用,避免每函数/
+        // 每模块 for-in 深拷贝(gen1 上自编译 functions.js 曾占数秒~数十秒)。
+        // 别名/mainCaptured 仍按帧拷贝(模块/owner 会覆盖时可 skip)。
+        newCtx.functions = this.functions;
+        newCtx.globals = this.globals;
+        if (!opts.skipAliases) {
+            for (let key in this.functionAliases) {
+                newCtx.functionAliases[key] = this.functionAliases[key];
+            }
         }
-        for (let key in this.functionAliases) {
-            newCtx.functionAliases[key] = this.functionAliases[key];
-        }
-        // 复制全局变量
-        for (let key in this.globals) {
-            newCtx.globals[key] = this.globals[key];
-        }
-        // 复制主程序被捕获变量
-        for (let key in this.mainCapturedVars) {
-            newCtx.mainCapturedVars[key] = this.mainCapturedVars[key];
+        if (!opts.skipMainCaptured) {
+            for (let key in this.mainCapturedVars) {
+                newCtx.mainCapturedVars[key] = this.mainCapturedVars[key];
+            }
         }
         // 复制类上下文（super 调用需要在方法/构造器帧内可见）
         newCtx.inClass = this.inClass;
@@ -309,7 +363,20 @@ export class CompileContext {
         newCtx.inStaticMethod = this.inStaticMethod; // 静态方法内 super.m() 走父类对象(非 prototype)
         // [支柱②] 去虚拟化局部 new 跟踪(函数作用域):浅拷贝——方法见外层类型,
         // 方法内自有赋值不回写外层(语义按函数作用域隔离)。
-        newCtx.devirtVarTypes = this.devirtVarTypes ? { ...this.devirtVarTypes } : null;
+        // 避免 `{...}` 展开(gen1 上更贵);空表不分配。
+        newCtx.devirtVarTypes = null;
+        if (this.devirtVarTypes) {
+            const src = this.devirtVarTypes;
+            const dst = {};
+            let n = 0;
+            for (const k in src) {
+                dst[k] = src[k];
+                n = n + 1;
+            }
+            if (n) newCtx.devirtVarTypes = dst;
+        }
+        // LSRA:子帧共享同一 VM,录制期 allocLocal 可绑 T*
+        newCtx.raVm = this.raVm;
         return newCtx;
     }
 }

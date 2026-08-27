@@ -51,10 +51,17 @@ const CORO_ARGC = 160;
 // 数组指针(0=未绑定)。体内据此把叶值绑进局部、跳过重复解构(自定义迭代器二重消费会
 // 错值/错计)。生成器 stub 写、体内首读;其它协程(普通 async)恒 0 不用。
 const CORO_PREBOUND = 168;
+// +176: argv[5..15] —— 寄存器窗口外实参快照(11 qword)。_coroutine_create 从
+// _call_argv 拷入,_coroutine_entry 写回,使 async/generator 体能读到第 6+ 实参。
+const CORO_ARGV = 176;
+const CORO_ARGV_SLOTS = 11; // 索引 5..15
 
 const TYPE_COROUTINE = 10;
-const COROUTINE_SIZE = 176;
-const COROUTINE_STACK_SIZE = 65536; // 64KB 栈
+const COROUTINE_SIZE = 176 + CORO_ARGV_SLOTS * 8; // 264
+// 生成器/async 体跑在这块独立栈上。64KB 够普通 yield/await,但直接/间接 eval
+// 会在**同一栈**上跑 compileFragment(整份编译器,多层 8KB prologue)→ 溢栈 SIGSEGV
+// (function* g(){ return eval("1+1") } 的根因)。256KB 覆盖该路径;主栈仍数 MB。
+const COROUTINE_STACK_SIZE = 262144;
 
 // 闭包魔数（与编译器保持一致）
 // async 闭包在协程入口需要把 closure_ptr 放到 S0
@@ -92,6 +99,7 @@ export class CoroutineGenerator {
         this.generateSpawnTramp(); // [方言] js f(x) 派发蹦床
         // [批次D] 生成器(function*/yield)运行时,骑在协程调度器上
         this.generateGeneratorNew();
+        this.generateGeneratorSetInstanceProto();
         this.generateGeneratorNext();
         this.generateGeneratorReturn();
         this.generateGeneratorThrow();
@@ -100,6 +108,9 @@ export class CoroutineGenerator {
         // [async generator] 复用协程+Promise:next() 返回 Promise<{value,done}>,体可 yield 也可 await
         this.generateAsyncGeneratorNew();
         this.generateAsyncGeneratorNext();
+        this.generateAgenUnwrapTramp();
+        this.generateAsyncGeneratorReturn();
+        this.generateAsyncGeneratorThrow();
     }
 
     // ==================== [批次D] 生成器运行时 ====================
@@ -254,6 +265,77 @@ export class CoroutineGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
     }
 
+    // _generator_set_instance_proto(A0=boxed genobj, A1=ctor-ish, A2=0 sync/1 async)
+    // -> RET=A0。GetPrototypeFromConstructor:proto = Get(ctor,"prototype");
+    // Type(proto) 非 Object 则回落 %Generator.prototype% / %AsyncGenerator.prototype%。
+    // ctor 必须是堆上闭包(0xc105/0xa51c);垃圾 S0/非函数 → 直接回落。
+    generateGeneratorSetInstanceProto() {
+        const vm = this.vm;
+        vm.label("_generator_set_instance_proto");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.S2, VReg.A2);
+
+        vm.cmpImm(VReg.S1, 0);
+        vm.jeq("_gsip_fallback");
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.S3, VReg.S1, VReg.V1);
+        vm.lea(VReg.V0, "_heap_base");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmp(VReg.S3, VReg.V0);
+        vm.jlt("_gsip_fallback");
+        vm.lea(VReg.V0, "_heap_ptr");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmp(VReg.S3, VReg.V0);
+        vm.jge("_gsip_fallback");
+        vm.load(VReg.V1, VReg.S3, 0);
+        vm.cmpImm(VReg.V1, 0xc105);
+        vm.jeq("_gsip_ctor_ok");
+        vm.cmpImm(VReg.V1, 0xa51c);
+        vm.jne("_gsip_fallback");
+
+        vm.label("_gsip_ctor_ok");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.call("_js_box_function");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, this.vm.asm.addString("prototype"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_closure_prop_get");
+        vm.shrImm(VReg.V1, VReg.RET, 48);
+        vm.cmpImm(VReg.V1, 0x7FFD);
+        vm.jeq("_gsip_use");
+        vm.cmpImm(VReg.V1, 0x7FFE);
+        vm.jeq("_gsip_use");
+        vm.cmpImm(VReg.V1, 0x7FFF);
+        vm.jeq("_gsip_use");
+        vm.jmp("_gsip_fallback");
+
+        vm.label("_gsip_use");
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.S3, VReg.RET, VReg.V1);
+        vm.jmp("_gsip_store");
+
+        vm.label("_gsip_fallback");
+        vm.cmpImm(VReg.S2, 0);
+        vm.jne("_gsip_fb_async");
+        vm.call("_ensure_gen_proto");
+        vm.jmp("_gsip_fb_unbox");
+        vm.label("_gsip_fb_async");
+        vm.call("_ensure_asyncgen_proto");
+        vm.label("_gsip_fb_unbox");
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.S3, VReg.RET, VReg.V1);
+
+        vm.label("_gsip_store");
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.V0, VReg.S0, VReg.V1);
+        vm.store(VReg.V0, 16, VReg.S3);
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+    }
+
     // _generator_next: 生成器 .next(v)。闭包调用约定:S0=闭包裸指针, A0=v, A5=this。
     // 语义:
     //   coro 已 COMPLETED → {value: undefined, done: true}(重复 next)
@@ -294,10 +376,18 @@ export class CoroutineGenerator {
         vm.cmpImm(VReg.V1, CORO_STATUS_COMPLETED);
         vm.jeq("_gennext_completed");
 
-        // yield: 值在 coro+72
+        // yield: 值在 coro+72。yield* raw:内层结果对象原样返回。
         vm.load(VReg.A0, VReg.S1, 72);
-        vm.lea(VReg.A1, "_js_false");
-        vm.load(VReg.A1, VReg.A1, 0);
+        vm.lea(VReg.V0, "_gen_raw_yield");
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_gennext_wrap");
+        vm.movImm(VReg.V1, 0);
+        vm.store(VReg.V0, 0, VReg.V1);
+        vm.mov(VReg.RET, VReg.A0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+        vm.label("_gennext_wrap");
+        vm.movImm64(VReg.A1, 0x7ff9000000000000n);
         vm.call("_generator_make_result");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
 
@@ -314,19 +404,15 @@ export class CoroutineGenerator {
         vm.load(VReg.A0, VReg.S1, 72);
         vm.cmpImm(VReg.A0, 0);
         vm.jne("_gennext_completed_val");
-        vm.lea(VReg.A0, "_js_undefined");
-        vm.load(VReg.A0, VReg.A0, 0);
+        vm.movImm64(VReg.A0, 0x7ffb000000000000n);
         vm.label("_gennext_completed_val");
-        vm.lea(VReg.A1, "_js_true");
-        vm.load(VReg.A1, VReg.A1, 0);
+        vm.movImm64(VReg.A1, 0x7ff9000000000001n);
         vm.call("_generator_make_result");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
 
         vm.label("_gennext_exhausted");
-        vm.lea(VReg.A0, "_js_undefined");
-        vm.load(VReg.A0, VReg.A0, 0);
-        vm.lea(VReg.A1, "_js_true");
-        vm.load(VReg.A1, VReg.A1, 0);
+        vm.movImm64(VReg.A0, 0x7ffb000000000000n);
+        vm.movImm64(VReg.A1, 0x7ff9000000000001n);
         vm.call("_generator_make_result");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
     }
@@ -359,8 +445,7 @@ export class CoroutineGenerator {
         vm.movImm(VReg.V1, 1);
         vm.store(VReg.V0, 0, VReg.V1);
         vm.mov(VReg.A0, VReg.S1);
-        vm.lea(VReg.A1, "_js_undefined");
-        vm.load(VReg.A1, VReg.A1, 0);
+        vm.movImm64(VReg.A1, 0x7ffb000000000000n);
         vm.call("_coroutine_resume");
 
         // finalizer 抛出?(pending 保留至此)→ 调用方栈上传播
@@ -376,18 +461,24 @@ export class CoroutineGenerator {
         vm.load(VReg.A0, VReg.S1, 72);
         vm.cmpImm(VReg.A0, 0);
         vm.jne("_genret_completed_val");
-        vm.lea(VReg.A0, "_js_undefined");
-        vm.load(VReg.A0, VReg.A0, 0);
+        vm.movImm64(VReg.A0, 0x7ffb000000000000n);
         vm.label("_genret_completed_val");
-        vm.lea(VReg.A1, "_js_true");
-        vm.load(VReg.A1, VReg.A1, 0);
+        vm.movImm64(VReg.A1, 0x7ff9000000000001n);
         vm.call("_generator_make_result");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
 
         vm.label("_genret_suspended");
         vm.load(VReg.A0, VReg.S1, 72);
-        vm.lea(VReg.A1, "_js_false");
-        vm.load(VReg.A1, VReg.A1, 0);
+        vm.lea(VReg.V0, "_gen_raw_yield");
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_genret_wrap");
+        vm.movImm(VReg.V1, 0);
+        vm.store(VReg.V0, 0, VReg.V1);
+        vm.mov(VReg.RET, VReg.A0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+        vm.label("_genret_wrap");
+        vm.movImm64(VReg.A1, 0x7ff9000000000000n);
         vm.call("_generator_make_result");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
 
@@ -401,8 +492,7 @@ export class CoroutineGenerator {
         // 记住返回值,使后续对 coro 的直接观察一致(诊断用途)
         vm.store(VReg.S1, 72, VReg.S2);
         vm.mov(VReg.A0, VReg.S2);
-        vm.lea(VReg.A1, "_js_true");
-        vm.load(VReg.A1, VReg.A1, 0);
+        vm.movImm64(VReg.A1, 0x7ff9000000000001n);
         vm.call("_generator_make_result");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
     }
@@ -438,8 +528,7 @@ export class CoroutineGenerator {
         vm.store(VReg.V0, 0, VReg.V1);
 
         vm.mov(VReg.A0, VReg.S1);
-        vm.lea(VReg.A1, "_js_undefined");
-        vm.load(VReg.A1, VReg.A1, 0);
+        vm.movImm64(VReg.A1, 0x7ffb000000000000n);
         vm.call("_coroutine_resume");
 
         // resume 返回后:SUSPENDED(catch 又 yield)还是 COMPLETED?
@@ -447,10 +536,18 @@ export class CoroutineGenerator {
         vm.cmpImm(VReg.V1, CORO_STATUS_COMPLETED);
         vm.jeq("_genthrow_completed");
 
-        // SUSPENDED:{value: coro+72, done:false}
+        // SUSPENDED:{value: coro+72, done:false};yield* raw 原样返回。
         vm.load(VReg.A0, VReg.S1, 72);
-        vm.lea(VReg.A1, "_js_false");
-        vm.load(VReg.A1, VReg.A1, 0);
+        vm.lea(VReg.V0, "_gen_raw_yield");
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_genthrow_wrap");
+        vm.movImm(VReg.V1, 0);
+        vm.store(VReg.V0, 0, VReg.V1);
+        vm.mov(VReg.RET, VReg.A0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+        vm.label("_genthrow_wrap");
+        vm.movImm64(VReg.A1, 0x7ff9000000000000n);
         vm.call("_generator_make_result");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
 
@@ -465,11 +562,9 @@ export class CoroutineGenerator {
         vm.load(VReg.A0, VReg.S1, 72);
         vm.cmpImm(VReg.A0, 0);
         vm.jne("_genthrow_completed_val");
-        vm.lea(VReg.A0, "_js_undefined");
-        vm.load(VReg.A0, VReg.A0, 0);
+        vm.movImm64(VReg.A0, 0x7ffb000000000000n);
         vm.label("_genthrow_completed_val");
-        vm.lea(VReg.A1, "_js_true");
-        vm.load(VReg.A1, VReg.A1, 0);
+        vm.movImm64(VReg.A1, 0x7ff9000000000001n);
         vm.call("_generator_make_result");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
 
@@ -483,8 +578,7 @@ export class CoroutineGenerator {
         vm.label("_genthrow_propagate_pending");
         vm.call("_throw_unwind");
         // _throw_unwind 不返回(跳到 catch 帧或退出);占位 epilogue 保栈平衡
-        vm.lea(VReg.A0, "_js_undefined");
-        vm.load(VReg.A0, VReg.A0, 0);
+        vm.movImm64(VReg.A0, 0x7ffb000000000000n);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
     }
 
@@ -567,6 +661,38 @@ export class CoroutineGenerator {
         vm.movImm64(VReg.V1, 0x7fff000000000000n);
         vm.or(VReg.A2, VReg.S2, VReg.V1);
         vm.call("_object_set");
+        // return 闭包 [magic, _async_generator_return, coro]
+        vm.movImm(VReg.A0, 24);
+        vm.call("_alloc");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.movImm(VReg.V1, 0xc105);
+        vm.store(VReg.S2, 0, VReg.V1);
+        vm.lea(VReg.V1, "_async_generator_return");
+        vm.store(VReg.S2, 8, VReg.V1);
+        vm.store(VReg.S2, 16, VReg.S0);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.A1, this.vm.asm.addString("return"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7fff000000000000n);
+        vm.or(VReg.A2, VReg.S2, VReg.V1);
+        vm.call("_object_set");
+        // throw 闭包 [magic, _async_generator_throw, coro]
+        vm.movImm(VReg.A0, 24);
+        vm.call("_alloc");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.movImm(VReg.V1, 0xc105);
+        vm.store(VReg.S2, 0, VReg.V1);
+        vm.lea(VReg.V1, "_async_generator_throw");
+        vm.store(VReg.S2, 8, VReg.V1);
+        vm.store(VReg.S2, 16, VReg.S0);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.A1, this.vm.asm.addString("throw"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7fff000000000000n);
+        vm.or(VReg.A2, VReg.S2, VReg.V1);
+        vm.call("_object_set");
         // Symbol.asyncIterator 闭包 [magic, _generator_self]
         vm.movImm(VReg.A0, 16);
         vm.call("_alloc");
@@ -641,11 +767,9 @@ export class CoroutineGenerator {
         vm.load(VReg.A0, VReg.S1, 72); // 体返回值(默认 return 的裸 0 归一成 undefined)
         vm.cmpImm(VReg.A0, 0);
         vm.jne("_agn_retval_ok");
-        vm.lea(VReg.A0, "_js_undefined");
-        vm.load(VReg.A0, VReg.A0, 0);
+        vm.movImm64(VReg.A0, 0x7ffb000000000000n);
         vm.label("_agn_retval_ok");
-        vm.lea(VReg.A1, "_js_true");
-        vm.load(VReg.A1, VReg.A1, 0);
+        vm.movImm64(VReg.A1, 0x7ff9000000000001n);
         vm.call("_generator_make_result"); // RET = {value, done:true}
         vm.mov(VReg.A1, VReg.RET);
         vm.mov(VReg.A0, VReg.S3); // P
@@ -661,12 +785,266 @@ export class CoroutineGenerator {
         vm.call("_promise_new");
         vm.mov(VReg.S3, VReg.RET);
         vm.movImm64(VReg.A0, 0x7ffb000000000000n); // undefined
-        vm.lea(VReg.A1, "_js_true");
-        vm.load(VReg.A1, VReg.A1, 0);
+        vm.movImm64(VReg.A1, 0x7ff9000000000001n);
         vm.call("_generator_make_result");
         vm.mov(VReg.A1, VReg.RET);
         vm.mov(VReg.A0, VReg.S3);
         vm.call("_promise_resolve");
+        vm.mov(VReg.RET, VReg.S3);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+    }
+
+    // 微任务回调:延迟 resume 以匹配 AsyncGeneratorUnwrapYieldResumption 时序。
+    generateAgenUnwrapTramp() {
+        const vm = this.vm;
+        vm.label("_agen_unwrap_tramp");
+        vm.prologue(0, [VReg.S0]);
+        vm.lea(VReg.V0, "_agen_unwrap_coro");
+        vm.load(VReg.A0, VReg.V0, 0);
+        vm.movImm64(VReg.A1, 0x7ffb000000000000n);
+        vm.call("_coroutine_resume");
+        vm.epilogue([VReg.S0], 0);
+
+        vm.label("_ensure_agen_unwrap_cb");
+        vm.prologue(0, [VReg.S0]);
+        vm.lea(VReg.V0, "_agen_unwrap_cb");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_eauc_done");
+        vm.movImm(VReg.A0, 24);
+        vm.call("_alloc");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.movImm(VReg.V1, 0xc105);
+        vm.store(VReg.S0, 0, VReg.V1);
+        vm.lea(VReg.V1, "_aref_generic");
+        vm.store(VReg.S0, 8, VReg.V1);
+        vm.lea(VReg.V1, "_agen_unwrap_tramp");
+        vm.store(VReg.S0, 16, VReg.V1);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_js_box_function");
+        vm.lea(VReg.V1, "_agen_unwrap_cb");
+        vm.store(VReg.V1, 0, VReg.RET);
+        vm.label("_eauc_done");
+        vm.lea(VReg.V0, "_agen_unwrap_cb");
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.epilogue([VReg.S0], 0);
+
+        // _agen_returnl_resume: 仅 resume 协程(unwrap await 后第二段微任务)。
+        vm.label("_agen_returnl_resume");
+        vm.prologue(0, [VReg.S0]);
+        vm.lea(VReg.V0, "_agen_unwrap_coro");
+        vm.load(VReg.A0, VReg.V0, 0);
+        vm.movImm64(VReg.A1, 0x7ffb000000000000n);
+        vm.call("_coroutine_resume");
+        vm.epilogue([VReg.S0], 0);
+
+        vm.label("_ensure_agen_returnl_cb");
+        vm.prologue(0, [VReg.S0]);
+        vm.lea(VReg.V0, "_agen_returnl_cb");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_earc_done");
+        vm.movImm(VReg.A0, 24);
+        vm.call("_alloc");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.movImm(VReg.V1, 0xc105);
+        vm.store(VReg.S0, 0, VReg.V1);
+        vm.lea(VReg.V1, "_aref_generic");
+        vm.store(VReg.S0, 8, VReg.V1);
+        vm.lea(VReg.V1, "_agen_returnl_resume");
+        vm.store(VReg.S0, 16, VReg.V1);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_js_box_function");
+        vm.lea(VReg.V1, "_agen_returnl_cb");
+        vm.store(VReg.V1, 0, VReg.RET);
+        vm.label("_earc_done");
+        vm.lea(VReg.V0, "_agen_returnl_cb");
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.epilogue([VReg.S0], 0);
+    }
+
+    // _async_generator_return(A0=v)：注入 _gen_return_pending 后 resume,返回 Promise。
+    // yield* raw 恢复点见 pending → mode=2,向内层转发 return。
+    generateAsyncGeneratorReturn() {
+        const vm = this.vm;
+        vm.label("_async_generator_return");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.load(VReg.S1, VReg.S0, 16);
+        vm.mov(VReg.S2, VReg.A0); // S2 = v
+        vm.load(VReg.V1, VReg.S1, 8);
+        vm.cmpImm(VReg.V1, CORO_STATUS_COMPLETED);
+        vm.jeq("_agr_completed_already");
+        vm.movImm(VReg.A0, 0);
+        vm.call("_promise_new");
+        vm.mov(VReg.S3, VReg.RET);
+        // await 挂起(+88≠0):入队 return,等当前 Await 结束后由 yield 路径 Unwrap。
+        vm.load(VReg.V1, VReg.S1, 88);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_agr_at_yield");
+        vm.lea(VReg.V0, "_agen_unwrap_value");
+        vm.store(VReg.V0, 0, VReg.S2);
+        vm.lea(VReg.V0, "_agen_unwrap_return_p");
+        vm.store(VReg.V0, 0, VReg.S3);
+        vm.lea(VReg.V0, "_agen_return_queued");
+        vm.movImm(VReg.V1, 1);
+        vm.store(VReg.V0, 0, VReg.V1);
+        vm.lea(VReg.V0, "_agen_unwrap_pending");
+        vm.movImm(VReg.V1, 1);
+        vm.store(VReg.V0, 0, VReg.V1);
+        vm.mov(VReg.RET, VReg.S3);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+        vm.label("_agr_at_yield");
+        // yield 挂起:先 Unwrap Await(v),再转发 return(勿同步 GetMethod return)。
+        vm.lea(VReg.V0, "_agen_raw_yield");
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_agr_return_inject");
+        vm.lea(VReg.V0, "_agen_unwrap_value");
+        vm.store(VReg.V0, 0, VReg.S2);
+        vm.lea(VReg.V0, "_agen_unwrap_pending");
+        vm.movImm(VReg.V1, 1);
+        vm.store(VReg.V0, 0, VReg.V1);
+        vm.store(VReg.S1, 88, VReg.S3);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.movImm64(VReg.A1, 0x7ffb000000000000n);
+        vm.call("_coroutine_resume");
+        vm.load(VReg.V1, VReg.S1, 8);
+        vm.cmpImm(VReg.V1, CORO_STATUS_COMPLETED);
+        vm.jne("_agr_return_p");
+        vm.jmp("_agr_return_after_resume");
+        vm.label("_agr_return_inject");
+        vm.store(VReg.S1, 88, VReg.S3);
+        vm.lea(VReg.V0, "_gen_return_value");
+        vm.store(VReg.V0, 0, VReg.S2);
+        vm.lea(VReg.V0, "_gen_return_pending");
+        vm.movImm(VReg.V1, 1);
+        vm.store(VReg.V0, 0, VReg.V1);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.movImm64(VReg.A1, 0x7ffb000000000000n);
+        vm.call("_coroutine_resume");
+        vm.load(VReg.V1, VReg.S1, 8);
+        vm.cmpImm(VReg.V1, CORO_STATUS_COMPLETED);
+        vm.jne("_agr_return_p");
+        vm.label("_agr_return_after_resume");
+        vm.lea(VReg.V0, "_exception_pending");
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_agr_completed_ok");
+        vm.lea(VReg.V0, "_exception_value");
+        vm.load(VReg.A1, VReg.V0, 0);
+        vm.mov(VReg.A0, VReg.S3);
+        vm.call("_promise_reject");
+        vm.lea(VReg.V0, "_exception_pending");
+        vm.movImm(VReg.V1, 0);
+        vm.store(VReg.V0, 0, VReg.V1);
+        vm.movImm(VReg.V1, 0);
+        vm.store(VReg.S1, 88, VReg.V1);
+        vm.mov(VReg.RET, VReg.S3);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+        vm.label("_agr_completed_ok");
+        vm.load(VReg.A0, VReg.S1, 72);
+        vm.cmpImm(VReg.A0, 0);
+        vm.jne("_agr_retval_ok");
+        vm.movImm64(VReg.A0, 0x7ffb000000000000n);
+        vm.label("_agr_retval_ok");
+        vm.movImm64(VReg.A1, 0x7ff9000000000001n);
+        vm.call("_generator_make_result");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.load(VReg.V1, VReg.S1, 88);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_agr_resolve_s3");
+        vm.mov(VReg.A0, VReg.V1);
+        vm.call("_promise_resolve");
+        vm.movImm(VReg.V1, 0);
+        vm.store(VReg.S1, 88, VReg.V1);
+        vm.jmp("_agr_return_p");
+        vm.label("_agr_resolve_s3");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.call("_promise_resolve");
+        vm.label("_agr_return_p");
+        vm.mov(VReg.RET, VReg.S3);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+        vm.label("_agr_completed_already");
+        vm.movImm(VReg.A0, 0);
+        vm.call("_promise_new");
+        vm.mov(VReg.S3, VReg.RET);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.movImm64(VReg.A1, 0x7ff9000000000001n);
+        vm.call("_generator_make_result");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S3);
+        vm.call("_promise_resolve");
+        vm.mov(VReg.RET, VReg.S3);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+    }
+
+    // _async_generator_throw(A0=e)：注入 _exception_pending 后 resume,返回 Promise。
+    // yield* raw 恢复点见 pending → mode=1,向内层转发 throw。
+    generateAsyncGeneratorThrow() {
+        const vm = this.vm;
+        vm.label("_async_generator_throw");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.load(VReg.S1, VReg.S0, 16);
+        vm.mov(VReg.S2, VReg.A0); // S2 = e
+        vm.load(VReg.V1, VReg.S1, 8);
+        vm.cmpImm(VReg.V1, CORO_STATUS_COMPLETED);
+        vm.jeq("_agt_completed_already");
+        vm.movImm(VReg.A0, 0);
+        vm.call("_promise_new");
+        vm.mov(VReg.S3, VReg.RET);
+        vm.store(VReg.S1, 88, VReg.S3);
+        vm.lea(VReg.V0, "_exception_value");
+        vm.store(VReg.V0, 0, VReg.S2);
+        vm.lea(VReg.V0, "_exception_pending");
+        vm.movImm(VReg.V1, 1);
+        vm.store(VReg.V0, 0, VReg.V1);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.movImm64(VReg.A1, 0x7ffb000000000000n);
+        vm.call("_coroutine_resume");
+        vm.load(VReg.V1, VReg.S1, 8);
+        vm.cmpImm(VReg.V1, CORO_STATUS_COMPLETED);
+        vm.jne("_agt_return_p");
+        vm.lea(VReg.V0, "_exception_pending");
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_agt_completed_ok");
+        vm.lea(VReg.V0, "_exception_value");
+        vm.load(VReg.A1, VReg.V0, 0);
+        vm.mov(VReg.A0, VReg.S3);
+        vm.call("_promise_reject");
+        vm.lea(VReg.V0, "_exception_pending");
+        vm.movImm(VReg.V1, 0);
+        vm.store(VReg.V0, 0, VReg.V1);
+        vm.movImm(VReg.V1, 0);
+        vm.store(VReg.S1, 88, VReg.V1);
+        vm.mov(VReg.RET, VReg.S3);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+        vm.label("_agt_completed_ok");
+        vm.load(VReg.V1, VReg.S1, 88);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_agt_return_p");
+        vm.load(VReg.A0, VReg.S1, 72);
+        vm.cmpImm(VReg.A0, 0);
+        vm.jne("_agt_retval_ok");
+        vm.movImm64(VReg.A0, 0x7ffb000000000000n);
+        vm.label("_agt_retval_ok");
+        vm.movImm64(VReg.A1, 0x7ff9000000000001n);
+        vm.call("_generator_make_result");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S3);
+        vm.call("_promise_resolve");
+        vm.movImm(VReg.V1, 0);
+        vm.store(VReg.S1, 88, VReg.V1);
+        vm.label("_agt_return_p");
+        vm.mov(VReg.RET, VReg.S3);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+        vm.label("_agt_completed_already");
+        vm.movImm(VReg.A0, 0);
+        vm.call("_promise_new");
+        vm.mov(VReg.S3, VReg.RET);
+        vm.mov(VReg.A1, VReg.S2);
+        vm.mov(VReg.A0, VReg.S3);
+        vm.call("_promise_reject");
         vm.mov(VReg.RET, VReg.S3);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
     }
@@ -752,10 +1130,14 @@ export class CoroutineGenerator {
         // 生成器 stub 随后回填 arg1-4;resumer 由 _coroutine_resume 在 resume 时写入）
         vm.movImm(VReg.V1, 0);
         vm.store(VReg.S2, CORO_RESUMER, VReg.V1);
-        vm.store(VReg.S2, CORO_ARG1, VReg.V1);
-        vm.store(VReg.S2, CORO_ARG2, VReg.V1);
-        vm.store(VReg.S2, CORO_ARG3, VReg.V1);
-        vm.store(VReg.S2, CORO_ARG4, VReg.V1);
+        // 缺参槽须是**真** JS_UNDEFINED:裸 0 不等于 0x7FFB…,形参默认值的
+        // `arg === undefined` 判据落空 → `async function f(x, y = x)` 里 y 恒为 0
+        // (dflt-params 族)。生成器 stub / 调用点随后按实参回填。
+        vm.movImm64(VReg.V2, 0x7ffb000000000000n);
+        vm.store(VReg.S2, CORO_ARG1, VReg.V2);
+        vm.store(VReg.S2, CORO_ARG2, VReg.V2);
+        vm.store(VReg.S2, CORO_ARG3, VReg.V2);
+        vm.store(VReg.S2, CORO_ARG4, VReg.V2);
         vm.store(VReg.S2, CORO_THIS, VReg.V1); // this=0(async 协程不写 → undefined 语义)
         vm.store(VReg.S2, CORO_EXC_TOP, VReg.V1); // 新协程异常链为空
         vm.store(VReg.S2, CORO_PREBOUND, VReg.V1); // [FDI eager] 默认无 transfer 数组
@@ -763,6 +1145,13 @@ export class CoroutineGenerator {
         vm.lea(VReg.V2, "_call_argc");
         vm.load(VReg.V2, VReg.V2, 0);
         vm.store(VReg.S2, CORO_ARGC, VReg.V2);
+
+        // [argv] 快照溢出槽:调用点刚写的 _call_argv[5..15] 随协程跨调度,入口写回。
+        vm.lea(VReg.V1, "_call_argv");
+        for (let i = 5; i < 16; i++) {
+            vm.load(VReg.V2, VReg.V1, i * 8);
+            vm.store(VReg.S2, CORO_ARGV + (i - 5) * 8, VReg.V2);
+        }
 
         // 生成器 stub 用:把刚建的协程裸指针留在 scratch 全局,stub 回填多实参时读取
         // (单线程、非重入:stub 建协程后立即读,期间无其它协程创建)
@@ -807,6 +1196,13 @@ export class CoroutineGenerator {
         vm.load(VReg.V1, VReg.S1, CORO_ARGC);
         vm.lea(VReg.V2, "_call_argc");
         vm.store(VReg.V2, 0, VReg.V1);
+
+        // [argv] 恢复溢出槽,供体内 emitArgvSpillSnapshot / arguments 读取第 6+ 实参。
+        vm.lea(VReg.V2, "_call_argv");
+        for (let i = 5; i < 16; i++) {
+            vm.load(VReg.V1, VReg.S1, CORO_ARGV + (i - 5) * 8);
+            vm.store(VReg.V2, i * 8, VReg.V1);
+        }
 
         // 调用协程函数
         vm.load(VReg.V6, VReg.S1, 56); // func_ptr
@@ -984,6 +1380,74 @@ export class CoroutineGenerator {
         // 设置状态为完成
         vm.movImm(VReg.V1, CORO_STATUS_COMPLETED);
         vm.store(VReg.V0, 8, VReg.V1);
+
+        // [async-gen] await 之后体 return:resume 方是调度器而非
+        // _async_generator_next/return,后者已把 P 还给调用方。必须在完成点
+        // 结算 coro+88,否则 P 一直 pending,或其它路径用 +72==0 填成 undefined。
+        vm.load(VReg.V1, VReg.V0, 88);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_cr_no_agen_p");
+        // 普通 async stub 在 +168 置 1。其 Promise 由 emitAsyncResolve/Reject 结算;
+        // 再走下方 _generator_make_result 会把函数 Promise 改写成 {value,done:true}
+        // (throw 变 fulfill、`return 42` 变成对象)。此处只做 pending 兜底 reject。
+        vm.load(VReg.V2, VReg.V0, 168);
+        vm.cmpImm(VReg.V2, 1);
+        vm.jne("_cr_agen_wrap");
+        vm.push(VReg.V0);
+        vm.lea(VReg.V2, "_exception_pending");
+        vm.load(VReg.V3, VReg.V2, 0);
+        vm.cmpImm(VReg.V3, 0);
+        vm.jeq("_cr_async_fn_res");
+        vm.lea(VReg.V2, "_exception_value");
+        vm.load(VReg.A1, VReg.V2, 0);
+        vm.load(VReg.A0, VReg.V0, 88);
+        vm.call("_promise_reject");
+        vm.lea(VReg.V2, "_exception_pending");
+        vm.movImm(VReg.V3, 0);
+        vm.store(VReg.V2, 0, VReg.V3);
+        vm.jmp("_cr_async_fn_clear");
+        vm.label("_cr_async_fn_res");
+        // emitAsyncResolve 未打到本 Promise 时的兜底:用 +72 原值兑现,不要 {value,done}。
+        vm.load(VReg.A1, VReg.V0, 72);
+        vm.load(VReg.A0, VReg.V0, 88);
+        vm.call("_promise_resolve");
+        vm.label("_cr_async_fn_clear");
+        vm.pop(VReg.V0);
+        vm.movImm(VReg.V1, 0);
+        vm.store(VReg.V0, 88, VReg.V1);
+        vm.jmp("_cr_no_agen_p");
+        vm.label("_cr_agen_wrap");
+        vm.push(VReg.V0); // 跨 helper 保 coro
+        vm.lea(VReg.V2, "_exception_pending");
+        vm.load(VReg.V3, VReg.V2, 0);
+        vm.cmpImm(VReg.V3, 0);
+        vm.jne("_cr_agen_rej");
+        vm.load(VReg.A0, VReg.V0, 72);
+        vm.cmpImm(VReg.A0, 0);
+        vm.jne("_cr_agen_val_ok");
+        vm.movImm64(VReg.A0, 0x7ffb000000000000n);
+        vm.label("_cr_agen_val_ok");
+        vm.movImm64(VReg.A1, 0x7ff9000000000001n);
+        vm.call("_generator_make_result");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.pop(VReg.V0);
+        vm.load(VReg.A0, VReg.V0, 88);
+        vm.push(VReg.V0);
+        vm.call("_promise_resolve");
+        vm.jmp("_cr_agen_p_done");
+        vm.label("_cr_agen_rej");
+        vm.lea(VReg.V2, "_exception_value");
+        vm.load(VReg.A1, VReg.V2, 0);
+        vm.load(VReg.A0, VReg.V0, 88);
+        vm.call("_promise_reject");
+        vm.lea(VReg.V2, "_exception_pending");
+        vm.movImm(VReg.V3, 0);
+        vm.store(VReg.V2, 0, VReg.V3);
+        vm.label("_cr_agen_p_done");
+        vm.pop(VReg.V0);
+        vm.movImm(VReg.V1, 0);
+        vm.store(VReg.V0, 88, VReg.V1);
+        vm.label("_cr_no_agen_p");
 
         // 回到 resumer(谁 resume 了本协程)而非硬编码主协程 —— 支持嵌套
         vm.load(VReg.V1, VReg.V0, CORO_RESUMER);

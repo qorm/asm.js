@@ -194,6 +194,12 @@ const keywords = {
 // 查找标识符是否为关键字
 // inTemplateExpression: 当在模板字符串表达式 ${...} 内部时，关键字应作为标识符处理
 export function lookupIdent(ident, inTemplateExpression = false) {
+    // 关键字全是长度 2..10 的小写 ASCII;长/短/非 a-z 起头直接 IDENT,免 gen1 属性未命中税
+    const len = ident.length;
+    if (len < 2 || len > 10) return TokenType.IDENT;
+    const c0 = ident.charCodeAt(0);
+    if (c0 < 97 || c0 > 122) return TokenType.IDENT;
+
     // 用 keywords[ident] 直接查 + typeof 判定，替代
     // Object.prototype.hasOwnProperty.call(keywords, ident)：后者依赖 .call/原型访问，
     // 编译产物（gen1）里 Object.prototype 访问与 Function.prototype.call 都会崩。

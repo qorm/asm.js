@@ -90,7 +90,7 @@ export const StatementParser = {
             return decl;
         } else if (this.curTokenIs(TokenType.FUNCTION)) {
             return this.parseFunctionDeclaration();
-        } else if (this.curTokenIs(TokenType.ASYNC) && !this.curToken.escaped && this.peekTokenIs(TokenType.FUNCTION)) {
+        } else if (this.isAsyncFunctionHead()) {
             return this.parseFunctionDeclaration();
         } else if (this.curTokenIs(TokenType.CLASS)) {
             return this.parseClassDeclaration();
@@ -349,6 +349,8 @@ export const StatementParser = {
         const prevLabelStack = this._labelStack;
         this._labelStack = [];
         let body = this.parseBlockStatement();
+        this.checkFormalLexicalConflict(params, body);
+        this.checkLexVarConflict(body && body.body);
         this._usedLabels = prevLabels;
         this._labelStack = prevLabelStack;
         if (isStrict) this.fnStrictDepth--;
@@ -368,12 +370,11 @@ export const StatementParser = {
         if (name === "yield" && this._immediateGen) {
             this.errors.push("Cannot use 'yield' as a binding name inside a generator");
         }
-        // [static-block-await] 静态初始化块直属语句是模块上下文,await 是保留字(不仅
-        // async 函数内);按 fnDepth 匹配:直属语句(含直接内嵌函数表达式的名字/形参,
-        // fnDepth+1 且 _inFormalParams)拒;嵌套函数**体**内的声明不穿透。
+        // [static-block-await] 静态初始化块直属语句是模块上下文,await 是保留字;
+        // ContainsAwait 不下钻函数边界,故只拒 fnDepth===staticBlockDepth 的直属绑定
+        // (`var await` / `let await`)。嵌套函数的名字/形参(`(function await(await){})`)合法。
         if (name === "await" && (this._immediateAsync ||
-            (this._staticBlockDepth && (this.fnDepth === this._staticBlockDepth ||
-                (this._inFormalParams && this.fnDepth === this._staticBlockDepth + 1))))) {
+            (this._staticBlockDepth && !this._immediateGen && this.fnDepth === this._staticBlockDepth))) {
             this.errors.push("Cannot use 'await' as a binding name inside an async function");
         }
         if (this.fnStrictDepth > 0 && (name === "eval" || name === "arguments")) {
@@ -385,6 +386,124 @@ export const StatementParser = {
     // 仅在「绑定/形参/声明名」位调用(绝不在属性名/方法名/标签位,故 { if:1 } / o.public=1 合法)。
     // 恒保留字任何模式报错;严格保留字仅 inStrictMode 报错(sloppy var let=1 / var public=1 仍合法)。
     // yield 生成器内 / await 异步内由 checkYieldAwaitBinding 另管,此处不重复。
+    // [no LineTerminator here] `async` 与 `function` 之间不得换行,否则 `async`
+    // 是标识符、后面的 function 是独立声明(`async\nfunction foo(){}`)。
+    isAsyncFunctionHead() {
+        return this.curTokenIs(TokenType.ASYNC) && !this.curToken.escaped &&
+            this.peekTokenIs(TokenType.FUNCTION) &&
+            !this.peekToken.lineBreakBefore &&
+            this.peekToken.line === this.curToken.line;
+    },
+
+    // LexicallyDeclaredNames(不进嵌套函数/类体):let/const/class;strict 下含
+    // FunctionDeclaration。供形参冲突与 lex∩var 早期错误。
+    _collectLexicalNames(node, out) {
+        if (!node || typeof node !== "object") return;
+        const t = node.type;
+        if (t === "VariableDeclaration") {
+            if (node.kind === "let" || node.kind === "const") {
+                const decls = node.declarations || [];
+                for (let i = 0; i < decls.length; i++) {
+                    if (decls[i].id) collectPatternNames(decls[i].id, out);
+                }
+            }
+            return;
+        }
+        if (t === "ClassDeclaration") {
+            if (node.id && node.id.type === "Identifier" && node.id.name) out[node.id.name] = true;
+            return;
+        }
+        if (t === "FunctionDeclaration") {
+            if (this.inStrictMode() && node.id && node.id.type === "Identifier" && node.id.name) {
+                out[node.id.name] = true;
+            }
+            return;
+        }
+        if (t === "FunctionExpression" || t === "ArrowFunctionExpression" || t === "ClassExpression") {
+            return;
+        }
+        if (t === "BlockStatement") {
+            const body = node.body || [];
+            for (let i = 0; i < body.length; i++) this._collectLexicalNames(body[i], out);
+            return;
+        }
+        if (t === "IfStatement") {
+            this._collectLexicalNames(node.consequent, out);
+            this._collectLexicalNames(node.alternate, out);
+            return;
+        }
+        if (t === "WhileStatement" || t === "DoWhileStatement" || t === "LabeledStatement" ||
+            t === "WithStatement") {
+            this._collectLexicalNames(node.body, out);
+            return;
+        }
+        if (t === "ForStatement") {
+            this._collectLexicalNames(node.init, out);
+            this._collectLexicalNames(node.body, out);
+            return;
+        }
+        if (t === "ForInStatement" || t === "ForOfStatement") {
+            this._collectLexicalNames(node.left, out);
+            this._collectLexicalNames(node.body, out);
+            return;
+        }
+        if (t === "TryStatement") {
+            this._collectLexicalNames(node.block, out);
+            if (node.handler) this._collectLexicalNames(node.handler.body, out);
+            this._collectLexicalNames(node.finalizer, out);
+            return;
+        }
+        if (t === "SwitchStatement") {
+            const cases = node.cases || [];
+            for (let i = 0; i < cases.length; i++) {
+                const cons = cases[i].consequent || [];
+                for (let j = 0; j < cons.length; j++) this._collectLexicalNames(cons[j], out);
+            }
+            return;
+        }
+        if (t === "ExportDeclaration" || t === "ExportNamedDeclaration" || t === "ExportDefaultDeclaration") {
+            this._collectLexicalNames(node.declaration, out);
+        }
+    },
+
+    // StatementList 的 LexicallyDeclaredNames ∩ VarDeclaredNames。
+    checkLexVarConflict(stmts) {
+        if (!stmts) return;
+        const lex = Object.create(null);
+        const vars = Object.create(null);
+        for (let i = 0; i < stmts.length; i++) {
+            this._collectLexicalNames(stmts[i], lex);
+            collectVarDeclarations(stmts[i], vars);
+        }
+        for (const n in lex) {
+            if (vars[n] === true) {
+                this.errors.push("Identifier '" + n + "' has already been declared");
+                return;
+            }
+        }
+    },
+
+    // FormalParameters BoundNames ∩ FunctionBody LexicallyDeclaredNames。
+    checkFormalLexicalConflict(params, body) {
+        if (!params || !body) return;
+        const plist = [];
+        for (let i = 0; i < params.length; i++) this.collectParamNames(params[i], plist);
+        if (plist.length === 0) return;
+        const pnames = Object.create(null);
+        for (let i = 0; i < plist.length; i++) pnames[plist[i]] = true;
+        const lex = Object.create(null);
+        if (body.type === "BlockStatement") {
+            const stmts = body.body || [];
+            for (let i = 0; i < stmts.length; i++) this._collectLexicalNames(stmts[i], lex);
+        }
+        for (const n in lex) {
+            if (pnames[n] === true) {
+                this.errors.push("Identifier '" + n + "' has already been declared");
+                return;
+            }
+        }
+    },
+
     checkReservedBinding(name) {
         if (typeof name !== "string" || name.length === 0) return;
         // [test262 早期错误 A] strict 模式下 eval/arguments 不得作为绑定标识符。
@@ -639,7 +758,10 @@ export const StatementParser = {
         let stmt = new AST.ReturnStatement(null);
         // 裸 return(无实参):peek 为 } / ; / EOF 时不得越过 return——否则会把块的
         // 收尾 } 当成 return 自身的末 token 吞掉,吃掉其后一条语句(bare-return swallow)。
-        if (!this.peekTokenIs(TokenType.SEMICOLON) && !this.peekTokenIs(TokenType.RBRACE) && !this.peekTokenIs(TokenType.EOF)) {
+        // return 与 Identifier_opt 之间有 LineTerminator → ASI,无实参(S12.9_A2)。
+        if (!this.peekTokenIs(TokenType.SEMICOLON) && !this.peekTokenIs(TokenType.RBRACE) &&
+            !this.peekTokenIs(TokenType.EOF) &&
+            !this.peekToken.lineBreakBefore && this.peekToken.line === this.curToken.line) {
             this.nextToken();
             stmt.argument = this.parseExpression(Precedence.LOWEST);
         }
@@ -952,12 +1074,17 @@ export const StatementParser = {
         this._markBreakableLabels();
         let cases = [];
         this.nextToken();
+        let sawDefault = false;
         while (!this.curTokenIs(TokenType.RBRACE) && !this.curTokenIs(TokenType.EOF)) {
             let test = null;
             if (this.curTokenIs(TokenType.CASE)) {
                 this.nextToken();
                 test = this.parseExpression(Precedence.LOWEST);
-            } else if (!this.curTokenIs(TokenType.DEFAULT)) {
+            } else if (this.curTokenIs(TokenType.DEFAULT)) {
+                if (sawDefault) this.errors.push("More than one default clause in switch statement");
+                sawDefault = true;
+            } else {
+                this.errors.push("Unexpected token in switch statement");
                 this.nextToken();
                 continue;
             }
@@ -1096,19 +1223,38 @@ export const StatementParser = {
     },
 
     parseExpressionStatement() {
-        let expr = this.parseExpression(Precedence.LOWEST);
         // [test262 cover-initialized-name] CoverInitializedName(`{a = 1}`)仅在解构
         // 目标位合法:表达式位(裸对象/实参等)是早期错误。AssignmentExpression 的
         // LHS 是目标位(跳过);其余位置出现 _coverInit 属性即报。
-        {
+        // 绝大多数表达式语句无 CoverInitializedName:由对象字面量解析置
+        // _seenCoverInit,未置则跳过整树扫描(gen1 上每条表达式语句的 for-in 很贵)。
+        this._seenCoverInit = false;
+        let expr = this.parseExpression(Precedence.LOWEST);
+        if (this._seenCoverInit) {
             const hasCover = (node) => {
                 if (!node || typeof node !== "object") return false;
                 if (Array.isArray(node)) {
                     for (let k = 0; k < node.length; k++) if (hasCover(node[k])) return true;
                     return false;
                 }
-                if (node.type === "AssignmentExpression") return hasCover(node.right);
-                if (node.type === "ObjectExpression") {
+                const t = node.type;
+                // 嵌套函数/类有各自的表达式语句检查,不得把体内 for-of 解构
+                // (`iter = (function*(){ for ({ x = yield } of …) })()`)误判成
+                // 外层赋值表达式位的 CoverInitializedName。
+                if (t === "FunctionExpression" || t === "FunctionDeclaration" ||
+                    t === "ArrowFunctionExpression" || t === "ClassExpression" ||
+                    t === "ClassDeclaration") return false;
+                // 叶子:无对象字面量
+                if (t === "Identifier" || t === "Literal" || t === "ThisExpression" ||
+                    t === "Super" || t === "PrivateIdentifier" || t === "MetaProperty" ||
+                    t === "EmptyStatement") return false;
+                // 解构目标位:赋值左、for-of/in 左、声明绑定。只扫表达式位。
+                if (t === "AssignmentExpression") return hasCover(node.right);
+                if (t === "ForOfStatement" || t === "ForInStatement") {
+                    return hasCover(node.right) || hasCover(node.body);
+                }
+                if (t === "VariableDeclarator") return hasCover(node.init);
+                if (t === "ObjectExpression") {
                     const prs = node.properties || [];
                     for (let k = 0; k < prs.length; k++) {
                         if (prs[k] && prs[k]._coverInit) return true;
@@ -1116,9 +1262,50 @@ export const StatementParser = {
                     }
                     return false;
                 }
+                // 类型化下钻(避免 Identifier 上的 for-in)
+                if (t === "MemberExpression") {
+                    return hasCover(node.object) || (node.computed && hasCover(node.property));
+                }
+                if (t === "CallExpression" || t === "NewExpression") {
+                    if (hasCover(node.callee)) return true;
+                    const args = node.arguments;
+                    if (args) for (let i = 0; i < args.length; i++) if (hasCover(args[i])) return true;
+                    return false;
+                }
+                if (t === "BinaryExpression" || t === "LogicalExpression") {
+                    return hasCover(node.left) || hasCover(node.right);
+                }
+                if (t === "UnaryExpression" || t === "UpdateExpression" ||
+                    t === "AwaitExpression" || t === "YieldExpression" ||
+                    t === "ThrowStatement" || t === "ReturnStatement") {
+                    return hasCover(node.argument);
+                }
+                if (t === "ConditionalExpression") {
+                    return hasCover(node.test) || hasCover(node.consequent) || hasCover(node.alternate);
+                }
+                if (t === "SequenceExpression" || t === "TemplateLiteral") {
+                    const xs = node.expressions;
+                    if (xs) for (let i = 0; i < xs.length; i++) if (hasCover(xs[i])) return true;
+                    return false;
+                }
+                if (t === "ArrayExpression") {
+                    const els = node.elements;
+                    if (els) for (let i = 0; i < els.length; i++) if (hasCover(els[i])) return true;
+                    return false;
+                }
+                if (t === "Property" || t === "PropertyDefinition") {
+                    return hasCover(node.value);
+                }
+                if (t === "BlockStatement" || t === "Program") {
+                    const body = node.body;
+                    if (body) for (let i = 0; i < body.length; i++) if (hasCover(body[i])) return true;
+                    return false;
+                }
+                if (t === "ExpressionStatement") return hasCover(node.expression);
                 for (const key in node) {
                     if (key === "type" || key === "loc" || key === "range" ||
                         key === "start" || key === "end") continue;
+                    if (key.length > 0 && key.charCodeAt(0) === 95) continue;
                     if (hasCover(node[key])) return true;
                 }
                 return false;

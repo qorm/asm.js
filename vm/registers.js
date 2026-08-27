@@ -56,3 +56,18 @@ export const RegType = {
     SPECIAL: "special", // 特殊用途
 };
 
+// 用户函数 LSRA 虚拟临时:"T" + 十进制序号。不进 backend.regMap;
+// 仅存在于 beginRecord/endRecord 缓冲,分配后改写为物理 VReg 或 spill home。
+export function isTemp(x) {
+    if (typeof x !== "string" || x.length < 2 || x.charCodeAt(0) !== 84) return false; // 'T'
+    for (let i = 1; i < x.length; i++) {
+        const c = x.charCodeAt(i);
+        if (c < 48 || c > 57) return false;
+    }
+    return true;
+}
+
+export function makeTempName(seq) {
+    return "T" + seq;
+}
+

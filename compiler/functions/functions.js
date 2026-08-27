@@ -1661,6 +1661,32 @@ export const FunctionCompiler = {
                     this.vm.call("_object_set");
                     this.vm.label(noCause);
                 }
+                this.emitMarkSuperCalled();
+                return;
+            }
+            // Promise 标识符父:无 classinfo,skip 会让 super(ex) 空操作 →
+            // NewPromiseCapability 收不到 resolve/reject(ctx-ctor 族)。
+            if (superName === "Promise" && thisOffset != null && !this.ctx.superClassExpr) {
+                if (expr.arguments.length >= 1) {
+                    this.compileExpression(expr.arguments[0]);
+                } else {
+                    this.vm.movImm64(VReg.RET, 0x7ffb000000000000n);
+                }
+                const execOff = this.ctx.allocLocal(`__super_p_exec_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, execOff, VReg.RET);
+                this.vm.load(VReg.A0, VReg.FP, thisOffset);
+                this.vm.mov(VReg.V1, VReg.A0);
+                this.vm.shrImm(VReg.V2, VReg.V1, 48);
+                this.vm.cmpImm(VReg.V2, 0);
+                const superPBoxed = this.ctx.newLabel("super_p_boxed");
+                this.vm.jne(superPBoxed);
+                this.vm.movImm64(VReg.V2, 0x7ffd000000000000n);
+                this.vm.or(VReg.A0, VReg.V1, VReg.V2);
+                this.vm.label(superPBoxed);
+                this.vm.load(VReg.A1, VReg.FP, execOff);
+                this.vm.call("_promise_super_init");
+                this.vm.store(VReg.FP, thisOffset, VReg.RET);
+                this.emitMarkSuperCalled();
                 return;
             }
             // 加载父类信息对象 → S1（本模块声明用 classinfo 槽；导入的父类
@@ -1695,6 +1721,29 @@ export const FunctionCompiler = {
             if (thisOffset) this.vm.load(VReg.A0, VReg.FP, thisOffset);
             this.vm.callIndirect(VReg.S2);
             this.vm.label(superSkipLabel);
+            // extends Promise 内建 heritage 无 classinfo → 上方 superSkip。
+            if (superName === "Promise" && thisOffset != null && !this.ctx.superClassExpr) {
+                if (expr.arguments.length >= 1) {
+                    this.compileExpression(expr.arguments[0]);
+                } else {
+                    this.vm.movImm64(VReg.RET, 0x7ffb000000000000n);
+                }
+                const execOff2 = this.ctx.allocLocal(`__super_p_exec2_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, execOff2, VReg.RET);
+                this.vm.load(VReg.A0, VReg.FP, thisOffset);
+                this.vm.mov(VReg.V1, VReg.A0);
+                this.vm.shrImm(VReg.V2, VReg.V1, 48);
+                this.vm.cmpImm(VReg.V2, 0);
+                const superPBoxed2 = this.ctx.newLabel("super_p_boxed2");
+                this.vm.jne(superPBoxed2);
+                this.vm.movImm64(VReg.V2, 0x7ffd000000000000n);
+                this.vm.or(VReg.A0, VReg.V1, VReg.V2);
+                this.vm.label(superPBoxed2);
+                this.vm.load(VReg.A1, VReg.FP, execOff2);
+                this.vm.call("_promise_super_init");
+                this.vm.store(VReg.FP, thisOffset, VReg.RET);
+            }
+            this.emitMarkSuperCalled();
             return;
         }
 

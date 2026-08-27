@@ -24,6 +24,11 @@
 //   --compile-timeout <ms>  default 30000
 //   --run-timeout <ms>      default 10000
 //   --quiet          Suppress per-test progress
+//   --no-report      Print totals only; do not write last_report.md / JSON
+//
+// Compile uses a fixed pool of resident Node child IPC workers (`--jobs`):
+// each worker loads the compiler module graph once, then `new Compiler` +
+// `compileFile` per test. Native binaries are still spawned independently.
 //
 // Output:
 //   tests/test262/last_report.md    human report (committed)
@@ -34,11 +39,11 @@ import { spawn, execFileSync } from "child_process";
 import { join, dirname, resolve, relative } from "path";
 import { fileURLToPath } from "url";
 import { tmpdir } from "os";
+import { CompilePool, aggregateTiming, formatTiming } from "./compile-pool.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const REPO = resolve(__dirname, "..", "..");
-const CLI = join(REPO, "cli.js");
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -228,7 +233,7 @@ const HOST_SHIMS = `
 function print(m){ console.log(String(m)); }
 var $262 = {
   createRealm: function(){ throw new Error("$262.createRealm unsupported"); },
-  detachArrayBuffer: function(buffer){ /* asm.js: buffer detach not fully implemented yet */ },
+  detachArrayBuffer: function(buffer){ __detachArrayBuffer(buffer); },
   evalScript: function(){ throw new Error("$262.evalScript unsupported"); },
   gc: function(){},
   global: this,
@@ -319,16 +324,23 @@ function gitRunnerSha() {
 //   CRASH        segfault / signal / timeout at compile or run
 // For negative tests the expected outcome is inverted (see below).
 
-async function runOneTest(t, opt, workdir) {
+async function runOneTest(t, opt, workdir, pool) {
   const srcPath = join(workdir, "t" + t.id + ".js");
   const binPath = join(workdir, "t" + t.id);
   writeFileSync(srcPath, t.source);
 
-  // Compile
-  const comp = await run(process.execPath,
-    [CLI, srcPath, "-o", binPath, "--target", opt.target], opt.compileTimeout);
+  const tCompile = Date.now();
+  const comp = await pool.compile({
+    sourcePath: srcPath,
+    outputPath: binPath,
+    target: opt.target,
+    cacheIdentity: t.rel + (t.strict ? "#strict" : "#sloppy"),
+    timeoutMs: opt.compileTimeout,
+  });
+  const compileMs = comp.compileMs || (Date.now() - tCompile);
+  const cacheHit = (comp.cacheHit === true || comp.cacheHit === false) ? comp.cacheHit : null;
 
-  const compiledOk = comp.code === 0 && existsSync(binPath);
+  const compiledOk = comp.ok && existsSync(binPath);
   const compileCrash = comp.timedOut || (comp.signal && comp.signal !== "SIGKILL");
 
   // NEGATIVE tests: expected error at a phase.
@@ -337,55 +349,61 @@ async function runOneTest(t, opt, workdir) {
     // parse / resolution => must fail to compile (asm.js has no separate resolve step)
     if (phase === "parse" || phase === "resolution" || phase === "early") {
       cleanup(srcPath, binPath);
-      if (comp.timedOut) return cls("CRASH", "negative-parse compile timeout");
+      if (comp.timedOut) return cls("CRASH", "negative-parse compile timeout", compileMs, 0, cacheHit);
       return compiledOk
-        ? cls("FAIL", "expected " + phase + " error but asm.js compiled it")
-        : cls("PASS", "compile rejected as expected (" + (t.meta.negative.type || "error") + ")");
+        ? cls("FAIL", "expected " + phase + " error but asm.js compiled it", compileMs, 0, cacheHit)
+        : cls("PASS", "compile rejected as expected (" + (t.meta.negative.type || "error") + ")", compileMs, 0, cacheHit);
     }
     // runtime: must compile, then throw at run time (nonzero exit, not a crash signal)
     if (!compiledOk) {
       cleanup(srcPath, binPath);
-      if (comp.timedOut) return cls("CRASH", "compile timeout");
-      return cls("COMPILE_FAIL", "runtime-negative failed to compile: " + firstLine(comp.stderr));
+      if (comp.timedOut) return cls("CRASH", "compile timeout", compileMs, 0, cacheHit);
+      return cls("COMPILE_FAIL", "runtime-negative failed to compile: " + firstLine(comp.stderr), compileMs, 0, cacheHit);
     }
+    const tRun = Date.now();
     const r = await run(binPath, [], opt.runTimeout);
+    const runMs = Date.now() - tRun;
     cleanup(srcPath, binPath);
-    if (r.timedOut) return cls("CRASH", "run timeout");
-    if (r.signal) return cls("CRASH", "run signal " + r.signal);
+    if (r.timedOut) return cls("CRASH", "run timeout", compileMs, runMs, cacheHit);
+    if (r.signal) return cls("CRASH", "run signal " + r.signal, compileMs, runMs, cacheHit);
     return r.code !== 0
-      ? cls("PASS", "threw at runtime as expected (" + (t.meta.negative.type || "error") + ")")
-      : cls("FAIL", "expected runtime " + (t.meta.negative.type || "error") + " but exited 0");
+      ? cls("PASS", "threw at runtime as expected (" + (t.meta.negative.type || "error") + ")", compileMs, runMs, cacheHit)
+      : cls("FAIL", "expected runtime " + (t.meta.negative.type || "error") + " but exited 0", compileMs, runMs, cacheHit);
   }
 
   // POSITIVE tests
   if (!compiledOk) {
     cleanup(srcPath, binPath);
-    if (compileCrash) return cls("CRASH", "compiler crashed/timeout: " + comp.signal);
-    return cls("COMPILE_FAIL", firstLine(comp.stderr) || "compile exit " + comp.code);
+    if (compileCrash) return cls("CRASH", "compiler crashed/timeout: " + comp.signal, compileMs, 0, cacheHit);
+    return cls("COMPILE_FAIL", firstLine(comp.stderr) || "compile exit " + comp.code, compileMs, 0, cacheHit);
   }
+  const tRun = Date.now();
   const r = await run(binPath, [], opt.runTimeout);
+  const runMs = Date.now() - tRun;
   cleanup(srcPath, binPath);
-  if (r.timedOut) return cls("CRASH", "run timeout");
-  if (r.signal && r.signal !== "SIGKILL") return cls("CRASH", "run signal " + r.signal);
-  if (r.code === null) return cls("CRASH", "no exit code");
+  if (r.timedOut) return cls("CRASH", "run timeout", compileMs, runMs, cacheHit);
+  if (r.signal && r.signal !== "SIGKILL") return cls("CRASH", "run signal " + r.signal, compileMs, runMs, cacheHit);
+  if (r.code === null) return cls("CRASH", "no exit code", compileMs, runMs, cacheHit);
 
   if (t.meta.flags.includes("async")) {
     // async: success signalled via stdout marker printed by $DONE.
     if (r.stdout.includes("Test262:AsyncTestComplete") && !r.stdout.includes("Test262:AsyncTestFailure")) {
-      return cls("PASS", "async complete");
+      return cls("PASS", "async complete", compileMs, runMs, cacheHit);
     }
     if (r.stdout.includes("Test262:AsyncTestFailure")) {
-      return cls("FAIL", "async: " + firstLine(r.stdout.split("Test262:AsyncTestFailure")[1] || ""));
+      return cls("FAIL", "async: " + firstLine(r.stdout.split("Test262:AsyncTestFailure")[1] || ""), compileMs, runMs, cacheHit);
     }
-    return cls("FAIL", r.code !== 0 ? "async threw (exit " + r.code + ")" : "async never signalled $DONE");
+    return cls("FAIL", r.code !== 0 ? "async threw (exit " + r.code + ")" : "async never signalled $DONE", compileMs, runMs, cacheHit);
   }
 
   return r.code === 0
-    ? cls("PASS", "")
-    : cls("FAIL", "exit " + r.code + (r.stderr ? ": " + firstLine(r.stderr) : ""));
+    ? cls("PASS", "", compileMs, runMs, cacheHit)
+    : cls("FAIL", "exit " + r.code + (r.stderr ? ": " + firstLine(r.stderr) : ""), compileMs, runMs, cacheHit);
 }
 
-function cls(status, detail) { return { status, detail }; }
+function cls(status, detail, compileMs, runMs, cacheHit) {
+  return { status, detail, compileMs: compileMs || 0, runMs: runMs || 0, cacheHit: cacheHit ?? null };
+}
 function firstLine(s) { return (s || "").split("\n").map((x) => x.trim()).filter(Boolean)[0] || ""; }
 function cleanup(...paths) { for (const p of paths) { try { rmSync(p, { force: true }); } catch {} } }
 
@@ -471,7 +489,7 @@ async function main() {
   const workdir = join(tmpdir(), "asm.js-t262-" + process.pid);
   mkdirSync(workdir, { recursive: true });
 
-  // Worker pool.
+  const compilePool = new CompilePool({ size: opt.jobs, repo: REPO });
   const results = new Array(tests.length);
   let next = 0, completed = 0;
   const t0 = Date.now();
@@ -481,11 +499,12 @@ async function main() {
       if (i >= tests.length) return;
       const t = tests[i];
       let res;
-      try { res = await runOneTest(t, opt, workdir); }
-      catch (e) { res = cls("CRASH", "harness error: " + e.message); }
+      try { res = await runOneTest(t, opt, workdir, compilePool); }
+      catch (e) { res = cls("CRASH", "harness error: " + e.message, 0, 0, null); }
       results[i] = { rel: t.rel, status: res.status, detail: res.detail,
                      flags: t.meta.flags, negative: t.meta.negative,
-                     features: t.meta.features, includes: t.meta.includes };
+                     features: t.meta.features, includes: t.meta.includes,
+                     compileMs: res.compileMs, runMs: res.runMs, cacheHit: res.cacheHit };
       completed++;
       if (!opt.quiet && completed % 50 === 0) {
         const rate = completed / ((Date.now() - t0) / 1000);
@@ -493,7 +512,12 @@ async function main() {
       }
     }
   }
-  await Promise.all(Array.from({ length: opt.jobs }, worker));
+  try {
+    await compilePool.start();
+    await Promise.all(Array.from({ length: opt.jobs }, worker));
+  } finally {
+    await compilePool.close();
+  }
   if (!opt.quiet) process.stderr.write("\n");
   try { rmSync(workdir, { recursive: true, force: true }); } catch {}
 
@@ -514,20 +538,26 @@ async function main() {
   }
   const runCount = tests.length;
   const pct = (n) => runCount ? ((100 * n) / runCount).toFixed(2) : "0.00";
+  const timing = aggregateTiming(results);
+  const wallMs = Date.now() - t0;
 
   // ---- Report ----
-  const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+  const elapsed = (wallMs / 1000).toFixed(1);
   const report = buildReport({
     opt, dirs, files: files.length, excluded, excludedFeatureCounts,
     eligible: eligible.length, run: runCount, totals, pct, byArea, failPatterns,
-    failByFeature, elapsed,
+    failByFeature, elapsed, timing,
   });
   // 部分/过滤运行(--no-report)不落地委托报告:否则 headline 被局部样本覆盖。
   if (opt.noReport) {
     const bad = results.filter((r) => r.status !== "PASS");
-    for (const r of bad) console.error(`${r.status} ${r.rel}  ${r.detail}`);
+    for (const r of bad) {
+      console.error(`${r.status} ${r.rel}  ${r.detail}` +
+        `  compileMs=${r.compileMs} runMs=${r.runMs} cacheHit=${r.cacheHit}`);
+    }
     console.error(`\nrun=${runCount} PASS=${totals.PASS} FAIL=${totals.FAIL} ` +
       `COMPILE_FAIL=${totals.COMPILE_FAIL} CRASH=${totals.CRASH} (${pct(totals.PASS)}%, ${elapsed}s)`);
+    console.error(formatTiming(timing, wallMs));
     return;
   }
   writeFileSync(join(__dirname, "last_report.md"), report);
@@ -542,6 +572,7 @@ async function main() {
     discovered: files.length, excluded, excludedFeatureCounts, eligible: eligible.length,
     run: runCount, totals,
     passRatePct: Number(pct(totals.PASS)),
+    timing,
     byArea,
     topFailPatterns: topN(failPatterns, 30),
   };
@@ -549,10 +580,14 @@ async function main() {
   writeFileSync(join(__dirname, "last_run_summary.json"), JSON.stringify(summary, null, 2));
   writeFileSync(join(__dirname, "last_run.json"), JSON.stringify({
     ...summary,
-    results: results.map((r) => ({ test: r.rel, status: r.status, detail: r.detail })),
+    results: results.map((r) => ({
+      test: r.rel, status: r.status, detail: r.detail,
+      compileMs: r.compileMs, runMs: r.runMs, cacheHit: r.cacheHit,
+    })),
   }, null, 2));
 
   console.error(report.split("\n").slice(0, 42).join("\n"));
+  console.error(formatTiming(timing, wallMs));
   console.error(`\nWrote tests/test262/last_report.md and last_run.json  (${elapsed}s)`);
 }
 
@@ -662,8 +697,10 @@ function buildReport(d) {
   P("  the test body. `raw` tests run the body alone. `onlyStrict` tests get a leading `\"use strict\";`.");
   P("- **One variant per test**: strict where `onlyStrict`, else the sloppy variant (we do not run");
   P("  both strict+sloppy for flag-less tests — a deliberate, stated bound to keep the AOT run tractable).");
-  P("- Each assembled test is AOT-compiled (`node cli.js t.js -o t --target " + d.opt.target + "`, "
-    + d.opt.compileTimeout / 1000 + "s timeout) then executed (" + d.opt.runTimeout / 1000 + "s timeout).");
+  P("- Each assembled test is AOT-compiled by a resident Node compile worker " +
+    "(`new Compiler` + `compileFile` per test; compiler modules loaded once per `--jobs` worker; " +
+    d.opt.jobs + " workers, target `" + d.opt.target + "`, " +
+    d.opt.compileTimeout / 1000 + "s timeout) then executed (" + d.opt.runTimeout / 1000 + "s timeout).");
   P("- Classification: PASS = positive test exits 0 (async: `Test262:AsyncTestComplete` on stdout);");
   P("  FAIL = compiled+ran but assertion threw / wrong exit; COMPILE_FAIL = asm.js could not compile;");
   P("  CRASH = signal/timeout. NEGATIVE tests invert: parse/resolution ⇒ PASS iff compile fails;");
@@ -683,6 +720,22 @@ function buildReport(d) {
   P("node tests/test262/run.mjs" + (d.opt.stride > 1 ? " --stride " + d.opt.stride : "")
     + " --jobs " + d.opt.jobs + " --target " + d.opt.target);
   P("```");
+  P("");
+  if (d.timing) {
+    P("");
+    P("## Timing");
+    P("");
+    P(`- wall-clock: ${d.elapsed}s`);
+    P(`- compile-sum (parallel overlap not subtracted): ${(d.timing.compileMsSum / 1000).toFixed(1)}s`);
+    P(`- run-sum: ${(d.timing.runMsSum / 1000).toFixed(1)}s`);
+    P(`- cache warm (hit): ${d.timing.warm}` +
+      (d.timing.warm ? ` (avg ${d.timing.warmAvgMs.toFixed(1)}ms)` : ""));
+    P(`- cache cold (miss): ${d.timing.cold}` +
+      (d.timing.cold ? ` (avg ${d.timing.coldAvgMs.toFixed(1)}ms)` : ""));
+    if (d.timing.unknown) {
+      P(`- cache unknown: ${d.timing.unknown} (compileFile / cache helper did not report \`cacheHit\`)`);
+    }
+  }
   P("");
   P(`_Run wall-clock: ${d.elapsed}s._`);
   return L.join("\n") + "\n";

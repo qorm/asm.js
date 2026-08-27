@@ -117,7 +117,7 @@ export const ModuleParser = {
             // 允许无名声明,赋合成名 __default__,复用具名 default export 通道。
             if (this.curTokenIs(TokenType.FUNCTION)) {
                 declaration = this.parseFunctionDeclaration("__default__");
-            } else if (this.curTokenIs(TokenType.ASYNC) && this.peekTokenIs(TokenType.FUNCTION)) {
+            } else if (this.isAsyncFunctionHead()) {
                 declaration = this.parseFunctionDeclaration("__default__");
             } else if (this.curTokenIs(TokenType.CLASS)) {
                 declaration = this.parseClassDeclaration("__default__");
@@ -128,7 +128,7 @@ export const ModuleParser = {
         // export function/class/const/let/var
         else if (this.curTokenIs(TokenType.FUNCTION)) {
             declaration = this.parseFunctionDeclaration();
-        } else if (this.curTokenIs(TokenType.ASYNC) && this.peekTokenIs(TokenType.FUNCTION)) {
+        } else if (this.isAsyncFunctionHead()) {
             declaration = this.parseFunctionDeclaration();
         } else if (this.curTokenIs(TokenType.CLASS)) {
             declaration = this.parseClassDeclaration();

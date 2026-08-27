@@ -1,7 +1,7 @@
 // asm.js 编译器 - C 调用约定包装器生成
 // 为导出函数生成符合 C ABI 的包装器
 
-import { VReg } from "../../vm/index.js";
+import { VReg } from "../../vm/registers.js";
 
 // C 调用约定包装器生成器
 export class WrapperGenerator {

@@ -11,7 +11,8 @@
 import { Compiler } from "../compiler/index.js";
 import { VReg } from "../vm/index.js";
 import { RUNTIME_STRINGS } from "../runtime/core/strings.js";
-import { analyzeCapturedVariables } from "../lang/analysis/closure.js";
+import { analyzeCapturedVariables, collectVarDeclarations } from "../lang/analysis/closure.js";
+import { SYM_NAMES } from "./symbols.js";
 
 // 命名运行时字符串常量(label→值):`_str_comma_only`(join 默认分隔符)、
 // `_str_length_prop`/`_str_object` 等由内建方法内联 `lea _str_<名>` 引用。片段不跑
@@ -27,168 +28,22 @@ function _strLabelIsNumeric(s) {
     return true;
 }
 
-// 符号名 → id。**必须与 runtime/core/allocator.js generateEngineSymaddr 的 syms 顺序一致**。
-export const SYM_IDS = {
-    _number_coerce: 0,
-    _js_add: 1,
-    _valueToStr: 2,
-    _strconcat: 3,
-    _object_get_ic: 4,
-    _subscript_get: 5,
-    _math_sqrt: 6,
-    _js_band: 7,
-    _js_bor: 8,
-    _js_bxor: 9,
-    _js_bshl: 10,
-    _js_bshr: 11,
-    _js_bushr: 12,
-    _to_boolean: 13,
-    _js_relcmp: 14,
-    _math_abs: 15,
-    _math_floor: 16,
-    _math_ceil: 17,
-    _math_round: 18,
-    _math_pow: 19,
-    _heap_base: 20,
-    _heap_ptr: 21,
-    _abstract_eq: 22,
-    _floatToString: 23,
-    _array_new_with_size: 24,
-    _array_set: 25,
-    _object_new_sized: 26,
-    _object_define: 27,
-    _js_length: 28,
-    _js_box_string: 29,
-    _js_typeof: 30,
-    _array_join: 31,
-    _array_to_string: 32,
-    _str_toUpperCase: 33,
-    _str_toLowerCase: 34,
-    _str_slice: 35,
-    _str_indexOf: 36,
-    _str_charCodeAt: 37,
-    _str_split: 38,
-    _str_trim: 39,
-    _str_substring: 40,
-    _str_repeat: 41,
-    _str_includes: 42,
-    _str_replace: 43,
-    _js_unbox: 44,
-    _array_length: 45,
-    _getStrContent: 46,
-    _typeof: 47,
-    _to_int32: 48,
-    _object_get: 49,
-    _maybe_getter: 50,
-    _js_lt: 51,
-    _js_le: 52,
-    _js_gt: 53,
-    _js_ge: 54,
-    _math_trunc: 55,
-    _math_cbrt: 56,
-    _str_padStart: 57,
-    _str_padEnd: 58,
-    _str_at: 59,
-    _str_charAt: 60,
-    _str_startsWith: 61,
-    _str_endsWith: 62,
-    _str_replaceAll: 63,
-    _str_replaceAll_fn: 64,
-    _array_push: 65,
-    _array_get: 66,
-    _array_reverse: 67,
-    _array_slice: 68,
-    _array_includes: 69,
-    _array_indexOf: 70,
-    _array_at: 71,
-    _array_flat: 72,
-    _math_log: 73,
-    _math_log2: 74,
-    _math_log10: 75,
-    _math_exp: 76,
-    _throw_unwind: 77,
-    _js_parseInt: 78,
-    _js_parseFloat: 79,
-    _str_to_num: 80,
-    _is_bigint: 81,
-    _num_toFixed: 82,
-    _strcmp: 83,
-    _str_lastIndexOf: 84,
-    _instanceof: 85,
-    _num_toString: 86,
-    _subscript_set: 87,
-    _exception_value: 88,
-    _exception_pending: 89,
-    _typed_array_new: 90,
-    _alloc: 91,
-    _coroutine_create: 92,
-    _strict_eq: 93,
-    _syscall_arg: 94,
-    _promise_new: 95,
-    _scheduler_spawn: 96,
-    _box_alloc: 97,
-    _print_str: 98,
-    _exc_ctx_top: 99,
-    _str_codepoint_at: 100,
-    _object_new: 101,
-    _object_set: 102,
-    _str_cp_bytes: 103,
-    _map_entries: 104,
-    _tag_str_a1: 105,
-    _tag_key_a1: 106,
-    _validate_callable: 107,
-    _array_pop: 108,
-    _array_shift: 109,
-    _array_unshift: 110,
-    _array_splice: 111,
-    _array_concat: 112,
-    _box_arr_r: 113,
-    _iterator_close: 114,
-    _box_obj_r: 115,
-    _object_normalize_order: 116,
-    _intToStr: 117,
-    _is_symbol: 118,
-    _array_spread_into: 119,
-    _array_species_check: 120,
-    _agen_map: 121,
-    _agen_filter: 122,
-    _agen_splice: 123,
-    _array_splice_rt: 124,
-    _call_argc: 125,
-    // for-in 数组侧表具名键枚举(statements.js compileForInStatement)
-    _closure_props_find: 126,
-    // eval/with 片段：`in`/HasProperty、赋值前自有键探测
-    _object_has: 127,
-    // eval 数值规范化；生成器声明；闭包属性写；define 属性 attr
-    _nan_canon: 128,
-    _generator_new: 129,
-    _closure_prop_set: 130,
-    _object_set_prop_attr: 131,
-    // eval 片段读 globalThis 对象（裸名 / typeof 回落）
-    _global_this: 132,
-    // eval 内 Function [[Strict]] 元数据
-    _func_meta_strict: 133,
-    // 数组解构限量 spread + IteratorClose
-    _array_spread_into_n: 134,
-    // 片段内函数值装箱
-    _js_box_function: 135,
-    // 闭包属性侧表读/define/attr(片段内函数 .prototype/.name 与一等构造器)
-    _closure_prop_get: 136,
-    _closure_prop_define: 137,
-    _closure_prop_set_attr: 138,
-    // well-known Symbol 惰性单例(emitArrayProtoObject/for-of 片段引用)
-    _symbol_wellknown: 139,
-    // 无原型对象创建(@@unscopables 等);对象属性删除(delete 片段)
-    _object_new_raw: 140,
-    _object_delete: 141,
-    // 可捕获 ReferenceError(TDZ 读/写守卫;片段内 let 前读)
-    _throw_reference_error: 142,
+// reloc 表里的伪 symId:标记"此 slotOffset 起为可写数据区"(见 compileFragment 末尾与
+// runtime/core/allocator.js 的 _engine_reloc_exec:据此分段 mprotect,数据区保持 RW)。
+export const RELOC_RW_SPLIT = 0xffffffff;
 
-};
+// 符号名 → id,由 engine/symbols.js 的有序表派生(避免与 allocator 分派表脱钩)。
+export const SYM_IDS = {};
+for (let _i = 0; _i < SYM_NAMES.length; _i++) SYM_IDS[SYM_NAMES[_i]] = _i;
 
 // 宿主可变数据全局:引用它们须运行时取宿主地址(不可内联常量)。见 compileFragment
 // 的 adrp→ldr-literal 改写。与常量单例(_js_true 等,内联同位型)相对。
-export const HOST_DATA = { _heap_base: 1, _heap_ptr: 1, _exception_value: 1, _exception_pending: 1, _exc_ctx_top: 1, _call_argc: 1, _global_this: 1 };
+export const HOST_DATA = { _heap_base: 1, _heap_ptr: 1, _exception_value: 1, _exception_pending: 1, _exc_ctx_top: 1, _call_argc: 1, _call_argv: 1, _global_this: 1 };
+// well-known Symbol 槽同属宿主可变数据(单例身份须与宿主共享,内联副本会造出第二个
+// Symbol.iterator)。名字由 WELLKNOWN_SYMBOLS 派生,与 SYM_NAMES 末尾登记一一对应。
+for (const _wk of ["iterator", "asyncIterator", "hasInstance", "isConcatSpreadable",
+    "match", "matchAll", "replace", "search", "species", "split",
+    "toPrimitive", "toStringTag", "unscopables"]) HOST_DATA["_symwk_" + _wk] = 1;
 
 // captureLayout 串解析:`name:off[:b],name:off[:b],...`(off 为调用者帧内 FP 偏移,负整数)。
 // 直接 eval 的词法作用域捕获:compileCallExpression 在直接 `eval(x)` 调用点把外层函数的
@@ -196,6 +51,37 @@ export const HOST_DATA = { _heap_base: 1, _heap_ptr: 1, _exception_value: 1, _ex
 // 尾随 `:b` 表示调用者槽已是 **box 指针**(该函数含 eval 帧模型升级,或该名被真闭包捕获):
 // copy-in 复用同一 box、copy-out 免回灌(逃逸闭包/调用者后续写经共享 box 联动)。
 // §1.6 无正则:split 由 String.split 提供(编译器自身可用)。
+// 直接 eval 的**调用点语境**标记(不是捕获项):`!ctx:<flags>`,flags 含 's'=方法体内
+// (super 合法)、'n'=函数体内(new.target 合法)。由 compileCallExpression 在改派
+// __eval_direct 时按所在上下文写入,片段解析据此放行相应元属性(间接 eval 无此项)。
+function parseLayoutFlags(s) {
+    const out = { allowSuper: false, allowNewTarget: false, strict: false };
+    if (!s || s.length === 0) return out;
+    const parts = s.split(",");
+    for (let i = 0; i < parts.length; i++) {
+        const p = parts[i];
+        if (!p || p.slice(0, 5) !== "!ctx:") continue;
+        const f = p.slice(5);
+        if (f.indexOf("s") >= 0) out.allowSuper = true;
+        if (f.indexOf("n") >= 0) out.allowNewTarget = true;
+        if (f.indexOf("t") >= 0) out.strict = true;
+    }
+    return out;
+}
+
+function parseLexNames(s) {
+    const out = {};
+    if (!s || s.length === 0) return out;
+    const parts = s.split(",");
+    for (let i = 0; i < parts.length; i++) {
+        const p = parts[i];
+        if (!p || p.slice(0, 5) !== "!lex:") continue;
+        const n = p.slice(5);
+        if (n.length > 0) out[n] = true;
+    }
+    return out;
+}
+
 function parseCaptureLayout(s) {
     const out = [];
     if (!s || s.length === 0) return out;
@@ -203,21 +89,25 @@ function parseCaptureLayout(s) {
     for (let i = 0; i < parts.length; i++) {
         const p = parts[i];
         if (!p || p.length === 0) continue;
+        if (p.slice(0, 1) === "!") continue; // 语境标记项,非捕获名
         const ci = p.indexOf(":");
         if (ci < 0) continue;
         const name = p.slice(0, ci);
         const rest = p.slice(ci + 1);
-        // rest 形如 "off" 或 "off:b"
+        // rest 形如 "off" / "off:b" / "off:i" / "off:bi"
         let callerBoxed = false;
+        let immutable = false;
         let offStr = rest;
         const ci2 = rest.indexOf(":");
         if (ci2 >= 0) {
             offStr = rest.slice(0, ci2);
-            callerBoxed = rest.slice(ci2 + 1) === "b";
+            const flags = rest.slice(ci2 + 1);
+            callerBoxed = flags.indexOf("b") >= 0;
+            immutable = flags.indexOf("i") >= 0;
         }
         const off = parseInt(offStr, 10);
         if (name.length === 0) continue;
-        out.push({ name: name, off: off, callerBoxed: callerBoxed });
+        out.push({ name: name, off: off, callerBoxed: callerBoxed, immutable: immutable });
     }
     return out;
 }
@@ -258,11 +148,43 @@ function capturesBoxedByInnerClosure(body, capNamesObj) {
 //   captureLayout: 直接 eval 词法捕获串(见 parseCaptureLayout);传入时片段以 A0=调用者 FP
 //     执行,入口 copy-in 调用者槽 → 片段局部,出口 copy-out 片段局部 → 调用者槽(读写捕获)。
 export function compileFragment(source, target, captureLayout) {
-    const c = new Compiler(target || "macos-arm64");
+    // 片段编译期伪装 Node:FixupBuffer 走 packed TA(nativeObjects=false)。
+    // 自举态 process.release 缺失会使 nativeObjects=true,再叠加 ByteBuffer
+    // 曾产出调到地址 0 的坏码(SIGSEGV)。片段极小,同时切回普通数组 code/data。
+    // 注意:宿主 Node 的 process.release 常为只读属性——不可在 finally 里写回原值
+    // (会抛 TypeError,宿主表现为 Cannot assign…,自托管常表现为 not a function),
+    // 只在原先缺失时写入,并仅在该分支清理。
+    const _hadRelease = !!process.release;
+    if (!_hadRelease) {
+        try { process.release = { name: "node" }; } catch (_e) { /* 只读则放弃伪装 */ }
+    }
+    let c;
+    try {
+        c = new Compiler(target || "macos-arm64");
+    } finally {
+        if (!_hadRelease) {
+            try { delete process.release; } catch (_e2) { /* ignore */ }
+        }
+    }
+    // Compiler 已用空 ByteBuffer;勿再把 code 换成 []——emit32 走 code.emit32,
+    // 普通数组无此方法 → compileFragment 入口即 "emit32 is not a function"。
     const captures = parseCaptureLayout(captureLayout);
-    const ast = c.parse(source);
+    const layoutFlags = parseLayoutFlags(captureLayout);
+    const ast = c.parse(source, layoutFlags);
     if (!ast.body || ast.body.length < 1) {
         throw new Error("engine: 空片段:" + source);
+    }
+    // EvalDeclarationInstantiation:sloppy `var` 与中间词法绑定冲突 → SyntaxError
+    if (captureLayout && captureLayout.indexOf("!lex:") >= 0) {
+        const lexNames = parseLexNames(captureLayout);
+        const varNames = {};
+        collectVarDeclarations({ type: "BlockStatement", body: ast.body }, varNames);
+        for (const n in varNames) {
+            if (!Object.prototype.hasOwnProperty.call(varNames, n)) continue;
+            if (Object.prototype.hasOwnProperty.call(lexNames, n)) {
+                throw new SyntaxError("Identifier '" + n + "' has already been declared");
+            }
+        }
     }
     // 语句序列(indirect-eval 风格,自足作用域):逐句 compileStatement,var/let/const
     // 绑定从同一 FRAG_FRAME 局部池 allocLocal 取槽;末句(通常 ExpressionStatement)的值
@@ -294,6 +216,13 @@ export function compileFragment(source, target, captureLayout) {
     // return 提前跳出并保留 RET,与正常 fall-through 完成值共用同一出口。
     const fragReturnLabel = "_frag_return";
     c.ctx.returnLabel = fragReturnLabel;
+    if (layoutFlags.strict) c.ctx.inStrictFunction = true;
+    if (captures.some(function (c) { return c.immutable; })) {
+        c.ctx.immutableLocals = new Set();
+        for (let _ii = 0; _ii < captures.length; _ii++) {
+            if (captures[_ii].immutable) c.ctx.immutableLocals.add(captures[_ii].name);
+        }
+    }
 
     // ── 直接 eval 词法捕获:copy-in ──────────────────────────────────────────
     // 片段以 A0 = 调用者(直接 eval 所在函数)运行时 FP 执行(见 _engine_reloc_exec_fp)。
@@ -319,6 +248,7 @@ export function compileFragment(source, target, captureLayout) {
         const fpSlot = c.ctx.allocLocal("__evalCallerFP");
         c.vm.store(VReg.FP, fpSlot, VReg.A0); // 存调用者 FP(A0 由 callIndirect 传入,prologue 不碰)
         capSlots = [];
+        c.ctx.preboxedVars = c.ctx.preboxedVars || new Set();
         for (let i = 0; i < captures.length; i++) {
             const nm = captures[i].name, off = captures[i].off;
             const slot = c.ctx.allocLocal(nm); // seed c.ctx.locals[nm] = 片段局部槽
@@ -326,13 +256,14 @@ export function compileFragment(source, target, captureLayout) {
             // callerBoxed:调用者槽已是 box 指针 → 片段复用同一 box(不新建),
             // copy-out 免回灌(写已直接落共享 box)。否则按片段内闭包捕获判是否新建 box。
             const boxed = callerBoxed || (boxedByClosure[nm] === true);
-            capSlots.push({ off: off, slot: slot, boxed: boxed, shared: callerBoxed });
+            capSlots.push({ off: off, slot: slot, boxed: boxed, shared: callerBoxed, name: nm });
             if (callerBoxed) {
                 // 复用调用者 box:直接把调用者槽内的 box 指针拷入片段槽,标 boxedVars。
                 c.vm.load(VReg.V1, VReg.FP, fpSlot); // callerFP
                 c.vm.load(VReg.V0, VReg.V1, off);    // caller 槽 = box 指针
                 c.vm.store(VReg.FP, slot, VReg.V0);  // 片段槽 = 同一 box 指针
                 c.ctx.boxedVars.add(nm);
+                c.ctx.preboxedVars.add(nm);
             } else if (boxed) {
                 // 装箱 copy-in:box[0] = 调用者槽值;片段槽存 box 指针;标记 boxedVars 使片段内
                 // 对该名的读/写走 deref、闭包创建时共享同一 box(见 compileFunctionExpression)。
@@ -344,6 +275,7 @@ export function compileFragment(source, target, captureLayout) {
                 c.vm.store(VReg.RET, 0, VReg.V1);    // box[0] = value
                 c.vm.store(VReg.FP, slot, VReg.RET); // 片段槽 = box 指针
                 c.ctx.boxedVars.add(nm);
+                c.ctx.preboxedVars.add(nm);
             } else {
                 c.vm.load(VReg.V1, VReg.FP, fpSlot); // V1 = callerFP
                 c.vm.load(VReg.V0, VReg.V1, off);    // V0 = 调用者槽值
@@ -394,6 +326,10 @@ export function compileFragment(source, target, captureLayout) {
             // shared(callerBoxed):调用者槽已是**同一** box 指针,写入 eval 期已直接落该 box,
             // 调用者槽本身不变 → 免回灌(若误回灌 deref 值会覆盖调用者槽的 box 指针 → 毁帧)。
             if (capSlots[i].shared) continue;
+            // this 不是绑定,写回会把片段槽灌进调用者 __this。
+            if (capSlots[i].name === "__this") continue;
+            // this 不是绑定,写回会把片段槽垃圾灌进调用者 __this(顶层类字段 eval 后崩)。
+            if (capSlots[i].name === "__this") continue;
             const off = capSlots[i].off, slot = capSlots[i].slot;
             c.vm.load(VReg.V1, VReg.FP, fpSlot); // callerFP
             c.vm.load(VReg.V0, VReg.FP, slot);   // 片段槽(boxed=box 指针 / plain=值)
@@ -417,7 +353,18 @@ export function compileFragment(source, target, captureLayout) {
         c.generatePendingFunctions();
     }
 
-    const code = c.asm.code.slice(cs);
+    // ByteBuffer.slice 返回 Uint8Array；片段链接器后续会 push trampoline/data，
+    // 因此在这里物化为可增长数组。
+    // 自举态下 Array.from(Uint8Array) 在 Function/eval 片段路径曾致链接码损坏
+    // (trampoline 槽未填 → 调到地址 0 SIGSEGV);改按字节 get 拷贝。
+    const codeEnd = c.asm.code.length;
+    const code = [];
+    if (c.asm.code && c.asm.code._asmjsByteBuffer) {
+        for (let i = cs; i < codeEnd; i++) code.push(c.asm.code.get(i));
+    } else {
+        const codeSlice = c.asm.code.slice(cs);
+        for (let i = 0; i < codeSlice.length; i++) code.push(codeSlice[i]);
+    }
     const fixups = fixupArr.slice(fs);
     // 注:用索引循环而非 for-of。Array.from(asm.data) 的结果在自编译产物里 for-of 会崩
     // (asm.js Array.from+for-of 交互 bug,follow-up);索引遍历规避。
@@ -440,7 +387,15 @@ export function compileFragment(source, target, captureLayout) {
         data = ds;
     } else {
         // arm64:.data 已含字节,dataLabels 直接带 {name, offset}。
-        data = c.asm.data || [];
+        // ByteBuffer 不能当下标数组读——片段链接只认可 push 的普通数组。
+        const raw = c.asm.data || [];
+        if (raw && raw._asmjsByteBuffer) {
+            const bytes = raw.slice();
+            data = [];
+            for (let i = 0; i < bytes.length; i = i + 1) data.push(bytes[i]);
+        } else {
+            data = raw;
+        }
         for (let i = 0; i < dataLabels.length; i++) dataLabelOff[dataLabels[i].name] = dataLabels[i].offset;
     }
 
@@ -549,7 +504,12 @@ export function compileFragment(source, target, captureLayout) {
     }
 
     // ── .data 常量 + 字符串字面量并置,改写 DATA 引用(adrp/add | rip32)──
-    while (buf.length & 7) buf.push(0);
+    // 数据区起点按 16KB 对齐(≥ 任一目标页大小):加载器只把 [0, dataOff) 设 RX、数据区
+    // 保持 RW。片段里的**可写数据槽**(class 的 classinfo/superinfo 全局、for-in 侧表等)
+    // 因此可在运行时写入;此前整段 RX → `new Function("return class X{}")()` 写 classinfo
+    // 槽即 SIGBUS(resizable-arraybuffer harness 用它造子类,整簇崩溃)。
+    const FRAG_DATA_ALIGN = 16384;
+    while (buf.length % FRAG_DATA_ALIGN !== 0) buf.push(0);
     const dataOff = buf.length;
     for (let i = 0; i < data.length; i++) buf.push(data[i]);
     const strBufOff = {};
@@ -561,7 +521,12 @@ export function compileFragment(source, target, captureLayout) {
         // arm64:把 `adrp Xd,_heap_base; add Xd,Xd,:lo12` 改写成 `ldr Xd,[pc+slot]; nop`,
         // slot 由 _engine_reloc_exec 填宿主 &_heap_base(symaddr 的 lea);后续代码 `ldr Xd,[Xd]`
         // 即读宿主堆指针值(共享同一堆)。x64 暂不支持(follow-up),明确报错。
-        if (fx.label in HOST_DATA) {
+        // 宿主运行时符号取地址(闭包里存的 trampoline/内建函数体指针)同理:片段内无此
+        // 代码体,只能运行时按 symId 取宿主地址填槽。片段自己发射的函数体(offset >= cs)
+        // 走下方片段内 code-label 路径。
+        const hostSymAddr = !(fx.label in dataLabelOff) && (fx.label in SYM_IDS)
+            && !(labelCodeOff(fx.label) !== undefined && labelCodeOff(fx.label) >= cs);
+        if ((fx.label in HOST_DATA) || hostSymAddr) {
             const off = fx.offset - cs;
             while (buf.length & 7) buf.push(0);
             const slot = buf.length;
@@ -648,6 +613,9 @@ export function compileFragment(source, target, captureLayout) {
     // HOST_DATA 的 ldr-literal 与 bcond/cbz 局部分支用 19 位 PC 相对 imm(±1MB),故设 256KB
     // 安全上限(远超实际 eval 片段;超限抛清晰错误)。x64 无此限(rip32 ±2GB)。
     if (!isX64 && buf.length > 262144) throw new Error("engine: arm64 片段 >256KB 未支持(19 位 PC 相对上限):" + source);
+    // 数据区起点哨兵(symId = 0xffffffff,非真符号):加载器据此只把 [0, dataOff) 设 RX,
+    // 数据区留 RW。放在末条,不影响前面 addr_slot 的回填顺序。
+    relocs.push({ slotOffset: dataOff, symId: RELOC_RW_SPLIT });
     return { bytes: buf, relocs };
 }
 

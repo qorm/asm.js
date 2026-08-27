@@ -264,6 +264,11 @@ export function inferType(node, ctx) {
                     return Type.ARRAY_BUFFER;
                 }
             }
+            // TypedArray 下标读 → NUMBER(canonical float);令 (ta[i]).toLocaleString
+            // 走 __NUM 改派(否则 UNKNOWN 落通用路径对浮点解引用崩)。
+            if (node.computed && inferType(node.object, ctx) === Type.TYPED_ARRAY) {
+                return Type.NUMBER;
+            }
             return Type.UNKNOWN;
 
         case "CallExpression":
@@ -369,18 +374,19 @@ function inferBinaryType(node, ctx) {
     const rightType = inferType(node.right, ctx);
 
     // 比较运算符返回 boolean
-    if (["<", "<=", ">", ">=", "==", "===", "!=", "!=="].includes(op)) {
+    if (op === "<" || op === "<=" || op === ">" || op === ">=" ||
+        op === "==" || op === "===" || op === "!=" || op === "!==") {
         return Type.BOOLEAN;
     }
 
     // 逻辑运算符
-    if (["&&", "||"].includes(op)) {
+    if (op === "&&" || op === "||") {
         // 返回操作数类型
         return leftType;
     }
 
     // 算术运算符
-    if (["+", "-", "*", "/", "%"].includes(op)) {
+    if (op === "+" || op === "-" || op === "*" || op === "/" || op === "%") {
         // 字符串拼接
         if (op === "+" && (leftType === Type.STRING || rightType === Type.STRING)) {
             return Type.STRING;
@@ -417,7 +423,8 @@ function inferBinaryType(node, ctx) {
     // 位运算符：结果现以**裸 float64 位**返回（与算术一致，见 coercion.js bitDispatch），
     // 故类型是 NUMBER 而非 INT64——否则 `"x=" + (a & b)` 走整数转字符串路径把
     // float64 位当整数打印（如 4096 打成 0x40B0...=4661225614328463360）。
-    if (["&", "|", "^", "<<", ">>", ">>>"].includes(op)) {
+    if (op === "&" || op === "|" || op === "^" ||
+        op === "<<" || op === ">>" || op === ">>>") {
         return Type.NUMBER;
     }
 

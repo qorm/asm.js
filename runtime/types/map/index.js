@@ -9,11 +9,12 @@
 // +32: bucket_count (8 bytes) - 桶数量（2 的幂）
 // +40: buckets_ptr (8 bytes) - 桶数组指针（每桶 8 字节 = 该桶哈希链头）
 //
-// 链表节点（32 字节）:
+// 链表节点（40 字节）:
 // +0:  key (8 bytes)
 // +8:  value (8 bytes)
 // +16: next (8 bytes)  - 插入序链
 // +24: hnext (8 bytes) - 同桶哈希链
+// +32: empty (8 bytes) - 0=在用, 1=墓碑(delete/clear 后活迭代器跳过)
 //
 // _hash_key 也在此文件生成（Set 复用）。
 
@@ -24,7 +25,7 @@ const TYPE_MAP = 4;
 // Map/Set 共享 type 字节(4/5),仅此标志区分,供 _object_proto_toString / print 打品牌。
 // GC 精确扫描走链表(head@16),不读 +48;打印/类型比较读 type@0——故加此槽零回归。
 const MAP_SIZE = 56;
-const MAP_NODE_SIZE = 32;
+const MAP_NODE_SIZE = 40;
 const INIT_BUCKETS = 8;
 
 export class MapGenerator {
@@ -38,28 +39,61 @@ export class MapGenerator {
         // ============================================================
         // _map_key_eq(A0, A1) -> RET (JS_TRUE/JS_FALSE):Map/Set 键相等 = SameValueZero。
         // 与 _strict_eq(===) 唯一差异:NaN 键相等(node 用 SameValueZero,NaN 与 NaN 同键)。
-        // isNaN(x) 判据:_strict_eq(x,x)==false(唯 NaN 自反不等;装箱 int0 等自反相等,
-        // 不误判)。保存/恢复 S0/S1(容器循环活跃寄存器),与 _strict_eq 同契约 → 直接替换其
-        // 键比较调用点。(NaN 落桶:canonical NaN 位一致 → _hash_key 同哈希,同桶可寻。)
+        // 快路:同位直接真(含同比特 NaN,正好符合 SVZ);双 0x7FFC 串走 _strcmp,
+        // 避开 _strict_eq 全类型分派 + 两次 NaN 自反探测(自举 Map 主税)。
         // ============================================================
+        const JS_TRUE = 0x7ff9000000000001n;
+        const JS_FALSE = 0x7ff9000000000000n;
         vm.label("_map_key_eq");
+        vm.cmp(VReg.A0, VReg.A1);
+        vm.jne("_mke_bits_differ");
+        vm.movImm64(VReg.RET, JS_TRUE);
+        vm.ret();
+
+        vm.label("_mke_bits_differ");
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.shrImm(VReg.V1, VReg.A1, 48);
+        vm.movImm(VReg.V2, 0x7FFC);
+        vm.cmp(VReg.V0, VReg.V2);
+        vm.jne("_mke_slow");
+        vm.cmp(VReg.V1, VReg.V2);
+        vm.jne("_mke_slow");
+        // 双字符串:脱壳后按 C 串比内容(与 _hash_key / _strict_eq 的 NUL 语义一致)
+        vm.prologue(16, [VReg.S0, VReg.S1]);
+        vm.movImm64(VReg.V0, 0x0000FFFFFFFFFFFFn);
+        vm.and(VReg.S0, VReg.A0, VReg.V0);
+        vm.and(VReg.S1, VReg.A1, VReg.V0);
+        vm.movImm64(VReg.V1, vm.ptrFloor);
+        vm.cmp(VReg.S0, VReg.V1);
+        vm.jlt("_mke_false");
+        vm.cmp(VReg.S1, VReg.V1);
+        vm.jlt("_mke_false");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_strcmp");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_mke_false");
+        vm.movImm64(VReg.RET, JS_TRUE);
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+
+        vm.label("_mke_slow");
         vm.prologue(16, [VReg.S0, VReg.S1]);
         vm.mov(VReg.S0, VReg.A0); // key1
         vm.mov(VReg.S1, VReg.A1); // key2
         vm.call("_strict_eq");    // 入口 A0/A1 未改
-        vm.movImm64(VReg.V1, 0x7ff9000000000001n);
+        vm.movImm64(VReg.V1, JS_TRUE);
         vm.cmp(VReg.RET, VReg.V1);
         vm.jeq("_mke_true");
         // 非 === → 仅两者皆 NaN 才 SameValueZero 相等
         vm.mov(VReg.A0, VReg.S0); vm.mov(VReg.A1, VReg.S0); vm.call("_strict_eq");
-        vm.movImm64(VReg.V1, 0x7ff9000000000001n); vm.cmp(VReg.RET, VReg.V1); vm.jeq("_mke_false"); // key1 非 NaN
+        vm.movImm64(VReg.V1, JS_TRUE); vm.cmp(VReg.RET, VReg.V1); vm.jeq("_mke_false"); // key1 非 NaN
         vm.mov(VReg.A0, VReg.S1); vm.mov(VReg.A1, VReg.S1); vm.call("_strict_eq");
-        vm.movImm64(VReg.V1, 0x7ff9000000000001n); vm.cmp(VReg.RET, VReg.V1); vm.jeq("_mke_false"); // key2 非 NaN
+        vm.movImm64(VReg.V1, JS_TRUE); vm.cmp(VReg.RET, VReg.V1); vm.jeq("_mke_false"); // key2 非 NaN
         vm.label("_mke_true");
-        vm.movImm64(VReg.RET, 0x7ff9000000000001n);
+        vm.movImm64(VReg.RET, JS_TRUE);
         vm.jmp("_mke_done");
         vm.label("_mke_false");
-        vm.movImm64(VReg.RET, 0x7ff9000000000000n);
+        vm.movImm64(VReg.RET, JS_FALSE);
         vm.label("_mke_done");
         vm.epilogue([VReg.S0, VReg.S1], 16);
 
@@ -106,10 +140,12 @@ export class MapGenerator {
         vm.epilogue([VReg.S0, VReg.S1], 32);
 
         vm.label("_hash_key_string");
-        // 脱壳取内容指针（null 结尾 C 串，与 _strcmp/_strict_eq 语义一致）
-        vm.mov(VReg.A0, VReg.S0);
-        vm.call("_getStrContent");
-        vm.mov(VReg.S0, VReg.RET);            // S0 = content ptr（迭代游标）
+        // 0x7FFC 直接脱壳(合法串 payload ≥ ptrFloor)。免 _getStrContent 全套检查。
+        vm.movImm64(VReg.V1, 0x0000FFFFFFFFFFFFn);
+        vm.and(VReg.S0, VReg.S0, VReg.V1);
+        vm.movImm64(VReg.V1, vm.ptrFloor);
+        vm.cmp(VReg.S0, VReg.V1);
+        vm.jlt("_hash_key_str_empty");
         vm.movImm64(VReg.S1, 0xcbf29ce484222325n); // FNV-1a offset basis（S1 = 累加器）
         vm.label("_hash_key_str_loop");
         vm.loadByte(VReg.V0, VReg.S0, 0);
@@ -122,6 +158,9 @@ export class MapGenerator {
         vm.jmp("_hash_key_str_loop");
         vm.label("_hash_key_str_done");
         vm.mov(VReg.RET, VReg.S1);
+        vm.epilogue([VReg.S0, VReg.S1], 32);
+        vm.label("_hash_key_str_empty");
+        vm.movImm64(VReg.RET, 0xcbf29ce484222325n);
         vm.epilogue([VReg.S0, VReg.S1], 32);
 
         // ============================================================
@@ -211,6 +250,9 @@ export class MapGenerator {
         vm.label("_map_rehash_walk");
         vm.cmpImm(VReg.S3, 0);
         vm.jeq("_map_rehash_done");
+        vm.load(VReg.V0, VReg.S3, 32); // empty
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_map_rehash_next");
         vm.load(VReg.A0, VReg.S3, 0); // node.key
         vm.call("_hash_key");
         vm.mov(VReg.V1, VReg.S1);
@@ -221,6 +263,7 @@ export class MapGenerator {
         vm.load(VReg.V1, VReg.S4, 0); // 旧桶链头
         vm.store(VReg.S3, 24, VReg.V1); // node.hnext = 旧桶链头
         vm.store(VReg.S4, 0, VReg.S3); // 桶 = node
+        vm.label("_map_rehash_next");
         vm.load(VReg.S3, VReg.S3, 16); // cur = node.next（插入序）
         vm.jmp("_map_rehash_walk");
         vm.label("_map_rehash_done");
@@ -261,10 +304,11 @@ export class MapGenerator {
         vm.cmpImm(VReg.S4, 0);
         vm.jeq("_map_set_insert");
         vm.load(VReg.A0, VReg.S4, 0); // node.key
+        vm.cmp(VReg.A0, VReg.S1);
+        vm.jeq("_map_set_update");
         vm.mov(VReg.A1, VReg.S1);
         vm.call("_map_key_eq");
-        vm.lea(VReg.V1, "_js_true");
-        vm.load(VReg.V1, VReg.V1, 0);
+        vm.movImm64(VReg.V1, 0x7ff9000000000001n);
         vm.cmp(VReg.RET, VReg.V1);
         vm.jeq("_map_set_update");
         vm.load(VReg.S4, VReg.S4, 24); // hnext
@@ -281,6 +325,8 @@ export class MapGenerator {
         vm.mov(VReg.S5, VReg.RET); // node（保护 RET）
         vm.store(VReg.S5, 0, VReg.S1); // key
         vm.store(VReg.S5, 8, VReg.S2); // value
+        vm.movImm(VReg.V0, 0);
+        vm.store(VReg.S5, 32, VReg.V0); // empty = 0
         // 挂到桶哈希链头
         vm.load(VReg.V1, VReg.S3, 0); // 旧桶链头
         vm.store(VReg.S5, 24, VReg.V1); // node.hnext = 旧桶链头
@@ -334,10 +380,11 @@ export class MapGenerator {
         vm.cmpImm(VReg.S2, 0);
         vm.jeq("_map_get_notfound");
         vm.load(VReg.A0, VReg.S2, 0);
+        vm.cmp(VReg.A0, VReg.S1);
+        vm.jeq("_map_get_found");
         vm.mov(VReg.A1, VReg.S1);
         vm.call("_map_key_eq");
-        vm.lea(VReg.V1, "_js_true");
-        vm.load(VReg.V1, VReg.V1, 0);
+        vm.movImm64(VReg.V1, 0x7ff9000000000001n);
         vm.cmp(VReg.RET, VReg.V1);
         vm.jeq("_map_get_found");
         vm.load(VReg.S2, VReg.S2, 24); // hnext
@@ -372,21 +419,20 @@ export class MapGenerator {
         vm.cmpImm(VReg.S2, 0);
         vm.jeq("_map_has_notfound");
         vm.load(VReg.A0, VReg.S2, 0);
+        vm.cmp(VReg.A0, VReg.S1);
+        vm.jeq("_map_has_found");
         vm.mov(VReg.A1, VReg.S1);
         vm.call("_map_key_eq");
-        vm.lea(VReg.V1, "_js_true");
-        vm.load(VReg.V1, VReg.V1, 0);
+        vm.movImm64(VReg.V1, 0x7ff9000000000001n);
         vm.cmp(VReg.RET, VReg.V1);
         vm.jeq("_map_has_found");
         vm.load(VReg.S2, VReg.S2, 24);
         vm.jmp("_map_has_loop");
         vm.label("_map_has_found");
-        vm.lea(VReg.RET, "_js_true"); // 返回 JS 布尔（供 `+` 拼接/if 使用），非裸 1
-        vm.load(VReg.RET, VReg.RET, 0);
+        vm.movImm64(VReg.RET, 0x7ff9000000000001n);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 48);
         vm.label("_map_has_notfound");
-        vm.lea(VReg.RET, "_js_false");
-        vm.load(VReg.RET, VReg.RET, 0);
+        vm.movImm64(VReg.RET, 0x7ff9000000000000n);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 48);
 
         // ============================================================
@@ -411,10 +457,11 @@ export class MapGenerator {
         vm.cmpImm(VReg.S3, 0);
         vm.jeq("_map_del_notfound");
         vm.load(VReg.A0, VReg.S3, 0);
+        vm.cmp(VReg.A0, VReg.S1);
+        vm.jeq("_map_del_found");
         vm.mov(VReg.A1, VReg.S1);
         vm.call("_map_key_eq");
-        vm.lea(VReg.V1, "_js_true");
-        vm.load(VReg.V1, VReg.V1, 0);
+        vm.movImm64(VReg.V1, 0x7ff9000000000001n);
         vm.cmp(VReg.RET, VReg.V1);
         vm.jeq("_map_del_found");
         vm.mov(VReg.S4, VReg.S3);
@@ -431,47 +478,33 @@ export class MapGenerator {
         vm.label("_map_del_chain_head");
         vm.store(VReg.S2, 0, VReg.V1); // 桶 = node.hnext
         vm.label("_map_del_ilist");
-        // 摘出插入序链表（走 head 用指针相等找前驱）
-        vm.load(VReg.S4, VReg.S0, 16); // cur = head
-        vm.movImm(VReg.S5, 0); // prevList = null
-        vm.label("_map_del_ilist_loop");
-        vm.cmpImm(VReg.S4, 0);
-        vm.jeq("_map_del_dec"); // 理论不达
-        vm.cmp(VReg.S4, VReg.S3);
-        vm.jeq("_map_del_ilist_unlink");
-        vm.mov(VReg.S5, VReg.S4);
-        vm.load(VReg.S4, VReg.S4, 16); // next
-        vm.jmp("_map_del_ilist_loop");
-        vm.label("_map_del_ilist_unlink");
-        vm.load(VReg.V1, VReg.S3, 16); // node.next
-        vm.cmpImm(VReg.S5, 0);
-        vm.jeq("_map_del_ilist_head");
-        vm.store(VReg.S5, 16, VReg.V1); // prevList.next = node.next
-        vm.jmp("_map_del_ilist_tail");
-        vm.label("_map_del_ilist_head");
-        vm.store(VReg.S0, 16, VReg.V1); // head = node.next
-        vm.label("_map_del_ilist_tail");
-        vm.load(VReg.V2, VReg.S0, 24); // tail
-        vm.cmp(VReg.V2, VReg.S3);
-        vm.jne("_map_del_dec");
-        vm.store(VReg.S0, 24, VReg.S5); // tail = prevList（删的是尾）
+        // 规范:条目标 empty,保留插入序链,活迭代器跳过墓碑。
+        vm.movImm(VReg.V1, 1);
+        vm.store(VReg.S3, 32, VReg.V1);
         vm.label("_map_del_dec");
         vm.load(VReg.V1, VReg.S0, 8);
         vm.subImm(VReg.V1, VReg.V1, 1);
         vm.store(VReg.S0, 8, VReg.V1);
         // 返回规范 JS 布尔(同 _map_has,非裸 1/0)——Map.prototype.delete 返 boolean。
-        vm.lea(VReg.RET, "_js_true");
-        vm.load(VReg.RET, VReg.RET, 0);
+        vm.movImm64(VReg.RET, 0x7ff9000000000001n);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
         vm.label("_map_del_notfound");
-        vm.lea(VReg.RET, "_js_false");
-        vm.load(VReg.RET, VReg.RET, 0);
+        vm.movImm64(VReg.RET, 0x7ff9000000000000n);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
 
         // ============================================================
         // _map_clear(A0 = map) - 清空（重置 size/head/tail 并清零桶数组）
         // ============================================================
         vm.label("_map_clear");
+        vm.load(VReg.V4, VReg.A0, 16); // cur = head
+        vm.label("_map_clear_tomb");
+        vm.cmpImm(VReg.V4, 0);
+        vm.jeq("_map_clear_buckets");
+        vm.movImm(VReg.V1, 1);
+        vm.store(VReg.V4, 32, VReg.V1); // empty = 1
+        vm.load(VReg.V4, VReg.V4, 16);
+        vm.jmp("_map_clear_tomb");
+        vm.label("_map_clear_buckets");
         vm.load(VReg.V0, VReg.A0, 32); // bucket_count
         vm.load(VReg.V1, VReg.A0, 40); // buckets_ptr
         vm.movImm(VReg.V2, 0); // 下标
@@ -506,10 +539,11 @@ export class MapGenerator {
         // (map/head/array/data_ptr)跨该调用安全;填充循环内无调用,V 寄存器安全。
         // ============================================================
         vm.label("_map_keys");
-        vm.movImm(VReg.V0, 0); // 字段偏移:key@0
-        vm.jmp("_map_kv_common");
+        vm.movImm(VReg.A1, 0);
+        vm.jmp("_map_iterator_new");
         vm.label("_map_values");
-        vm.movImm(VReg.V0, 8); // 字段偏移:value@8
+        vm.movImm(VReg.A1, 1);
+        vm.jmp("_map_iterator_new");
         vm.label("_map_kv_common");
         vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
         vm.mov(VReg.S3, VReg.V0); // S3 = 字段偏移(暂存,跨 array_new 保活)
@@ -553,13 +587,9 @@ export class MapGenerator {
         // 保旧数组形态供 for-of 快路(statements.js 按数组迭代)。
         // ============================================================
         vm.label("_map_entries");
-        vm.prologue(0, []);
-        vm.call("_map_entries_raw");
-        vm.mov(VReg.A0, VReg.RET);
-        vm.movImm(VReg.A1, 0);
-        vm.call("_array_iterator_new");
-        vm.epilogue([], 0);
-        // _map_entries_raw(A0 = map) -> boxed 真数组[[k,v]...]
+        vm.movImm(VReg.A1, 2);
+        vm.jmp("_map_iterator_new");
+        // _map_entries_raw 仍供内部快照;公开 entries() 走活迭代器。
         // 每个元素是新建的 2 元真数组 [key, value](装箱)。内层 _array_new_with_size
         // 调用只存 S0-S3,故索引/外层头/外层 data_ptr/当前节点全放 S0-S3 跨调用保活;
         // 未处理的链表由 S3(当前节点,在其栈帧内)保守栈扫描保活。
@@ -620,8 +650,64 @@ export class MapGenerator {
         const TAG_ARRAY = 0x7ffe000000000000n;
         vm.label("_map_groupBy");
         vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
-        vm.mov(VReg.S0, VReg.A0); // items(boxed 数组)
+        vm.mov(VReg.S0, VReg.A0); // items
         vm.mov(VReg.S1, VReg.A1); // cb
+        // RequireObjectCoercible(items)
+        vm.shrImm(VReg.V3, VReg.S0, 48);
+        vm.cmpImm(VReg.V3, 0x7FFA);
+        vm.jeq("_mgb_coercible");
+        vm.cmpImm(VReg.V3, 0x7FFB);
+        vm.jne("_mgb_coerced");
+        vm.label("_mgb_coercible");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot convert undefined or null to object"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+        vm.label("_mgb_coerced");
+        // IsCallable(callbackfn)
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_is_callable");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_mgb_cb_ok");
+        vm.lea(VReg.A0, vm.asm.addString("Map.groupBy callback is not a function"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+        vm.label("_mgb_cb_ok");
+        // 非数组 → GetIterator 校验后收成数组(字符串/自定义 iterable;
+        // 不可迭代 → TypeError,避免 _array_length 解引用崩)。
+        vm.shrImm(VReg.V3, VReg.S0, 48);
+        vm.cmpImm(VReg.V3, 0x7FFE);
+        vm.jeq("_mgb_isarr");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.lea(VReg.A1, vm.asm.addString("Symbol.iterator"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.shrImm(VReg.V3, VReg.RET, 48);
+        vm.cmpImm(VReg.V3, 0x7FFF);
+        vm.jeq("_mgb_iter_ok");
+        vm.lea(VReg.A0, vm.asm.addString("object is not iterable"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+        vm.label("_mgb_iter_ok");
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.call("_box_arr_r");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.movImm(VReg.A2, 0);
+        vm.movImm(VReg.A3, 0);
+        vm.call("_array_from_iter_into");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.label("_mgb_isarr");
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_array_length");
         vm.mov(VReg.S3, VReg.RET); // length
@@ -763,11 +849,15 @@ export class MapGenerator {
         vm.label("_amfe_loop");
         vm.cmpImm(VReg.S2, 0);
         vm.jeq("_amfe_done");
+        vm.load(VReg.V0, VReg.S2, 32); // empty
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_amfe_next");
         vm.load(VReg.A0, VReg.S2, 8);   // arg0 = value
         vm.load(VReg.A1, VReg.S2, 0);   // arg1 = key
         vm.mov(VReg.A2, VReg.S0);       // arg2 = map(裸,与值表示一致)
         vm.mov(VReg.A3, VReg.S1);       // callback
         vm.call("_aref_invoke_cb");
+        vm.label("_amfe_next");
         vm.load(VReg.S2, VReg.S2, 16);  // cur = node.next
         vm.jmp("_amfe_loop");
         vm.label("_amfe_done");
@@ -779,6 +869,285 @@ export class MapGenerator {
         vm.or(VReg.A1, VReg.A1, VReg.V1);
         vm.jmp("_aref_throw_incompat");
 
+        // ============================================================
+        // _coll_cb_this(A0=cb, A1=thisArg) -> RET = 回调实际收到的 this。
+        // Map/Set.prototype.forEach 的 Call(callbackfn, T, …):T 为 undefined/null
+        // 时按 callee 的 [[Strict]] 走 OrdinaryCallBindThis(非严格 → globalThis,
+        // 严格 → undefined);其余值原样透传。编译期内联循环直接 callIndirect,不经
+        // _fn_invoke_tail,故此处先算好 this 存槽(callback-this-strict/-non-strict)。
+        // ============================================================
+        vm.label("_coll_cb_this");
+        vm.prologue(16, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0); // cb
+        vm.mov(VReg.S1, VReg.A1); // thisArg
+        vm.shrImm(VReg.V1, VReg.S1, 48);
+        vm.cmpImm(VReg.V1, 0x7ffb); // undefined
+        vm.jeq("_cct_bind");
+        vm.cmpImm(VReg.V1, 0x7ffa); // null
+        vm.jeq("_cct_bind");
+        vm.mov(VReg.RET, VReg.S1);
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+        vm.label("_cct_bind");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_js_unbox"); // RET = 裸闭包/函数指针
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_cct_undef");
+        vm.load(VReg.V1, VReg.RET, 0); // magic
+        vm.movImm(VReg.V2, 0xc105);    // CLOSURE_MAGIC
+        vm.cmp(VReg.V1, VReg.V2);
+        vm.jeq("_cct_clos");
+        vm.movImm(VReg.V2, 0xa51c);    // ASYNC_CLOSURE_MAGIC
+        vm.cmp(VReg.V1, VReg.V2);
+        vm.jeq("_cct_clos");
+        vm.mov(VReg.A0, VReg.RET);     // 裸函数指针即入口
+        vm.jmp("_cct_do");
+        vm.label("_cct_clos");
+        vm.load(VReg.A0, VReg.RET, 8); // 闭包块 func_ptr@8
+        vm.label("_cct_do");
+        vm.movImm64(VReg.A1, 0x7ffb000000000000n);
+        vm.call("_ordinary_bind_this");
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+        vm.label("_cct_undef");
+        vm.movImm64(VReg.RET, 0x7ffb000000000000n);
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+
+        // ============================================================
+        // [Upsert 提案] _map_getOrInsert(A0=map, A1=key, A2=value) -> RET
+        //   键已存在 → 返回既有值(不覆盖);否则插入 value 并返回 value。
+        // 键规范化(-0 → +0)由 _map_has/_map_get/_map_set 各自的 SameValueZero
+        // 语义与 _map_set 的 nz 归一保证,此处不重复。
+        // ============================================================
+        vm.label("_map_getOrInsert");
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.mov(VReg.S0, VReg.A0); // map
+        vm.mov(VReg.S1, VReg.A1); // key
+        vm.mov(VReg.S2, VReg.A2); // value
+        vm.call("_map_has");      // A0/A1 已就绪
+        vm.movImm64(VReg.V1, 0x7ff9000000000001n);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_mgoi_present");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_map_set");
+        vm.mov(VReg.RET, VReg.S2);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
+        vm.label("_mgoi_present");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_map_get");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
+
+        // ============================================================
+        // [Upsert 提案] _map_getOrInsertComputed(A0=map, A1=key, A2=callbackfn) -> RET
+        //   键已存在 → 直接返回既有值,**不调用** callbackfn;否则
+        //   value = Call(callbackfn, undefined, «key»),随后再落库(回调内对同键的
+        //   写入会被本次结果覆盖 —— 规范在回调后重新扫描条目,_map_set 的
+        //   "命中则更新、否则追加" 与之同语义)并返回 value。
+        // callbackfn 不可调用 → TypeError(先于键查找,规范步骤 3)。
+        // 寄存器:_validate_callable 契约为 in/out = S0,故 map 放 S3。
+        // ============================================================
+        vm.label("_map_getOrInsertComputed");
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.mov(VReg.S3, VReg.A0); // map
+        vm.mov(VReg.S1, VReg.A1); // key
+        vm.mov(VReg.S0, VReg.A2); // callbackfn
+        // IsCallable:_aref_require_cb 是单一真源(裸堆块须 closure/async/classinfo
+        // magic —— Symbol 等裸块不放行);随后 _validate_callable 把可调用 Proxy
+        // 归一成合成闭包块,令 _promise_invoke1 的 magic 分派恒成立。
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_aref_require_cb");   // 不可调用则抛 TypeError,不返回
+        vm.call("_validate_callable"); // in/out = S0
+        vm.mov(VReg.S2, VReg.S0);      // S2 = 校验后的回调
+        vm.mov(VReg.A0, VReg.S3);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_map_has");
+        vm.movImm64(VReg.V1, 0x7ff9000000000001n);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_mgoic_present");
+        // 回调收到规范化后的键(-0 → +0,canonical-key-passed-to-callback)
+        vm.movImm64(VReg.V1, 0x8000000000000000n);
+        vm.cmp(VReg.S1, VReg.V1);
+        vm.jne("_mgoic_nz_ok");
+        vm.movImm(VReg.S1, 0);
+        vm.label("_mgoic_nz_ok");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_promise_invoke1"); // Call(cb, undefined, «key»),argc=1
+        vm.mov(VReg.S2, VReg.RET);  // S2 = value
+        vm.mov(VReg.A0, VReg.S3);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_map_set");
+        vm.mov(VReg.RET, VReg.S2);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
+        vm.label("_mgoic_present");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_map_get");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
+
+        // _map_construct_fill(A0=裸 Map, A1=iterable) -> RET=A0。
+        // 规范 24.1.1.1:Get(map,"set") 后边迭代边 Call(adder,map,«k,v»);
+        // adder 抛错 / 条目非 Object → IteratorClose。禁止先抽干迭代器(无限
+        // iterator + set 抛错的测例会挂死)。
+        vm.label("_map_construct_fill");
+        {
+            const STR_TAG = 0x7ffc000000000000n;
+            const keyStr = (dst, s) => {
+                vm.lea(dst, vm.asm.addString(s));
+                vm.movImm64(VReg.V1, STR_TAG);
+                vm.or(dst, dst, VReg.V1);
+            };
+            const throwTE = (lab, msg) => {
+                vm.label(lab);
+                vm.lea(VReg.A0, vm.asm.addString(msg));
+                vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+                vm.and(VReg.A0, VReg.A0, VReg.V1);
+                vm.movImm64(VReg.V1, STR_TAG);
+                vm.or(VReg.A0, VReg.A0, VReg.V1);
+                vm.call("_throw_type_error");
+            };
+            vm.prologue(128, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+            vm.mov(VReg.S0, VReg.A0); // map
+            vm.mov(VReg.S1, VReg.A1); // iterable
+            // adder = Get(map, "set")
+            vm.mov(VReg.A0, VReg.S0);
+            keyStr(VReg.A1, "set");
+            vm.call("_object_get");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.mov(VReg.A1, VReg.S0);
+            vm.call("_maybe_getter");
+            vm.mov(VReg.S4, VReg.RET); // adder
+            vm.mov(VReg.A0, VReg.S4);
+            vm.call("_is_callable");
+            vm.cmpImm(VReg.RET, 0);
+            // gen1:_object_get 常取不到 Map.prototype.set(方法靠编译特化),
+            // 规范 Get 失败时不得直接崩——对本征 Map 回退 _map_set。
+            vm.jne("_mcf_have_adder");
+            vm.movImm(VReg.S4, 0); // 0 = 使用内建 _map_set
+            vm.label("_mcf_have_adder");
+            // GetIterator
+            vm.mov(VReg.A0, VReg.S1);
+            keyStr(VReg.A1, "Symbol.iterator");
+            vm.call("_object_get");
+            vm.shrImm(VReg.V3, VReg.RET, 48);
+            vm.cmpImm(VReg.V3, 0x7FFF);
+            vm.jne("_mcf_not_iter");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.mov(VReg.A1, VReg.S1);
+            vm.call("_spread_call0");
+            vm.mov(VReg.S3, VReg.RET); // iter
+
+            vm.label("_mcf_loop");
+            vm.mov(VReg.A0, VReg.S3);
+            keyStr(VReg.A1, "next");
+            vm.call("_object_get");
+            vm.shrImm(VReg.V3, VReg.RET, 48);
+            vm.cmpImm(VReg.V3, 0x7FFF);
+            vm.jne("_mcf_done");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.mov(VReg.A1, VReg.S3);
+            vm.call("_spread_call0");
+            vm.mov(VReg.S5, VReg.RET); // result
+            vm.mov(VReg.A0, VReg.S5);
+            keyStr(VReg.A1, "done");
+            vm.call("_object_get");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.mov(VReg.A1, VReg.S5);
+            vm.call("_maybe_getter");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.call("_to_boolean");
+            vm.cmpImm(VReg.RET, 0);
+            vm.jne("_mcf_done");
+            vm.mov(VReg.A0, VReg.S5);
+            keyStr(VReg.A1, "value");
+            vm.call("_object_get");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.mov(VReg.A1, VReg.S5);
+            vm.call("_maybe_getter");
+            vm.mov(VReg.S2, VReg.RET); // entry
+            // try { type-check; Get 0/1; Call adder } catch { close; rethrow }
+            vm.lea(VReg.V0, "_exc_ctx_top");
+            vm.load(VReg.V1, VReg.V0, 0);
+            vm.store(VReg.SP, 32, VReg.V1);
+            vm.lea(VReg.V1, "_mcf_catch");
+            vm.store(VReg.SP, 40, VReg.V1);
+            vm.mov(VReg.V1, VReg.SP);
+            vm.store(VReg.SP, 48, VReg.V1);
+            vm.store(VReg.SP, 56, VReg.FP);
+            vm.store(VReg.SP, 64, VReg.S0);
+            vm.store(VReg.SP, 72, VReg.S1);
+            vm.store(VReg.SP, 80, VReg.S2);
+            vm.store(VReg.SP, 88, VReg.S3);
+            vm.store(VReg.SP, 96, VReg.S4);
+            vm.store(VReg.SP, 104, VReg.S5);
+            vm.addImm(VReg.V1, VReg.SP, 32);
+            vm.store(VReg.V0, 0, VReg.V1);
+            // Type(entry) is Object?
+            vm.shrImm(VReg.V3, VReg.S2, 48);
+            vm.cmpImm(VReg.V3, 0x7FFE);
+            vm.jeq("_mcf_ent_ok");
+            vm.cmpImm(VReg.V3, 0x7FFD);
+            vm.jeq("_mcf_ent_ok");
+            vm.jmp("_mcf_bad_entry");
+            vm.label("_mcf_ent_ok");
+            vm.mov(VReg.A0, VReg.S2);
+            keyStr(VReg.A1, "0");
+            vm.call("_object_get");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.mov(VReg.A1, VReg.S2);
+            vm.call("_maybe_getter");
+            vm.store(VReg.SP, 16, VReg.RET); // key
+            vm.mov(VReg.A0, VReg.S2);
+            keyStr(VReg.A1, "1");
+            vm.call("_object_get");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.mov(VReg.A1, VReg.S2);
+            vm.call("_maybe_getter");
+            vm.mov(VReg.A3, VReg.RET); // value
+            vm.load(VReg.A2, VReg.SP, 16); // key
+            vm.cmpImm(VReg.S4, 0);
+            vm.jeq("_mcf_intrinsic_set");
+            vm.mov(VReg.A0, VReg.S4); // adder
+            vm.mov(VReg.A1, VReg.S0); // this=map
+            vm.movImm(VReg.A4, 2);
+            vm.call("_promise_invoke2");
+            vm.jmp("_mcf_after_set");
+            vm.label("_mcf_intrinsic_set");
+            vm.mov(VReg.A0, VReg.S0); // map
+            vm.load(VReg.A1, VReg.SP, 16); // key
+            vm.mov(VReg.A2, VReg.A3); // value
+            vm.call("_map_set");
+            vm.label("_mcf_after_set");
+            // pop try
+            vm.load(VReg.V1, VReg.SP, 32);
+            vm.lea(VReg.V0, "_exc_ctx_top");
+            vm.store(VReg.V0, 0, VReg.V1);
+            vm.jmp("_mcf_loop");
+
+            vm.label("_mcf_catch");
+            vm.load(VReg.V1, VReg.SP, 32);
+            vm.lea(VReg.V0, "_exc_ctx_top");
+            vm.store(VReg.V0, 0, VReg.V1);
+            vm.mov(VReg.A0, VReg.S3);
+            vm.call("_iterator_close_keep");
+            vm.call("_throw_unwind");
+
+            vm.label("_mcf_bad_entry");
+            vm.lea(VReg.A0, vm.asm.addString("Iterator value is not an entry object"));
+            vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+            vm.and(VReg.A0, VReg.A0, VReg.V1);
+            vm.movImm64(VReg.V1, STR_TAG);
+            vm.or(VReg.A0, VReg.A0, VReg.V1);
+            vm.call("_throw_type_error"); // 落入 _mcf_catch
+
+            vm.label("_mcf_done");
+            vm.mov(VReg.RET, VReg.S0);
+            vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 128);
+            throwTE("_mcf_not_iter", "object is not iterable");
+        }
+
         // _map_ctor_call - `Map()` 不带 new(经值路径调用,如 `const M=Map; M()`)→
         // TypeError(规范 24.1.1.1:Constructor Map requires 'new')。new Map(...) 在
         // compileNewExpression 静态特判,从不落此。
@@ -789,6 +1158,15 @@ export class MapGenerator {
         vm.mov(VReg.A0, VReg.RET);
         vm.call("_throw_type_error");   // 不返回
         vm.epilogue([VReg.S0], 16);     // 理论不达
+
+        // WeakMap 同形(裸 WeakMap() → TypeError);new WeakMap 走 compileNewExpression。
+        vm.label("_weakmap_ctor_call");
+        vm.prologue(16, [VReg.S0]);
+        vm.lea(VReg.A0, vm.asm.addString("Constructor WeakMap requires 'new'"));
+        vm.call("_js_box_string");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_throw_type_error");
+        vm.epilogue([VReg.S0], 16);
 
         // ============================================================
         // [I2 红队] 接收者品牌守卫 + V8 风格消息构造。
@@ -807,6 +1185,12 @@ export class MapGenerator {
         // 引用此标签,程序不触裸 Map 时 members.js 不会登记 → 链接期缺标签
         // 即 "Unknown label"(members.js _reEnsureSlot 对已登记同名槽查重跳过)。
         vm.asm.addDataLabel("_nsobj_map_proto");
+        vm.asm.addDataQword(0);
+        vm.asm.addDataLabel("_nsobj_map_iter_proto");
+        vm.asm.addDataQword(0);
+        vm.asm.addDataLabel("_nsobj_weakmap_proto");
+        vm.asm.addDataQword(0);
+        vm.asm.addDataLabel("_nsobj_weakmap");
         vm.asm.addDataQword(0);
         const STRTAG_I2 = 0x7ffc000000000000n;
         // 守卫头:成功落穿到紧跟的代码;失败 jmp <tag>_bad(A0 保持原接收者)。
@@ -839,6 +1223,129 @@ export class MapGenerator {
             vm.or(VReg.A1, VReg.A1, VReg.V1);
             vm.jmp("_aref_throw_incompat");
         };
+        // 活 Map 迭代器:游标走插入序链,跳过 empty@32 墓碑(clear/delete 后仍可达)。
+        // 闭包 48B: magic@0 nextfn@8 map@16 node@24 kind@32 done@40。
+        // kind 0=keys 1=values 2=entries。
+        vm.label("_map_iterator_new");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.mov(VReg.S2, VReg.A0); // map
+        vm.mov(VReg.S3, VReg.A1); // kind
+        vm.call("_object_new");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.movImm(VReg.A0, 48);
+        vm.call("_alloc");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.movImm(VReg.V1, 0xc105);
+        vm.store(VReg.S0, 0, VReg.V1);
+        vm.lea(VReg.V1, "_map_iter_next");
+        vm.store(VReg.S0, 8, VReg.V1);
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V2, VReg.S2, VReg.V1);
+        vm.store(VReg.S0, 16, VReg.V2);
+        vm.load(VReg.V1, VReg.V2, 16); // head
+        vm.store(VReg.S0, 24, VReg.V1); // node
+        vm.store(VReg.S0, 32, VReg.S3); // kind
+        vm.movImm(VReg.V1, 0);
+        vm.store(VReg.S0, 40, VReg.V1); // done
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.A1, this.vm.asm.addString("next"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7fff000000000000n);
+        vm.or(VReg.A2, VReg.S0, VReg.V1);
+        vm.call("_object_set");
+        vm.movImm(VReg.A0, 16);
+        vm.call("_alloc");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.movImm(VReg.V1, 0xc105);
+        vm.store(VReg.S0, 0, VReg.V1);
+        vm.lea(VReg.V1, "_generator_self");
+        vm.store(VReg.S0, 8, VReg.V1);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.A1, this.vm.asm.addString("Symbol.iterator"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7fff000000000000n);
+        vm.or(VReg.A2, VReg.S0, VReg.V1);
+        vm.call("_object_set");
+        vm.call("_ensure_set_iter_protos");
+        vm.lea(VReg.V0, "_nsobj_map_iter_proto");
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.emitMaskLoad(VReg.V2);
+        vm.andMaskReg(VReg.V1, VReg.V1, VReg.V2);
+        vm.store(VReg.S1, 16, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+        vm.mov(VReg.RET, VReg.S1);
+        vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+
+        vm.label("_map_iter_next");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.mov(VReg.S3, VReg.S0);
+        vm.load(VReg.V0, VReg.S0, 40);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_map_iter_done");
+        vm.label("_map_iter_skip");
+        vm.load(VReg.S2, VReg.S3, 24); // node
+        vm.cmpImm(VReg.S2, 0);
+        vm.jeq("_map_iter_done");
+        vm.load(VReg.V1, VReg.S2, 16); // next
+        vm.store(VReg.S3, 24, VReg.V1);
+        vm.load(VReg.V0, VReg.S2, 32); // empty
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_map_iter_skip");
+        vm.load(VReg.V1, VReg.S3, 32); // kind
+        vm.cmpImm(VReg.V1, 1);
+        vm.jeq("_map_iter_values");
+        vm.cmpImm(VReg.V1, 2);
+        vm.jeq("_map_iter_entries");
+        vm.load(VReg.S0, VReg.S2, 0); // key
+        vm.jmp("_map_iter_box0");
+        vm.label("_map_iter_values");
+        vm.load(VReg.S0, VReg.S2, 8); // value
+        vm.label("_map_iter_box0");
+        vm.cmpImm(VReg.S0, 0);
+        vm.jne("_map_iter_emit");
+        vm.movImm64(VReg.S0, 0x7ff8000000000000n);
+        vm.jmp("_map_iter_emit");
+        vm.label("_map_iter_entries");
+        vm.load(VReg.S0, VReg.S2, 0);
+        vm.cmpImm(VReg.S0, 0);
+        vm.jne("_map_iter_ek");
+        vm.movImm64(VReg.S0, 0x7ff8000000000000n);
+        vm.label("_map_iter_ek");
+        vm.load(VReg.S1, VReg.S2, 8);
+        vm.cmpImm(VReg.S1, 0);
+        vm.jne("_map_iter_ev");
+        vm.movImm64(VReg.S1, 0x7ff8000000000000n);
+        vm.label("_map_iter_ev");
+        vm.movImm(VReg.A0, 2);
+        vm.call("_array_new_with_size");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.movImm(VReg.A1, 0);
+        vm.mov(VReg.A2, VReg.S0);
+        vm.call("_array_set");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.movImm(VReg.A1, 1);
+        vm.mov(VReg.A2, VReg.S1);
+        vm.call("_array_set");
+        vm.movImm64(VReg.V1, 0x7ffe000000000000n);
+        vm.mov(VReg.S0, VReg.S2);
+        vm.or(VReg.S0, VReg.S0, VReg.V1);
+        vm.label("_map_iter_emit");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.movImm64(VReg.A1, 0x7ff9000000000000n);
+        vm.call("_generator_make_result");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+        vm.label("_map_iter_done");
+        vm.movImm(VReg.V0, 1);
+        vm.store(VReg.S3, 40, VReg.V0);
+        vm.movImm64(VReg.A0, 0x7ffb000000000000n);
+        vm.movImm64(VReg.A1, 0x7ff9000000000001n);
+        vm.call("_generator_make_result");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+
         // 薄壳:品牌守卫 → 纯尾调既有裸 helper(消息前缀与 Node 逐字一致)。
         const guarded = (label, typeByte, helper, prefix) => {
             vm.label(label);
@@ -849,6 +1356,8 @@ export class MapGenerator {
         guarded("_aref_map_get", TYPE_MAP, "_map_get", "Method Map.prototype.get called on incompatible receiver ");
         guarded("_aref_map_set", TYPE_MAP, "_map_set", "Method Map.prototype.set called on incompatible receiver ");
         guarded("_aref_map_has", TYPE_MAP, "_map_has", "Method Map.prototype.has called on incompatible receiver ");
+        guarded("_aref_map_getOrInsert", TYPE_MAP, "_map_getOrInsert", "Method Map.prototype.getOrInsert called on incompatible receiver ");
+        guarded("_aref_map_getOrInsertComputed", TYPE_MAP, "_map_getOrInsertComputed", "Method Map.prototype.getOrInsertComputed called on incompatible receiver ");
         guarded("_aref_map_delete", TYPE_MAP, "_map_delete", "Method Map.prototype.delete called on incompatible receiver ");
         guarded("_aref_map_keys", TYPE_MAP, "_map_keys", "Method Map.prototype.keys called on incompatible receiver ");
         guarded("_aref_map_values", TYPE_MAP, "_map_values", "Method Map.prototype.values called on incompatible receiver ");

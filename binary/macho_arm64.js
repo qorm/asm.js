@@ -45,6 +45,7 @@ let S_NON_LAZY_SYMBOL_POINTERS = 6; // 非延迟符号指针
 export class MachOARM64Generator {
     constructor() {
         this.buffer = [];
+        this.nodeBuffer = false;
         this.baseAddr = 4294967296; // 0x100000000
         this.pageSize = 16384; // 0x4000
         this.externalDylibs = []; // 额外的动态库
@@ -67,6 +68,10 @@ export class MachOARM64Generator {
     }
 
     write(byte) {
+        if (this.nodeBuffer) {
+            this.buffer[this.cursor++] = byte & 255;
+            return;
+        }
         // 先取局部再 push(#18 实验兼优化):`this.buffer.push` 是成员 push,编译器
         // 对其发射「push + _object_set 写回成员」——12MB 产物 = 1200 万次属性写回。
         // asm.js 数组头地址稳定(ensure_cap 原地更新 data_ptr),写回本是恒等操作;
@@ -76,24 +81,89 @@ export class MachOARM64Generator {
         b.push(byte & 255);
     }
 
+    writeByteBuffer(buf) {
+        const CHUNK_BITS = 20;
+        const CHUNK_SIZE = 1048576;
+        const CHUNK_MASK = 1048575;
+        let src = 0;
+        const n = buf.length;
+        if (!this.nodeBuffer) {
+            // 自举数组缓冲:按 word 拆字节 push(勿逐字节 get,40MB 会拖死)
+            const b = this.buffer;
+            while (src < n) {
+                const within = src & CHUNK_MASK;
+                const word = buf.chunks[src >> CHUNK_BITS][within >> 2];
+                const rem = n - src;
+                if (rem >= 4 && (within & 3) === 0) {
+                    b.push(word & 255, (word >>> 8) & 255, (word >>> 16) & 255, (word >>> 24) & 255);
+                    src += 4;
+                } else {
+                    b.push((word >>> ((within & 3) << 3)) & 255);
+                    src += 1;
+                }
+            }
+            return;
+        }
+        while (src < n) {
+            const within = src & CHUNK_MASK;
+            const count = Math.min(n - src, CHUNK_SIZE - within);
+            const chunk = buf.chunks[src >> CHUNK_BITS];
+            // 与 ByteBuffer.slice 同形:先整块视窗再 subarray。
+            // 三参 (buffer, byteOffset+within, count) 在自举 TypedArray 上会越界。
+            const view = new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+            this.buffer.set(view.subarray(within, within + count), this.cursor);
+            this.cursor += count;
+            src += count;
+        }
+    }
+
     writeBytes(bytes) {
-        // length 读一次缓存(#18 假说验证兼无害加固):自举下同一数组 length 作循环
-        // 边界反复读取,特定堆布局出现偏大值 → 产物尾部多写页对齐垃圾。写出期间
-        // bytes 不变,单次读取与逐轮读取在 node 语义等价。
-        // 局部引用直 push,省掉每字节一次 write() 方法调用(16MB 产物 = 1600 万次)。
+        if (bytes && bytes._asmjsByteBuffer) {
+            this.writeByteBuffer(bytes);
+            return;
+        }
+        if (this.nodeBuffer) {
+            const n = bytes.length;
+            if (bytes && bytes.BYTES_PER_ELEMENT === 1 && typeof this.buffer.set === "function") {
+                this.buffer.set(bytes, this.cursor);
+                this.cursor += n;
+                return;
+            }
+            if (process.release) {
+                Buffer.from(bytes).copy(this.buffer, this.cursor);
+                this.cursor += n;
+                return;
+            }
+            for (let i = 0; i < n; i = i + 1) this.buffer[this.cursor + i] = bytes[i] & 255;
+            this.cursor += n;
+            return;
+        }
+        // length 读一次缓存(#18)
         const b = this.buffer;
         const n = bytes.length;
         for (let i = 0; i < n; i = i + 1) {
-            b.push(bytes[i]);
+            b.push(bytes[i] & 255);
         }
     }
 
     write16(value) {
+        if (this.nodeBuffer) {
+            this.buffer[this.cursor++] = value & 255;
+            this.buffer[this.cursor++] = (value >> 8) & 255;
+            return;
+        }
         const b = this.buffer;
         b.push(value & 255, (value >> 8) & 255);
     }
 
     write32(value) {
+        if (this.nodeBuffer) {
+            this.buffer[this.cursor++] = value & 255;
+            this.buffer[this.cursor++] = (value >> 8) & 255;
+            this.buffer[this.cursor++] = (value >> 16) & 255;
+            this.buffer[this.cursor++] = (value >> 24) & 255;
+            return;
+        }
         const b = this.buffer;
         b.push(value & 255, (value >> 8) & 255, (value >> 16) & 255, (value >> 24) & 255);
     }
@@ -101,37 +171,45 @@ export class MachOARM64Generator {
     write64(value) {
         let low = value & 4294967295;
         let high = Math.floor(value / 4294967296) & 4294967295;
+        if (this.nodeBuffer) {
+            this.write32(low);
+            this.write32(high);
+            return;
+        }
         const b = this.buffer;
         b.push(low & 255, (low >> 8) & 255, (low >> 16) & 255, (low >> 24) & 255,
                high & 255, (high >> 8) & 255, (high >> 16) & 255, (high >> 24) & 255);
     }
 
     writeString(str, strLen) {
-        const b = this.buffer;
         for (let i = 0; i < strLen; i = i + 1) {
-            if (i < str.length) {
-                b.push(str.charCodeAt(i));
-            } else {
-                b.push(0);
-            }
+            if (i < str.length) this.write(str.charCodeAt(i));
+            else this.write(0);
         }
     }
 
     writeCString(str) {
-        const b = this.buffer;
         for (let i = 0; i < str.length; i = i + 1) {
-            b.push(str.charCodeAt(i));
+            this.write(str.charCodeAt(i));
         }
-        b.push(0);
+        this.write(0);
     }
 
     padTo(offset) {
+        if (this.nodeBuffer) {
+            while (this.cursor < offset) this.write(0);
+            return;
+        }
         while (this.buffer.length < offset) {
             this.write(0);
         }
     }
 
     alignTo(align) {
+        if (this.nodeBuffer) {
+            while (this.cursor % align !== 0) this.write(0);
+            return;
+        }
         while (this.buffer.length % align !== 0) {
             this.write(0);
         }
@@ -275,6 +353,15 @@ export class MachOARM64Generator {
         let linkeditFileSize = Math.ceil(linkeditSize / this.pageSize) * this.pageSize;
 
         let bindInfoFileOffset = linkeditFileOffset;
+
+        // 预分配最终文件:Node 用 Buffer.copy,自宿主用 Uint8Array.set(同型 memcpy),
+        // 避免 68MB 产物逐字节 push。ASMJS_BINARY_ARRAY=1 保留旧数组路径对拍。
+        if (!process.env.ASMJS_BINARY_ARRAY) {
+            const fileSize = linkeditFileOffset + linkeditFileSize;
+            this.buffer = process.release ? Buffer.alloc(fileSize) : new Uint8Array(fileSize);
+            this.cursor = 0;
+            this.nodeBuffer = true;
+        }
 
         // 使用 _start 标签作为入口点，如果没有则使用代码开头
         let startOffset = (labels && labels.get("_start") !== undefined) ? labels.get("_start") : 0;
@@ -496,6 +583,11 @@ export class MachOARM64Generator {
         // 填充到 linkedit 结束
         this.padTo(linkeditFileOffset + linkeditSize);
 
+        if (this.nodeBuffer) {
+            return this.buffer.subarray
+                ? this.buffer.subarray(0, this.cursor)
+                : this.buffer.slice(0, this.cursor);
+        }
         const result = this.buffer;
         return result;
     }

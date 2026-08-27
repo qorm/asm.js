@@ -1,13 +1,13 @@
 // asm.js 编译器 - Array 方法编译
 // 从 builtin_methods.js 按功能拆出(2026-07-14)。方法经 this 解析,与主 mixin 同一原型。
 
-import { VReg } from "../../vm/index.js";
+import { VReg } from "../../vm/registers.js";
+import { argsHasSpread } from "../expressions/expressions.js";
 
 export const BuiltinArrayMethodCompiler = {
     // [半支持修补] Array.prototype.flat(depth):接收者已在 RET。逐层调用 _array_flat
     // (每次展一层),直到 depth 耗尽或数组内已无嵌套数组(提前退出——支持 flat(Infinity))。
-    // depth 来源:数字字面量→截断整数;标识符 Infinity→大哨兵(配合无嵌套退出);
-    // 其他表达式→_to_int32(变量形式的 Infinity 会坍缩为 0,罕见,不支持)。
+    // depth:undefined→1;+Inf→大哨兵;ToInteger≤0→0(不展平,返回原数组浅拷贝语义由 species 路径保证)。
     compileArrayFlatDepth(depthArg) {
         const vm = this.vm;
         const id = this.nextLabelId();
@@ -17,17 +17,22 @@ export const BuiltinArrayMethodCompiler = {
         const lenOff = this.ctx.allocLocal(`__flat_len_${id}`);
         // 接收者(boxed 数组)已在 RET
         vm.store(VReg.FP, accOff, VReg.RET);
-        // depth 整数 → depthOff
+        // depth → 裸 int(ToIntegerOrInfinity 近似)
         if (depthArg.type === "Literal" && typeof depthArg.value === "number") {
-            vm.movImm(VReg.V0, Math.max(0, Math.trunc(depthArg.value)));
+            const d = depthArg.value;
+            if (!Number.isFinite(d) && d > 0) vm.movImm(VReg.V0, 0x40000000);
+            else vm.movImm(VReg.V0, Math.max(0, Math.trunc(d) | 0));
             vm.store(VReg.FP, depthOff, VReg.V0);
         } else if (depthArg.type === "Identifier" && depthArg.name === "Infinity") {
-            vm.movImm(VReg.V0, 0x40000000); // 足够大;"无嵌套即止"负责真正退出
+            vm.movImm(VReg.V0, 0x40000000);
+            vm.store(VReg.FP, depthOff, VReg.V0);
+        } else if (depthArg.type === "Identifier" && depthArg.name === "undefined") {
+            vm.movImm(VReg.V0, 1);
             vm.store(VReg.FP, depthOff, VReg.V0);
         } else {
             this.compileExpression(depthArg);
             vm.mov(VReg.A0, VReg.RET);
-            vm.call("_to_int32");
+            vm.call("_flat_to_depth");
             vm.store(VReg.FP, depthOff, VReg.RET);
         }
         const outL = `_flat_out_${id}`;
@@ -81,7 +86,7 @@ export const BuiltinArrayMethodCompiler = {
         // push 方法特殊处理：需要更新数组引用（因为扩容可能重新分配）
         if (method === "push") {
             if (args.length > 0) {
-                const hasSpread = args.some((a) => a && a.type === "SpreadElement");
+                const hasSpread = argsHasSpread(args);
                 if (!hasSpread) {
                     // 多参数 push(a,b,c,...):逐个 _array_push;每次扩容可能返回新指针,
                     // 栈顶滚动保存当前数组指针,循环结束 RET=最终数组。(曾只编译 args[0]
@@ -272,7 +277,7 @@ export const BuiltinArrayMethodCompiler = {
                 this.vm.cmpImm(VReg.V0, 0x7FFE);
                 this.vm.jne(_ssFb);
 
-                this.vm.mov(VReg.A0, VReg.RET);
+                this.vm.load(VReg.A0, VReg.FP, _ssRecv);
                 this.vm.call("_array_species_check");
                 this.vm.cmpImm(VReg.RET, 0);
                 this.vm.jne(_ssFb);
@@ -300,30 +305,32 @@ export const BuiltinArrayMethodCompiler = {
                 this.vm.call("_box_arr_r");
                 this.vm.jmp(_ssEnd);
                 // fallback: non-default species
+                // 实参求值会毁 A0,先落栈再装参(同 concat)。
                 this.vm.label(_ssFb);
-                this.vm.load(VReg.A0, VReg.FP, _ssRecv);
-                if (args.length >= 2) {
+                {
+                const sOff = this.ctx.allocLocal(`__sl_a1_${this.nextLabelId()}`);
+                const eOff = this.ctx.allocLocal(`__sl_a2_${this.nextLabelId()}`);
+                if (args.length >= 1) {
                     this.compileExpression(args[0]);
-                    this.vm.mov(VReg.A1, VReg.RET);
-                    this.vm.push(VReg.A1);
-                    this.compileExpression(args[1]);
-                    this.vm.mov(VReg.A2, VReg.RET);
-                    this.vm.pop(VReg.A1);
-                } else if (args.length >= 1) {
-                    this.compileExpression(args[0]);
-                    this.vm.mov(VReg.A1, VReg.RET);
-                    this.vm.movImm(VReg.A2, 2147483647);
-                    this.vm.scvtf(0, VReg.A2);
-                    this.vm.fmovToInt(VReg.A2, 0);
+                    this.vm.store(VReg.FP, sOff, VReg.RET);
                 } else {
-                    this.vm.movImm(VReg.A1, 0);
-                    this.vm.scvtf(0, VReg.A1);
-                    this.vm.fmovToInt(VReg.A1, 0);
-                    this.vm.movImm(VReg.A2, 2147483647);
-                    this.vm.scvtf(0, VReg.A2);
-                    this.vm.fmovToInt(VReg.A2, 0);
+                    this.vm.movImm(VReg.V0, 0);
+                    this.vm.scvtf(0, VReg.V0);
+                    this.vm.fmovToInt(VReg.V0, 0);
+                    this.vm.store(VReg.FP, sOff, VReg.V0);
                 }
+                if (args.length >= 2) {
+                    this.compileExpression(args[1]);
+                    this.vm.store(VReg.FP, eOff, VReg.RET);
+                } else {
+                    this.vm.movImm64(VReg.V0, 0x7ffb000000000000n); // undefined → 到末尾
+                    this.vm.store(VReg.FP, eOff, VReg.V0);
+                }
+                this.vm.load(VReg.A0, VReg.FP, _ssRecv);
+                this.vm.load(VReg.A1, VReg.FP, sOff);
+                this.vm.load(VReg.A2, VReg.FP, eOff);
                 this.vm.call("_agen_slice");
+                }
                 this.vm.label(_ssEnd);
                 }
                 break;
@@ -372,12 +379,10 @@ export const BuiltinArrayMethodCompiler = {
                     const doneLabel = `_includes_done_${this.nextLabelId()}`;
                     this.vm.cmpImm(VReg.RET, 0);
                     this.vm.jne(trueLabel);
-                    this.vm.lea(VReg.V0, "_js_false");
-                    this.vm.load(VReg.RET, VReg.V0, 0);
+                    this.vm.movImm64(VReg.RET, 0x7ff9000000000000n);
                     this.vm.jmp(doneLabel);
                     this.vm.label(trueLabel);
-                    this.vm.lea(VReg.V0, "_js_true");
-                    this.vm.load(VReg.RET, VReg.V0, 0);
+                    this.vm.movImm64(VReg.RET, 0x7ff9000000000001n);
                     this.vm.label(doneLabel);
                 }
                 break;
@@ -462,15 +467,29 @@ export const BuiltinArrayMethodCompiler = {
                 break;
             }
             case "toSorted": {
-                // [#35] 非破坏排序:slice 拷贝存临时槽,借"伪 Identifier"复用
-                // compileArraySort(其签名要求 AST 节点会重求值,临时名解析到该槽)
-                this.vm.mov(VReg.A0, VReg.RET);
+                // ES:IsCallable(comparefn) 先于 ToObject / LengthOfArrayLike / slice。
+                // 旧路先 slice 再 sort,comparefn=null 会先读 length(getter 抛 Test262Error)。
+                const tsRecvOff = this.ctx.allocLocal(`__tosorted_recv_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, tsRecvOff, VReg.RET);
+                if (args.length > 0) {
+                    this.compileExpression(args[0]);
+                    const tsCmpOff = this.ctx.allocLocal(`__tosorted_cmp_${this.nextLabelId()}`);
+                    this.vm.store(VReg.FP, tsCmpOff, VReg.RET);
+                    const tsCmpSkip = this.ctx.newLabel("tosorted_cmp_skip");
+                    this.vm.shrImm(VReg.V0, VReg.RET, 48);
+                    this.vm.cmpImm(VReg.V0, 0x7FFB);
+                    this.vm.jeq(tsCmpSkip);
+                    this.vm.load(VReg.A0, VReg.FP, tsCmpOff);
+                    this.vm.call("_aref_require_cb");
+                    this.vm.label(tsCmpSkip);
+                }
+                this.vm.load(VReg.A0, VReg.FP, tsRecvOff);
                 this.vm.call("_js_unbox");
                 this.vm.mov(VReg.A0, VReg.RET);
                 this.vm.movImm(VReg.A1, 0);
                 this.vm.movImm(VReg.A2, 2147483647);
                 this.vm.call("_array_slice");
-                this.vm.call("_box_arr_r"); // box->helper
+                this.vm.call("_box_arr_r");
                 const tsName = `__tosorted_${this.nextLabelId()}`;
                 const tsOff = this.ctx.allocLocal(tsName);
                 this.vm.store(VReg.FP, tsOff, VReg.RET);
@@ -554,23 +573,51 @@ export const BuiltinArrayMethodCompiler = {
                 this.vm.call("_array_join");
                 break;
             case "reverse":
-                // 接收者已在 RET(line 148);二次求值会让 X.reverse() 作接收者时反转两遍。
+                // 接收者已在 RET;须走活读(_agen_reverse):defineProperty accessor
+                // 缩 length(get_if_present_with_delete)。稠密 _array_reverse 不触发 getter。
                 this.vm.mov(VReg.A0, VReg.RET);
-                this.vm.call("_array_reverse");
+                this.vm.call("_agen_reverse");
                 break;
-            case "flat":
-                // arr.flat() - 展开一层。此前无 case 落 default 返回接收者本身 → join
-                // 出乱码。接收者已在 RET。
+            case "toLocaleString":
+                // 元素 Invoke(toLocaleString);勿当 join/toString(布尔原语 accessor 测例)。
+                this.vm.mov(VReg.A0, VReg.RET);
+                this.vm.call("_agen_toLocaleString");
+                break;
+            case "flat": {
+                // 默认真数组保持 `_array_flat` 快路(编译器自举无参 flat)。
+                // 自定义 species / 非数组 → `_agen_flat`(ArraySpeciesCreate + CDP)。
+                const _flFb = this.ctx.newLabel("fl_spec_fb");
+                const _flEnd = this.ctx.newLabel("fl_spec_done");
+                const _flRecv = this.ctx.allocLocal(`__fl_spec_r_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, _flRecv, VReg.RET);
+                this.vm.load(VReg.V0, VReg.FP, _flRecv);
+                this.vm.shrImm(VReg.V0, VReg.V0, 48);
+                this.vm.cmpImm(VReg.V0, 0x7FFE);
+                this.vm.jne(_flFb);
+                this.vm.load(VReg.A0, VReg.FP, _flRecv);
+                this.vm.call("_array_species_check");
+                this.vm.cmpImm(VReg.RET, 0);
+                this.vm.jne(_flFb);
+                this.vm.load(VReg.RET, VReg.FP, _flRecv);
                 if (args.length === 0) {
-                    // 无参深度 1:保持原 codegen 逐字节不变(自举安全——编译器源仅用无参 flat)。
                     this.vm.mov(VReg.A0, VReg.RET);
                     this.vm.call("_array_flat");
                 } else {
-                    // [半支持修补] flat(depth):此前忽略深度参数恒展一层。
-                    // 循环展平,每层一次 _array_flat,直到深度耗尽或已无嵌套数组。
                     this.compileArrayFlatDepth(args[0]);
                 }
+                this.vm.jmp(_flEnd);
+                this.vm.label(_flFb);
+                if (args.length === 0) {
+                    this.vm.movImm64(VReg.A1, 0x7ffb000000000000n);
+                } else {
+                    this.compileExpression(args[0]);
+                    this.vm.mov(VReg.A1, VReg.RET);
+                }
+                this.vm.load(VReg.A0, VReg.FP, _flRecv);
+                this.vm.call("_agen_flat");
+                this.vm.label(_flEnd);
                 break;
+            }
             case "lastIndexOf":
                 // 接收者已在 RET(line 148),勿二次求值(同 join 理由)。
                 // A0=arr, A1=value, A2=fromIndex(从此下标向前搜;缺省用 INT_MAX 哨兵,
@@ -617,7 +664,8 @@ export const BuiltinArrayMethodCompiler = {
                 this.vm.cmpImm(VReg.V0, 0x7FFE);
                 this.vm.jne(_ccSpecFb);
 
-                this.vm.mov(VReg.A0, VReg.RET);
+                // fast path: default species(重载 recv:x64 上 V0≡RET,tag 判别已毁 RET)
+                this.vm.load(VReg.A0, VReg.FP, _ccRecvSp);
                 this.vm.call("_array_species_check");
                 this.vm.cmpImm(VReg.RET, 0);
                 this.vm.jne(_ccSpecFb);
@@ -631,41 +679,7 @@ export const BuiltinArrayMethodCompiler = {
                 this.vm.call("_array_new_with_size");
                 this.vm.store(VReg.FP, accOff, VReg.RET);
 
-                // 展开一个数组源（已存于 srcOff）到累加器
-                const spreadArrInto = (srcOff) => {
-                    const lenOff = this.ctx.allocLocal(`__concat_len_${this.nextLabelId()}`);
-                    const idxOff = this.ctx.allocLocal(`__concat_idx_${this.nextLabelId()}`);
-                    this.vm.load(VReg.A0, VReg.FP, srcOff);
-                    this.vm.call("_array_length");         // RET = 整数长度
-                    this.vm.store(VReg.FP, lenOff, VReg.RET);
-                    this.vm.movImm(VReg.V0, 0);
-                    this.vm.store(VReg.FP, idxOff, VReg.V0);
-                    const id = this.nextLabelId();
-                    const loopL = `_concat_loop_${id}`;
-                    const doneL = `_concat_ldone_${id}`;
-                    this.vm.label(loopL);
-                    this.vm.load(VReg.V0, VReg.FP, idxOff);
-                    this.vm.load(VReg.V1, VReg.FP, lenOff);
-                    this.vm.cmp(VReg.V0, VReg.V1);
-                    this.vm.jge(doneL);
-                    this.vm.load(VReg.A0, VReg.FP, srcOff);
-                    this.vm.load(VReg.A1, VReg.FP, idxOff);
-                    this.vm.call("_array_get");            // RET = elem
-                    this.vm.mov(VReg.A1, VReg.RET);
-                    this.vm.load(VReg.A0, VReg.FP, accOff);
-                    this.vm.call("_array_push");
-                    this.vm.store(VReg.FP, accOff, VReg.RET);
-                    this.vm.load(VReg.V0, VReg.FP, idxOff);
-                    this.vm.addImm(VReg.V0, VReg.V0, 1);
-                    this.vm.store(VReg.FP, idxOff, VReg.V0);
-                    this.vm.jmp(loopL);
-                    this.vm.label(doneL);
-                };
-
-                // 接收者一定是数组
-                spreadArrInto(recvOff);
-
-                // 单个实参并入累加器。使用 _concat_append_item 处理 IsConcatSpreadable。
+                // 单个源并入累加器。使用 _concat_append_item 处理 IsConcatSpreadable。
                 const concatOneArg = (argOff) => {
                     this.vm.load(VReg.A0, VReg.FP, accOff);
                     this.vm.load(VReg.A1, VReg.FP, argOff);
@@ -673,7 +687,11 @@ export const BuiltinArrayMethodCompiler = {
                     this.vm.store(VReg.FP, accOff, VReg.RET);
                 };
 
-                if (args.some((a) => a && a.type === "SpreadElement")) {
+                // 接收者亦属 items[0]:须 Get(@@isConcatSpreadable)(get-order 测例)。
+                // 旧 spreadArrInto 跳过 → 仅 species 的 constructor 被观察。
+                concatOneArg(recvOff);
+
+                if (argsHasSpread(args)) {
                     // 含 spread 实参(`[].concat(...arrays)`):把全部实参(spread 展开)建成数组,
                     // 运行时逐元素 concat。此前对 SpreadElement 调 compileExpression → 坏码整程序崩。
                     this.compileArrayExpressionWithSpread(args); // RET = 实参数组(boxed)
@@ -719,17 +737,24 @@ export const BuiltinArrayMethodCompiler = {
                 this.vm.jmp(_ccSpecEnd);
 
                 // fallback: non-default species / 非数组 this -> _agen_concat
+                // 实参 compileExpression 会毁 A0..A4,须先全部落栈再装参。
                 this.vm.label(_ccSpecFb);
-                this.vm.load(VReg.A0, VReg.FP, _ccRecvSp);
+                {
+                const argSlots = [];
                 for (let ci = 0; ci < Math.min(args.length, 4); ci++) {
                     this.compileExpression(args[ci]);
-                    if (ci === 0) this.vm.mov(VReg.A1, VReg.RET);
-                    else if (ci === 1) this.vm.mov(VReg.A2, VReg.RET);
-                    else if (ci === 2) this.vm.mov(VReg.A3, VReg.RET);
-                    else if (ci === 3) this.vm.mov(VReg.A4, VReg.RET);
+                    const off = this.ctx.allocLocal(`__cc_arg_${ci}_${this.nextLabelId()}`);
+                    this.vm.store(VReg.FP, off, VReg.RET);
+                    argSlots.push(off);
                 }
+                this.vm.load(VReg.A0, VReg.FP, _ccRecvSp);
+                if (argSlots.length > 0) this.vm.load(VReg.A1, VReg.FP, argSlots[0]);
+                if (argSlots.length > 1) this.vm.load(VReg.A2, VReg.FP, argSlots[1]);
+                if (argSlots.length > 2) this.vm.load(VReg.A3, VReg.FP, argSlots[2]);
+                if (argSlots.length > 3) this.vm.load(VReg.A4, VReg.FP, argSlots[3]);
                 this.emitSetCallArgc(Math.min(args.length, 4));
                 this.vm.call("_agen_concat");
+                }
                 this.vm.label(_ccSpecEnd);
                 break;
             }
@@ -756,7 +781,7 @@ export const BuiltinArrayMethodCompiler = {
                     const uid = this.nextLabelId();
                     const uArrOff = this.ctx.allocLocal(`__unshift_arr_${uid}`);
                     this.vm.store(VReg.FP, uArrOff, VReg.RET); // 保存接收者(装箱数组)
-                    if (args.some((a) => a && a.type === "SpreadElement")) {
+                    if (argsHasSpread(args)) {
                         // spread 慢路径:arr.unshift(x, ...src, y)。逐参 compileExpression 会对
                         // SpreadElement 报 "Unhandled expression type" 并产坏码,故先把全部实参
                         // 编成一个展开后的 items 数组(ArrayExpression 处理 spread,gen2 安全),
@@ -847,34 +872,41 @@ export const BuiltinArrayMethodCompiler = {
                 this.vm.jmp(_spSpecEnd);
 
                 // fallback: non-default species / 非数组 this -> _agen_splice_items
-                // (A3=items 数组;与方法值 _agen_splice 的 argc 打包装入口分离)
+                // 实参求值会毁 A0,先落栈再装参。
                 this.vm.label(_spSpecFb);
-                this.vm.load(VReg.A0, VReg.FP, _spRecvSp);
+                {
+                const stOff = this.ctx.allocLocal(`__sp_fb_s_${_spId}`);
+                const dlOff = this.ctx.allocLocal(`__sp_fb_d_${_spId}`);
+                const itOff = this.ctx.allocLocal(`__sp_fb_i_${_spId}`);
                 if (args.length >= 1) {
                     this.compileExpression(args[0]);
-                    this.vm.mov(VReg.A1, VReg.RET);
-                    if (args.length >= 2) {
-                        this.compileExpression(args[1]);
-                        this.vm.mov(VReg.A2, VReg.RET);
-                    } else {
-                        this.vm.movImm64(VReg.A2, 0x7ffb000000000000n); // undefined → 删到尾
-                    }
+                    this.vm.store(VReg.FP, stOff, VReg.RET);
                 } else {
-                    this.vm.movImm(VReg.A1, 0);
-                    this.vm.scvtf(0, VReg.A1);
-                    this.vm.fmovToInt(VReg.A1, 0);
-                    this.vm.movImm64(VReg.A2, 0x7ffb000000000000n);
+                    this.vm.movImm(VReg.V0, 0);
+                    this.vm.scvtf(0, VReg.V0);
+                    this.vm.fmovToInt(VReg.V0, 0);
+                    this.vm.store(VReg.FP, stOff, VReg.V0);
+                }
+                if (args.length >= 2) {
+                    this.compileExpression(args[1]);
+                    this.vm.store(VReg.FP, dlOff, VReg.RET);
+                } else {
+                    this.vm.movImm64(VReg.V0, 0x7ffb000000000000n); // undefined → 删到尾
+                    this.vm.store(VReg.FP, dlOff, VReg.V0);
                 }
                 if (args.length >= 3) {
-                    const _spCtxOff = this.ctx.allocLocal(`__sp_ctx_${_spId}`);
                     this.compileExpression({ type: "ArrayExpression", elements: args.slice(2) });
-                    this.vm.store(VReg.FP, _spCtxOff, VReg.RET);
-                    this.vm.load(VReg.A3, VReg.FP, _spCtxOff);
+                    this.vm.store(VReg.FP, itOff, VReg.RET);
                 } else {
-                    this.vm.movImm(VReg.A3, 0);
+                    this.vm.movImm(VReg.V0, 0);
+                    this.vm.store(VReg.FP, itOff, VReg.V0);
                 }
+                this.vm.load(VReg.A0, VReg.FP, _spRecvSp);
+                this.vm.load(VReg.A1, VReg.FP, stOff);
+                this.vm.load(VReg.A2, VReg.FP, dlOff);
+                this.vm.load(VReg.A3, VReg.FP, itOff);
                 this.vm.call("_agen_splice_items");
-
+                }
                 this.vm.label(_spSpecEnd);
                 break;
             }
@@ -986,144 +1018,43 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.load(VReg.RET, VReg.FP, arrOff); // 返回接收者
     },
 
-    // [半支持修补] arr.copyWithin(target, start?, end?):此前无 case → 落 default 返 false → 崩。
-    // 原地把 [start,end) 复制到 target(索引按 ES 归一)。count = min(end-start, len-target);
-    // 重叠时按方向复制避免自覆盖。返回接收者(调用点已把接收者求值到 RET)。
+    // arr.copyWithin(target, start?, end?):接收者已在 RET。实参求值后委托
+    // `_array_copyWithin_rt`(与 `_agen_copyWithin` 同体):捕获 length、ToInteger
+    // 副作用、Has/Get/Set 与 Delete。不再内联循环——调用点码更短,语义只维护一处。
     compileArrayCopyWithin(args) {
         const id = this.nextLabelId();
         const arrOff = this.ctx.allocLocal(`__cw_arr_${id}`);
-        const lenOff = this.ctx.allocLocal(`__cw_len_${id}`);
         const tgtOff = this.ctx.allocLocal(`__cw_tgt_${id}`);
         const fromOff = this.ctx.allocLocal(`__cw_from_${id}`);
         const endOff = this.ctx.allocLocal(`__cw_end_${id}`);
-        const cntOff = this.ctx.allocLocal(`__cw_cnt_${id}`);
-        const toOff = this.ctx.allocLocal(`__cw_to_${id}`);
-        const stepOff = this.ctx.allocLocal(`__cw_step_${id}`);
-        const fcOff = this.ctx.allocLocal(`__cw_fc_${id}`);
-        const valOff = this.ctx.allocLocal(`__cw_val_${id}`);
         this.vm.store(VReg.FP, arrOff, VReg.RET);
-        this.vm.load(VReg.A0, VReg.FP, arrOff);
-        this.vm.call("_array_length");
-        this.vm.store(VReg.FP, lenOff, VReg.RET);
-        // target/start/end:显式 undefined → default(0/0/len);统一 _aref_relidx
+        const undef = () => {
+            this.vm.movImm64(VReg.V0, 0x7ffb000000000000n);
+            return VReg.V0;
+        };
         if (args.length >= 1) {
             this.compileExpression(args[0]);
-            this.vm.mov(VReg.A0, VReg.RET);
-            this.vm.load(VReg.A1, VReg.FP, lenOff);
-            this.vm.movImm(VReg.A2, 0);
-            this.vm.call("_aref_relidx");
             this.vm.store(VReg.FP, tgtOff, VReg.RET);
         } else {
-            this.vm.movImm(VReg.V0, 0);
-            this.vm.store(VReg.FP, tgtOff, VReg.V0);
+            this.vm.store(VReg.FP, tgtOff, undef());
         }
         if (args.length >= 2) {
             this.compileExpression(args[1]);
-            this.vm.mov(VReg.A0, VReg.RET);
-            this.vm.load(VReg.A1, VReg.FP, lenOff);
-            this.vm.movImm(VReg.A2, 0);
-            this.vm.call("_aref_relidx");
             this.vm.store(VReg.FP, fromOff, VReg.RET);
         } else {
-            this.vm.movImm(VReg.V0, 0);
-            this.vm.store(VReg.FP, fromOff, VReg.V0);
+            this.vm.store(VReg.FP, fromOff, undef());
         }
         if (args.length >= 3) {
             this.compileExpression(args[2]);
-            this.vm.mov(VReg.A0, VReg.RET);
-            this.vm.load(VReg.A1, VReg.FP, lenOff);
-            this.vm.load(VReg.A2, VReg.FP, lenOff); // end 缺省 len
-            this.vm.call("_aref_relidx");
             this.vm.store(VReg.FP, endOff, VReg.RET);
         } else {
-            this.vm.load(VReg.V0, VReg.FP, lenOff);
-            this.vm.store(VReg.FP, endOff, VReg.V0);
+            this.vm.store(VReg.FP, endOff, undef());
         }
-        // count = min(end - from, len - target)
-        this.vm.load(VReg.V0, VReg.FP, endOff);
-        this.vm.load(VReg.V1, VReg.FP, fromOff);
-        this.vm.sub(VReg.V0, VReg.V0, VReg.V1); // end - from
-        this.vm.store(VReg.FP, cntOff, VReg.V0);
-        this.vm.load(VReg.V0, VReg.FP, lenOff);
-        this.vm.load(VReg.V1, VReg.FP, tgtOff);
-        this.vm.sub(VReg.V0, VReg.V0, VReg.V1); // len - target
-        this.vm.load(VReg.V1, VReg.FP, cntOff);
-        const useV0L = `_cw_usev0_${id}`;
-        this.vm.cmp(VReg.V0, VReg.V1);
-        this.vm.jle(useV0L);   // V0 <= cnt → count = V0
-        this.vm.load(VReg.V0, VReg.FP, cntOff);
-        this.vm.label(useV0L);
-        this.vm.store(VReg.FP, cntOff, VReg.V0);
-        const doneL = `_cw_done_${id}`;
-        // count <= 0 → 完成
-        this.vm.load(VReg.V0, VReg.FP, cntOff);
-        this.vm.cmpImm(VReg.V0, 0);
-        this.vm.jle(doneL);
-        // fc = from + count
-        this.vm.load(VReg.V0, VReg.FP, fromOff);
-        this.vm.load(VReg.V1, VReg.FP, cntOff);
-        this.vm.add(VReg.V0, VReg.V0, VReg.V1);
-        this.vm.store(VReg.FP, fcOff, VReg.V0);
-        // 方向:from < target && target < fc → 后向,否则前向
-        const fwdL = `_cw_fwd_${id}`;
-        const copyL = `_cw_copy_${id}`;
-        this.vm.load(VReg.V0, VReg.FP, fromOff);
-        this.vm.load(VReg.V1, VReg.FP, tgtOff);
-        this.vm.cmp(VReg.V0, VReg.V1);
-        this.vm.jge(fwdL); // from >= target → 前向
-        this.vm.load(VReg.V0, VReg.FP, tgtOff);
-        this.vm.load(VReg.V1, VReg.FP, fcOff);
-        this.vm.cmp(VReg.V0, VReg.V1);
-        this.vm.jge(fwdL); // target >= fc → 前向
-        // 后向:to = target+count-1; from = fc-1; step = -1
-        this.vm.load(VReg.V0, VReg.FP, tgtOff);
-        this.vm.load(VReg.V1, VReg.FP, cntOff);
-        this.vm.add(VReg.V0, VReg.V0, VReg.V1);
-        this.vm.addImm(VReg.V0, VReg.V0, -1);
-        this.vm.store(VReg.FP, toOff, VReg.V0);
-        this.vm.load(VReg.V0, VReg.FP, fcOff);
-        this.vm.addImm(VReg.V0, VReg.V0, -1);
-        this.vm.store(VReg.FP, fromOff, VReg.V0);
-        this.vm.movImm(VReg.V0, -1);
-        this.vm.store(VReg.FP, stepOff, VReg.V0);
-        this.vm.jmp(copyL);
-        this.vm.label(fwdL);
-        // 前向:to = target; step = +1 (from 不变)
-        this.vm.load(VReg.V0, VReg.FP, tgtOff);
-        this.vm.store(VReg.FP, toOff, VReg.V0);
-        this.vm.movImm(VReg.V0, 1);
-        this.vm.store(VReg.FP, stepOff, VReg.V0);
-        this.vm.label(copyL);
-        const loopL = `_cw_loop_${id}`;
-        this.vm.label(loopL);
-        this.vm.load(VReg.V0, VReg.FP, cntOff);
-        this.vm.cmpImm(VReg.V0, 0);
-        this.vm.jle(doneL);
-        // val = arr[from]
         this.vm.load(VReg.A0, VReg.FP, arrOff);
-        this.vm.load(VReg.A1, VReg.FP, fromOff);
-        this.vm.call("_array_get");
-        this.vm.store(VReg.FP, valOff, VReg.RET);
-        // arr[to] = val
-        this.vm.load(VReg.A0, VReg.FP, arrOff);
-        this.vm.load(VReg.A1, VReg.FP, toOff);
-        this.vm.load(VReg.A2, VReg.FP, valOff);
-        this.vm.call("_array_set");
-        // from += step; to += step; count--
-        this.vm.load(VReg.V0, VReg.FP, fromOff);
-        this.vm.load(VReg.V1, VReg.FP, stepOff);
-        this.vm.add(VReg.V0, VReg.V0, VReg.V1);
-        this.vm.store(VReg.FP, fromOff, VReg.V0);
-        this.vm.load(VReg.V0, VReg.FP, toOff);
-        this.vm.load(VReg.V1, VReg.FP, stepOff);
-        this.vm.add(VReg.V0, VReg.V0, VReg.V1);
-        this.vm.store(VReg.FP, toOff, VReg.V0);
-        this.vm.load(VReg.V0, VReg.FP, cntOff);
-        this.vm.addImm(VReg.V0, VReg.V0, -1);
-        this.vm.store(VReg.FP, cntOff, VReg.V0);
-        this.vm.jmp(loopL);
-        this.vm.label(doneL);
-        this.vm.load(VReg.RET, VReg.FP, arrOff); // 返回接收者
+        this.vm.load(VReg.A1, VReg.FP, tgtOff);
+        this.vm.load(VReg.A2, VReg.FP, fromOff);
+        this.vm.load(VReg.A3, VReg.FP, endOff);
+        this.vm.call("_array_copyWithin_rt");
     },
 
     // [半支持修补] 把 RET 中的裸 int32 索引按 ES 相对索引语义归一后存入 outOff:
@@ -1153,7 +1084,6 @@ export const BuiltinArrayMethodCompiler = {
     // 注：ArrayCallbackCompiler(builtin_array_callbacks.js) 从未被 mix 进原型，
     // 故 some/every 在编译产物里从来没实现过；此处补齐在活跃 mixin 中。
     compileArraySome(arrayExpr, callbackExpr, thisArgExpr = null) {
-        this.compileExpression(arrayExpr);
         const arrOffset = this.ctx.allocLocal(`__some_arr_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, arrOffset, VReg.RET);
 
@@ -1231,7 +1161,6 @@ export const BuiltinArrayMethodCompiler = {
 
     // 编译 arr.every(callback) -> boolean
     compileArrayEvery(arrayExpr, callbackExpr, thisArgExpr = null) {
-        this.compileExpression(arrayExpr);
         const arrOffset = this.ctx.allocLocal(`__every_arr_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, arrOffset, VReg.RET);
 
@@ -1261,83 +1190,35 @@ export const BuiltinArrayMethodCompiler = {
 
     // 编译 arr.find(callback) -> element or undefined
     compileArrayFind(arrayExpr, callbackExpr, thisArgExpr = null) {
-        this.compileExpression(arrayExpr);
+        // 与 findLast 同形:走 runtime(thisArg / 严格 this / 洞 Get)。
+        // 旧内联循环未置 A5=undefined → onlyStrict 下 this 残留为 0。
         const arrOffset = this.ctx.allocLocal(`__find_arr_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, arrOffset, VReg.RET);
-
-        this.vm.mov(VReg.A0, VReg.RET);
-        this.vm.call("_js_unbox");
-        this.vm.load(VReg.V1, VReg.RET, 8);
-        const lenOffset = this.ctx.allocLocal(`__find_len_${this.nextLabelId()}`);
-        this.vm.store(VReg.FP, lenOffset, VReg.V1);
 
         this.compileExpression(callbackExpr);
         const cbOffset = this.ctx.allocLocal(`__find_cb_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, cbOffset, VReg.RET);
         this.emitCallbackGuard(cbOffset);
-        this.emitThisArgSlot(thisArgExpr, "find");
+        const thisArgSlot = this.emitThisArgSlot(thisArgExpr, "find");
 
-        const idxOffset = this.ctx.allocLocal(`__find_idx_${this.nextLabelId()}`);
-        this.vm.movImm(VReg.V0, 0);
-        this.vm.store(VReg.FP, idxOffset, VReg.V0);
-        const elemOffset = this.ctx.allocLocal(`__find_elem_${this.nextLabelId()}`);
+        const fbLbl = this.ctx.newLabel("find_fallback");
+        const doneLbl = this.ctx.newLabel("find_done");
+        this.vm.load(VReg.V0, VReg.FP, arrOffset);
+        this.vm.shrImm(VReg.V0, VReg.V0, 48);
+        this.vm.cmpImm(VReg.V0, 0x7FFE);
+        this.vm.jne(fbLbl);
 
-        const loopLabel = this.ctx.newLabel("find_loop");
-        const endLabel = this.ctx.newLabel("find_end");
-        const foundLabel = this.ctx.newLabel("find_found");
-        const returnLabel = this.ctx.newLabel("find_return");
+        this.emitArrayRtCbCall("_array_find_rt_t", arrOffset, cbOffset, thisArgSlot);
+        this.vm.jmp(doneLbl);
 
-        this.vm.label(loopLabel);
-        this.vm.load(VReg.V0, VReg.FP, idxOffset);
-        this.vm.load(VReg.V1, VReg.FP, lenOffset);
-        this.vm.cmp(VReg.V0, VReg.V1);
-        this.vm.jge(endLabel);
-        // [timeout guard] max safe iterations
-        this.vm.movImm(VReg.V2, 0x1000000);
-        this.vm.cmp(VReg.V0, VReg.V2);
-        this.vm.jge(endLabel);
-
-        this.vm.load(VReg.A0, VReg.FP, arrOffset);
-        this.vm.load(VReg.A1, VReg.FP, idxOffset);
-        this.vm.call("_subscript_get");
-        this.vm.store(VReg.FP, elemOffset, VReg.RET);
-
-        this.vm.load(VReg.V6, VReg.FP, cbOffset);
-        this.vm.push(VReg.V6);
-        this.vm.load(VReg.A0, VReg.FP, elemOffset);
-        this.vm.load(VReg.A1, VReg.FP, idxOffset);
-        this.vm.scvtf(0, VReg.A1); this.vm.fmovToInt(VReg.A1, 0); // index → 装箱 JS number
-        this.vm.load(VReg.A2, VReg.FP, arrOffset);
-        this.vm.pop(VReg.S0);
-        this.emitClosureCallAfterSetup();
-
-        this.vm.mov(VReg.A0, VReg.RET);   // 回调结果搬 A0
-        this.vm.call("_to_boolean");
-        this.vm.cmpImm(VReg.RET, 0);
-        this.vm.jne(foundLabel);
-
-        this.vm.load(VReg.V0, VReg.FP, idxOffset);
-        this.vm.addImm(VReg.V0, VReg.V0, 1);
-        this.vm.store(VReg.FP, idxOffset, VReg.V0);
-        this.vm.jmp(loopLabel);
-
-        this.vm.label(foundLabel);
-        this.vm.load(VReg.RET, VReg.FP, elemOffset);
-        this.vm.jmp(returnLabel);
-
-        this.vm.label(endLabel);
-        // 未找到返回 undefined 的**值**（原版 lea 只取地址=真值 → `!find()` 恒 false，
-        // 自举 moduleOrder.find 恒判"已存在"从不 push 主模块）。
-        this.vm.lea(VReg.V0, "_js_undefined");
-        this.vm.load(VReg.RET, VReg.V0, 0);
-
-        this.vm.label(returnLabel);
+        this.vm.label(fbLbl);
+        this.emitAgenCbCall("_agen_find", arrOffset, cbOffset, thisArgSlot);
+        this.vm.label(doneLbl);
     },
 
     // [#35] arr.findLast(cb)/findLastIndex(cb) —— 反向 find;走 runtime 与 every 同形
     // (thisArg / 洞 Get / 泛型 this 经 _agen_findLast*)。
     compileArrayFindLast(arrayExpr, callbackExpr, wantIndex, thisArgExpr = null) {
-        this.compileExpression(arrayExpr);
         const arrOffset = this.ctx.allocLocal(`__findL_arr_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, arrOffset, VReg.RET);
 
@@ -1371,76 +1252,29 @@ export const BuiltinArrayMethodCompiler = {
         const arrOffset = this.ctx.allocLocal(`__findIdx_arr_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, arrOffset, VReg.RET);
 
-        this.vm.mov(VReg.A0, VReg.RET);
-        this.vm.call("_js_unbox");
-        this.vm.load(VReg.V1, VReg.RET, 8);
-        const lenOffset = this.ctx.allocLocal(`__findIdx_len_${this.nextLabelId()}`);
-        this.vm.store(VReg.FP, lenOffset, VReg.V1);
-
         this.compileExpression(callbackExpr);
         const cbOffset = this.ctx.allocLocal(`__findIdx_cb_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, cbOffset, VReg.RET);
         this.emitCallbackGuard(cbOffset);
-        this.emitThisArgSlot(thisArgExpr, "findIdx");
+        const thisArgSlot = this.emitThisArgSlot(thisArgExpr, "findIdx");
 
-        const idxOffset = this.ctx.allocLocal(`__findIdx_idx_${this.nextLabelId()}`);
-        this.vm.movImm(VReg.V0, 0);
-        this.vm.store(VReg.FP, idxOffset, VReg.V0);
-        const elemOffset = this.ctx.allocLocal(`__findIdx_elem_${this.nextLabelId()}`);
+        const fbLbl = this.ctx.newLabel("findIdx_fallback");
+        const doneLbl = this.ctx.newLabel("findIdx_done");
+        this.vm.load(VReg.V0, VReg.FP, arrOffset);
+        this.vm.shrImm(VReg.V0, VReg.V0, 48);
+        this.vm.cmpImm(VReg.V0, 0x7FFE);
+        this.vm.jne(fbLbl);
 
-        const loopLabel = this.ctx.newLabel("findIdx_loop");
-        const endLabel = this.ctx.newLabel("findIdx_end");
-        const foundLabel = this.ctx.newLabel("findIdx_found");
-        const returnLabel = this.ctx.newLabel("findIdx_return");
+        this.emitArrayRtCbCall("_array_findIndex_rt_t", arrOffset, cbOffset, thisArgSlot);
+        this.vm.jmp(doneLbl);
 
-        this.vm.label(loopLabel);
-        this.vm.load(VReg.V0, VReg.FP, idxOffset);
-        this.vm.load(VReg.V1, VReg.FP, lenOffset);
-        this.vm.cmp(VReg.V0, VReg.V1);
-        this.vm.jge(endLabel);
-        // [timeout guard] max safe iterations
-        this.vm.movImm(VReg.V2, 0x1000000);
-        this.vm.cmp(VReg.V0, VReg.V2);
-        this.vm.jge(endLabel);
-
-        this.vm.load(VReg.A0, VReg.FP, arrOffset);
-        this.vm.load(VReg.A1, VReg.FP, idxOffset);
-        this.vm.call("_subscript_get");
-        this.vm.store(VReg.FP, elemOffset, VReg.RET);
-
-        this.vm.load(VReg.V6, VReg.FP, cbOffset);
-        this.vm.push(VReg.V6);
-        this.vm.load(VReg.A0, VReg.FP, elemOffset);
-        this.vm.load(VReg.A1, VReg.FP, idxOffset);
-        this.vm.scvtf(0, VReg.A1); this.vm.fmovToInt(VReg.A1, 0); // index → 装箱 JS number
-        this.vm.load(VReg.A2, VReg.FP, arrOffset);
-        this.vm.pop(VReg.S0);
-        this.emitClosureCallAfterSetup();
-
-        this.vm.mov(VReg.A0, VReg.RET);
-        this.vm.call("_to_boolean");
-        this.vm.cmpImm(VReg.RET, 0);
-        this.vm.jne(foundLabel);
-
-        this.vm.load(VReg.V0, VReg.FP, idxOffset);
-        this.vm.addImm(VReg.V0, VReg.V0, 1);
-        this.vm.store(VReg.FP, idxOffset, VReg.V0);
-        this.vm.jmp(loopLabel);
-
-        this.vm.label(foundLabel);
-        this.vm.load(VReg.RET, VReg.FP, idxOffset);
-        this.vm.jmp(returnLabel);
-
-        this.vm.label(endLabel);
-        this.vm.movImm(VReg.RET, -1);
-
-        this.vm.label(returnLabel);
-        this.boxIntAsNumber(VReg.RET);
+        this.vm.label(fbLbl);
+        this.emitAgenCbCall("_agen_findIndex", arrOffset, cbOffset, thisArgSlot);
+        this.vm.label(doneLbl);
     },
 
     // 编译 arr.forEach(callback) - 支持 Array 和 TypedArray
     compileArrayForEach(arrayExpr, callbackExpr, thisArgExpr = null) {
-        this.compileExpression(arrayExpr);
         const arrOffset = this.ctx.allocLocal(`__forEach_arr_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, arrOffset, VReg.RET);
 
@@ -1648,8 +1482,9 @@ export const BuiltinArrayMethodCompiler = {
         const _msRecvSp = this.ctx.allocLocal(`__ms_spec_r_${this.nextLabelId()}`);
         const _msCbSp = this.ctx.allocLocal(`__ms_spec_cb_${this.nextLabelId()}`);
 
-        // Save receiver and callback before species check (evaluated exactly once)
-        this.compileExpression(arrayExpr);
+        // 接收者已在 RET(compileArrayMethod 求值一次)。此处再 compileExpression
+        // 会让 Object.entries(o).map 把 entries 跑两遍:第一次 Get 加 extra,第二次
+        // ownKeys 含 extra(test262 entries/return-order)。
         this.vm.store(VReg.FP, _msRecvSp, VReg.RET);
         this.compileExpression(callbackExpr);
         this.vm.store(VReg.FP, _msCbSp, VReg.RET);
@@ -1678,119 +1513,17 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.label(_msSpecEnd);
     },
 
-    // 编译 arr.flatMap(callback[, thisArg]) —— map 后把返回的数组展平一层。
-    // 结果用 _array_new_with_size(0)+_array_push 增长构建(同 filter,标准布局)。
-    // 回调返回数组(tag 0x7ffe)→ 逐元素 push;否则整体 push 一次。
+    // 编译 arr.flatMap(callback[, thisArg]) —— 委托 `_array_flatMap_rt_t`
+    // (内含 ArraySpeciesCreate + CDPOrThrow)。
     compileArrayFlatMap(arrayExpr, callbackExpr, thisArgExpr = null) {
-        this.compileExpression(arrayExpr);
-        const arrOffset = this.ctx.allocLocal(`__flatmap_arr_${this.nextLabelId()}`);
-        this.vm.store(VReg.FP, arrOffset, VReg.RET);
-
-        // 源数组长度
-        this.vm.load(VReg.A0, VReg.FP, arrOffset);
-        this.vm.call("_array_length");
-        const lenOffset = this.ctx.allocLocal(`__flatmap_len_${this.nextLabelId()}`);
-        this.vm.store(VReg.FP, lenOffset, VReg.RET);
-
-        // 空结果数组(装箱前是裸指针)
-        this.vm.movImm(VReg.A0, 0);
-        this.vm.call("_array_new_with_size");
-        const newArrOffset = this.ctx.allocLocal(`__flatmap_newarr_${this.nextLabelId()}`);
-        this.vm.store(VReg.FP, newArrOffset, VReg.RET);
-
-        // 回调闭包 + 可选 thisArg
+        const recvSp = this.ctx.allocLocal(`__fm_r_${this.nextLabelId()}`);
+        const cbSp = this.ctx.allocLocal(`__fm_cb_${this.nextLabelId()}`);
+        this.vm.store(VReg.FP, recvSp, VReg.RET);
         this.compileExpression(callbackExpr);
-        const cbOffset = this.ctx.allocLocal(`__flatmap_cb_${this.nextLabelId()}`);
-        this.vm.store(VReg.FP, cbOffset, VReg.RET);
-        this.emitCallbackGuard(cbOffset);
-        this.emitThisArgSlot(thisArgExpr, "flatMap");
-
-        const idxOffset = this.ctx.allocLocal(`__flatmap_idx_${this.nextLabelId()}`);
-        this.vm.movImm(VReg.V0, 0);
-        this.vm.store(VReg.FP, idxOffset, VReg.V0);
-        const elemOffset = this.ctx.allocLocal(`__flatmap_elem_${this.nextLabelId()}`);
-        const mapOffset = this.ctx.allocLocal(`__flatmap_mapped_${this.nextLabelId()}`);
-        const jOffset = this.ctx.allocLocal(`__flatmap_j_${this.nextLabelId()}`);
-        const len2Offset = this.ctx.allocLocal(`__flatmap_len2_${this.nextLabelId()}`);
-
-        const loopLabel = this.ctx.newLabel("flatmap_loop");
-        const endLabel = this.ctx.newLabel("flatmap_end");
-        const notArrLabel = this.ctx.newLabel("flatmap_notarr");
-        const innerLabel = this.ctx.newLabel("flatmap_inner");
-        const innerEndLabel = this.ctx.newLabel("flatmap_inner_end");
-        const nextLabel = this.ctx.newLabel("flatmap_next");
-
-        this.vm.label(loopLabel);
-        this.vm.load(VReg.V0, VReg.FP, idxOffset);
-        this.vm.load(VReg.V1, VReg.FP, lenOffset);
-        this.vm.cmp(VReg.V0, VReg.V1);
-        this.vm.jge(endLabel);
-
-        // elem = src[idx]
-        this.vm.load(VReg.A0, VReg.FP, arrOffset);
-        this.vm.load(VReg.A1, VReg.FP, idxOffset);
-        this.vm.call("_subscript_get");
-        this.vm.store(VReg.FP, elemOffset, VReg.RET);
-
-        // mapped = cb(elem, idx, arr)
-        this.vm.load(VReg.V6, VReg.FP, cbOffset);
-        this.vm.push(VReg.V6);
-        this.vm.load(VReg.A0, VReg.FP, elemOffset);
-        this.vm.load(VReg.A1, VReg.FP, idxOffset);
-        this.vm.scvtf(0, VReg.A1); this.vm.fmovToInt(VReg.A1, 0); // index → 装箱 JS number
-        this.vm.load(VReg.A2, VReg.FP, arrOffset);
-        this.vm.pop(VReg.S0);
-        this.emitClosureCallAfterSetup();
-        this.vm.store(VReg.FP, mapOffset, VReg.RET);
-
-        // 数组？高16 == 0x7ffe → 展平一层
-        this.vm.shrImm(VReg.V0, VReg.RET, 48);
-        this.vm.cmpImm(VReg.V0, 0x7ffe);
-        this.vm.jne(notArrLabel);
-
-        // len2 = length(mapped); j=0..len2: newArr = push(newArr, mapped[j])
-        this.vm.load(VReg.A0, VReg.FP, mapOffset);
-        this.vm.call("_array_length");
-        this.vm.store(VReg.FP, len2Offset, VReg.RET);
-        this.vm.movImm(VReg.V0, 0);
-        this.vm.store(VReg.FP, jOffset, VReg.V0);
-
-        this.vm.label(innerLabel);
-        this.vm.load(VReg.V0, VReg.FP, jOffset);
-        this.vm.load(VReg.V1, VReg.FP, len2Offset);
-        this.vm.cmp(VReg.V0, VReg.V1);
-        this.vm.jge(innerEndLabel);
-        this.vm.load(VReg.A0, VReg.FP, mapOffset);
-        this.vm.load(VReg.A1, VReg.FP, jOffset);
-        this.vm.call("_subscript_get");
-        this.vm.mov(VReg.A1, VReg.RET);
-        this.vm.load(VReg.A0, VReg.FP, newArrOffset);
-        this.vm.call("_array_push");
-        this.vm.store(VReg.FP, newArrOffset, VReg.RET);
-        this.vm.load(VReg.V0, VReg.FP, jOffset);
-        this.vm.addImm(VReg.V0, VReg.V0, 1);
-        this.vm.store(VReg.FP, jOffset, VReg.V0);
-        this.vm.jmp(innerLabel);
-        this.vm.label(innerEndLabel);
-        this.vm.jmp(nextLabel);
-
-        // 非数组:整体 push 一次
-        this.vm.label(notArrLabel);
-        this.vm.load(VReg.A1, VReg.FP, mapOffset);
-        this.vm.load(VReg.A0, VReg.FP, newArrOffset);
-        this.vm.call("_array_push");
-        this.vm.store(VReg.FP, newArrOffset, VReg.RET);
-
-        this.vm.label(nextLabel);
-        this.vm.load(VReg.V0, VReg.FP, idxOffset);
-        this.vm.addImm(VReg.V0, VReg.V0, 1);
-        this.vm.store(VReg.FP, idxOffset, VReg.V0);
-        this.vm.jmp(loopLabel);
-
-        this.vm.label(endLabel);
-        this.vm.load(VReg.RET, VReg.FP, newArrOffset);
-        this.vm.call("_box_arr_r"); // box->helper
-        return;
+        this.vm.store(VReg.FP, cbSp, VReg.RET);
+        this.emitCallbackGuard(cbSp);
+        const thisArgSlot = this.emitThisArgSlot(thisArgExpr, "flatMap");
+        this.emitArrayRtCbCall("_array_flatMap_rt_t", recvSp, cbSp, thisArgSlot);
     },
 
     // 编译 arr.filter(callback) - 支持 Array 和 TypedArray
@@ -1801,8 +1534,6 @@ export const BuiltinArrayMethodCompiler = {
         const _fsRecvSp = this.ctx.allocLocal(`__fs_spec_r_${this.nextLabelId()}`);
         const _fsCbSp = this.ctx.allocLocal(`__fs_spec_cb_${this.nextLabelId()}`);
 
-        // Save receiver and callback before species check (evaluated exactly once)
-        this.compileExpression(arrayExpr);
         this.vm.store(VReg.FP, _fsRecvSp, VReg.RET);
         this.compileExpression(callbackExpr);
         this.vm.store(VReg.FP, _fsCbSp, VReg.RET);
@@ -1975,7 +1706,6 @@ export const BuiltinArrayMethodCompiler = {
 
     // 编译 arr.reduce(callback, initialValue?)
     compileArrayReduce(arrayExpr, callbackExpr, initialValueExpr) {
-        this.compileExpression(arrayExpr);
         const arrOffset = this.ctx.allocLocal(`__reduce_arr_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, arrOffset, VReg.RET);
 
@@ -2024,7 +1754,6 @@ export const BuiltinArrayMethodCompiler = {
     // 编译 arr.reduceRight(callback, initialValue?) —— reduce 的镜像:从 len-1 递减到 0。
     // 无初值时以末元素为初值、索引从 len-2 起;回调签名同 reduce(acc, cur, idx, arr)。
     compileArrayReduceRight(arrayExpr, callbackExpr, initialValueExpr) {
-        this.compileExpression(arrayExpr);
         const arrOffset = this.ctx.allocLocal(`__rredr_arr_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, arrOffset, VReg.RET);
 
