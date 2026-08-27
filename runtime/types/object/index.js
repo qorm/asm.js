@@ -595,16 +595,21 @@ export class ObjectGenerator {
         vm.label("_cpe_done");
         // 数组键:置 ARR_HAS_SIDETABLE,让 _array_side_elem_* 热路径 O(1) 跳过链表。
         // 函数 magic 头不是 TYPE_ARRAY,不受影响。
+        // x64 V0≡RET≡RAX:此处若用 V0 作 scratch 会毁掉刚装箱的 props,ensure
+        // 实际返回裸 fn 指针 → _object_set 当对象写、侧表 count 恒 0
+        // (f.foo=1 / assert.sameValue=fn 全失效)。先把 RET 挪到 S1。
+        vm.mov(VReg.S1, VReg.RET); // boxed props
         vm.movImm64(VReg.V1, MASK);
-        vm.and(VReg.V0, VReg.S0, VReg.V1);
-        vm.load(VReg.V1, VReg.V0, 0);
+        vm.and(VReg.V3, VReg.S0, VReg.V1);
+        vm.load(VReg.V1, VReg.V3, 0);
         vm.andImm(VReg.V1, VReg.V1, 0xff);
         vm.cmpImm(VReg.V1, 1); // TYPE_ARRAY
         vm.jne("_cpe_ret");
-        vm.loadByte(VReg.V1, VReg.V0, 1);
+        vm.loadByte(VReg.V1, VReg.V3, 1);
         vm.orImm(VReg.V1, VReg.V1, ARR_HAS_SIDETABLE);
-        vm.storeByte(VReg.V0, 1, VReg.V1);
+        vm.storeByte(VReg.V3, 1, VReg.V1);
         vm.label("_cpe_ret");
+        vm.mov(VReg.RET, VReg.S1);
         vm.epilogue([VReg.S0, VReg.S1], 0);
 
         // _closure_prop_get(A0=fn, A1=key) -> value / undefined(无 props 或键 miss)。
@@ -648,7 +653,7 @@ export class ObjectGenerator {
         vm.load(VReg.V2, VReg.S2, OBJECT_PROPS_PTR_OFFSET);
         vm.shlImm(VReg.V0, VReg.S4, 4);
         vm.add(VReg.V0, VReg.V2, VReg.V0);
-        vm.load(VReg.V3, VReg.V0, 8);       // V3 = 槽值(_object_get_attr 调用前取出)
+        vm.load(VReg.S3, VReg.V0, 8);       // S3 = 槽值(count 已用完;x64 V3 跨 call 失效)
         vm.mov(VReg.A0, VReg.S2);
         vm.mov(VReg.A1, VReg.S4);
         vm.call("_object_get_attr");        // RET = attr 字节(flags_ptr=0 → ATTR_DEFAULT)
@@ -659,7 +664,7 @@ export class ObjectGenerator {
         // arr.prop)经本 helper 返值且**不**再套 _maybe_getter;此前原样返回
         // TYPE_GETTER 裸指针 → 读成 denormal float(4-315-1 等)。gOPD 走
         // props 上 _object_get(不经本 helper)仍得标记块。S1=接收者(this)。
-        vm.mov(VReg.A0, VReg.V3);
+        vm.mov(VReg.A0, VReg.S3);
         vm.mov(VReg.A1, VReg.S1);
         vm.call("_maybe_getter");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
