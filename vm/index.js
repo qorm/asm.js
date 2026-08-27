@@ -100,6 +100,8 @@ const RC_CALLWINDOWSAPI = 85;
 const RC_CALLIAT = 86;
 const RC_JNAN = 87;   // fcmp 后 unordered(任一操作数 NaN)分支:arm64 BVS / x64 JP
 const RC_FSQRT = 88;  // 浮点平方根
+const RC_LOAD32 = 89;  // 32-bit load, zero-extend to 64 (Int32Array/Uint32Array)
+const RC_STORE32 = 90; // 32-bit store (TypedArray word / Uint32 fast path)
 
 export class VirtualMachine {
     constructor(arch, os, asm) {
@@ -148,6 +150,16 @@ export class VirtualMachine {
             }
         }
         this._recN = 0;
+        // 新录制段:T* 序号从 0 起。newTemp 未接线时返回 null,allocLocal 走 FP 槽。
+        this._tempSeq = 0;
+        this._tempHomes = null;
+    }
+
+    // 用户函数 LSRA 临时:与 spill home(FP 槽)绑定。runUserFuncRegAlloc 尚未
+    // 接到 endRecord,故返回 null —— allocLocal 不绑 T*,读路径走 FP load。
+    // 与 macos-arm64 97.29% 基线同一条局部路径;有方法即可让含函数的 test262 编过。
+    newTemp(homeOff) {
+        return null;
     }
 
     _flushRecordVerbatim() {
@@ -485,6 +497,8 @@ export class VirtualMachine {
         if (n === RC_MOVIMM64) { this.movImm64(a, b); return; }
         if (n === RC_LOADBYTE) { this.loadByte(a, b, c); return; }
         if (n === RC_STOREBYTE) { this.storeByte(a, b, c); return; }
+        if (n === RC_LOAD32) { this.load32(a, b, c); return; }
+        if (n === RC_STORE32) { this.store32(a, b, c); return; }
         if (n === RC_JBE) { this.jbe(a); return; }
         if (n === RC_JB) { this.jb(a); return; }
         if (n === RC_JA) { this.ja(a); return; }
@@ -647,6 +661,20 @@ export class VirtualMachine {
     storeByte(base, offset, src) {
         if (this._recN >= 0) { const k = this._recN; if (k < REC_CAP) { this._recOp[k] = RC_STOREBYTE; this._recA[k] = base; this._recB[k] = offset; this._recC[k] = src; this._recN = k + 1; return; } this._flushRecordVerbatim(); }
         this.backend.storeByte(base, offset, src);
+        this._sfOff = -1;
+    }
+
+    // 32 位加载: dest = zero_extend32([base + offset])
+    // 用于 Int32Array/Uint32Array 元素读;Int32 符号扩展由调用方 shl+sar 完成。
+    load32(dest, base, offset) {
+        if (this._recN >= 0) { const k = this._recN; if (k < REC_CAP) { this._recOp[k] = RC_LOAD32; this._recA[k] = dest; this._recB[k] = base; this._recC[k] = offset; this._recN = k + 1; return; } this._flushRecordVerbatim(); }
+        this.backend.load32(dest, base, offset);
+    }
+
+    // 32 位存储: [base + offset] = src (低32位)
+    store32(base, offset, src) {
+        if (this._recN >= 0) { const k = this._recN; if (k < REC_CAP) { this._recOp[k] = RC_STORE32; this._recA[k] = base; this._recB[k] = offset; this._recC[k] = src; this._recN = k + 1; return; } this._flushRecordVerbatim(); }
+        this.backend.store32(base, offset, src);
         this._sfOff = -1;
     }
 

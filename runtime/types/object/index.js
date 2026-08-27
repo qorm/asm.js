@@ -936,13 +936,16 @@ export class ObjectGenerator {
         vm.jne("_cps_set");                    // 非字符串键 → 常规侧表写
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_getStrContent");
-        vm.mov(VReg.V3, VReg.RET);             // 内容指针
-        vm.mov(VReg.A0, VReg.V3);
+        // 内容指针必须进 callee-saved:x64 V3≡A4≡R8,跨 _strcmp 即失效,
+        // 第二次 strcmp 拿垃圾当键,常误判成 "length" → 有元数据的函数赋值被
+        // _cps_ignored 静默丢掉(test262 harness 的 assert.sameValue=fn 全失效)。
+        vm.mov(VReg.S3, VReg.RET);
+        vm.mov(VReg.A0, VReg.S3);
         vm.lea(VReg.A1, vm.asm.addString("name"));
         vm.call("_strcmp");
         vm.cmpImm(VReg.RET, 0);
         vm.jeq("_cps_nl_name");
-        vm.mov(VReg.A0, VReg.V3);
+        vm.mov(VReg.A0, VReg.S3);
         vm.lea(VReg.A1, vm.asm.addString("length"));
         vm.call("_strcmp");
         vm.cmpImm(VReg.RET, 0);
@@ -982,15 +985,15 @@ export class ObjectGenerator {
         // 故 defineProperty(fn,"caller",{value:1}) 的 own-prop 覆盖仍有效(侧表命中
         // 读回,forbidden-ext 族依赖)。
         vm.label("_cps_chk_forbidden");
-        vm.mov(VReg.A0, VReg.S0);             // A0 = key(装箱串;跨调用后 V3 已失效)
+        vm.mov(VReg.A0, VReg.S0);             // A0 = key(装箱串)
         vm.call("_getStrContent");
-        vm.mov(VReg.V3, VReg.RET);            // V3 = 内容指针(重取)
-        vm.mov(VReg.A0, VReg.V3);
+        vm.mov(VReg.S3, VReg.RET);            // S3 = 内容指针(x64 V3 跨 _strcmp 失效)
+        vm.mov(VReg.A0, VReg.S3);
         vm.lea(VReg.A1, vm.asm.addString("caller"));
         vm.call("_strcmp");
         vm.cmpImm(VReg.RET, 0);
         vm.jeq("_cps_forbidden");
-        vm.mov(VReg.A0, VReg.V3);
+        vm.mov(VReg.A0, VReg.S3);
         vm.lea(VReg.A1, vm.asm.addString("arguments"));
         vm.call("_strcmp");
         vm.cmpImm(VReg.RET, 0);
@@ -1031,13 +1034,13 @@ export class ObjectGenerator {
         vm.jne("_cpdf_set");                   // 非字符串键 → 直接 define 落侧表
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_getStrContent");
-        vm.mov(VReg.V3, VReg.RET);
-        vm.mov(VReg.A0, VReg.V3);
+        vm.mov(VReg.S3, VReg.RET);             // 同 _closure_prop_set:x64 V3 跨 call 失效
+        vm.mov(VReg.A0, VReg.S3);
         vm.lea(VReg.A1, vm.asm.addString("name"));
         vm.call("_strcmp");
         vm.cmpImm(VReg.RET, 0);
         vm.jeq("_cpdf_nl_name");
-        vm.mov(VReg.A0, VReg.V3);
+        vm.mov(VReg.A0, VReg.S3);
         vm.lea(VReg.A1, vm.asm.addString("length"));
         vm.call("_strcmp");
         vm.cmpImm(VReg.RET, 0);
@@ -4782,12 +4785,21 @@ export class ObjectGenerator {
         vm.pop(VReg.A0); // proto boxed
         vm.mov(VReg.A1, VReg.S1); // key
         vm.call("_js_unbox");
-        vm.mov(VReg.V2, VReg.RET); // proto raw
+        // x64: V2=RDX / V3=R8 / V4=R9 皆 caller-saved,且 V2≡A2。
+        // _object_key_eq 会毁掉它们 → 第二轮把残留串指针当对象扫 props_ptr 崩。
+        // 栈槽:[SP+32]=proto raw [SP+40]=count [SP+48]=idx(本帧 64B,16/24 已占用)。
+        vm.store(VReg.SP, 32, VReg.RET); // proto raw
+        vm.mov(VReg.V2, VReg.RET);
         vm.load(VReg.V3, VReg.V2, 8); // count
+        vm.store(VReg.SP, 40, VReg.V3);
         vm.movImm(VReg.V4, 0); // idx
+        vm.store(VReg.SP, 48, VReg.V4);
         vm.label("_object_set_proto_wloop");
+        vm.load(VReg.V4, VReg.SP, 48);
+        vm.load(VReg.V3, VReg.SP, 40);
         vm.cmp(VReg.V4, VReg.V3);
         vm.jge("_object_set_append"); // proto 自有表无此键 → 追加 own
+        vm.load(VReg.V2, VReg.SP, 32); // reload proto (call 后 V2 已死)
         vm.load(VReg.V0, VReg.V2, OBJECT_PROPS_PTR_OFFSET);
         vm.shl(VReg.V1, VReg.V4, 4);
         vm.add(VReg.V0, VReg.V0, VReg.V1);
@@ -4796,11 +4808,13 @@ export class ObjectGenerator {
         vm.call("_object_key_eq");
         vm.cmpImm(VReg.RET, 0);
         vm.jne("_object_set_proto_wfound");
+        vm.load(VReg.V4, VReg.SP, 48);
         vm.addImm(VReg.V4, VReg.V4, 1);
+        vm.store(VReg.SP, 48, VReg.V4);
         vm.jmp("_object_set_proto_wloop");
         vm.label("_object_set_proto_wfound");
-        vm.mov(VReg.A0, VReg.V2);
-        vm.mov(VReg.A1, VReg.V4);
+        vm.load(VReg.A0, VReg.SP, 32); // proto raw
+        vm.load(VReg.A1, VReg.SP, 48); // idx
         vm.call("_object_get_attr");
         vm.andImm(VReg.V0, VReg.RET, ATTR_WRITABLE);
         vm.cmpImm(VReg.V0, 0);
@@ -11684,10 +11698,6 @@ export class ObjectGenerator {
         vm.jeq("_ogopd_string");
         vm.cmpImm(VReg.V1, 0x7FFF);
         vm.jeq("_ogopd_fn");
-        // [string primitive] 装箱字符串(0x7FFC)→ 包装对象描述符(索引字符 + "length")
-        vm.shrImm(VReg.V1, VReg.S0, 48);
-        vm.cmpImm(VReg.V1, 0x7FFC);
-        vm.jeq("_ogopd_str_prim");
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.S2, VReg.S0, VReg.V1); // raw obj
         vm.cmpImm(VReg.S2, 0);

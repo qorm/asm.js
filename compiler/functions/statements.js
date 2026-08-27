@@ -52,6 +52,44 @@ const BUILTIN_HERITAGE_NAMES = {
 
 // 语句编译方法混入
 export const StatementCompiler = {
+    // d2bcc0d 调用点抽出但漏了本方法 → 含 super 的 class/arrow COMPILE_FAIL。
+    // 箭头捕获 lexical Super(非 nested function/class)。保守:见 Super 节点即真。
+    functionBodyUsesLexicalSuper(fn) {
+        if (!fn) return false;
+        const walk = (node, inNestedFn) => {
+            if (!node || typeof node !== "object") return false;
+            const t = node.type;
+            if (t === "Super") return true;
+            if (t === "FunctionDeclaration" || t === "FunctionExpression" ||
+                t === "ClassDeclaration" || t === "ClassExpression") {
+                if (node === fn) {
+                    if (walk(node.body, false)) return true;
+                    if (walk(node.params, false)) return true;
+                    return false;
+                }
+                return false;
+            }
+            if (t === "ArrowFunctionExpression") {
+                if (walk(node.body, false)) return true;
+                if (walk(node.params, false)) return true;
+                return false;
+            }
+            if (Array.isArray(node)) {
+                for (let i = 0; i < node.length; i++) if (walk(node[i], inNestedFn)) return true;
+                return false;
+            }
+            for (const k in node) {
+                if (k === "type" || k === "loc" || k === "range" || k === "start" || k === "end") continue;
+                const v = node[k];
+                if (v && typeof v === "object") {
+                    if (walk(v, inNestedFn)) return true;
+                }
+            }
+            return false;
+        };
+        return walk(fn, false);
+    },
+
     emitUnhandledExceptionExit() {
         this.vm.movImm(VReg.A0, 1);
         if (this.os === "wasi") {

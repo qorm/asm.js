@@ -1458,6 +1458,29 @@ export const ExpressionCompiler = {
         }
     },
 
+    // 非展开 new C(args):A0=this,实参装 A1..A5。saveRegs 跨实参求值压栈保活
+    // (通常 S0=this / S1=classinfo / S2=ctor)。padUndefined 时未提供的 A 槽填
+    // JS_UNDEFINED,使默认参数生效。d2bcc0d 抽出调用点但漏了本方法 → new/class
+    // 全 COMPILE_FAIL(this.compileCtorArgsToRegs is not a function)。
+    compileCtorArgsToRegs(args, saveRegs, padUndefined) {
+        const ctorArgRegs = CTOR_ARG_REGS_A1;
+        const n = (args && args.length) || 0;
+        const ctorArgCount = n < ctorArgRegs.length ? n : ctorArgRegs.length;
+        for (let i = 0; i < saveRegs.length; i++) this.vm.push(saveRegs[i]);
+        for (let i = 0; i < ctorArgCount; i++) {
+            this.compileExpression(args[i]);
+            this.vm.push(VReg.RET);
+        }
+        for (let i = ctorArgCount - 1; i >= 0; i--) this.vm.pop(ctorArgRegs[i]);
+        for (let i = saveRegs.length - 1; i >= 0; i--) this.vm.pop(saveRegs[i]);
+        if (padUndefined) {
+            for (let i = ctorArgCount; i < ctorArgRegs.length; i++) {
+                this.vm.movImm64(ctorArgRegs[i], 0x7ffb000000000000n);
+            }
+        }
+        this.emitSetCallArgc(ctorArgCount);
+    },
+
     // new F(...args)：构造函数含展开实参。约定 A0=this、实参在 A1-A5,故先存 S0/S1/S2,
     // 用 compileArrayExpressionWithSpread 把全部实参(展开+普通)构建成 boxed 数组,再按运行时
     // 长度把前 5 个装入 A1..A5(越界填 JS_UNDEFINED),最后恢复 S0/S1/S2。受既有 5 参寄存器约束

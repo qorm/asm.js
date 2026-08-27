@@ -12,7 +12,7 @@ import { ByteBuffer } from "../asm/byte-buffer.js";
 import { FixupBuffer } from "../asm/fixup-buffer.js";
 import { SYM_NAMES } from "../engine/symbols.js";
 
-const SNAPSHOT_VERSION = 41;
+const SNAPSHOT_VERSION = 42;
 const snapshots = new Map();
 const TOOLCHAIN_DIRS = ["runtime", "asm", "backend", "vm", "engine"];
 const TOOLCHAIN_FILES = ["compiler/index.js", "compiler/runtime-snapshot.js"];
@@ -118,9 +118,23 @@ function captureCompiler(compiler) {
 }
 
 function applyCompiler(compiler, snapshot) {
+    // 磁盘 decodeSnapshot 把 code 解成 ByteBuffer。arm64 汇编器本身就是
+    // ByteBuffer(_byteCode); x64/wasm32 用 number[] 下标读写(fixupAll 写
+    // this.code[offset]=…)。若把 ByteBuffer 套上去,下标赋值只变成对象自有
+    // 属性,slice()/ELF 导出读不到 —— 产物只剩 displacement 槽,linux-x64
+    // 二次编译 _start 前几字节全 0 → 入口即 SIGSEGV。须在覆盖 _byteCode
+    // 之前记下活汇编器形态,再把 ByteBuffer 摊回 number[]。
+    const wantsByteCode = !!compiler.asm._byteCode;
     for (const name of Object.keys(snapshot.asm)) compiler.asm[name] = clone(snapshot.asm[name]);
     compiler.ctx.labelCounter = snapshot.ctxLabelCounter;
     compiler.labelCounter = snapshot.compilerLabelCounter;
+    if (!wantsByteCode && compiler.asm.code && compiler.asm.code._asmjsByteBuffer) {
+        const bytes = compiler.asm.code.slice();
+        const arr = new Array(bytes.length);
+        for (let i = 0; i < bytes.length; i++) arr[i] = bytes[i];
+        compiler.asm.code = arr;
+        compiler.asm._byteCode = false;
+    }
 }
 
 function encodeMeta(snapshot) {
