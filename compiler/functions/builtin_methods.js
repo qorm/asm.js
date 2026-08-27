@@ -627,12 +627,23 @@ export const BuiltinMethodCompiler = {
                 this.vm.store(VReg.FP, _ss, VReg.A1);
                 let splitLimSlot = null;
                 if (args.length >= 2) {
-                    // ToUint32(limit) 先于 sep ToString（可观测 abrupt 序）
-                    this.compileExpressionAsInt(args[1]);
-                    this.vm.movImm64(VReg.V1, 0xFFFFFFFFn);
-                    this.vm.and(VReg.RET, VReg.RET, VReg.V1);
+                    // ToUint32(limit) 先于 sep ToString;undefined limit → 无截断
+                    this.compileExpression(args[1]);
+                    const limRawSlot = this.ctx.allocLocal(`__splitlimraw_${this.nextLabelId()}`);
+                    this.vm.store(VReg.FP, limRawSlot, VReg.RET);
+                    const splitHasLim = this.ctx.newLabel(`__split_haslim_${this.nextLabelId()}`);
+                    const splitAfterLim = this.ctx.newLabel(`__split_afterlim_${this.nextLabelId()}`);
+                    this.vm.movImm64(VReg.V1, 0x7ffb000000000000n);
+                    this.vm.load(VReg.V0, VReg.FP, limRawSlot);
+                    this.vm.cmp(VReg.V0, VReg.V1);
+                    this.vm.jne(splitHasLim);
+                    this.vm.jmp(splitAfterLim);
+                    this.vm.label(splitHasLim);
+                    this.vm.load(VReg.A0, VReg.FP, limRawSlot);
+                    this.vm.call("_to_uint32");
                     splitLimSlot = this.ctx.allocLocal(`__splitlim_${this.nextLabelId()}`);
                     this.vm.store(VReg.FP, splitLimSlot, VReg.RET);
+                    this.vm.label(splitAfterLim);
                 }
                 this.emitArrayCtorObject();
                 this.vm.load(VReg.A1, VReg.FP, _ss);

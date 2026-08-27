@@ -1878,9 +1878,10 @@ export class CoercionGenerator {
         vm.call("_is_symbol");
         vm.cmpImm(VReg.RET, 0);
         vm.jeq("_num_coerce_not_symbol");
-        vm.lea(VReg.A0, vm.asm.addString("Cannot convert a Symbol value to a number"));
-        vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.A0, VReg.A0, VReg.V1);
-        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.lea(VReg.V0, vm.asm.addString("Cannot convert a Symbol value to a number"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.V0, VReg.V0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.V0, VReg.V0, VReg.V1);
+        vm.mov(VReg.A0, VReg.V0);
         vm.call("_throw_type_error"); // 不返回
         vm.label("_num_coerce_not_symbol");
 

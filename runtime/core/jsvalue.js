@@ -968,24 +968,30 @@ export class JSValueGenerator {
         // A1 = 装箱构造值(tag 0x7FFF 函数或 0x7FFD 对象),S0 = 实例(未脱壳)。
         // _closure_prop_get(A0=构造器, A1="prototype") → RET = 装箱 prototype。
         vm.label("_iof_boxed_ctor");
-        // [bound fn instanceof] 绑定函数:取其目标函数(Function.prototype.bind 返回的
-        // 函数可能无自有 prototype,ES 实例应沿目标函数的原型链检查)。检测:脱壳后 +8
-        // 的代码指针 == _bound_tramp,则 +16 的 target 即真构造器。
-        vm.emitMaskLoad(VReg.V0);
-        vm.andMaskReg(VReg.V3, VReg.A1, VReg.V0); // V3 = 裸构造器指针
-        vm.lea(VReg.V4, "_heap_base"); vm.load(VReg.V4, VReg.V4, 0);
-        vm.cmp(VReg.V3, VReg.V4); vm.jlt("_iof_boxed_no_bind");
-        vm.lea(VReg.V4, "_heap_ptr"); vm.load(VReg.V4, VReg.V4, 0);
-        vm.cmp(VReg.V3, VReg.V4); vm.jge("_iof_boxed_no_bind");
-        vm.load(VReg.V1, VReg.V3, 0);
-        vm.cmpImm(VReg.V1, 0xc105); // CLOSURE_MAGIC
+        // [bound fn instanceof] 绑定函数:取其目标函数,沿目标原型链检查。
+        vm.movImm64(VReg.V0, 0x0000ffffffffffffn);
+        vm.and(VReg.V1, VReg.A1, VReg.V0);       // V1 = raw ptr
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_iof_boxed_no_bind");
+        vm.lea(VReg.V2, "_heap_base");
+        vm.load(VReg.V2, VReg.V2, 0);
+        vm.cmp(VReg.V1, VReg.V2);
+        vm.jlt("_iof_boxed_no_bind");
+        vm.lea(VReg.V2, "_heap_ptr");
+        vm.load(VReg.V2, VReg.V2, 0);
+        vm.cmp(VReg.V1, VReg.V2);
+        vm.jge("_iof_boxed_no_bind");
+        vm.load(VReg.V0, VReg.V1, 0);
+        vm.cmpImm(VReg.V0, 0xc105);               // CLOSURE_MAGIC?
         vm.jne("_iof_boxed_no_bind");
-        vm.lea(VReg.V1, "_bound_tramp");
-        vm.load(VReg.V4, VReg.V3, 8);
-        vm.cmp(VReg.V4, VReg.V1);
+        vm.load(VReg.V0, VReg.V1, 8);
+        vm.lea(VReg.V2, "_bound_tramp");
+        vm.cmp(VReg.V0, VReg.V2);                 // bound tramp?
         vm.jne("_iof_boxed_no_bind");
-        vm.load(VReg.A1, VReg.V3, 16); // A1 = 目标函数(boxed),替换构造器
-        vm.jmp("_iof_boxed_ctor");     // 递归:目标可能也是 bound,链式展开
+        vm.load(VReg.A1, VReg.V1, 16);            // target constructor
+        vm.mov(VReg.A0, VReg.S0);                 // instance unchanged
+        vm.call("_instanceof");                   // recurse on target
+        vm.epilogue([VReg.S0, VReg.S1], 16);
         vm.label("_iof_boxed_no_bind");
         vm.mov(VReg.A0, VReg.A1); // A0 = 装箱构造器(_closure_prop_get 的第一参数)
         vm.mov(VReg.S1, VReg.S0); // 暂存 S0(实例,跨 _closure_prop_get 调用)

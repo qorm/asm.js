@@ -11684,6 +11684,10 @@ export class ObjectGenerator {
         vm.jeq("_ogopd_string");
         vm.cmpImm(VReg.V1, 0x7FFF);
         vm.jeq("_ogopd_fn");
+        // [string primitive] 装箱字符串(0x7FFC)→ 包装对象描述符(索引字符 + "length")
+        vm.shrImm(VReg.V1, VReg.S0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFC);
+        vm.jeq("_ogopd_str_prim");
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.S2, VReg.S0, VReg.V1); // raw obj
         vm.cmpImm(VReg.S2, 0);

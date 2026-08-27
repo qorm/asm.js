@@ -4229,6 +4229,25 @@ export class StringGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
     }
 
+    // _str_new(A0=length) -> raw content pointer (heap string, unboxed)
+    // Creates a new heap string of given length, zero-filled, null-terminated.
+    // Used by _str_replaceAll_fn for accumulator initialization.
+    generateStrNew() {
+        const vm = this.vm;
+        vm.label("_str_new");
+        vm.prologue(16, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0);       // length
+        vm.mov(VReg.A0, VReg.S0);
+        vm.addImm(VReg.A0, VReg.A0, 1); // +1 for null terminator
+        vm.call("_alloc");
+        vm.mov(VReg.S1, VReg.RET);       // content pointer
+        this.writeStringHeader(VReg.S1, VReg.S0);
+        vm.add(VReg.V0, VReg.S1, VReg.S0);
+        vm.movImm(VReg.V1, 0);
+        vm.storeByte(VReg.V0, 0, VReg.V1); // null terminate
+        vm.mov(VReg.RET, VReg.S1);
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+    }
 
     // ── String ↔ RegExp @@ 协议(GetMethod + Call)────────────────────────────────
     // ES: match/replace/replaceAll/search/split/matchAll 在 searchValue 为对象时先
@@ -6516,6 +6535,7 @@ export class StringGenerator {
         this.generateTrimEnd();
         this.generateSubstr();
         this.generateSubstring(); // _str_substring(str.substring 语义:负→0、swap);此前死代码未接
+        this.generateStrNew();         // _str_new: create empty heap string
         this.generateReplaceExpand();
         this.generateReplace();
         this.generateReplaceAll();
