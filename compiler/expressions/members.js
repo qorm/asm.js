@@ -1709,8 +1709,8 @@ export const MemberCompiler = {
             vm.or(VReg.A1, VReg.A1, VReg.V1);
             vm.call("_symbol_wellknown"); // RET = symbol raw ptr
             // Save symbol in scratch slot (data segment, persistent across calls)
-            vm.lea(VReg.V0, tmpSlot);
-            vm.store(VReg.V0, 0, VReg.RET);
+            vm.lea(VReg.V1, tmpSlot);
+            vm.store(VReg.V1, 0, VReg.RET); // x64: lea V0 would clobber RET
             // Create method closure
             // [test262 Symbol.match/name] 规范 name = "[Symbol.match]"(非裸名)。
             if (this.getFunctionLabel(sm[1])) {
@@ -1772,8 +1772,8 @@ export const MemberCompiler = {
             };
             this.compileFunctionExpression(speciesAst); // RET = getter closure (boxed)
             // Save getter closure in scratch slot
-            vm.lea(VReg.V0, tmpSlot);
-            vm.store(VReg.V0, 0, VReg.RET);
+            vm.lea(VReg.V1, tmpSlot);
+            vm.store(VReg.V1, 0, VReg.RET); // x64: lea V0 would clobber RET
             // Set getter name = "get [Symbol.species]"
             vm.lea(VReg.V0, tmpSlot);
             vm.load(VReg.A0, VReg.V0, 0);
@@ -3670,8 +3670,8 @@ export const MemberCompiler = {
             vm.load(VReg.A0, VReg.V0, 0);
             this.emitBoxedStringKey("values", VReg.A1);
             vm.call("_object_get");
-            vm.lea(VReg.V0, tmpSlot);
-            vm.store(VReg.V0, 0, VReg.RET); // 保 values 闭包
+            vm.lea(VReg.V1, tmpSlot);
+            vm.store(VReg.V1, 0, VReg.RET); // 保 values 闭包(x64 lea V0 会毁 RET)
             // 字符串键
             vm.lea(VReg.V0, tmpSlot);
             vm.load(VReg.RET, VReg.V0, 0);
@@ -3697,8 +3697,8 @@ export const MemberCompiler = {
             // @@unscopables: ObjectCreate(null) + 各方法名 = true
             vm.call("_object_new_raw");
             vm.call("_box_obj_r");
-            vm.lea(VReg.V0, tmpSlot);
-            vm.store(VReg.V0, 0, VReg.RET); // 保 unscopables 对象
+            vm.lea(VReg.V1, tmpSlot);
+            vm.store(VReg.V1, 0, VReg.RET); // 保 unscopables 对象(x64 lea V0 会毁 RET)
             const unscNames = [
                 "copyWithin", "entries", "fill", "find", "findIndex",
                 "flat", "flatMap", "includes", "keys", "values",
@@ -3748,8 +3748,8 @@ export const MemberCompiler = {
             vm.load(VReg.A0, VReg.V0, 0);
             this.emitBoxedStringKey("entries", VReg.A1);
             vm.call("_object_get");
-            vm.lea(VReg.V0, tmpSlot);
-            vm.store(VReg.V0, 0, VReg.RET); // 保 entries 闭包
+            vm.lea(VReg.V1, tmpSlot);
+            vm.store(VReg.V1, 0, VReg.RET); // 保 entries 闭包(x64 lea V0 会毁 RET)
             vm.lea(VReg.V0, tmpSlot);
             vm.load(VReg.RET, VReg.V0, 0);
             this._reSetProtoProp(protoSlot, "Symbol.iterator", BUILTIN_PROP_ATTR);
@@ -3814,8 +3814,8 @@ export const MemberCompiler = {
         if (typeof cfg.speciesTmpSlot === "string") {
             this._reEnsureSlot(cfg.speciesTmpSlot);
             this.emitBuiltinFnClosure("_get_this");
-            vm.lea(VReg.V0, cfg.speciesTmpSlot);
-            vm.store(VReg.V0, 0, VReg.RET);
+            vm.lea(VReg.V1, cfg.speciesTmpSlot);
+            vm.store(VReg.V1, 0, VReg.RET); // x64: lea V0 would clobber RET
             // emitBoxedStringKey(A1) calls _tag_key_a1 which clobbers A0/RET.
             // Reload A0 from slot after each call.
             vm.lea(VReg.V0, cfg.speciesTmpSlot);
