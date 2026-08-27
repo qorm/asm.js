@@ -227,8 +227,10 @@ export const BuiltinArrayMethodCompiler = {
                 {
                 const _popFallbackLbl = this.ctx.newLabel("pop_fallback");
                 const _popEndLbl = this.ctx.newLabel("pop_end");
-                this.vm.shrImm(VReg.V0, VReg.RET, 48);
-                this.vm.cmpImm(VReg.V0, 0x7FFE);
+                // x64 V0==RET==RAX: tag must go to V1 or RET is destroyed and
+                // both _array_pop and _agen_pop receive the tag as the array.
+                this.vm.shrImm(VReg.V1, VReg.RET, 48);
+                this.vm.cmpImm(VReg.V1, 0x7FFE);
                 this.vm.jne(_popFallbackLbl);
                 this.vm.mov(VReg.A0, VReg.RET);
                 this.vm.call("_js_unbox");

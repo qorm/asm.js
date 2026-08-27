@@ -6082,16 +6082,19 @@ export const MemberCompiler = {
                     this.vm.cmpImm(VReg.V1, 0x7FFE);
                     this.vm.jne(dynL);
                     this.vm.call("_js_unbox");
-                    this.vm.loadByte(VReg.V0, VReg.RET, 0);
+                    // x64 V0==RET==RAX: type byte must not land in V0 or the unboxed
+                    // ptr dies and mov A0,RET feeds the type to _array_length (SIGSEGV
+                    // on [].length). V1 held the tag; call clobbered it and it is free.
+                    this.vm.loadByte(VReg.V1, VReg.RET, 0);
                     if (objType === "TypedArray") {
-                        this.vm.cmpImm(VReg.V0, 0x40);
+                        this.vm.cmpImm(VReg.V1, 0x40);
                         this.vm.jlt(dynL);
-                        this.vm.cmpImm(VReg.V0, 0x70);
+                        this.vm.cmpImm(VReg.V1, 0x70);
                         this.vm.jgt(dynL);
                         this.vm.mov(VReg.A0, VReg.RET);
                         this.vm.call("_typed_array_length");
                     } else {
-                        this.vm.cmpImm(VReg.V0, 1); // TYPE_ARRAY
+                        this.vm.cmpImm(VReg.V1, 1); // TYPE_ARRAY
                         this.vm.jne(dynL);
                         this.vm.mov(VReg.A0, VReg.RET);
                         this.vm.call("_array_length");
