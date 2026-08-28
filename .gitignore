@@ -21,6 +21,9 @@ gen2x
 gen2a
 gen2lx
 gen3
+# lettered self-compile leftovers (g1v / gen1d / ...)
+g[123][a-z]
+gen[123][a-z]
 asmjs-gen1
 *_compiled.out
 # 交叉编译 / 平台后缀产物
