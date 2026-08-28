@@ -1952,14 +1952,18 @@ export class Compiler {
         }
         // [Number shim] 源码用 toExponential/toPrecision 方法调用时前置注入 __number_shim
         // (路线同 JSON/eval shim);调用点由 compileCallExpression 改派到 __NUM_* 绑定。
+        // leftover-arg extract: Number.prototype.toPrecision 值读无 ".toPrecision("
+        // 时占位 _aref_num_toString leftover ToString vs RangeError
+        // (official precision-cannot-be-coerced .call(1, fn/NaN/{})).
         // 检测串拆开拼接,免本文件/codegen 自身的注释命中而误注入自举产物(gate 零影响)。
         const expMethodText = ".toExp" + "onential(";
         const preMethodText = ".toPre" + "cision(";
         const tlsMethodText = ".toLoca" + "leString(";
+        const preExtractText = "prototype.toPre" + "cision";
         if (filePath.indexOf("__number_shim.js") === -1 &&
             src.indexOf("__number_shim") === -1 &&
             (src.indexOf(expMethodText) !== -1 || src.indexOf(preMethodText) !== -1 ||
-             src.indexOf(tlsMethodText) !== -1)) {
+             src.indexOf(tlsMethodText) !== -1 || src.indexOf(preExtractText) !== -1)) {
             bumpSrc(injectShimImport(src, 'import { __NUM_toExponential, __NUM_toPrecision, __NUM_toLocaleString } from "__number_shim";\n'));
         }
         // [Date shim] 源码用 toLocaleString/toLocaleDateString/toLocaleTimeString 方法时

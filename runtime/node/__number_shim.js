@@ -32,7 +32,11 @@ export function __NUM_toExponential(v, f) {
         while (mant < 1) { mant = mant * 10; exp = exp - 1; }
     }
     var mantStr;
-    if (f === undefined || f === null) {
+    // leftover-arg leftover null is ToInteger(null)=0, not leftover
+    // undefined auto-precision. official tointeger-fractiondigits
+    // (123.456).toExponential(null) leftover "1.23456e+2" vs "1e+2".
+    // leftover-arg 0-arg / leftover undefined still auto.
+    if (f === undefined) {
         mantStr = "" + mant;
     } else {
         f = f | 0;
@@ -88,7 +92,19 @@ export function __NUM_toLocaleString(v) {
 }
 
 export function __NUM_toPrecision(v, p) {
-    v = Number(v);
+    // leftover-arg thisNumberValue TypeError. official this-type-not-number
+    // leftover Number() coerce "NaN"/"1" vs TypeError (leftover-arg extract
+    // injects shim; leftover-boolean boxing leftover ToNumber vs TypeError).
+    // leftover-number boxing Number wrapper still unbox.
+    if (typeof v !== "number") {
+        // leftover-number boxing Number wrapper / Number.prototype
+        // ([[NumberData]]). Number.prototype instanceof Number is leftover
+        // false here; official undefined-precision-arg Number.prototype.toPrecision().
+        if (v !== Number.prototype && !(v instanceof Number)) {
+            throw new TypeError("Number.prototype.toPrecision requires that 'this' be a Number");
+        }
+        v = Number(v);
+    }
     if (p === undefined || p === null) return "" + v; // leftover-arg 0-arg / undefined → ToString
     p = p | 0; // ToInteger (valueOf side effects; leftover Inf/NaN |0 leftover 0)
     // leftover Inf/NaN this after ToInteger, before range (spec 4 / 7).

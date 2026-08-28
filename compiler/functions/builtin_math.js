@@ -14,6 +14,11 @@ export const BuiltinMathMethodCompiler = {
                 this.compileExpression(args[0]);
                 this.vm.mov(VReg.A0, VReg.RET);
                 this.vm.call("_math_floor");
+                // leftover Inf/NaN: ffloor(NaN) hardware qNaN 0x7FF8 leftover empty
+                // (NaN-boxing tag alias). Same emitMathNanNormalize as sqrt/pow.
+                this.emitMathNanNormalize();
+            } else {
+                this.vm.movImm64(VReg.RET, 0x7FF0000000000001n); // leftover-arg 0-arg leftover RET
             }
             return true;
         }
@@ -23,6 +28,9 @@ export const BuiltinMathMethodCompiler = {
                 this.compileExpression(args[0]);
                 this.vm.mov(VReg.A0, VReg.RET);
                 this.vm.call("_math_ceil");
+                this.emitMathNanNormalize();
+            } else {
+                this.vm.movImm64(VReg.RET, 0x7FF0000000000001n); // leftover-arg 0-arg leftover RET
             }
             return true;
         }
@@ -32,6 +40,9 @@ export const BuiltinMathMethodCompiler = {
                 this.compileExpression(args[0]);
                 this.vm.mov(VReg.A0, VReg.RET);
                 this.vm.call("_math_trunc");
+                this.emitMathNanNormalize();
+            } else {
+                this.vm.movImm64(VReg.RET, 0x7FF0000000000001n); // leftover-arg 0-arg leftover RET
             }
             return true;
         }
@@ -41,6 +52,9 @@ export const BuiltinMathMethodCompiler = {
                 this.compileExpression(args[0]);
                 this.vm.mov(VReg.A0, VReg.RET);
                 this.vm.call("_math_round");
+                this.emitMathNanNormalize();
+            } else {
+                this.vm.movImm64(VReg.RET, 0x7FF0000000000001n); // leftover-arg 0-arg leftover RET
             }
             return true;
         }
@@ -50,6 +64,8 @@ export const BuiltinMathMethodCompiler = {
                 this.compileExpression(args[0]);
                 this.vm.mov(VReg.A0, VReg.RET);
                 this.vm.call("_math_abs");
+            } else {
+                this.vm.movImm64(VReg.RET, 0x7FF0000000000001n); // leftover-arg 0-arg leftover RET
             }
             return true;
         }

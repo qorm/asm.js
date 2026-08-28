@@ -2799,6 +2799,13 @@ export const FunctionCompiler = {
 
             // parseInt(str, radix) / parseFloat(str) 全局函数
             if (callee.name === "parseInt") {
+                // leftover-arg: parseInt() ≡ ToString(undefined)="undefined" → NaN.
+                // args==0 used to compileExpression(missing) leftover RET 0 then
+                // leftover-arg ToString of raw +0 → parseInt("0")=0 vs NaN.
+                if (expr.arguments.length === 0) {
+                    this.vm.movImm64(VReg.RET, 0x7ff0000000000001n);
+                    return;
+                }
                 this.compileExpression(expr.arguments[0]);
                 this.vm.push(VReg.RET);
                 if (expr.arguments.length > 1) {
@@ -3666,16 +3673,21 @@ export const FunctionCompiler = {
             if (obj.type === "Identifier" && obj.name === "Number" && prop && prop.type === "Identifier" &&
                 (prop.name === "parseInt" || prop.name === "parseFloat")) {
                 if (prop.name === "parseInt") {
-                    this.compileExpression(expr.arguments[0]);
-                    this.vm.push(VReg.RET);
-                    if (expr.arguments.length > 1) {
-                        this.compileExpression(expr.arguments[1]);
-                        this.vm.mov(VReg.A1, VReg.RET);
+                    // leftover-arg: Number.parseInt() ≡ parseInt() leftover-arg NaN.
+                    if (expr.arguments.length === 0) {
+                        this.vm.movImm64(VReg.RET, 0x7ff0000000000001n);
                     } else {
-                        this.vm.movImm(VReg.A1, 0);
+                        this.compileExpression(expr.arguments[0]);
+                        this.vm.push(VReg.RET);
+                        if (expr.arguments.length > 1) {
+                            this.compileExpression(expr.arguments[1]);
+                            this.vm.mov(VReg.A1, VReg.RET);
+                        } else {
+                            this.vm.movImm(VReg.A1, 0);
+                        }
+                        this.vm.pop(VReg.A0);
+                        this.vm.call("_js_parseInt");
                     }
-                    this.vm.pop(VReg.A0);
-                    this.vm.call("_js_parseInt");
                 } else {
                     // leftover-arg: Number.parseFloat() ≡ parseFloat() leftover-arg NaN.
                     if (expr.arguments.length === 0) {

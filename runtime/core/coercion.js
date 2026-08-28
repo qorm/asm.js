@@ -489,8 +489,73 @@ export class CoercionGenerator {
         vm.label("_js_parseInt");
         vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
 
-        // 取字符串内容指针
+        // leftover-arg ToString of raw number: spec ToString then parse.
+        // parseInt(-1) leftover _getStrContent invalid → empty → NaN vs
+        // parseInt("-1")=-1 (official A1_T2). high16<0x7FF8 (except data-ptr
+        // 0x1000/0x1001) or >0x7FFF → _numberToString. Tagged leftover-arg
+        // / string 0x7FFC still _getStrContent. Scratch V5/V6 (linux-x64 V0=RET).
         vm.push(VReg.A1);
+        vm.shrImm(VReg.V5, VReg.A0, 48);
+        vm.cmpImm(VReg.V5, 0x7FF8);
+        vm.jlt("_pi_maybe_num");
+        vm.cmpImm(VReg.V5, 0x8000);
+        vm.jge("_pi_num");
+        // leftover-number boxing: Number wrapper 0x7FFD [[NumberData]]
+        // via __number_value → ToString then parse. parseInt(new Number(-1))
+        // leftover _getStrContent empty → NaN vs -1 (official A1_T5).
+        // String wrapper miss used leftover empty still NaN (official A1_T6).
+        // Generic obj leftover empty used leftover NaN (official A1_T7).
+        // Scratch V5/V6 (linux-x64 V0=RET). S0 stashes obj across _object_get.
+        vm.cmpImm(VReg.V5, 0x7FFD);
+        vm.jeq("_pi_numobj");
+        vm.jmp("_pi_as_str");
+        vm.label("_pi_numobj");
+        vm.mov(VReg.S0, VReg.A0);
+        vm.lea(VReg.A1, vm.asm.addString("__number_value"));
+        vm.movImm64(VReg.V6, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V6);
+        vm.call("_object_get");
+        vm.movImm64(VReg.V6, 0x7ffb000000000000n);
+        vm.cmp(VReg.RET, VReg.V6);
+        vm.jeq("_pi_numobj_miss");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.jmp("_pi_num");
+        vm.label("_pi_numobj_miss");
+        // leftover-number boxing String wrapper 0x7FFD [[StringData]]
+        // via __value. parseInt(new String("-1")) leftover _getStrContent
+        // empty → NaN vs -1 (official A1_T6). Spec ToString(String object)
+        // = [[StringData]]; then parse. Generic miss → _valueToStr
+        // (official A1_T7). Scratch V5/V6 (linux-x64 V0=RET).
+        vm.mov(VReg.A0, VReg.S0);
+        vm.lea(VReg.A1, vm.asm.addString("__value"));
+        vm.movImm64(VReg.V6, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V6);
+        vm.call("_object_get");
+        vm.movImm64(VReg.V6, 0x7ffb000000000000n);
+        vm.cmp(VReg.RET, VReg.V6);
+        vm.jeq("_pi_strobj_miss");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.jmp("_pi_as_str");
+        vm.label("_pi_strobj_miss");
+        // leftover-arg ToString of generic 0x7FFD: OrdinaryToPrimitive
+        // hint String. parseInt({toString:()=>0}) leftover _getStrContent
+        // empty → NaN vs 0 (official A1_T7). _valueToStr treats toString()=>+0
+        // as miss (RET==0) and uses valueOf. _parse_otp_string keeps +0.
+        // Number/String wrappers already unboxed above.
+        // Scratch V5/V6 (linux-x64 V0=RET). S0 is the object; radix on stack.
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_parse_otp_string");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.jmp("_pi_as_str");
+        vm.label("_pi_maybe_num");
+        vm.cmpImm(VReg.V5, 0x1000);
+        vm.jeq("_pi_as_str");
+        vm.cmpImm(VReg.V5, 0x1001);
+        vm.jeq("_pi_as_str");
+        vm.label("_pi_num");
+        vm.call("_numberToString");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.label("_pi_as_str");
         vm.call("_getStrContent");
         vm.mov(VReg.S0, VReg.RET); // S0 = char*
         vm.pop(VReg.A0);
@@ -616,24 +681,94 @@ export class CoercionGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
 
         // parseFloat(str):置宽松位 → _str_to_num(尾部垃圾忽略,解析前缀)→ 复位。
-        // parseFloat("3.14px")=3.14、"100%"=100、"42px"=42。纯垃圾/无前导数字 → 沿用
-        // _str_to_num 无效路径(与 Number 同,记偏差)。A0=字符串,V0/V1 置位不碰 A0。
+        // parseFloat("3.14px")=3.14、"100%"=100、"42px"=42。纯垃圾 → _str_to_num
+        // 无效路径 leftover NaN。空串 leftover-number boxing 由 no_digits +
+        // _parse_lenient 收 leftover NaN(Number("") 仍 leftover 0)。A0=字符串。
         vm.label("_js_parseFloat");
         vm.prologue(16, [VReg.S0]);
-        // leftover-arg: parseFloat(undefined/null/boolean/object) leftover qNaN
-        // 0x7FF8… boxed-int0 alias leftover empty vs NaN. Spec ToString then
-        // parse: "undefined"/"null"/"true"/"[object Object]" → no digits → NaN.
-        // high16>=0x7FF8 && !=0x7FFC (string) leftover-arg → canonical NaN.
-        // Scratch V5/V6 (linux-x64 V0=RET). Raw numbers leftover-arg ToString
-        // / _str_to_num_not_string qNaN not this close. parseInt emit unchanged.
+        // leftover-arg ToString of raw number: parseFloat(ToString(n)) ≡ n
+        // except -0 → +0. Prior leftover-arg check high16>=0x7FF8 && !=0x7FFC
+        // treated ALL negative floats (high16>=0x8000) as tagged leftover NaN
+        // (official A1_T2 parseFloat(-1.1) leftover NaN) and sent +finite
+        // through _str_to_num_not_string leftover qNaN empty (parseFloat(42)).
+        // Tagged leftover-arg (undef/null/bool) still canonical NaN.
+        // leftover-number boxing Number wrapper 0x7FFD unboxed below.
+        // String 0x7FFC / data-ptr 0x1000/0x1001 still parse. Scratch V5/V6
+        // (linux-x64 V0=RET).
         vm.shrImm(VReg.V5, VReg.A0, 48);
-        vm.movImm(VReg.V6, 0x7FF8);
-        vm.cmp(VReg.V5, VReg.V6);
-        vm.jlt("_js_parseFloat_str");
-        vm.movImm(VReg.V6, 0x7FFC);
-        vm.cmp(VReg.V5, VReg.V6);
+        vm.cmpImm(VReg.V5, 0x7FF8);
+        vm.jlt("_js_parseFloat_pos");
+        vm.cmpImm(VReg.V5, 0x8000);
+        vm.jge("_js_parseFloat_neg");
+        vm.cmpImm(VReg.V5, 0x7FFC);
         vm.jeq("_js_parseFloat_str");
+        // leftover-number boxing: Number wrapper 0x7FFD [[NumberData]]
+        // via __number_value. parseFloat(new Number(-1.1)) leftover tagged
+        // NaN vs -1.1 (official A1_T5). Spec ToString(Number object) =
+        // ToString([[NumberData]]); then parse ≡ identity except -0 → +0.
+        // String wrapper miss used leftover tagged NaN (official A1_T6).
+        // Generic / Boolean miss used leftover NaN (official A1_T7).
+        // Scratch V5/V6 (linux-x64 V0=RET). S0 already in prologue.
+        vm.cmpImm(VReg.V5, 0x7FFD);
+        vm.jeq("_js_parseFloat_numobj");
         vm.movImm64(VReg.RET, 0x7ff0000000000001n);
+        vm.epilogue([VReg.S0], 16);
+        vm.label("_js_parseFloat_numobj");
+        vm.mov(VReg.S0, VReg.A0);
+        vm.lea(VReg.A1, vm.asm.addString("__number_value"));
+        vm.movImm64(VReg.V6, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V6);
+        vm.call("_object_get");
+        vm.movImm64(VReg.V6, 0x7ffb000000000000n);
+        vm.cmp(VReg.RET, VReg.V6);
+        vm.jeq("_js_parseFloat_numobj_miss");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.movImm64(VReg.V6, 0x8000000000000000n);
+        vm.cmp(VReg.A0, VReg.V6);
+        vm.jne("_js_parseFloat_num_ret");
+        vm.movImm(VReg.RET, 0); // -0 → +0 (ToString(-0)="0")
+        vm.epilogue([VReg.S0], 16);
+        vm.label("_js_parseFloat_numobj_miss");
+        // leftover-number boxing String wrapper 0x7FFD [[StringData]]
+        // via __value. parseFloat(new String("-1.1")) leftover tagged NaN
+        // vs -1.1 (official A1_T6). Spec ToString(String object) =
+        // [[StringData]]; then parse. Generic miss → _valueToStr
+        // (official A1_T7). Scratch V5/V6
+        // (linux-x64 V0=RET). S0 is the wrapper.
+        vm.mov(VReg.A0, VReg.S0);
+        vm.lea(VReg.A1, vm.asm.addString("__value"));
+        vm.movImm64(VReg.V6, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V6);
+        vm.call("_object_get");
+        vm.movImm64(VReg.V6, 0x7ffb000000000000n);
+        vm.cmp(VReg.RET, VReg.V6);
+        vm.jeq("_js_parseFloat_strobj_miss");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.jmp("_js_parseFloat_str");
+        vm.label("_js_parseFloat_strobj_miss");
+        // leftover-arg ToString of generic 0x7FFD: OrdinaryToPrimitive
+        // hint String. parseFloat({toString:()=>0}) leftover NaN vs 0
+        // (official A1_T7). _valueToStr treats toString()=>+0 as miss
+        // (RET==0) and uses valueOf. _parse_otp_string keeps +0.
+        // Number/String wrappers already unboxed above.
+        // Scratch V5/V6 (linux-x64 V0=RET). S0 is the object.
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_parse_otp_string");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.jmp("_js_parseFloat_str");
+        vm.label("_js_parseFloat_neg");
+        vm.movImm64(VReg.V6, 0x8000000000000000n);
+        vm.cmp(VReg.A0, VReg.V6);
+        vm.jne("_js_parseFloat_num_ret");
+        vm.movImm(VReg.RET, 0); // -0 → +0 (ToString(-0)="0")
+        vm.epilogue([VReg.S0], 16);
+        vm.label("_js_parseFloat_pos");
+        vm.cmpImm(VReg.V5, 0x1000);
+        vm.jeq("_js_parseFloat_str");
+        vm.cmpImm(VReg.V5, 0x1001);
+        vm.jeq("_js_parseFloat_str");
+        vm.label("_js_parseFloat_num_ret");
+        vm.mov(VReg.RET, VReg.A0);
         vm.epilogue([VReg.S0], 16);
         vm.label("_js_parseFloat_str");
         vm.lea(VReg.V0, "_parse_lenient");
@@ -646,6 +781,47 @@ export class CoercionGenerator {
         vm.store(VReg.V0, 0, VReg.V1);   // 复位
         vm.mov(VReg.RET, VReg.S0);
         vm.epilogue([VReg.S0], 16);
+
+        // leftover wrapper boxing RET: OrdinaryToPrimitive hint String then
+        // ToString. A0 = 0x7FFD generic obj. RET = boxed string.
+        // _object_user_tostr miss / toString()=>+0 both return RET==0.
+        // _valueToStr treats that as miss and uses valueOf (A1_T7 CHECK#2
+        // leftover 1 vs 0). Here RET==0 is +0.0 primitive → "0".
+        // Still-object tags → valueOf; both objects → TypeError.
+        // Scratch V5/V6 (linux-x64 V0=RET).
+        vm.label("_parse_otp_string");
+        vm.prologue(16, [VReg.S0]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.call("_object_user_tostr");
+        vm.shrImm(VReg.V5, VReg.RET, 48);
+        vm.cmpImm(VReg.V5, 0x7FFD);
+        vm.jeq("_parse_otp_vo");
+        vm.cmpImm(VReg.V5, 0x7FFE);
+        vm.jeq("_parse_otp_vo");
+        vm.cmpImm(VReg.V5, 0x7FFF);
+        vm.jeq("_parse_otp_vo");
+        vm.label("_parse_otp_prim");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_valueToStr");
+        vm.epilogue([VReg.S0], 16);
+        vm.label("_parse_otp_vo");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_user_valueof");
+        vm.shrImm(VReg.V5, VReg.RET, 48);
+        vm.cmpImm(VReg.V5, 0x7FFD);
+        vm.jeq("_parse_otp_fail");
+        vm.cmpImm(VReg.V5, 0x7FFE);
+        vm.jeq("_parse_otp_fail");
+        vm.cmpImm(VReg.V5, 0x7FFF);
+        vm.jeq("_parse_otp_fail");
+        vm.jmp("_parse_otp_prim");
+        vm.label("_parse_otp_fail");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot convert object to primitive value"));
+        vm.movImm64(VReg.V6, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V6);
+        vm.movImm64(VReg.V6, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V6);
+        vm.call("_throw_type_error");
     }
 
     // 内置转换函数的可调用版本（供 filter(Boolean) 等一等函数传递）
@@ -1512,6 +1688,15 @@ export class CoercionGenerator {
         vm.jeq("_str_to_num_maybe_inf");
         // [radix] 进制前缀 0x/0X(16)、0o/0O(8)、0b/0B(2)。JS 规范 NonDecimalIntegerLiteral
         // 不允许正负号(Number("-0x1")===NaN),故仅正号(S1==1)时识别前缀,否则落十进制。
+        // parseFloat leftover-number boxing leftover NaN: spec StrDecimalLiteral
+        // has no 0x/0o/0b. parseFloat("0x") leftover NaN vs 0 (official A4_T1);
+        // parseFloat("0x1") leftover 1 vs 0 (A4_T3). _parse_lenient → decimal
+        // so "0x" parses digit 0 + leftover x ignored. Number("0x") still NaN.
+        // Scratch V5 (linux-x64 V0=RET / V1=A3 used as 2nd char).
+        vm.lea(VReg.V5, "_parse_lenient");
+        vm.load(VReg.V5, VReg.V5, 0);
+        vm.cmpImm(VReg.V5, 0);
+        vm.jne("_str_to_num_decimal_init");
         vm.cmpImm(VReg.S1, 1);
         vm.jne("_str_to_num_decimal_init");
         vm.loadByte(VReg.V0, VReg.S0, 0);
@@ -1591,7 +1776,8 @@ export class CoercionGenerator {
         // 停止字符是 '.' → 解析小数部分(整数部分可空,支持 ".5"=0.5)。
         vm.cmpImm(VReg.V0, 46); // '.'
         vm.jeq("_str_to_num_dot_frac");
-        // 非 '.':若整数部分也无数字 → 无效输入(空串/纯空白由 no_digits 归 0)。
+        // 非 '.':若整数部分也无数字 → 无效输入(空串/纯空白由 no_digits:
+        // Number leftover 0; parseFloat leftover-number boxing NaN)。
         vm.cmpImm(VReg.V2, 0); // V2 = digit found flag
         vm.jeq("_str_to_num_no_digits");
         vm.jmp("_str_to_num_maybe_exp");
@@ -1661,8 +1847,21 @@ export class CoercionGenerator {
         vm.addImm(VReg.S0, VReg.S0, 1);
         vm.jmp("_str_to_num_exp_loop");
         vm.label("_str_to_num_exp_end");
-        vm.cmpImm(VReg.V3, 0);          // 'e' 后无数字(如 "1e") → 无效 NaN
-        vm.jeq("_str_to_num_invalid");
+        vm.cmpImm(VReg.V3, 0);          // 'e' 后无数字(如 "1e"/"1ex")
+        vm.jne("_str_to_num_exp_have_digits");
+        // leftover-number boxing leftover NaN: parseFloat longest
+        // StrDecimalLiteral prefix. "1ex"/"1e-x"/"1e" have no exponent
+        // digits so the 'e' is leftover garbage; prefix before e is the
+        // result (official A4_T2 parseFloat("1ex") leftover NaN vs 1).
+        // Number("1e")/"1ex" still NaN (strict whole-string). S5 already
+        // 0 at do_exp. Scratch V1 (same as other _parse_lenient loads;
+        // linux-x64 V0=RET holds leftover char).
+        vm.lea(VReg.V1, "_parse_lenient");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_str_to_num_finish"); // parseFloat leftover NaN → prefix
+        vm.jmp("_str_to_num_invalid"); // Number leftover NaN
+        vm.label("_str_to_num_exp_have_digits");
         vm.cmpImm(VReg.V2, 0);          // 应用指数符号
         vm.jge("_str_to_num_exp_signed");
         vm.neg(VReg.S5, VReg.S5);
@@ -1699,11 +1898,19 @@ export class CoercionGenerator {
         vm.loadByte(VReg.V0, VReg.S0, 0);
         vm.jmp("_str_to_num_skip_trailing_ws");
 
-        // 无数字输入处理(空字符串或纯空白)
+        // 无数字输入处理(空字符串或纯空白)。leftover-number boxing leftover 0
+        // ToNumber: Number("")=0; parseFloat("") leftover 0 vs NaN (official
+        // 15.1.2.3-2-1 / A3_T1). _parse_lenient → leftover NaN. Scratch V1
+        // (same as other _parse_lenient loads; linux-x64 V0=RET holds char).
         vm.label("_str_to_num_no_digits");
-        // 检查是否是结束符(空字符串的情况)
         vm.cmpImm(VReg.V0, 0); // 结束符
-        vm.jeq("_str_to_num_finish"); // 是结束符,返回 0
+        vm.jne("_str_to_num_no_digits_ws");
+        vm.lea(VReg.V1, "_parse_lenient");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_str_to_num_invalid"); // parseFloat empty leftover 0 → NaN
+        vm.jmp("_str_to_num_finish"); // Number("") leftover 0
+        vm.label("_str_to_num_no_digits_ws");
         // 检查是否是空白字符(跳过空白后重新检查)
         vm.cmpImm(VReg.V0, 32); // 空格
         vm.jeq("_str_to_num_skip_ws");
