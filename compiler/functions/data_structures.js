@@ -240,6 +240,23 @@ export const DataStructureCompiler = {
         }
         const nonSpread = count - spreadCount;
 
+        // Annex B.3.1: Syntax Error if two+ proto-setters
+        // (PropertyName : AssignmentExpression named "__proto__").
+        // Method / shorthand / computed / get/set are not proto setters.
+        // compileObjectExpression is only for object literals; destructuring
+        // assignment uses reinterpretAsPattern (obj-prop-__proto__dup).
+        let protoSetters = 0;
+        for (let psi = 0; psi < count; psi++) {
+            const pp = props[psi];
+            if (!pp || pp.type === "SpreadElement" || pp.computed || pp.method || pp.shorthand) continue;
+            if (pp.kind === "get" || pp.kind === "set") continue;
+            const pkn = this.objectPropStaticKeyName(pp.key);
+            if (pkn === "__proto__") protoSetters++;
+        }
+        if (protoSetters > 1) {
+            throw new SyntaxError("Duplicate __proto__ property");
+        }
+
         // 统一走对象运行时封装，避免手写对象头/布局导致的不一致。
         // 对象现已支持自动扩容（capacity 满即 realloc 2×、指针稳定），故只给小初始容量，
         // 动态追加属性时自然增长。**关键**：旧代码给每个 {} 预留 16384/8192B（对象无扩容时代的
@@ -517,32 +534,42 @@ export const DataStructureCompiler = {
 
             // ES ObjectLiteral __proto__:非计算键 "__proto__" 设 [[Prototype]],不建自有属性。
             // `{__proto__:null}` → getPrototypeOf null(此前当普通键 define,链仍 Object.prototype)。
-            if (keyName === "__proto__") {
+            // Method `{ __proto__() {} }` and shorthand `{ __proto__ }` are not proto setters.
+            // x64: tag extract must not use V0 (V0≡RET) — shrImm V0,RET,48 smashed
+            // the proto, then store into boxed obj+16 (objOffset is 0x7FFD) SIGSEGV.
+            // GetSuperBase tests use `{__proto__: proto, m(){ return super[key]; }}`.
+            if (keyName === "__proto__" && !prop.method && !prop.shorthand) {
                 this.compileExpression(prop.value);
+                const protoValOff = this.ctx.allocLocal(`__objlit_proto_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, protoValOff, VReg.RET);
                 const protoNullL = this.ctx.newLabel("objlit_proto_null");
                 const protoDoneL = this.ctx.newLabel("objlit_proto_done");
                 const protoObjL = this.ctx.newLabel("objlit_proto_obj");
-                this.vm.shrImm(VReg.V0, VReg.RET, 48);
-                this.vm.cmpImm(VReg.V0, 0x7FFA); // null
+                this.vm.shrImm(VReg.V1, VReg.RET, 48); // V1 tag; x64 V0≡RET
+                this.vm.cmpImm(VReg.V1, 0x7FFA); // null
                 this.vm.jeq(protoNullL);
-                this.vm.cmpImm(VReg.V0, 0x7FFD); // object
+                this.vm.cmpImm(VReg.V1, 0x7FFD); // object
                 this.vm.jeq(protoObjL);
-                this.vm.cmpImm(VReg.V0, 0x7FFE); // array
+                this.vm.cmpImm(VReg.V1, 0x7FFE); // array
                 this.vm.jeq(protoObjL);
-                this.vm.cmpImm(VReg.V0, 0x7FFF); // function
+                this.vm.cmpImm(VReg.V1, 0x7FFF); // function
                 this.vm.jeq(protoObjL);
                 // 其它值:规范忽略(不改 [[Prototype]]);此处同样跳过
                 this.vm.jmp(protoDoneL);
                 this.vm.label(protoNullL);
-                this.vm.load(VReg.V1, VReg.FP, objOffset);
-                this.vm.movImm(VReg.V0, 0);
-                this.vm.store(VReg.V1, 16, VReg.V0);
+                this.vm.load(VReg.V2, VReg.FP, objOffset);
+                this.vm.emitMaskLoad(VReg.V1);
+                this.vm.andMaskReg(VReg.V2, VReg.V2, VReg.V1); // raw obj
+                this.vm.movImm(VReg.V1, 0);
+                this.vm.store(VReg.V2, 16, VReg.V1);
                 this.vm.jmp(protoDoneL);
                 this.vm.label(protoObjL);
-                this.vm.emitMaskLoad(VReg.V0);
-                this.vm.andMaskReg(VReg.RET, VReg.RET, VReg.V0); // 裸 proto
-                this.vm.load(VReg.V1, VReg.FP, objOffset);
-                this.vm.store(VReg.V1, 16, VReg.RET);
+                this.vm.load(VReg.RET, VReg.FP, protoValOff);
+                this.vm.emitMaskLoad(VReg.V1);
+                this.vm.andMaskReg(VReg.RET, VReg.RET, VReg.V1); // raw proto
+                this.vm.load(VReg.V2, VReg.FP, objOffset);
+                this.vm.andMaskReg(VReg.V2, VReg.V2, VReg.V1); // raw obj
+                this.vm.store(VReg.V2, 16, VReg.RET);
                 this.vm.label(protoDoneL);
                 continue;
             }
@@ -620,10 +647,11 @@ export const DataStructureCompiler = {
         }
     },
 
-    // SetFunctionName(fn, propKey)。Symbol → "[desc]" / "";字符串键原样。
+    // SetFunctionName(fn, propKey [, prefix])。Symbol → "[desc]" / "";字符串键原样。
+    // prefix "get"/"set": name = prefix + " " + name（"get " / "get [test262]"）。
     // forClass:类值是 classinfo,attr 须写对象本身(_object_set_prop_attr),
     // 不可走 _closure_prop_set_attr(那只改侧表,classinfo.name 描述符不变)。
-    _emitSetFunctionName(fnSlot, keySlot, forClass) {
+    _emitSetFunctionName(fnSlot, keySlot, forClass, prefix) {
         const vm = this.vm;
         const symL = this.ctx.newLabel("objlit_sfn_sym");
         const emptyL = this.ctx.newLabel("objlit_sfn_empty");
@@ -661,6 +689,18 @@ export const DataStructureCompiler = {
         vm.call("_js_box_string");
 
         vm.label(nameReadyL);
+        // SetFunctionName prefix: "get"/"set" → prefix + " " + name
+        // 匿名 Symbol 描述为空 → "get " / "set "（尾空格是规范）。
+        if (prefix === "get" || prefix === "set") {
+            vm.mov(VReg.A0, VReg.RET);
+            vm.call("_getStrContent");
+            vm.store(VReg.FP, nameSlot, VReg.RET);
+            vm.lea(VReg.A0, this.asm.addString(prefix + " "));
+            vm.load(VReg.A1, VReg.FP, nameSlot);
+            vm.call("_strconcat");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.call("_js_box_string");
+        }
         vm.store(VReg.FP, nameSlot, VReg.RET);
         // define(fn, "name", nameStr);函数值走 _closure_prop_define
         vm.load(VReg.A0, VReg.FP, fnSlot);
@@ -676,6 +716,16 @@ export const DataStructureCompiler = {
         } else {
             vm.call("_closure_prop_set_attr");
         }
+    },
+
+    // 类方法/访问器是 0x7FFF|TEXT。装箱标签后走 SetFunctionName。
+    _emitSetFunctionNameForLabel(label, keySlot, prefix) {
+        this.vm.lea(VReg.A2, label);
+        this.vm.movImm64(VReg.V0, 0x7fff000000000000n);
+        this.vm.or(VReg.A2, VReg.A2, VReg.V0);
+        const fnSlot = this.ctx.allocLocal(`__sfnlbl_${this.nextLabelId()}`);
+        this.vm.store(VReg.FP, fnSlot, VReg.A2);
+        this._emitSetFunctionName(fnSlot, keySlot, false, prefix);
     },
 
     // 发射对象字面量访问器：24B 标记对象 {TYPE_GETTER@0, getter@8, setter@16}，
@@ -694,9 +744,12 @@ export const DataStructureCompiler = {
         this.vm.store(VReg.RET, 16, VReg.V1);
 
         // getter/setter：编译 FunctionExpression 得装箱闭包(0x7fff|ptr)，
-        // 脱壳成裸堆指针存入对应槽
+        // 脱壳成裸堆指针存入对应槽。装箱值留 FP 槽供 SetFunctionName。
+        let getSlot = null, setSlot = null;
         if (group.getter) {
             this.compileExpression(group.getter);
+            getSlot = this.ctx.allocLocal(`__objaccg_${this.nextLabelId()}`);
+            this.vm.store(VReg.FP, getSlot, VReg.RET);
             this.vm.emitMaskLoad(VReg.V1);
             this.vm.andMaskReg(VReg.V0, VReg.RET, VReg.V1);
             this.vm.load(VReg.V1, VReg.FP, markerOffset);
@@ -704,6 +757,8 @@ export const DataStructureCompiler = {
         }
         if (group.setter) {
             this.compileExpression(group.setter);
+            setSlot = this.ctx.allocLocal(`__objaccs_${this.nextLabelId()}`);
+            this.vm.store(VReg.FP, setSlot, VReg.RET);
             this.vm.emitMaskLoad(VReg.V1);
             this.vm.andMaskReg(VReg.V0, VReg.RET, VReg.V1);
             this.vm.load(VReg.V1, VReg.FP, markerOffset);
@@ -719,8 +774,13 @@ export const DataStructureCompiler = {
         const keyLabel = this.asm.addString(group.name);
         this.vm.lea(VReg.A1, keyLabel);
         this.vm.call("_tag_str_a1"); // key box->helper
+        const keySlot = this.ctx.allocLocal(`__objacck_${this.nextLabelId()}`);
+        this.vm.store(VReg.FP, keySlot, VReg.A1);
         this.vm.load(VReg.A2, VReg.FP, markerOffset);
         this.vm.call("_object_define");
+        // SetFunctionName(closure, propKey, "get"|"set") — 静态键 "get id"
+        if (getSlot) this._emitSetFunctionName(getSlot, keySlot, false, "get");
+        if (setSlot) this._emitSetFunctionName(setSlot, keySlot, false, "set");
     },
 
     // get/set [Symbol.xxx]():TYPE_GETTER 挂 well-known Symbol 键(非 ToString 假串)。
@@ -780,8 +840,11 @@ export const DataStructureCompiler = {
         this.vm.store(VReg.RET, 8, VReg.V1);
         this.vm.store(VReg.RET, 16, VReg.V1);
 
+        let getSlot = null, setSlot = null;
         if (group.getter) {
             this.compileExpression(group.getter);
+            getSlot = this.ctx.allocLocal(`__objcacg_${this.nextLabelId()}`);
+            this.vm.store(VReg.FP, getSlot, VReg.RET);
             this.vm.emitMaskLoad(VReg.V1);
             this.vm.andMaskReg(VReg.V0, VReg.RET, VReg.V1);
             this.vm.load(VReg.V1, VReg.FP, markerOffset);
@@ -789,6 +852,8 @@ export const DataStructureCompiler = {
         }
         if (group.setter) {
             this.compileExpression(group.setter);
+            setSlot = this.ctx.allocLocal(`__objcacs_${this.nextLabelId()}`);
+            this.vm.store(VReg.FP, setSlot, VReg.RET);
             this.vm.emitMaskLoad(VReg.V1);
             this.vm.andMaskReg(VReg.V0, VReg.RET, VReg.V1);
             this.vm.load(VReg.V1, VReg.FP, markerOffset);
@@ -825,5 +890,8 @@ export const DataStructureCompiler = {
         this.vm.load(VReg.A1, VReg.FP, kOff);
         this.vm.load(VReg.A2, VReg.FP, markerOffset);
         this.vm.call("_accessor_define");
+        // SetFunctionName(closure, propKey, "get"|"set"): Symbol → "get " / "get [desc]"
+        if (getSlot) this._emitSetFunctionName(getSlot, kOff, false, "get");
+        if (setSlot) this._emitSetFunctionName(setSlot, kOff, false, "set");
     },
 };

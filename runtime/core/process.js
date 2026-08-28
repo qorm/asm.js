@@ -999,6 +999,7 @@ export class ProcessGenerator {
         };
         globalCtorRef("Map", "_map_ctor_call");
         globalCtorRef("Set", "_set_ctor_call");
+        globalCtorRef("Proxy", "_proxy_ctor_call");
         // RegExp prop-desc 只查 this.RegExp 的 own/属性位,源码不读标识符 RegExp
         // → 不会走 emitRegExpCtorObject。占位可调用闭包(真单例在提及标识符时覆盖)。
         globalCtorRef("RegExp", "_array_ctor_call");

@@ -342,8 +342,13 @@ export const OperatorCompiler = {
             (e && e.type === "Identifier" && e.name === "NaN");
         if (NAN_ARITH_OPS[op] &&
             (isStaticNaN(expr.left) || isStaticNaN(expr.right))) {
-            this.vm.movImm64(VReg.RET, 0x7ff0000000000001n);
-            return;
+            // 1n+NaN / 1n+undefined must TypeError (ToNumeric mix), not fold to NaN.
+            const _nL = inferType(expr.left, this.ctx);
+            const _nR = inferType(expr.right, this.ctx);
+            if (_nL !== Type.BIGINT && _nR !== Type.BIGINT) {
+                this.vm.movImm64(VReg.RET, 0x7ff0000000000001n);
+                return;
+            }
         }
 
         // 字符串连接处理
@@ -365,8 +370,10 @@ export const OperatorCompiler = {
                 this.compileStringConcat(expr);
                 return;
             }
-            // 非拼接的 `+` 里静态 NaN 操作数 → 结果 NaN(同上,跳过 fadd 规范化)
-            if (isStaticNaN(expr.left) || isStaticNaN(expr.right)) {
+            // 非拼接的 `+` 里静态 NaN 操作数 → 结果 NaN(同上,跳过 fadd 规范化).
+            // Skip when a side is BIGINT: 1n+NaN is TypeError via _js_add.
+            if ((isStaticNaN(expr.left) || isStaticNaN(expr.right)) &&
+                leftType !== Type.BIGINT && rightType !== Type.BIGINT) {
                 this.vm.movImm64(VReg.RET, 0x7ff0000000000001n);
                 return;
             }
@@ -375,14 +382,17 @@ export const OperatorCompiler = {
             // 否则 _number_coerce 后浮点加法）。
             // BIGINT 也走 _js_add（内部双 _is_bigint → i64 加；否则回落）。
             // 否则 10n+5n 两侧静态 BIGINT 会绕过动态分派落浮点得 "0."。
-            // ARRAY/OBJECT/FUNCTION 也走 _js_add(其内 ToPrimitive:数组→逗号串、
-            // 对象/函数→valueOf/toString)。函数静态类型不是 OBJECT,字面量
-            // `fn+fn` / `1+fn` 否则落 fadd,NaN-box 函数标成 NaN。
+            // ARRAY/OBJECT/FUNCTION/DATE 也走 _js_add(其内 ToPrimitive:数组→逗号串、
+            // 对象/函数→valueOf/toString, Date default hint string)。
+            // Date 静态类型不是 OBJECT: `d+d` / `1+d` 否则落 fadd 经
+            // _number_coerce 时间戳(date+date 是 0)。
+            // 函数静态类型不是 OBJECT,字面量 `fn+fn` / `1+fn` 否则落 fadd。
             if (leftType === Type.UNKNOWN || rightType === Type.UNKNOWN ||
                 leftType === Type.BIGINT || rightType === Type.BIGINT ||
                 leftType === Type.ARRAY || rightType === Type.ARRAY ||
                 leftType === Type.OBJECT || rightType === Type.OBJECT ||
-                leftType === Type.FUNCTION || rightType === Type.FUNCTION) {
+                leftType === Type.FUNCTION || rightType === Type.FUNCTION ||
+                leftType === Type.DATE || rightType === Type.DATE) {
                 // [fix-stack-corrupt] 使用 FP 槽保存左值,避免 push/pop 异常路径栈失衡
                 this.compileExpression(expr.left);
                 const tmpSlot = this.ctx.allocLocal("__tmp_add_left");
@@ -1104,6 +1114,7 @@ export const OperatorCompiler = {
             if (inLeftIsPrivate) {
                 // [ES2022] #x in o:先求 obj,再查私有键。
                 compileOperandAsJSValue(expr.right);
+                this.emitInRhsObjectCheck();
                 this.vm.mov(VReg.A0, VReg.RET);
                 this.vm.call("_js_unbox");
                 this.vm.store(VReg.FP, inObjOff, VReg.RET);
@@ -1117,6 +1128,7 @@ export const OperatorCompiler = {
                 const inKeyOff = this.ctx.allocLocal(`__in_key_${this.nextLabelId()}`);
                 this.vm.store(VReg.FP, inKeyOff, VReg.RET);
                 compileOperandAsJSValue(expr.right); // obj → RET
+                this.emitInRhsObjectCheck();
                 this.vm.mov(VReg.A0, VReg.RET);
                 this.vm.call("_js_unbox");
                 this.vm.store(VReg.FP, inObjOff, VReg.RET);
@@ -1277,22 +1289,18 @@ export const OperatorCompiler = {
                 this.boxNumber(VReg.RET);
                 break;
             case "%":
-                // 浮点取模: a % b = a - trunc(a / b) * b
-                if (!isIntOp) {
-                    // 使用 VM 的统一接口
-                    this.vm.fmovToFloat(0, VReg.RET); // FP0 = left
-                    this.vm.fmovToFloat(1, VReg.V1); // FP1 = right
-                    this.vm.fmod(0, 0, 1); // FP0 = FP0 % FP1
-                    // 结果用**裸 float64 位**返回，与 `/` 及数字字面量表示一致。
-                    // 此前 boxFPAsNumber 装箱成堆 Number 对象，导致 `x%8 === 5`、
-                    // `len%8 !== 0` 等比较全错（堆 Number ≠ 裸浮点/int），
-                    // 自举时 alignTo 的 `while (buf.length % 8 !== 0)` 死循环。
-                    this.vm.fmovToInt(VReg.RET, 0);
-                    if (mightBeNaN) this.emitNaNCanon();
-                    break;
-                }
-                this.vm.mod(VReg.RET, VReg.RET, VReg.V1);
-                this.boxNumber(VReg.RET);
+                // Always fmod. isIntOp integer rem of already-float bits loses
+                // signed zero (-1%-1 → +0) and is not JS remainder.
+                // fmod (x64) also does finite%Inf → dividend + r==0 copysign.
+                this.vm.fmovToFloat(0, VReg.RET); // FP0 = left
+                this.vm.fmovToFloat(1, VReg.V1); // FP1 = right
+                this.vm.fmod(0, 0, 1); // FP0 = FP0 % FP1
+                // 结果用**裸 float64 位**返回，与 `/` 及数字字面量表示一致。
+                // 此前 boxFPAsNumber 装箱成堆 Number 对象，导致 `x%8 === 5`、
+                // `len%8 !== 0` 等比较全错（堆 Number ≠ 裸浮点/int），
+                // 自举时 alignTo 的 `while (buf.length % 8 !== 0)` 死循环。
+                this.vm.fmovToInt(VReg.RET, 0);
+                if (mightBeNaN) this.emitNaNCanon();
                 break;
                 case "&":
                 case "|":
@@ -1394,6 +1402,28 @@ export const OperatorCompiler = {
             default:
                 console.warn("Unhandled binary operator:", expr.operator);
         }
+    },
+
+    // ES RelationalExpression in: If Type(rval) is not Object, throw TypeError.
+    // RET stays boxed. Tag scratch is V5 (x64 V0 is RET). high16=0 && RET!=0
+    // accepted like _try_hasinstance (classinfo / naked heap). +0 → throw.
+    emitInRhsObjectCheck() {
+        const inOk = this.ctx.newLabel("in_rhs_obj");
+        const inThrow = this.ctx.newLabel("in_rhs_throw");
+        this.vm.shrImm(VReg.V5, VReg.RET, 48);
+        this.vm.cmpImm(VReg.V5, 0x7FFD);
+        this.vm.jeq(inOk);
+        this.vm.cmpImm(VReg.V5, 0x7FFE);
+        this.vm.jeq(inOk);
+        this.vm.cmpImm(VReg.V5, 0x7FFF);
+        this.vm.jeq(inOk);
+        this.vm.cmpImm(VReg.V5, 0);
+        this.vm.jne(inThrow);
+        this.vm.cmpImm(VReg.RET, 0);
+        this.vm.jne(inOk);
+        this.vm.label(inThrow);
+        this.emitThrowTypeError("Right-hand side of 'in' is not an object");
+        this.vm.label(inOk);
     },
 
     // [P3.1] ToNumber 内联快路守卫:RET=任意 JSValue → RET=float64 位。
@@ -1554,6 +1584,44 @@ export const OperatorCompiler = {
         this.vm.label(endLabel);
     },
 
+    // Strict `delete obj[p]`: if [[Delete]] is false, throw TypeError
+    // (ES 13.5.1.2 / 13.5.3.5). Sloppy just yields the boolean.
+    // Boxed false = 0x7ff9...0000. Use imm, not lea — x64 lea scratches RAX===RET.
+    _emitStrictDeleteCheck() {
+        if (!(this.ctx && this.ctx.inStrictFunction)) return;
+        const ok = this.ctx.newLabel("del_strict_ok");
+        this.vm.movImm64(VReg.V1, 0x7ff9000000000000n);
+        this.vm.cmp(VReg.RET, VReg.V1);
+        this.vm.jne(ok);
+        this.emitThrowTypeError("Cannot delete property");
+        this.vm.label(ok);
+    },
+
+    // Top-level script `var` / FunctionDeclaration are CreateGlobalVarBinding /
+    // CreateGlobalFunctionBinding: own on the global object, [[Configurable]]:false.
+    // Used by `delete this.name` (S11.4.1_A3.1 #2). let/const/class are lexical
+    // and must NOT match (they are not global-object properties).
+    _isScriptGlobalObjectBinding(name) {
+        if (!name) return false;
+        if (this._isScriptLikeModule && !this._isScriptLikeModule()) return false;
+        const ast = this._currentModuleAst;
+        if (!ast || !ast.body) return false;
+        for (let i = 0; i < ast.body.length; i++) {
+            const st = ast.body[i];
+            if (!st) continue;
+            if (st.type === "FunctionDeclaration" && st.id && st.id.name === name) return true;
+            if (st.type === "VariableDeclaration" && st.kind === "var") {
+                const ds = st.declarations || [];
+                for (let j = 0; j < ds.length; j++) {
+                    const id = ds[j] && ds[j].id;
+                    if (id && id.type === "Identifier" && id.name === name) return true;
+                }
+            }
+        }
+        return false;
+    },
+
+
     // 编译一元表达式
     compileUnaryExpression(expr) {
         // [#33] delete obj.prop / obj["k"] / obj[expr] —— 原先无 case 静默 no-op。
@@ -1569,6 +1637,19 @@ export const OperatorCompiler = {
                         this.compileExpression(darg.property);
                     }
                     this.emitThrowReferenceError("Unsupported reference to 'super'");
+                    return;
+                }
+                if (darg.object && darg.object.type === "ThisExpression" && !darg.computed &&
+                    darg.property && darg.property.type === "Identifier" &&
+                    this.ctx.shouldReuseMainCapturedBox && this.ctx.shouldReuseMainCapturedBox() &&
+                    this._isScriptGlobalObjectBinding(darg.property.name)) {
+                    // CreateGlobalVarBinding [[Configurable]]:false. Official leftover
+                    // S11.4.1_A3.1 #2: `var y=1; delete this.y` must be sloppy false.
+                    // Identifier `delete y` already returns false; member path went
+                    // _object_delete and the var is often not mirrored onto globalThis
+                    // (mirror only when source contains "globalThis").
+                    this.vm.movImm64(VReg.RET, 0x7ff9000000000000n);
+                    this._emitStrictDeleteCheck();
                     return;
                 }
                 // 静态键:computed 中只有字符串字面量与 well-known Symbol 成员
@@ -1590,6 +1671,7 @@ export const OperatorCompiler = {
                     this.vm.mov(VReg.A0, VReg.RET);
                     this.emitBoxedStringKey(dName, VReg.A1);
                     this.vm.call("_object_delete");
+                    this._emitStrictDeleteCheck();
                     return;
                 }
                 // 动态键:_object_key_eq 内容比较兜底
@@ -1599,6 +1681,7 @@ export const OperatorCompiler = {
                 this.vm.mov(VReg.A0, VReg.RET);
                 this.vm.pop(VReg.A1);
                 this.vm.call("_object_delete");
+                this._emitStrictDeleteCheck();
                 return;
             }
             // [L2-②] 非成员 delete(delete identifier / delete callExpr):
@@ -1779,19 +1862,14 @@ export const OperatorCompiler = {
                     this.vm.movImm(VReg.RET, 0);
                     this.vm.sub(VReg.RET, VReg.RET, VReg.V1);
                 } else {
-                    // 非数值(字符串/UNKNOWN)操作数先 ToNumber:此前直接 fmovToFloat 把串
-                    // 指针位当 double → `-"7"`=NaN。数值类型保快路(免 coerce,护自举热路径/定点)。
-                    const negT = inferType(expr.argument, this.ctx);
-                    if (negT !== Type.FLOAT64 && negT !== Type.NUMBER && !isIntType(negT)) {
-                        this.vm.mov(VReg.A0, VReg.RET);
-                        this.vm.call("_number_coerce");
-                    }
-                    // 浮点类型：使用浮点运算
-                    // 将位模式移到浮点寄存器
+                    // Always ToNumber like unary plus. inferType(new Number) is
+                    // NUMBER but RET is a 0x7FFD wrapper; fneg of the pointer
+                    // bits is NaN (`-new Number(-1)`). Primitive NUMBER/FLOAT64
+                    // stay identity in _number_coerce.
+                    this.vm.mov(VReg.A0, VReg.RET);
+                    this.vm.call("_number_coerce");
                     this.vm.fmovToFloat(0, VReg.RET);
-                    // 浮点取负
                     this.vm.fneg(0, 0);
-                    // 移回整数寄存器
                     this.vm.fmovToInt(VReg.RET, 0);
                 }
                 break;

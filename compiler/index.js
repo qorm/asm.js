@@ -3663,6 +3663,8 @@ export class Compiler {
         func._fnStrict = fnStrict;
         this.registerFuncMeta(funcLabel, func, name);
         this.ctx.inStrictFunction = fnStrict;
+        const prevCurrentFnName = this.ctx.currentFnName;
+        this.ctx.currentFnName = name || (func.id && func.id.name) || null;
         if (!fnStrict && func.body) {
             collectLexicalDeclarations(func.body, this.ctx.lexLocalNames);
         }
@@ -3749,6 +3751,10 @@ export class Compiler {
                 if (params[ri] && params[ri].type === "SpreadElement") { declNeedFullArgv = true; break; }
             }
         }
+        // 尽早落 A5=this:emitArgumentsArray / 默认值求值的 helper call 都会毁掉 A5。
+        const declThisOffEarly = this.ctx.allocLocal("__this");
+        vm.store(VReg.FP, declThisOffEarly, VReg.A5);
+        this.emitSnapshotNewTarget();
         this.emitArgvSpillSnapshot(declNeedFullArgv ? 16 : params.length);
         if (declUsesArguments) {
             this.emitArgumentsArray();
@@ -3862,12 +3868,8 @@ export class Compiler {
         // 无默认值的后续形参被标记但从未走 delete 分支,残留令函数体读它误抛 ReferenceError。
         if (this.ctx.tdzParams) this.ctx.tdzParams.clear();
 
-        // [#36] 顶层函数声明也存 __this(A5):此前该路径不落 __this 槽 →
-        // 函数声明被当方法/经 call,apply,bind 调用时 this 恒 0(闭包路径早有)。
-        // async 同构:经 stub → _coroutine_entry 恢复 A5=CORO_THIS 后再进体,须落槽
-        // (不可再 `if (!isAsync)` 跳过 —— asy.call/o.m=asy 会丢 this)。
-        const declThisOff = this.ctx.allocLocal("__this");
-        vm.store(VReg.FP, declThisOff, VReg.A5);
+        // __this 已在 arguments/默认值求值前落入(见 declThisOffEarly)。
+        // 不可再从 A5 重写:那些路径的 JS/helper 调用已毁掉 A5。
 
         for (let i = 0; i < paramOffsets.length; i++) {
             const param = paramOffsets[i];
@@ -3994,6 +3996,7 @@ export class Compiler {
         this.ctx._asyncPromiseOff = prevDeclAsyncPromiseOff;
         this.ctx.inAsyncGenerator = false;
         this.ctx.inStrictFunction = prevInStrictFunction;
+        this.ctx.currentFnName = prevCurrentFnName;
 
         // If this function is exported, store its address into the captured var box
         if (this._exportNameSet ? this._exportNameSet.has(name) : (this.exports && this.exports.includes(name))) {
@@ -4186,7 +4189,7 @@ export class Compiler {
             } else if (t === "Property") {
                 if ((!node.kind || node.kind === "init") && isAnonFn(node.value)) {
                     const kn = keyName(node.key, node.computed);
-                    if (kn !== null) hints.set(node.value, kn);
+                    if (kn !== null && (kn !== "__proto__" || node.method)) hints.set(node.value, kn);
                 }
                 // 方法简写 `{ m(){} }` 与访问器没有 [[Construct]](无 .prototype);AST 上
                 // 与 `{ m: function(){} }` 同为 FunctionExpression,故在此盖章供

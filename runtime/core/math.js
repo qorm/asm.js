@@ -1125,6 +1125,19 @@ export class MathGenerator {
         vm.prologue(0, [VReg.S0, VReg.S1]);
         vm.mov(VReg.S0, VReg.A0);   // S0 = base 位
         vm.mov(VReg.S1, VReg.A1);   // S1 = exp 位
+        // If exponent is NaN, the result is NaN (ES Number::exponentiate step 1).
+        // Must precede integer/large-int: x64 ucomisd NaN sets ZF=1 so
+        // jne after ftrunc(NaN) does not take _mpow_nonint; |NaN|>=2^53
+        // → _mpow_large_int; fcvtzs(NaN)=INT64_MIN treated as negative
+        // even → 1/Inf leftover +0 (`-Infinity ** NaN` → 0). Integer |exp|
+        // > Inf (same bit test as NaN base). Scratch V1/V2 only.
+        vm.movImm64(VReg.V1, 0x7fffffffffffffffn);
+        vm.and(VReg.V2, VReg.S1, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ff0000000000000n);
+        vm.cmp(VReg.V2, VReg.V1);
+        vm.jle("_mpow_exp_notnan");
+        vm.jmp("_mpow_nan");
+        vm.label("_mpow_exp_notnan");
         // NaN 底:exp==±0 → 1(规范);其余 → NaN。须先于 ±Inf 指数表,
         // 否则 |NaN|>1 被当成普通底,NaN^(-Inf) 得 +0(A4 回归)。
         vm.movImm64(VReg.V1, 0x7fffffffffffffffn);
@@ -1323,6 +1336,14 @@ export class MathGenerator {
         vm.movImm(VReg.RET, 0);            // (±0)^正大偶数 → +0
         vm.epilogue([VReg.S0, VReg.S1], 0);
         vm.label("_mpow_large_int_nonzero");
+        // ±Inf ** |exp|>=2^53: x64 fcvtzs saturates huge finite to
+        // INT64_MIN (indefinite), treated as negative even → 1/Inf
+        // leftover +0 (`Infinity ** MAX_VALUE` / `-Infinity ** MAX_VALUE`).
+        // All |exp|>=2^53 integers are even; existing _mpow_infbase
+        // (y>0 → +Inf, y<0 → +0) matches ES. V2 still |base|.
+        vm.movImm64(VReg.V1, 0x7ff0000000000000n);
+        vm.cmp(VReg.V2, VReg.V1);
+        vm.jeq("_mpow_infbase");
         vm.fcvtzs(VReg.V0, 1);
         vm.movImm(VReg.V1, 1);
         vm.not(VReg.V1, VReg.V1);

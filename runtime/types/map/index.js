@@ -1022,9 +1022,16 @@ export class MapGenerator {
             vm.mov(VReg.A0, VReg.S4);
             vm.call("_is_callable");
             vm.cmpImm(VReg.RET, 0);
-            // gen1:_object_get 常取不到 Map.prototype.set(方法靠编译特化),
-            // 规范 Get 失败时不得直接崩——对本征 Map 回退 _map_set。
             vm.jne("_mcf_have_adder");
+            // Get 不可调用:0 / undefined → 内建回退(默认 proto 方法尚非一等值);
+            // 其它已定义值(null / 1 / {}) → 规范 TypeError。
+            vm.cmpImm(VReg.S4, 0);
+            vm.jeq("_mcf_use_intrinsic");
+            vm.shrImm(VReg.V1, VReg.S4, 48);
+            vm.cmpImm(VReg.V1, 0x7FFB);
+            vm.jeq("_mcf_use_intrinsic");
+            throwTE("_mcf_bad_adder", "Map.prototype.set is not a function");
+            vm.label("_mcf_use_intrinsic");
             vm.movImm(VReg.S4, 0); // 0 = 使用内建 _map_set
             vm.label("_mcf_have_adder");
             // GetIterator
@@ -1068,13 +1075,16 @@ export class MapGenerator {
             vm.call("_maybe_getter");
             vm.mov(VReg.S2, VReg.RET); // entry
             // try { type-check; Get 0/1; Call adder } catch { close; rethrow }
-            vm.lea(VReg.V0, "_exc_ctx_top");
-            vm.load(VReg.V1, VReg.V0, 0);
-            vm.store(VReg.SP, 32, VReg.V1);
-            vm.lea(VReg.V1, "_mcf_catch");
-            vm.store(VReg.SP, 40, VReg.V1);
-            vm.mov(VReg.V1, VReg.SP);
-            vm.store(VReg.SP, 48, VReg.V1);
+            // x64 V0===RET: lea catch may scratch RAX, so do not keep &_exc_ctx_top
+            // in V0 across lea("_mcf_catch"). Re-lea immediately before the store
+            // (same pattern as _array_from_iter_into / _set_construct_fill).
+            vm.lea(VReg.V1, "_exc_ctx_top");
+            vm.load(VReg.V2, VReg.V1, 0);
+            vm.store(VReg.SP, 32, VReg.V2);
+            vm.lea(VReg.V2, "_mcf_catch");
+            vm.store(VReg.SP, 40, VReg.V2);
+            vm.mov(VReg.V2, VReg.SP);
+            vm.store(VReg.SP, 48, VReg.V2);
             vm.store(VReg.SP, 56, VReg.FP);
             vm.store(VReg.SP, 64, VReg.S0);
             vm.store(VReg.SP, 72, VReg.S1);
@@ -1082,8 +1092,9 @@ export class MapGenerator {
             vm.store(VReg.SP, 88, VReg.S3);
             vm.store(VReg.SP, 96, VReg.S4);
             vm.store(VReg.SP, 104, VReg.S5);
-            vm.addImm(VReg.V1, VReg.SP, 32);
-            vm.store(VReg.V0, 0, VReg.V1);
+            vm.addImm(VReg.V2, VReg.SP, 32);
+            vm.lea(VReg.V1, "_exc_ctx_top");
+            vm.store(VReg.V1, 0, VReg.V2);
             // Type(entry) is Object?
             vm.shrImm(VReg.V3, VReg.S2, 48);
             vm.cmpImm(VReg.V3, 0x7FFE);

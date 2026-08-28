@@ -698,6 +698,11 @@ export class VirtualMachine {
         this.lea(tmpA, "_call_argc");
         this.movImm(tmpB, n);
         this.store(tmpA, 0, tmpB);
+        // Runtime Call (getter/apply trampoline/etc.): NewTarget is undefined.
+        // Construct sites overwrite _call_new_target after this helper.
+        this.lea(tmpA, "_call_new_target");
+        this.movImm64(tmpB, 0x7ffb000000000000n);
+        this.store(tmpA, 0, tmpB);
     }
 
     // ========== 算术运算 ==========

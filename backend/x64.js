@@ -1537,9 +1537,35 @@ export class X64Backend extends Backend {
     }
 
     // 浮点取模: fpDest = fpA % fpB
+    // ES Number::remainder: finite % ±Inf → dividend; r==0 keeps sign of dividend.
+    // Formula a - trunc(a/b)*b alone: -1%-1 → +0 (IEEE -1-(-1)); 1%Inf → NaN (0*Inf).
     fmod(fpDest, fpA, fpB) {
-        // 浮点取模: a % b = a - trunc(a / b) * b
-        // 使用 XMM7 作为临时寄存器
+        const seq = (this._fmodSeq = (this._fmodSeq | 0) + 1);
+        const formula = "_xfmod_f_" + seq;
+        const done = "_xfmod_d_" + seq;
+
+        // dest often aliases fpA (fmod(0,0,1)); save a bits in R11=V6 scratch
+        // before formula overwrites dest.
+        this.asm.movqFromXmm(Reg.R11, fpA);
+
+        // |b| == +Inf?  (RAX/RCX scratch; fmod callers only need XMM dest)
+        this.asm.movqFromXmm(Reg.RAX, fpB);
+        this.asm.shlImm(Reg.RAX, 1);
+        this.asm.shrImm(Reg.RAX, 1);
+        this.asm.movImm(Reg.RCX, 0x7ff00000);
+        this.asm.shlImm(Reg.RCX, 32); // RCX = +Inf bits
+        this.asm.cmpReg(Reg.RAX, Reg.RCX);
+        this.asm.jne(formula);
+        // b is Inf: finite a → return a; Inf/NaN a → formula (NaN)
+        this.asm.movqFromXmm(Reg.RAX, fpA);
+        this.asm.shlImm(Reg.RAX, 1);
+        this.asm.shrImm(Reg.RAX, 1);
+        this.asm.cmpReg(Reg.RAX, Reg.RCX);
+        this.asm.jae(formula);
+        this.asm.movsd(fpDest, fpA);
+        this.asm.jmp(done);
+
+        this.asm.label(formula);
         this.asm.movsd(7, fpA); // XMM7 = a
         this.asm.divsd(7, fpB); // XMM7 = a / b
         this.asm.roundsd(7, 7, 3); // XMM7 = trunc(XMM7), mode 3 = toward zero
@@ -1548,6 +1574,17 @@ export class X64Backend extends Backend {
             this.asm.movsd(fpDest, fpA);
         }
         this.asm.subsd(fpDest, 7); // fpDest = a - XMM7
+
+        // r == ±0 → copysign(0, a). xorpd XMM7=+0; dest must not be 7 (existing temp).
+        this.asm.xorpd(7, 7);
+        this.asm.ucomisd(fpDest, 7);
+        this.asm.jp(done);
+        this.asm.jne(done);
+        this.asm.movImm(Reg.RCX, 0x80000000);
+        this.asm.shlImm(Reg.RCX, 32);
+        this.asm.andReg(Reg.R11, Reg.RCX); // sign of original a
+        this.asm.movqToXmm(fpDest, Reg.R11);
+        this.asm.label(done);
     }
 
     // 浮点与零比较

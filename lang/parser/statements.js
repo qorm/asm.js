@@ -75,8 +75,13 @@ export const StatementParser = {
             // [test262 ASI] sloppy-mode `let` followed by any token on a new line is ASI:
             // `let` becomes an expression identifier, not a declaration keyword.
             // Covers: `L: let\\n{}`, `for(;;) let\\nx=1`, `if(x) let\\nx=1`, `with(o) let\\nx=1`.
+            // Exception: ExpressionStatement lookahead forbids `let [` (even across
+            // LineTerminator). `let\n[a] = 0` is a LexicalDeclaration — illegal as a
+            // Statement (if/for/while/with/label body) via checkStatementBody, legal as
+            // StatementListItem. Previously ASI + infix `[` compiled `let[a] = 0`.
             if (this.curTokenIs(TokenType.LET) && !this.inStrictMode() &&
-                this.peekToken.line !== this.curToken.line) {
+                this.peekToken.line !== this.curToken.line &&
+                !this.peekTokenIs(TokenType.LBRACKET)) {
                 return this.parseExpressionStatement();
             }
             const decl = this.parseVariableDeclaration();
@@ -902,9 +907,12 @@ export const StatementParser = {
                     this.peekTokenIs(TokenType.RPAREN);
                 if (!topIn) {
                     // [~In] 只沿**顶层表达式链**传播:进括号、方括号(计算键/下标)、实参、
-                    // 数组/对象字面量、模板替换、函数/类体、三元的两个分支后,语法参数按
+                    // 数组/对象字面量、模板替换、函数/类体、三元**真**分支后,语法参数按
                     // 规范复位为 [+In](CoverParenthesizedExpression / ComputedPropertyName /
-                    // ArgumentList …)。此前是无差别全树搜索,把 `class { get ['x' in o](){} }`
+                    // ArgumentList / Conditional true-branch AssignmentExpression[+In] …)。
+                    // 三元假分支是 AssignmentExpression[?In],继续传播 ~In
+                    // (`for (true ? 0 : 0 in {}; false;)` in-branch-2)。
+                    // 此前是无差别全树搜索,把 `class { get ['x' in o](){} }`
                     // 这类合法写法误判为早期错误(整份源码 COMPILE_FAIL)。
                     const findIn = (node) => {
                         if (!node || typeof node !== "object") return false;
@@ -921,7 +929,7 @@ export const StatementParser = {
                             return false;
                         }
                         if (t === "AssignmentExpression") return findIn(node.left) || findIn(node.right);
-                        if (t === "ConditionalExpression") return findIn(node.test); // 分支为 [+In]
+                        if (t === "ConditionalExpression") return findIn(node.test) || findIn(node.alternate); // 真分支 [+In]; 假分支 [?In]
                         if (t === "UnaryExpression" || t === "UpdateExpression" ||
                             t === "AwaitExpression" || t === "YieldExpression" ||
                             t === "SpreadElement") return findIn(node.argument);

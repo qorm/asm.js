@@ -2306,6 +2306,18 @@ export class AllocatorGenerator {
         vm.andMaskReg(VReg.V0, VReg.A0, VReg.V1); // 脱壳
         vm.cmpImm(VReg.V0, 0);
         vm.jeq("_gc_rem_done");
+        // TEXT / non-heap (class method 0x7FFF|TEXT): payload is a code
+        // pointer. TEXT < _gc_last_ptr looks "old" and the RS-dedup bitmap
+        // index underflows → SIGSEGV (instance.method.caller= / .foo=).
+        // V1 was the mask; reuse. V0=payload must stay live.
+        vm.lea(VReg.V1, "_heap_base");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jlt("_gc_rem_done");
+        vm.lea(VReg.V1, "_heap_ptr");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jge("_gc_rem_done");
         // old 判定:块 < last_ptr(用户区指针-16=块头;直接用用户区指针比较即可,
         // 误差 16B 只影响 young/old 边界一个块,young 误记无害)
         vm.lea(VReg.V6, "_gc_last_ptr");
@@ -4310,6 +4322,12 @@ export class AllocatorGenerator {
         // 与 _call_argc 同一"最后写、最先读"契约;超过 16 个实参仍按旧约定截断。
         asm.addDataLabel("_call_argv");
         for (let i = 0; i < 16; i = i + 1) asm.addDataQword(0);
+
+        // [new.target ABI] Construct writes NewTarget (boxed fn / naked classinfo);
+        // Call writes JS_UNDEFINED. Callee prologue snapshots into __new_target.
+        // Regular data qword (not MCTX) so x64/arm64 share the same lea.
+        asm.addDataLabel("_call_new_target");
+        asm.addDataQword(JS_UNDEFINED);
 
         // [gen.return] 生成器 return(v) 注入通道:_generator_return 对挂起协程置
         // pending=1、value=v 后 resume;yield 恢复点(emitYieldValue)见 pending 即清零、

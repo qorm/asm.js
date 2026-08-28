@@ -89,23 +89,26 @@ export function __NUM_toLocaleString(v) {
 
 export function __NUM_toPrecision(v, p) {
     v = Number(v);
-    if (p === undefined || p === null) return "" + v; // 无参 = toString
-    p = p | 0;
+    if (p === undefined || p === null) return "" + v; // leftover-arg 0-arg / undefined → ToString
+    p = p | 0; // ToInteger (valueOf side effects; leftover Inf/NaN |0 leftover 0)
+    // leftover Inf/NaN this after ToInteger, before range (spec 4 / 7).
+    // NaN.toPrecision(0|Infinity) / Infinity.toPrecision(1000) leftover RangeError vs "NaN"/"Infinity".
+    if (v !== v) return "NaN";
+    if (v === Infinity) return "Infinity";
+    if (v === -Infinity) return "-Infinity";
     // RangeError: precision must be in [1, 100] (ES 21.1.3.7 step 8)
     if (p < 1 || p > 100) {
         throw new RangeError("toPrecision() argument must be between 1 and 100");
     }
-    if (v !== v) return "NaN";
-    if (v === Infinity) return "Infinity";
-    if (v === -Infinity) return "-Infinity";
-    // -0 detection (1/(-0) === -Infinity)
-    const neg = v < 0 || (v === 0 && (1 / v) < 0);
+    // Spec step 7: If x < 0. IEEE -0 is not < 0, so (-0).toPrecision(p)
+    // is "0" / "0.0…" (not "-0"). ToString(-0) stays on the no-arg path.
+    const neg = v < 0;
     var a = neg ? -v : v;
     if (a === 0) {
-        if (p === 1) return neg ? "-0" : "0";
+        if (p === 1) return "0";
         var s = "0.";
         for (var i = 0; i < p - 1; i++) s = s + "0";
-        return (neg ? "-" : "") + s;
+        return s;
     }
     var e = Math.floor(Math.log10(a));
     // Correct log10 floating-point error so that 10^e <= a < 10^(e+1)
@@ -120,7 +123,15 @@ export function __NUM_toPrecision(v, p) {
     } else {
         var dec = p - 1 - e;
         if (dec < 0) dec = 0;
-        out = a.toFixed(dec);
+        // Runtime _num_toFixed scales by 10^digits in int64. 10^20 overflows
+        // (toFixed(20) of 3 is garbage); 10^15 is safe. Spec allows 1..100
+        // significant digits: take a safe toFixed then pad trailing zeros.
+        if (dec <= 15) {
+            out = a.toFixed(dec);
+        } else {
+            out = a.toFixed(15);
+            for (var zi = 15; zi < dec; zi++) out = out + "0";
+        }
     }
     return (neg ? "-" : "") + out;
 }

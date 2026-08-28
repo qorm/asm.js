@@ -292,21 +292,45 @@ export function compileFragment(source, target, captureLayout) {
     for (let i = 0; i < body.length; i++) {
         if (body[i].type === "FunctionDeclaration") c.compileStatement(body[i]);
     }
+    // Empty Block `{}` is UpdateEmpty(empty) — compileBlockStatement is a
+    // no-op and Block is not in NO_VALUE_STMT, so leftover RET (prologue 0)
+    // leaked (`eval("{}")` → 0). Init after hoist/copy-in so empty block /
+    // labeled-empty stay undefined; valued body and `1; {}` overwrite / keep.
+    // Do not force undefined on last Block (eval("1; {}") must stay 1).
+    c.vm.lea(VReg.RET, "_js_undefined");
+    c.vm.load(VReg.RET, VReg.RET, 0);
     let lastStmt = null;
+    // VariableStatement completion is empty (ES UpdateEmpty keeps prior).
+    // compileVariableDeclaration with init leaves the init value in RET;
+    // without init it does not write RET. Last `var` must not force undefined
+    // (`eval("2; var x")` / `eval("2; var x = 1")` stay 2). Stash RET across
+    // each var so an initializer cannot smash prior. Init after hoist covers
+    // `eval("var x")` / `eval("var x = 1")`. Do not force last Block
+    // (`eval("1; {}")` stays 1). Do not load undefined inside
+    // compileVariableDeclaration / compileBlockStatement.
+    let varCptnSlot = 0;
     for (let i = 0; i < body.length; i++) {
         if (body[i].type === "FunctionDeclaration") continue;
-        c.compileStatement(body[i]);
+        if (body[i].type === "VariableDeclaration") {
+            if (!varCptnSlot) varCptnSlot = c.ctx.allocLocal("__var_cptn");
+            c.vm.store(VReg.FP, varCptnSlot, VReg.RET);
+            c.compileStatement(body[i]);
+            c.vm.load(VReg.RET, VReg.FP, varCptnSlot);
+        } else {
+            c.compileStatement(body[i]);
+        }
         lastStmt = body[i];
     }
     if (lastStmt === null) lastStmt = body[body.length - 1]; // 全是函数声明 → 完成值 undefined
     // ES 完成值(eval 语义):表达式语句/含表达式的控制流(if/try/switch/循环/块)以
     // "最后求值的表达式"为完成值——asm.js codegen 恒把它留在 RET,故只需**不**覆盖。
-    // 仅"无值"末句(声明/空/break/continue)完成值为 undefined,须显式置。
+    // 仅"无值"末句(声明/break/continue)完成值为 undefined,须显式置。 EmptyStatement is a no-op (does not write RET). Last `;` must not force undefined (`eval("2;;")` stays 2). Init after hoist covers `eval(";")`.
+    // VariableDeclaration is empty (stash above); not in this set.
     // (new Function 不经此路径:__eval_shim 把它包装成 `(function(){...})` 表达式片段,
     //  片段求值即真闭包,函数语义/形参绑定全由正常 compileFunctionBody 处理。)
     const NO_VALUE_STMT = {
-        VariableDeclaration: 1, FunctionDeclaration: 1, ClassDeclaration: 1,
-        EmptyStatement: 1, ImportDeclaration: 1, ImportLibDeclaration: 1,
+        FunctionDeclaration: 1, ClassDeclaration: 1,
+        ImportDeclaration: 1, ImportLibDeclaration: 1,
         BreakStatement: 1, ContinueStatement: 1,
     };
     if (NO_VALUE_STMT[lastStmt.type] === 1) {

@@ -1179,9 +1179,20 @@ export class CoroutineGenerator {
         // 下面会把参数加载到 A0(X0)，因此先把协程指针复制到 callee-saved 寄存器作为 base。
         vm.mov(VReg.S1, VReg.V0);
 
+        // leftover-arg: restore argc/argv BEFORE A0-A4. x64 V1≡A3 V2≡A2;
+        // doing this after the loads smashed arguments[2]/[3] (and z) in
+        // generator bodies (params-dflt-*-ref-arguments).
+        vm.load(VReg.V1, VReg.S1, CORO_ARGC);
+        vm.lea(VReg.V2, "_call_argc");
+        vm.store(VReg.V2, 0, VReg.V1);
+        vm.lea(VReg.V2, "_call_argv");
+        for (let i = 5; i < 16; i++) {
+            vm.load(VReg.V1, VReg.S1, CORO_ARGV + (i - 5) * 8);
+            vm.store(VReg.V2, i * 8, VReg.V1);
+        }
+
         // 加载参数。多实参:A0=arg(coro+64),A1-A4=coro+112..136。
-        // func_ptr 用 V6(R11 scratch)而非 V1——x64 上 V1=RCX=A3,若用 V1 存 func 会被
-        // 下面 A3 的加载踩掉。A0-A4 加载不碰 V6,故 V6 末尾加载再 callIndirect 安全。
+        // func_ptr 用 V6(R11 scratch)而非 V1——x64 上 V1=RCX=A3。
         vm.load(VReg.A0, VReg.S1, 64); // arg (A0)
         vm.load(VReg.A1, VReg.S1, CORO_ARG1);
         vm.load(VReg.A2, VReg.S1, CORO_ARG2);
@@ -1191,18 +1202,6 @@ export class CoroutineGenerator {
 
         // 恢复 closure 指针到 S0（闭包函数会从 S0 读取捕获变量）
         vm.load(VReg.S0, VReg.S1, 96); // closure_ptr
-
-        // [argc] 恢复创建点实参个数到全局(体内 arguments 构建读取)
-        vm.load(VReg.V1, VReg.S1, CORO_ARGC);
-        vm.lea(VReg.V2, "_call_argc");
-        vm.store(VReg.V2, 0, VReg.V1);
-
-        // [argv] 恢复溢出槽,供体内 emitArgvSpillSnapshot / arguments 读取第 6+ 实参。
-        vm.lea(VReg.V2, "_call_argv");
-        for (let i = 5; i < 16; i++) {
-            vm.load(VReg.V1, VReg.S1, CORO_ARGV + (i - 5) * 8);
-            vm.store(VReg.V2, i * 8, VReg.V1);
-        }
 
         // 调用协程函数
         vm.load(VReg.V6, VReg.S1, 56); // func_ptr

@@ -162,6 +162,25 @@ export const ExpressionCompiler = {
             case "AwaitExpression":
                 this.compileAwaitExpression(expr);
                 break;
+            case "__YsaTakeReturn": {
+                // yield* return 注入标志(全局)。x64 V0≡RET:lea 后再 load RET 会冲掉地址,
+                // store 前必须重新 lea。
+                const took = this.ctx.newLabel("ysa_took");
+                const done = this.ctx.newLabel("ysa_take_done");
+                this.vm.lea(VReg.V1, "_agen_raw_yield");
+                this.vm.load(VReg.RET, VReg.V1, 0);
+                this.vm.cmpImm(VReg.RET, 0);
+                this.vm.jne(took);
+                this.vm.movImm(VReg.RET, 0);
+                this.vm.jmp(done);
+                this.vm.label(took);
+                this.vm.lea(VReg.V1, "_agen_raw_yield");
+                this.vm.movImm(VReg.V2, 0);
+                this.vm.store(VReg.V1, 0, VReg.V2);
+                this.vm.movImm(VReg.RET, 1);
+                this.vm.label(done);
+                break;
+            }
             case "__CallWithThis":
                 // yield* 缓存的 [[NextMethod]] / throw / return:Call(fn, this, args)
                 // 不经 fn.call(…),避免 class 方法里 Function.prototype.call 分派丢参。
@@ -226,16 +245,11 @@ export const ExpressionCompiler = {
         }
     },
 
-    // 类表达式编译:内联执行类声明(建类信息对象 + 绑定类名槽 + 静态字段/块),然后读类名
-    // 标识符把类值放 RET。这样 `const C = class D{...}` 里 C 拿到类、D 在体内可自引用。
+    // 类表达式编译:内联执行类声明(建类信息对象 + classScope 名绑定 + 静态字段/块)。
+    // compileClassDeclaration 对 ClassExpression 在 leaveScope 前把类值写入 RET,
+    // 不可再 Identifier 读名(外层同名 var 已恢复)。
     compileClassExpression(expr) {
-        this.compileClassDeclaration(expr);
-        const nm = expr.id && expr.id.name;
-        if (nm) {
-            this.compileExpression({ type: "Identifier", name: nm });
-        } else {
-            this.vm.movImm(VReg.RET, 0);
-        }
+        this.compileClassDeclaration(expr, true);
     },
 
     // 编译 new 表达式
@@ -287,7 +301,13 @@ export const ExpressionCompiler = {
                 break;
 
             case "Boolean": {
-                // new Boolean(x) -> Boolean wrapper object (exact String pattern)
+                // new Boolean(x) → same order as new String / Object(bool):
+                // materialize ctor+proto first, then _boolean_new (sets __proto__
+                // from _nsobj_boolean_proto). The old "call _boolean_new then
+                // emitBooleanProtoObject then store(V1,16,RET)" epilogue SIGSEGV
+                // on x64: emit* after the wrapper is live, plus a redundant proto
+                // store. Object(false) already used this order and worked.
+                this.emitBooleanCtorObject();
                 if (args.length > 0) {
                     this.compileExpression(args[0]);
                 } else {
@@ -295,26 +315,17 @@ export const ExpressionCompiler = {
                 }
                 this.vm.mov(VReg.A0, VReg.RET);
                 this.vm.call("_boolean_new"); // RET = boxed wrapper (0x7FFD)
-                // Save wrapper in FP slot
-                const bWrapOff = this.ctx.allocLocal(`__bnew_wrap_${this.nextLabelId()}`);
-                this.vm.store(VReg.FP, bWrapOff, VReg.RET);
-                // Lazy-init Boolean.prototype, then set on wrapper
-                this.emitBooleanProtoObject(); // RET = boxed Boolean.prototype
-                this.vm.load(VReg.V1, VReg.FP, bWrapOff);
-                this.vm.emitMaskLoad(VReg.V2);
-                this.vm.andMaskReg(VReg.V1, VReg.V1, VReg.V2); // V1 = raw wrapper ptr
-                // Unbox proto before storing: __proto__ slot expects raw pointer
-                this.vm.andMaskReg(VReg.RET, VReg.RET, VReg.V2);
-                this.vm.store(VReg.V1, 16, VReg.RET); // wrapper->proto = raw proto ptr
-                // Return boxed wrapper
-                this.vm.load(VReg.RET, VReg.FP, bWrapOff);
                 break;
             }
 
             case "Float":
             case "Number":
-                // new Number(x) -> Number wrapper object (0x7FFD-tagged), matching
-                // the Boolean wrapper pattern. typeof returns "object".
+                // new Number(x) → same order as new String / Object(0):
+                // emitNumberCtorObject first, then _number_new. Runtime already
+                // sets wrapper.__proto__ from _nsobj_number_proto. The old
+                // post-call emitNumberProtoObject + store(V1,16,RET) SIGSEGV on
+                // linux-x64 (4-405 / 4-581). Object(0) already used this order.
+                this.emitNumberCtorObject();
                 if (args.length > 0) {
                     this.compileExpression(args[0]);
                 } else {
@@ -322,19 +333,6 @@ export const ExpressionCompiler = {
                 }
                 this.vm.mov(VReg.A0, VReg.RET);
                 this.vm.call("_number_new"); // RET = boxed wrapper (0x7FFD)
-                // Save wrapper in FP slot
-                const numWrapOff = this.ctx.allocLocal(`__nnew_wrap_${this.nextLabelId()}`);
-                this.vm.store(VReg.FP, numWrapOff, VReg.RET);
-                // Lazy-init Number.prototype, then set on wrapper
-                this.emitNumberProtoObject(); // RET = boxed Number.prototype
-                this.vm.load(VReg.V1, VReg.FP, numWrapOff);
-                this.vm.emitMaskLoad(VReg.V2);
-                this.vm.andMaskReg(VReg.V1, VReg.V1, VReg.V2); // V1 = raw wrapper ptr
-                // Unbox proto before storing: __proto__ slot expects raw pointer
-                this.vm.andMaskReg(VReg.RET, VReg.RET, VReg.V2);
-                this.vm.store(VReg.V1, 16, VReg.RET); // wrapper->proto = raw proto ptr
-                // Return boxed wrapper
-                this.vm.load(VReg.RET, VReg.FP, numWrapOff);
                 break;
 
             case "String": {
@@ -627,18 +625,25 @@ export const ExpressionCompiler = {
 
             case "Proxy":
                 // new Proxy(target, handler):target/handler 求值后建 proxy 块(type=8)。
+                // 缺参 = undefined;_proxy_new 对非 Object 抛 TypeError(ProxyCreate)。
                 // get/set/has 陷阱在 _object_get/_object_set/_prop_in 冷分支调 handler。
                 // (独立 case,避开 WeakMap→Map / WeakSet→Set 的 fall-through 链)
-                if (args.length >= 2) {
-                    this.compileExpression(args[0]); // target
+                {
                     const proxyTOff = this.ctx.allocLocal(`__proxynew_t_${this.nextLabelId()}`);
+                    if (args.length >= 1) {
+                        this.compileExpression(args[0]);
+                    } else {
+                        this.vm.movImm64(VReg.RET, 0x7ffb000000000000n);
+                    }
                     this.vm.store(VReg.FP, proxyTOff, VReg.RET);
-                    this.compileExpression(args[1]); // handler
-                    this.vm.mov(VReg.A1, VReg.RET);
+                    if (args.length >= 2) {
+                        this.compileExpression(args[1]);
+                        this.vm.mov(VReg.A1, VReg.RET);
+                    } else {
+                        this.vm.movImm64(VReg.A1, 0x7ffb000000000000n);
+                    }
                     this.vm.load(VReg.A0, VReg.FP, proxyTOff);
                     this.vm.call("_proxy_new");
-                } else {
-                    this.vm.movImm(VReg.RET, 0);
                 }
                 break;
 
@@ -1086,6 +1091,14 @@ export const ExpressionCompiler = {
             this.vm.mov(VReg.A5, VReg.S0);
             this.emitSetCallArgc(args.length > 16 ? 16 : args.length); // [argc ABI]
         }
+        // NewTarget = boxed F (same memo slot as identifier `F`).
+        // emitSetCallArgc just wrote undefined; overwrite after args are live.
+        {
+            const slotLabel = this.ensureFuncClosureSlot(symbol);
+            this.vm.lea(VReg.V5, slotLabel);
+            this.vm.load(VReg.V6, VReg.V5, 0);
+            this.emitSetNewTargetFromReg(VReg.V6);
+        }
         this.vm.call(funcLabel);
 
         // 4. 返回:显式返回对象/数组/TypedArray(tag 0x7ffd/0x7ffe 或裸 TA)覆盖,
@@ -1307,20 +1320,29 @@ export const ExpressionCompiler = {
 
             // 重新设置 A0 = this
             this.vm.mov(VReg.A0, VReg.S0);
+            // x64/LSRA: user ctor prologue may not restore S0 (heavy body after
+            // super()+fields). Stash the allocated instance on THIS frame.
+            const unewInst = this.ctx.allocLocal(`__unew_inst_${this.nextLabelId()}`);
+            this.vm.store(VReg.FP, unewInst, VReg.S0);
 
+            // NewTarget = same naked classinfo identifier `C` returns.
+            this.vm.mov(VReg.V6, VReg.S1);
+            this.emitSetNewTargetFromReg(VReg.V6);
             // 间接调用构造函数
             this.vm.callIndirect(VReg.S2);
+            this.vm.load(VReg.S0, VReg.FP, unewInst);
 
             // [A2] 类实例形状:ctor 返回后校验实例 count==key_count 才赋形状描述符
             // (ctor 体加/删声明外键则不符,留 0 安全退化;IC 键自验证兜底)。
             const clsShape = this._classShapeSite(className);
             if (clsShape) {
                 const unewNoShpL = this.ctx.newLabel("unew_noshape");
-                this.vm.load(VReg.V0, VReg.S0, 8);
-                this.vm.cmpImm(VReg.V0, clsShape.keyCount);
+                // x64 V0≡RET: ctor return (boxed this) must survive this check.
+                this.vm.load(VReg.V2, VReg.S0, 8);
+                this.vm.cmpImm(VReg.V2, clsShape.keyCount);
                 this.vm.jne(unewNoShpL);
-                this.vm.lea(VReg.V0, clsShape.label);
-                this.vm.store(VReg.S0, 48, VReg.V0);
+                this.vm.lea(VReg.V2, clsShape.label);
+                this.vm.store(VReg.S0, 48, VReg.V2);
                 this.vm.label(unewNoShpL);
             }
 
@@ -1382,16 +1404,21 @@ export const ExpressionCompiler = {
                     this.compileCtorArgsToRegs(args, [VReg.S0, VReg.S1, VReg.S2], false);
                 }
                 this.vm.mov(VReg.A0, VReg.S0);
+                const unewInst2 = this.ctx.allocLocal(`__unew_inst2_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, unewInst2, VReg.S0);
+                this.vm.mov(VReg.V6, VReg.S1);
+                this.emitSetNewTargetFromReg(VReg.V6);
                 this.vm.callIndirect(VReg.S2);
+                this.vm.load(VReg.S0, VReg.FP, unewInst2);
                 // [A2] 类实例形状(同主分支):count==key_count 校验后赋形状描述符
                 const clsShape2 = this._classShapeSite(className);
                 if (clsShape2) {
                     const unewNoShpL2 = this.ctx.newLabel("unew_noshape");
-                    this.vm.load(VReg.V0, VReg.S0, 8);
-                    this.vm.cmpImm(VReg.V0, clsShape2.keyCount);
+                    this.vm.load(VReg.V2, VReg.S0, 8);
+                    this.vm.cmpImm(VReg.V2, clsShape2.keyCount);
                     this.vm.jne(unewNoShpL2);
-                    this.vm.lea(VReg.V0, clsShape2.label);
-                    this.vm.store(VReg.S0, 48, VReg.V0);
+                    this.vm.lea(VReg.V2, clsShape2.label);
+                    this.vm.store(VReg.S0, 48, VReg.V2);
                     this.vm.label(unewNoShpL2);
                 }
                 // 同主分支:保留 ctor 返回的对象/数组/TypedArray
@@ -1528,6 +1555,44 @@ export const ExpressionCompiler = {
         this.vm.pop(VReg.S1);
         this.vm.pop(VReg.S0);
         // [argc ABI] 构造 spread:实参个数为运行时数组长度
+        this.vm.load(VReg.V6, VReg.FP, lenOff);
+        this.emitSetCallArgc(0, VReg.V6);
+    },
+
+    // Unpack a boxed arguments array (already evaluated) into A1..A5 + _call_argv.
+    // EvaluateNew: ArgumentListEvaluation runs before IsConstructor; compileDynamicNew
+    // therefore cannot compileCtorArgsToRegs (would re-eval) on the classinfo path.
+    emitCtorArgRegsFromArray(argsArrOff) {
+        const ctorArgRegs = CTOR_ARG_REGS_A1;
+        this.vm.push(VReg.S0);
+        this.vm.push(VReg.S1);
+        this.vm.push(VReg.S2);
+        this.vm.load(VReg.A0, VReg.FP, argsArrOff);
+        this.vm.call("_array_length");
+        const lenOff = this.ctx.allocLocal(`__dnewal_len_${this.nextLabelId()}`);
+        this.vm.store(VReg.FP, lenOff, VReg.RET);
+        for (let i = 4; i >= 0; i--) {
+            const id = this.nextLabelId();
+            const undefL = `_dnewal_undef_${id}`;
+            const doneL = `_dnewal_done_${id}`;
+            this.vm.load(VReg.V1, VReg.FP, lenOff); // V1 not V0: x64 V0===RET
+            this.vm.cmpImm(VReg.V1, i);
+            this.vm.jle(undefL);
+            this.vm.load(VReg.A0, VReg.FP, argsArrOff);
+            this.vm.movImm(VReg.A1, i);
+            this.vm.call("_array_get");
+            this.vm.jmp(doneL);
+            this.vm.label(undefL);
+            this.vm.movImm64(VReg.RET, 0x7ffb000000000000n);
+            this.vm.label(doneL);
+            this.vm.push(VReg.RET);
+        }
+        this.vm.load(VReg.A0, VReg.FP, argsArrOff);
+        this.vm.call("_call_argv_fill");
+        for (let i = 0; i < 5; i++) this.vm.pop(ctorArgRegs[i]);
+        this.vm.pop(VReg.S2);
+        this.vm.pop(VReg.S1);
+        this.vm.pop(VReg.S0);
         this.vm.load(VReg.V6, VReg.FP, lenOff);
         this.emitSetCallArgc(0, VReg.V6);
     },
@@ -2305,8 +2370,37 @@ export const ExpressionCompiler = {
         // props 侧表(与 fn.x=v 写侧同键形)。
         const dnFnValSlot = this.ctx.allocLocal(`__dnew_fnval_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, dnFnValSlot, constructorReg);
+        // S1 mask is after ArgumentListEvaluation: args smash V0===RET / constructorReg.
+
+        // IsConstructor(newTarget) when explicit (Reflect.construct 3-arg).
+        // isConstructor(f) is Reflect.construct(function(){}, [], f): target is
+        // a plain constructor, so the _aref_* guard on the *target* never fires.
+        // Synthesized builtins (JSON.rawJSON, Object.create, Math.abs, …) must
+        // still reject as newTarget. _is_nonctor_fn now treats _aref_generic /
+        // _aref_static_tramp as non-constructors.
+        if (newTargetOff != null && newTargetOff !== undefined) {
+            const ntOkL = this.ctx.newLabel("dnew_nt_ok");
+            this.vm.load(VReg.A0, VReg.FP, newTargetOff);
+            this.vm.emitMaskLoad(VReg.V1);
+            this.vm.andMaskReg(VReg.A0, VReg.A0, VReg.V1);
+            this.vm.call("_is_nonctor_fn");
+            this.vm.cmpImm(VReg.RET, 0);
+            this.vm.jeq(ntOkL);
+            this.vm.lea(VReg.A0, this.asm.addString("value is not a constructor"));
+            this.vm.call("_js_box_string");
+            this.vm.mov(VReg.A0, VReg.RET);
+            this.vm.call("_throw_type_error");
+            this.vm.label(ntOkL);
+        }
+
+        // EvaluateNew: ArgumentListEvaluation BEFORE IsConstructor
+        // (ctorExpr-isCtor-after-args-eval). Pin ctor in FP first; reload S1 after.
+        const dnArgsSlot = this.ctx.allocLocal(`__dnew_args_${this.nextLabelId()}`);
+        this.compileArrayExpressionWithSpread(args);
+        this.vm.store(VReg.FP, dnArgsSlot, VReg.RET);
+        this.vm.load(VReg.V6, VReg.FP, dnFnValSlot);
         this.vm.movImm64(VReg.V7, 0x0000ffffffffffffn);
-        this.vm.and(VReg.S1, constructorReg, VReg.V7);
+        this.vm.and(VReg.S1, VReg.V6, VReg.V7);
 
         // [Proxy construct] 值为 Proxy(块 type@0==8)→ 构造走 construct 陷阱蹦床
         // (须在解 props_ptr 前判别;S1 已去 tag)。
@@ -2320,7 +2414,7 @@ export const ExpressionCompiler = {
             this.vm.jne(notProxyL);
             const pSlot = this.ctx.allocLocal(`__dnewpx_${this.nextLabelId()}`);
             this.vm.store(VReg.FP, pSlot, VReg.S1);
-            this.compileArrayExpressionWithSpread(args); // RET = 实参 boxed 数组
+            this.vm.load(VReg.RET, VReg.FP, dnArgsSlot); // RET = 实参 boxed 数组
             this.vm.mov(VReg.A1, VReg.RET); // 先取 RET(与 A0 同物理寄存器 X0/RAX!)
             this.vm.load(VReg.A0, VReg.FP, pSlot);
             this.vm.call("_proxy_construct_call");
@@ -2349,7 +2443,7 @@ export const ExpressionCompiler = {
             this.vm.lea(VReg.V0, "_ta_ctor_tramp");
             this.vm.cmp(VReg.V1, VReg.V0);
             this.vm.jne(dnewNotTa);
-            this.compileArrayExpressionWithSpread(args);
+            this.vm.load(VReg.RET, VReg.FP, dnArgsSlot);
             this.vm.mov(VReg.A1, VReg.RET);
             this.vm.load(VReg.A0, VReg.FP, dnFnValSlot);
             this.vm.call("_ta_construct");
@@ -2371,7 +2465,7 @@ export const ExpressionCompiler = {
             this.vm.mov(VReg.A0, VReg.RET);
             this.vm.call("_throw_type_error"); // does not return
             this.vm.label(dnewConstructable);
-            this.compileArrayExpressionWithSpread(args); // RET = 实参 boxed 数组
+            this.vm.load(VReg.RET, VReg.FP, dnArgsSlot); // RET = 实参 boxed 数组
             this.vm.mov(VReg.A1, VReg.RET); // 先取 RET(与 A0 同物理寄存器 X0/RAX!)
             this.vm.load(VReg.A0, VReg.FP, dnFnValSlot);
             if (newTargetOff != null && newTargetOff !== undefined) {
@@ -2429,10 +2523,17 @@ export const ExpressionCompiler = {
 
         // 4. 准备参数（构造函数约定: A0 = this, 参数在 A1-A5）
         // 未提供的构造函数实参填 JS_UNDEFINED，使被调用方默认参数生效
-        this.compileCtorArgsToRegs(args, [VReg.S0, VReg.S1, VReg.S2], true);
+        this.emitCtorArgRegsFromArray(dnArgsSlot);
 
         // 5. 调用构造函数 (A0 = this)
         this.vm.mov(VReg.A0, VReg.S0);
+        // NewTarget: explicit (Reflect.construct 3-arg) or the constructor value.
+        if (newTargetOff != null && newTargetOff !== undefined) {
+            this.vm.load(VReg.V6, VReg.FP, newTargetOff);
+        } else {
+            this.vm.load(VReg.V6, VReg.FP, dnFnValSlot);
+        }
+        this.emitSetNewTargetFromReg(VReg.V6);
         this.vm.callIndirect(VReg.S2);
 
         // 6. 返回:构造器显式返回对象/数组/TypedArray 则用之(super→_ta_construct

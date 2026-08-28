@@ -59,9 +59,42 @@ export class CoercionGenerator {
     generateRelCmp() {
         const vm = this.vm;
         vm.label("_js_relcmp");
-        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.prologue(16, [VReg.S0, VReg.S1]);
         vm.mov(VReg.S0, VReg.A0);
         vm.mov(VReg.S1, VReg.A1);
+        // Abstract Relational Comparison: ToPrimitive(x/y, hint Number) first.
+        // Then if both strings, lexicographic; else ToNumber + fcmp.
+        // Prior path ToNumber'd the object (toString-first) so
+        // `{valueOf:()=>"-2",toString:()=>-2} < "-1"` was -2 < -1 (true)
+        // instead of string "-2" < "-1" (false).
+        // Frame-save right across left ToPrimitive (S1 callee-saved but
+        // _js_toprimitive callees may still clobber).
+        vm.store(VReg.SP, 0, VReg.S1);
+        vm.shrImm(VReg.V1, VReg.S0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFD);
+        vm.jeq("_relcmp_tp_l");
+        vm.cmpImm(VReg.V1, 0x7FFE);
+        vm.jeq("_relcmp_tp_l");
+        vm.cmpImm(VReg.V1, 0x7FFF);
+        vm.jne("_relcmp_tp_r");
+        vm.label("_relcmp_tp_l");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_js_toprimitive");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.label("_relcmp_tp_r");
+        vm.load(VReg.S1, VReg.SP, 0);
+        vm.shrImm(VReg.V1, VReg.S1, 48);
+        vm.cmpImm(VReg.V1, 0x7FFD);
+        vm.jeq("_relcmp_tp_rdo");
+        vm.cmpImm(VReg.V1, 0x7FFE);
+        vm.jeq("_relcmp_tp_rdo");
+        vm.cmpImm(VReg.V1, 0x7FFF);
+        vm.jne("_relcmp_after_tp");
+        vm.label("_relcmp_tp_rdo");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_js_toprimitive");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.label("_relcmp_after_tp");
         // 两侧都是 String?
         vm.shrImm(VReg.V0, VReg.S0, 48);
         vm.cmpImm(VReg.V0, 0x7FFC);
@@ -77,7 +110,7 @@ export class CoercionGenerator {
         vm.jlt("_relcmp_lt");
         vm.jgt("_relcmp_gt");
         vm.movImm(VReg.RET, 0); // 相等
-        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.epilogue([VReg.S0, VReg.S1], 16);
         // 数值路径:各 ToNumber 后 fcmp
         vm.label("_relcmp_num");
         vm.mov(VReg.A0, VReg.S0); vm.call("_number_coerce"); vm.mov(VReg.S0, VReg.RET);
@@ -90,10 +123,10 @@ export class CoercionGenerator {
         vm.jflt("_relcmp_lt");
         vm.jfgt("_relcmp_gt");
         vm.movImm(VReg.RET, 0); // 相等
-        vm.epilogue([VReg.S0, VReg.S1], 0);
-        vm.label("_relcmp_lt"); vm.movImm(VReg.RET, 1); vm.epilogue([VReg.S0, VReg.S1], 0);
-        vm.label("_relcmp_gt"); vm.movImm(VReg.RET, 2); vm.epilogue([VReg.S0, VReg.S1], 0);
-        vm.label("_relcmp_unord"); vm.movImm(VReg.RET, 3); vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+        vm.label("_relcmp_lt"); vm.movImm(VReg.RET, 1); vm.epilogue([VReg.S0, VReg.S1], 16);
+        vm.label("_relcmp_gt"); vm.movImm(VReg.RET, 2); vm.epilogue([VReg.S0, VReg.S1], 16);
+        vm.label("_relcmp_unord"); vm.movImm(VReg.RET, 3); vm.epilogue([VReg.S0, VReg.S1], 16);
 
         // 4 个布尔 wrapper:call _js_relcmp,按编码返回 _js_true/_js_false。
         // lt:code==1;le:0 或 1;gt:2;ge:0 或 2。unordered(3)对全部为 false。
@@ -123,6 +156,12 @@ export class CoercionGenerator {
     generateBigInt() {
         const vm = this.vm;
         const TYPE_BIGINT = 14;
+        const asm = vm.asm;
+        // ToObject(BigInt) wrapper shares these with emitBigIntCtorObject.
+        asm.addDataLabel("_nsobj_bigint");
+        asm.addDataQword(0);
+        asm.addDataLabel("_nsobj_bigint_proto");
+        asm.addDataQword(0);
 
         vm.label("_bigint_box");
         vm.prologue(16, [VReg.S0]);
@@ -159,6 +198,46 @@ export class CoercionGenerator {
         vm.label("_is_bigint_no");
         vm.movImm(VReg.RET, 0);
         vm.epilogue([VReg.S0], 0);
+
+        // _ensure_bigint_proto -> boxed BigInt.prototype (same _nsobj_bigint_proto).
+        vm.label("_ensure_bigint_proto");
+        vm.prologue(0, [VReg.S0]);
+        vm.lea(VReg.V0, "_nsobj_bigint_proto");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_ebip_have");
+        vm.call("_object_new");
+        vm.call("_box_obj_r");
+        vm.lea(VReg.V1, "_nsobj_bigint_proto");
+        vm.store(VReg.V1, 0, VReg.RET);
+        vm.mov(VReg.V0, VReg.RET);
+        vm.label("_ebip_have");
+        vm.mov(VReg.RET, VReg.V0);
+        vm.epilogue([VReg.S0], 0);
+
+        // _bigint_wrap(A0=primitive BigInt) -> boxed BigInt wrapper (0x7FFD).
+        // OrdinaryToObject: [[BigIntData]] via __bigint_value; __proto__ = BigInt.prototype.
+        vm.label("_bigint_wrap");
+        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.mov(VReg.S1, VReg.A0);
+        vm.call("_object_new");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.store(VReg.SP, 0, VReg.S0);
+        vm.call("_ensure_bigint_proto");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.lea(VReg.A1, vm.asm.addString("__bigint_value"));
+        vm.movImm64(VReg.V2, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V2);
+        vm.mov(VReg.A2, VReg.S1);
+        vm.call("_object_define");
+        vm.load(VReg.S0, VReg.SP, 0);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_js_unbox");
+        vm.store(VReg.S0, 16, VReg.RET);
+        vm.mov(VReg.RET, VReg.S0);
+        vm.call("_box_obj_r");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 16);
 
         vm.label("_to_i64_lenient");
         vm.prologue(16, [VReg.S0]);
@@ -541,6 +620,22 @@ export class CoercionGenerator {
         // _str_to_num 无效路径(与 Number 同,记偏差)。A0=字符串,V0/V1 置位不碰 A0。
         vm.label("_js_parseFloat");
         vm.prologue(16, [VReg.S0]);
+        // leftover-arg: parseFloat(undefined/null/boolean/object) leftover qNaN
+        // 0x7FF8… boxed-int0 alias leftover empty vs NaN. Spec ToString then
+        // parse: "undefined"/"null"/"true"/"[object Object]" → no digits → NaN.
+        // high16>=0x7FF8 && !=0x7FFC (string) leftover-arg → canonical NaN.
+        // Scratch V5/V6 (linux-x64 V0=RET). Raw numbers leftover-arg ToString
+        // / _str_to_num_not_string qNaN not this close. parseInt emit unchanged.
+        vm.shrImm(VReg.V5, VReg.A0, 48);
+        vm.movImm(VReg.V6, 0x7FF8);
+        vm.cmp(VReg.V5, VReg.V6);
+        vm.jlt("_js_parseFloat_str");
+        vm.movImm(VReg.V6, 0x7FFC);
+        vm.cmp(VReg.V5, VReg.V6);
+        vm.jeq("_js_parseFloat_str");
+        vm.movImm64(VReg.RET, 0x7ff0000000000001n);
+        vm.epilogue([VReg.S0], 16);
+        vm.label("_js_parseFloat_str");
         vm.lea(VReg.V0, "_parse_lenient");
         vm.movImm(VReg.V1, 1);
         vm.store(VReg.V0, 0, VReg.V1);   // 宽松位 = 1
@@ -769,6 +864,25 @@ export class CoercionGenerator {
         vm.call("_js_toprimitive");
         vm.mov(VReg.S1, VReg.RET);
         vm.label("_js_add_slow_strchk");
+        // ToPrimitive produced a Symbol → TypeError (ToNumber/ToString).
+        // Naked TYPE_SYMBOL high16=0 used to fall into ptr/numeric add.
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_is_symbol");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_js_add_sym_err");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_is_symbol");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_js_add_sym_err");
+        vm.jmp("_js_add_strchk_x");
+        vm.label("_js_add_sym_err");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot convert a Symbol value to a number"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+        vm.label("_js_add_strchk_x");
         // --- x 是字符串? ---
         vm.shrImm(VReg.V0, VReg.S0, 48);
         vm.cmpImm(VReg.V0, 0x7FFC); // 装箱字符串
@@ -809,17 +923,30 @@ export class CoercionGenerator {
         vm.jeq("_js_add_concat");
 
         vm.label("_js_add_numeric");
-        // BigInt 双真：两侧都是 bigint → i64 加 → box。必须前置于下方 ptr_int 判断，
-        // 否则 bigint 箱（裸 user_ptr）被当指针相加 → "0."（现状 bug）。
+        // After ToPrimitive + string-concat check: one BigInt and the other
+        // not BigInt → TypeError (ToNumeric type mismatch). Both → i64 add.
+        // Neither → existing ptr/float. Must stay ahead of ptr_int: a lone
+        // bigint naked ptr used to add as a pointer (1n+1 → denormal).
         vm.mov(VReg.A0, VReg.S0); vm.call("_is_bigint");
-        vm.cmpImm(VReg.RET, 0); vm.jeq("_js_add_num_ptr");
+        vm.cmpImm(VReg.RET, 0); vm.jeq("_js_add_x_not_bi");
         vm.mov(VReg.A0, VReg.S1); vm.call("_is_bigint");
-        vm.cmpImm(VReg.RET, 0); vm.jeq("_js_add_num_ptr");
+        vm.cmpImm(VReg.RET, 0); vm.jeq("_js_add_mix_err");
         vm.load(VReg.V0, VReg.S0, 0); // 左 i64 值（user_ptr+0）
         vm.load(VReg.V1, VReg.S1, 0); // 右 i64 值
         vm.add(VReg.V0, VReg.V0, VReg.V1);
         vm.mov(VReg.A0, VReg.V0); vm.call("_bigint_box");
         vm.epilogue([VReg.S0, VReg.S1], 32);
+        vm.label("_js_add_x_not_bi");
+        vm.mov(VReg.A0, VReg.S1); vm.call("_is_bigint");
+        vm.cmpImm(VReg.RET, 0); vm.jne("_js_add_mix_err");
+        vm.jmp("_js_add_num_ptr");
+        vm.label("_js_add_mix_err");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot mix BigInt and other types, use explicit conversions"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
 
         vm.label("_js_add_num_ptr");
         // 指针整数路径：任一侧是裸指针（高16位=0 且 >= 4GB）且不是
@@ -955,6 +1082,9 @@ export class CoercionGenerator {
         vm.label("_ae_same_bits_float");
         vm.fmovToFloat(0, VReg.S0);
         vm.fcmp(0, 0); // NaN 检测 (NaN != NaN)
+        // x64 ucomisd: unordered sets ZF=PF=CF=1, so jeq alone treats NaN==x as true.
+        // jnan (arm64 BVS / x64 JP) first → false. ARM jeq already skipped unordered.
+        vm.jnan("_abstract_eq_false");
         vm.jeq("_abstract_eq_true");
         vm.jmp("_abstract_eq_false");
 
@@ -976,6 +1106,7 @@ export class CoercionGenerator {
         vm.mov(VReg.A0, VReg.S1); vm.call("_bi_to_f"); vm.mov(VReg.S5, VReg.RET);
         vm.fmovToFloat(0, VReg.S4); vm.fmovToFloat(1, VReg.S5);
         vm.fcmp(0, 1);
+        vm.jnan("_abstract_eq_false");
         vm.jeq("_abstract_eq_true");
         vm.jmp("_abstract_eq_false");
         vm.label("_ae_after_bigint");
@@ -1236,6 +1367,7 @@ export class CoercionGenerator {
         vm.fmovToFloat(0, VReg.S0);
         vm.fmovToFloat(1, VReg.S1);
         vm.fcmp(0, 1);
+        vm.jnan("_abstract_eq_false");
         vm.jeq("_abstract_eq_true");
         vm.jmp("_abstract_eq_false");
 
@@ -1247,6 +1379,7 @@ export class CoercionGenerator {
         vm.scvtf(1, VReg.V0); // D1 = float(y)
         vm.fmovToFloat(0, VReg.S0);
         vm.fcmp(0, 1);
+        vm.jnan("_abstract_eq_false");
         vm.jeq("_abstract_eq_true");
         vm.jmp("_abstract_eq_false");
 
@@ -1258,6 +1391,7 @@ export class CoercionGenerator {
         vm.scvtf(0, VReg.V0); // D0 = float(x)
         vm.fmovToFloat(1, VReg.S1);
         vm.fcmp(0, 1);
+        vm.jnan("_abstract_eq_false");
         vm.jeq("_abstract_eq_true");
         vm.jmp("_abstract_eq_false");
 
@@ -2050,13 +2184,13 @@ export class CoercionGenerator {
         vm.epilogue([VReg.S0, VReg.S1], 64);
         vm.label("_num_coerce_obj_vo_fallback");
         vm.mov(VReg.A0, VReg.S0);
-        vm.call("_object_user_valueof");   // RET = valueOf 结果 或 0
-        vm.cmpImm(VReg.RET, 0);
-        vm.jeq("_num_coerce_obj_tostring"); // 无 valueOf → OrdinaryToPrimitive 试 toString
-        // 结果若又是对象 → 试 toString(防 valueOf 返 this;Number hint 第二方法)
+        vm.call("_object_user_valueof");   // RET = valueOf 结果,或原对象(无)
+        // miss 现返原对象;+0.0 是合法 ToNumber 结果,勿 cmpImm 0。
         vm.mov(VReg.S1, VReg.RET);
         vm.shrImm(VReg.V0, VReg.S1, 48);
         vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jeq("_num_coerce_obj_tostring");
+        vm.cmpImm(VReg.V0, 0x7FFF);
         vm.jeq("_num_coerce_obj_tostring");
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_number_coerce");
@@ -2189,9 +2323,28 @@ export class CoercionGenerator {
         vm.label("_strict_eq_fcmp");
         vm.fmovToFloat(0, VReg.S0);
         vm.fcmp(0, 0); // NaN 检测(NaN != NaN)
+        // x64 ucomisd: unordered sets ZF=PF=CF=1, so jeq alone treats NaN===NaN as true.
+        // jnan (arm64 BVS / x64 JP) first → false. ARM jeq already skipped unordered.
+        vm.jnan("_strict_eq_false");
         vm.jeq("_strict_eq_true"); // 非 NaN → true
         vm.jmp("_strict_eq_false"); // NaN → false
         vm.label("_strict_eq_bits_differ");
+
+        // BigInt is a naked heap ptr (high16=0). Two boxes of the same i64
+        // (1n+2n vs 3n) differ in address so bits-differ; SameValue / ===
+        // must compare the payload. Type mismatch with a BigInt is false.
+        vm.mov(VReg.A0, VReg.S0); vm.call("_is_bigint");
+        vm.cmpImm(VReg.RET, 0); vm.jeq("_strict_eq_x_not_bi");
+        vm.mov(VReg.A0, VReg.S1); vm.call("_is_bigint");
+        vm.cmpImm(VReg.RET, 0); vm.jeq("_strict_eq_false");
+        vm.load(VReg.V1, VReg.S0, 0);
+        vm.load(VReg.V2, VReg.S1, 0);
+        vm.cmp(VReg.V1, VReg.V2);
+        vm.jeq("_strict_eq_true");
+        vm.jmp("_strict_eq_false");
+        vm.label("_strict_eq_x_not_bi");
+        vm.mov(VReg.A0, VReg.S1); vm.call("_is_bigint");
+        vm.cmpImm(VReg.RET, 0); vm.jne("_strict_eq_false");
 
         // 如果不相等，检查类型
         // 提取高 16 位。tagged 值 high16 ∈ [0x7FF8, 0x7FFF]；其余都是 float，

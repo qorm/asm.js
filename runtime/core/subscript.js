@@ -43,21 +43,21 @@ export class SubscriptGenerator {
         vm.call("_str_index_char"); // str[i]:越界返 undefined(非 charAt 的 "")
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
 
-        // 动态键的具名路径:与 _object_get_str_named(object/index.js)同一约定——
-        // 键须真为 0x7FFC 字符串,仅认 "length",其余(方法名等)→ undefined。
+        // 动态键的具名路径:与 _object_get_str_named 同一约定——
+        // own "length"; 其余具名/Symbol → String.prototype (GetV)。
         // 若无此分支,`var k="length"; s[k]` 会因 _subscript_key_int 返 -1 而落
         // _str_index_char(-1) → undefined,与 node 的 3 不符。
         vm.label("_subscript_get_str_named");
         vm.shrImm(VReg.V1, VReg.S1, 48);
         vm.cmpImm(VReg.V1, 0x7FFC);
-        vm.jne("_subscript_get_str_undef");
+        vm.jne("_subscript_get_str_proto");
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_getStrContent");
         vm.mov(VReg.A0, VReg.RET);
         vm.lea(VReg.A1, this.vm.asm.addString("length"));
         vm.call("_strcmp");
         vm.cmpImm(VReg.RET, 0);
-        vm.jne("_subscript_get_str_undef");
+        vm.jne("_subscript_get_str_proto");
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_js_length"); // RET = 裸整数长度
         vm.mov(VReg.V0, VReg.RET);
@@ -65,11 +65,40 @@ export class SubscriptGenerator {
         vm.fmovToInt(VReg.RET, 0); // 裸 int → canonical float64 位模式
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
 
+        vm.label("_subscript_get_str_proto");
+        vm.lea(VReg.V0, "_nsobj_string_proto");
+        vm.load(VReg.S2, VReg.V0, 0);
+        vm.cmpImm(VReg.S2, 0);
+        vm.jeq("_subscript_get_str_undef");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0); // original string as getter this
+        vm.call("_maybe_getter");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
+
         vm.label("_subscript_get_str_undef");
         vm.movImm64(VReg.RET, 0x7FFB000000000000n); // undefined
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
 
         vm.label("_subscript_get_not_str");
+        // Number / bool (0x7FF9) / other non-object tags: GetV miss → undefined.
+        // Last-session well-known @@iterator fallback calls _subscript_get on
+        // IC miss; (0)[Symbol.iterator] is high16=0 (looks like a ptr) or a
+        // float64 tag and used to SIGSEGV in unbox+load type.
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0); // naked heap / +0
+        vm.jeq("_subscript_get_objlike");
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jeq("_subscript_get_objlike");
+        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jeq("_subscript_get_objlike");
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jeq("_subscript_get_objlike");
+        vm.jmp("_subscript_get_str_undef");
+
+        vm.label("_subscript_get_objlike");
         // [code ptr] 函数值(0x7FFF)的载荷可能是**代码段标签**(类方法/顶层函数声明以裸
         // label 存原型),不是堆块:按对象头 load [P] 会把指令字节当 type 读 → 具名键
         // (`m[k]`,k="length"/"name")恒 undefined、数字键(`m[0]`)被当数组下标解引用
@@ -94,6 +123,11 @@ export class SubscriptGenerator {
         // unbox arr：可能是裸指针或 0x7FFE/0x7FFD 装箱值（_js_unbox 保留 A1）
         vm.call("_js_unbox");
         vm.mov(VReg.S0, VReg.RET); // arr (裸指针)
+        vm.cmpImm(VReg.S0, 0);
+        vm.jeq("_subscript_get_str_undef");
+        vm.movImm64(VReg.V1, vm.ptrFloor);
+        vm.cmp(VReg.S0, VReg.V1);
+        vm.jlt("_subscript_get_str_undef");
 
         // 加载类型标签
         vm.load(VReg.S3, VReg.S0, 0); // S3 = 完整类型
@@ -144,6 +178,30 @@ export class SubscriptGenerator {
         vm.call("_is_symbol");
         vm.cmpImm(VReg.RET, 0);
         vm.jne("_subscript_get_named");
+        // ToPropertyKey + CanonicalNumericIndexString for array keys.
+        // bool/null/undefined/"true" and IEEE 1.1 must not ToInt32
+        // (arr[true] ≡ arr["true"]; arr[1.1] is named "1.1", not index 1).
+        // Raw compiler indices (high16=0 / sign-extended 0xFFFF) stay
+        // _syscall_arg so arr[1] movImm A1,1 is unchanged.
+        vm.shrImm(VReg.V1, VReg.S1, 48);
+        vm.cmpImm(VReg.V1, 0x7FF9);
+        vm.jeq("_subscript_get_objkey");
+        vm.cmpImm(VReg.V1, 0x7FFA);
+        vm.jeq("_subscript_get_objkey");
+        vm.cmpImm(VReg.V1, 0x7FFB);
+        vm.jeq("_subscript_get_objkey");
+        vm.cmpImm(VReg.V1, 0x7FFE);
+        vm.jeq("_subscript_get_objkey");
+        vm.cmpImm(VReg.V1, 0x7FFF);
+        vm.jeq("_subscript_get_objkey");
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_subscript_get_syscall");
+        vm.cmpImm(VReg.V1, 0xFFFF);
+        vm.jeq("_subscript_get_syscall");
+        vm.cmpImm(VReg.V1, 0x7FF8);
+        vm.jeq("_subscript_get_syscall");
+        vm.jmp("_subscript_get_objkey");
+        vm.label("_subscript_get_syscall");
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_syscall_arg");
         vm.mov(VReg.S1, VReg.RET);
@@ -384,6 +442,24 @@ export class SubscriptGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
 
         vm.label("_subscript_get_array");
+        // Arguments [[Get]] (9.4.4.1): mapped index reads the formal box
+        // *before* OrdinaryGet. defineProperty seeds a side-table snapshot
+        // that must not shadow the live [[ParameterMap]] (mapped-nonconfigurable-2).
+        vm.loadByte(VReg.V0, VReg.S0, 1);
+        vm.andImm(VReg.V0, VReg.V0, 32); // ARR_IS_ARGUMENTS
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_subscript_get_arr_side");
+        vm.cmpImm(VReg.S1, 0);
+        vm.jlt("_subscript_get_arr_side");
+        vm.movImm64(VReg.V1, 0x7ffe000000000000n);
+        vm.or(VReg.A0, VReg.S0, VReg.V1);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_args_param_map_get_box");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_subscript_get_arr_side");
+        vm.load(VReg.RET, VReg.RET, 0); // *box
+        vm.jmp("_subscript_get_done");
+        vm.label("_subscript_get_arr_side");
         // [W7b] 侧表优先:defineProperty 的 accessor/attrs/稀疏大索引。
         // 无 ARR_HAS_SIDETABLE 时 helper 立即 miss(否则每次数组读都扫全局链表,自举卡死)。
         vm.mov(VReg.A0, VReg.S0);
@@ -531,6 +607,20 @@ export class SubscriptGenerator {
         vm.call("_closure_prop_get"); // miss → undefined
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
         vm.label("_subscript_get_named_len");
+        // arguments.length is an ordinary data property (may be a string).
+        vm.loadByte(VReg.V0, VReg.S0, 1);
+        vm.andImm(VReg.V0, VReg.V0, 32); // ARR_IS_ARGUMENTS
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_subscript_get_named_len_arr");
+        vm.movImm64(VReg.V1, 0x7ffe000000000000n);
+        vm.or(VReg.A0, VReg.S0, VReg.V1);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_closure_prop_get");
+        vm.shrImm(VReg.V1, VReg.RET, 48);
+        vm.cmpImm(VReg.V1, 0x7FFB);
+        vm.jeq("_subscript_get_named_len_arr");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
+        vm.label("_subscript_get_named_len_arr");
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_js_length"); // 裸整数长度
         vm.scvtf(0, VReg.RET);
@@ -558,15 +648,15 @@ export class SubscriptGenerator {
         vm.call("_closure_prop_get");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
 
-        // null/undefined 基对象:把键规范化为字符串后交给 _throw_read_nullish
-        // 构造 `Cannot read properties of null|undefined (reading '<k>')` 并 unwind。
-        // A0=base(null/undefined), S1=原始键(任意值)。不返回。
+        // null/undefined 基对象:ToObject(base) 先于 ToPropertyKey(key)
+        // (EvaluatePropertyAccessWithExpressionKey / GetValue). Do not
+        // stringify the key — prop.toString() would hide the TypeError
+        // (computed-reference-null-or-undefined).
+        // A0=base(null/undefined). 不返回。
         vm.label("_subscript_get_nullish");
-        vm.mov(VReg.S0, VReg.A0); // 保住 base 跨 _valueToStr
-        vm.mov(VReg.A0, VReg.S1); // 键 -> 字符串(供 message)
-        vm.call("_valueToStr");
-        vm.mov(VReg.A1, VReg.RET); // 键字符串
-        vm.mov(VReg.A0, VReg.S0);  // base
+        vm.lea(VReg.A1, vm.asm.addString(""));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
         vm.call("_throw_read_nullish"); // 不返回
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64); // 理论不达
     }
@@ -596,6 +686,12 @@ export class SubscriptGenerator {
         vm.jeq("_subscript_set_nullish");
         vm.cmpImm(VReg.V0, 0x7FFB); // undefined
         vm.jeq("_subscript_set_nullish");
+        // String primitive (0x7FFC): sloppy no-op / strict TypeError.
+        // Get already special-cases this. Set used to unbox the content
+        // pointer and load type@0 from the first string bytes → SIGSEGV
+        // (unshift/throws-with-string-receiver on .call('', 1) / 'abc').
+        vm.cmpImm(VReg.V0, 0x7FFC);
+        vm.jeq("_sss_frozen_reject");
         // Uint32/Int32[装箱 int] 快路。`chunk[i] = word >>> 0` 的值是 0x7FF8 标签,
         // 旧路要经 _gc_remember/_js_unbox/_is_symbol/_syscall_arg/_typed_array_set/
         // _number_coerce 再按字节写——自编译 66MB TEXT 上千万次 emit32 的主税。
@@ -716,6 +812,27 @@ export class SubscriptGenerator {
         vm.call("_is_symbol");
         vm.cmpImm(VReg.RET, 0);
         vm.jne("_subscript_set_named");
+        // Mirror get: ToPropertyKey for bool/null/undefined and IEEE
+        // floats (arr[1.1]='x' is named "1.1", not index 1).
+        vm.shrImm(VReg.V1, VReg.S1, 48);
+        vm.cmpImm(VReg.V1, 0x7FF9);
+        vm.jeq("_subscript_set_objkey");
+        vm.cmpImm(VReg.V1, 0x7FFA);
+        vm.jeq("_subscript_set_objkey");
+        vm.cmpImm(VReg.V1, 0x7FFB);
+        vm.jeq("_subscript_set_objkey");
+        vm.cmpImm(VReg.V1, 0x7FFE);
+        vm.jeq("_subscript_set_objkey");
+        vm.cmpImm(VReg.V1, 0x7FFF);
+        vm.jeq("_subscript_set_objkey");
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_subscript_set_syscall");
+        vm.cmpImm(VReg.V1, 0xFFFF);
+        vm.jeq("_subscript_set_syscall");
+        vm.cmpImm(VReg.V1, 0x7FF8);
+        vm.jeq("_subscript_set_syscall");
+        vm.jmp("_subscript_set_objkey");
+        vm.label("_subscript_set_syscall");
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_syscall_arg");
         vm.mov(VReg.S1, VReg.RET);
@@ -802,7 +919,7 @@ export class SubscriptGenerator {
         vm.cmpImm(VReg.RET, 2);
         vm.jeq("_sss_frozen_reject");
         vm.cmpImm(VReg.RET, 0);
-        vm.jne("_subscript_set_done");
+        vm.jne("_sss_side_done_pmap");
         // Object.freeze:稠密索引 [[Writable]]=false。seal 不置 EXT_FROZEN,索引仍可改写。
         // 必须在侧表之后:冻结访问器仍走 setter;无侧表的 [0,1,2] 落到此拒写。
         vm.loadByte(VReg.V1, VReg.S0, 1);
@@ -941,6 +1058,21 @@ export class SubscriptGenerator {
         vm.add(VReg.V0, VReg.V1, VReg.V0);
         vm.store(VReg.V0, 0, VReg.S2);
 
+        vm.label("_sss_side_done_pmap");
+        // Arguments [[Set]] (9.4.4.5): OrdinarySet then Set(map, P, V).
+        // Side-table hit used to skip the formal box (stale after defineProperty).
+        vm.loadByte(VReg.V0, VReg.S0, 1);
+        vm.andImm(VReg.V0, VReg.V0, 32);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_subscript_set_done");
+        vm.movImm64(VReg.V1, 0x7ffe000000000000n);
+        vm.or(VReg.A0, VReg.S0, VReg.V1);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_args_param_map_get_box");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_subscript_set_done");
+        vm.store(VReg.RET, 0, VReg.S2);
+        vm.jmp("_subscript_set_done");
         vm.label("_sss_frozen_reject");
         vm.load(VReg.V0, VReg.SP, 24);
         vm.cmpImm(VReg.V0, 2);
@@ -1130,11 +1262,14 @@ export class SubscriptGenerator {
         vm.store(VReg.RET, 0, VReg.S0);
         vm.store(VReg.RET, 8, VReg.S1);
         vm.store(VReg.RET, 16, VReg.S2);
-        vm.lea(VReg.V0, "_args_pmap_head");
-        vm.load(VReg.V1, VReg.V0, 0);
-        vm.store(VReg.RET, 24, VReg.V1);
-        vm.store(VReg.V0, 0, VReg.RET);
-        vm.mov(VReg.A0, VReg.RET);
+        // x64 V0≡RET: lea V0 会毁掉刚 alloc 的节点,把 _args_pmap_head 写成自指
+        // 并越界写 +24 污染数据段 → 随后 arguments[i] / .length SIGSEGV。
+        vm.mov(VReg.S0, VReg.RET); // node (args_raw 已写入 +0)
+        vm.lea(VReg.V1, "_args_pmap_head");
+        vm.load(VReg.V2, VReg.V1, 0);
+        vm.store(VReg.S0, 24, VReg.V2);
+        vm.store(VReg.V1, 0, VReg.S0);
+        vm.mov(VReg.A0, VReg.S0);
         vm.call("_gc_remember");
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_gc_remember");
@@ -1217,6 +1352,111 @@ export class SubscriptGenerator {
         vm.store(VReg.V0, 0, VReg.V1); // map[idx] = 0
         vm.label("_apmu_done");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+
+        // Strict arguments: own callee/caller accessors = %ThrowTypeError%
+        // (ES 10.4.4.6 / 10.4.4.7). Side-table TYPE_GETTER → _maybe_getter
+        // / _closure_prop_get dispatch to _fp_throw_accessor.
+        vm.label("_args_install_strict_throwers");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.mov(VReg.S0, VReg.A0); // args boxed
+        vm.call("_closure_props_ensure");
+        vm.mov(VReg.S1, VReg.RET); // side table
+        // --- callee ---
+        vm.movImm(VReg.A0, 24);
+        vm.call("_alloc");
+        vm.mov(VReg.S2, VReg.RET); // marker (x64: not V0)
+        vm.movImm(VReg.V1, 60); // TYPE_GETTER
+        vm.store(VReg.S2, 0, VReg.V1);
+        vm.lea(VReg.V1, "_fp_throw_accessor");
+        vm.store(VReg.S2, 8, VReg.V1);
+        vm.store(VReg.S2, 16, VReg.V1);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.A1, vm.asm.addString("callee"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_object_define");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.A1, vm.asm.addString("callee"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.movImm(VReg.A2, 4); // ATTR_CONFIGURABLE
+        vm.call("_object_set_prop_attr");
+        // Modern ES: only callee is %ThrowTypeError%. arguments.caller is not own
+        // (Node: undefined). ES5 installed both; keep callee only.
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+
+        // arguments[@@iterator] = Array.prototype.values (own, attr W+C).
+        // Copies proto values if already materialized; no-op if proto empty
+        // (gOPD/GET lazy-retry after [][Symbol.iterator] fills the proto).
+        vm.label("_args_install_iterator");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.mov(VReg.S0, VReg.A0); // args
+        // Do NOT _ensure_array_proto: that plants an empty object in
+        // _nsobj_array_proto and emitArrayProtoObject then skips filling
+        // values/@@iterator (test262 evaluate [][Symbol.iterator] AFTER
+        // arguments is created). Only copy if proto is already filled.
+        vm.lea(VReg.V0, "_nsobj_array_proto");
+        vm.load(VReg.A0, VReg.V0, 0);
+        vm.cmpImm(VReg.A0, 0);
+        vm.jeq("_args_iter_done");
+        vm.lea(VReg.A1, vm.asm.addString("values"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.shrImm(VReg.V1, VReg.RET, 48);
+        vm.cmpImm(VReg.V1, 0x7FFB);
+        vm.jeq("_args_iter_try_str");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_args_iter_try_str");
+        vm.jmp("_args_iter_have");
+        vm.label("_args_iter_try_str");
+        vm.lea(VReg.V0, "_nsobj_array_proto");
+        vm.load(VReg.A0, VReg.V0, 0);
+        vm.lea(VReg.A1, vm.asm.addString("Symbol.iterator"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.shrImm(VReg.V1, VReg.RET, 48);
+        vm.cmpImm(VReg.V1, 0x7FFB);
+        vm.jeq("_args_iter_done");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_args_iter_done");
+        vm.label("_args_iter_have");
+        vm.mov(VReg.S2, VReg.RET); // values closure
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_closure_props_ensure");
+        vm.mov(VReg.S1, VReg.RET); // side table
+        // string key "Symbol.iterator"
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.A1, vm.asm.addString("Symbol.iterator"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_object_define");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.A1, vm.asm.addString("Symbol.iterator"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.movImm(VReg.A2, 5); // W+C, not E
+        vm.call("_object_set_prop_attr");
+        // well-known @@iterator
+        vm.lea(VReg.A0, "_symwk_iterator");
+        vm.lea(VReg.A1, vm.asm.addString("Symbol.iterator"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_symbol_wellknown");
+        vm.mov(VReg.S3, VReg.RET);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_object_define");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.movImm(VReg.A2, 5);
+        vm.call("_object_set_prop_attr");
+        vm.label("_args_iter_done");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
     }
 
     // _subscript_key_int(key) -> 裸整数下标 | -1
@@ -1338,6 +1578,12 @@ export class SubscriptGenerator {
         vm.andMaskReg(VReg.S0, VReg.S0, VReg.V1); // 裸头
 
         vm.label("_js_set_length_writable_chk");
+        // arguments.length is an ordinary data property (ES 10.4.4):
+        // `arguments.length = "foo"` must store the string, not ToUint32.
+        vm.loadByte(VReg.V0, VReg.S0, 1);
+        vm.andImm(VReg.V0, VReg.V0, 32); // ARR_IS_ARGUMENTS
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_js_set_length_fallback");
         // 数组:boxed value → 有限整数 ∈[0,2^32-1]
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_number_coerce");

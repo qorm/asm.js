@@ -28,7 +28,7 @@ export class BooleanGenerator {
     generateBooleanNew() {
         const vm = this.vm;
         vm.label("_boolean_new");
-        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2]);
 
         // Step 1: convert to boolean
         // A0 = raw value
@@ -44,29 +44,29 @@ export class BooleanGenerator {
         // Step 2: create wrapper object
         vm.call("_object_new"); // RET = raw obj ptr
         vm.mov(VReg.S1, VReg.RET); // S1 = raw obj ptr
+        vm.store(VReg.SP, 0, VReg.S1);
 
-        // Step 3: 惰性物化 Boolean.prototype(与 emitBooleanCtorObject 同槽)。
+        // Step 3: Boolean.prototype from _ensure RET (boxed on both paths).
+        // Same x64 V3-reload-as-0 bug as _number_new.
         vm.call("_ensure_boolean_proto");
-        vm.lea(VReg.V3, "_nsobj_boolean_proto");
-        vm.load(VReg.V3, VReg.V3, 0); // V3 = boxed proto (0 if not yet materialized)
-        // Unbox proto: __proto__ slot stores raw pointer, not boxed value
-        vm.emitMaskLoad(VReg.V1);
-        vm.andMaskReg(VReg.V3, VReg.V3, VReg.V1);
-        vm.store(VReg.S1, 16, VReg.V3); // obj.__proto__ = raw prototype pointer
-
-        // Step 4: store __boolean_value
+        vm.mov(VReg.S2, VReg.RET); // proto from ensure (attach AFTER define)
+        // Step 4: define own [[BooleanData]] while proto is Object.prototype
         vm.mov(VReg.A0, VReg.S1);
         vm.lea(VReg.A1, vm.asm.addString("__boolean_value"));
         vm.movImm64(VReg.V2, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.A1, VReg.V2);
         vm.mov(VReg.A2, VReg.S0);
-        vm.call("_object_set");
+        vm.call("_object_define");
+        vm.load(VReg.S1, VReg.SP, 0);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_js_unbox");
+        vm.store(VReg.S1, 16, VReg.RET);
 
-        // Step 5: box and return
-        vm.mov(VReg.A0, VReg.S1);
-        vm.call("_box_obj_r"); // RET = 0x7FFD-tagged wrapper
+        // _box_obj_r boxes RET, not A0 (x64 A0≠RET; leftover RET = unboxed proto)
+        vm.mov(VReg.RET, VReg.S1);
+        vm.call("_box_obj_r");
 
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 16);
     }
 
     // _boolean_toString(this) -> "true" or "false" (boxed string 0x7FFC)
@@ -96,9 +96,12 @@ export class BooleanGenerator {
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.A1, VReg.V1);
         vm.call("_object_get"); // RET = value
-        // Brand check: must be boolean (0x7FF9)
-        vm.shrImm(VReg.V0, VReg.RET, 48);
-        vm.cmpImm(VReg.V0, 0x7FF9);
+        // Brand check: must be boolean (0x7FF9).
+        // x64 V0≡RET: shrImm(V0, RET, 48) clobbered the value into tag
+        // 0x7FF9 (prints as denormal 1.6186e-319). S0 then never equals
+        // JS_FALSE, so toString always returned "true".
+        vm.shrImm(VReg.V2, VReg.RET, 48);
+        vm.cmpImm(VReg.V2, 0x7FF9);
         vm.jne("_bts_typeerr");
         vm.mov(VReg.S0, VReg.RET);
         vm.jmp("_bts_print");
@@ -150,9 +153,9 @@ export class BooleanGenerator {
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.A1, VReg.V1);
         vm.call("_object_get"); // RET = value
-        // Brand check: must be boolean
-        vm.shrImm(VReg.V0, VReg.RET, 48);
-        vm.cmpImm(VReg.V0, 0x7FF9);
+        // Brand check: must be boolean. V2 not V0 (x64 V0≡RET).
+        vm.shrImm(VReg.V2, VReg.RET, 48);
+        vm.cmpImm(VReg.V2, 0x7FF9);
         vm.jne("_bvo_typeerr");
         vm.jmp("_bvo_end");
 

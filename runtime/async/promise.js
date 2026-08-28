@@ -97,9 +97,10 @@ export class PromiseGenerator {
     // 恢复上下文但**未**出链——见 _throw_unwind 注释)。
     emitExcPop(off) {
         const vm = this.vm;
-        vm.lea(VReg.V0, "_exc_ctx_top");
-        vm.load(VReg.V1, VReg.SP, off + 0);
-        vm.store(VReg.V0, 0, VReg.V1);
+        // V5/V6: x64 V0≡RET. Callers (iter-step) need RET after pop.
+        vm.lea(VReg.V5, "_exc_ctx_top");
+        vm.load(VReg.V6, VReg.SP, off + 0);
+        vm.store(VReg.V5, 0, VReg.V6);
     }
 
     // 读并清 _exception_pending / 取 _exception_value -> dst
@@ -158,6 +159,7 @@ export class PromiseGenerator {
         this.generateBoundTramp();
         this.generatePromiseCtorCall();
         this.generateArefGuards();
+        this.generateEnsurePromiseProto();
     }
 
     // _promise_invoke1(A0=cb, A1=arg) -> RET
@@ -348,11 +350,10 @@ export class PromiseGenerator {
         const vm = this.vm;
         const EXC = 0;
         vm.label("_promise_thenable_adopt");
-        vm.prologue(112, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.prologue(112, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
         vm.mov(VReg.S0, VReg.A0); // boxed promise
         vm.mov(VReg.S1, VReg.A1); // thenable
         vm.mov(VReg.S2, VReg.A2); // then 函数
-        // resolveFn -> S3、rejectFn -> V6 之前先建 resolve
         vm.mov(VReg.A0, VReg.S0);
         vm.movImm(VReg.A1, 0);
         vm.call("_promise_make_resolver");
@@ -360,22 +361,22 @@ export class PromiseGenerator {
         vm.mov(VReg.A0, VReg.S0);
         vm.movImm(VReg.A1, 1);
         vm.call("_promise_make_resolver");
-        vm.mov(VReg.V6, VReg.RET); // rejectFn(caller-saved,紧接着就用)
+        vm.mov(VReg.S4, VReg.RET); // rejectFn in S4: emitExcPush clobbers V*
         this.emitExcPush(EXC, "_pta_catch");
         vm.mov(VReg.A0, VReg.S2);
         vm.mov(VReg.A1, VReg.S1);
         vm.mov(VReg.A2, VReg.S3);
-        vm.mov(VReg.A3, VReg.V6);
+        vm.mov(VReg.A3, VReg.S4);
         vm.movImm(VReg.A4, 2);
         vm.call("_promise_invoke2");
         this.emitExcPop(EXC);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 112);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 112);
         vm.label("_pta_catch");
         this.emitExcPop(EXC);
         vm.mov(VReg.A0, VReg.S0);
         this.emitTakeException(VReg.A1);
         vm.call("_promise_reject");
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 112);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 112);
     }
 
     // ==================== [#74] Promise 反应微任务队列 ====================
@@ -865,6 +866,15 @@ export class PromiseGenerator {
         vm.jeq("_pr_tagchk");
         vm.movImm(VReg.V1, 1);
         vm.store(VReg.SP, 96, VReg.V1);
+        // Own then only. Proto.then is now visible on a real Get (typeof p.then),
+        // so inherited Promise.prototype.then must not steal brand adopt —
+        // same gate as _promise_then (resolve-prms-cstm-then). Native
+        // `return Promise.reject(e)` must stay on _pr_adopt_promise.
+        vm.mov(VReg.A0, VReg.S1);
+        this.emitStringConst(VReg.A1, "then");
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_pr_adopt_promise");
         vm.jmp("_pr_then_lookup");
 
         vm.label("_pr_tagchk");
@@ -1028,7 +1038,24 @@ export class PromiseGenerator {
 
         vm.label("_promise_then");
         vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.mov(VReg.S2, VReg.A0); // boxed receiver
         vm.mov(VReg.S1, VReg.A1); // callback
+        // Own then override only (resolve-prms-cstm-then). _closure_prop_get
+        // walks proto (4-596), so inherited Promise.prototype.then would steal
+        // the brand path and invoke2 proto.then — RET=0, await sees a non-thenable.
+        // hasOwn("then") is 0 on a real Promise → brand _promise_then.
+        this.emitStringConst(VReg.A1, "then");
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_pt_brand");
+        vm.mov(VReg.A0, VReg.S2);
+        this.emitStringConst(VReg.A1, "then");
+        vm.call("_closure_prop_get");
+        vm.shrImm(VReg.V2, VReg.RET, 48);
+        vm.cmpImm(VReg.V2, 0x7FFF);
+        vm.jeq("_pt_own_then");
+        vm.label("_pt_brand");
+        vm.mov(VReg.A0, VReg.S2);
         vm.call("_js_unbox"); // A0=promise -> 裸
         vm.mov(VReg.S0, VReg.RET);
 
@@ -1135,10 +1162,36 @@ export class PromiseGenerator {
             vm.label(okLabel);
         };
 
+        vm.label("_pt_own_then");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S2);
+        vm.mov(VReg.A2, VReg.S1);
+        vm.movImm64(VReg.A3, JS_UNDEFINED);
+        vm.movImm(VReg.A4, 1);
+        vm.call("_promise_invoke2");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
+
         vm.label("_promise_then2");
         vm.prologue(48, SAVED);
+        vm.mov(VReg.S3, VReg.A0); // boxed receiver
         vm.mov(VReg.S1, VReg.A1); // onF
         vm.mov(VReg.S4, VReg.A2); // onR
+        // Own then only. Proto then (after _closure_prop_get proto walk) is the
+        // brand method — invoking it via _pt2_own_then drops the derived promise
+        // (RET=0) so await wrap.then(onFul,onRej) sees 0 and for-await loops again
+        // (double IteratorClose on rejected next value).
+        this.emitStringConst(VReg.A1, "then");
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_pt2_brand");
+        vm.mov(VReg.A0, VReg.S3);
+        this.emitStringConst(VReg.A1, "then");
+        vm.call("_closure_prop_get");
+        vm.shrImm(VReg.V2, VReg.RET, 48);
+        vm.cmpImm(VReg.V2, 0x7FFF);
+        vm.jeq("_pt2_own_then");
+        vm.label("_pt2_brand");
+        vm.mov(VReg.A0, VReg.S3);
         vm.call("_js_unbox");     // A0=promise -> 裸
         vm.mov(VReg.S0, VReg.RET);
         vm.movImm(VReg.A0, 0);
@@ -1176,6 +1229,15 @@ export class PromiseGenerator {
         vm.mov(VReg.A1, VReg.S5);
         vm.call("_promise_append_handler"); // 尾插 reject 链
         vm.mov(VReg.RET, VReg.S2);
+        vm.epilogue(SAVED, 48);
+
+        vm.label("_pt2_own_then");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.mov(VReg.A2, VReg.S1);
+        vm.mov(VReg.A3, VReg.S4);
+        vm.movImm(VReg.A4, 2);
+        vm.call("_promise_invoke2");
         vm.epilogue(SAVED, 48);
 
         vm.label("_pt2_ful"); // 已 fulfilled → 排入 onF
@@ -1728,6 +1790,20 @@ export class PromiseGenerator {
         vm.call("_js_unbox");
         vm.mov(VReg.S0, VReg.RET);
 
+        // Pending value@+16 is 0. After yield, a still-pending promise used to
+        // fall through to ful_fast and return 0 — `await p.then(v=>v+1)` and
+        // AFS `await wrap.then(onFul,onRej)` both became 0, so for-await looped
+        // and closed the sync iterator twice. Drain queued reactions first
+        // (then-derived settle this turn); never treat PENDING as fulfilled.
+        vm.label("_paw_check");
+        vm.load(VReg.V1, VReg.S0, 8);
+        vm.cmpImm(VReg.V1, PROMISE_FULFILLED);
+        vm.jeq("_paw_ful_fast");
+        vm.cmpImm(VReg.V1, PROMISE_REJECTED);
+        vm.jeq("_paw_rej_fast");
+        vm.store(VReg.SP, 0, VReg.S0);
+        vm.call("_promise_drain_reactions");
+        vm.load(VReg.S0, VReg.SP, 0);
         vm.load(VReg.V1, VReg.S0, 8);
         vm.cmpImm(VReg.V1, PROMISE_FULFILLED);
         vm.jeq("_paw_ful_fast");
@@ -1738,9 +1814,7 @@ export class PromiseGenerator {
         vm.load(VReg.S1, VReg.S1, 0);
         vm.store(VReg.S0, 40, VReg.S1);
         vm.call("_coroutine_yield");
-        vm.load(VReg.V1, VReg.S0, 8);
-        vm.cmpImm(VReg.V1, PROMISE_REJECTED);
-        vm.jeq("_paw_rej_fast");
+        vm.jmp("_paw_check");
 
         vm.label("_paw_ful_fast");
         vm.load(VReg.RET, VReg.S0, 16);
@@ -1903,21 +1977,23 @@ export class PromiseGenerator {
         vm.load(VReg.RET, VReg.S1, 0); // cap.promise
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
         vm.label("_prs_builtin");
-        // 入参本身是 promise 时,规范 27.2.4.7 步骤 2 只在 Get(x,"constructor") === C
-        // 时原样返回(resolve/arg-uniq-ctor 把 promise1.constructor 改成 null 后要求
-        // 返回**新** promise)。%Promise% 未物化时无从比较,保留原样返回。
+        // 入参本身是 promise 时,规范 27.2.4.7 / PromiseResolve 必须 Get(x,"constructor")
+        // 再 SameValue(C)。%Promise% 未物化时仍须 Get(副作用:constructor getter 可抛,
+        // AsyncFromSyncIteratorContinuation 的 IfAbruptRejectPromise 依赖此);比较失败
+        // 才回落原样返回。
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_is_promise");
         vm.cmpImm(VReg.RET, 0);
         vm.jeq("_prs_new");
+        vm.mov(VReg.A0, VReg.S0);
+        this.emitStringConst(VReg.A1, "constructor");
+        vm.call("_object_get");
+        vm.mov(VReg.S1, VReg.RET);
         vm.lea(VReg.V0, "_nsobj_promise");
         vm.load(VReg.S2, VReg.V0, 0);
         vm.cmpImm(VReg.S2, 0);
         vm.jeq("_prs_same");
-        vm.mov(VReg.A0, VReg.S0);
-        this.emitStringConst(VReg.A1, "constructor");
-        vm.call("_object_get");
-        vm.cmp(VReg.RET, VReg.S2);
+        vm.cmp(VReg.S1, VReg.S2);
         vm.jne("_prs_new");
         vm.label("_prs_same");
         vm.mov(VReg.RET, VReg.S0);
@@ -2442,14 +2518,11 @@ export class PromiseGenerator {
         vm.call("_pnpc_is_callable");
         vm.cmpImm(VReg.RET, 0);
         vm.jne("_pnpc_chk_rej");
-        // resolve 未捕获:class extends Promise 的 super no-op → 补调 executor + native backing
-        // [ctx-ctor] Promise.all.call(SubPromise,…) 传入的 C 是 0x7FFF 函数标签的类构造器
-        // (非裸 classinfo / 0x7FFD 对象)。旧判据只放行 0x7FFD 与 type@0=3 裸指针 →
-        // 落 _pnpc_notcallable「Promise resolve or reject function is not callable」。
+        // resolve 未捕获:仅 classinfo(type=3) 可回退(super() 未捕获 resolve)。
+        // 普通函数(0x7FFF ZeroArgConstructor / fn1..fn6)必须 TypeError
+        // (S25.4.4.1_A4.1_T1 / capability-executor-not-callable)。
         vm.shrImm(VReg.V1, VReg.S0, 48);
         vm.cmpImm(VReg.V1, 0x7FFD);
-        vm.jeq("_pnpc_fallback");
-        vm.cmpImm(VReg.V1, 0x7FFF); // 类/函数构造器形态
         vm.jeq("_pnpc_fallback");
         vm.cmpImm(VReg.V1, 0);
         vm.jne("_pnpc_notcallable");
@@ -3505,10 +3578,12 @@ export class PromiseGenerator {
         vm.addImm(VReg.A1, VReg.SP, 96);
         vm.call("_pcomb_iter_step");
         this.emitExcPop(0);
-        vm.movImm(VReg.V1, 1);
-        vm.store(VReg.SP, 144, VReg.V1);
+        // PerformPromiseAll: next===false → [[Done]]=true before resolve.
+        // Do not mark Done=false on the exhausted next (capability-resolve-throws-no-close).
         vm.cmpImm(VReg.RET, 0);
         vm.jeq("_pall_done");
+        vm.movImm(VReg.V1, 1);
+        vm.store(VReg.SP, 144, VReg.V1);
         vm.load(VReg.V1, VReg.S4, 16);
         vm.addImm(VReg.V1, VReg.V1, 1);
         vm.store(VReg.S4, 16, VReg.V1);
@@ -3639,6 +3714,13 @@ export class PromiseGenerator {
         vm.jeq("_btr_closure");
         vm.cmpImm(VReg.V6, ASYNC_CLOSURE_MAGIC);
         vm.jeq("_btr_closure");
+        // Class ctor (type@0==3): [[Call]] must TypeError. jmpIndirect of
+        // classinfo was SIGSEGV (binding.js `f(1,2)` after Subclass.bind).
+        vm.andImm(VReg.V6, VReg.V6, 0xff);
+        vm.cmpImm(VReg.V6, 3);
+        vm.jne("_btr_bare");
+        vm.call("_throw_not_a_function");
+        vm.label("_btr_bare");
         vm.mov(VReg.V5, VReg.S0);
         vm.movImm(VReg.S0, 0);
         vm.jmpIndirect(VReg.V5);
@@ -3648,8 +3730,9 @@ export class PromiseGenerator {
 
         // [IsConstructor] _is_nonctor_fn(A0 = 裸函数/闭包/Proxy 指针) -> RET = 1 表示**确定**
         // 没有 [[Construct]](箭头/方法简写/async/generator,以及绑定到它们的 bound fn /
-        // Proxy 包装上述目标)。判据是函数元数据 kind bit9;未登记的入口(内建/classinfo)
-        // 返 0。bound 沿 target@16、Proxy 沿 target@8 链式展开(规范 10.4.1.2 / 10.5.2)。
+        // Proxy 包装上述目标,以及内建方法闭包 _aref_generic / _aref_static_tramp)。
+        // 判据是函数元数据 kind bit9 或 fnptr 为上述蹦床;未登记的入口(classinfo /
+        // 普通函数)返 0。bound 沿 target@16、Proxy 沿 target@8 链式展开。
         vm.label("_is_nonctor_fn");
         vm.prologue(0, [VReg.S0, VReg.S1]);
         vm.mov(VReg.S0, VReg.A0);
@@ -3680,8 +3763,20 @@ export class PromiseGenerator {
         vm.load(VReg.S0, VReg.S0, 8);
         vm.jmp("_incf_unbox_cont");
         vm.label("_incf_meta");
+        // Built-in method/static closures: no [[Construct]] (ES 10.3 / 17).
+        // V0 = fnptr@8. _aref_generic = proto methods; _aref_static_tramp =
+        // Object/JSON/Math/Number statics (emitMemoizedBuiltinRef / emitJSONMethodRef).
+        vm.lea(VReg.V1, "_aref_generic");
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jeq("_incf_yes");
+        vm.lea(VReg.V1, "_aref_static_tramp");
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jeq("_incf_yes");
         vm.mov(VReg.A0, VReg.V0);
         vm.call("_func_meta_nonctor");
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_incf_yes");
+        vm.movImm(VReg.RET, 1);
         vm.epilogue([VReg.S0, VReg.S1], 0);
         vm.label("_incf_no");
         vm.movImm(VReg.RET, 0);
@@ -3740,10 +3835,12 @@ export class PromiseGenerator {
         vm.addImm(VReg.A1, VReg.SP, 96);
         vm.call("_pcomb_iter_step");
         this.emitExcPop(0);
-        vm.movImm(VReg.V1, 1);
-        vm.store(VReg.SP, 144, VReg.V1);
+        // PerformPromiseAll: next===false → [[Done]]=true before resolve.
+        // Do not mark Done=false on the exhausted next (capability-resolve-throws-no-close).
         vm.cmpImm(VReg.RET, 0);
         vm.jeq("_pany_done");
+        vm.movImm(VReg.V1, 1);
+        vm.store(VReg.SP, 144, VReg.V1);
         vm.load(VReg.V1, VReg.S4, 16);
         vm.addImm(VReg.V1, VReg.V1, 1);
         vm.store(VReg.S4, 16, VReg.V1);
@@ -4073,10 +4170,12 @@ export class PromiseGenerator {
         vm.addImm(VReg.A1, VReg.SP, 96);
         vm.call("_pcomb_iter_step");
         this.emitExcPop(0);
-        vm.movImm(VReg.V1, 1);
-        vm.store(VReg.SP, 144, VReg.V1);
+        // PerformPromiseAll: next===false → [[Done]]=true before resolve.
+        // Do not mark Done=false on the exhausted next (capability-resolve-throws-no-close).
         vm.cmpImm(VReg.RET, 0);
         vm.jeq("_prc_done");
+        vm.movImm(VReg.V1, 1);
+        vm.store(VReg.SP, 144, VReg.V1);
         this.emitExcPush(0, "_prc_catch");
         vm.load(VReg.A0, VReg.SP, 80);
         vm.load(VReg.A1, VReg.SP, 88);
@@ -4174,10 +4273,12 @@ export class PromiseGenerator {
         vm.addImm(VReg.A1, VReg.SP, 96);
         vm.call("_pcomb_iter_step");
         this.emitExcPop(0);
-        vm.movImm(VReg.V1, 1);
-        vm.store(VReg.SP, 144, VReg.V1);
+        // PerformPromiseAll: next===false → [[Done]]=true before resolve.
+        // Do not mark Done=false on the exhausted next (capability-resolve-throws-no-close).
         vm.cmpImm(VReg.RET, 0);
         vm.jeq("_pas_done");
+        vm.movImm(VReg.V1, 1);
+        vm.store(VReg.SP, 144, VReg.V1);
         vm.load(VReg.V1, VReg.S4, 16);
         vm.addImm(VReg.V1, VReg.V1, 1);
         vm.store(VReg.S4, 16, VReg.V1);
@@ -4250,6 +4351,64 @@ export class PromiseGenerator {
         this.emitStringConst(VReg.A0, "Promise constructor cannot be invoked without 'new'");
         vm.call("_throw_type_error"); // 不返回
         vm.epilogue([VReg.S0], 16);   // 理论不达
+    }
+
+    // _ensure_promise_proto() -> boxed Promise.prototype
+    // new Promise / async / agen.next() never evaluate the Promise identifier, so
+    // emitPromiseCtorObject does not hang methods. Get of "then" (harness
+    // typeof p.then === "function") must still see proto.then. Create the proto
+    // singleton if empty; hang then/catch/finally unless already own (compiler
+    // materialize reuses this same object). x64: slot store via V1, proto in S0.
+    generateEnsurePromiseProto() {
+        const vm = this.vm;
+        vm.label("_ensure_promise_proto");
+        vm.prologue(16, [VReg.S0, VReg.S1]);
+        vm.lea(VReg.V1, "_nsobj_promise_proto");
+        vm.load(VReg.S0, VReg.V1, 0);
+        vm.cmpImm(VReg.S0, 0);
+        vm.jne("_epp_have_obj");
+        vm.call("_object_new");
+        vm.call("_box_obj_r");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.lea(VReg.V1, "_nsobj_promise_proto");
+        vm.store(VReg.V1, 0, VReg.S0);
+        vm.label("_epp_have_obj");
+        vm.mov(VReg.A0, VReg.S0);
+        this.emitStringConst(VReg.A1, "then");
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_epp_done");
+        this._hangArefMethod(VReg.S0, "then", "_aref_promise_then");
+        this._hangArefMethod(VReg.S0, "catch", "_aref_promise_catch");
+        this._hangArefMethod(VReg.S0, "finally", "_aref_promise_finally");
+        vm.label("_epp_done");
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+    }
+
+    // 24B {magic, _aref_generic, helper} + box + proto[name] attr 5.
+    // emitStringConst uses V4 (x64 ≡ A5); A2 holds the boxed fn across it.
+    _hangArefMethod(protoReg, name, helperLabel) {
+        const vm = this.vm;
+        vm.movImm(VReg.A0, 24);
+        vm.call("_alloc");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.movImm(VReg.V1, 0xc105);
+        vm.store(VReg.S1, 0, VReg.V1);
+        vm.lea(VReg.V1, "_aref_generic");
+        vm.store(VReg.S1, 8, VReg.V1);
+        vm.lea(VReg.V1, helperLabel);
+        vm.store(VReg.S1, 16, VReg.V1);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_js_box_function");
+        vm.mov(VReg.A2, VReg.RET);
+        vm.mov(VReg.A0, protoReg);
+        this.emitStringConst(VReg.A1, name);
+        vm.call("_object_set");
+        vm.mov(VReg.A0, protoReg);
+        this.emitStringConst(VReg.A1, name);
+        vm.movImm(VReg.A2, 5);
+        vm.call("_object_set_prop_attr");
     }
 
     // [I2 红队] 物化 Promise 原型/静态方法值闭包的接收者守卫(成员表

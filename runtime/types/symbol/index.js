@@ -41,6 +41,8 @@ export class SymbolGenerator {
         this.generateSymbolWellknown();
         this.generateSymbolValueOf();
         this.generateSymbolDescription();
+        this.generateEnsureSymbolProto();
+        this.generateSymbolWrap();
     }
 
     // 数据段槽：注册表链表头 + well-known 槽。
@@ -54,6 +56,13 @@ export class SymbolGenerator {
             asm.addDataLabel("_symwk_" + WELLKNOWN_SYMBOLS[i]);
             asm.addDataQword(0);
         }
+        // ToObject(Symbol) wrapper shares these with emitSymbolCtorObject
+        // (_reEnsureSlot skips existing labels). Proto slot must exist in the
+        // runtime image: _agen_toobject may wrap before Symbol is evaluated.
+        asm.addDataLabel("_nsobj_symbol");
+        asm.addDataQword(0);
+        asm.addDataLabel("_nsobj_symbol_proto");
+        asm.addDataQword(0);
     }
 
     // _symbol_new(desc) -> 裸符号指针
@@ -181,7 +190,13 @@ export class SymbolGenerator {
         vm.call("_symbol_this_value");
         vm.mov(VReg.S0, VReg.RET);
         vm.lea(VReg.A0, "_str_symbol_open"); // "Symbol("
-        vm.load(VReg.A1, VReg.S0, 8); // desc 裸指针（0 → _getStrContent 给空串）
+        vm.load(VReg.A1, VReg.S0, 8); // desc 裸指针; 0 = no description
+        // _strconcat/_emitArgStrInline treats 0 as number 0 → "0"
+        // (Symbol() was "Symbol(0)" vs spec "Symbol()").
+        vm.cmpImm(VReg.A1, 0);
+        vm.jne("_sts_have_desc");
+        vm.lea(VReg.A1, vm.asm.addString(""));
+        vm.label("_sts_have_desc");
         vm.call("_strconcat");
         vm.mov(VReg.A0, VReg.RET);
         vm.lea(VReg.A1, "_str_rparen"); // ")"
@@ -321,5 +336,54 @@ export class SymbolGenerator {
         vm.label("_sdesc_undef");
         vm.movImm64(VReg.RET, 0x7ffb000000000000n); // undefined
         vm.epilogue([VReg.S0, VReg.S1], 0);
+    }
+
+    // _ensure_symbol_proto -> boxed Symbol.prototype (same _nsobj_symbol_proto).
+    // Minimal object if ctor not yet materialized; emitSymbolCtorObject reuses
+    // the slot so wrapper.__proto__ === Symbol.prototype after value read.
+    generateEnsureSymbolProto() {
+        const vm = this.vm;
+        vm.label("_ensure_symbol_proto");
+        vm.prologue(0, [VReg.S0]);
+        vm.lea(VReg.V0, "_nsobj_symbol_proto");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_esyp_have");
+        vm.call("_object_new");
+        vm.call("_box_obj_r");
+        vm.lea(VReg.V1, "_nsobj_symbol_proto");
+        vm.store(VReg.V1, 0, VReg.RET);
+        vm.mov(VReg.V0, VReg.RET);
+        vm.label("_esyp_have");
+        vm.mov(VReg.RET, VReg.V0);
+        vm.epilogue([VReg.S0], 0);
+    }
+
+    // _symbol_wrap(A0=primitive Symbol) -> boxed Symbol wrapper (0x7FFD).
+    // OrdinaryToObject: [[SymbolData]] via __symbol_value; __proto__ = Symbol.prototype.
+    // Mirrors _number_new (define own data while proto is Object.prototype, then attach).
+    generateSymbolWrap() {
+        const vm = this.vm;
+        vm.label("_symbol_wrap");
+        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.mov(VReg.S1, VReg.A0); // primitive Symbol
+        vm.call("_object_new");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.store(VReg.SP, 0, VReg.S0);
+        vm.call("_ensure_symbol_proto");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.lea(VReg.A1, vm.asm.addString("__symbol_value"));
+        vm.movImm64(VReg.V2, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V2);
+        vm.mov(VReg.A2, VReg.S1);
+        vm.call("_object_define");
+        vm.load(VReg.S0, VReg.SP, 0);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_js_unbox");
+        vm.store(VReg.S0, 16, VReg.RET);
+        vm.mov(VReg.RET, VReg.S0);
+        vm.call("_box_obj_r");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 16);
     }
 }

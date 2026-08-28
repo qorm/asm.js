@@ -11,7 +11,8 @@
 // (对象内跳过、数组内 "null"、顶层返回 undefined)。stringify 支持 replacer
 // (函数逐节点 this=holder / 数组键白名单)、space 缩进(数字钳[0,10]/字符串前10)、
 // toJSON 协议(节点对象有 function 型 toJSON 先调再序列化);parse 支持 reviver
-// (自底向上,返回 undefined 删属性)。未覆盖:循环引用检测(深度 200 兜底防炸栈)。
+// (自底向上,返回 undefined 删属性;第三参 {source} 为 json-parse-with-source
+// 原始值源文本,对象/数组或被改写的属性无 source)。未覆盖:循环引用检测(深度 200 兜底防炸栈)。
 
 function __jsonHex4(n) {
     const h = "0123456789abcdef";
@@ -115,15 +116,21 @@ function __jsonSer(value, indent, depth) {
         // 天然正确),按内部品牌(模块级登记表)判,raw 文本原样嵌入(不引号、不转义)。
         const __ri = __js_rawjson_objs.indexOf(value);
         if (__ri !== -1) return __js_rawjson_texts[__ri];
-        // 包装对象(Number/Boolean):规范 SerializeJSONProperty 步骤 3 要求解包内部槽。
-        if (typeof value.__boolean_value !== "undefined") {
+        // 包装对象:用 instanceof 认品牌,禁止 [[Get]] 内部槽名。
+        // Proxy get 对任意键返回值时,`typeof value.__boolean_value` 会误判成 Boolean
+        // 并把 JSON.stringify(proxy) 编成 "true"(value-object-proxy)。
+        // Boolean → [[BooleanData]](不用 valueOf);Number → ToNumber;String → ToString。
+        if (value instanceof Boolean) {
             return value.__boolean_value ? "true" : "false";
         }
-        if (typeof value.__number_value !== "undefined") {
-            const __nv = value.__number_value;
+        if (value instanceof Number) {
+            const __nv = Number(value);
             const __nfs = "" + __nv;
             if (__nfs === "NaN" || __nfs === "Infinity" || __nfs === "-Infinity") return "null";
             return __nfs;
+        }
+        if (value instanceof String) {
+            return __jsonQuote(String(value));
         }
     }
     const t = typeof value;
@@ -217,11 +224,16 @@ function __jsonObj(obj, indent, depth) {
             mv.push(s);
         }
     } else {
-        for (const k in obj) {
-            const s = __jsonPropV(obj, k, obj[k], newIndent, depth + 1);
-            if (s === undefined) continue; // undefined/函数/symbol 值属性跳过
+        // EnumerableOwnPropertyNames(value, "key"):自有可枚举字符串键。
+        // for-in 不走 Proxy ownKeys,空对象 target 会编成 {} 或误走包装解包。
+        // Object.keys 已有 ownKeys+enumerable 过滤(value-object-proxy)。
+        const __own = Object.keys(obj);
+        for (let i = 0; i < __own.length; i++) {
+            const k = __own[i];
+            const sv = __jsonPropV(obj, k, obj[k], newIndent, depth + 1);
+            if (sv === undefined) continue; // undefined/函数/symbol 值属性跳过
             mk.push(k);
-            mv.push(s);
+            mv.push(sv);
         }
     }
     const n = mk.length;
@@ -248,6 +260,12 @@ function __jsonObj(obj, indent, depth) {
 
 // space → 缩进单元串:数字钳 [0,10] 个空格;字符串取前 10 字符;其余 ""。
 function __jsonGap(space) {
+    // 规范:Type(space) 是 Object 且带 [[NumberData]]/[[StringData]] 时先 ToNumber/ToString。
+    // 必须 instanceof,不能 Get 内部槽(与 __jsonSer 同一 Proxy 陷阱)。
+    if (space !== null && typeof space === "object") {
+        if (space instanceof Number) space = Number(space);
+        else if (space instanceof String) space = String(space);
+    }
     const t = typeof space;
     if (t === "number") {
         if (space !== space) return ""; // NaN
@@ -327,6 +345,52 @@ function __jsonErr(msg) {
 // 用模块级游标(单线程编译/运行模型,安全)。
 let __jp_s = "";
 let __jp_i = 0;
+// json-parse-with-source (ES InternalizeJSONProperty context): primitive
+// tokens keep their exact source text; objects/arrays have none. Parallel
+// arrays (gen1: no WeakMap). Cleared per parse.
+let __jp_last_src = undefined;
+let __jp_src_holders = [];
+let __jp_src_names = [];
+let __jp_src_texts = [];
+let __jp_src_vals = [];
+
+function __jpClearSources() {
+    __jp_last_src = undefined;
+    __jp_src_holders = [];
+    __jp_src_names = [];
+    __jp_src_texts = [];
+    __jp_src_vals = [];
+}
+
+function __jpRecordSource(holder, name, val, src) {
+    if (src === undefined) return;
+    __jp_src_holders.push(holder);
+    __jp_src_names.push(name);
+    __jp_src_texts.push(src);
+    __jp_src_vals.push(val);
+}
+
+function __jpSameValue(a, b) {
+    if (a === b) {
+        if (a === 0) return (1 / a) === (1 / b);
+        return true;
+    }
+    return a !== a && b !== b;
+}
+
+// Context is OrdinaryObjectCreate(%Object.prototype%). source is present
+// only when Get(holder, name) is still the originally parsed primitive.
+function __jpMakeContext(holder, name, val) {
+    for (let i = 0; i < __jp_src_holders.length; i++) {
+        if (__jp_src_holders[i] === holder && __jp_src_names[i] === name) {
+            if (__jpSameValue(__jp_src_vals[i], val)) {
+                return { source: __jp_src_texts[i] };
+            }
+            break;
+        }
+    }
+    return {};
+}
 
 function __jpWs() {
     while (__jp_i < __jp_s.length) {
@@ -448,13 +512,18 @@ function __jpValue(depth) {
     if (depth > 200) __jsonErr("too deep");
     __jpWs();
     if (__jp_i >= __jp_s.length) __jsonErr("unexpected end");
+    const start = __jp_i;
     const c = __jp_s.charCodeAt(__jp_i);
-    if (c === 34) return __jpString();
+    if (c === 34) {
+        const v = __jpString();
+        __jp_last_src = __jp_s.slice(start, __jp_i);
+        return v;
+    }
     if (c === 123) { // {
         __jp_i = __jp_i + 1;
         const obj = {};
         __jpWs();
-        if (__jp_s.charCodeAt(__jp_i) === 125) { __jp_i = __jp_i + 1; return obj; }
+        if (__jp_s.charCodeAt(__jp_i) === 125) { __jp_i = __jp_i + 1; __jp_last_src = undefined; return obj; }
         while (true) {
             __jpWs();
             if (__jp_s.charCodeAt(__jp_i) !== 34) __jsonErr("expected key");
@@ -464,11 +533,13 @@ function __jpValue(depth) {
             __jp_i = __jp_i + 1;
             // 不用 obj[k]= :k==="__proto__" 会改 [[Prototype]]。规范 CreateDataProperty
             // 把 "__proto__" 当普通自有数据键。
-            __jpCreateDataProp(obj, k, __jpValue(depth + 1));
+            const val = __jpValue(depth + 1);
+            __jpRecordSource(obj, k, val, __jp_last_src);
+            __jpCreateDataProp(obj, k, val);
             __jpWs();
             const d = __jp_s.charCodeAt(__jp_i);
             if (d === 44) { __jp_i = __jp_i + 1; continue; }
-            if (d === 125) { __jp_i = __jp_i + 1; return obj; }
+            if (d === 125) { __jp_i = __jp_i + 1; __jp_last_src = undefined; return obj; }
             __jsonErr("expected , or }");
         }
     }
@@ -476,20 +547,28 @@ function __jpValue(depth) {
         __jp_i = __jp_i + 1;
         const arr = [];
         __jpWs();
-        if (__jp_s.charCodeAt(__jp_i) === 93) { __jp_i = __jp_i + 1; return arr; }
+        if (__jp_s.charCodeAt(__jp_i) === 93) { __jp_i = __jp_i + 1; __jp_last_src = undefined; return arr; }
         while (true) {
-            arr.push(__jpValue(depth + 1));
+            const idx = arr.length;
+            const val = __jpValue(depth + 1);
+            const src = __jp_last_src;
+            arr.push(val);
+            __jpRecordSource(arr, "" + idx, val, src);
             __jpWs();
             const d = __jp_s.charCodeAt(__jp_i);
             if (d === 44) { __jp_i = __jp_i + 1; continue; }
-            if (d === 93) { __jp_i = __jp_i + 1; return arr; }
+            if (d === 93) { __jp_i = __jp_i + 1; __jp_last_src = undefined; return arr; }
             __jsonErr("expected , or ]");
         }
     }
-    if (c === 116) return __jpLit("true", true);
-    if (c === 102) return __jpLit("false", false);
-    if (c === 110) return __jpLit("null", null);
-    if (c === 45 || (c >= 48 && c <= 57)) return __jpNumber();
+    if (c === 116) { const v = __jpLit("true", true); __jp_last_src = "true"; return v; }
+    if (c === 102) { const v = __jpLit("false", false); __jp_last_src = "false"; return v; }
+    if (c === 110) { const v = __jpLit("null", null); __jp_last_src = "null"; return v; }
+    if (c === 45 || (c >= 48 && c <= 57)) {
+        const v = __jpNumber();
+        __jp_last_src = __jp_s.slice(start, __jp_i);
+        return v;
+    }
     __jsonErr("unexpected token");
 }
 
@@ -538,20 +617,26 @@ function __jpInternalize(holder, name, value, reviver) {
             }
         }
     }
-    return reviver.call(holder, name, value);
+    return reviver.call(holder, name, value, __jpMakeContext(holder, name, value));
 }
 
 export function __JSON_parse(text, reviver) {
     __jp_s = "" + text;
     __jp_i = 0;
+    __jpClearSources();
     const v = __jpValue(0);
+    const topSrc = __jp_last_src;
     __jpWs();
     if (__jp_i < __jp_s.length) __jsonErr("trailing garbage");
     if (typeof reviver === "function") {
         const root = {};
         root[""] = v;
-        return __jpInternalize(root, "", v, reviver);
+        __jpRecordSource(root, "", v, topSrc);
+        const result = __jpInternalize(root, "", v, reviver);
+        __jpClearSources();
+        return result;
     }
+    __jpClearSources();
     return v;
 }
 

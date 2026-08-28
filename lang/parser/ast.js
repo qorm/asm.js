@@ -105,14 +105,19 @@ function isStampableCallable(expr) {
          expr.id.name.indexOf("__classexpr") === 0);
 }
 
-export function stampFnHintFromKey(expr, key) {
+export function stampFnHintFromKey(expr, key, prefix) {
     if (!isStampableCallable(expr) || !key || typeof key !== "object") return;
     let name = null;
     if (key.type === "Identifier") name = key.name;
-    else if (key.type === "Literal" &&
+    else if (key.type === "PrivateIdentifier" && typeof key.name === "string") {
+        // DefineField SetFunctionName(initValue, privateName) → ".name" is "#field"
+        name = key.name.charAt(0) === "#" ? key.name : "#" + key.name;
+    } else if (key.type === "Literal" &&
         (typeof key.value === "string" || typeof key.value === "number")) {
         name = String(key.value);
     }
+    // SetFunctionName(F, name, "get"|"set") → "get id" / "set id"
+    if (name !== null && (prefix === "get" || prefix === "set")) name = prefix + " " + name;
     if (name !== null) stampFnHint(expr, name);
 }
 
@@ -174,6 +179,8 @@ export class MethodDefinition extends Node {
         this.static = isStatic || false;
         this.computed = computed || false;
         if ((!kind || kind === "method") && !computed) stampFnHintFromKey(value, key);
+        // MethodDefinition get/set: SetFunctionName prefix (static keys only)
+        if ((kind === "get" || kind === "set") && !computed) stampFnHintFromKey(value, key, kind);
     }
 }
 
@@ -185,6 +192,10 @@ export class PropertyDefinition extends Node {
         this.value = value;
         this.computed = computed || false;
         this.static = isStatic || false;
+        // DefineField NamedEvaluation: anonymous fn/arrow/class field inits
+        // get .name = field name ("field" / "#field"). Object literals already
+        // stamp via Property; class fields were the leftover "" vs "#field".
+        if (!this.computed) stampFnHintFromKey(value, key);
     }
 }
 
@@ -459,7 +470,19 @@ export class Property extends Node {
         this.kind = kind || "init";
         this.computed = computed || false;
         this.shorthand = shorthand || false;
-        if ((!kind || kind === "init") && !computed) stampFnHintFromKey(value, key);
+        if ((!kind || kind === "init") && !computed) {
+            // Proto setter `{__proto__: fn}` is not NamedEvaluation (isProtoSetter).
+            // Method `{ __proto__() {} }` re-stamps in the parser LPAREN branch.
+            let kn = null;
+            if (key && key.type === "Identifier") kn = key.name;
+            else if (key && key.type === "Literal" &&
+                (typeof key.value === "string" || typeof key.value === "number")) {
+                kn = String(key.value);
+            }
+            if (kn !== "__proto__") stampFnHintFromKey(value, key);
+        }
+        // Object accessor: SetFunctionName(F, key, "get"|"set") for static keys
+        if ((kind === "get" || kind === "set") && !computed) stampFnHintFromKey(value, key, kind);
     }
 }
 

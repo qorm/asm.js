@@ -575,20 +575,44 @@ export class JSValueGenerator {
         vm.load(VReg.V0, VReg.V1, 0);
         vm.cmpImm(VReg.V0, 8); // TYPE_PROXY
         vm.jne("_js_typeof_object");
+        // Walk [[ProxyTarget]] chain (nested / revoked function proxy).
+        // S1 = remaining depth (S0 still original; S1 was high16, dead here).
+        vm.movImm(VReg.S1, 8);
+        vm.label("_js_typeof_px_target");
+        vm.subImm(VReg.S1, VReg.S1, 1);
+        vm.cmpImm(VReg.S1, 0);
+        vm.jeq("_js_typeof_object");
         vm.load(VReg.V1, VReg.V1, 8); // target(存放形态)
         vm.shrImm(VReg.V0, VReg.V1, 48);
         vm.cmpImm(VReg.V0, 0x7fff);
         vm.jeq("_js_typeof_function");
+        vm.cmpImm(VReg.V0, 0x7ffd);
+        vm.jeq("_js_typeof_px_box");
         vm.cmpImm(VReg.V0, 0);
         vm.jne("_js_typeof_object");
         vm.cmpImm(VReg.V1, 0);
         vm.jeq("_js_typeof_object");
-        vm.load(VReg.V0, VReg.V1, 0); // 裸 target:type/magic 判可调用
-        vm.cmpImm(VReg.V0, 3);        // TYPE_CLOSURE(classinfo)
+        vm.load(VReg.V0, VReg.V1, 0);
+        vm.cmpImm(VReg.V0, 3);
         vm.jeq("_js_typeof_function");
-        vm.cmpImm(VReg.V0, 0xc105);   // CLOSURE_MAGIC
+        vm.cmpImm(VReg.V0, 0xc105);
         vm.jeq("_js_typeof_function");
-        vm.cmpImm(VReg.V0, 0xa51c);   // ASYNC_CLOSURE_MAGIC
+        vm.cmpImm(VReg.V0, 0xa51c);
+        vm.jeq("_js_typeof_function");
+        vm.cmpImm(VReg.V0, 8);
+        vm.jeq("_js_typeof_px_target");
+        vm.jmp("_js_typeof_object");
+        vm.label("_js_typeof_px_box");
+        vm.movImm64(VReg.V0, 0x0000ffffffffffffn);
+        vm.and(VReg.V1, VReg.V1, VReg.V0);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_js_typeof_object");
+        vm.load(VReg.V0, VReg.V1, 0);
+        vm.cmpImm(VReg.V0, 8);
+        vm.jeq("_js_typeof_px_target");
+        vm.cmpImm(VReg.V0, 0xc105);
+        vm.jeq("_js_typeof_function");
+        vm.cmpImm(VReg.V0, 0xa51c);
         vm.jeq("_js_typeof_function");
         vm.jmp("_js_typeof_object");
 
@@ -691,8 +715,10 @@ export class JSValueGenerator {
         const vm = this.vm;
         // _try_hasinstance(A0=构造器/right, A1=实例/left) -> RET:
         //   若 right 有 function 型 [Symbol.hasInstance],以 (left) 调之(this=right)、结果
-        //   经 _to_boolean 归一为装箱布尔返回;否则返回裸 0(哨兵:无 hasInstance,走常规 instanceof)。
-        //   right 脱壳成裸指针后传 _object_get(接受高16=0 裸指针,含 classinfo type=3)。
+        //   经 _to_boolean 归一为装箱布尔返回;否则 InstanceofOperator step 4:
+        //   IsCallable(target) false → TypeError(A6 / GetMethod miss); callable → 裸 0
+        //   哨兵走常规 OrdinaryHasInstance。GetMethod: present-non-callable(非 undef/null)
+        //   亦 TypeError。right 脱壳成裸指针后传 _object_get。
         vm.label("_try_hasinstance");
         vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
         vm.mov(VReg.S2, VReg.A0); // right(构造器)
@@ -730,7 +756,16 @@ export class JSValueGenerator {
         vm.mov(VReg.S1, VReg.RET);
         vm.shrImm(VReg.V0, VReg.S1, 48);
         vm.cmpImm(VReg.V0, 0x7FFF);   // function tag
-        vm.jne("_thi_none");
+        vm.jeq("_thi_has_fn");
+        // GetMethod: undefined/null/0 → no handler; any other present value → TypeError
+        vm.cmpImm(VReg.V0, 0x7FFB);
+        vm.jeq("_thi_none");
+        vm.cmpImm(VReg.V0, 0x7FFA);
+        vm.jeq("_thi_none");
+        vm.cmpImm(VReg.S1, 0);
+        vm.jeq("_thi_none");
+        vm.jmp("_thi_throw");
+        vm.label("_thi_has_fn");
         // 调 [Symbol.hasInstance](left)。方法值可能是闭包(magic 0xc105@0,真函数@8,对象字面量
         // 方法)或裸函数指针(类静态方法,label 即入口)——按 magic 分派(同 _aref_invoke_cb)。
         vm.movImm64(VReg.V0, 0x0000ffffffffffffn);
@@ -750,7 +785,16 @@ export class JSValueGenerator {
         vm.setCallArgcImm(1, VReg.V0, VReg.V2); // [argc ABI] [Symbol.hasInstance](x)
         vm.callIndirect(VReg.V1);
         vm.mov(VReg.A0, VReg.RET);
-        vm.call("_to_boolean");       // 归一装箱布尔
+        vm.call("_to_boolean");       // RET = 0/1 raw (emitTest leftover 5e-324 if returned)
+        // InstanceofOperator 12.9.4: ToBoolean(Call(@@hasInstance)). compile instanceof
+        // treats RET==0 as OrdinaryHasInstance sentinel; raw 1 is leftover 5e-324 vs true.
+        // Box like _builtin_boolean / _iof_true. Do not change _to_boolean (0/1 for tests).
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_thi_box_false");
+        vm.movImm64(VReg.RET, JS_TRUE);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
+        vm.label("_thi_box_false");
+        vm.movImm64(VReg.RET, JS_FALSE);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
         vm.label("_thi_throw");
         vm.lea(VReg.A0, vm.asm.addString("Right-hand side of 'instanceof' is not an object"));
@@ -758,7 +802,18 @@ export class JSValueGenerator {
         vm.mov(VReg.A0, VReg.RET);
         vm.call("_throw_type_error"); // 不返回
         vm.label("_thi_none");
-        vm.movImm(VReg.RET, 0);       // 裸 0 哨兵
+        // ES InstanceofOperator: no @@hasInstance → If IsCallable(target) is false, throw.
+        // {} / Math / globalThis / instance-as-RHS were collapsing to false (A6_T1/T2/T4).
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_is_callable");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_thi_none_ok");
+        vm.lea(VReg.A0, vm.asm.addString("Right-hand side of 'instanceof' is not callable"));
+        vm.call("_js_box_string");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_throw_type_error"); // 不返回
+        vm.label("_thi_none_ok");
+        vm.movImm(VReg.RET, 0);       // 裸 0 哨兵(callable, OrdinaryHasInstance)
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
 
         // _isarray_ref(A0=value) -> boxed bool。Array.isArray 作一等值(回调/变量)的
@@ -1032,7 +1087,11 @@ export class JSValueGenerator {
         // 普通函数 new F 挂 __proto__=F.prototype;此处沿实例 __proto__ 链上溯比对,
         // 复用 _iof_proto_walk(与用户类 instanceof 同一防环/堆守卫的上溯逻辑)。
         vm.label("_instanceof_proto");
-        vm.prologue(16, [VReg.S0]);
+        // 必须与 _instanceof 同序言:本入口 jmp _iof_proto_walk 后从
+        // _iof_true/_iof_false epilogue([S0,S1],16) 返回。只存 S0 时
+        // x64 多弹出 S1 → 毁掉返回地址 SIGSEGV(`o instanceof F` /
+        // `this instanceof Test262Error` 全崩)。
+        vm.prologue(16, [VReg.S0, VReg.S1]);
         vm.mov(VReg.S0, VReg.A0); // S0 = 实例
         vm.mov(VReg.V2, VReg.A1); // V2 = 目标 prototype(裸)
         vm.cmpImm(VReg.V2, 0);
@@ -1160,7 +1219,28 @@ export class JSValueGenerator {
         vm.movImm(VReg.S3, 4);
         vm.label("_fpb_alloc");
         vm.mov(VReg.S0, VReg.S4);
+        // Class constructors are type=3 classinfo boxed 0x7FFD (not 0x7FFF).
+        // IsCallable is true; _validate_callable only accepts 0x7FFF / 0xc105 /
+        // TYPE_PROXY. GET-then-call `var b=C.bind; b({})` needs this hop.
+        vm.shrImm(VReg.S1, VReg.S0, 48);
+        vm.cmpImm(VReg.S1, 0x7ffd);
+        vm.jeq("_fpb_try_cls");
+        vm.cmpImm(VReg.S1, 0);
+        vm.jne("_fpb_validate");
+        vm.label("_fpb_try_cls");
+        vm.movImm64(VReg.S1, 0x0000ffffffffffffn);
+        vm.and(VReg.S0, VReg.S0, VReg.S1);
+        vm.cmpImm(VReg.S0, 0);
+        vm.jeq("_fpb_validate_restore");
+        vm.load(VReg.S1, VReg.S0, 0);
+        vm.andImm(VReg.S1, VReg.S1, 0xff);
+        vm.cmpImm(VReg.S1, 3);
+        vm.jeq("_fpb_validated");
+        vm.label("_fpb_validate_restore");
+        vm.mov(VReg.S0, VReg.S4);
+        vm.label("_fpb_validate");
         vm.call("_validate_callable");
+        vm.label("_fpb_validated");
         vm.mov(VReg.S4, VReg.S0);
         vm.shlImm(VReg.V0, VReg.S3, 3);
         vm.addImm(VReg.A0, VReg.V0, 40);
@@ -1264,27 +1344,37 @@ export class JSValueGenerator {
         vm.callIndirect(VReg.V6);
         vm.epilogue(SAVED, FRAME);
 
-        // [Array.prototype.push 取值] 规范:ToObject → 真数组走 _array_push;否则类数组
-        // Set(O, ToString(len), item) + length++。nullish → TypeError。
+        // [Array.prototype.push 取值] 规范:ToObject → 真数组 argc==1 走 _array_push;
+        // 否则类数组/argc>=2 活读 Set(O, ToString(len+i), item_i, true) + Set length。
         // argc==0:仍 Set(O,"length",len,true)(frozen 空数组 TypeError),返 len。
+        // Same family as _agen_unshift: argc>=2 insert A1..A4; len+argCount > 2^53-1
+        // TypeError before Set (throws-if-integer-limit-exceeded / A2_T2 Infinity);
+        // live Set is _subscript_set_strict (Throw=true).
         vm.label("_fpg_arr_push");
-        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2]);
-        vm.mov(VReg.S1, VReg.A1);              // 保 value
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.mov(VReg.S1, VReg.A1);              // item0
+        vm.store(VReg.SP, 8, VReg.A2);         // item1
+        vm.store(VReg.SP, 16, VReg.A3);        // item2
+        vm.store(VReg.SP, 24, VReg.A4);        // item3
         vm.call("_agen_toobject");             // nullish → TypeError
         vm.mov(VReg.S0, VReg.RET);             // boxed O
-        vm.lea(VReg.V0, "_call_argc");
-        vm.load(VReg.V0, VReg.V0, 0);
-        vm.cmpImm(VReg.V0, 0);
+        // x64 V0≡RET: argc load uses V1
+        vm.lea(VReg.V1, "_call_argc");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.mov(VReg.S3, VReg.V1);              // S3 = argCount
+        vm.cmpImm(VReg.S3, 0);
         vm.jeq("_fpg_arr_push_noarg");
+        vm.cmpImm(VReg.S3, 1);
+        vm.jne("_fpg_arr_push_live");          // argc>=2: live even for true arrays
         vm.shrImm(VReg.V5, VReg.S0, 48);
         vm.cmpImm(VReg.V5, 0x7ffe);
-        vm.jne("_fpg_arr_push_obj");
+        vm.jne("_fpg_arr_push_live");
         // 真数组 tag:仅 TYPE_ARRAY 走稠密 push(TypedArray 0x7FFE 走对象路径)
         vm.emitMaskLoad(VReg.V4);
         vm.andMaskReg(VReg.V0, VReg.S0, VReg.V4);
         vm.loadByte(VReg.V0, VReg.V0, 0);
         vm.cmpImm(VReg.V0, 1); // TYPE_ARRAY
-        vm.jne("_fpg_arr_push_obj");
+        vm.jne("_fpg_arr_push_live");
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S1);
         vm.call("_array_push");
@@ -1293,7 +1383,7 @@ export class JSValueGenerator {
         vm.call("_array_length");
         vm.scvtf(0, VReg.RET);
         vm.fmovToInt(VReg.RET, 0);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 16);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
         vm.label("_fpg_arr_push_noarg");
         // Set(length, len, true); return len
         vm.shrImm(VReg.V5, VReg.S0, 48);
@@ -1312,7 +1402,7 @@ export class JSValueGenerator {
         vm.call("_array_setlength_throw");
         vm.scvtf(0, VReg.S2);
         vm.fmovToInt(VReg.RET, 0);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 16);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
         vm.label("_fpg_arr_push_noarg_obj");
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_agen_tolength");
@@ -1323,24 +1413,60 @@ export class JSValueGenerator {
         vm.call("_agen_setlength_throw");
         vm.scvtf(0, VReg.S2);
         vm.fmovToInt(VReg.RET, 0);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 16);
-        vm.label("_fpg_arr_push_obj");
-        // 类数组:len=ToLength(O.length); Set(O,len,value); Set(O,"length",len+1); return len+1
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
+        vm.label("_fpg_arr_push_live");
+        // ToLength; if len+argCount > 2^53-1 TypeError (before any Set).
+        // x64 V0≡RET: sum in V1, clamp const in V2 (A2 dead; items on SP).
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_agen_tolength");
         vm.mov(VReg.S2, VReg.RET); // len bare
+        vm.add(VReg.V1, VReg.S2, VReg.S3);
+        vm.movImm64(VReg.V2, 9007199254740991n);
+        vm.cmp(VReg.V1, VReg.V2);
+        vm.jle("_fpg_push_len_ok");
+        vm.lea(VReg.A0, vm.asm.addString("Invalid array length"));
+        vm.call("_js_box_string");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_throw_type_error");
+        vm.label("_fpg_push_len_ok");
+        // Set(O, len+i, item_i, true) for i in 0..min(argc,4)
         vm.mov(VReg.A0, VReg.S0);
         vm.scvtf(0, VReg.S2);
-        vm.fmovToInt(VReg.A1, 0); // boxed index = len
+        vm.fmovToInt(VReg.A1, 0);
         vm.mov(VReg.A2, VReg.S1);
-        vm.call("_subscript_set");
-        vm.addImm(VReg.S2, VReg.S2, 1); // newLen
+        vm.call("_subscript_set_strict");
+        vm.cmpImm(VReg.S3, 2);
+        vm.jlt("_fpg_push_setlen");
+        vm.addImm(VReg.V1, VReg.S2, 1);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.scvtf(0, VReg.V1);
+        vm.fmovToInt(VReg.A1, 0);
+        vm.load(VReg.A2, VReg.SP, 8);
+        vm.call("_subscript_set_strict");
+        vm.cmpImm(VReg.S3, 3);
+        vm.jlt("_fpg_push_setlen");
+        vm.addImm(VReg.V1, VReg.S2, 2);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.scvtf(0, VReg.V1);
+        vm.fmovToInt(VReg.A1, 0);
+        vm.load(VReg.A2, VReg.SP, 16);
+        vm.call("_subscript_set_strict");
+        vm.cmpImm(VReg.S3, 4);
+        vm.jlt("_fpg_push_setlen");
+        vm.addImm(VReg.V1, VReg.S2, 3);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.scvtf(0, VReg.V1);
+        vm.fmovToInt(VReg.A1, 0);
+        vm.load(VReg.A2, VReg.SP, 24);
+        vm.call("_subscript_set_strict");
+        vm.label("_fpg_push_setlen");
+        vm.add(VReg.S2, VReg.S2, VReg.S3); // newLen
         vm.mov(VReg.A0, VReg.S0);
         vm.scvtf(0, VReg.S2);
         vm.fmovToInt(VReg.A2, 0);
-        vm.call("_agen_setlength_throw"); // Set(..., Throw=true)
+        vm.call("_agen_setlength_throw");
         vm.scvtf(0, VReg.S2);
         vm.fmovToInt(VReg.RET, 0);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 16);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
     }
 }

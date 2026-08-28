@@ -252,7 +252,9 @@ export const BuiltinArrayMethodCompiler = {
                 break;
             case "at":
                 // arr.at(index) - 支持负索引
-                // 注意：index 应该是整数
+                // leftover-arg: at() ≡ at(undefined) → ToInteger(undefined)=0.
+                // args==0 used to leave leftover RET (the receiver array)
+                // so [1,2,3].at() was leftover array. 1-arg emit unchanged.
                 if (args.length > 0) {
                     this.vm.push(VReg.RET); // 保存数组 JSValue
                     this.compileExpressionAsInt(args[0]);
@@ -261,6 +263,12 @@ export const BuiltinArrayMethodCompiler = {
                     // unbox JSValue 得到裸指针
                     this.vm.call("_js_unbox");
                     this.vm.mov(VReg.A0, VReg.RET);
+                    this.vm.call("_array_at");
+                } else {
+                    this.vm.mov(VReg.A0, VReg.RET);
+                    this.vm.call("_js_unbox");
+                    this.vm.mov(VReg.A0, VReg.RET);
+                    this.vm.movImm(VReg.A1, 0); // ToInteger(undefined)=0
                     this.vm.call("_array_at");
                 }
                 break;
@@ -339,6 +347,11 @@ export const BuiltinArrayMethodCompiler = {
             case "indexOf":
                 // arr.indexOf(value, fromIndex?) — 走 _aref_arr_indexOf:
                 // ToLength 后 len==0 先 -1,再 ToInteger(from);+Inf from → -1。
+                // leftover-arg: indexOf() ≡ indexOf(undefined) → Strict Equality
+                // search for undefined. args==0 used to leave leftover RET (the
+                // array) so [undefined].indexOf() was leftover empty array /
+                // leftover 0. Missing searchElement is 0x7FFB. 1-arg / 2-arg
+                // emit unchanged.
                 if (args.length > 0) {
                     this.vm.push(VReg.RET); // 数组(装箱)
                     this.compileExpression(args[0]);
@@ -351,11 +364,19 @@ export const BuiltinArrayMethodCompiler = {
                     this.vm.mov(VReg.A2, VReg.RET);
                     this.vm.pop(VReg.A1); // value
                     this.vm.pop(VReg.A0); // array
-                    this.vm.call("_aref_arr_indexOf"); // RET = 装箱数字
+                } else {
+                    this.vm.mov(VReg.A0, VReg.RET);
+                    this.vm.movImm64(VReg.A1, 0x7ffb000000000000n);
+                    this.vm.movImm64(VReg.A2, 0x7ffb000000000000n);
                 }
+                this.vm.call("_aref_arr_indexOf"); // RET = 装箱数字
                 break;
             case "includes":
                 // arr.includes(value, fromIndex?) -> 返回 _js_true 或 _js_false
+                // leftover-arg: includes() ≡ includes(undefined) → SameValueZero
+                // search for undefined. args==0 used to leave leftover RET (the
+                // array) so [0].includes() was leftover 0 / leftover-boolean.
+                // Missing searchElement is 0x7FFB. 1-arg / 2-arg emit unchanged.
                 if (args.length > 0) {
                     this.vm.push(VReg.RET);
                     this.compileExpression(args[0]);
@@ -372,21 +393,25 @@ export const BuiltinArrayMethodCompiler = {
                         this.vm.movImm(VReg.A2, 0);
                     }
                     this.vm.pop(VReg.A0);
-                    // unbox JSValue 得到裸指针(_js_unbox 保 A1,不碰 A2)
-                    this.vm.call("_js_unbox");
+                } else {
                     this.vm.mov(VReg.A0, VReg.RET);
-                    this.vm.call("_array_includes");
-                    // 转换为布尔单例
-                    const trueLabel = `_includes_true_${this.nextLabelId()}`;
-                    const doneLabel = `_includes_done_${this.nextLabelId()}`;
-                    this.vm.cmpImm(VReg.RET, 0);
-                    this.vm.jne(trueLabel);
-                    this.vm.movImm64(VReg.RET, 0x7ff9000000000000n);
-                    this.vm.jmp(doneLabel);
-                    this.vm.label(trueLabel);
-                    this.vm.movImm64(VReg.RET, 0x7ff9000000000001n);
-                    this.vm.label(doneLabel);
+                    this.vm.movImm64(VReg.A1, 0x7ffb000000000000n);
+                    this.vm.movImm(VReg.A2, 0);
                 }
+                // unbox JSValue 得到裸指针(_js_unbox 保 A1,不碰 A2)
+                this.vm.call("_js_unbox");
+                this.vm.mov(VReg.A0, VReg.RET);
+                this.vm.call("_array_includes");
+                // 转换为布尔单例
+                const trueLabel = `_includes_true_${this.nextLabelId()}`;
+                const doneLabel = `_includes_done_${this.nextLabelId()}`;
+                this.vm.cmpImm(VReg.RET, 0);
+                this.vm.jne(trueLabel);
+                this.vm.movImm64(VReg.RET, 0x7ff9000000000000n);
+                this.vm.jmp(doneLabel);
+                this.vm.label(trueLabel);
+                this.vm.movImm64(VReg.RET, 0x7ff9000000000001n);
+                this.vm.label(doneLabel);
                 break;
             case "forEach":
                 // arr.forEach(callback) - 编译时展开循环
@@ -624,6 +649,10 @@ export const BuiltinArrayMethodCompiler = {
                 // 接收者已在 RET(line 148),勿二次求值(同 join 理由)。
                 // A0=arr, A1=value, A2=fromIndex(从此下标向前搜;缺省用 INT_MAX 哨兵,
                 // 运行时钳到 len-1)。此前不传 fromIndex → 恒从末尾搜,忽略第 2 参。
+                // leftover-arg: lastIndexOf() === lastIndexOf(undefined) -> Strict
+                // Equality search for undefined. args==0 used to pass leftover 0
+                // so [undefined].lastIndexOf() was -1 and [0].lastIndexOf() was 0.
+                // Missing searchElement is 0x7FFB. 1-arg / 2-arg emit unchanged.
                 this.vm.push(VReg.RET);
                 if (args.length >= 2) {
                     // fromIndex 存栈,先算 value 再算 fromIndex(保持求值序 value→from)
@@ -634,7 +663,7 @@ export const BuiltinArrayMethodCompiler = {
                     this.compileExpression(args[0]); this.vm.mov(VReg.A1, VReg.RET);
                     this.vm.movImm(VReg.A2, 2147483647);
                 } else {
-                    this.vm.movImm(VReg.A1, 0);
+                    this.vm.movImm64(VReg.A1, 0x7ffb000000000000n);
                     this.vm.movImm(VReg.A2, 2147483647);
                 }
                 this.vm.pop(VReg.A0);
@@ -826,6 +855,24 @@ export const BuiltinArrayMethodCompiler = {
                             this.vm.call("_array_unshift"); // RET = 新长度
                         }
                     }
+                } else {
+                    // unshift() no-args: Set(length,len,true) then return len.
+                    // Fallthrough left RET=array so x.unshift() === 1 printed
+                    // Actual "1" ([1].toString()). Writable-array Set is a
+                    // no-op; frozen / nonwritable length → TypeError
+                    // (set-length-zero-array-is-frozen).
+                    const uid0 = this.nextLabelId();
+                    const u0Arr = this.ctx.allocLocal(`__unshift0_arr_${uid0}`);
+                    const u0Len = this.ctx.allocLocal(`__unshift0_len_${uid0}`);
+                    this.vm.store(VReg.FP, u0Arr, VReg.RET);
+                    this.vm.mov(VReg.A0, VReg.RET);
+                    this.vm.call("_array_length");
+                    this.vm.store(VReg.FP, u0Len, VReg.RET);
+                    this.vm.load(VReg.A0, VReg.FP, u0Arr);
+                    this.vm.load(VReg.A1, VReg.FP, u0Len);
+                    this.vm.call("_array_setlength_throw");
+                    this.vm.load(VReg.RET, VReg.FP, u0Len);
+                    this.intToFloat64Bits(VReg.RET);
                 }
                 break;
             case "splice": {
@@ -862,7 +909,8 @@ export const BuiltinArrayMethodCompiler = {
                 this.vm.store(VReg.FP, spStartOff, VReg.RET);
                 const spDelOff = this.ctx.allocLocal(`__splice_del_${_spId}`);
                 if (args.length > 1) { this.compileExpressionAsInt(args[1]); }
-                else { this.vm.movImm(VReg.RET, 0x7fffffff); } // 省略 delCount → 删到尾
+                else if (args.length === 1) { this.vm.movImm(VReg.RET, 0x7fffffff); } // start 在、del 省略 → 删到尾
+                else { this.vm.movImm(VReg.RET, 0); } // start 也不在 → actualDeleteCount = 0
                 this.vm.store(VReg.FP, spDelOff, VReg.RET);
                 // items 数组
                 this.compileExpression({ type: "ArrayExpression", elements: args.slice(2) });
@@ -892,8 +940,14 @@ export const BuiltinArrayMethodCompiler = {
                 if (args.length >= 2) {
                     this.compileExpression(args[1]);
                     this.vm.store(VReg.FP, dlOff, VReg.RET);
-                } else {
+                } else if (args.length === 1) {
                     this.vm.movImm64(VReg.V0, 0x7ffb000000000000n); // undefined → 删到尾
+                    this.vm.store(VReg.FP, dlOff, VReg.V0);
+                } else {
+                    // start not present → actualDeleteCount = 0 (not delete-to-end)
+                    this.vm.movImm(VReg.V0, 0);
+                    this.vm.scvtf(0, VReg.V0);
+                    this.vm.fmovToInt(VReg.V0, 0);
                     this.vm.store(VReg.FP, dlOff, VReg.V0);
                 }
                 if (args.length >= 3) {
@@ -915,6 +969,9 @@ export const BuiltinArrayMethodCompiler = {
             case "toSpliced": {
                 // [ES2023] arr.toSpliced(start, delCount?, ...items) -> 新数组(非破坏)。
                 // 同 splice 参数处理,call `_array_toSpliced`(内部全拷贝→splice 副本→返副本)。
+                // leftover-arg: toSpliced() start not present → actualDeleteCount=0
+                // (copy of receiver). args==0 used to pass del=INT_MAX → leftover empty.
+                // 1-arg / 2-arg emit unchanged (same helper).
                 const id = this.nextLabelId();
                 const tsArrOff = this.ctx.allocLocal(`__tospliced_arr_${id}`);
                 this.vm.store(VReg.FP, tsArrOff, VReg.RET);
@@ -923,7 +980,11 @@ export const BuiltinArrayMethodCompiler = {
                 else { this.vm.movImm(VReg.RET, 0); }
                 this.vm.store(VReg.FP, tsStartOff, VReg.RET);
                 const tsDelOff = this.ctx.allocLocal(`__tospliced_del_${id}`);
+                // leftover-arg: toSpliced() start not present → actualDeleteCount=0
+                // (copy). args==0 used to pass del=INT_MAX → leftover empty [].
+                // 1-arg (start present, deleteCount missing) still INT_MAX sentinel.
                 if (args.length > 1) { this.compileExpressionAsInt(args[1]); }
+                else if (args.length === 0) { this.vm.movImm(VReg.RET, 0); }
                 else { this.vm.movImm(VReg.RET, 0x7fffffff); }
                 this.vm.store(VReg.FP, tsDelOff, VReg.RET);
                 this.compileExpression({ type: "ArrayExpression", elements: args.slice(2) });
@@ -965,7 +1026,9 @@ export const BuiltinArrayMethodCompiler = {
     // 无该 label)→ 静默 no-op。编译期循环 _array_set,索引按 ES 语义归一(负数 +len、钳到
     // [0,len])。原地填充,返回接收者(调用点已把接收者求值到 RET)。
     compileArrayFill(args) {
-        if (args.length === 0) return;
+        // fill() no-value is fill(undefined), not a no-op. Spec: missing
+        // value is undefined; then Set each index in [0,len). argc==0
+        // used to `return` leaving RET=array (compareArray saw [0,0]).
         const id = this.nextLabelId();
         const arrOff = this.ctx.allocLocal(`__fill_arr_${id}`);
         const valOff = this.ctx.allocLocal(`__fill_val_${id}`);
@@ -973,7 +1036,11 @@ export const BuiltinArrayMethodCompiler = {
         const endOff = this.ctx.allocLocal(`__fill_end_${id}`);
         const lenOff = this.ctx.allocLocal(`__fill_len_${id}`);
         this.vm.store(VReg.FP, arrOff, VReg.RET);
-        this.compileExpression(args[0]); // value(boxed)
+        if (args.length >= 1) {
+            this.compileExpression(args[0]); // value(boxed)
+        } else {
+            this.vm.movImm64(VReg.RET, 0x7ffb000000000000n);
+        }
         this.vm.store(VReg.FP, valOff, VReg.RET);
         this.vm.load(VReg.A0, VReg.FP, arrOff);
         this.vm.call("_array_length");

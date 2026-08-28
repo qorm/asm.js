@@ -46,14 +46,14 @@ export const BuiltinMethodCompiler = {
 
             case "charAt":
                 // str.charAt(index) - 返回单字符字符串
+                // pos 不预 fcvtzs:x64 cvttsd2si(NaN)→INT64_MIN 当裸负下标→空串,
+                // 破坏 charAt(NaN)/charAt("x")→ToInteger→0(linux-x64 leftover S9.4_A1)。
+                // _str_charAt 内部 ToInteger(NaN/-Inf→0 仅 NaN;±Inf→oob)。
                 if (args.length > 0) {
                     this.compileExpression(args[0]);
-                    // 索引是浮点数表示，转为整数 (使用 VM 统一接口)
-                    this.vm.fmovToFloat(0, VReg.RET);
-                    this.vm.fcvtzs(VReg.RET, 0);
-                    this.vm.mov(VReg.A1, VReg.RET);
+                    this.vm.mov(VReg.A1, VReg.RET); // raw JSValue: NaN/Inf/string 保留
                 } else {
-                    this.vm.movImm(VReg.A1, 0);
+                    this.vm.movImm(VReg.A1, 0); // 0-arg leftover: ToInteger(undefined)=0
                 }
                 this.vm.pop(VReg.A0);
                 this.vm.call("_str_charAt");
@@ -87,14 +87,15 @@ export const BuiltinMethodCompiler = {
 
             case "charCodeAt":
                 // str.charCodeAt(index) - 返回字符编码
+                // pos 不预 fcvtzs:x64 cvttsd2si(NaN)→INT64_MIN 当裸负下标→NaN,
+                // 破坏 charCodeAt(NaN)/charCodeAt("…2")→ToInteger→0/2
+                // (linux-x64 leftover pos-coerce-string)。
+                // _str_charCodeAt 内部 ToInteger(NaN→0;±Inf→oob)。
                 if (args.length > 0) {
                     this.compileExpression(args[0]);
-                    // 索引是浮点数表示，转为整数 (使用 VM 统一接口)
-                    this.vm.fmovToFloat(0, VReg.RET);
-                    this.vm.fcvtzs(VReg.RET, 0);
-                    this.vm.mov(VReg.A1, VReg.RET);
+                    this.vm.mov(VReg.A1, VReg.RET); // raw JSValue: NaN/Inf/string 保留
                 } else {
-                    this.vm.movImm(VReg.A1, 0);
+                    this.vm.movImm(VReg.A1, 0); // 0-arg leftover: ToInteger(undefined)=0
                 }
                 this.vm.pop(VReg.A0);
                 this.vm.call("_str_charCodeAt");
@@ -117,20 +118,12 @@ export const BuiltinMethodCompiler = {
                 this.vm.call("_getStrContent");
                 this.vm.push(VReg.RET); // 保存内容指针
 
-                // 编译 start 参数
+                // start 不预 _to_int32:保留 Infinity/NaN 原值(同 substring),
+                // _str_slice 内部 ToIntegerOrInfinity。预转 +Inf→0 会把
+                // slice(Infinity, Infinity) 错成 slice(0, +Inf)→全串。
                 if (args.length > 0) {
                     this.compileExpression(args[0]);
-                    // x64: RET(RAX) 与 A0(RDI) 是不同寄存器, _to_int32 读 A0, 需显式搬运;
-                    // arm64: RET(X0)==A0(X0) 同寄存器, 加 mov 会改字节, 故守卫仅 x64。
-                    if (this.vm.backend.name === "x64") this.vm.mov(VReg.A0, VReg.RET);
-                    // 确保是 Int32 (NaN-boxed) - 使用 V1 避免覆盖 RET (V0 和 RET 都映射到 X0)
-                    this.vm.call("_to_int32");
-                    // 截断为低32位再装箱（负数的高位会与tag冲突）
-                    this.vm.movImm64(VReg.V1, 0xFFFFFFFFn);
-                    this.vm.and(VReg.RET, VReg.RET, VReg.V1);
-                    this.vm.movImm64(VReg.V1, 0x7FF8000000000000n);
-                    this.vm.or(VReg.RET, VReg.RET, VReg.V1);
-                    this.vm.push(VReg.RET); // 保存 start (boxed)
+                    this.vm.push(VReg.RET); // start(raw JSValue: NaN/Inf 保留原 float bits)
                 } else {
                     this.vm.movImm64(VReg.V1, 0x7FF8000000000000n); // 0 (boxed)
                     this.vm.push(VReg.V1);

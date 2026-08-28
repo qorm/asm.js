@@ -1344,6 +1344,15 @@ export class SetGenerator {
             vm.call("_is_callable");
             vm.cmpImm(VReg.RET, 0);
             vm.jne("_scf_have_adder");
+            // Get 不可调用:0 / undefined → 内建回退(默认 proto 方法尚非一等值);
+            // 其它已定义值(null / 1 / {}) → 规范 TypeError(set-iterable-throws-when-add-is-not-callable)。
+            vm.cmpImm(VReg.S4, 0);
+            vm.jeq("_scf_use_intrinsic");
+            vm.shrImm(VReg.V1, VReg.S4, 48);
+            vm.cmpImm(VReg.V1, 0x7FFB);
+            vm.jeq("_scf_use_intrinsic");
+            throwTE("_scf_bad_adder", "Set.prototype.add is not a function");
+            vm.label("_scf_use_intrinsic");
             vm.movImm(VReg.S4, 0); // 0 = 内建 _set_add
             vm.label("_scf_have_adder");
             vm.mov(VReg.A0, VReg.S1);
@@ -1385,13 +1394,16 @@ export class SetGenerator {
             vm.mov(VReg.A1, VReg.S5);
             vm.call("_maybe_getter");
             vm.mov(VReg.S2, VReg.RET);
-            vm.lea(VReg.V0, "_exc_ctx_top");
-            vm.load(VReg.V1, VReg.V0, 0);
-            vm.store(VReg.SP, 32, VReg.V1);
-            vm.lea(VReg.V1, "_scf_catch");
-            vm.store(VReg.SP, 40, VReg.V1);
-            vm.mov(VReg.V1, VReg.SP);
-            vm.store(VReg.SP, 48, VReg.V1);
+            // x64 V0===RET: lea catch may scratch RAX, so do not keep &_exc_ctx_top
+            // in V0 across lea("_scf_catch"). Re-lea immediately before the store
+            // (same pattern as _array_from_iter_into / _array_spread_into_map).
+            vm.lea(VReg.V1, "_exc_ctx_top");
+            vm.load(VReg.V2, VReg.V1, 0);
+            vm.store(VReg.SP, 32, VReg.V2);
+            vm.lea(VReg.V2, "_scf_catch");
+            vm.store(VReg.SP, 40, VReg.V2);
+            vm.mov(VReg.V2, VReg.SP);
+            vm.store(VReg.SP, 48, VReg.V2);
             vm.store(VReg.SP, 56, VReg.FP);
             vm.store(VReg.SP, 64, VReg.S0);
             vm.store(VReg.SP, 72, VReg.S1);
@@ -1399,8 +1411,9 @@ export class SetGenerator {
             vm.store(VReg.SP, 88, VReg.S3);
             vm.store(VReg.SP, 96, VReg.S4);
             vm.store(VReg.SP, 104, VReg.S5);
-            vm.addImm(VReg.V1, VReg.SP, 32);
-            vm.store(VReg.V0, 0, VReg.V1);
+            vm.addImm(VReg.V2, VReg.SP, 32);
+            vm.lea(VReg.V1, "_exc_ctx_top");
+            vm.store(VReg.V1, 0, VReg.V2);
             vm.cmpImm(VReg.S4, 0);
             vm.jeq("_scf_intrinsic_add");
             vm.mov(VReg.A0, VReg.S4);

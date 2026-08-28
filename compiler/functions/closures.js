@@ -340,7 +340,7 @@ export const ClosureCompiler = {
             const s = stmts[i];
             if (!s || s.type !== "ExpressionStatement") break;
             const e = s.expression;
-            if (!e || e.type !== "Literal" || typeof e.value !== "string") break;
+            if (!e || (e.type !== "Literal" && e.type !== "StringLiteral") || typeof e.value !== "string") break;
             if (e.value === "use strict") return true;
         }
         return false;
@@ -369,6 +369,10 @@ export const ClosureCompiler = {
             }
             const t = node.type;
             if (t === "ThisExpression") return true;
+            // Super property/call uses GetThisBinding of the enclosing method.
+            // Object-literal super.fromA in an arrow must capture lexical __this
+            // (GetPrototypeOf(this)); Super alone is not ThisExpression.
+            if (t === "SuperExpression" || t === "Super") return true;
             // 不下钻嵌套的普通函数（它们有自己的 this）；箭头函数继续下钻
             if (t === "FunctionExpression" || t === "FunctionDeclaration") return false;
             if (t === "Identifier" || t === "Literal" || t === "Super" ||
@@ -450,6 +454,64 @@ export const ClosureCompiler = {
             return false;
         };
         return walk(expr.body);
+    },
+
+    // Arrow lexical NewTarget: true if body has `new.target` (not nested function).
+    functionBodyUsesNewTarget(expr) {
+        const walk = (node) => {
+            if (!node || typeof node !== "object") return false;
+            if (Array.isArray(node)) {
+                for (let i = 0; i < node.length; i++) if (walk(node[i])) return true;
+                return false;
+            }
+            const t = node.type;
+            if (t === "MetaProperty") {
+                return !!(node.meta && node.meta.name === "new" &&
+                    node.property && node.property.name === "target");
+            }
+            if (t === "FunctionExpression" || t === "FunctionDeclaration" ||
+                t === "ClassDeclaration" || t === "ClassExpression") return false;
+            if (t === "Identifier" || t === "Literal" || t === "ThisExpression" ||
+                t === "Super" || t === "PrivateIdentifier" || t === "EmptyStatement" ||
+                t === "DebuggerStatement" || t === "TemplateElement") return false;
+            for (const k in node) {
+                if (k === "type" || k === "loc" || k === "start" || k === "end" || k === "range") continue;
+                if (k.length && k.charCodeAt(0) === 95) continue;
+                const v = node[k];
+                if (v && typeof v === "object" && walk(v)) return true;
+            }
+            return false;
+        };
+        return walk(expr && expr.body) || walk(expr && expr.params);
+    },
+
+    // Arrow lexical Super / ThisBindingStatus: Super or SuperExpression
+    // (not nested function/class). d2bcc0d extracted the call site but
+    // missed this helper → class ctor arrows COMPILE_FAIL.
+    functionBodyUsesSuper(expr) {
+        const walk = (node) => {
+            if (!node || typeof node !== "object") return false;
+            if (Array.isArray(node)) {
+                for (let i = 0; i < node.length; i++) if (walk(node[i])) return true;
+                return false;
+            }
+            const t = node.type;
+            if (t === "Super" || t === "SuperExpression") return true;
+            if (t === "FunctionExpression" || t === "FunctionDeclaration" ||
+                t === "ClassDeclaration" || t === "ClassExpression") return false;
+            if (t === "Identifier" || t === "Literal" || t === "ThisExpression" ||
+                t === "PrivateIdentifier" || t === "EmptyStatement" ||
+                t === "DebuggerStatement" || t === "MetaProperty" ||
+                t === "TemplateElement") return false;
+            for (const k in node) {
+                if (k === "type" || k === "loc" || k === "start" || k === "end" || k === "range") continue;
+                if (k.length && k.charCodeAt(0) === 95) continue;
+                const v = node[k];
+                if (v && typeof v === "object" && walk(v)) return true;
+            }
+            return false;
+        };
+        return walk(expr && expr.body) || walk(expr && expr.params);
     },
 
     // 函数体是否把 `arguments` 当值引用(非 obj.arguments 属性/对象字面量键)。
@@ -573,6 +635,11 @@ export const ClosureCompiler = {
             vm.store(VReg.FP, so, vm.getArgReg(k));
             saved.push(so);
         }
+        // A5=this: helper 调用(_array_new/_array_push)会毁掉 A5。此前只恢复 A0..A4,
+        // 序言稍后 __this=A5 写成垃圾 → this+arguments 同函数 SIGSEGV(x64; arm64
+        // 同样会被 call 毁掉 A5,只是偶发未爆)。
+        const thisSave = this.ctx.allocLocal("__args_a5_this");
+        vm.store(VReg.FP, thisSave, VReg.A5);
         // [argv 溢出] 实参 5..15 在 _call_argv:快照槽已由 emitArgvSpillSnapshot 备好
         // (未备则本函数只见前 5 个,同旧行为)。argc 守卫在下方收集循环里统一做。
         const spill = this.ctx._argvSpill;
@@ -601,14 +668,87 @@ export const ClosureCompiler = {
         vm.label(done);
         // 标记 arguments 异质:越界 [[Set]] 不抬 length(ARR_IS_ARGUMENTS=bit5)
         vm.load(VReg.A0, VReg.FP, argOff);
-        vm.emitMaskLoad(VReg.V4);
-        vm.andMaskReg(VReg.V0, VReg.A0, VReg.V4); // 裸头
-        vm.loadByte(VReg.V1, VReg.V0, 1);
+        // x64 V4≡A5: mask 入 V4 会毁掉 this,随后 __this=A5 变成掩码。V5/V6 无 ABI 别名。
+        vm.emitMaskLoad(VReg.V5);
+        vm.andMaskReg(VReg.V6, VReg.A0, VReg.V5); // 裸头
+        vm.loadByte(VReg.V1, VReg.V6, 1);
         vm.orImm(VReg.V1, VReg.V1, 32);
-        vm.storeByte(VReg.V0, 1, VReg.V1);
+        vm.storeByte(VReg.V6, 1, VReg.V1);
+        // sloppy: arguments.callee = 当前函数。
+        // IIFE/方法:入口 S0 是闭包(compileClosureCall)。顶层 function 声明直调
+        // 不置 S0 → 用与 compileIdentifier 同一 _funcclosure_<sym> memo 槽。
+        if (!this.ctx.inStrictFunction) {
+            const calS0 = this.ctx.newLabel("args_callee_s0");
+            const calSet = this.ctx.newLabel("args_callee_set");
+            const calSkip = this.ctx.newLabel("args_callee_skip");
+            const calName = this.ctx.newLabel("args_callee_name");
+            vm.shrImm(VReg.V1, VReg.S0, 48);
+            vm.cmpImm(VReg.V1, 0x7FFF);
+            vm.jeq(calS0);
+            vm.cmpImm(VReg.S0, 0);
+            vm.jeq(calName);
+            vm.load(VReg.V0, VReg.S0, 0);
+            vm.cmpImm(VReg.V0, 0xc105);
+            vm.jeq(calS0);
+            vm.jmp(calName);
+            vm.label(calS0);
+            vm.mov(VReg.A2, VReg.S0);
+            vm.shrImm(VReg.V1, VReg.S0, 48);
+            vm.cmpImm(VReg.V1, 0x7FFF);
+            vm.jeq(calSet);
+            vm.emitMaskLoad(VReg.V5);
+            vm.andMaskReg(VReg.A2, VReg.S0, VReg.V5);
+            vm.movImm64(VReg.V1, 0x7fff000000000000n);
+            vm.or(VReg.A2, VReg.A2, VReg.V1);
+            vm.jmp(calSet);
+            vm.label(calName);
+            const fnName = this.ctx.currentFnName;
+            if (fnName && this.ensureFuncClosureSlot && this.getFunctionLabel) {
+                const funcLabel = this.getFunctionLabel(fnName) || (this.getDeclaredFunctionLabel && this.getDeclaredFunctionLabel(fnName));
+                if (funcLabel) {
+                    const fcSymbol = (this.ctx.getFunctionSymbol && this.ctx.getFunctionSymbol(fnName)) || fnName;
+                    const slotLabel = this.ensureFuncClosureSlot(fcSymbol);
+                    const haveL = this.ctx.newLabel("args_callee_have");
+                    vm.lea(VReg.V0, slotLabel);
+                    vm.load(VReg.RET, VReg.V0, 0);
+                    vm.cmpImm(VReg.RET, 0);
+                    vm.jne(haveL);
+                    vm.movImm(VReg.A0, 16);
+                    vm.call("_alloc");
+                    vm.mov(VReg.S1, VReg.RET);
+                    vm.movImm(VReg.V1, 0xc105);
+                    vm.store(VReg.S1, 0, VReg.V1);
+                    vm.lea(VReg.V1, funcLabel);
+                    vm.store(VReg.S1, 8, VReg.V1);
+                    vm.mov(VReg.A0, VReg.S1);
+                    vm.call("_js_box_function");
+                    vm.lea(VReg.V1, slotLabel);
+                    vm.store(VReg.V1, 0, VReg.RET);
+                    vm.label(haveL);
+                    vm.mov(VReg.A2, VReg.RET);
+                    vm.jmp(calSet);
+                }
+            }
+            vm.jmp(calSkip);
+            vm.label(calSet);
+            vm.load(VReg.A0, VReg.FP, argOff);
+            vm.lea(VReg.A1, vm.asm.addString("callee"));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+            vm.or(VReg.A1, VReg.A1, VReg.V1);
+            vm.call("_object_set");
+            vm.label(calSkip);
+        } else {
+            // strict: own callee/caller = %ThrowTypeError% accessors
+            vm.load(VReg.A0, VReg.FP, argOff);
+            vm.call("_args_install_strict_throwers");
+        }
+        // own @@iterator = Array.prototype.values (lazy if proto not filled)
+        vm.load(VReg.A0, VReg.FP, argOff);
+        vm.call("_args_install_iterator");
         for (let k = 0; k <= 4; k++) {
             vm.load(vm.getArgReg(k), VReg.FP, saved[k]);
         }
+        vm.load(VReg.A5, VReg.FP, thisSave);
     },
 
     // [argv 溢出] 寄存器窗口(实参 0-4)之外的实参 5..15 由调用点写 _call_argv 全局。
@@ -794,9 +934,21 @@ export const ClosureCompiler = {
             }
             if (!hasThisCap) captured = captured.concat(["__this"]);
         }
-        // 箭头 lexical Super:捕获外层派生构造器的 __super_called box。
+        // 箭头 lexical NewTarget:捕获外层 __new_target(Call 写 undefined,不能读全局)。
+        const capturesNT = expr.type === "ArrowFunctionExpression" &&
+            this.functionBodyUsesNewTarget(expr);
+        if (capturesNT) {
+            let hasNT = false;
+            for (let i = 0; i < captured.length; i++) {
+                if (captured[i] === "__new_target") { hasNT = true; break; }
+            }
+            if (!hasNT) captured = captured.concat(["__new_target"]);
+        }
+        // 箭头 lexical Super / ThisBindingStatus:捕获外层派生构造器的
+        // __super_called box。() => this 也须见未初始化 this (GetThisBinding)。
         if (expr.type === "ArrowFunctionExpression" &&
-            this.ctx.superCalledOff != null && this.functionBodyUsesSuper(expr)) {
+            this.ctx.superCalledOff != null &&
+            (this.functionBodyUsesSuper(expr) || this.functionBodyUsesThis(expr))) {
             let hasSC = false;
             for (let i = 0; i < captured.length; i++) {
                 if (captured[i] === "__super_called") { hasSC = true; break; }
@@ -887,7 +1039,7 @@ export const ClosureCompiler = {
                 // 重赋值(写 FP 槽的 box)只更新新 box,旧 box 持有者(如顶层函数实参
                 // 求值里的副作用)读到陈旧值(#63:obj.m(arg(1),arg(2)) 丢 a1/a2)。
                 // __this 不是 box,走下面的新建 box 路径。
-                if (outerBoxedVars.has(varName) && varName !== "__this") {
+                if (outerBoxedVars.has(varName) && varName !== "__this" && varName !== "__new_target") {
                     this.vm.load(VReg.V1, VReg.FP, offset);        // V1 = 既有 box 指针
                     this.vm.store(VReg.V3, 16 + i * 8, VReg.V1);   // 闭包槽 = 共享既有 box
                     this.vm.push(VReg.V3);                         // 闭包指针压回,供下轮/后续
@@ -916,6 +1068,19 @@ export const ClosureCompiler = {
                 this.vm.store(VReg.V2, 16 + i * 8, VReg.RET);  // [V2 + offset] = box
 
                 // 将闭包指针重新压栈（供下次迭代或后续使用）
+                this.vm.push(VReg.V2);
+            } else if (varName === "__new_target") {
+                // 顶层箭头:无外层 NewTarget → undefined
+                this.vm.pop(VReg.V3);
+                this.vm.push(VReg.V3);
+                this.vm.movImm64(VReg.V1, 0x7ffb000000000000n);
+                this.vm.push(VReg.V1);
+                this.vm.push(VReg.V3);
+                this.vm.call("_box_alloc");
+                this.vm.pop(VReg.V2);
+                this.vm.pop(VReg.V1);
+                this.vm.store(VReg.RET, 0, VReg.V1);
+                this.vm.store(VReg.V2, 16 + i * 8, VReg.RET);
                 this.vm.push(VReg.V2);
             } else if (varName === "__this") {
                 // 顶层箭头:无外层 __this 槽,词法 this = globalThis。
@@ -993,6 +1158,17 @@ export const ClosureCompiler = {
                     return out;
                 })()
                 : null),
+            classNameFromParent: (this.ctx.classNameBindings
+                ? (() => {
+                    const out = [];
+                    const cn = this.ctx.classNameBindings;
+                    for (let i = 0; i < captured.length; i++) {
+                        const n = captured[i];
+                        if (cn.has(n)) out.push(n);
+                    }
+                    return out;
+                })()
+                : null),
         });
     },
 
@@ -1041,6 +1217,7 @@ export const ClosureCompiler = {
             let fdiList = null;
             this._genStubFnExpr = func.expr;
             this.ctx._pendingImmutableFromParent = func.immutableFromParent;
+            this.ctx._pendingClassNameFromParent = func.classNameFromParent;
             if (isGeneratorFunction(func.expr) && !isAsyncFunction(func.expr)) {
                 fdiList = this.emitGeneratorStub(func.label + "_gbody", true, undefined, func.captured);
             } else if (isGeneratorFunction(func.expr) && isAsyncFunction(func.expr)) {
@@ -1055,6 +1232,7 @@ export const ClosureCompiler = {
             this.compileFunctionBody(func.expr, func.captured, fdiList);
             this._genStubFnExpr = null;
             this.ctx._pendingImmutableFromParent = null;
+            this.ctx._pendingClassNameFromParent = null;
             this._currentModuleAst = savedModuleAst;
             this.ctx.mainCapturedVars = savedMCV;
             this.ctx.functionAliases = savedFA;
@@ -1106,6 +1284,7 @@ export const ClosureCompiler = {
         const prevInStrictFunction = this.ctx.inStrictFunction;
         const prevPreboundFnDecls = this.ctx._preboundFnDecls;
         const prevImmutableLocals = this.ctx.immutableLocals;
+        const prevClassNameBindings = this.ctx.classNameBindings;
         const prevFnExprNameSlot = this.ctx.fnExprNameSlot;
         const prevSuperCalledOff = this.ctx.superCalledOff;
         const prevWithScopes = this.ctx.withScopes;
@@ -1125,12 +1304,15 @@ export const ClosureCompiler = {
         const fnStrict = this._computeFunctionStrict(expr);
         expr._fnStrict = fnStrict;
         this.ctx.inStrictFunction = fnStrict;
+        const prevCurrentFnName = this.ctx.currentFnName;
+        this.ctx.currentFnName = (expr.id && expr.id.name) ? expr.id.name : null;
 
         // 分析函数体中哪些变量会被内部闭包捕获
         const innerBoxedVars = analyzeSharedVariables(expr);
         this._addDirectEvalBoxedVars(expr, innerBoxedVars);
         this.ctx.boxedVars = innerBoxedVars;
         this.ctx.immutableLocals = new Set(this.ctx._pendingImmutableFromParent || []);
+        this.ctx.classNameBindings = new Set(this.ctx._pendingClassNameFromParent || []);
         this.ctx.fnExprNameSlot = 0;
         this.ctx.superCalledOff = null;
         const prevInFunctionBody = this.ctx._inFunctionBody;
@@ -1199,6 +1381,10 @@ export const ClosureCompiler = {
                 if (params[ri] && params[ri].type === "SpreadElement") { needFullArgv = true; break; }
             }
         }
+        // 尽早落 A5=this:emitArgumentsArray / 默认值求值的 helper call 都会毁掉 A5。
+        const thisOffsetEarly = this.ctx.allocLocal("__this");
+        vm.store(VReg.FP, thisOffsetEarly, VReg.A5);
+        this.emitSnapshotNewTarget();
         this.emitArgvSpillSnapshot(needFullArgv ? 16 : params.length);
         if (usesArguments) {
             this.emitArgumentsArray();
@@ -1339,9 +1525,8 @@ export const ClosureCompiler = {
             }
         }
 
-        // 保存 this 指针（通过 A5 传入的隐藏参数）到 __this 局部变量
-        const thisOffset = this.ctx.allocLocal("__this");
-        vm.store(VReg.FP, thisOffset, VReg.A5);
+        // __this 已在 arguments/默认值求值前落入(见 thisOffsetEarly)。
+        // 不可再从 A5 重写:那些路径的 JS/helper 调用已毁掉 A5。
 
         // 处理闭包捕获变量 - 从闭包对象中加载 box 指针
         // S0 寄存器包含闭包对象指针（由 compileClosureCall 传入）
@@ -1385,6 +1570,13 @@ export const ClosureCompiler = {
                     vm.load(VReg.V1, VReg.V1, 0);             // this 值
                     const thisOff = this.ctx.getLocal("__this");
                     vm.store(VReg.FP, thisOff, VReg.V1);
+                    continue;
+                }
+                if (varName === "__new_target") {
+                    vm.load(VReg.V1, VReg.S1, closureOffset);
+                    vm.load(VReg.V1, VReg.V1, 0);
+                    const ntOff = this.ctx.getLocal("__new_target");
+                    if (ntOff != null) vm.store(VReg.FP, ntOff, VReg.V1);
                     continue;
                 }
                 if (varName.length >= 7 && varName.slice(0, 7) === "__with_") {
@@ -1569,7 +1761,9 @@ export const ClosureCompiler = {
         this.ctx.inAsyncGenerator = prevInAsyncGenerator;
         this.ctx.inCoroBody = prevInCoroBody;
         this.ctx.inStrictFunction = prevInStrictFunction;
+        this.ctx.currentFnName = prevCurrentFnName;
         this.ctx.immutableLocals = prevImmutableLocals;
+        this.ctx.classNameBindings = prevClassNameBindings;
         this.ctx.fnExprNameSlot = prevFnExprNameSlot;
         this.ctx.superCalledOff = prevSuperCalledOff;
         this.ctx.withScopes = prevWithScopes;

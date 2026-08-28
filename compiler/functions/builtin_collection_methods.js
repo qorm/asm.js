@@ -718,9 +718,26 @@ export const BuiltinCollectionMethodCompiler = {
                 return true;
 
             case "getTimezoneOffset":
-                // UTC 近似:恒返回 0(记偏差)
-                this.vm.movImm(VReg.RET, 0);
-                this.boxIntAsNumber(VReg.RET);
+                // leftover 0: Invalid Date (ts exponent all-1s) → canonical NaN.
+                // Valid still boxed 0 (UTC approx). Scratch V5/V6 (linux-x64 V0=RET).
+                // A0 still holds date after compileExpression+mov A0,RET.
+                {
+                    const tzoNan = this.ctx.newLabel("tzo_nan");
+                    const tzoDone = this.ctx.newLabel("tzo_done");
+                    this.vm.emitMaskLoad(VReg.V6);
+                    this.vm.andMaskReg(VReg.V5, VReg.A0, VReg.V6);
+                    this.vm.load(VReg.V5, VReg.V5, 8);
+                    this.vm.shrImm(VReg.V5, VReg.V5, 52);
+                    this.vm.andImm(VReg.V5, VReg.V5, 0x7ff);
+                    this.vm.cmpImm(VReg.V5, 0x7ff);
+                    this.vm.jeq(tzoNan);
+                    this.vm.movImm(VReg.RET, 0);
+                    this.boxIntAsNumber(VReg.RET);
+                    this.vm.jmp(tzoDone);
+                    this.vm.label(tzoNan);
+                    this.vm.movImm64(VReg.RET, 0x7ff0000000000001n);
+                    this.vm.label(tzoDone);
+                }
                 return true;
 
             case "getMilliseconds":

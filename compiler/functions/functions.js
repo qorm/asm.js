@@ -213,6 +213,30 @@ export const FunctionCompiler = {
             this.vm.movImm(VReg.V6, argCount);
             this.vm.store(VReg.V5, 0, VReg.V6);
         }
+        // Call (not Construct): NewTarget is undefined. Construct sites
+        // overwrite via emitSetNewTargetFromReg after this helper.
+        this.emitSetNewTargetUndefined();
+    },
+
+    emitSetNewTargetUndefined() {
+        this.vm.lea(VReg.V5, "_call_new_target");
+        this.vm.movImm64(VReg.V6, 0x7ffb000000000000n);
+        this.vm.store(VReg.V5, 0, VReg.V6);
+    },
+
+    emitSetNewTargetFromReg(srcReg) {
+        this.vm.lea(VReg.V5, "_call_new_target");
+        this.vm.store(VReg.V5, 0, srcReg);
+    },
+
+    // Snapshot NewTarget into this frame before any JS call can overwrite the global.
+    // V5/V6: no A0-A5 alias on x64 (R10/R11).
+    emitSnapshotNewTarget() {
+        const off = this.ctx.allocLocal("__new_target");
+        this.vm.lea(VReg.V5, "_call_new_target");
+        this.vm.load(VReg.V6, VReg.V5, 0);
+        this.vm.store(VReg.FP, off, VReg.V6);
+        return off;
     },
 
     // 编译含扩展的调用实参 f(a, ...b, c)
@@ -358,15 +382,32 @@ export const FunctionCompiler = {
     // 与 new Date(y,mo,...)(expressions.js compileNewExpression 的 Date case)同源
     // Hinnant days-from-civil 历法(截断除法 + era 调整,全年代正确、UTC 语义自洽)。
     // 唯一区别:不调用 _date_new_ts 装箱成 Date,而是把毫秒作为裸 float64 数值留在 RET。
-    // 缺省(ECMAScript):month=0、day=1、其余=0(year 缺省→NaN,此处不特判)。
+    // 缺省(ECMAScript):month=0、day=1、其余=0。year 缺省→NaN(0-arg leftover-arg)。
     // 结果留在 RET(V0):裸 float64 位模式,即本运行时的 number 表示(同 getTime/new Date ms)。
     emitDateUTCms(args) {
+        // leftover-arg: Date.UTC() ≡ ToNumber(undefined) → NaN → TimeClip(NaN).
+        // args==0 used to invent year=0/month=0/day=1 (year 0 epoch). Missing
+        // year is NaN. leftover Inf/NaN ToInteger: supplied NaN/±Inf/undefined
+        // used to fcvtzs → 0 (year-0 epoch / leftover month 0). MakeDay/MakeTime
+        // not-finite → NaN. Finite 1-arg+ calendar emit unchanged.
+        if (args.length === 0) {
+            this.vm.movImm64(VReg.RET, 0x7ff0000000000001n); // canonical NaN(number)
+            return;
+        }
+        const nanL = this.ctx.newLabel("dutc_nan");
+        const doneL = this.ctx.newLabel("dutc_done");
         const dOffs = [];
         for (let di2 = 0; di2 < 7; di2++) {
             dOffs.push(this.ctx.allocLocal(`__dutc_a${di2}_${this.nextLabelId()}`));
             if (di2 < args.length) {
                 this.compileExpression(args[di2]);
                 this.emitNumberCoerceFast();
+                // leftover Inf/NaN ToInteger: fcvtzs(NaN/±Inf)→0. Scratch V5
+                // (linux-x64 V0=RET). Exponent all-1s → TimeClip NaN.
+                this.vm.shrImm(VReg.V5, VReg.RET, 52);
+                this.vm.andImm(VReg.V5, VReg.V5, 0x7ff);
+                this.vm.cmpImm(VReg.V5, 0x7ff);
+                this.vm.jeq(nanL);
                 this.vm.fmovToFloat(0, VReg.RET);
                 this.vm.fcvtzs(VReg.RET, 0);
             } else {
@@ -450,6 +491,10 @@ export const FunctionCompiler = {
         this.vm.add(VReg.V2, VReg.V2, VReg.V3); // ms(整数)
         this.vm.scvtf(0, VReg.V2);
         this.vm.fmovToInt(VReg.RET, 0); // RET = 裸 float64 毫秒数值(number)
+        this.vm.jmp(doneL);
+        this.vm.label(nanL);
+        this.vm.movImm64(VReg.RET, 0x7ff0000000000001n); // canonical NaN(number)
+        this.vm.label(doneL);
     },
 
     emitNullishGuardToLabel(reg, label) {
@@ -962,16 +1007,17 @@ export const FunctionCompiler = {
         const dpdCheckProxyLabel = this.ctx.newLabel("dpd_check_proxy");
         this.vm.load(VReg.RET, VReg.FP, oOff);
         // Tag check first: non-object → skip proxy check, let runtime throw TypeError
-        this.vm.shrImm(VReg.V0, VReg.RET, 48);
-        this.vm.cmpImm(VReg.V0, 0x7FFD); this.vm.jeq(dpdCheckProxyLabel);
-        this.vm.cmpImm(VReg.V0, 0);      this.vm.jeq(dpdCheckProxyLabel); // bare ptr
+        // x64 V0≡RET: same as static defineProperty — keep boxed obj in RET.
+        this.vm.shrImm(VReg.V1, VReg.RET, 48);
+        this.vm.cmpImm(VReg.V1, 0x7FFD); this.vm.jeq(dpdCheckProxyLabel);
+        this.vm.cmpImm(VReg.V1, 0);      this.vm.jeq(dpdCheckProxyLabel); // bare ptr
         this.vm.jmp(normalLabel);
         this.vm.label(dpdCheckProxyLabel);
         this.vm.emitMaskLoad(VReg.V1);
-        this.vm.andMaskReg(VReg.V0, VReg.RET, VReg.V1); // 裸指针
-        this.vm.cmpImm(VReg.V0, 0);
+        this.vm.andMaskReg(VReg.V2, VReg.RET, VReg.V1); // 裸指针 (V2≢RET)
+        this.vm.cmpImm(VReg.V2, 0);
         this.vm.jeq(normalLabel);
-        this.vm.loadByte(VReg.V1, VReg.V0, 0);
+        this.vm.loadByte(VReg.V1, VReg.V2, 0);
         this.vm.cmpImm(VReg.V1, 8); // TYPE_PROXY
         this.vm.jne(normalLabel);
         this.vm.load(VReg.A0, VReg.FP, oOff);
@@ -1157,6 +1203,8 @@ export const FunctionCompiler = {
         this.emitExcCtxRestore(excFrameOff);
         vm.pop(VReg.RET);
         vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A5, "_nsobj_promise");
+        vm.load(VReg.A5, VReg.A5, 0);
         vm.call("_Promise_resolve");
         vm.jmp(endLabel);
 
@@ -1168,6 +1216,8 @@ export const FunctionCompiler = {
         vm.store(VReg.V0, 0, VReg.V1);
         vm.lea(VReg.V0, "_exception_value");
         vm.load(VReg.A0, VReg.V0, 0);
+        vm.lea(VReg.A5, "_nsobj_promise");
+        vm.load(VReg.A5, VReg.A5, 0);
         vm.call("_Promise_reject");
 
         vm.label(endLabel);
@@ -1177,6 +1227,10 @@ export const FunctionCompiler = {
 
     // 编译函数调用
     compileCallExpression(expr) {
+        // OptionalChain continuation: `a?.b.c()` / `a?.b.c(++x)` must skip
+        // the call (and args) when the `?.` root is nullish. Same helper as
+        // compileMemberExpression (`a?.b.c` / `o?.c.#f`).
+        if (this._emitOptionalChainContinuation(expr)) return;
         const callee = expr.callee;
 
         // Array.isArray(x) → _instanceof(x, 1)(内建 Array 标识;#15)
@@ -1693,12 +1747,41 @@ export const FunctionCompiler = {
             // 当标识符编译，拿到 namespace 中的类信息对象，再去 tag；表达式父类走
             // superInfoLabel 全局）
             this.emitLoadSuperClassInfo(VReg.S1);
-            // [Cluster 11] 内建构造器无 classinfo → S1=0 → 跳过父构造器调用。
+            // [Cluster 11] 内建构造器无 classinfo → S1=0 → 跳过父 Construct。
             // `this` 已是有效普通对象实例；原型链链接已在 compileClassDeclaration
-            // skipProtoLink 处跳过。非 100% 规范但零误拒/零崩溃。
+            // skipProtoLink 处跳过。ArgumentListEvaluation still runs (spec SuperCall
+            // step 4 before IsConstructor/Construct) so super(thrower()) throws.
             const superSkipLabel = this.ctx.newLabel("super_skip");
+            const superFnL = this.ctx.newLabel("super_fn_parent");
+            const superBindL = this.ctx.newLabel("super_bind");
+            const superConstructL = this.ctx.newLabel("super_construct");
+            const superNullL = this.ctx.newLabel("super_null_parent");
             this.vm.cmpImm(VReg.S1, 0);
-            this.vm.jeq(superSkipLabel);
+            this.vm.jne(superConstructL);
+            this.compileArrayExpressionWithSpread(expr.arguments || []);
+            this.vm.jmp(superSkipLabel);
+            this.vm.label(superConstructL);
+            // extends null sentinel 1: GetSuperConstructor → %FunctionPrototype%
+            // is not a constructor → TypeError (class-definition-null-proto-super).
+            // Old path load(S1+0) at address 1 SIGSEGV. Eval args first (spec SuperCall).
+            this.vm.cmpImm(VReg.S1, 1);
+            this.vm.jne(superNullL);
+            this.compileArrayExpressionWithSpread(expr.arguments || []);
+            this.vm.lea(VReg.A0, this.asm.addString("Super constructor is not a constructor"));
+            this.vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+            this.vm.and(VReg.A0, VReg.A0, VReg.V1);
+            this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+            this.vm.or(VReg.A0, VReg.A0, VReg.V1);
+            this.vm.call("_throw_type_error");
+            this.vm.label(superNullL);
+            // Function parent (0xc105/0xa51c): not classinfo. Reading props_ptr@32
+            // is a SIGSEGV (class-field-is-observable-by-proxy: extends function).
+            // SuperCall Construct(func, args, GetNewTarget()) via _fn_construct_call.
+            this.vm.load(VReg.V1, VReg.S1, 0);
+            this.vm.cmpImm(VReg.V1, 0xc105);
+            this.vm.jeq(superFnL);
+            this.vm.cmpImm(VReg.V1, 0xa51c);
+            this.vm.jeq(superFnL);
             this.vm.load(VReg.S2, VReg.S1, 32); // props_ptr
             this.vm.load(VReg.S2, VReg.S2, 8);  // 父 ctor 地址 = props[0].val
             // 参数编入 A1-A5，A0 = this
@@ -1716,10 +1799,74 @@ export const FunctionCompiler = {
                 }
                 for (let i = n - 1; i >= 0; i--) this.vm.pop(ctorArgRegs[i]);
                 this.vm.pop(VReg.S2);
-                this.emitSetCallArgc(n); // [argc ABI]
+                // 隐式派生 ctor 合成 super(f0..f4):寄存器里仍转发最多 5 个,
+                // 但 _call_argc 必须是 new 的真实个数,否则 parent arguments.length
+                // 恒为 5(new Derived → 5, new Derived(0,1,2) → 5)。
+                if (this.ctx.syntheticDerivedCtor && this.ctx.ctorArgcOff != null) {
+                    this.vm.load(VReg.V6, VReg.FP, this.ctx.ctorArgcOff);
+                    this.emitSetCallArgc(0, VReg.V6);
+                } else {
+                    this.emitSetCallArgc(n); // [argc ABI]
+                }
             }
             if (thisOffset) this.vm.load(VReg.A0, VReg.FP, thisOffset);
+            // SuperCall: Construct(func, argList, GetNewTarget()). emitSetCallArgc
+            // just wrote undefined; restore this frame's NewTarget (most-derived).
+            {
+                const ntOff = this.ctx.getLocal("__new_target");
+                if (ntOff != null) {
+                    this.vm.load(VReg.V6, VReg.FP, ntOff);
+                    this.emitSetNewTargetFromReg(VReg.V6);
+                }
+            }
             this.vm.callIndirect(VReg.S2);
+            this.vm.jmp(superBindL);
+            this.vm.label(superFnL);
+            {
+                const fnSlot = this.ctx.allocLocal(`__super_fn_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, fnSlot, VReg.S1);
+                this.compileArrayExpressionWithSpread(expr.arguments || []);
+                this.vm.mov(VReg.A1, VReg.RET);
+                this.vm.load(VReg.A0, VReg.FP, fnSlot);
+                this.vm.movImm64(VReg.V1, 0x7fff000000000000n);
+                this.vm.or(VReg.A0, VReg.A0, VReg.V1);
+                const ntOff = this.ctx.getLocal("__new_target");
+                if (ntOff != null) this.vm.load(VReg.A2, VReg.FP, ntOff);
+                else this.vm.movImm(VReg.A2, 0);
+                this.vm.call("_fn_construct_call");
+            }
+            this.vm.label(superBindL);
+            // SuperCall BindThisValue: parent Construct result rebinds this
+            // (class C extends B { constructor(){ return new Proxy(this,h) } }).
+            // Must run before emitMarkSuperCalled so field inits see the proxy.
+            if (thisOffset != null) {
+                const keepL = this.ctx.newLabel("super_bind_obj");
+                const doneL = this.ctx.newLabel("super_bind_done");
+                this.vm.shrImm(VReg.V2, VReg.RET, 48);
+                this.vm.cmpImm(VReg.V2, 0x7ffd);
+                this.vm.jeq(keepL);
+                this.vm.cmpImm(VReg.V2, 0x7ffe);
+                this.vm.jeq(keepL);
+                this.vm.cmpImm(VReg.V2, 0x7fff);
+                this.vm.jeq(keepL);
+                this.vm.cmpImm(VReg.V2, 0);
+                this.vm.jne(doneL);
+                this.vm.cmpImm(VReg.RET, 0);
+                this.vm.jeq(doneL);
+                this.vm.loadByte(VReg.V2, VReg.RET, 0);
+                this.vm.cmpImm(VReg.V2, 2);
+                this.vm.jeq(keepL);
+                this.vm.cmpImm(VReg.V2, 8);
+                this.vm.jeq(keepL);
+                this.vm.cmpImm(VReg.V2, 4);
+                this.vm.jeq(keepL);
+                this.vm.cmpImm(VReg.V2, 5);
+                this.vm.jeq(keepL);
+                this.vm.jmp(doneL);
+                this.vm.label(keepL);
+                this.vm.store(VReg.FP, thisOffset, VReg.RET);
+                this.vm.label(doneL);
+            }
             this.vm.label(superSkipLabel);
             // extends Promise 内建 heritage 无 classinfo → 上方 superSkip。
             if (superName === "Promise" && thisOffset != null && !this.ctx.superClassExpr) {
@@ -1755,6 +1902,38 @@ export const FunctionCompiler = {
             if ((prop.type === "Literal" || prop.type === "StringLiteral") && typeof prop.value !== "object")
                 keyName = String(prop.value);
             const thisOffset = this.ctx.getLocal("__this");
+            this.emitGuardDerivedThis();
+            // Object-literal / base-class: no classinfo. Same HomeObject≈this
+            // path as named super.method(). emitLoadSuperClassInfo(undefined)
+            // left S1=0 → load S1+32 SIGSEGV (prop-expr-obj-ref-this).
+            if (!this.ctx.superClass) {
+                this.emitSuperLoadThisProto();
+                const protoOff = this.ctx.allocLocal(`__supth_ccproto_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, protoOff, VReg.RET);
+                if (keyName !== null) {
+                    this.emitBoxedStringKey(keyName, VReg.A1);
+                    this.vm.load(VReg.A0, VReg.FP, protoOff);
+                    this.vm.call("_object_get");
+                } else {
+                    this.compileExpression(prop);
+                    this.vm.mov(VReg.A0, VReg.RET);
+                    this.vm.call("_js_prop_key");
+                    const keyOff = this.ctx.allocLocal(`__supth_cckey_${this.nextLabelId()}`);
+                    this.vm.store(VReg.FP, keyOff, VReg.RET);
+                    this.vm.load(VReg.A0, VReg.FP, protoOff);
+                    this.vm.load(VReg.A1, VReg.FP, keyOff);
+                    this.vm.call("_object_get");
+                }
+                this.vm.mov(VReg.A0, VReg.RET);
+                if (thisOffset) this.vm.load(VReg.A1, VReg.FP, thisOffset);
+                else this.vm.movImm(VReg.A1, 0);
+                this.vm.call("_maybe_getter");
+                this.vm.mov(VReg.V6, VReg.RET);
+                if (thisOffset) this.vm.load(VReg.V5, VReg.FP, thisOffset);
+                else this.vm.movImm(VReg.V5, 0);
+                this.compileMethodCall(VReg.V6, VReg.V5, expr.arguments);
+                return;
+            }
             this.emitLoadSuperClassInfo(VReg.S1);
             if (!this.ctx.inStaticMethod) { this.vm.load(VReg.S1, VReg.S1, 32); this.vm.load(VReg.S1, VReg.S1, 24); }
             this.vm.emitMaskLoad(VReg.V1); this.vm.andMaskReg(VReg.A0, VReg.S1, VReg.V1);
@@ -1774,6 +1953,25 @@ export const FunctionCompiler = {
             callee.object.type === "SuperExpression") {
             const thisOffset = this.ctx.getLocal("__this");
             const methodName = this.getMemberPropertyName(callee.property);
+            // Object-literal / base-class: no classinfo. Get(GetPrototypeOf(this), name)
+            // then Call with this. Same HomeObject≈this approximation as super.prop GET.
+            if (!this.ctx.superClass) {
+                this.emitSuperLoadThisProto();
+                const protoOff = this.ctx.allocLocal(`__supth_cproto_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, protoOff, VReg.RET);
+                this.emitBoxedStringKey(methodName, VReg.A1);
+                this.vm.load(VReg.A0, VReg.FP, protoOff);
+                this.vm.call("_object_get");
+                this.vm.mov(VReg.A0, VReg.RET);
+                if (thisOffset) this.vm.load(VReg.A1, VReg.FP, thisOffset);
+                else this.vm.movImm(VReg.A1, 0);
+                this.vm.call("_maybe_getter");
+                this.vm.mov(VReg.V6, VReg.RET);
+                if (thisOffset) this.vm.load(VReg.V5, VReg.FP, thisOffset);
+                else this.vm.movImm(VReg.V5, 0);
+                this.compileMethodCall(VReg.V6, VReg.V5, expr.arguments);
+                return;
+            }
             this.emitLoadSuperClassInfo(VReg.S1);
             if (!this.ctx.inStaticMethod) {
                 this.vm.load(VReg.S1, VReg.S1, 32); // props_ptr
@@ -1850,7 +2048,7 @@ export const FunctionCompiler = {
             // Map()、Promise() 无 new 抛 TypeError)。排除用户局部变量/函数遮蔽同名(极罕见但合法)。
             if (callee.name === "Map" || callee.name === "Set" ||
                 callee.name === "WeakMap" || callee.name === "WeakSet" ||
-                callee.name === "Promise") {
+                callee.name === "Promise" || callee.name === "Proxy") {
                 const _shadow = _calleeFn ||
                     (this.ctx.getLocal && this.ctx.getLocal(callee.name));
                 if (!_shadow) {
@@ -1895,6 +2093,19 @@ export const FunctionCompiler = {
                     callee: { type: "Identifier", name: "Array" },
                     arguments: expr.arguments,
                 });
+                return;
+            }
+            // Date() 不带 new → 当前时间字符串(ES 21.4.2)。语法位 `Date()` 原先
+            // 不是 hasFunction/local → 整调用被忽略,RET 残值(官方 typeof Date()
+            // 得 "function";孤立 `var d=Date()` 得 number)。值路径
+            // `const D=Date; D()` 已经 ctor 闭包命中 _date_call。实参仍求值
+            // (leftover-arg:`Date(n=39)`),结果丢弃。遮蔽守卫同 Array。
+            if (callee.name === "Date" && !(this.dateNameShadowed && this.dateNameShadowed())) {
+                const dargs = expr.arguments || [];
+                for (let di = 0; di < dargs.length; di++) {
+                    this.compileExpression(dargs[di]);
+                }
+                this.vm.call("_date_call");
                 return;
             }
             // Error 族无 new 调用与 new Error(...) 同义(ES 规范第 19.5.1 节)。
@@ -2601,6 +2812,13 @@ export const FunctionCompiler = {
                 return;
             }
             if (callee.name === "parseFloat") {
+                // leftover-arg: parseFloat() ≡ ToString(undefined)="undefined" → NaN.
+                // args==0 used to compileExpression(missing) leftover 0 then
+                // _str_to_num_not_string leftover qNaN empty vs NaN.
+                if (expr.arguments.length === 0) {
+                    this.vm.movImm64(VReg.RET, 0x7ff0000000000001n);
+                    return;
+                }
                 // 前导数字前缀解析(尾部非数字字符忽略):parseFloat("3.14px")=3.14。
                 // 此前直调 _str_to_num(严格)→ 尾部垃圾判 NaN/0。_js_parseFloat 置宽松位。
                 this.compileExpression(expr.arguments[0]);
@@ -2724,6 +2942,16 @@ export const FunctionCompiler = {
                     this.emitBooleanProtoObject();  // 确保 Boolean.prototype 已物化
                     this.vm.load(VReg.A0, VReg.FP, boolValOff);
                     this.vm.call("_boolean_new");
+                } else if (arg.type === "Literal" && typeof arg.value === "bigint") {
+                    // Object(1n) → BigInt wrapper. Naked bigint is high16=0 heap
+                    // ptr; the dynamic path used to treat it as Number (_number_new
+                    // → _builtin_number SIGSEGV) or as an already-object.
+                    this.compileExpression(arg);
+                    const biOff = this.ctx.allocLocal(`__objcall_bi_${this.nextLabelId()}`);
+                    this.vm.store(VReg.FP, biOff, VReg.RET);
+                    if (this.emitBigIntCtorObject) this.emitBigIntCtorObject();
+                    this.vm.load(VReg.A0, VReg.FP, biOff);
+                    this.vm.call("_bigint_wrap");
                 } else {
                     // 动态参数:运行时 ToObject。
                     this.compileExpression(arg);
@@ -2735,19 +2963,37 @@ export const FunctionCompiler = {
                     this.emitBooleanProtoObject();
                     this.emitNumberProtoObject();
                     this.emitStringProtoObject();
+                    if (this.emitSymbolCtorObject) this.emitSymbolCtorObject();
+                    if (this.emitBigIntCtorObject) this.emitBigIntCtorObject();
                     // 重载参数值
                     this.vm.load(VReg.RET, VReg.FP, argSlot);
-                    // 已是对象(0x7FFD/0x7FFE/裸指针) → 直接返回
+                    // 已是对象(0x7FFD/0x7FFE/0x7FFF 函数/裸指针) → 直接返回
                     const retLabel = `__objc_ret_${uniq}`;
                     const notBareLabel = `__objc_not_bare_${uniq}`;
                     const wrapBoolLabel = `__objc_wrap_bool_${uniq}`;
                     const wrapNumLabel = `__objc_wrap_num_${uniq}`;
                     const wrapStrLabel = `__objc_wrap_str_${uniq}`;
                     const wrapEmptyLabel = `__objc_wrap_empty_${uniq}`;
+                    const wrapSymLabel = `__objc_wrap_sym_${uniq}`;
+                    const wrapBiLabel = `__objc_wrap_bi_${uniq}`;
+                    // Naked Symbol / BigInt are high16=0 heap ptrs, not objects.
+                    // Old path: Symbol fell into Number wrap; BigInt too (or
+                    // returned as-is). _is_* has heap-bounds guards.
+                    this.vm.mov(VReg.A0, VReg.RET);
+                    this.vm.call("_is_symbol");
+                    this.vm.cmpImm(VReg.RET, 0);
+                    this.vm.jne(wrapSymLabel);
+                    this.vm.load(VReg.A0, VReg.FP, argSlot);
+                    this.vm.call("_is_bigint");
+                    this.vm.cmpImm(VReg.RET, 0);
+                    this.vm.jne(wrapBiLabel);
+                    this.vm.load(VReg.RET, VReg.FP, argSlot);
                     this.vm.shrImm(VReg.V1, VReg.RET, 48);
                     this.vm.cmpImm(VReg.V1, 0x7FFD);
                     this.vm.jeq(retLabel);
                     this.vm.cmpImm(VReg.V1, 0x7FFE);
+                    this.vm.jeq(retLabel);
+                    this.vm.cmpImm(VReg.V1, 0x7FFF);
                     this.vm.jeq(retLabel);
                     this.vm.cmpImm(VReg.V1, 0);
                     this.vm.jne(notBareLabel);
@@ -2794,6 +3040,14 @@ export const FunctionCompiler = {
                     this.vm.label(wrapEmptyLabel);
                     this.vm.call("_object_new");
                     this.vm.call("_box_obj_r");
+                    this.vm.jmp(retLabel);
+                    this.vm.label(wrapSymLabel);
+                    this.vm.load(VReg.A0, VReg.FP, argSlot);
+                    this.vm.call("_symbol_wrap");
+                    this.vm.jmp(retLabel);
+                    this.vm.label(wrapBiLabel);
+                    this.vm.load(VReg.A0, VReg.FP, argSlot);
+                    this.vm.call("_bigint_wrap");
                     this.vm.jmp(retLabel);
                     this.vm.label(retLabel);
                 }
@@ -3330,7 +3584,26 @@ export const FunctionCompiler = {
                 const fL = this.ctx.newLabel("numis_f");
                 const eL = this.ctx.newLabel("numis_e");
                 const rawL = this.ctx.newLabel("numis_raw");
-                this.compileExpression(expr.arguments[0]); // RET = 值(整段无 call,V1-V3 安全)
+                this.compileExpression(expr.arguments[0]); // RET = 值
+                // leftover-boolean boxing: Symbol 裸堆指针 high16==0 落 raw 当
+                // subnormal → leftover true. Number.isFinite(Symbol) leftover true vs false.
+                // 同族 isNaN 已 false(指数非全 1)。_is_symbol 毁 RET; linux-x64 V0=RET。
+                // scratch V5; 不碰已占用 V0/V1/V2/V4。+0.0 bits=0 免 call。
+                const nsymL = this.ctx.newLabel("numis_nsym");
+                this.vm.push(VReg.RET);
+                this.vm.shrImm(VReg.V5, VReg.RET, 48);
+                this.vm.cmpImm(VReg.V5, 0);
+                this.vm.jne(nsymL);
+                this.vm.cmpImm(VReg.RET, 0);
+                this.vm.jeq(nsymL); // +0.0, not Symbol
+                this.vm.mov(VReg.A0, VReg.RET);
+                this.vm.call("_is_symbol");
+                this.vm.cmpImm(VReg.RET, 0);
+                this.vm.jeq(nsymL);
+                this.vm.pop(VReg.V5); // discard saved value
+                this.vm.jmp(fL); // Symbol → Type not Number → false
+                this.vm.label(nsymL);
+                this.vm.pop(VReg.RET);
                 this.vm.shrImm(VReg.V1, VReg.RET, 48); // V1 = 高16
                 // 装箱 int32:isNaN → false,其余 → true
                 this.vm.cmpImm(VReg.V1, 0x7FF8);
@@ -3404,10 +3677,15 @@ export const FunctionCompiler = {
                     this.vm.pop(VReg.A0);
                     this.vm.call("_js_parseInt");
                 } else {
-                    // Number.parseFloat ≡ parseFloat(ES2015):宽松前缀解析。
-                    this.compileExpression(expr.arguments[0]);
-                    this.vm.mov(VReg.A0, VReg.RET);
-                    this.vm.call("_js_parseFloat");
+                    // leftover-arg: Number.parseFloat() ≡ parseFloat() leftover-arg NaN.
+                    if (expr.arguments.length === 0) {
+                        this.vm.movImm64(VReg.RET, 0x7ff0000000000001n);
+                    } else {
+                        // Number.parseFloat ≡ parseFloat(ES2015):宽松前缀解析。
+                        this.compileExpression(expr.arguments[0]);
+                        this.vm.mov(VReg.A0, VReg.RET);
+                        this.vm.call("_js_parseFloat");
+                    }
                 }
                 return;
             }
@@ -3449,9 +3727,10 @@ export const FunctionCompiler = {
                     // 当数组 slice → 对生成器等越界读段错误(限制注释已过时)。无 mapFn 的
                     // 非数组走 compileExpression([...x])(与 iterator toArray 同,gen2 安全)。
                     if (expr.arguments.length === 0) {
-                        this.vm.movImm(VReg.A0, 0);
-                        this.vm.call("_array_new_with_size"); // RET = 裸指针
-                        this.vm.call("_box_arr_r"); // box->helper
+                        // leftover-arg: Array.from() ≡ from(undefined) → ToObject(undefined)
+                        // → TypeError. args==0 used to invent leftover []. 1-arg emit
+                        // unchanged (undefined/null already ToObject-throw).
+                        this.emitThrowTypeError("Cannot convert undefined or null to object");
                         return;
                     }
                     const fromArg = expr.arguments[0];
@@ -3512,18 +3791,23 @@ export const FunctionCompiler = {
                             this.vm.call("_box_arr_r"); // box->helper
                             const afromArrSlot = this.ctx.allocLocal(`__afrom_iter_arr_${fid}`);
                             this.vm.store(VReg.FP, afromArrSlot, VReg.RET); // 存装箱数组
-                            this.vm.load(VReg.A1, VReg.FP, objOff); // A1 = src
-                            // 编译 callback(第 2 参) -- 写 RET=X0,arm64 会覆盖 A0
+                            // compileExpression(callback/thisArg) 毁掉 A1/A2(x64 A2===V2)。
+                            // src/callback/thisArg 全部求值后再装 A0-A3。
                             this.compileExpression(expr.arguments[1]);
-                            this.vm.mov(VReg.A2, VReg.RET); // A2 = callback
-                            // thisArg(第 3 参)
+                            const afromCbSlot = this.ctx.allocLocal(`__afrom_iter_cb_${fid}`);
+                            this.vm.store(VReg.FP, afromCbSlot, VReg.RET);
+                            const afromThisSlot = this.ctx.allocLocal(`__afrom_iter_this_${fid}`);
                             if (expr.arguments.length >= 3) {
                                 this.compileExpression(expr.arguments[2]);
-                                this.vm.mov(VReg.A3, VReg.RET); // A3 = thisArg
+                                this.vm.store(VReg.FP, afromThisSlot, VReg.RET);
                             } else {
-                                this.vm.movImm(VReg.A3, 0); // A3 = undefined
+                                this.vm.movImm(VReg.V0, 0);
+                                this.vm.store(VReg.FP, afromThisSlot, VReg.V0);
                             }
-                            this.vm.load(VReg.A0, VReg.FP, afromArrSlot); // 恢复 A0 = 装箱数组
+                            this.vm.load(VReg.A0, VReg.FP, afromArrSlot);
+                            this.vm.load(VReg.A1, VReg.FP, objOff);
+                            this.vm.load(VReg.A2, VReg.FP, afromCbSlot);
+                            this.vm.load(VReg.A3, VReg.FP, afromThisSlot);
                             this.vm.call("_array_spread_into_map"); // RET = 填充后的装箱数组
                             this.vm.store(VReg.FP, arrOff, VReg.RET);
                         } else {
@@ -3582,18 +3866,21 @@ export const FunctionCompiler = {
                             // 求值 src(一次)并留栈槽防二次求值
                             this.compileExpression(fromArg);
                             this.vm.store(VReg.FP, srcOff, VReg.RET);
-                            this.vm.mov(VReg.A1, VReg.RET); // A1 = src
-                            // callback(第 2 参)
                             this.compileExpression(expr.arguments[1]);
-                            this.vm.mov(VReg.A2, VReg.RET); // A2 = callback
-                            // thisArg(第 3 参)
+                            const afromSrcCbSlot = this.ctx.allocLocal(`__afrom_src_cb_${fid}`);
+                            this.vm.store(VReg.FP, afromSrcCbSlot, VReg.RET);
+                            const afromSrcThisSlot = this.ctx.allocLocal(`__afrom_src_this_${fid}`);
                             if (expr.arguments.length >= 3) {
                                 this.compileExpression(expr.arguments[2]);
-                                this.vm.mov(VReg.A3, VReg.RET); // A3 = thisArg
+                                this.vm.store(VReg.FP, afromSrcThisSlot, VReg.RET);
                             } else {
-                                this.vm.movImm(VReg.A3, 0); // A3 = undefined
+                                this.vm.movImm(VReg.V0, 0);
+                                this.vm.store(VReg.FP, afromSrcThisSlot, VReg.V0);
                             }
-                            this.vm.load(VReg.A0, VReg.FP, afromSrcArrSlot); // 恢复 A0 = 装箱数组
+                            this.vm.load(VReg.A0, VReg.FP, afromSrcArrSlot);
+                            this.vm.load(VReg.A1, VReg.FP, srcOff);
+                            this.vm.load(VReg.A2, VReg.FP, afromSrcCbSlot);
+                            this.vm.load(VReg.A3, VReg.FP, afromSrcThisSlot);
                             this.vm.call("_array_spread_into_map"); // RET = 装箱数组
                         }
                     } else if (fromIsArray) {
@@ -3680,21 +3967,20 @@ export const FunctionCompiler = {
                 // When newTarget is present, use it as constructor (with _aref_generic guard
                 // in compileDynamicNew for not-a-constructor tests).
                 if (prop.name === "construct" && rargs.length >= 2) {
+                    // Construct(target, argsList[, newTarget]). newTarget defaults to target.
+                    // Previously the 3-arg path constructed newTarget itself, so
+                    // Reflect.construct(f, [], g) never ran f (new.target stayed f).
+                    let ntOff = null;
                     if (rargs.length >= 3) {
-                        // newTarget provided: construct using newTarget as constructor
+                        ntOff = this.ctx.allocLocal(`__rc_nt_${this.nextLabelId()}`);
                         this.compileExpression(rargs[2]);
-                        this.vm.mov(VReg.V6, VReg.RET);
-                        this.compileDynamicNew(VReg.V6, [
-                            { type: "SpreadElement", argument: rargs[1] },
-                        ]);
-                    } else {
-                        // No newTarget: target is the constructor
-                        this.compileExpression({
-                            type: "NewExpression",
-                            callee: rargs[0],
-                            arguments: [{ type: "SpreadElement", argument: rargs[1] }],
-                        });
+                        this.vm.store(VReg.FP, ntOff, VReg.RET);
                     }
+                    this.compileExpression(rargs[0]);
+                    this.vm.mov(VReg.V6, VReg.RET);
+                    this.compileDynamicNew(VReg.V6, [
+                        { type: "SpreadElement", argument: rargs[1] },
+                    ], ntOff);
                     return;
                 }
                 // Reflect.getOwnPropertyDescriptor(target, key) → Object.getOwnPropertyDescriptor(target, key)
@@ -3735,14 +4021,28 @@ export const FunctionCompiler = {
                 // 两实参**只求值一次**落临时局部再以合成标识符引用:否则对象字面量等每次求值
                 // 产生新对象,`a!==a` 变 `{}!=={}`(不同引用)→ true → 误入 NaN 支路,
                 // 令 `Object.is({},{})`/`Object.is([],[])` 错返 true(应 false)。
-                if (prop.name === "is" && expr.arguments.length >= 2) {
+                if (prop.name === "is") {
+                    // leftover-arg: Object.is() ≡ SameValue(undefined, undefined)
+                    // === true. Object.is(x) ≡ SameValue(x, undefined). Missing
+                    // args are 0x7FFB. args<2 used to fall through to generic
+                    // Object.is call → leftover A0/A1 → SIGSEGV
+                    // (same-value-x-y-empty / same-value-x-y-undefined).
+                    // 2-arg emit unchanged (same SameValue polyfill).
                     const aName = `__objis_a_${this.nextLabelId()}`;
                     const bName = `__objis_b_${this.nextLabelId()}`;
                     const aOff = this.ctx.allocLocal(aName);
                     const bOff = this.ctx.allocLocal(bName);
-                    this.compileExpression(expr.arguments[0]);
+                    if (expr.arguments.length >= 1) {
+                        this.compileExpression(expr.arguments[0]);
+                    } else {
+                        this.vm.movImm64(VReg.RET, 0x7ffb000000000000n);
+                    }
                     this.vm.store(VReg.FP, aOff, VReg.RET);
-                    this.compileExpression(expr.arguments[1]);
+                    if (expr.arguments.length >= 2) {
+                        this.compileExpression(expr.arguments[1]);
+                    } else {
+                        this.vm.movImm64(VReg.RET, 0x7ffb000000000000n);
+                    }
                     this.vm.store(VReg.FP, bOff, VReg.RET);
                     const a = { type: "Identifier", name: aName };
                     const b = { type: "Identifier", name: bName };
@@ -3787,13 +4087,16 @@ export const FunctionCompiler = {
                     // Object.keys(obj) -> array。getOwnPropertyNames 对象路径在本简化模型里
                     // (所有自有键皆可枚举、无 symbol 键)委托 _object_keys;array/string 目标
                     // 额外含 "length"(_object_gopn 入口分派,test262 S1)。
+                    // leftover-arg: Object.keys() ≡ keys(undefined) → ToObject(undefined)
+                    // → TypeError. args==0 used to return leftover 0 and never call.
+                    // Missing arg is 0x7FFB. 1-arg emit unchanged (same helper).
                     if (expr.arguments.length > 0) {
                         this.compileExpression(expr.arguments[0]);
                         this.vm.mov(VReg.A0, VReg.RET);
-                        this.vm.call(prop.name === "keys" ? "_object_keys" : "_object_gopn");
                     } else {
-                        this.vm.movImm(VReg.RET, 0);
+                        this.vm.movImm64(VReg.A0, 0x7ffb000000000000n);
                     }
+                    this.vm.call(prop.name === "keys" ? "_object_keys" : "_object_gopn");
                     return;
                 }
                 if (prop.name === "getOwnPropertySymbols") {
@@ -3809,40 +4112,55 @@ export const FunctionCompiler = {
                 }
                 if (prop.name === "values") {
                     // Object.values(obj) -> array
+                    // leftover-arg: Object.values() ≡ values(undefined) →
+                    // RequireObjectCoercible(undefined) → TypeError. args==0 used
+                    // to return leftover 0 and never call. Missing arg is 0x7FFB.
                     if (expr.arguments.length > 0) {
                         this.compileExpression(expr.arguments[0]);
                         this.vm.mov(VReg.A0, VReg.RET);
-                        this.vm.call("_object_values");
                     } else {
-                        this.vm.movImm(VReg.RET, 0);
+                        this.vm.movImm64(VReg.A0, 0x7ffb000000000000n);
                     }
+                    this.vm.call("_object_values");
                     return;
                 }
                 if (prop.name === "entries") {
                     // Object.entries(obj) -> [[key, value], ...]
+                    // leftover-arg: Object.entries() ≡ entries(undefined) →
+                    // RequireObjectCoercible(undefined) → TypeError. args==0 used
+                    // to return leftover 0 and never call. Missing arg is 0x7FFB.
                     if (expr.arguments.length > 0) {
                         this.compileExpression(expr.arguments[0]);
                         this.vm.mov(VReg.A0, VReg.RET);
-                        this.vm.call("_object_entries");
                     } else {
-                        this.vm.movImm(VReg.RET, 0);
+                        this.vm.movImm64(VReg.A0, 0x7ffb000000000000n);
                     }
+                    this.vm.call("_object_entries");
                     return;
                 }
                 // [#35] Object.hasOwn(o, k):ES ToObject(O) 先于 ToPropertyKey(P)。
                 // 走 _aref_obj_hasOwn(对 A0 先 nullish 抛),勿直调 _object_has
                 // (_object_has 为 hasOwnProperty 保留 ToPropertyKey→ToObject 序)。
                 if (prop.name === "hasOwn") {
+                    // leftover-arg: Object.hasOwn() ≡ hasOwn(undefined, undefined)
+                    // → ToObject(undefined) → TypeError. args<2 used to return
+                    // leftover false and never call. Missing args are 0x7FFB.
+                    // 2-arg emit unchanged (same helper).
                     if (expr.arguments.length >= 2) {
                         this.compileExpression(expr.arguments[0]);
                         this.vm.push(VReg.RET);
                         this.compileExpression(expr.arguments[1]);
                         this.vm.mov(VReg.A1, VReg.RET);
                         this.vm.pop(VReg.A0);
-                        this.vm.call("_aref_obj_hasOwn"); // RET = 装箱布尔
+                    } else if (expr.arguments.length === 1) {
+                        this.compileExpression(expr.arguments[0]);
+                        this.vm.mov(VReg.A0, VReg.RET);
+                        this.vm.movImm64(VReg.A1, 0x7ffb000000000000n);
                     } else {
-                        this.vm.movImm64(VReg.RET, 0x7ff9000000000000n); // was lea+load _js const
+                        this.vm.movImm64(VReg.A0, 0x7ffb000000000000n);
+                        this.vm.movImm64(VReg.A1, 0x7ffb000000000000n);
                     }
+                    this.vm.call("_aref_obj_hasOwn"); // RET = 装箱布尔
                     return;
                 }
                 // [#61 P1] Object.freeze/seal/preventExtensions —— 对象级冻结位。
@@ -3850,17 +4168,21 @@ export const FunctionCompiler = {
                 // helper 内 tag 守卫直接返回原值)。
                 if (prop.name === "freeze" || prop.name === "seal" ||
                     prop.name === "preventExtensions") {
+                    // leftover-arg: Object.freeze() ≡ freeze(undefined) →
+                    // Type(O) is not Object → return O (undefined). args==0
+                    // used to return leftover 0 and never call. Missing arg
+                    // is 0x7FFB. 1-arg emit unchanged (same helper).
                     if (expr.arguments.length > 0) {
                         this.compileExpression(expr.arguments[0]);
                         this.vm.mov(VReg.A0, VReg.RET);
-                        this.vm.call(
-                            prop.name === "freeze" ? "_object_freeze" :
-                            prop.name === "seal" ? "_object_seal" :
-                            "_object_preventExtensions"
-                        );
                     } else {
-                        this.vm.movImm(VReg.RET, 0);
+                        this.vm.movImm64(VReg.A0, 0x7ffb000000000000n);
                     }
+                    this.vm.call(
+                        prop.name === "freeze" ? "_object_freeze" :
+                        prop.name === "seal" ? "_object_seal" :
+                        "_object_preventExtensions"
+                    );
                     return;
                 }
                 // [#61 P1] Object.isFrozen/isSealed/isExtensible —— helper 直接返回
@@ -3965,8 +4287,10 @@ export const FunctionCompiler = {
                         this.vm.label(feDone);
                         this.vm.load(VReg.RET, VReg.FP, feObj);
                     } else {
-                        this.vm.call("_object_new");
-                        this.vm.call("_box_obj_r"); // box->helper
+                        // leftover-arg: Object.fromEntries() ≡ fromEntries(undefined)
+                        // RequireObjectCoercible(undefined) → TypeError. Do not
+                        // invent an empty object (was leftover {} / RET=0).
+                        this.emitThrowTypeError("Cannot convert undefined or null to object");
                     }
                     return;
                 }
@@ -3979,6 +4303,16 @@ export const FunctionCompiler = {
                     // 原逐参路径把 SpreadElement 当单个 source 喂 _object_assign → 丢全部展开源
                     // (返回空/仅 target)。改为:target 落槽,余参经 compileArrayExpressionWithSpread
                     // 建成 sources 数组,运行时逐元素 _object_assign。
+                    // ToObject(number/bool/string) inside _object_assign uses _*_new.
+                    // Those call _ensure_*_proto, which only fill a bare proto (no
+                    // valueOf/constructor) unless the compiler already materialized
+                    // the real Xxx.prototype. Object() already emit*ProtoObject first;
+                    // assign must too or Object.assign(1,{a:1}).valueOf() is
+                    // Object.prototype.valueOf → [object Object] (Target-Number/Boolean).
+                    // Emit before compiling args (clobbers RET). Same three as Object() ToObject.
+                    this.emitBooleanProtoObject();
+                    this.emitNumberProtoObject();
+                    this.emitStringProtoObject();
                     const asgnHasSpread = expr.arguments.slice(1).some((a) => a && a.type === "SpreadElement");
                     if (asgnHasSpread && expr.arguments.length >= 2) {
                         const tgtOff = this.ctx.allocLocal(`__assign_tgt_${this.nextLabelId()}`);
@@ -4033,7 +4367,13 @@ export const FunctionCompiler = {
                         this.vm.load(VReg.A1, VReg.A1, 0);
                         this.vm.call("_object_assign");
                     } else {
-                        this.vm.movImm(VReg.RET, 0);
+                        // leftover-arg: Object.assign() ≡ ToObject(undefined) → TypeError.
+                        // args==0 used to return leftover 0 and never call. Missing
+                        // target is 0x7FFB. 1-arg / n-arg emit unchanged (same helper).
+                        this.vm.movImm64(VReg.A0, 0x7ffb000000000000n);
+                        this.vm.lea(VReg.A1, "_js_undefined");
+                        this.vm.load(VReg.A1, VReg.A1, 0);
+                        this.vm.call("_object_assign");
                     }
                     return;
                 }
@@ -4089,27 +4429,38 @@ export const FunctionCompiler = {
                     // `var TypedArray = Object.getPrototypeOf(Int8Array)` 此前拿到
                     // undefined,该 harness 下 74 例在首个 TypedArray.prototype 读处即抛),
                     // 其余一律尾调既有 _object_getPrototypeOf,语义不变。
+                    // leftover-arg: Object.getPrototypeOf() ≡ getPrototypeOf(undefined)
+                    // → ToObject(undefined) → TypeError (15.2.3.2-0-3). args==0 used
+                    // to return leftover 0 (IEEE +0) and never call. Missing arg is
+                    // 0x7FFB. 1-arg emit unchanged (same helper).
                     if (expr.arguments.length > 0) {
                         this.compileExpression(expr.arguments[0]);
                         this.vm.mov(VReg.A0, VReg.RET);
-                        this.vm.call("_ta_getprototypeof");
                     } else {
-                        this.vm.movImm(VReg.RET, 0);
+                        this.vm.movImm64(VReg.A0, 0x7ffb000000000000n);
                     }
+                    this.vm.call("_ta_getprototypeof");
                     return;
                 }
                 if (prop.name === "setPrototypeOf") {
                     // Object.setPrototypeOf(obj, proto)
+                    // leftover-arg: args<2 still call. Missing proto is undefined
+                    // (TypeError); missing obj is undefined (RequireObjectCoercible).
                     if (expr.arguments.length >= 2) {
                         this.compileExpression(expr.arguments[1]);
                         this.vm.push(VReg.RET);
                         this.compileExpression(expr.arguments[0]);
                         this.vm.pop(VReg.A1);
                         this.vm.mov(VReg.A0, VReg.RET);
-                        this.vm.call("_object_setPrototypeOf");
+                    } else if (expr.arguments.length >= 1) {
+                        this.compileExpression(expr.arguments[0]);
+                        this.vm.mov(VReg.A0, VReg.RET);
+                        this.vm.movImm64(VReg.A1, 0x7ffb000000000000n);
                     } else {
-                        this.vm.movImm(VReg.RET, 0);
+                        this.vm.movImm64(VReg.A0, 0x7ffb000000000000n);
+                        this.vm.movImm64(VReg.A1, 0x7ffb000000000000n);
                     }
+                    this.vm.call("_object_setPrototypeOf");
                     return;
                 }
                 // [#58 B2] Object.defineProperty(obj, key, descriptor)
@@ -4145,16 +4496,20 @@ export const FunctionCompiler = {
                     const dpDoneLabel = this.ctx.newLabel("dp_done");
                     const dpCheckProxyLabel = this.ctx.newLabel("dp_check_proxy");
                     this.vm.load(VReg.RET, VReg.FP, dpObj);
-                    this.vm.shrImm(VReg.V0, VReg.RET, 48);
-                    this.vm.cmpImm(VReg.V0, 0x7FFD); this.vm.jeq(dpCheckProxyLabel);
-                    this.vm.cmpImm(VReg.V0, 0);      this.vm.jeq(dpCheckProxyLabel); // bare ptr
+                    // x64 V0≡RET: extract tag into V1 so the boxed obj in RET survives.
+                    // Old shrImm(V0, RET, 48) left RET=0x7FFD, then loadByte(0x7FFD) SIGSEGV
+                    // on Object.defineProperty({}, "x", {value:1}). Arrays (0x7FFE) skipped
+                    // this proxy check, which is why arguments/array defineProperty worked.
+                    this.vm.shrImm(VReg.V1, VReg.RET, 48);
+                    this.vm.cmpImm(VReg.V1, 0x7FFD); this.vm.jeq(dpCheckProxyLabel);
+                    this.vm.cmpImm(VReg.V1, 0);      this.vm.jeq(dpCheckProxyLabel); // bare ptr
                     this.vm.jmp(dpNormalLabel); // non-object → let runtime throw TypeError
                     this.vm.label(dpCheckProxyLabel);
                     this.vm.emitMaskLoad(VReg.V1);
-                    this.vm.andMaskReg(VReg.V0, VReg.RET, VReg.V1); // 裸指针
-                    this.vm.cmpImm(VReg.V0, 0);
+                    this.vm.andMaskReg(VReg.V2, VReg.RET, VReg.V1); // 裸指针 (V2≢RET)
+                    this.vm.cmpImm(VReg.V2, 0);
                     this.vm.jeq(dpNormalLabel);
-                    this.vm.loadByte(VReg.V1, VReg.V0, 0);
+                    this.vm.loadByte(VReg.V1, VReg.V2, 0);
                     this.vm.cmpImm(VReg.V1, 8); // TYPE_PROXY
                     this.vm.jne(dpNormalLabel);
                     // proxy 分支:求值整份描述符对象 → 陷阱
@@ -4289,16 +4644,26 @@ export const FunctionCompiler = {
                     // defineProperty(fn,"length",{enumerable:true}) 等覆盖必须经运行时侧表
                     // 反映——静态合成会盖掉 attrs/value。一律走 _object_getOwnPropertyDescriptor
                     // (_ogopd_fn:侧表优先,miss 再回落元数据硬编码形状)。
-                    if (expr.arguments.length >= 2) {
-                        this.compileExpression(expr.arguments[0]); // obj
+                    // leftover-arg: Object.getOwnPropertyDescriptor() ≡
+                    // gOPD(undefined, undefined) → ToObject(undefined) →
+                    // TypeError. 1-arg ≡ gOPD(O, undefined). args<2 used to
+                    // return leftover undefined and never call. Missing args
+                    // are 0x7FFB. 2-arg emit unchanged (same helper).
+                    if (expr.arguments.length >= 1) {
+                        this.compileExpression(expr.arguments[0]);
                         this.vm.push(VReg.RET);
-                        this.compileExpression(expr.arguments[1]); // key
+                        if (expr.arguments.length >= 2) {
+                            this.compileExpression(expr.arguments[1]);
+                        } else {
+                            this.vm.movImm64(VReg.RET, 0x7ffb000000000000n);
+                        }
                         this.vm.mov(VReg.A1, VReg.RET);
                         this.vm.pop(VReg.A0);
-                        this.vm.call("_object_getOwnPropertyDescriptor");
                     } else {
-                        this.vm.movImm64(VReg.RET, 0x7ffb000000000000n); // was lea+load _js const
+                        this.vm.movImm64(VReg.A0, 0x7ffb000000000000n);
+                        this.vm.movImm64(VReg.A1, 0x7ffb000000000000n);
                     }
+                    this.vm.call("_object_getOwnPropertyDescriptor");
                     return;
                 }
                 // Object.getOwnPropertyDescriptors(obj):脱糖为 Object.fromEntries(
@@ -4401,6 +4766,12 @@ export const FunctionCompiler = {
                         this.vm.movImm(VReg.RET, 0);
                     }
                     this.vm.mov(VReg.A0, VReg.RET);
+                    // [pcomb A5] 同 Promise.all:快路不设 A5 → 求值实参残留的 A5
+                    // (对象字面量 / 方法 / console.log 的 this)被 _Promise_resolve 误判
+                    // 为 Promise 子类 → NewPromiseCapability(垃圾 C) SIGSEGV。
+                    // 这是 class-symbol-iterator / for-await 的 {value,done} 门。
+                    this.vm.lea(VReg.A5, "_nsobj_promise");
+                    this.vm.load(VReg.A5, VReg.A5, 0);
                     this.vm.call("_Promise_resolve");
                     return;
                 }
@@ -4412,6 +4783,9 @@ export const FunctionCompiler = {
                         this.vm.movImm(VReg.RET, 0);
                     }
                     this.vm.mov(VReg.A0, VReg.RET);
+                    // [pcomb A5] 同 resolve:显式 %Promise%,勿吃实参残留 A5。
+                    this.vm.lea(VReg.A5, "_nsobj_promise");
+                    this.vm.load(VReg.A5, VReg.A5, 0);
                     this.vm.call("_Promise_reject");
                     return;
                 }
@@ -5393,6 +5767,15 @@ export const FunctionCompiler = {
                 const cabGen = this.ctx.newLabel("cab_generic");
                 const cabClos = this.ctx.newLabel("cab_closure");
                 const cabEnd = this.ctx.newLabel("cab_end");
+                // Known class ctor (naked classinfo, type@0==3, high16=0).
+                // Runtime tag/ptrFloor/magic below miss these; Class.bind must
+                // take the inlined Function.prototype.bind path.
+                if (obj && obj.type === "Identifier") {
+                    const _cabDecl = this.ctx.getFunction && this.ctx.getFunction(obj.name);
+                    if (_cabDecl && _cabDecl.type === "ClassDeclaration") {
+                        this.vm.jmp(cabClos);
+                    }
+                }
                 // 裸 TAG_FUNCTION 值(类方法/普通函数读值 c.m,tag=0x7fff、无闭包头):其
                 // 代码指针在 TEXT 段、低于 ptrFloor，旧 magic/ptrFloor 判别误落 cabGen
                 // (把 .call 当对象属性找 → undefined,c.m.call/apply/bind 全崩)。tag 命中
@@ -5407,11 +5790,19 @@ export const FunctionCompiler = {
                 this.vm.jeq(cabGen);
                 this.vm.movImm64(VReg.V1, this.vm.ptrFloor);
                 this.vm.cmp(VReg.V0, VReg.V1);
-                this.vm.jlt(cabGen);
+                // unsigned: heap ptrs may have bit47 set (QEMU/Docker) and
+                // signed jlt treats them as < ptrFloor → classinfo misses cabClos.
+                this.vm.jb(cabGen);
                 this.vm.load(VReg.V1, VReg.V0, 0);
                 this.vm.cmpImm(VReg.V1, 0xc105);
                 this.vm.jeq(cabClos);
                 this.vm.cmpImm(VReg.V1, 0xa51c);
+                this.vm.jeq(cabClos);
+                // classinfo TYPE_FUNCTION=3 (boxed 0x7FFD). Class.bind/call/apply
+                // must take the Function.prototype path — cabGen _object_get
+                // finds bind but _fp_bind_tramp _validate_callable rejects type=3.
+                this.vm.andImm(VReg.V1, VReg.V1, 0xff);
+                this.vm.cmpImm(VReg.V1, 3);
                 this.vm.jeq(cabClos);
                 this.vm.jmp(cabGen);
                 this.vm.label(cabClos);
@@ -5454,7 +5845,13 @@ export const FunctionCompiler = {
                     // call:this=首参,余参原样;apply:this=首参,第二参数组脱糖为 spread
                     const cabT = this.ctx.allocLocal(`__cab_this_${this.nextLabelId()}`);
                     if (expr.arguments.length > 0) this.compileExpression(expr.arguments[0]);
-                    else this.vm.movImm(VReg.RET, 0);
+                    else {
+                        // leftover-arg: fn.call() / fn.apply() thisArg not present
+                        // ≡ undefined. args==0 stored leftover 0 so ToObject(this)
+                        // boxed Number(0) and missed TypeError (flat.call /
+                        // indexOf.call / pop.call). 1-arg thisArg emit unchanged.
+                        this.vm.movImm64(VReg.RET, 0x7ffb000000000000n);
+                    }
                     this.vm.store(VReg.FP, cabT, VReg.RET);
                     const cabRest = prop.name === "call"
                         ? expr.arguments.slice(1)
@@ -5478,6 +5875,25 @@ export const FunctionCompiler = {
                 this.vm.load(VReg.V5, VReg.FP, cabFn);
                 this.compileMethodCall(VReg.V6, VReg.V5, expr.arguments);
                 this.vm.label(cabEnd);
+                return;
+            }
+
+            // this.#m() / C.#g(): PrivateBrandCheck on the receiver before Get.
+            // Generic emitObjectGetIC walks proto, so D.f() → this.#g() found C.#g.
+            // obj is already pushed as this (compileExpression + push above).
+            if (!callee.computed && this._isPrivateMemberKey && this._isPrivateMemberKey(prop)) {
+                const mangled = this.manglePrivateName(prop.name);
+                this.vm.load(VReg.RET, VReg.SP, 0);
+                this.emitPrivateBrandCheck(mangled, 0);
+                this.vm.load(VReg.A0, VReg.SP, 0);
+                this.emitBoxedStringKey(mangled, VReg.A1);
+                this.vm.call("_object_get");
+                this.vm.mov(VReg.A0, VReg.RET);
+                this.vm.load(VReg.A1, VReg.SP, 0);
+                this.vm.call("_maybe_getter");
+                this.vm.mov(VReg.V6, VReg.RET);
+                this.vm.pop(VReg.V5);
+                this.compileMethodCall(VReg.V6, VReg.V5, expr.arguments);
                 return;
             }
 
@@ -5527,16 +5943,65 @@ export const FunctionCompiler = {
 
         // 通用函数调用
         if (callee.type === "Identifier") {
-            // with(obj) 内 method() 直接调用:callee 非已知函数/局部时,经 with-read 解析
-            // (obj.method)后闭包调用(命中);miss 走词法(未知标识符→undefined→not a function)。
-            // 仅活跃 with 作用域触发,普通代码不变。(this=undefined,罕用,记偏差)
-            if (this.ctx.withScopes && this.ctx.withScopes.length > 0 && !this._inWithResolve &&
+            // with(obj) 内 method() 直接调用:HasBinding 命中则 Get +
+            // compileMethodCall(this=WithBaseObject)。此前 with-read 后
+            // compileClosureCall → sloppy OrdinaryCallBindThis = globalThis
+            // (with-base-obj leftover)。仅活跃 with 触发;已知函数/局部仍走下方。
+            if (this._hasAnyWithScope() && !this._inWithResolve &&
                 !this.ctx.hasFunction(callee.name) &&
                 !(this.ctx.getLocal && this.ctx.getLocal(callee.name)) &&
                 !this.ctx.getMainCapturedVar(callee.name)) {
-                this.compileExpression(callee); // with-read → obj[name]
+                const doneL = this.ctx.newLabel("with_call_done");
+                const cur = this.ctx.withScopes || [];
+                for (let wi = cur.length - 1; wi >= 0; wi--) {
+                    const missL = this.ctx.newLabel("with_call_miss");
+                    this._emitObjectEnvHasBinding(cur[wi], callee.name, missL);
+                    // x64 V0≡RET: HasBinding 后从帧槽重载 (V5=this, V6=func)
+                    this.vm.load(VReg.A0, VReg.FP, cur[wi]);
+                    this.vm.push(VReg.A0);
+                    this.emitBoxedStringKey(callee.name, VReg.A1);
+                    this.vm.call("_object_get");
+                    this.vm.mov(VReg.A0, VReg.RET);
+                    this.vm.pop(VReg.A1);
+                    this.vm.call("_maybe_getter");
+                    this.vm.mov(VReg.V6, VReg.RET);
+                    this.vm.load(VReg.V5, VReg.FP, cur[wi]);
+                    this.compileMethodCall(VReg.V6, VReg.V5, expr.arguments);
+                    this.vm.jmp(doneL);
+                    this.vm.label(missL);
+                }
+                if (this._isOwnBinding(callee.name)) {
+                    this._inWithResolve = true;
+                    this.compileExpression(callee);
+                    this._inWithResolve = false;
+                    this.vm.mov(VReg.V6, VReg.RET);
+                    this.compileClosureCall(VReg.V6, expr.arguments);
+                    this.vm.jmp(doneL);
+                } else {
+                    const outer = this.ctx.outerWithScopes || [];
+                    for (let wi = outer.length - 1; wi >= 0; wi--) {
+                        const missL = this.ctx.newLabel("with_call_omiss");
+                        this._emitObjectEnvHasBinding(outer[wi], callee.name, missL);
+                        this.vm.load(VReg.A0, VReg.FP, outer[wi]);
+                        this.vm.push(VReg.A0);
+                        this.emitBoxedStringKey(callee.name, VReg.A1);
+                        this.vm.call("_object_get");
+                        this.vm.mov(VReg.A0, VReg.RET);
+                        this.vm.pop(VReg.A1);
+                        this.vm.call("_maybe_getter");
+                        this.vm.mov(VReg.V6, VReg.RET);
+                        this.vm.load(VReg.V5, VReg.FP, outer[wi]);
+                        this.compileMethodCall(VReg.V6, VReg.V5, expr.arguments);
+                        this.vm.jmp(doneL);
+                        this.vm.label(missL);
+                    }
+                }
+                this._inWithResolve = true;
+                this.compileExpression(callee);
+                this._inWithResolve = false;
                 this.vm.mov(VReg.V6, VReg.RET);
                 this.compileClosureCall(VReg.V6, expr.arguments);
+                this.vm.label(doneL);
                 return;
             }
             const globalLabel = this.ctx.getMainCapturedVar(callee.name);
@@ -5623,12 +6088,26 @@ export const FunctionCompiler = {
             } else if (t === "Property") {
                 if ((!node.kind || node.kind === "init") && isAnonCallable(node.value)) {
                     const kn = keyName(node.key, node.computed);
-                    if (kn !== null) hints.set(node.value, kn);
+                    // Proto setter is not NamedEvaluation; method `{ __proto__() {} }`
+                    // already has parse-time _fnHint.
+                    if (kn !== null && (kn !== "__proto__" || node.method)) hints.set(node.value, kn);
                 }
             } else if (t === "MethodDefinition") {
                 if ((!node.kind || node.kind === "method") && isAnonCallable(node.value)) {
                     const kn = keyName(node.key, node.computed);
                     if (kn !== null) hints.set(node.value, kn);
+                }
+            } else if (t === "PropertyDefinition") {
+                // class fields (static/instance, public/private)
+                if (isAnonCallable(node.value)) {
+                    if (node.key && node.key.type === "PrivateIdentifier" &&
+                        typeof node.key.name === "string") {
+                        const pn = node.key.name;
+                        hints.set(node.value, pn.charAt(0) === "#" ? pn : "#" + pn);
+                    } else {
+                        const kn = keyName(node.key, node.computed);
+                        if (kn !== null) hints.set(node.value, kn);
+                    }
                 }
             }
             for (const k in node) {

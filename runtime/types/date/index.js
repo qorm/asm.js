@@ -736,14 +736,24 @@ export class DateGenerator {
         vm.store(VReg.S0, 8, VReg.RET);
         vm.epilogue([VReg.S0, VReg.S1], 0);
 
-        // getTimezoneOffset wrapper:本运行时全 UTC,恒返回装箱 0(同 compileDateMethod)。
+        // getTimezoneOffset wrapper:本运行时全 UTC,valid → 装箱 0;Invalid Date leftover
+        // 0 → canonical NaN(同 compileDateMethod / _date_get_part_num)。
         // [Date 加固] 仍先校验接收者(非 Date 抛 TypeError,与 node 一致)。
         vm.label("_aref_date_tzoffset");
         vm.prologue(0, []);
-        vm.call("_date_this_get"); // 仅校验(this 丢弃;非 Date 不返回)
+        vm.call("_date_this_get"); // RET = 裸 date 指针(非 Date 不返回)
+        // leftover 0: ts exponent all-1s → NaN. Scratch V5 (linux-x64 V0=RET).
+        vm.load(VReg.V5, VReg.RET, 8);
+        vm.shrImm(VReg.V5, VReg.V5, 52);
+        vm.andImm(VReg.V5, VReg.V5, 0x7ff);
+        vm.cmpImm(VReg.V5, 0x7ff);
+        vm.jeq("_aref_date_tzoffset_nan");
         vm.movImm(VReg.RET, 0);
         vm.scvtf(0, VReg.RET);
         vm.fmovToInt(VReg.RET, 0);
+        vm.epilogue([], 0);
+        vm.label("_aref_date_tzoffset_nan");
+        vm.movImm64(VReg.RET, 0x7ff0000000000001n);
         vm.epilogue([], 0);
 
         // ── [Date 加固] this 校验族 ────────────────────────────────────────────

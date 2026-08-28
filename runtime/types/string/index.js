@@ -596,8 +596,16 @@ export class StringGenerator {
         vm.cmp(VReg.S0, VReg.V1);
         vm.jge("_getStrContent_invalid"); // 超出堆当前边界，非法指针
 
-        // 在堆范围内，检查类型标记是否为 STRING
+        // 在堆范围内，检查类型标记是否为 STRING。
+        // S0 是 user_ptr(block+16) 才合法;symbol/对象块指针(type@0)的 S0-16
+        // 可能低于 heap_base → 解引用未映射页 SIGSEGV。
+        // new Number() 在 Number.prototype 已挂 Symbol.toStringTag 后
+        // _object_set(__number_value) 走链 _object_key_eq 即踩此坑。
         vm.subImm(VReg.V0, VReg.S0, 16); // V0 = block pointer
+        vm.lea(VReg.V1, "_heap_base");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jlt("_getStrContent_invalid");
         vm.load(VReg.V1, VReg.V0, 0);
         vm.andImm(VReg.V1, VReg.V1, 0xff);
         vm.movImm(VReg.V2, TYPE_STRING);
@@ -1564,14 +1572,14 @@ export class StringGenerator {
         vm.call("_object_user_tostr");
         vm.cmpImm(VReg.RET, 0);
         vm.jeq("_valueToStr_try_vo"); // toString 非 callable → 试 valueOf(hint string 第二方法)
-        vm.shrImm(VReg.V0, VReg.RET, 48);
-        vm.cmpImm(VReg.V0, 0x7FFD);       // toString 返回仍是对象
+        vm.shrImm(VReg.V2, VReg.RET, 48); // x64 V0≡RET: tag 入 V2, 否则 RET 被毁后递归 stringify 标签
+        vm.cmpImm(VReg.V2, 0x7FFD);       // toString 返回仍是对象
         vm.jeq("_valueToStr_try_vo");
-        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.cmpImm(VReg.V2, 0x7FFE);
         vm.jeq("_valueToStr_try_vo");
-        vm.cmpImm(VReg.V0, 0x7FFF);       // 或函数(hint String:再试 valueOf)
+        vm.cmpImm(VReg.V2, 0x7FFF);       // 或函数(hint String:再试 valueOf)
         vm.jeq("_valueToStr_try_vo");
-        vm.cmpImm(VReg.V0, 0);
+        vm.cmpImm(VReg.V2, 0);
         vm.jne("_valueToStr_obj_tostr_ok"); // 带 tag 的原语 → 递归归一
         // high16==0:裸堆对象(return {})须试 valueOf;数据段串则当原语。
         vm.cmpImm(VReg.RET, 0);
@@ -1594,19 +1602,17 @@ export class StringGenerator {
         vm.label("_valueToStr_try_vo");
         vm.mov(VReg.A0, VReg.S0);         // 恢复原装箱对象
         vm.call("_object_user_valueof");  // 尝试 valueOf
-        vm.cmpImm(VReg.RET, 0);
+        vm.shrImm(VReg.V2, VReg.RET, 48); // x64 V0≡RET
+        vm.cmpImm(VReg.V2, 0x7FFD);       // valueOf 又返对象 / 无 valueOf
         vm.jeq("_valueToStr_object_default");
-        vm.shrImm(VReg.V0, VReg.RET, 48);
-        vm.cmpImm(VReg.V0, 0x7FFD);       // valueOf 又返对象
+        vm.cmpImm(VReg.V2, 0x7FFE);
         vm.jeq("_valueToStr_object_default");
-        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.cmpImm(VReg.V2, 0x7FFF);       // 或函数
         vm.jeq("_valueToStr_object_default");
-        vm.cmpImm(VReg.V0, 0x7FFF);       // 或函数
-        vm.jeq("_valueToStr_object_default");
-        vm.cmpImm(VReg.V0, 0);
+        vm.cmpImm(VReg.V2, 0);
         vm.jne("_valueToStr_vo_ok");
         vm.cmpImm(VReg.RET, 0);
-        vm.jeq("_valueToStr_object_default");
+        vm.jeq("_valueToStr_vo_ok");      // +0.0 primitive
         vm.lea(VReg.V1, "_heap_base");
         vm.load(VReg.V1, VReg.V1, 0);
         vm.cmp(VReg.RET, VReg.V1);
@@ -1999,8 +2005,8 @@ export class StringGenerator {
         vm.movImm64(VReg.V0, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.A1, VReg.V0);
         vm.call("_object_get");
-        vm.shrImm(VReg.V0, VReg.RET, 48);
-        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.shrImm(VReg.V2, VReg.RET, 48); // x64 V0≡RET: 否则把 toString 闭包毁成标签 0x7FFF
+        vm.cmpImm(VReg.V2, 0x7FFD);
         vm.jne("_object_user_tostr_getter");
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.RET, VReg.RET, VReg.V1);
@@ -2025,6 +2031,7 @@ export class StringGenerator {
         vm.load(VReg.V1, VReg.S0, 8);      // V1 = 真函数指针
         vm.mov(VReg.A0, VReg.S2);
         vm.mov(VReg.A5, VReg.S2);          // this = 对象
+        vm.movImm64(VReg.A1, 0x7ffb000000000000n); // undefined (argc=0; toString radix)
         vm.setCallArgcImm(0, VReg.V0, VReg.V2); // [argc ABI] toString()
         vm.callIndirect(VReg.V1);          // RET = 用户 toString 结果
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
@@ -2033,7 +2040,9 @@ export class StringGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
 
         // _object_user_valueof(A0 = 装箱对象) -> RET:自有 function 型 valueOf 的调用结果,
-        // 或 0(无)。ToNumber(obj) via _number_coerce 用。约定同 _object_user_tostr。
+        // 或原对象(无 callable valueOf)。+0.0 是合法原语,不能再用 0 作 miss 哨兵
+        // (`""+new Number(0)` 曾把 valueOf=+0 当 miss → toString  leftover A1 当 radix SIGSEGV)。
+        // 调用方以 tag 0x7FFD/0x7FFF 判"仍是对象,试下一方法"。
         vm.label("_object_user_valueof");
         vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2]);
         vm.mov(VReg.S2, VReg.A0);
@@ -2042,8 +2051,8 @@ export class StringGenerator {
         vm.movImm64(VReg.V0, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.A1, VReg.V0);
         vm.call("_object_get");
-        vm.shrImm(VReg.V0, VReg.RET, 48);
-        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.shrImm(VReg.V2, VReg.RET, 48); // x64 V0≡RET: 否则 valueOf 闭包毁成标签
+        vm.cmpImm(VReg.V2, 0x7FFD);
         vm.jne("_object_user_valueof_getter");
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.RET, VReg.RET, VReg.V1);
@@ -2068,11 +2077,12 @@ export class StringGenerator {
         vm.load(VReg.V1, VReg.S0, 8);
         vm.mov(VReg.A0, VReg.S2);
         vm.mov(VReg.A5, VReg.S2);
+        vm.movImm64(VReg.A1, 0x7ffb000000000000n); // undefined (argc=0)
         vm.setCallArgcImm(0, VReg.V0, VReg.V2); // [argc ABI] valueOf()
         vm.callIndirect(VReg.V1);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
         vm.label("_object_user_valueof_none");
-        vm.movImm(VReg.RET, 0);
+        vm.mov(VReg.RET, VReg.S2); // still-object sentinel (not +0.0)
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
 
         // _call_toprimitive(A0=装箱对象 0x7FFD, A1=hint 装箱串) -> RET:
@@ -2093,18 +2103,13 @@ export class StringGenerator {
         vm.movImm64(VReg.V0, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.A1, VReg.V0);
         vm.call("_symbol_wellknown"); // RET = symbol 键
+        // Same path as obj[Symbol.toPrimitive]: _subscript_get does
+        // ToPropertyKey + Get + _maybe_getter. Direct _object_get(obj,
+        // wellknown) missed defineProperty accessors after _jpk_low
+        // stringified the stored key.
         vm.mov(VReg.A1, VReg.RET);
         vm.mov(VReg.A0, VReg.S2);
-        vm.call("_object_get");       // RET = 方法或 undef/0
-        vm.shrImm(VReg.V0, VReg.RET, 48);
-        vm.cmpImm(VReg.V0, 0x7FFD);
-        vm.jne("_ctp_getter");
-        vm.emitMaskLoad(VReg.V1);
-        vm.andMaskReg(VReg.RET, VReg.RET, VReg.V1); // 装箱 getter 标记须脱壳,_maybe_getter 只认裸指针
-        vm.label("_ctp_getter");
-        vm.mov(VReg.A0, VReg.RET);
-        vm.mov(VReg.A1, VReg.S2);
-        vm.call("_maybe_getter");     // GetMethod:访问器必须调用(可抛 Test262Error)
+        vm.call("_subscript_get");
         vm.mov(VReg.S1, VReg.RET);
         vm.lea(VReg.V0, "_js_undefined");
         vm.load(VReg.V0, VReg.V0, 0);
@@ -2127,10 +2132,10 @@ export class StringGenerator {
         vm.setCallArgcImm(1, VReg.V0, VReg.V2); // [argc ABI] [Symbol.toPrimitive](hint)
         vm.callIndirect(VReg.V1);
         // ToPrimitive:exotic 返回对象 → TypeError(不可回落 OrdinaryToPrimitive)
-        vm.shrImm(VReg.V0, VReg.RET, 48);
-        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.shrImm(VReg.V2, VReg.RET, 48); // x64 V0≡RET: 否则原语结果被毁成标签
+        vm.cmpImm(VReg.V2, 0x7FFD);
         vm.jeq("_ctp_obj_result");
-        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.cmpImm(VReg.V2, 0x7FFE);
         vm.jeq("_ctp_obj_result");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
         vm.label("_ctp_not_callable");
@@ -2148,6 +2153,20 @@ export class StringGenerator {
         vm.label("_js_toprimitive");
         vm.prologue(16, [VReg.S0]);
         vm.mov(VReg.S0, VReg.A0);
+        // Date [[DefaultValue]] / @@toPrimitive hint default is string.
+        // Must run before GetMethod: _subscript_get on a 16B Date can return
+        // leftover 0 (timestamp@8) which looks like a primitive and skips
+        // OrdinaryToPrimitive. valueOf would also yield 0 so date+date was 0.
+        vm.shrImm(VReg.V2, VReg.S0, 48);
+        vm.cmpImm(VReg.V2, 0x7FFD);
+        vm.jne("_js_toprim_try_exotic");
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.V1, VReg.S0, VReg.V1);
+        vm.load(VReg.V0, VReg.V1, 0);
+        vm.andImm(VReg.V0, VReg.V0, 0xff);
+        vm.cmpImm(VReg.V0, 7); // TYPE_DATE
+        vm.jeq("_js_toprim_default_str");
+        vm.label("_js_toprim_try_exotic");
         // [Symbol.toPrimitive] 优先(hint "default")
         vm.mov(VReg.A0, VReg.S0);
         vm.lea(VReg.A1, vm.asm.addString("default"));
@@ -2160,22 +2179,77 @@ export class StringGenerator {
         vm.cmpImm(VReg.V2, 0x7FFF);        // 函数(含无 trap 原样返回)→ 同样回退
         vm.jne("_js_toprim_done");
         vm.label("_js_toprim_ordinary");
+        // BigInt wrapper: [[BigIntData]] via __bigint_value (Object(2n)+1n).
+        // After @@toPrimitive miss so a user trap still wins. x64 V0≡RET:
+        // cannot cmp RET against a constant loaded into V0.
+        vm.mov(VReg.A0, VReg.S0);
+        vm.lea(VReg.A1, vm.asm.addString("__bigint_value"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.store(VReg.SP, 0, VReg.RET);
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_is_bigint");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_js_toprim_no_bi_slot");
+        vm.load(VReg.RET, VReg.SP, 0);
+        vm.jmp("_js_toprim_done");
+        vm.label("_js_toprim_no_bi_slot");
+        // Number wrapper: [[NumberData]] via __number_value (new Number(1)+"").
+        // After @@toPrimitive miss so a user trap still wins. x64 V0≡RET:
+        // save at SP+0; accept boxed int32 / IEEE float / +0.0; reject
+        // undefined and naked heap leftovers.
+        vm.mov(VReg.A0, VReg.S0);
+        vm.lea(VReg.A1, vm.asm.addString("__number_value"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.store(VReg.SP, 0, VReg.RET);
+        vm.shrImm(VReg.V1, VReg.RET, 48);
+        vm.cmpImm(VReg.V1, 0x7FFB);
+        vm.jeq("_js_toprim_no_num_slot");
+        vm.cmpImm(VReg.V1, 0x7FF8);
+        vm.jeq("_js_toprim_num_hit");
+        vm.cmpImm(VReg.V1, 0x7FF9);
+        vm.jlt("_js_toprim_num_raw");
+        vm.cmpImm(VReg.V1, 0x7FFF);
+        vm.jle("_js_toprim_no_num_slot");
+        vm.jmp("_js_toprim_num_hit");
+        vm.label("_js_toprim_num_raw");
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_js_toprim_num_hit");
+        vm.movImm64(VReg.V1, vm.ptrFloor);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jge("_js_toprim_no_num_slot");
+        vm.label("_js_toprim_num_hit");
+        vm.load(VReg.RET, VReg.SP, 0);
+        vm.jmp("_js_toprim_done");
+        vm.label("_js_toprim_no_num_slot");
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_object_user_valueof");   // A0 仍是对象/函数
-        vm.cmpImm(VReg.RET, 0);
-        vm.jeq("_js_toprim_try_tostr");
+        // miss 现返原对象(0x7FFD);+0.0 是合法原语,勿 cmpImm 0。
         vm.shrImm(VReg.V2, VReg.RET, 48); // (x64 V2==A2 无活值;V0≡RET 会盖掉原始值结果)
-        vm.cmpImm(VReg.V2, 0x7FFD);        // valueOf 结果又是对象?
+        vm.cmpImm(VReg.V2, 0x7FFD);        // valueOf 结果又是对象 / 无 valueOf?
         vm.jeq("_js_toprim_try_tostr");
         vm.cmpImm(VReg.V2, 0x7FFF);        // 或仍是函数
-        vm.jne("_js_toprim_done");         // 原始值 → 用
+        vm.jne("_js_toprim_done");         // 原始值(含 +0.0) → 用
         vm.label("_js_toprim_try_tostr");
         // OrdinaryToPrimitive:valueOf 返对象后调用户 toString(可抛);无则 _valueToStr。
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_object_user_tostr");
-        vm.cmpImm(VReg.RET, 0);
-        vm.jeq("_js_toprim_default_str");
+        // +0.0 is a legal primitive. Miss sentinel is also 0, but a callable
+        // toString already returned its result (`1 > {toString:()=>0}`).
+        // Still-object tags → TypeError (valueOf already failed this branch).
+        vm.shrImm(VReg.V2, VReg.RET, 48); // x64 V0≡RET: keep primitive result
+        vm.cmpImm(VReg.V2, 0x7FFD);
+        vm.jeq("_js_toprim_both_obj");
+        vm.cmpImm(VReg.V2, 0x7FFF);
+        vm.jeq("_js_toprim_both_obj");
+        vm.cmpImm(VReg.V2, 0x7FFE);
+        vm.jeq("_js_toprim_both_obj");
         vm.epilogue([VReg.S0], 16);
+        vm.label("_js_toprim_both_obj");
+        this._emitThrowTypeError("Cannot convert object to primitive value");
         vm.label("_js_toprim_default_str");
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_valueToStr");
@@ -3076,22 +3150,56 @@ export class StringGenerator {
 
         vm.label("_str_charAt");
         vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2]);
-        vm.store(VReg.SP, 0, VReg.A1); // pos 存栈:ToString(this) 的 call 可能踩 S1
+        vm.store(VReg.SP, 0, VReg.A1); // pos 存栈:ToString/_strlen 的 call 踩 A1/S1
         vm.mov(VReg.A0, VReg.A0);
         this._emitThisToString("charAt");
         vm.mov(VReg.S0, VReg.A0);
+
+        // leftover-arg / V0 smash:先 _strlen,再从栈重装 pos。预 fcvtzs/+_emitToInteger
+        // 在 x64 上把 NaN 收成 INT64_MIN(V0==RET 冲 float bits),charAt(NaN) 空串。
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_strlen");
+        vm.mov(VReg.S2, VReg.RET); // S2 = len(越界用;稍后 _getStrContent 覆写为内容指针)
+
         vm.load(VReg.A0, VReg.SP, 0);
-        this._emitToInteger("charAt");
-        vm.mov(VReg.S1, VReg.RET);
+        // at()/s[i] 仍传裸 int(high16=0/符号扩展)。0-arg emit 亦裸 0。勿当 float。
+        vm.shrImm(VReg.V1, VReg.A0, 48);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_charAt_raw");
+        vm.cmpImm(VReg.V1, 0xFFFF);
+        vm.jeq("_charAt_raw");
+        // 勿把 high16==0x8000 当裸 INT64_MIN:IEEE -0.0 同型,charAt(-0) 须为 "a"(S9.4_A2)
+        vm.call("_number_coerce");
+        // ToInteger:NaN→0;±Inf→oob(≠ substring 的 -Inf→0)。x64 V0==RET,extract 用 V2。
+        {
+            const expReg = vm.backend.name === "x64" ? VReg.V2 : VReg.V0;
+            vm.shrImm(expReg, VReg.RET, 52);
+            vm.andImm(expReg, expReg, 0x7FF);
+            vm.cmpImm(expReg, 0x7FF);
+            vm.jne("_charAt_finite");
+            vm.movImm64(expReg, 0x000fffffffffffffn);
+            vm.and(expReg, VReg.RET, expReg);
+            vm.cmpImm(expReg, 0);
+            vm.jne("_charAt_zero"); // NaN → 0
+        }
+        vm.jmp("_str_charAt_oob"); // ±Inf → ""
+        vm.label("_charAt_zero");
+        vm.movImm(VReg.S1, 0);
+        vm.jmp("_charAt_pos_done");
+        vm.label("_charAt_finite");
+        vm.fmovToFloat(0, VReg.RET);
+        vm.fcvtzs(VReg.S1, 0);
+        vm.jmp("_charAt_pos_done");
+        vm.label("_charAt_raw");
+        vm.mov(VReg.S1, VReg.A0);
+        vm.label("_charAt_pos_done");
 
         // 越界检查:index<0 或 >=length → 返回空字符串(charAt 语义;此前无检查 → 越界
         // 读堆邻居返垃圾字符,是 `"hi".charAt(5)`/`s[oob]` 返垃圾、动态串下标崩的共因)。
         // 注:.at()/自带界检的调用者只在界内调本函数,不受影响。
-        vm.mov(VReg.A0, VReg.S0);
-        vm.call("_strlen");        // RET = 长度
         vm.cmpImm(VReg.S1, 0);
         vm.jlt("_str_charAt_oob");
-        vm.cmp(VReg.S1, VReg.RET);
+        vm.cmp(VReg.S1, VReg.S2);
         vm.jge("_str_charAt_oob");
 
         // 获取字符串内容指针
@@ -3345,12 +3453,44 @@ export class StringGenerator {
 
         vm.label("_str_charCodeAt");
         vm.prologue(16, [VReg.S0, VReg.S1]);
-        vm.store(VReg.SP, 0, VReg.A1); // pos 存栈,躲 ToString 的 call
+        vm.store(VReg.SP, 0, VReg.A1); // pos 存栈:ToString 的 call 踩 A1
         this._emitThisToString("charCodeAt");
         vm.mov(VReg.S1, VReg.A0);
+
+        // leftover-arg / V0 smash:先 ToString,再从栈重装 pos。预 fcvtzs/+_emitToInteger
+        // 在 x64 上把 NaN/string 收成 INT64_MIN(V0==RET 冲 float bits),charCodeAt(NaN) NaN。
         vm.load(VReg.A0, VReg.SP, 0);
-        this._emitToInteger("charCodeAt");
-        vm.mov(VReg.S0, VReg.RET); // S0 = index (int)
+        // at()/s[i] 仍传裸 int(high16=0/符号扩展)。0-arg emit 亦裸 0。勿当 float。
+        vm.shrImm(VReg.V1, VReg.A0, 48);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_charCodeAt_raw");
+        vm.cmpImm(VReg.V1, 0xFFFF);
+        vm.jeq("_charCodeAt_raw");
+        // 勿把 high16==0x8000 当裸 INT64_MIN:IEEE -0.0 同型,charCodeAt(-0) 须为 first
+        vm.call("_number_coerce");
+        // ToInteger:NaN→0;±Inf→oob。x64 V0==RET,extract 用 V2。
+        {
+            const expReg = vm.backend.name === "x64" ? VReg.V2 : VReg.V0;
+            vm.shrImm(expReg, VReg.RET, 52);
+            vm.andImm(expReg, expReg, 0x7FF);
+            vm.cmpImm(expReg, 0x7FF);
+            vm.jne("_charCodeAt_finite");
+            vm.movImm64(expReg, 0x000fffffffffffffn);
+            vm.and(expReg, VReg.RET, expReg);
+            vm.cmpImm(expReg, 0);
+            vm.jne("_charCodeAt_zero"); // NaN → 0
+        }
+        vm.jmp("_str_charCodeAt_oob"); // ±Inf → NaN
+        vm.label("_charCodeAt_zero");
+        vm.movImm(VReg.S0, 0);
+        vm.jmp("_charCodeAt_pos_done");
+        vm.label("_charCodeAt_finite");
+        vm.fmovToFloat(0, VReg.RET);
+        vm.fcvtzs(VReg.S0, 0);
+        vm.jmp("_charCodeAt_pos_done");
+        vm.label("_charCodeAt_raw");
+        vm.mov(VReg.S0, VReg.A0);
+        vm.label("_charCodeAt_pos_done");
 
         // 边界检查：JS 里 charCodeAt(index) 当 index<0 或 index>=length 返回 NaN，不越界读。
         // **长度必须 O(1) 获取**：堆字符串([type@0=6,length@8,content@16])直接读 length@8；
@@ -3848,15 +3988,15 @@ export class StringGenerator {
         vm.label("_str_slice");
         // S0=str, S1=start, S2=end/result, S3=len, S4=newLen, S5=index
         vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.store(VReg.SP, 0, VReg.A1);
+        vm.store(VReg.SP, 8, VReg.A2);
         vm.mov(VReg.S0, VReg.A0);
-        vm.mov(VReg.S1, VReg.A1);
-        vm.store(VReg.SP, 0, VReg.A2);
         vm.mov(VReg.A0, VReg.S0);
         this._emitThisToString("slice");
         vm.mov(VReg.S0, VReg.A0);
-        vm.load(VReg.S2, VReg.SP, 0);
 
-        // 1. 获取解箱后的内容指针和长度
+        // 1. 获取解箱后的内容指针和长度。A1/A2 是 caller-saved:先留在栈上,
+        // 等 _getStrContent/_strlen 返回再装回(同 _str_substring leftover-arg)。
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_getStrContent");
         vm.mov(VReg.S0, VReg.RET); // S0 = raw string pointer
@@ -3865,22 +4005,71 @@ export class StringGenerator {
         vm.call("_strlen");
         vm.mov(VReg.S3, VReg.RET); // S3 = len
 
-        // 2. 规范化索引 (S1=start, S2=end)
-        vm.mov(VReg.A0, VReg.S1);
-        vm.call("_to_int32");
-        vm.mov(VReg.S1, VReg.RET);
+        // leftover-arg: reload start/end after calls smash S1/S2
+        vm.load(VReg.S1, VReg.SP, 0);
+        vm.load(VReg.S2, VReg.SP, 8);
 
-        // end = (end === undefined) ? len : ToInt32(end)
+        // 2. ToIntegerOrInfinity(start/end). _to_int32 将 +Inf/-Inf 归零,
+        // 破坏 slice(NaN, Infinity)→全串(linux-x64 leftover A2_T2)。
+        // x64: V0==RET, shrImm/movImm64(V0) 冲掉 float bits; end 已在 S2,
+        // V2==A2 此处可当 scratch(同 _str_substring)。
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_number_coerce");
+        {
+            const expReg = vm.backend.name === "x64" ? VReg.V2 : VReg.V0;
+            vm.shrImm(expReg, VReg.RET, 52);
+            vm.andImm(expReg, expReg, 0x7FF);
+            vm.cmpImm(expReg, 0x7FF);
+            vm.jne("_slice_s_finite");
+            vm.movImm64(expReg, 0x000fffffffffffffn);
+            vm.and(expReg, VReg.RET, expReg);
+            vm.cmpImm(expReg, 0);
+            vm.jne("_slice_s_zero");
+            vm.shrImm(expReg, VReg.RET, 63);
+            vm.cmpImm(expReg, 0);
+            vm.jne("_slice_s_zero");
+        }
+        vm.mov(VReg.S1, VReg.S3);
+        vm.jmp("_slice_s_done");
+        vm.label("_slice_s_zero");
+        vm.movImm(VReg.S1, 0);
+        vm.jmp("_slice_s_done");
+        vm.label("_slice_s_finite");
+        vm.fmovToFloat(0, VReg.RET);
+        vm.fcvtzs(VReg.S1, 0);
+        vm.label("_slice_s_done");
+
+        // end = (end === undefined) ? len : ToIntegerOrInfinity(end)
         vm.movImm64(VReg.V0, 0x7ffb000000000000n); // JS_UNDEFINED
         vm.cmp(VReg.S2, VReg.V0);
         const endIsLen = "_slice_end_is_len_final";
         const calcStart = "_slice_calc_start_final";
         vm.jeq(endIsLen);
-        
-        vm.mov(VReg.A0, VReg.S2);
-        vm.call("_to_int32");
-        vm.mov(VReg.S2, VReg.RET);
 
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_number_coerce");
+        {
+            const expReg = vm.backend.name === "x64" ? VReg.V2 : VReg.V0;
+            vm.shrImm(expReg, VReg.RET, 52);
+            vm.andImm(expReg, expReg, 0x7FF);
+            vm.cmpImm(expReg, 0x7FF);
+            vm.jne("_slice_e_finite");
+            vm.movImm64(expReg, 0x000fffffffffffffn);
+            vm.and(expReg, VReg.RET, expReg);
+            vm.cmpImm(expReg, 0);
+            vm.jne("_slice_e_zero");
+            vm.shrImm(expReg, VReg.RET, 63);
+            vm.cmpImm(expReg, 0);
+            vm.jne("_slice_e_zero");
+        }
+        vm.mov(VReg.S2, VReg.S3);
+        vm.jmp(calcStart);
+        vm.label("_slice_e_zero");
+        vm.movImm(VReg.S2, 0);
+        vm.jmp(calcStart);
+        vm.label("_slice_e_finite");
+        vm.fmovToFloat(0, VReg.RET);
+        vm.fcvtzs(VReg.S2, 0);
         vm.jmp(calcStart);
 
         vm.label(endIsLen);
@@ -3998,10 +4187,9 @@ export class StringGenerator {
         vm.mov(VReg.A0, VReg.S0);
         this._emitThisToString("substring");
         vm.mov(VReg.S0, VReg.A0);
-        vm.load(VReg.A1, VReg.SP, 0);
-        vm.load(VReg.A2, VReg.SP, 8);
 
-        // 获取内容指针
+        // 获取内容指针。A1/A2 是 caller-saved:先留在栈上,等 _getStrContent/_strlen
+        // 返回再装回,否则 leftover A1/A2 当 start/end → 全 arity 空串(linux-x64)。
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_getStrContent");
         vm.mov(VReg.S0, VReg.RET); // S0 = raw content
@@ -4011,6 +4199,10 @@ export class StringGenerator {
         vm.call("_strlen");
         vm.mov(VReg.S3, VReg.RET); // S3 = len
 
+        // leftover-arg: reload start/end after calls smash A1/A2
+        vm.load(VReg.A1, VReg.SP, 0);
+        vm.load(VReg.A2, VReg.SP, 8);
+
         // 规范化 start(需 ToIntegerOrInfinity 语义:Infinity 不归零)
         // _to_int32 将 +Inf/-Inf 归零,破坏 substring(NaN,Infinity) 语义;
         // 改用 _number_coerce 取 float64 位,特判 Infinity: +Inf→len, -Inf→0。
@@ -4018,19 +4210,23 @@ export class StringGenerator {
         vm.mov(VReg.S4, VReg.A2);            // 保存 end 参数
         vm.mov(VReg.A0, VReg.A1);            // A0 = start arg
         vm.call("_number_coerce");           // RET = raw float64 bits
-        // 指数全 1(0x7FF)=NaN/Inf:移位取指数并掩码
-        vm.shrImm(VReg.V0, VReg.RET, 52);
-        vm.andImm(VReg.V0, VReg.V0, 0x7FF);
-        vm.cmpImm(VReg.V0, 0x7FF);
-        vm.jne("_substring_s_finite");
-        // NaN(尾数!=0) → 0; +/-Inf(尾数==0):检符号位
-        vm.movImm64(VReg.V0, 0x000fffffffffffffn);
-        vm.and(VReg.V0, VReg.RET, VReg.V0);
-        vm.cmpImm(VReg.V0, 0);
-        vm.jne("_substring_s_zero");          // NaN → 0
-        vm.shrImm(VReg.V0, VReg.RET, 63);     // 符号位
-        vm.cmpImm(VReg.V0, 0);
-        vm.jne("_substring_s_zero");          // -Inf → 0
+        // x64: V0==RET, shrImm/movImm64(V0) 冲掉 float bits(同空串路径用 V2)
+        // end 已在 S4, V2==A2 此处可当 scratch。
+        {
+            const expReg = vm.backend.name === "x64" ? VReg.V2 : VReg.V0;
+            vm.shrImm(expReg, VReg.RET, 52);
+            vm.andImm(expReg, expReg, 0x7FF);
+            vm.cmpImm(expReg, 0x7FF);
+            vm.jne("_substring_s_finite");
+            // NaN(尾数!=0) → 0; +/-Inf(尾数==0):检符号位
+            vm.movImm64(expReg, 0x000fffffffffffffn);
+            vm.and(expReg, VReg.RET, expReg);
+            vm.cmpImm(expReg, 0);
+            vm.jne("_substring_s_zero");          // NaN → 0
+            vm.shrImm(expReg, VReg.RET, 63);     // 符号位
+            vm.cmpImm(expReg, 0);
+            vm.jne("_substring_s_zero");          // -Inf → 0
+        }
         // +Inf → len(S3):钳位后即为全长
         vm.mov(VReg.S1, VReg.S3);
         vm.jmp("_substring_s_done");
@@ -4049,17 +4245,20 @@ export class StringGenerator {
         vm.jeq("_substring_end_is_len");
         vm.mov(VReg.A0, VReg.A2);
         vm.call("_number_coerce");
-        vm.shrImm(VReg.V0, VReg.RET, 52);
-        vm.andImm(VReg.V0, VReg.V0, 0x7FF);
-        vm.cmpImm(VReg.V0, 0x7FF);
-        vm.jne("_substring_e_finite");
-        vm.movImm64(VReg.V0, 0x000fffffffffffffn);
-        vm.and(VReg.V0, VReg.RET, VReg.V0);
-        vm.cmpImm(VReg.V0, 0);
-        vm.jne("_substring_e_zero");
-        vm.shrImm(VReg.V0, VReg.RET, 63);
-        vm.cmpImm(VReg.V0, 0);
-        vm.jne("_substring_e_zero");
+        {
+            const expReg = vm.backend.name === "x64" ? VReg.V2 : VReg.V0;
+            vm.shrImm(expReg, VReg.RET, 52);
+            vm.andImm(expReg, expReg, 0x7FF);
+            vm.cmpImm(expReg, 0x7FF);
+            vm.jne("_substring_e_finite");
+            vm.movImm64(expReg, 0x000fffffffffffffn);
+            vm.and(expReg, VReg.RET, expReg);
+            vm.cmpImm(expReg, 0);
+            vm.jne("_substring_e_zero");
+            vm.shrImm(expReg, VReg.RET, 63);
+            vm.cmpImm(expReg, 0);
+            vm.jne("_substring_e_zero");
+        }
         vm.mov(VReg.S2, VReg.S3);            // +Inf → len
         vm.jmp("_substring_calc_start");
         vm.label("_substring_e_zero");
@@ -5177,7 +5376,8 @@ export class StringGenerator {
     }
 
     // _num_toString(value, radix_raw) -> 装箱字符串
-    // value: 装箱 int32 或裸 float64(经 _to_int32 取整);radix: 裸 int(2..36,非法回退 10)。
+    // value: 装箱 int32 或裸 float64(经 _to_int32 取整);radix: 裸 int。
+    // ES Number.prototype.toString: radix < 2 or > 36 → RangeError (was clamp-to-10).
     // 小数部分不输出(JS 会输出基数小数,暂不支持)。倒序填 scratch 缓冲后
     // 经 _cstr_to_heap_str 建串——避免手写串头(见 runtime-helper 契约教训)。
     generateNumToString() {
@@ -5187,6 +5387,35 @@ export class StringGenerator {
         vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
 
         vm.mov(VReg.S1, VReg.A1); // radix(入口捕获,后续调用会冲 A1)
+        // Spec: radix undefined → 10. x64 leftover A1 is 0, a tagged
+        // JSValue, or a naked heap ptr (high16=0, >= ptrFloor). Those are
+        // not a real radix. Raw 2..36 still RangeError-checked so
+        // toString(37) throws. toString(0) becomes 10 (rare leftover).
+        vm.shrImm(VReg.V1, VReg.S1, 48);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_numts_radix_default");
+        vm.cmpImm(VReg.S1, 0);
+        vm.jeq("_numts_radix_default");
+        vm.movImm64(VReg.V1, vm.ptrFloor);
+        vm.cmp(VReg.S1, VReg.V1);
+        vm.jge("_numts_radix_default");
+        vm.jmp("_numts_radix_have");
+        vm.label("_numts_radix_default");
+        vm.movImm(VReg.S1, 10);
+        vm.label("_numts_radix_have");
+        // RangeError before NaN/Inf early-out so NaN.toString(37) still throws.
+        vm.cmpImm(VReg.S1, 2);
+        vm.jlt("_numts_radix_err");
+        vm.cmpImm(VReg.S1, 36);
+        vm.jle("_numts_radix_checked");
+        vm.label("_numts_radix_err");
+        vm.lea(VReg.A0, vm.asm.addString("toString() radix argument must be between 2 and 36"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_range_error");
+        vm.label("_numts_radix_checked");
         // 值 → 64 位整数(替代 _to_int32:后者截 32 位符号,大整数 [2^31,2^53) 环绕出错,
         // 如 (3735928559).toString(16) 应 "deadbeef" 而非 "-21524111")。
         vm.mov(VReg.S0, VReg.A0);
@@ -5254,14 +5483,7 @@ export class StringGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
         vm.label("_numts_conv_done"); // S0 = int 值(64 位)
 
-        // radix 钳位:<2 或 >36 → 10
-        vm.cmpImm(VReg.S1, 2);
-        vm.jlt("_numts_radix_dft");
-        vm.cmpImm(VReg.S1, 36);
-        vm.jle("_numts_radix_ok");
-        vm.label("_numts_radix_dft");
-        vm.movImm(VReg.S1, 10);
-        vm.label("_numts_radix_ok");
+        // radix already validated ∈ [2,36]
 
         // scratch 缓冲(80B 足够 64 位二进制+符号+NUL)
         vm.movImm(VReg.A0, 80);
@@ -6339,10 +6561,11 @@ export class StringGenerator {
         vm.call("_tag_key_a1");
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_object_get");
-        vm.shrImm(VReg.V0, VReg.RET, 48);
-        vm.cmpImm(VReg.V0, 0x7FFC);
+        // x64 V0≡RET: tag extract must not clobber the boxed string.
+        vm.shrImm(VReg.V2, VReg.RET, 48);
+        vm.cmpImm(VReg.V2, 0x7FFC);
         vm.jeq("_tsw_ret");
-        vm.cmpImm(VReg.V0, 0);
+        vm.cmpImm(VReg.V2, 0);
         vm.jne("_tsw_throw");
         vm.cmpImm(VReg.RET, 0);
         vm.jeq("_tsw_throw");
@@ -6389,10 +6612,11 @@ export class StringGenerator {
         vm.call("_tag_key_a1");
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_object_get");
-        vm.shrImm(VReg.V0, VReg.RET, 48);
-        vm.cmpImm(VReg.V0, 0x7FFC);
+        // x64 V0≡RET: same as Boolean / toString wrapper.
+        vm.shrImm(VReg.V2, VReg.RET, 48);
+        vm.cmpImm(VReg.V2, 0x7FFC);
         vm.jeq("_vo_ret");
-        vm.cmpImm(VReg.V0, 0);
+        vm.cmpImm(VReg.V2, 0);
         vm.jne("_vo_throw");
         vm.cmpImm(VReg.RET, 0);
         vm.jeq("_vo_throw");
@@ -6666,6 +6890,13 @@ export class StringGenerator {
         vm.mov(VReg.S0, VReg.A0);
         vm.mov(VReg.S1, VReg.A1);
         guardHead("_ants");
+        // argc==0: leftover A1 is not a radix. _aref_generic shifts the
+        // incoming A0 (this, set by _object_user_tostr) into A1, so
+        // toString() on new Number(1) became toString(1) → RangeError.
+        vm.lea(VReg.V1, "_call_argc");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_ants_dft");
         argIntOr("_ants", 10, "_ants_go");
         vm.label("_ants_go");
         // radix 缺省/10:规范 ToString(含小数)。_num_toString 截断成整数

@@ -1285,6 +1285,17 @@ export const ExpressionParser = {
                 this.errors.push("expected ( after accessor name");
                 return null;
             }
+            // MethodDefinition prefixes (`*` / `async`) require `(`.
+            // `{* foo}` / `{async async}` are not IdentifierReference shorthand.
+            if ((isGenMethod || isAsyncMethod) && !this.peekTokenIs(TokenType.LPAREN)) {
+                this.errors.push("generator/async prefix requires a method");
+                return null;
+            }
+            // Computed PropertyDefinition is `[e]: v` or `[e]()` — `{[x]}` is not shorthand.
+            if (computed && !this.peekTokenIs(TokenType.LPAREN) && !this.peekTokenIs(TokenType.COLON)) {
+                this.errors.push("computed property name requires a value or method");
+                return null;
+            }
             if (this.peekTokenIs(TokenType.COMMA) || this.peekTokenIs(TokenType.RBRACE)) {
                 // [test262 S12.6.2_A15] 简写属性仅限标识符:`({1})`/`({"a"})` 的裸数字/字符串
                 // 键无冒号 → SyntaxError(node 对拍 "Unexpected number/string")。此前
@@ -1336,6 +1347,14 @@ export const ExpressionParser = {
                 // [test262] super.x 在对象方法内合法(parseSuperExpression 判 _inObjMethod)
                 this._inObjMethod = (this._inObjMethod || 0) + 1;
                 let params = this.parseFunctionParams();
+                // [L2-④] getter 不得有形参,setter 必须恰 1 个非 rest 形参
+                // (class methods already check this in classes.js; object literals did not).
+                if (accessorKind === "get" && params.length > 0) {
+                    this.errors.push("getter must not have formal parameters");
+                }
+                if (accessorKind === "set" && params.length !== 1) {
+                    this.errors.push("setter must have exactly one formal parameter");
+                }
                 if (!this.expectPeek(TokenType.LBRACE)) {
                     this.fnDepth--;
                     this._inObjMethod = this._inObjMethod - 1;
@@ -1364,7 +1383,19 @@ export const ExpressionParser = {
                     const mfn = new AST.FunctionExpression(null, params, body, isAsyncMethod, isGenMethod);
                     mfn.async = isAsyncMethod;
                     mfn.generator = isGenMethod;
-                    properties.push(new AST.Property(key, mfn, accessorKind !== null ? accessorKind : "init", computed, false));
+                    const mprop = new AST.Property(key, mfn, accessorKind !== null ? accessorKind : "init", computed, false);
+                    mprop.method = true;
+                    // Method `{ __proto__() {} }` is NamedEvaluation (not a proto setter).
+                    if (!computed && accessorKind === null) {
+                        let kn = null;
+                        if (key && key.type === "Identifier") kn = key.name;
+                        else if (key && key.type === "Literal" &&
+                            (typeof key.value === "string" || typeof key.value === "number")) {
+                            kn = String(key.value);
+                        }
+                        if (kn === "__proto__") AST.stampFnHintFromKey(mfn, key);
+                    }
+                    properties.push(mprop);
                 }
             } else {
                 if (!this.expectPeek(TokenType.COLON)) return null;

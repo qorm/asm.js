@@ -27,17 +27,22 @@ export const AsyncCompiler = {
         this.compileExpression(expr.argument);
         // RET = 被 await 的值(可能是 Promise,也可能是普通值/thenable)
 
-        // await 非 Promise/thenable:值本身即结果。Promise 与 thenable 都须经
-        // _Promise_resolve(已有 promise 直返,否则新建 promise 并 adopt thenable.then)
-        // 再 _promise_await;否则 `await 7` 返 7、`await thenable` 返对象本身
-        // (await-awaits-thenables 族:`await {then:fn}` 必须返 42)。
+        // Ordinary async: non-thenable is the result (await 7 → 7). Promise /
+        // thenable go through _Promise_resolve then _promise_await.
+        // Async generator Await (spec 6.2.3.1) ALWAYS PromiseResolve + a
+        // microtask, even for {done:false}. Else yield-star-return-then-getter-
+        // ticks is start,get then,get return vs start,tick 1,get then.
+        // _promise_await_job enqueues a resume reaction when already settled.
+        const agenAwait = !!this.ctx.inAsyncGenerator;
         const awaitDone = this.ctx.newLabel("await_done");
+        if (!agenAwait) {
         vm.mov(VReg.A0, VReg.RET);
         vm.push(VReg.RET);
         vm.call("_is_promise_or_thenable");
         vm.cmpImm(VReg.RET, 0);
         vm.pop(VReg.RET);           // RET = 被 await 的值(还原)
         vm.jeq(awaitDone);
+        }
 
         // [test262] Promise 直接 await;thenable 经 _Promise_resolve adopt 后再 await。
         // [A5] _Promise_resolve 把 A5 当构造器 C。await 在方法/静态方法体内时 A5 仍是
@@ -49,7 +54,7 @@ export const AsyncCompiler = {
         vm.load(VReg.A5, VReg.A5, 0);
         vm.call("_Promise_resolve"); // RET = 装箱 promise(原 promise 直返 / 新建+adopt)
         vm.mov(VReg.A0, VReg.RET);
-        vm.call("_promise_await");
+        vm.call(agenAwait ? "_promise_await_job" : "_promise_await");
         // RET = resolved 值；若被 reject，_promise_await 已置 _exception_pending
 
         // 检查 await 期间是否产生异常（promise 被 reject）
@@ -95,6 +100,10 @@ export const AsyncCompiler = {
             vm.movImm64(VReg.RET, 0x7ffb000000000000n); // was lea+load _js const
         }
         if (this.ctx.inAsyncGenerator) {
+            // yield* 的 AsyncGeneratorYield 不再 Await 值(值解包由 AFS 包装器负责;
+            // 真异步迭代器的 value 原样产出,yield-star-promise-not-unwrapped)。
+            // 普通 `yield expr` 仍先 Await。
+            if (!expr._noAwait) {
             // [async generator] AsyncGeneratorYield:先 Await(yield 值)再产出。
             // `yield Promise.reject(e)` 须使该次 next() Promise reject(e)(而非把 Promise
             // 当值产出)。await 只对 Promise 施加(非 Promise 值原样返回)。reject → 异常
@@ -126,6 +135,7 @@ export const AsyncCompiler = {
             vm.label(yieldExcLabel);
             vm.pop(VReg.RET);
             vm.label(yieldDone);
+            }
             this.emitAsyncYieldValue();
         } else {
             this.emitYieldValue(); // 挂起 RET；恢复后 RET = next(v)/throw 注入值
@@ -151,6 +161,42 @@ export const AsyncCompiler = {
         vm.pop(VReg.V1); // coro
         vm.movImm(VReg.V0, 0);
         vm.store(VReg.V1, 88, VReg.V0); // 清 +88
+        // return() while this next() was still in Await (+88≠0) only queued.
+        // next() is now fulfilled; consume the queue as a return resumption
+        // (star: _agen_raw_yield → __YsaTakeReturn → await recv).
+        const queuedL = this.ctx.newLabel("ayield_queued");
+        const noQueuedL = this.ctx.newLabel("ayield_noqueued");
+        const starDoneEarly = this.ctx.newLabel("ayield_retdone_q");
+        vm.lea(VReg.V1, "_agen_return_queued");
+        vm.load(VReg.V2, VReg.V1, 0);
+        vm.cmpImm(VReg.V2, 0);
+        vm.jne(queuedL);
+        vm.jmp(noQueuedL);
+        vm.label(queuedL);
+        vm.movImm(VReg.V2, 0);
+        vm.store(VReg.V1, 0, VReg.V2);
+        vm.lea(VReg.V1, "_agen_unwrap_pending");
+        vm.store(VReg.V1, 0, VReg.V2);
+        vm.lea(VReg.V1, "_agen_unwrap_return_p");
+        vm.load(VReg.V2, VReg.V1, 0);
+        vm.lea(VReg.V1, "_scheduler_current");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.store(VReg.V1, 88, VReg.V2);
+        vm.lea(VReg.V1, "_agen_unwrap_value");
+        vm.load(VReg.RET, VReg.V1, 0);
+        if (this.ctx._ysaInStar) {
+            vm.lea(VReg.V1, "_agen_raw_yield");
+            vm.movImm(VReg.V2, 1);
+            vm.store(VReg.V1, 0, VReg.V2);
+            vm.jmp(starDoneEarly);
+        }
+        this.emitPendingFinalizers(0, true);
+        if (this.ctx.returnLabel) {
+            vm.jmp(this.ctx.returnLabel);
+        } else {
+            this.emitUnhandledExceptionExit();
+        }
+        vm.label(noQueuedL);
         // 挂起;恢复后 RET = coro+72(next(v) 注入值)
         vm.call("_coroutine_yield");
         // [agen.throw] 恢复后异常注入检查(与 emitYieldValue 同构)
@@ -169,7 +215,36 @@ export const AsyncCompiler = {
             this.emitUnhandledExceptionExit();
         }
         vm.label(contLabel);
+        // [agen.return] x64 V0≡RET:pending 地址放 V1,pop RET 之后才能 store(勿用 V0)。
+        // yield* 内:置 _agen_raw_yield,注入值作为 yield 结果 → 委托环 __YsaTakeReturn → mode=2。
+        // 普通 yield:跑 finalizer 后完成协程。
+        const retFall = this.ctx.newLabel("ayield_retfall");
+        const starDone = this.ctx.newLabel("ayield_retdone");
+        vm.lea(VReg.V1, "_gen_return_pending");
+        vm.load(VReg.V2, VReg.V1, 0);
+        vm.cmpImm(VReg.V2, 0);
+        vm.jeq(retFall);
         vm.pop(VReg.RET);
+        vm.movImm(VReg.V2, 0);
+        vm.store(VReg.V1, 0, VReg.V2);
+        vm.lea(VReg.V1, "_gen_return_value");
+        vm.load(VReg.RET, VReg.V1, 0);
+        if (this.ctx._ysaInStar) {
+            vm.lea(VReg.V1, "_agen_raw_yield");
+            vm.movImm(VReg.V2, 1);
+            vm.store(VReg.V1, 0, VReg.V2);
+            vm.jmp(starDone);
+        }
+        this.emitPendingFinalizers(0, true);
+        if (this.ctx.returnLabel) {
+            vm.jmp(this.ctx.returnLabel);
+        } else {
+            this.emitUnhandledExceptionExit();
+        }
+        vm.label(retFall);
+        vm.pop(VReg.RET);
+        vm.label(starDone);
+        vm.label(starDoneEarly);
     },
 
     // 把 RET 作为 yield 值挂起协程；恢复后 RET = next(v) 传入的 v。
@@ -206,15 +281,16 @@ export const AsyncCompiler = {
         // 槽保命;finalizer 内含 yield 则协程再次挂起,恢复后继续走到 returnLabel),
         // 最终以该值完成协程 → _generator_return 返回 {value, done:true}。
         vm.label(retChkLabel);
-        vm.lea(VReg.V0, "_gen_return_pending");
-        vm.load(VReg.V1, VReg.V0, 0);
-        vm.cmpImm(VReg.V1, 0);
+        // x64 V0≡RET:pop RET 会冲掉 pending 地址。地址放 V1,标志/零放 V2。
+        vm.lea(VReg.V1, "_gen_return_pending");
+        vm.load(VReg.V2, VReg.V1, 0);
+        vm.cmpImm(VReg.V2, 0);
         vm.jeq(contLabel);
-        vm.pop(VReg.RET); // 弃 resume 值
-        vm.movImm(VReg.V1, 0);
-        vm.store(VReg.V0, 0, VReg.V1); // 清 pending(消费一次)
-        vm.lea(VReg.V0, "_gen_return_value");
-        vm.load(VReg.RET, VReg.V0, 0); // RET = 注入返回值
+        vm.pop(VReg.RET); // 弃 resume 值(V0 被冲,V1 仍是地址)
+        vm.movImm(VReg.V2, 0);
+        vm.store(VReg.V1, 0, VReg.V2); // 清 pending(消费一次)
+        vm.lea(VReg.V1, "_gen_return_value");
+        vm.load(VReg.RET, VReg.V1, 0); // RET = 注入返回值
         this.emitPendingFinalizers(0, true);
         if (this.ctx.returnLabel) {
             vm.jmp(this.ctx.returnLabel);
@@ -382,25 +458,119 @@ export const AsyncCompiler = {
         const valName = `__ysa_val_${id}`;
         const idn = (n) => ({ type: "Identifier", name: n });
         const member = (o, p, computed) => ({ type: "MemberExpression", object: o, property: p, computed: !!computed });
-        const callWithThis = (fn, thisArg, args) => ({ type: "__CallWithThis", calleeFn: fn, thisArg: thisArg, callArgs: args || [] });
+        const callWithThis = (fn, thisArg, args) => ({ type: "CallExpression",
+            callee: { type: "MemberExpression", object: fn, property: { type: "Identifier", name: "call" }, computed: false },
+            arguments: [thisArg].concat(args || []) });
         const symAsyncIter = () => member(idn("Symbol"), idn("asyncIterator"), false);
         const symIter = () => member(idn("Symbol"), idn("iterator"), false);
         const asyncIterRef = member(idn(srcName), symAsyncIter(), true);
         const typeofIs = (val, s) => ({ type: "BinaryExpression", operator: "===", left: { type: "UnaryExpression", operator: "typeof", argument: val }, right: { type: "StringLiteral", value: s } });
-        // 取到迭代器后:缓存 next、转发 resume 值(yield-star-sync-next 等依赖)。
+        // 取到迭代器后:缓存 next。真异步迭代器与 AFS 包装器共用此环:
+        // await next/throw 结果须是 Object(否则 TypeError,不读 .then);
+        // yield 值不再 Await(_noAwait);throw 注入经 try/catch 转发 iterator.throw。
+        const modeName = `__ysa_mode_${id}`;
+        const thrName = `__ysa_thr_${id}`;
+        const retmName = `__ysa_retm_${id}`;
+        const rfName = `__ysa_rf_${id}`;
+        const notObj = (v) => ({ type: "LogicalExpression", operator: "||",
+            left: { type: "BinaryExpression", operator: "===", left: v, right: { type: "Literal", value: null } },
+            right: { type: "BinaryExpression", operator: "!==",
+                left: { type: "UnaryExpression", operator: "typeof", argument: v },
+                right: { type: "StringLiteral", value: "object" } } });
+        const throwTE = (msg) => ({ type: "ThrowStatement", argument: { type: "NewExpression",
+            callee: { type: "Identifier", name: "TypeError" }, arguments: [{ type: "Literal", value: msg }] } });
         const afterIter = { type: "BlockStatement", body: [
             { type: "VariableDeclaration", kind: "const", declarations: [{ type: "VariableDeclarator", id: idn(nextName), init: member(idn(itName), idn("next"), false) }] },
             { type: "VariableDeclaration", kind: "let", declarations: [{ type: "VariableDeclarator", id: idn(recvName), init: idn("undefined") }] },
+            { type: "VariableDeclaration", kind: "let", declarations: [{ type: "VariableDeclarator", id: idn(modeName), init: { type: "NumericLiteral", value: 0 } }] },
+            { type: "VariableDeclaration", kind: "let", declarations: [{ type: "VariableDeclarator", id: idn(resName), init: idn("undefined") }] },
+            { type: "VariableDeclaration", kind: "let", declarations: [{ type: "VariableDeclarator", id: idn(rfName), init: { type: "NumericLiteral", value: 0 } }] },
             { type: "WhileStatement", test: { type: "BooleanLiteral", value: true }, body: { type: "BlockStatement", body: [
-                { type: "VariableDeclaration", kind: "const", declarations: [{ type: "VariableDeclarator", id: idn(resName), init: { type: "AwaitExpression", argument: callWithThis(idn(nextName), idn(itName), [idn(recvName)]) } }] },
+                { type: "IfStatement",
+                  test: { type: "BinaryExpression", operator: "===", left: idn(modeName), right: { type: "NumericLiteral", value: 0 } },
+                  consequent: { type: "ExpressionStatement", expression: { type: "AssignmentExpression", operator: "=",
+                      left: idn(resName), right: { type: "AwaitExpression", argument: callWithThis(idn(nextName), idn(itName), [idn(recvName)]) } } },
+                  alternate: { type: "IfStatement",
+                    test: { type: "BinaryExpression", operator: "===", left: idn(modeName), right: { type: "NumericLiteral", value: 1 } },
+                    consequent: { type: "BlockStatement", body: [
+                      { type: "VariableDeclaration", kind: "const", declarations: [{ type: "VariableDeclarator", id: idn(thrName), init: member(idn(itName), idn("throw"), false) }] },
+                      { type: "IfStatement",
+                        test: { type: "UnaryExpression", operator: "!", argument: typeofIs(idn(thrName), "function") },
+                        consequent: { type: "BlockStatement", body: [
+                            { type: "TryStatement",
+                              block: { type: "BlockStatement", body: [
+                                  { type: "VariableDeclaration", kind: "const", declarations: [{ type: "VariableDeclarator", id: idn(retmName), init: member(idn(itName), idn("return"), false) }] },
+                                  { type: "IfStatement",
+                                    test: typeofIs(idn(retmName), "function"),
+                                    consequent: { type: "ExpressionStatement", expression: { type: "AwaitExpression", argument: callWithThis(idn(retmName), idn(itName), []) } },
+                                    alternate: null },
+                              ] },
+                              handler: { type: "CatchClause", param: idn(`__ysa_ce_${id}`),
+                                         body: { type: "BlockStatement", body: [] } },
+                              finalizer: null },
+                            { type: "ThrowStatement", argument: idn(recvName) },
+                        ] },
+                        alternate: { type: "ExpressionStatement", expression: { type: "AssignmentExpression", operator: "=",
+                            left: idn(resName), right: { type: "AwaitExpression", argument: callWithThis(idn(thrName), idn(itName), [idn(recvName)]) } } } },
+                    ] },
+                    alternate: { type: "BlockStatement", body: [
+                      { type: "VariableDeclaration", kind: "const", declarations: [{ type: "VariableDeclarator", id: idn(retmName), init: member(idn(itName), idn("return"), false) }] },
+                      { type: "IfStatement",
+                        test: { type: "UnaryExpression", operator: "!", argument: typeofIs(idn(retmName), "function") },
+                        consequent: { type: "BlockStatement", body: [
+                            { type: "ExpressionStatement", expression: { type: "AssignmentExpression", operator: "=",
+                                left: idn(valName), right: { type: "AwaitExpression", argument: idn(recvName) } } },
+                            { type: "ReturnStatement", argument: idn(valName) },
+                        ] },
+                        alternate: { type: "ExpressionStatement", expression: { type: "AssignmentExpression", operator: "=",
+                            left: idn(resName), right: { type: "AwaitExpression", argument: callWithThis(idn(retmName), idn(itName), [idn(recvName)]) } } } },
+                    ] } } },
+                { type: "IfStatement",
+                  test: notObj(idn(resName)),
+                  consequent: throwTE("Iterator result is not an object"),
+                  alternate: null },
                 { type: "IfStatement",
                   test: member(idn(resName), idn("done"), false),
                   consequent: { type: "BlockStatement", body: [
                       { type: "ExpressionStatement", expression: { type: "AssignmentExpression", operator: "=", left: idn(valName), right: member(idn(resName), idn("value"), false) } },
-                      { type: "BreakStatement" },
+                      { type: "IfStatement",
+                        test: { type: "BinaryExpression", operator: "===", left: idn(modeName), right: { type: "NumericLiteral", value: 2 } },
+                        consequent: { type: "ReturnStatement", argument: idn(valName) },
+                        alternate: { type: "BreakStatement" } },
                   ] },
                   alternate: null },
-                { type: "ExpressionStatement", expression: { type: "AssignmentExpression", operator: "=", left: idn(recvName), right: { type: "YieldExpression", delegate: false, argument: member(idn(resName), idn("value"), false) } } },
+                // IteratorValue before the yield-injection try: a throwing
+                // value getter is abrupt completion of yield* (throw-notdone-
+                // iter-value-throws). Catching it as mode=1 re-called .throw()
+                // forever (TIME).
+                { type: "ExpressionStatement", expression: { type: "AssignmentExpression", operator: "=",
+                    left: idn(valName), right: member(idn(resName), idn("value"), false) } },
+                { type: "TryStatement",
+                  block: { type: "BlockStatement", body: [
+                      { type: "ExpressionStatement", expression: { type: "AssignmentExpression", operator: "=",
+                          left: idn(recvName),
+                          right: { type: "YieldExpression", delegate: false, _noAwait: true,
+                                   argument: idn(valName) } } },
+                      { type: "ExpressionStatement", expression: { type: "AssignmentExpression", operator: "=",
+                          left: idn(modeName), right: { type: "NumericLiteral", value: 0 } } },
+                  ] },
+                  handler: { type: "CatchClause", param: idn(`__ysa_ye_${id}`),
+                    body: { type: "BlockStatement", body: [
+                        { type: "ExpressionStatement", expression: { type: "AssignmentExpression", operator: "=",
+                            left: idn(recvName), right: idn(`__ysa_ye_${id}`) } },
+                        { type: "ExpressionStatement", expression: { type: "AssignmentExpression", operator: "=",
+                            left: idn(modeName), right: { type: "NumericLiteral", value: 1 } } },
+                    ] } },
+                  finalizer: null },
+                { type: "IfStatement",
+                  test: { type: "__YsaTakeReturn" },
+                  consequent: { type: "BlockStatement", body: [
+                      { type: "ExpressionStatement", expression: { type: "AssignmentExpression", operator: "=",
+                          left: idn(modeName), right: { type: "NumericLiteral", value: 2 } } },
+                      { type: "ExpressionStatement", expression: { type: "AssignmentExpression", operator: "=",
+                          left: idn(recvName), right: { type: "AwaitExpression", argument: idn(recvName) } } },
+                  ] },
+                  alternate: null },
             ] } },
         ] };
         // async 迭代器:typeof 已取过 __am,用 Call(__am,__src) 勿再 get。
@@ -408,13 +578,17 @@ export const AsyncCompiler = {
             { type: "VariableDeclaration", kind: "const", declarations: [{ type: "VariableDeclarator", id: idn(itName), init: callWithThis(idn(amName), idn(srcName), []) }] },
             afterIter,
         ] };
+        // 同步迭代器:CreateAsyncFromSyncIterator → 真包装器(next/return/throw 为
+        // 独立 async 方法,用 this.__sync / this.__nm;工厂是普通函数,方法体不进
+        // async-gen 协程编译)。之后与真异步迭代器共用 afterIter。
+        const it0Name = `__ysa_it0_${id}`;
         const syncBlock = { type: "BlockStatement", body: [
-            // GetMethod(@@iterator):读一次再 Call,勿二次 get(探测日志序敏感)。
             { type: "VariableDeclaration", kind: "const", declarations: [{ type: "VariableDeclarator", id: idn(smName), init: member(idn(srcName), symIter(), true) }] },
             { type: "IfStatement",
               test: typeofIs(idn(smName), "function"),
               consequent: { type: "BlockStatement", body: [
-                  { type: "VariableDeclaration", kind: "const", declarations: [{ type: "VariableDeclarator", id: idn(itName), init: callWithThis(idn(smName), idn(srcName), []) }] },
+                  { type: "VariableDeclaration", kind: "const", declarations: [{ type: "VariableDeclarator", id: idn(it0Name), init: callWithThis(idn(smName), idn(srcName), []) }] },
+                  { type: "VariableDeclaration", kind: "const", declarations: [{ type: "VariableDeclarator", id: idn(itName), init: this.createAFSWrapperAST(idn(it0Name)) }] },
                   afterIter,
               ] },
               alternate: { type: "ThrowStatement", argument: { type: "NewExpression", callee: { type: "Identifier", name: "TypeError" }, arguments: [{ type: "Literal", value: "obj[Symbol.iterator] is not a function" }] } } },
@@ -448,10 +622,251 @@ export const AsyncCompiler = {
                     ] } },
               ] } },
         ] };
+        const prevYsa = this.ctx._ysaInStar;
+        this.ctx._ysaInStar = true;
         this.compileStatement(dispatch);
+        this.ctx._ysaInStar = prevYsa;
         // RET = __val(yield* 表达式值 = 被委托者 return 值)
         vm.load(VReg.RET, VReg.FP, valOff);
     },
+
+    // ---- CreateAsyncFromSyncIterator (ES 7.4.8 / %AsyncFromSyncIteratorPrototype%) ----
+    // 脱糖成 IIFE+对象{next,return,throw},复用现有 async/await/try 编译。包装器对用户
+    // 代码不可达(仅 for-await / yield* 内部持有)。next/return/throw 走
+    // AsyncFromSyncIteratorContinuation:IteratorNext → PromiseResolve(value) →
+    // IfAbruptRejectPromise + closeOnRejection(IteratorClose)。
+    _afsId(n) { return { type: "Identifier", name: n }; },
+    _afsMem(o, p, computed) {
+        return { type: "MemberExpression", object: typeof o === "string" ? this._afsId(o) : o,
+                 property: typeof p === "string" ? this._afsId(p) : p, computed: !!computed };
+    },
+    _afsCallThis(fn, thisArg, args) {
+        // 用 fn.call(this, ...args):生成器 next/return 经 __CallWithThis 会丢闭包 S0
+        // 返 undefined(unwrap-promise / sync-throw 见 TypeError not an object)。
+        const fnN = typeof fn === "string" ? this._afsId(fn) : fn;
+        const thisN = typeof thisArg === "string" ? this._afsId(thisArg) : thisArg;
+        return { type: "CallExpression",
+                 callee: { type: "MemberExpression", object: fnN, property: this._afsId("call"), computed: false },
+                 arguments: [thisN].concat(args || []) };
+    },
+    _afsFn(params, bodyStmts, isAsync) {
+        return { type: "FunctionExpression", params: params.map((n) => this._afsId(n)),
+                 body: { type: "BlockStatement", body: bodyStmts },
+                 async: !!isAsync, isAsync: !!isAsync };
+    },
+    _afsLit(v) {
+        if (v === null) return { type: "Literal", value: null };
+        if (typeof v === "string") return { type: "StringLiteral", value: v };
+        if (typeof v === "boolean") return { type: "BooleanLiteral", value: v };
+        if (typeof v === "number") return { type: "NumericLiteral", value: v };
+        return { type: "Literal", value: v };
+    },
+    _afsTypeofIs(val, s) {
+        return { type: "BinaryExpression", operator: "===",
+                 left: { type: "UnaryExpression", operator: "typeof", argument: typeof val === "string" ? this._afsId(val) : val },
+                 right: this._afsLit(s) };
+    },
+    _afsThrowTE(msg) {
+        return { type: "ThrowStatement", argument: { type: "NewExpression",
+                 callee: this._afsId("TypeError"), arguments: [this._afsLit(msg)] } };
+    },
+    _afsNotObject(val) {
+        return { type: "LogicalExpression", operator: "||",
+                 left: { type: "BinaryExpression", operator: "===",
+                         left: typeof val === "string" ? this._afsId(val) : val,
+                         right: this._afsLit(null) },
+                 right: { type: "BinaryExpression", operator: "!==",
+                          left: { type: "UnaryExpression", operator: "typeof",
+                                  argument: typeof val === "string" ? this._afsId(val) : val },
+                          right: this._afsLit("object") } };
+    },
+    _afsVar(kind, name, init) {
+        return { type: "VariableDeclaration", kind,
+                 declarations: [{ type: "VariableDeclarator", id: this._afsId(name), init: init }] };
+    },
+    _afsAssign(name, right) {
+        return { type: "ExpressionStatement", expression: { type: "AssignmentExpression",
+                 operator: "=", left: this._afsId(name), right: right } };
+    },
+    _afsPromiseResolve(val) {
+        return { type: "CallExpression",
+                 callee: this._afsMem(this._afsId("Promise"), "resolve"),
+                 arguments: [typeof val === "string" ? this._afsId(val) : val] };
+    },
+    _afsIteratorCloseIgnore(syncName) {
+        const ret = "__afs_retc";
+        return { type: "TryStatement",
+            block: { type: "BlockStatement", body: [
+                this._afsVar("var", ret, this._afsMem(syncName, "return")),
+                { type: "IfStatement",
+                  test: this._afsTypeofIs(ret, "function"),
+                  consequent: { type: "ExpressionStatement",
+                    expression: this._afsCallThis(ret, syncName, []) },
+                  alternate: null },
+            ] },
+            handler: { type: "CatchClause", param: this._afsId("__afs_ce"),
+                       body: { type: "BlockStatement", body: [] } },
+            finalizer: null };
+    },
+
+    _afsThis() { return { type: "ThisExpression" }; },
+
+    // CreateAsyncFromSyncIterator(syncIterator) → wrapper object.
+    // 工厂是普通函数(pending,不在 async-gen 协程体里编译方法)。方法本身是 async,
+    // 用 this.__sync / this.__nm,不再闭包捕获也不再套一层 inner async IIFE。
+    createAFSWrapperAST(syncIterExpr) {
+        return {
+            type: "CallExpression",
+            callee: this._afsFn(["s"], [
+                { type: "ReturnStatement", argument: { type: "ObjectExpression", properties: [
+                    { type: "Property", key: this._afsId("__sync"), kind: "init", computed: false,
+                      value: this._afsId("s") },
+                    { type: "Property", key: this._afsId("__nm"), kind: "init", computed: false,
+                      value: this._afsMem("s", "next") },
+                    { type: "Property", key: this._afsId("next"), kind: "init", computed: false,
+                      value: this._afsMakeNextFn() },
+                    { type: "Property", key: this._afsId("return"), kind: "init", computed: false,
+                      value: this._afsMakeReturnFn() },
+                    { type: "Property", key: this._afsId("throw"), kind: "init", computed: false,
+                      value: this._afsMakeThrowFn() },
+                ] } },
+            ]),
+            arguments: [syncIterExpr],
+        };
+    },
+
+    _afsSyncSlot() { return this._afsMem(this._afsThis(), "__sync"); },
+    _afsNmSlot() { return this._afsMem(this._afsThis(), "__nm"); },
+
+    _afsPromiseReject(val) {
+        return { type: "CallExpression",
+                 callee: this._afsMem(this._afsId("Promise"), "reject"),
+                 arguments: [typeof val === "string" ? this._afsId(val) : val] };
+    },
+
+    // 普通函数 + Promise.then(非 async):async gen 体内调 async 函数会走 stub 把
+    // 外层协程弄坏(await helper() 变 NaN、.next() 非 thenable)。regular fn 返 Promise 可 await。
+    _afsContThen(closeOnRejection) {
+        const onFul = this._afsFn(["v"], [
+            { type: "ReturnStatement", argument: { type: "ObjectExpression", properties: [
+                { type: "Property", key: this._afsId("value"), kind: "init", computed: false, value: this._afsId("v") },
+                { type: "Property", key: this._afsId("done"), kind: "init", computed: false, value: this._afsId("done") },
+            ] } },
+        ], false);
+        const onRej = closeOnRejection ? this._afsFn(["e"], [
+            { type: "IfStatement",
+              test: { type: "UnaryExpression", operator: "!", argument: this._afsId("done") },
+              consequent: this._afsIteratorCloseIgnore("__afs_s"),
+              alternate: null },
+            { type: "ThrowStatement", argument: this._afsId("e") },
+        ], false) : null;
+        const thenArgs = [onFul];
+        if (onRej) thenArgs.push(onRej);
+        return [
+            this._afsVar("var", "done", this._afsMem("result", "done")),
+            this._afsVar("var", "val", this._afsMem("result", "value")),
+            this._afsVar("var", "wrap", this._afsLit(null)),
+            { type: "TryStatement",
+              block: { type: "BlockStatement", body: [
+                  this._afsAssign("wrap", this._afsPromiseResolve("val")),
+              ] },
+              handler: { type: "CatchClause", param: this._afsId("e"),
+                body: { type: "BlockStatement", body: (closeOnRejection ? [
+                    { type: "IfStatement",
+                      test: { type: "UnaryExpression", operator: "!", argument: this._afsId("done") },
+                      consequent: this._afsIteratorCloseIgnore("__afs_s"),
+                      alternate: null },
+                ] : []).concat([
+                    { type: "ReturnStatement", argument: this._afsPromiseReject("e") },
+                ]) } },
+              finalizer: null },
+            { type: "ReturnStatement", argument: { type: "CallExpression",
+                callee: this._afsMem("wrap", "then"),
+                arguments: thenArgs } },
+        ];
+    },
+
+    _afsWrapTry(bodyStmts) {
+        return this._afsFn(["value"], [
+            { type: "TryStatement",
+              block: { type: "BlockStatement", body: bodyStmts },
+              handler: { type: "CatchClause", param: this._afsId("e"),
+                body: { type: "BlockStatement", body: [
+                    { type: "ReturnStatement", argument: this._afsPromiseReject("e") },
+                ] } },
+              finalizer: null },
+        ], false);
+    },
+
+    _afsMakeNextFn() {
+        return this._afsWrapTry([
+            this._afsVar("var", "__afs_s", this._afsSyncSlot()),
+            this._afsVar("var", "__afs_n", this._afsNmSlot()),
+            this._afsVar("var", "__afs_p", { type: "BinaryExpression", operator: ">",
+                left: this._afsMem("arguments", "length"), right: this._afsLit(0) }),
+            this._afsVar("var", "result", this._afsLit(null)),
+            { type: "IfStatement",
+              test: this._afsId("__afs_p"),
+              consequent: this._afsAssign("result", this._afsCallThis("__afs_n", "__afs_s", [this._afsId("value")])),
+              alternate: this._afsAssign("result", this._afsCallThis("__afs_n", "__afs_s", [])) },
+            { type: "IfStatement",
+              test: this._afsNotObject("result"),
+              consequent: this._afsThrowTE("Iterator result is not an object"),
+              alternate: null },
+        ].concat(this._afsContThen(true)));
+    },
+
+    _afsMakeReturnFn() {
+        return this._afsWrapTry([
+            this._afsVar("var", "__afs_s", this._afsSyncSlot()),
+            this._afsVar("var", "ret", this._afsMem("__afs_s", "return")),
+            this._afsVar("var", "__afs_p", { type: "BinaryExpression", operator: ">",
+                left: this._afsMem("arguments", "length"), right: this._afsLit(0) }),
+            { type: "IfStatement",
+              test: { type: "UnaryExpression", operator: "!", argument: this._afsTypeofIs("ret", "function") },
+              consequent: { type: "ReturnStatement", argument: this._afsPromiseResolve(
+                  { type: "ObjectExpression", properties: [
+                      { type: "Property", key: this._afsId("value"), kind: "init", computed: false, value: this._afsId("value") },
+                      { type: "Property", key: this._afsId("done"), kind: "init", computed: false, value: this._afsLit(true) },
+                  ] }) },
+              alternate: null },
+            this._afsVar("var", "result", this._afsLit(null)),
+            { type: "IfStatement",
+              test: this._afsId("__afs_p"),
+              consequent: this._afsAssign("result", this._afsCallThis("ret", "__afs_s", [this._afsId("value")])),
+              alternate: this._afsAssign("result", this._afsCallThis("ret", "__afs_s", [])) },
+            { type: "IfStatement",
+              test: this._afsNotObject("result"),
+              consequent: this._afsThrowTE("Iterator result is not an object"),
+              alternate: null },
+        ].concat(this._afsContThen(false)));
+    },
+
+    _afsMakeThrowFn() {
+        return this._afsWrapTry([
+            this._afsVar("var", "__afs_s", this._afsSyncSlot()),
+            this._afsVar("var", "thr", this._afsMem("__afs_s", "throw")),
+            this._afsVar("var", "__afs_p", { type: "BinaryExpression", operator: ">",
+                left: this._afsMem("arguments", "length"), right: this._afsLit(0) }),
+            { type: "IfStatement",
+              test: { type: "UnaryExpression", operator: "!", argument: this._afsTypeofIs("thr", "function") },
+              consequent: { type: "BlockStatement", body: [
+                  this._afsIteratorCloseIgnore("__afs_s"),
+                  this._afsThrowTE("The iterator does not provide a 'throw' method."),
+              ] },
+              alternate: null },
+            this._afsVar("var", "result", this._afsLit(null)),
+            { type: "IfStatement",
+              test: this._afsId("__afs_p"),
+              consequent: this._afsAssign("result", this._afsCallThis("thr", "__afs_s", [this._afsId("value")])),
+              alternate: this._afsAssign("result", this._afsCallThis("thr", "__afs_s", [])) },
+            { type: "IfStatement",
+              test: this._afsNotObject("result"),
+              consequent: this._afsThrowTE("Iterator result is not an object"),
+              alternate: null },
+        ].concat(this._afsContThen(true)));
+    },
+
 
     // [批次D] 生成器函数 stub：函数标签处不执行体，改为创建协程+生成器对象。
     // 进入时寄存器状态与普通函数调用一致：A0..=实参(A0=p0,A1=p1..A4=p4)、S0=闭包指针
@@ -694,16 +1109,11 @@ export const AsyncCompiler = {
         }
         const thisOff = rec.allocLocal("__this");
         vm.store(VReg.FP, thisOff, VReg.A5);
-        // 捕获名:S0 闭包 box 指针预载入探针帧(与体内 closure 载入同法)
-        const caps = capturedNames || [];
-        for (let i = 0; i < caps.length; i++) {
-            const off = rec.allocLocal(caps[i]);
-            vm.load(VReg.V1, VReg.S0, 16 + i * 8);
-            vm.store(VReg.FP, off, VReg.V1);
-        }
-        // 实参落槽(FDI 毁 A 寄存器前)
+        // leftover-arg: save A0-A4 (not just n formals) BEFORE captures / V1.
+        // x64 V1≡A3: capture lea smashed arguments[3]; restoring only n=3 left
+        // A3 leftover in coro+128 → body arguments[3] denormal.
         const slots = [];
-        for (let i = 0; i < n; i++) {
+        for (let i = 0; i < 5; i++) {
             const off = rec.allocLocal(`__fdiarg_${i}`);
             vm.store(VReg.FP, off, vm.getArgReg(i));
             slots.push(off);
@@ -723,6 +1133,13 @@ export const AsyncCompiler = {
         }
         if (fdiNeedFullArgv) this.emitArgvSpillSnapshot(16);
         if (fdiUsesArguments) this.emitArgumentsArray();
+        // 捕获名:S0 闭包 box 指针预载入探针帧(与体内 closure 载入同法)
+        const caps = capturedNames || [];
+        for (let i = 0; i < caps.length; i++) {
+            const off = rec.allocLocal(caps[i]);
+            vm.load(VReg.V1, VReg.S0, 16 + i * 8);
+            vm.store(VReg.FP, off, VReg.V1);
+        }
         // rest 绑定模式:parser 拆成 SpreadElement(__restpat_N) + 影子 pattern(.restSource)。
         // 普通函数路径在形参循环里 emitRestParam;FDI 此前只跑 emitParamDestructure,
         // getLocal(restSource) 失败 → 编译期 throw。先按 SpreadElement 下标收 rest 数组。
@@ -876,7 +1293,7 @@ export const AsyncCompiler = {
         this.ctx.locals = savedLocals;
         this.ctx.boxedVars = savedBoxed;
         this.ctx.varTypes = savedVarTypes;
-        for (let i = 0; i < n; i++) {
+        for (let i = 0; i < 5; i++) {
             vm.load(vm.getArgReg(i), VReg.FP, slots[i]);
         }
         vm.load(VReg.A5, VReg.FP, thisSlot);
@@ -1791,6 +2208,12 @@ export const AsyncCompiler = {
     emitAsyncResolveAndReturnFromRet() {
         const vm = this.vm;
 
+        // x64 V0≡RET: stash the return value BEFORE popExc / lea V0.
+        // Old order lea(_exception_pending) into V0 smashed RET, so
+        // `async () => p` / `return 9` settled leftover bits (denormal
+        // number) and throwsAsync saw fulfillment instead of adopt.
+        vm.push(VReg.RET);
+
         this._emitAsyncPopExcChain();
 
         // 清 _exception_pending:finally 块的 return 覆盖任何在途异常
@@ -1798,9 +2221,6 @@ export const AsyncCompiler = {
         vm.lea(VReg.V0, "_exception_pending");
         vm.movImm(VReg.V1, 0);
         vm.store(VReg.V0, 0, VReg.V1);
-
-        // 保存返回值
-        vm.push(VReg.RET);
 
         this._emitAsyncLoadPromise(VReg.V2);
 
