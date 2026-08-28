@@ -401,12 +401,40 @@ export const BuiltinMethodCompiler = {
                 return true;
 
             case "repeat":
-                // str.repeat(count) - 重复字符串
+                // str.repeat(count) - leftover Inf/NaN ToInteger + leftover-arg ToNumber.
+                // Raw fcvtzs of leftover-tagged (NaN/null/undefined/false/"0") leftover
+                // RangeError (x64 fcvtzs(NaN)→INT64_MIN). leftover Inf keep saturate
+                // RangeError. Scratch V5 (linux-x64 V0=RET). leftover-arg 0-arg unchanged.
                 if (args.length > 0) {
                     this.compileExpression(args[0]);
-                    // 索引是浮点数表示，转为整数
+                    this.emitNumberCoerceFast();
+                    const finiteL = this.ctx.newLabel("rpt_fin");
+                    const zeroL = this.ctx.newLabel("rpt_zero");
+                    const ninfL = this.ctx.newLabel("rpt_ninf");
+                    const doneL = this.ctx.newLabel("rpt_done");
+                    this.vm.shrImm(VReg.V5, VReg.RET, 52);
+                    this.vm.andImm(VReg.V5, VReg.V5, 0x7ff);
+                    this.vm.cmpImm(VReg.V5, 0x7ff);
+                    this.vm.jne(finiteL);
+                    this.vm.movImm64(VReg.V5, 0x000FFFFFFFFFFFFFn);
+                    this.vm.and(VReg.V5, VReg.RET, VReg.V5);
+                    this.vm.cmpImm(VReg.V5, 0);
+                    this.vm.jne(zeroL);
+                    this.vm.shrImm(VReg.V5, VReg.RET, 63);
+                    this.vm.cmpImm(VReg.V5, 0);
+                    this.vm.jne(ninfL);
+                    this.vm.movImm64(VReg.RET, 0x7FFFFFFFFFFFFFFFn);
+                    this.vm.jmp(doneL);
+                    this.vm.label(ninfL);
+                    this.vm.movImm64(VReg.RET, 0x8000000000000000n);
+                    this.vm.jmp(doneL);
+                    this.vm.label(zeroL);
+                    this.vm.movImm(VReg.RET, 0);
+                    this.vm.jmp(doneL);
+                    this.vm.label(finiteL);
                     this.vm.fmovToFloat(0, VReg.RET);
                     this.vm.fcvtzs(VReg.RET, 0);
+                    this.vm.label(doneL);
                     this.vm.mov(VReg.A1, VReg.RET);
                 } else {
                     this.vm.movImm(VReg.A1, 0);
