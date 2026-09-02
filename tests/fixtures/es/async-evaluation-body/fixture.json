@@ -1,0 +1,10 @@
+{
+  "description": "Async function body runs synchronously until the first await (AsyncFunctionStart).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "called",
+    "exitCode": 0
+  }
+}

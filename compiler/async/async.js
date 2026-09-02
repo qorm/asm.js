@@ -2201,17 +2201,25 @@ export const AsyncCompiler = {
         // async 函数声明调用:建协程 + 返回 Promise。closure_ptr=0(顶层声明无闭包)。
         // [多实参透传] 协程实参约定(见 _coroutine_entry):A0=coro+64(首参)、A1-A4=
         // coro+112/120/128/136(CORO_ARG1-4)。_coroutine_create 仅存首参、清零 CORO_ARG1-4;
-        // 次参 2-5 在 create 后由本调用点回填。此前只编 args[0] → `f(x,y)` 丢 y。最多 5 参。
+        // 次参 2-5 在 create 后由本调用点回填。此前只编 args[0] → `f(x,y)` 丢 y。
+        // 第 6+ 实参写入 _call_argv,由 create 快照进 CORO_ARGV(leftover-arg /
+        // dflt-params-arg-val-not-undefined 第 6 形参)。
         // funcPtr 与各实参先落 FP 局部槽:compileExpression 会自由冲寄存器(架构无关,无裸栈)。
-        const argc = args ? Math.min(args.length, 5) : 0;
+        const argc = args ? Math.min(args.length, 16) : 0;
+        const regc = argc > 5 ? 5 : argc;
         const fpSlot = this.ctx.allocLocal(`__async_fp_${this.nextLabelId()}`);
         vm.store(VReg.FP, fpSlot, funcPtr);
         const argSlots = [];
-        for (let i = 0; i < argc; i++) {
+        for (let i = 0; i < regc; i++) {
             this.compileExpression(args[i]);
             const slot = this.ctx.allocLocal(`__async_darg${i}_${this.nextLabelId()}`);
             vm.store(VReg.FP, slot, VReg.RET);
             argSlots.push(slot);
+        }
+        for (let i = 5; i < argc; i++) {
+            this.compileExpression(args[i]);
+            vm.lea(VReg.V5, "_call_argv");
+            vm.store(VReg.V5, i * 8, VReg.RET);
         }
 
         // [argc] 实参求值(上方 compileExpression)可能含嵌套调用把 _call_argc 写脏;
@@ -2219,7 +2227,7 @@ export const AsyncCompiler = {
         this.emitSetCallArgc(argc);
         // 组装 _coroutine_create(A0=func_ptr, A1=首参|undefined, A2=0)
         vm.load(VReg.A0, VReg.FP, fpSlot); // func_ptr
-        if (argc > 0) {
+        if (regc > 0) {
             vm.load(VReg.A1, VReg.FP, argSlots[0]); // 首参
         } else {
             vm.movImm64(VReg.A1, 0x7ffb000000000000n); // JS_UNDEFINED:无参调用缺省参数应得 undefined
@@ -2230,7 +2238,7 @@ export const AsyncCompiler = {
 
         // 回填次参 2-5 到 CORO_ARG1-4(coro+112/120/128/136)。V1 scratch(下无 call 打断)。
         const coroArgOff = [112, 120, 128, 136];
-        for (let i = 1; i < argc; i++) {
+        for (let i = 1; i < regc; i++) {
             vm.load(VReg.V1, VReg.FP, argSlots[i]);
             vm.store(VReg.S2, coroArgOff[i - 1], VReg.V1);
         }
@@ -2248,6 +2256,11 @@ export const AsyncCompiler = {
         // 将协程加入调度队列
         vm.mov(VReg.A0, VReg.S2);
         vm.call("_scheduler_spawn");
+        // [AsyncFunctionStart] 同步执行至首个 await/return。evaluation-body.js:
+        // `async function foo(){ called=true; await p }`; foo(); assert(called).
+        vm.mov(VReg.A0, VReg.S2);
+        vm.movImm64(VReg.A1, 0x7ffb000000000000n);
+        vm.call("_coroutine_resume");
 
         // 返回 Promise
         vm.mov(VReg.RET, VReg.S3);

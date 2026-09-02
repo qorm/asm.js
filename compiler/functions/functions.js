@@ -974,19 +974,26 @@ export const FunctionCompiler = {
         // [多实参透传] 协程实参约定(见 _coroutine_entry):A0=coro+64(首参)、A1-A4=
         // coro+112/120/128/136(CORO_ARG1-4)。_coroutine_create 仅存首参(A1→coro+64)并把
         // CORO_ARG1-4 清零;故次参 2-5 须在 create 后由本调用点回填(镜像生成器 stub 做法,
-        // 但用 FP 槽而非裸栈)。最多 5 参(A0-A4;A5 留 this),超出丢弃(记偏差)。
-        const argc = args ? Math.min(args.length, 5) : 0;
+        // 但用 FP 槽而非裸栈)。前 5 参走 A0-A4;第 6+ 已由 compileCallArguments
+        // 写入 _call_argv,create 快照进 CORO_ARGV。勿把 argc 截成 5,否则 spill 丢第 6 参。
+        const argc = args ? Math.min(args.length, 16) : 0;
+        const regc = argc > 5 ? 5 : argc;
         // 先把全部实参(A0-A4)暂存到 FP 局部槽——_coroutine_create 会作为 call 冲掉 A 寄存器。
         const argSlots = [];
-        for (let i = 0; i < argc; i++) {
+        for (let i = 0; i < regc; i++) {
             const slot = this.ctx.allocLocal(`__async_arg${i}_${this.nextLabelId()}`);
             vm.store(VReg.FP, slot, vm.getArgReg(i));
             argSlots.push(slot);
         }
 
+        // Preserve leftover-arg argc (compileCallArguments already wrote
+        // _call_argc/_call_argv). Re-store the true count so create's snapshot
+        // keeps argv[5..] (dflt-params 6th formal).
+        this.emitSetCallArgc(argc);
+
         // 组装 _coroutine_create(A0=func_ptr, A1=首参|undefined, A2=closure_ptr)
         vm.load(VReg.A0, VReg.S0, 8); // func_ptr
-        if (argc > 0) {
+        if (regc > 0) {
             vm.load(VReg.A1, VReg.FP, argSlots[0]); // 首参
         } else {
             vm.movImm64(VReg.A1, 0x7ffb000000000000n); // JS_UNDEFINED:无参调用缺省参数应得 undefined
@@ -997,7 +1004,7 @@ export const FunctionCompiler = {
 
         // 回填次参 2-5 到 CORO_ARG1-4(coro+112/120/128/136)。V1 作 scratch(下无 call 打断)。
         const coroArgOff = [112, 120, 128, 136];
-        for (let i = 1; i < argc; i++) {
+        for (let i = 1; i < regc; i++) {
             vm.load(VReg.V1, VReg.FP, argSlots[i]);
             vm.store(VReg.S2, coroArgOff[i - 1], VReg.V1);
         }
@@ -1009,10 +1016,16 @@ export const FunctionCompiler = {
 
         // 关联协程和 Promise
         vm.store(VReg.S2, 88, VReg.S3); // coro.promise = Promise
+        vm.movImm(VReg.V1, 1);
+        vm.store(VReg.S2, 168, VReg.V1);
 
         // 将协程加入调度队列
         vm.mov(VReg.A0, VReg.S2);
         vm.call("_scheduler_spawn");
+        // [AsyncFunctionStart] 同步执行至首个 await/return。
+        vm.mov(VReg.A0, VReg.S2);
+        vm.movImm64(VReg.A1, 0x7ffb000000000000n);
+        vm.call("_coroutine_resume");
 
         // 返回 Promise
         vm.mov(VReg.RET, VReg.S3);

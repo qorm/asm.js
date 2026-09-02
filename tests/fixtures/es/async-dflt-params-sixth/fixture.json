@@ -1,0 +1,10 @@
+{
+  "description": "Async function leftover-arg: the 6th actual argument is not dropped into a default.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "1 0",
+    "exitCode": 0
+  }
+}
