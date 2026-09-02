@@ -1,0 +1,10 @@
+{
+  "description": "Block-level async function declarations return a thenable Promise, not a sync result.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "function",
+    "exitCode": 0
+  }
+}

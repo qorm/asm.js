@@ -2626,8 +2626,14 @@ export const StatementCompiler = {
             params: stmt.params,
             body: stmt.body,
             id: stmt.id,
-            async: stmt.async, // 保留 async 标志
-            isGenerator: stmt.isGenerator, // [批次D] 保留生成器标志
+            // Parser FunctionDeclaration stores isAsync, not async. Copying only
+            // stmt.async left nested `async function f(){}` as a sync closure:
+            // f() ran the body immediately and returned a non-thenable, so
+            // f().then($DONE,$DONE) never queued (unscopables-with $DONE).
+            async: !!(stmt.async || stmt.isAsync),
+            isAsync: !!(stmt.async || stmt.isAsync),
+            isGenerator: !!(stmt.isGenerator || stmt.generator),
+            generator: !!(stmt.isGenerator || stmt.generator),
         };
 
         this.compileFunctionExpression(funcExpr);

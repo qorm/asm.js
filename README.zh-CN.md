@@ -18,7 +18,7 @@
 
 - **规范符合性**：最新 test262 符合性基线达 **97.29%**（6,142/6,313 stride-5 子集；详见 `tests/test262/last_report.md`，macOS-ARM64 运行记录：COMPILE_FAIL 0、CRASH 0、FAIL 171）。
 - **自举确定性**：macOS-ARM64 与 Linux-ARM64 均已验证逐字节相同的自举固定点（`gen1 == gen2 == gen3`）。
-- **测试基线**：412 项仓库核心 fixtures 测试全绿通过。
+- **测试基线**：413 项仓库核心 fixtures 测试全绿通过。
 - **版本历史与更新记录**：详细的发布日志与技术波次记录请参阅 **[CHANGELOG.zh-CN.md](./CHANGELOG.zh-CN.md)**。
 
 `asm.js` 已在**两个 ARM64 目标(macOS-ARM64 原生、Linux-ARM64 Docker)上实现自举**:在每个目标上,编译器把自身源码编译成原生二进制,该二进制再次编译编译器,产物**逐字节一致** —— 稳定的自我复现定点(`gen1 == gen2 == gen3`)。x64 三目标(macOS-x64、Linux-x64、Windows-x64)在 v1.1.0 曾达成此定点,当前**不保持**:x64 上完整自编译 CLI 命中一个布局敏感的编译阻塞,正在取证排查(其交叉编译产物仍能正确构建并运行普通程序——五目标平台矩阵绿)。当前支持较大的 ES 子集与有限的 Node 核心 shim 子集;完整 ECMAScript 与完整 Node.js 兼容仍在进行中。
@@ -60,7 +60,7 @@
 - **性能处于 AOT 档位,分负载差异大。** 2026-07 对 Node 24 实测:数值循环 ~2.7×(优化前 ~14×)、属性访问密集 ~13×(从 ~32× 收窄)、字符串构建 ~3×、Map 操作略快于 Node。要 V8-JIT 级多态属性热循环速度仍不是对的工具;数值/CLI/启动敏感负载差距已收窄到小倍数(asm.js ~2ms 启动 vs Node ~40ms)。已落地杠杆:区间线性扫描寄存器分配、属性站点缓存、ToNumber 内联快路、比较-分支融合;下一杠杆:对象 shape(属性差距)。
 - **内存模型为保守式非移动。** 分代 GC(sticky mark-bit minor + Go 式 full 步调,64KB 按类 span + O(1) 页映射)已是缺省;仍为保守/非移动 + 大虚拟地址预留,重负载峰值 RSS 高于成熟运行时(编译器自编译峰值 ~1.4 GB,分代前 ~2 GB)。
 - **`eval` 以封闭世界为代价、无 native addon。** 独立二进制默认封闭世界;N-API/`.node` 插件与单二进制模型冲突,不在范围内。全局作用域的 `eval`/`new Function` 现已可用(引擎库 route B:使用它们的程序会把编译器编入产物,见 `engine/README.md`);词法作用域捕获与运行时 specifier 的 `import()` 仍待做(ROADMAP L2c)。
-- **未达生产级。** 尚无稳定性承诺与 semver 纪律,主力开发者一人。测试覆盖以 fixtures 为主(412/412——全绿);test262 符合性 harness 已就位,当前工作区基线为 stride-5 子集(`language/` + 核心 `built-ins/`;built-ins/Math 100%、Number 94.0%、Object 98.5%、JSON 90.3%、String 96.3%、RegExp 99.2%、Promise 92.1%、Map 100%、Set 100%、Array 99.8%)6,142 / 6,313 = **97.29%**(见 `tests/test262/last_report.md`,2026-08-26 macos-arm64),较 v0.3.65 的 70.19% 与 v0.2.1 的 20.55% 已显著提升,CRASH 0、COMPILE_FAIL 0;剩余 171 FAIL(class / Symbol.iterator / async-iteration / class-fields / async `$DONE`)仍在推进。linux-x64 leftover-arg 记录见 `tests/test262/last_report_linux-x64.md`。
+- **未达生产级。** 尚无稳定性承诺与 semver 纪律,主力开发者一人。测试覆盖以 fixtures 为主(413/413——全绿);test262 符合性 harness 已就位,当前工作区基线为 stride-5 子集(`language/` + 核心 `built-ins/`;built-ins/Math 100%、Number 94.0%、Object 98.5%、JSON 90.3%、String 96.3%、RegExp 99.2%、Promise 92.1%、Map 100%、Set 100%、Array 99.8%)6,142 / 6,313 = **97.29%**(见 `tests/test262/last_report.md`,2026-08-26 macos-arm64),较 v0.3.65 的 70.19% 与 v0.2.1 的 20.55% 已显著提升,CRASH 0、COMPILE_FAIL 0;剩余 171 FAIL(class / Symbol.iterator / async-iteration / class-fields / async `$DONE`)仍在推进。linux-x64 leftover-arg 记录见 `tests/test262/last_report_linux-x64.md`。
 
 ### 适合与不适合
 
