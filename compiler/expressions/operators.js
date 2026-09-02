@@ -372,8 +372,15 @@ export const OperatorCompiler = {
             }
             // 非拼接的 `+` 里静态 NaN 操作数 → 结果 NaN(同上,跳过 fadd 规范化).
             // Skip when a side is BIGINT: 1n+NaN is TypeError via _js_add.
+            // Skip OBJECT/ARRAY/FUNCTION/DATE/UNKNOWN: ToPrimitive may yield a
+            // string (`new String("1")+undefined === "1undefined"`). Folding
+            // those to NaN skipped _js_add entirely.
             if ((isStaticNaN(expr.left) || isStaticNaN(expr.right)) &&
-                leftType !== Type.BIGINT && rightType !== Type.BIGINT) {
+                leftType !== Type.BIGINT && rightType !== Type.BIGINT &&
+                !hasObjArr &&
+                leftType !== Type.FUNCTION && rightType !== Type.FUNCTION &&
+                leftType !== Type.DATE && rightType !== Type.DATE &&
+                leftType !== Type.UNKNOWN && rightType !== Type.UNKNOWN) {
                 this.vm.movImm64(VReg.RET, 0x7ff0000000000001n);
                 return;
             }

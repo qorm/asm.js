@@ -1,0 +1,10 @@
+{
+  "description": "new String primitive + undefined concatenates after ToPrimitive, not numeric NaN.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "1undefined\nundefined1\n1undefined\nundefined1",
+    "exitCode": 0
+  }
+}

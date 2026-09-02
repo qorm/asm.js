@@ -3279,35 +3279,36 @@ export class StringGenerator {
         vm.jmp("_js_toprim_done");
         vm.label("_js_toprim_no_bi_slot");
         // Number wrapper: [[NumberData]] via __number_value (new Number(1)+"").
-        // After @@toPrimitive miss so a user trap still wins. x64 V0≡RET:
-        // save at SP+0; accept boxed int32 / IEEE float / +0.0; reject
-        // undefined and naked heap leftovers.
+        // Presence first: _object_get miss is leftover 0, which is also +0.0.
+        vm.mov(VReg.A0, VReg.S0);
+        vm.lea(VReg.A1, vm.asm.addString("__number_value"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_js_toprim_no_num_slot");
         vm.mov(VReg.A0, VReg.S0);
         vm.lea(VReg.A1, vm.asm.addString("__number_value"));
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.A1, VReg.V1);
         vm.call("_object_get");
-        vm.store(VReg.SP, 0, VReg.RET);
-        vm.shrImm(VReg.V1, VReg.RET, 48);
-        vm.cmpImm(VReg.V1, 0x7FFB);
-        vm.jeq("_js_toprim_no_num_slot");
-        vm.cmpImm(VReg.V1, 0x7FF8);
-        vm.jeq("_js_toprim_num_hit");
-        vm.cmpImm(VReg.V1, 0x7FF9);
-        vm.jlt("_js_toprim_num_raw");
-        vm.cmpImm(VReg.V1, 0x7FFF);
-        vm.jle("_js_toprim_no_num_slot");
-        vm.jmp("_js_toprim_num_hit");
-        vm.label("_js_toprim_num_raw");
-        vm.cmpImm(VReg.V1, 0);
-        vm.jne("_js_toprim_num_hit");
-        vm.movImm64(VReg.V1, vm.ptrFloor);
-        vm.cmp(VReg.RET, VReg.V1);
-        vm.jge("_js_toprim_no_num_slot");
-        vm.label("_js_toprim_num_hit");
-        vm.load(VReg.RET, VReg.SP, 0);
         vm.jmp("_js_toprim_done");
         vm.label("_js_toprim_no_num_slot");
+        // String wrapper: [[StringData]] via __value (new String("1")+undefined).
+        vm.mov(VReg.A0, VReg.S0);
+        vm.lea(VReg.A1, vm.asm.addString("__value"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_js_toprim_no_str_slot");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.lea(VReg.A1, vm.asm.addString("__value"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.jmp("_js_toprim_done");
+        vm.label("_js_toprim_no_str_slot");
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_object_user_valueof");   // A0 仍是对象/函数
         // miss 现返原对象(0x7FFD);+0.0 是合法原语,勿 cmpImm 0。
