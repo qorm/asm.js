@@ -1,0 +1,8 @@
+{
+  "description": "ASI cannot apply between let and await in an async function; let\\nawait 0 is a SyntaxError.",
+  "expect": {
+    "parse": false,
+    "compile": false,
+    "run": false
+  }
+}

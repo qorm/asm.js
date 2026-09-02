@@ -89,9 +89,13 @@ export const StatementParser = {
             // LineTerminator). `let\n[a] = 0` is a LexicalDeclaration — illegal as a
             // Statement (if/for/while/with/label body) via checkStatementBody, legal as
             // StatementListItem. Previously ASI + infix `[` compiled `let[a] = 0`.
+            // Exception: `await`/`yield` remain BindingIdentifier grammatically, so
+            // ASI cannot apply between `let` and them (`let\nawait 0` in async is a
+            // SyntaxError, not `let;` + `await 0`).
             if (this.curTokenIs(TokenType.LET) && !this.inStrictMode() &&
                 this.peekToken.line !== this.curToken.line &&
                 !(this._immediateGen && this.peekTokenIs(TokenType.YIELD)) &&
+                !(this._immediateAsync && this.peekTokenIs(TokenType.AWAIT)) &&
                 !this.peekTokenIs(TokenType.LBRACKET)) {
                 return this.parseExpressionStatement();
             }
