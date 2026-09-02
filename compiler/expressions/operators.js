@@ -975,6 +975,7 @@ export const OperatorCompiler = {
             else if (bn === "Map") biWantType = 4;
             else if (bn === "Set") biWantType = 5;
             else if (bn === "Promise") biWantType = 11;
+            else if (bn === "ArrayBuffer") biWantType = 12;
             // TypedArray 族:实例头 type 字节即各自 TYPE(0x40-0x61)。x instanceof Int8Array
             // 仅当 type 字节精确相等(与 Date/Map 同法,heap 界内读 [ptr+0] 低字节)。
             else if (bn === "Int8Array") biWantType = 0x40;
@@ -1649,6 +1650,35 @@ export const OperatorCompiler = {
                     // _object_delete and the var is often not mirrored onto globalThis
                     // (mirror only when source contains "globalThis").
                     this.vm.movImm64(VReg.RET, 0x7ff9000000000000n);
+                    this._emitStrictDeleteCheck();
+                    return;
+                }
+                // Array/String protocol builtins are represented by both the
+                // real well-known Symbol key and a legacy "Symbol.*" lookup
+                // alias.  A computed delete must remove the actual Symbol
+                // property and keep that internal alias in sync; deleting only
+                // the string alias left @@iterator observable and made array
+                // destructuring ignore `delete Array.prototype[Symbol.iterator]`.
+                const wkDeleteName = darg.computed && darg.property &&
+                    darg.property.type === "MemberExpression"
+                    ? this.getMemberPropertyName(darg.property) : null;
+                if (wkDeleteName === "Symbol.iterator" ||
+                    wkDeleteName === "Symbol.asyncIterator") {
+                    const recvOff = this.ctx.allocLocal(`__delwk_recv_${this.nextLabelId()}`);
+                    const done = this.ctx.newLabel("delwk_done");
+                    this.compileExpression(darg.object);
+                    this.vm.store(VReg.FP, recvOff, VReg.RET);
+                    this.compileExpression(darg.property); // the real well-known Symbol
+                    this.vm.mov(VReg.A1, VReg.RET);
+                    this.vm.load(VReg.A0, VReg.FP, recvOff);
+                    this.vm.call("_object_delete");
+                    this.vm.movImm64(VReg.V1, 0x7ff9000000000001n); // true
+                    this.vm.cmp(VReg.RET, VReg.V1);
+                    this.vm.jne(done); // non-configurable Symbol property:preserve alias
+                    this.vm.load(VReg.A0, VReg.FP, recvOff);
+                    this.emitBoxedStringKey(wkDeleteName, VReg.A1);
+                    this.vm.call("_object_delete");
+                    this.vm.label(done);
                     this._emitStrictDeleteCheck();
                     return;
                 }

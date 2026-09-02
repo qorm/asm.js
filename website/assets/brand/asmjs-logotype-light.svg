@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 280 80" width="280" height="80" role="img" aria-labelledby="ltLightTitle ltLightDesc">
+  <title id="ltLightTitle">asm.js Standalone Logotype (Light)</title>
+  <desc id="ltLightDesc">Standalone precision vector wordmark for light theme</desc>
+  <g class="logotype" fill="#0B0D0C" transform="translate(-100, -10)">
+    <!-- letter 'a' -->
+    <path d="M158 36 H148 V42 C144 37 137 34 129 34 C117 34 108 43 108 56 C108 69 117 78 129 78 C137 78 144 75 148 70 V78 H158 V36 Z M133 69 C123 69 118 63 118 56 C118 49 123 43 133 43 C143 43 148 49 148 56 C148 63 143 69 133 69 Z" />
+    <!-- letter 's' -->
+    <path d="M198 48 C198 40 191 34 180 34 C170 34 163 39 162 48 H172 C173 43 176 41 180 41 C185 41 188 43 188 46 C188 49 185 50 178 52 C167 54 161 58 161 65 C161 73 169 78 180 78 C191 78 199 73 199 64 H189 C188 69 185 71 180 71 C175 71 171 69 171 65 C171 62 174 60 182 58 C193 56 198 52 198 48 Z" />
+    <!-- letter 'm' -->
+    <path d="M208 36 H218 V43 C221 37 228 34 235 34 C242 34 247 38 249 43 C253 37 260 34 268 34 C278 34 284 41 284 52 V78 H274 V53 C274 45 270 42 264 42 C258 42 254 46 254 53 V78 H244 V53 C244 45 240 42 234 42 C228 42 224 46 224 53 V78 H214 V36 H208 Z" />
+    <!-- Dot '.' (Fixed Point) -->
+    <rect x="294" y="66" width="12" height="12" fill="#1F7A38" />
+    <!-- letter 'j' -->
+    <rect x="320" y="20" width="10" height="10" fill="#0B0D0C" />
+    <path d="M320 36 H330 V74 C330 83 325 88 314 88 H308 V80 H314 C318 80 320 78 320 74 V36 Z" />
+    <!-- letter 's' -->
+    <path d="M370 48 C370 40 363 34 352 34 C342 34 335 39 334 48 H344 C345 43 348 41 352 41 C357 41 360 43 360 46 C360 49 357 50 350 52 C339 54 333 58 333 65 C333 73 341 78 352 78 C363 78 371 73 371 64 H361 C360 69 357 71 352 71 C347 71 343 69 343 65 C343 62 346 60 354 58 C365 56 370 52 370 48 Z" />
+  </g>
+</svg>

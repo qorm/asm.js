@@ -369,8 +369,19 @@ export const AssignmentCompiler = {
 
             // 简单赋值
             if (op === "=") {
-                // [L4.2] M1:IP 原地拼接已关(`_canIpStringAccum` 恒否);热路径不再跑门控。
+                // [L4.2 字符串原地拼接] 仅对逃逸分析通过的 `s = s + E` 开启
+                // 原地 append。编译器会在 compileStringConcat 中将该站点改发
+                // `_str_concat_ip`；不满足门控时保持通用 `_strconcat` 语义。
+                const _ipCand = expr.right && expr.right.type === "BinaryExpression" &&
+                    expr.right.operator === "+" && expr.right.left &&
+                    expr.right.left.type === "Identifier" && expr.right.left.name === name &&
+                    this._isKnownStringExpr(expr.right.right) &&
+                    !isBoxed && !globalLabel &&
+                    !(this.ctx.withScopes && this.ctx.withScopes.length > 0) &&
+                    this._canIpStringAccum && this._canIpStringAccum(name);
+                if (_ipCand) this.ctx._ipConcatVar = name;
                 this.compileExpression(expr.right);
+                if (_ipCand) this.ctx._ipConcatVar = null;
                 // 具名函数表达式 BindingIdentifier:CreateImmutableBinding。
                 // sloppy 静默忽略赋值(仍返 RHS);strict 抛 TypeError。
                 // 本函数形参/var 同名走 ownBindingNames,可写;箭头捕获外层名仍禁写。
@@ -546,12 +557,24 @@ export const AssignmentCompiler = {
             }
 
             if (isUnboxedArith && op === "+=") {
-                // += 需要完整的 JS 加法语义（字符串拼接/数值），走运行时分派
+                // 字符串累加器命中 L4.2 门控时，直接走原地 append；否则保留
+                // 完整 JS `+` 分派。右值静态字符串时无需额外 ToString。
+                const _ipPlus = this._isKnownStringExpr(expr.right) &&
+                    !isBoxed && !globalLabel &&
+                    !(this.ctx.withScopes && this.ctx.withScopes.length > 0) &&
+                    this._canIpStringAccum && this._canIpStringAccum(name);
                 this.vm.push(VReg.V1);
-                this.compileExpression(expr.right);
-                this.vm.mov(VReg.A1, VReg.RET);
-                this.vm.pop(VReg.A0);
-                this.vm.call("_js_add");
+                if (_ipPlus) {
+                    this.compileExpressionToString(expr.right);
+                    this.vm.mov(VReg.A1, VReg.RET);
+                    this.vm.pop(VReg.A0);
+                    this.vm.call("_str_concat_ip");
+                } else {
+                    this.compileExpression(expr.right);
+                    this.vm.mov(VReg.A1, VReg.RET);
+                    this.vm.pop(VReg.A0);
+                    this.vm.call("_js_add");
+                }
                 this._storeLocalTemp(name, offset, VReg.RET);
             } else if (isUnboxedArith) {
                 // [#F64] 未装箱算术复合赋值:slot 值可能是 tagged 值(如 x=true 存为
@@ -866,6 +889,9 @@ export const AssignmentCompiler = {
             this.vm.store(VReg.FP, slenValOff, VReg.RET);  // 保存原始 RHS(作表达式值)
             this.vm.mov(VReg.A1, VReg.RET);                // A1 = boxed value(保留 Inf/负数)
             this.vm.load(VReg.A0, VReg.FP, slenObjOff);    // A0 = 对象
+            const slenStrict = (this.ctx && this.ctx.inStrictFunction) ||
+                (this._currentModuleAst && this._currentModuleAst._bsStrict);
+            this.vm.movImm(VReg.A2, slenStrict ? 1 : 0);
             this.vm.call("_js_set_length");
             this.vm.load(VReg.RET, VReg.FP, slenValOff);   // 赋值表达式求值为原始 RHS 值
             return;
@@ -888,7 +914,9 @@ export const AssignmentCompiler = {
             this.vm.mov(VReg.A2, VReg.RET);
             this.vm.load(VReg.A0, VReg.FP, cpsObjOff);
             this.emitBoxedStringKey(member.property.name, VReg.A1);
-            this.vm.call("_closure_prop_set");
+            const _cpsStrict = (this.ctx && this.ctx.inStrictFunction) ||
+                (this._currentModuleAst && this._currentModuleAst._bsStrict);
+            this.vm.call(_cpsStrict ? "_closure_prop_set_strict" : "_closure_prop_set");
             this.vm.load(VReg.RET, VReg.FP, cpsValOff);
             return;
         }
@@ -912,7 +940,31 @@ export const AssignmentCompiler = {
                 this.vm.store(VReg.FP, cvalOff, VReg.RET); // 保存被赋值(call 后作表达式值)
                 this.vm.mov(VReg.A2, VReg.RET);
                 this.vm.load(VReg.A0, VReg.FP, objOffset);
-                this.emitBoxedStringKey(computedPropName, VReg.A1);
+                if (computedPropName === "Symbol.iterator" ||
+                    computedPropName === "Symbol.asyncIterator" ||
+                    computedPropName === "Symbol.species") {
+                    // 规范键是 well-known Symbol;勿落字符串别名(读侧 @@iterator 走符号键)。
+                    const wkSlot = computedPropName === "Symbol.iterator"
+                        ? "_symwk_iterator"
+                        : (computedPropName === "Symbol.asyncIterator"
+                            ? "_symwk_asyncIterator"
+                            : "_symwk_species");
+                    this.vm.lea(VReg.A0, wkSlot);
+                    this.vm.lea(VReg.A1, this.asm.addString(computedPropName));
+                    this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+                    this.vm.or(VReg.A1, VReg.A1, VReg.V1);
+                    this.vm.call("_symbol_wellknown");
+                    this.vm.mov(VReg.A1, VReg.RET);
+                    this.vm.load(VReg.A0, VReg.FP, objOffset);
+                } else {
+                    this.emitBoxedStringKey(computedPropName, VReg.A1);
+                }
+                // Resolving a well-known Symbol calls _symbol_wellknown, which is
+                // free to clobber argument registers.  Reload the saved RHS only
+                // after the key is ready; otherwise `obj[Symbol.iterator] = fn`
+                // stores an A2 scratch value on x64 and GetMethod later sees a
+                // non-callable number instead of fn.
+                this.vm.load(VReg.A2, VReg.FP, cvalOff);
                 {
                     const strictSet = (this.ctx && this.ctx.inStrictFunction) ||
                         (this._currentModuleAst && this._currentModuleAst._bsStrict);
@@ -1444,7 +1496,9 @@ export const AssignmentCompiler = {
                 this.vm.load(VReg.A2, VReg.SP, 0);   // new
                 this.vm.load(VReg.A0, VReg.SP, 2 * updSlot);  // obj(函数值)
                 this.emitBoxedStringKey(staticKey, VReg.A1);
-                this.vm.call("_closure_prop_set");
+                const _updFnStrict = (this.ctx && this.ctx.inStrictFunction) ||
+                    (this._currentModuleAst && this._currentModuleAst._bsStrict);
+                this.vm.call(_updFnStrict ? "_closure_prop_set_strict" : "_closure_prop_set");
             } else {
                 this.vm.load(VReg.A0, VReg.SP, 2 * updSlot);  // obj
                 this.vm.load(VReg.A2, VReg.SP, 0);   // new
@@ -1486,6 +1540,127 @@ export const AssignmentCompiler = {
 
         // 5. 统一走 boxNumber，避免在各处重复手写装箱逻辑
         this.boxNumber(VReg.S0);
+    },
+
+    // [L4.2] 保守的字符串累加逃逸门控。仅当变量所有写入都是字符串字面量
+    // 或门控拼接、且在最后一次拼接前没有可观察别名时，才允许原地追加。
+    _canIpStringAccum(name) {
+        const root = this.ctx && this.ctx._ipScanRoot;
+        // Bootstrap determinism: compiler/runtime sources are themselves
+        // self-hosted and must retain their canonical concat instruction stream.
+        // Restrict L4 to user/test modules; this still covers test262's
+        // buildString hot path while avoiding gen1→gen2 drift in toolchain code.
+        const srcPath = this.sourcePath || (this._currentModuleAst && this._currentModuleAst.filename) || "";
+        if (typeof srcPath === "string" && /\/(compiler|runtime|lang|vm|backend|asm)\//.test(srcPath)) return false;
+        if (!root || (this.ctx._ipExportedNames && this.ctx._ipExportedNames.has(name))) return false;
+        let index = this.ctx._ipIndex;
+        if (!index) index = this.ctx._ipIndex = this._buildIpIndex(root);
+        if (index.paramNames.has(name)) return false;
+        const e = index.per.get(name);
+        if (!e || e.appends.length === 0 || e.nestedRef || e.badWrite) return false;
+        const lastAppend = e.appends[e.appends.length - 1];
+        let activeEnd = lastAppend;
+        for (let i = 0; i < index.loops.length; i++) {
+            const L = index.loops[i];
+            if (L[0] <= lastAppend && lastAppend <= L[1]) { activeEnd = L[1]; break; }
+        }
+        for (let i = 0; i < e.escapes.length; i++) if (e.escapes[i] <= activeEnd) return false;
+        return true;
+    },
+
+    // inferType cannot see the compiler's special `String.fromCodePoint.apply`
+    // lowering, so recognize that exact builtin shape as a string producer.
+    _isKnownStringExpr(expr) {
+        if (!expr) return false;
+        if (inferType(expr, this.ctx) === Type.STRING) return true;
+        if (expr.type !== "CallExpression" || !expr.callee || expr.callee.type !== "MemberExpression") return false;
+        const p = expr.callee.property;
+        const o = expr.callee.object;
+        if (!p || p.type !== "Identifier" || p.name !== "apply" || !o || o.type !== "MemberExpression") return false;
+        return o.object && o.object.type === "Identifier" && o.object.name === "String" &&
+            o.property && o.property.type === "Identifier" &&
+            (o.property.name === "fromCodePoint" || o.property.name === "fromCharCode");
+    },
+
+    _buildIpIndex(root) {
+        let idx = 0, fnDepth = 0;
+        const loops = [];
+        const per = new Map();
+        const paramNames = new Set();
+        const entry = (nm) => {
+            let e = per.get(nm);
+            if (!e) { e = { appends: [], escapes: [], badWrite: false, nestedRef: false }; per.set(nm, e); }
+            return e;
+        };
+        const isStrLit = (n) => n && (n.type === "StringLiteral" || n.type === "TemplateLiteral" ||
+            (n.type === "Literal" && typeof n.value === "string"));
+        const isStringProducer = (n) => {
+            if (isStrLit(n)) return true;
+            if (!n || n.type !== "CallExpression" || !n.callee || n.callee.type !== "MemberExpression") return false;
+            const p = n.callee.property, o = n.callee.object;
+            return p && p.type === "Identifier" && p.name === "apply" && o && o.type === "MemberExpression" &&
+                o.object && o.object.type === "Identifier" && o.object.name === "String" &&
+                o.property && o.property.type === "Identifier" &&
+                (o.property.name === "fromCodePoint" || o.property.name === "fromCharCode");
+        };
+        const isGatedFor = (n, nm) => n && n.type === "AssignmentExpression" && n.left &&
+            n.left.type === "Identifier" && n.left.name === nm &&
+            (n.operator === "+=" || (n.operator === "=" && n.right && n.right.type === "BinaryExpression" &&
+             n.right.operator === "+" && n.right.left && n.right.left.type === "Identifier" &&
+             n.right.left.name === nm));
+        const collectParams = (n) => {
+            if (!n || typeof n !== "object") return;
+            if (Array.isArray(n)) { for (let i = 0; i < n.length; i++) collectParams(n[i]); return; }
+            if (n.type === "Identifier" && n.name) paramNames.add(n.name);
+            for (const k in n) if (k !== "type") collectParams(n[k]);
+        };
+        collectParams(root.params || []);
+        const walk = (node, parent, grand) => {
+            if (!node || typeof node !== "object") return;
+            if (Array.isArray(node)) { for (let i = 0; i < node.length; i++) walk(node[i], parent, grand); return; }
+            const my = idx++;
+            const t = node.type;
+            if (typeof t === "string" && t.indexOf("Function") >= 0) {
+                fnDepth++;
+                for (const k in node) if (k !== "type") walk(node[k], node, parent);
+                fnDepth--;
+                return;
+            }
+            let loopRec = null;
+            if (t === "ForStatement" || t === "ForInStatement" || t === "ForOfStatement" ||
+                t === "WhileStatement" || t === "DoWhileStatement") {
+                loopRec = [my, my]; loops.push(loopRec);
+            }
+            if (t === "Identifier" && node.name) {
+                const nm = node.name;
+                if (fnDepth > 0) entry(nm).nestedRef = true;
+                else if (parent && ((parent.type === "VariableDeclarator" && parent.id === node) ||
+                    (parent.type === "FunctionDeclaration" && parent.id === node) ||
+                    (parent.type === "ClassDeclaration" && parent.id === node))) {
+                    // declaration binding, not a read
+                } else if (parent && parent.type === "AssignmentExpression" && parent.left === node && isGatedFor(parent, nm)) {
+                    entry(nm).appends.push(my);
+                } else if (grand && grand.type === "AssignmentExpression" && isGatedFor(grand, nm) &&
+                           grand.right === parent && parent && parent.type === "BinaryExpression" && parent.left === node) {
+                    // accumulator read in `s = s + E`
+                } else entry(nm).escapes.push(my);
+            }
+            if (fnDepth === 0) {
+                if (t === "AssignmentExpression" && node.left && node.left.type === "Identifier" && node.left.name) {
+                    const nm = node.left.name;
+                    if (!isGatedFor(node, nm) && !(node.operator === "=" && isStringProducer(node.right))) entry(nm).badWrite = true;
+                }
+                if (t === "VariableDeclarator" && node.id && node.id.type === "Identifier" && node.id.name &&
+                    node.init && !isStringProducer(node.init)) entry(node.id.name).badWrite = true;
+                if (t === "UpdateExpression" && node.argument && node.argument.type === "Identifier" && node.argument.name) {
+                    entry(node.argument.name).badWrite = true;
+                }
+            }
+            for (const k in node) if (k !== "type") walk(node[k], node, parent);
+            if (loopRec) loopRec[1] = idx;
+        };
+        walk(root.body, null, null);
+        return { per, loops, paramNames };
     },
 
 };

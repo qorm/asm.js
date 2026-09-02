@@ -66,38 +66,26 @@ export class SymbolGenerator {
     }
 
     // _symbol_new(desc) -> 裸符号指针
-    // desc: boxed string / 裸字符串指针 / 0(undefined)；其它形态（数字等）
-    // description 置空（偏差：不做 ToString）。
+    // undefined 保留「无 description」；其余值严格执行 ToString，并保存所得
+    // 字符串内容指针。调用方必须用 JS_UNDEFINED 表示缺参，不能再用裸 0：
+    // 裸 0 同时也是合法的数值 +0，Symbol(0).description 必须为 "0"。
     generateSymbolNew() {
         const vm = this.vm;
 
         vm.label("_symbol_new");
         vm.prologue(0, [VReg.S0]);
         vm.mov(VReg.S0, VReg.A0);
-
-        // 归一化 desc → 裸字符串指针
         vm.shrImm(VReg.V1, VReg.S0, 48);
-        vm.cmpImm(VReg.V1, 0x7FFC);
-        vm.jeq("_symbol_new_unbox");
-        vm.cmpImm(VReg.V1, 0);
-        vm.jeq("_symbol_new_bare");
-        // 非字符串 tagged/float → 无描述
-        vm.movImm(VReg.S0, 0);
+        vm.cmpImm(VReg.V1, 0x7FFB);
+        vm.jeq("_symbol_new_no_desc");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_valueToStr"); // 可调用用户 toString/valueOf，并传播异常
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_getStrContent");
+        vm.mov(VReg.S0, VReg.RET);
         vm.jmp("_symbol_new_alloc");
 
-        vm.label("_symbol_new_unbox");
-        vm.emitMaskLoad(VReg.V1);
-        vm.andMaskReg(VReg.S0, VReg.S0, VReg.V1);
-        vm.jmp("_symbol_new_floor");
-
-        vm.label("_symbol_new_bare");
-        vm.cmpImm(VReg.S0, 0);
-        vm.jeq("_symbol_new_alloc");
-        vm.label("_symbol_new_floor");
-        // 防御 floor：低于二进制基址的垃圾"指针"不当描述串存（与 _getStrContent 同判据）
-        vm.movImm64(VReg.V1, vm.ptrFloor);
-        vm.cmp(VReg.S0, VReg.V1);
-        vm.jge("_symbol_new_alloc");
+        vm.label("_symbol_new_no_desc");
         vm.movImm(VReg.S0, 0);
 
         vm.label("_symbol_new_alloc");
@@ -213,7 +201,10 @@ export class SymbolGenerator {
         vm.label("_symbol_for");
         vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
         vm.mov(VReg.S0, VReg.A0); // key JSValue
-        vm.call("_getStrContent"); // A0 已是 key
+        vm.call("_valueToStr"); // ToString(key)，含用户代码与异常传播
+        vm.mov(VReg.S0, VReg.RET); // 保存规范化后的 boxed string
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_getStrContent");
         vm.mov(VReg.S1, VReg.RET); // key 内容指针
 
         vm.lea(VReg.V1, "_symbol_registry");
@@ -259,8 +250,12 @@ export class SymbolGenerator {
 
         vm.label("_symbol_keyfor");
         vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.call("_is_symbol");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_symbol_keyfor_typeerr");
         vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
-        vm.and(VReg.S0, VReg.A0, VReg.V1); // 脱壳保险（裸符号本就高16=0）
+        vm.and(VReg.S0, VReg.S0, VReg.V1); // 裸符号本就高16=0
         vm.lea(VReg.V1, "_symbol_registry");
         vm.load(VReg.S1, VReg.V1, 0);
         vm.label("_symbol_keyfor_loop");
@@ -284,6 +279,14 @@ export class SymbolGenerator {
         vm.lea(VReg.RET, "_js_undefined"); // 装箱 undefined(匹配 node 打印)
         vm.load(VReg.RET, VReg.RET, 0);
         vm.epilogue([VReg.S0, VReg.S1], 0);
+
+        vm.label("_symbol_keyfor_typeerr");
+        vm.lea(VReg.A0, vm.asm.addString("Symbol.keyFor requires a symbol"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
     }
 
     // _symbol_wellknown(slot, desc) -> 裸符号指针

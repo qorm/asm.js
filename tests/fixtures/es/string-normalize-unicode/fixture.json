@@ -1,0 +1,10 @@
+{
+  "description": "String.prototype.normalize returns canonical and compatibility Unicode forms.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "default Å⫝̸क़Ω̈́\nforms ẛ̣ ṩ ṩ\ncoerced Å⫝̸क़Ω̈́ Å⫝̸क़Ω̈́",
+    "exitCode": 0
+  }
+}

@@ -38,7 +38,22 @@ for (let _i = 0; _i < SYM_NAMES.length; _i++) SYM_IDS[SYM_NAMES[_i]] = _i;
 
 // 宿主可变数据全局:引用它们须运行时取宿主地址(不可内联常量)。见 compileFragment
 // 的 adrp→ldr-literal 改写。与常量单例(_js_true 等,内联同位型)相对。
-export const HOST_DATA = { _heap_base: 1, _heap_ptr: 1, _exception_value: 1, _exception_pending: 1, _exc_ctx_top: 1, _call_argc: 1, _call_argv: 1, _global_this: 1 };
+export const HOST_DATA = {
+    _heap_base: 1, _heap_ptr: 1, _exception_value: 1, _exception_pending: 1,
+    _exc_ctx_top: 1, _call_argc: 1, _call_argv: 1, _call_argc_ext: 1, _global_this: 1,
+    _call_new_target: 1, _nsobj_array_proto: 1,
+    // Object's lazy singleton slots are process-global. Dynamic class/eval
+    // fragments must relocate these references to the host slots rather than
+    // allocating fragment-local shadow copies.
+    _nsobj_object: 1, _nsobj_object_proto: 1, _nsobj_object_ready: 1,
+    // Coroutine resumption channels are process-global mutable state.  A
+    // dynamically compiled generator must share the host slots rather than
+    // receiving fragment-local zero-filled copies.
+    _gen_return_pending: 1, _gen_return_value: 1,
+    _agen_return_queued: 1, _agen_unwrap_pending: 1,
+    _agen_unwrap_return_p: 1, _agen_unwrap_value: 1,
+    _nsobj_promise: 1,
+};
 // well-known Symbol 槽同属宿主可变数据(单例身份须与宿主共享,内联副本会造出第二个
 // Symbol.iterator)。名字由 WELLKNOWN_SYMBOLS 派生,与 SYM_NAMES 末尾登记一一对应。
 for (const _wk of ["iterator", "asyncIterator", "hasInstance", "isConcatSpreadable",
@@ -148,6 +163,8 @@ function capturesBoxedByInnerClosure(body, capNamesObj) {
 //   captureLayout: 直接 eval 词法捕获串(见 parseCaptureLayout);传入时片段以 A0=调用者 FP
 //     执行,入口 copy-in 调用者槽 → 片段局部,出口 copy-out 片段局部 → 调用者槽(读写捕获)。
 export function compileFragment(source, target, captureLayout) {
+    const _traceFrag = typeof process !== "undefined" && process.env && process.env.ASMJS_TRACE_CLASS === "1";
+    if (_traceFrag) console.log("CF_ENTER", source && source.length);
     // 片段编译期伪装 Node:FixupBuffer 走 packed TA(nativeObjects=false)。
     // 自举态 process.release 缺失会使 nativeObjects=true,再叠加 ByteBuffer
     // 曾产出调到地址 0 的坏码(SIGSEGV)。片段极小,同时切回普通数组 code/data。
@@ -210,6 +227,26 @@ export function compileFragment(source, target, captureLayout) {
     // 下标回填到站点槽(在片段页内)→ 写只读页 SIGBUS。故片段禁 IC,emitObjectGetIC
     // 改走 _object_get + _maybe_getter(无站点写回)。
     c.engineNoIC = true;
+    // Route-B compiler execution runs inside generated native code.  Its
+    // hand-written recorder/slot-promotion pass is not yet receiver/liveness
+    // complete for the compiler's own large methods; keep it off while a
+    // fragment is compiling so a transient backend call cannot overwrite the
+    // compiler `this` object.  Ordinary AOT code retains the optimisation.
+    c.vm._disableRecord = true;
+    // Propagate the route-B marker to the VM for narrow self-host diagnostics;
+    // ordinary AOT VMs leave it false/undefined.
+    c.vm._engineNoIC = true;
+    c.ctx._engineLocalNames = [];
+    c.ctx._engineLocalOffsets = [];
+    // The self-hosted x64 Map can miss equal-but-distinct string keys in the
+    // assembler label map. Capture labels only for engine fragments so local
+    // class/function branches have a content-based fallback; normal AOT
+    // compilation never allocates these side tables.
+    if (!(process.env && process.env.ASMJS_ENGINE_LABEL_FALLBACK === "0")) {
+        c.asm._engineLabelNames = [];
+        c.asm._engineLabelOffsets = [];
+    }
+    if (_traceFrag) console.log("CF_LABEL_MODE", c.asm._engineLabelNames ? 1 : 0);
     c.vm.prologue(FRAG_FRAME, []);
     // `return X`(new Function 体常见)由 compileReturnStatement 把值置 RET 再 jmp
     // ctx.returnLabel。片段里把 returnLabel 设成 epilogue 前的汇合点 _frag_return,使
@@ -314,7 +351,8 @@ export function compileFragment(source, target, captureLayout) {
         if (body[i].type === "VariableDeclaration") {
             if (!varCptnSlot) varCptnSlot = c.ctx.allocLocal("__var_cptn");
             c.vm.store(VReg.FP, varCptnSlot, VReg.RET);
-            c.compileStatement(body[i]);
+            try { c.compileStatement(body[i]); }
+            catch (e) { throw e; }
             c.vm.load(VReg.RET, VReg.FP, varCptnSlot);
         } else {
             c.compileStatement(body[i]);
@@ -374,7 +412,29 @@ export function compileFragment(source, target, captureLayout) {
     // `lea _fn_N`(code-label DATA 引用)在下方 DATA 循环解析为片段内偏移(见 code-label 分支)。
     // 全片段须 <4096B(arm64 ADRP 同页):map+闭包+箭头体较大,超限即报错回落。
     if (c.pendingFunctions && c.pendingFunctions.length > 0) {
+        if (_traceFrag) console.log("CF_PENDING_BEGIN", c.pendingFunctions.length);
         c.generatePendingFunctions();
+        if (_traceFrag) console.log("CF_PENDING_DONE", c.asm.code.length);
+    }
+    if (_traceFrag && c.asm._engineLabelNames) {
+        let _els = "";
+        for (let _ei = 0; _ei < c.asm._engineLabelNames.length; _ei++) {
+            const _en = c.asm._engineLabelNames[_ei];
+            if (typeof _en === "string" && (_en.indexOf("super_proto") >= 0 || _en.indexOf("skip_proto") >= 0)) {
+                _els += _en + "=" + c.asm._engineLabelOffsets[_ei] + ";";
+            }
+        }
+        if (_els) console.log("CF_ENGINE_LABELS", _els);
+    }
+    // Dynamic-function callers need the parser's canonical length calculation
+    // (defaults/rest/destructuring stop the ordinary arity count).  The
+    // pending-function metadata is already produced while emitting the
+    // fragment; expose just the first top-level function's arity as a small
+    // JS-side manifest.  Ordinary eval users ignore this field.
+    let fragmentFunctionMeta = null;
+    if (c._funcMeta && c._funcMeta.length > 0) {
+        const fm = c._funcMeta[0];
+        fragmentFunctionMeta = { kind: fm.kind, arity: fm.arity };
     }
 
     // ByteBuffer.slice 返回 Uint8Array；片段链接器后续会 push trampoline/data，
@@ -390,6 +450,42 @@ export function compileFragment(source, target, captureLayout) {
         for (let i = 0; i < codeSlice.length; i++) code.push(codeSlice[i]);
     }
     const fixups = fixupArr.slice(fs);
+    if (_traceFrag) {
+        let _df = "";
+        for (let _fi = 0; _fi < fixups.length; _fi++) {
+            const _fx = fixups[_fi];
+            if (_fx && _fx.type === "adrp" && (_fx.label === "_nsobj_object" || _fx.label === "_nsobj_object_ready" || _fx.label === "_nsobj_object_proto")) {
+                _df += _fx.label + "@" + (_fx.offset - cs) + ":rd" + _fx.rd + ";";
+                if (_df.length > 1200) break;
+            }
+        }
+        console.log("CF_OBJECT_FIXUPS", _df);
+        let _db = "";
+        const _ln = c.asm._engineLabelNames || [];
+        const _lo = c.asm._engineLabelOffsets || [];
+        for (let _li = 0; _li < _ln.length; _li++) {
+            const _nm = _ln[_li];
+            if (typeof _nm === "string" && (_nm.indexOf("skip_proto") >= 0 || _nm.indexOf("super_proto_done") >= 0)) {
+                _db += _nm + "=" + _lo[_li] + ";";
+                if (_db.length > 2000) break;
+            }
+        }
+        let _tail = "";
+        const _from = _ln.length > 12 ? _ln.length - 12 : 0;
+        for (let _ti = _from; _ti < _ln.length; _ti++) {
+            _tail += String(_ln[_ti]) + "=" + _lo[_ti] + ";";
+        }
+        console.log("CF_BRANCH_LABELS", _db, "count", _ln.length, "tail", _tail);
+        let _mt = "";
+        if (c.asm.labels && c.asm.labels.forEach) {
+            c.asm.labels.forEach(function (_off, _name) {
+                if (typeof _name === "string" && (_name.indexOf("skip_proto") >= 0 || _name.indexOf("super_proto") >= 0)) {
+                    _mt += _name + "=" + _off + ";";
+                }
+            });
+        }
+        console.log("CF_MAP_PROTO", _mt);
+    }
     // 注:用索引循环而非 for-of。Array.from(asm.data) 的结果在自编译产物里 for-of 会崩
     // (asm.js Array.from+for-of 交互 bug,follow-up);索引遍历规避。
     const strings = c.asm.strings || [];
@@ -440,11 +536,27 @@ export function compileFragment(source, target, captureLayout) {
     // label→代码偏移(绝对,c.asm.code 内)。两架构 resolveLabel 契约不同:
     //   arm64:resolveLabel(l) 返回 label **名**,再 labels.get(name) 取 offset。
     //   x64:  resolveLabel(l) 直接返回数值 offset(跟随字符串别名链),未定义返回 undefined。
+    const labelNameEq = (a, b) => {
+        if (a === b) return true;
+        if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
+        for (let i = 0; i < a.length; i++) {
+            if (a.charCodeAt(i) !== b.charCodeAt(i)) return false;
+        }
+        return true;
+    };
     const labelCodeOff = (l) => {
         if (!c.asm.labels) return undefined;
         if (isX64) {
             const v = c.asm.resolveLabel ? c.asm.resolveLabel(l) : c.asm.labels.get(l);
-            return typeof v === "number" ? v : undefined;
+            if (typeof v === "number") return v;
+            const names = c.asm._engineLabelNames || [];
+            const offsets = c.asm._engineLabelOffsets || [];
+            // Search backwards because assembler labels may be deliberately
+            // redefined; the Map path also keeps the latest definition.
+            for (let i = names.length - 1; i >= 0; i--) {
+                if (labelNameEq(names[i], l)) return offsets[i];
+            }
+            return undefined;
         }
         const rl = c.asm.resolveLabel ? c.asm.resolveLabel(l) : l;
         return c.asm.labels.get(rl);
@@ -478,11 +590,17 @@ export function compileFragment(source, target, captureLayout) {
             while (buf.length & 7) buf.push(0);
             const tOff = buf.length;
             if (isX64) {
-                // mov rax,[rip+2](48 8B 05 02 00 00 00);jmp rax(FF E0);slot(8B)
-                const t = [0x48, 0x8b, 0x05, 0x02, 0x00, 0x00, 0x00, 0xff, 0xe0];
+                // Preserve RAX/RET across the trampoline: some helpers (notably
+                // _tag_str_r) consume their input directly from RET. Loading
+                // the target into RAX changed that input into the helper's own
+                // address, so every dynamic string literal became the first
+                // bytes of _tag_str_r (0x48,0xB9,...). R11 is caller-saved and
+                // not part of the fragment call ABI.
+                // mov r11,[rip+3](4C 8B 1D 03 00 00 00);jmp r11(41 FF E3);slot(8B)
+                const t = [0x4c, 0x8b, 0x1d, 0x03, 0x00, 0x00, 0x00, 0x41, 0xff, 0xe3];
                 for (let k = 0; k < t.length; k++) buf.push(t[k]);
                 for (let k = 0; k < 8; k++) buf.push(0);
-                relocs.push({ slotOffset: tOff + 9, symId });
+                relocs.push({ slotOffset: tOff + 10, symId });
             } else {
                 for (let k = 0; k < 16; k++) buf.push(0);
                 w32(tOff, 0x58000050);     // ldr x16, #8
@@ -525,6 +643,17 @@ export function compileFragment(source, target, captureLayout) {
                 w32(brBuf, (op | ((rel4 & 0x7ffff) << 5) | rt) >>> 0);
             }
         }
+    }
+    if (_traceFrag) {
+        let _bf = "";
+        for (let _fi = 0; _fi < fixups.length; _fi++) {
+            const _fx = fixups[_fi];
+            if (_fx && typeof _fx.label === "string" && (_fx.label.indexOf("super_proto") >= 0 || _fx.label.indexOf("skip_proto") >= 0)) {
+                const _ta = labelCodeOff(_fx.label);
+                _bf += _fx.type + "@" + (_fx.offset - cs) + "->" + (_ta === undefined ? "?" : (_ta - cs)) + ";";
+            }
+        }
+        if (_bf.length) console.log("CF_SUPER_BRANCHES", _bf);
     }
 
     // ── .data 常量 + 字符串字面量并置,改写 DATA 引用(adrp/add | rip32)──
@@ -591,7 +720,8 @@ export function compileFragment(source, target, captureLayout) {
                 let content;
                 if (_strLabelIsNumeric(suffix)) {
                     // `_str_<N>`:表达式字面量,driven from asm.strings 驻留表。
-                    content = strings[parseInt(suffix, 10)] || "";
+                    const strIndex = parseInt(suffix, 10);
+                    content = strings[strIndex] || "";
                 } else if (fx.label in RUNTIME_STR_BY_LABEL) {
                     // `_str_<名>`:命名运行时字符串常量(内建方法内联引用),按已知值内联。
                     content = RUNTIME_STR_BY_LABEL[fx.label];
@@ -640,7 +770,8 @@ export function compileFragment(source, target, captureLayout) {
     // 数据区起点哨兵(symId = 0xffffffff,非真符号):加载器据此只把 [0, dataOff) 设 RX,
     // 数据区留 RW。放在末条,不影响前面 addr_slot 的回填顺序。
     relocs.push({ slotOffset: dataOff, symId: RELOC_RW_SPLIT });
-    return { bytes: buf, relocs };
+    if (_traceFrag) console.log("CF_DONE", buf.length, relocs.length);
+    return { bytes: buf, relocs, functionMeta: fragmentFunctionMeta };
 }
 
 // relocs → 字节缓冲(每条 8B:slotOffset 4B LE + symId 4B LE),供 __engine_exec_reloc。

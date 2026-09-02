@@ -1,13 +1,15 @@
 // asm.js - 闭包分析模块
 // 分析函数表达式中捕获的外部变量
 
+import { parse } from "../parser/index.js";
 // 检查是否是内置函数或全局对象。
 // 用 {name:1} 而非 Set:gen1 上 Set.has 偏贵(见 skipAstKey 注释);===1 避开原型链。
 const BUILTIN_OR_GLOBAL_NAMES = {
     print: 1, console: 1, Promise: 1, Uint8Array: 1, Buffer: 1, Math: 1, sleep: 1, Array: 1,
     Object: 1, String: 1, Number: 1, Boolean: 1, Date: 1, RegExp: 1, JSON: 1, Error: 1,
     undefined: 1, null: 1, NaN: 1, Infinity: 1, globalThis: 1, queueMicrotask: 1,
-    __asmjs_setTimeout: 1, __asmjs_setImmediate: 1, __asmjs_queueMicrotask: 1, __asmjs_clearTimer: 1,
+    __asmjs_setTimeout: 1, __asmjs_setTimeoutUnref: 1, __asmjs_setImmediate: 1,
+    __asmjs_queueMicrotask: 1, __asmjs_clearTimer: 1,
 };
 
 export function isBuiltinOrGlobal(name) {
@@ -1285,4 +1287,95 @@ export function analyzeTopLevelSharedVariables(ast) {
         }
     }
     return sharedVars;
+}
+
+// 类字段 `eval('outer = 1')` 等:源码里外层名藏在字符串里,analyzeCapturedVariables
+// 扫不到。解析直接 eval 的字面量实参,收集可引用外层词法的标识符(跳过嵌套函数体)。
+export function collectDirectEvalSourceRefs(node) {
+    const out = [];
+    const seen = {};
+    const add = (name) => {
+        if (!name || isBuiltinOrGlobal(name)) return;
+        if (seen[name]) return;
+        seen[name] = true;
+        out.push(name);
+    };
+    // `collectReferencedVariables` is deliberately not used here:declaration ids in
+    // eval source are bindings,not references to the caller.  This walker keeps
+    // those binding positions out while covering expressions nested under all
+    // statement kinds (`while (outer) ...` was previously missed).
+    const walkSourceNode = (n) => {
+        if (!n || typeof n !== "object") return;
+        if (Array.isArray(n)) {
+            for (let i = 0; i < n.length; i++) walkSourceNode(n[i]);
+            return;
+        }
+        const t = n.type;
+        if (t === "Identifier") { add(n.name); return; }
+        // Direct eval inherits the caller's ThisBinding.  The compiler models
+        // that binding in the synthetic __this local, so expose it to the
+        // capture-layout builder when eval source contains `this`.
+        if (t === "ThisExpression") { add("__this"); return; }
+        if (t === "FunctionDeclaration" || t === "FunctionExpression" ||
+            t === "ArrowFunctionExpression" || t === "ClassDeclaration" ||
+            t === "ClassExpression") return;
+        if (t === "VariableDeclarator") {
+            if (n.init) walkSourceNode(n.init);
+            return;
+        }
+        if (t === "MemberExpression" && !n.computed) {
+            walkSourceNode(n.object);
+            return;
+        }
+        if ((t === "Property" || t === "PropertyDefinition" ||
+            t === "MethodDefinition") && !n.computed) {
+            // Accessor functions created by a direct-eval object literal are
+            // still closures over the caller's lexical environment.  Their
+            // bodies are represented as FunctionExpression nodes, so the
+            // generic function early-return below would otherwise hide names
+            // such as `s2` assigned by a setter.  Traverse only accessor
+            // bodies here; ordinary nested functions keep the historical
+            // declaration-shadowing behavior of this conservative walker.
+            if ((n.kind === "get" || n.kind === "set") && n.value &&
+                (n.value.type === "FunctionExpression" ||
+                 n.value.type === "ArrowFunctionExpression" ||
+                 n.value.type === "FunctionDeclaration")) {
+                walkSourceNode(n.value.body);
+            } else {
+                walkSourceNode(n.value);
+            }
+            return;
+        }
+        if (t === "LabeledStatement") {
+            walkSourceNode(n.body);
+            return;
+        }
+        if (t === "BreakStatement" || t === "ContinueStatement" ||
+            t === "MetaProperty") return;
+        if (t === "CatchClause") {
+            walkSourceNode(n.body);
+            return;
+        }
+        if (t === "CallExpression" && n.callee && n.callee.type === "Identifier" &&
+            n.callee.name === "eval" && n.arguments && n.arguments[0]) {
+            const arg = n.arguments[0];
+            let src = null;
+            if ((arg.type === "Literal" || arg.type === "StringLiteral") &&
+                typeof arg.value === "string") src = arg.value;
+            if (src) {
+                try {
+                    const prog = parse(src);
+                    if (prog) walkSourceNode(prog);
+                } catch (_e) { /* 非法 eval 源码:运行时再抛 */ }
+            }
+        }
+        for (const k in n) {
+            if (skipAstKey(k)) continue;
+            const v = n[k];
+            if (!v || typeof v !== "object") continue;
+            walkSourceNode(v);
+        }
+    };
+    walkSourceNode(node);
+    return out;
 }

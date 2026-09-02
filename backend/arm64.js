@@ -65,6 +65,19 @@ export const Reg = {
     XZR: 31,
 };
 
+// Temporary/robustness diagnostic: mapReg is pure and its mapping is static;
+// keep a receiver-independent table so a malformed self-hosted member call can
+// still be diagnosed past register mapping.  Remove if not needed.
+const ARM64_REGMAP_STATIC = {
+    [VReg.V0]: Reg.X8, [VReg.V1]: Reg.X9, [VReg.V2]: Reg.X10, [VReg.V3]: Reg.X11,
+    [VReg.V4]: Reg.X12, [VReg.V5]: Reg.X13, [VReg.V6]: Reg.X14, [VReg.V7]: Reg.X15,
+    [VReg.S0]: Reg.X19, [VReg.S1]: Reg.X20, [VReg.S2]: Reg.X21, [VReg.S3]: Reg.X22,
+    [VReg.S4]: Reg.X23, [VReg.S5]: Reg.X24,
+    [VReg.A0]: Reg.X0, [VReg.A1]: Reg.X1, [VReg.A2]: Reg.X2, [VReg.A3]: Reg.X3,
+    [VReg.A4]: Reg.X4, [VReg.A5]: Reg.X5, [VReg.RET]: Reg.X0,
+    [VReg.FP]: Reg.FP, [VReg.SP]: Reg.SP, [VReg.LR]: Reg.LR,
+};
+
 export class ARM64Backend extends Backend {
     constructor(asm, platform) {
         super(asm);
@@ -111,14 +124,27 @@ export class ARM64Backend extends Backend {
     }
 
     mapReg(vreg) {
-        const phys = this.regMap[vreg];
+        const phys = this && this.regMap ? this.regMap[vreg] : ARM64_REGMAP_STATIC[vreg];
         if (phys !== undefined) return phys;
         if (typeof vreg === "number") return vreg;
         throw new Error("Unknown virtual register: " + vreg);
     }
 
     scratchReg(...regs) {
-        const avoid = regs.map((reg) => typeof reg === "number" ? reg : this.mapReg(reg));
+        if (typeof process !== "undefined" && process.env && process.env.ASMJS_DBG_SCRATCH === "1") {
+            throw new Error("SCRATCH_HIT:" + regs.length);
+        }
+        // Keep this path callback-free.  The compiler self-hosts this class,
+        // and an arrow callback here can lose the lexical receiver after the
+        // class method is lowered, turning `this.mapReg` into a null-receiver
+        // call (most visibly for S2 while compiling dynamic class bodies).
+        // The explicit loop has the same semantics and preserves the backend
+        // instance on both host and self-hosted code paths.
+        const avoid = [];
+        for (let i = 0; i < regs.length; i++) {
+            const reg = regs[i];
+            avoid.push(typeof reg === "number" ? reg : this.mapReg(reg));
+        }
         for (const candidate of [Reg.X16, Reg.X17, Reg.X15, Reg.X14]) {
             if (!avoid.includes(candidate)) {
                 return candidate;
@@ -130,6 +156,7 @@ export class ARM64Backend extends Backend {
     // ========== 数据移动 ==========
 
     mov(dest, src) {
+        if (!this) throw new Error("BNULL_mov");
         // 同物理寄存器自消除:RET==A0==V0==X0 等别名令 mov(A0,RET) 类调用密度极高,
         // 自编译产物中 self-mov 达 12.8 万条(占总指令 4%),全为废指令。
         const d = this.mapReg(dest);
@@ -139,15 +166,18 @@ export class ARM64Backend extends Backend {
     }
 
     movImm(dest, imm) {
+        if (!this) throw new Error("BNULL_movImm");
         this.asm.movImm(this.mapReg(dest), imm);
     }
 
     movImm64(dest, imm) {
+        if (!this) throw new Error("BNULL_movImm64");
         // 64位立即数，直接使用 asm.movImm64
         this.asm.movImm64(this.mapReg(dest), imm);
     }
 
     load(dest, base, offset) {
+        if (!this) throw new Error("BNULL_load");
         const rd = this.mapReg(dest);
         const rb = this.mapReg(base);
         if (offset >= -256 && offset <= 255) {
@@ -177,6 +207,7 @@ export class ARM64Backend extends Backend {
     }
 
     store(base, offset, src) {
+        if (!this) throw new Error("BNULL_store");
         const rs = this.mapReg(src);
         const rb = this.mapReg(base);
         if (offset >= -256 && offset <= 255) {
@@ -209,6 +240,7 @@ export class ARM64Backend extends Backend {
 
     // 存储字节 (8位)
     storeByte(base, offset, src) {
+        if (!this) throw new Error("BNULL_storeByte");
         const rs = this.mapReg(src);
         const rb = this.mapReg(base);
         this.asm.strb(rs, rb, offset);
@@ -216,12 +248,14 @@ export class ARM64Backend extends Backend {
 
     // 加载字节 (零扩展到64位)
     loadByte(dest, base, offset) {
+        if (!this) throw new Error("BNULL_loadByte");
         const rd = this.mapReg(dest);
         const rb = this.mapReg(base);
         this.asm.ldrb(rd, rb, offset);
     }
 
     store32(base, offset, src) {
+        if (!this) throw new Error("BNULL_store32");
         const rs = this.mapReg(src);
         const rb = this.mapReg(base);
         if ((offset >= 0 && (offset & 3) === 0 && offset < 16384) ||
@@ -240,6 +274,7 @@ export class ARM64Backend extends Backend {
     }
 
     load32(dest, base, offset) {
+        if (!this) throw new Error("BNULL_load32");
         const rd = this.mapReg(dest);
         const rb = this.mapReg(base);
         if ((offset >= 0 && (offset & 3) === 0 && offset < 16384) ||
@@ -258,6 +293,7 @@ export class ARM64Backend extends Backend {
     }
 
     lea(dest, label) {
+        if (!this) throw new Error("BNULL_lea");
         // [M2] per-M 执行态槽:寻址改为 x28(M 上下文)+ 偏移,而非 PC-relative 全局。
         // _call_argc 最热:每调用点写,特判免 M_CTX_REDIRECT 查表。
         if (label === "_call_argc") {
@@ -277,36 +313,44 @@ export class ARM64Backend extends Backend {
     // 一经 _start(及未来线程蹦床)`mov x28, src` 绑定即全程存活(callee-saved 无人改、
     // 裸 syscall 保留)。docs/PARALLEL_DESIGN.md §3.1。
     bindContextReg(srcVReg) {
+        if (!this) throw new Error("BNULL_bindContextReg");
         this.asm.movReg(Reg.X28, this.mapReg(srcVReg));
     }
 
     // ========== 算术运算 ==========
 
     add(dest, a, b) {
+        if (!this) throw new Error("BNULL_add");
         this.asm.addReg(this.mapReg(dest), this.mapReg(a), this.mapReg(b));
     }
 
     addImm(dest, src, imm) {
+        if (!this) throw new Error("BNULL_addImm");
         this.asm.addImm(this.mapReg(dest), this.mapReg(src), imm);
     }
 
     sub(dest, a, b) {
+        if (!this) throw new Error("BNULL_sub");
         this.asm.subReg(this.mapReg(dest), this.mapReg(a), this.mapReg(b));
     }
 
     subImm(dest, src, imm) {
+        if (!this) throw new Error("BNULL_subImm");
         this.asm.subImm(this.mapReg(dest), this.mapReg(src), imm);
     }
 
     mul(dest, a, b) {
+        if (!this) throw new Error("BNULL_mul");
         this.asm.mul(this.mapReg(dest), this.mapReg(a), this.mapReg(b));
     }
 
     div(dest, a, b) {
+        if (!this) throw new Error("BNULL_div");
         this.asm.sdiv(this.mapReg(dest), this.mapReg(a), this.mapReg(b));
     }
 
     mod(dest, a, b) {
+        if (!this) throw new Error("BNULL_mod");
         // ARM64 没有直接的取模指令: a % b = a - (a / b) * b
         const rd = this.mapReg(dest);
         const ra = this.mapReg(a);
@@ -319,18 +363,22 @@ export class ARM64Backend extends Backend {
     // ========== 位运算 ==========
 
     and(dest, a, b) {
+        if (!this) throw new Error("BNULL_and");
         this.asm.andReg(this.mapReg(dest), this.mapReg(a), this.mapReg(b));
     }
 
     or(dest, a, b) {
+        if (!this) throw new Error("BNULL_or");
         this.asm.orrReg(this.mapReg(dest), this.mapReg(a), this.mapReg(b));
     }
 
     xor(dest, a, b) {
+        if (!this) throw new Error("BNULL_xor");
         this.asm.eorReg(this.mapReg(dest), this.mapReg(a), this.mapReg(b));
     }
 
     shl(dest, src, count) {
+        if (!this) throw new Error("BNULL_shl");
         if (typeof count === "number") {
             this.asm.lslImm(this.mapReg(dest), this.mapReg(src), count);
         } else {
@@ -339,10 +387,12 @@ export class ARM64Backend extends Backend {
     }
 
     shlImm(dest, src, imm) {
+        if (!this) throw new Error("BNULL_shlImm");
         this.asm.lslImm(this.mapReg(dest), this.mapReg(src), imm);
     }
 
     shr(dest, src, count) {
+        if (!this) throw new Error("BNULL_shr");
         if (typeof count === "number") {
             this.asm.lsrImm(this.mapReg(dest), this.mapReg(src), count);
         } else {
@@ -351,11 +401,13 @@ export class ARM64Backend extends Backend {
     }
 
     shrImm(dest, src, imm) {
+        if (!this) throw new Error("BNULL_shrImm");
         this.asm.lsrImm(this.mapReg(dest), this.mapReg(src), imm);
     }
 
     // 算术右移 (保留符号位)
     sar(dest, src, count) {
+        if (!this) throw new Error("BNULL_sar");
         if (typeof count === "number") {
             this.asm.asrImm(this.mapReg(dest), this.mapReg(src), count);
         } else {
@@ -364,48 +416,58 @@ export class ARM64Backend extends Backend {
     }
 
     sarImm(dest, src, imm) {
+        if (!this) throw new Error("BNULL_sarImm");
         this.asm.asrImm(this.mapReg(dest), this.mapReg(src), imm);
     }
 
     // 按位非: dest = ~src
     not(dest, src) {
+        if (!this) throw new Error("BNULL_not");
         this.asm.mvn(this.mapReg(dest), this.mapReg(src));
     }
 
     // 取反: dest = 0 - src
     neg(dest, src) {
+        if (!this) throw new Error("BNULL_neg");
         this.asm.negReg(this.mapReg(dest), this.mapReg(src));
     }
 
     // 位测试
     test(a, b) {
+        if (!this) throw new Error("BNULL_test");
         this.asm.tst(this.mapReg(a), this.mapReg(b));
     }
 
     testImm(a, imm) {
+        if (!this) throw new Error("BNULL_testImm");
         this.asm.tstImm(this.mapReg(a), imm);
     }
 
     // 立即数版本的位运算
     andImm(dest, src, imm) {
+        if (!this) throw new Error("BNULL_andImm");
         this.asm.andImm(this.mapReg(dest), this.mapReg(src), imm);
     }
 
     orImm(dest, src, imm) {
+        if (!this) throw new Error("BNULL_orImm");
         this.asm.orrImm(this.mapReg(dest), this.mapReg(src), imm);
     }
 
     xorImm(dest, src, imm) {
+        if (!this) throw new Error("BNULL_xorImm");
         this.asm.eorImm(this.mapReg(dest), this.mapReg(src), imm);
     }
 
     // ========== 比较与跳转 ==========
 
     cmp(a, b) {
+        if (!this) throw new Error("BNULL_cmp");
         this.asm.cmpReg(this.mapReg(a), this.mapReg(b));
     }
 
     cmpImm(a, imm) {
+        if (!this) throw new Error("BNULL_cmpImm");
         if (imm >= 0 && imm <= 4095) {
             this.asm.cmpImm(this.mapReg(a), imm);
         } else {
@@ -421,6 +483,14 @@ export class ARM64Backend extends Backend {
     }
 
     jeq(label) {
+        if (this && this.asm && this.asm._engineTrace) {
+            try {
+                const _ls = typeof label === "string" ? label : String(label);
+                if (_ls.indexOf("skip_proto_link") >= 0 || _ls.indexOf("super_proto_ci") >= 0) {
+                    print("DBG_BE_JEQ:" + typeof label + ":" + _ls);
+                }
+            } catch (_eDbgBeJeq) {}
+        }
         this.asm.beq(label);
     }
 
@@ -492,6 +562,14 @@ export class ARM64Backend extends Backend {
     // ========== 函数调用 ==========
 
     prologue(stackSize, savedRegs) {
+        if (!this) throw new Error("BACKEND_PRO_THIS_UNDEF");
+        if (!this) throw new Error("BNULL_prologue");
+        if (typeof print === "function" && stackSize === 8192) {
+            try { print("BE_PRO:" + (savedRegs ? savedRegs.length : "null") + ":" +
+                (savedRegs ? String(savedRegs[0]) + "," + String(savedRegs[1]) + "," +
+                    String(savedRegs[2]) + "," + String(savedRegs[3]) : "") + ":" +
+                (this && this.regMap ? "ok" : "bad")); } catch (_eDbgPro) {}
+        }
         // 保存 FP 和 LR
         this.asm.stpPre(Reg.FP, Reg.LR, Reg.SP, -16);
         this.asm.movReg(Reg.FP, Reg.SP);
@@ -499,9 +577,15 @@ export class ARM64Backend extends Backend {
         // 保存 callee-saved 寄存器
         // 计算实际要保存的寄存器对数（向上取整确保偶数）
         const numPairs = Math.ceil(savedRegs.length / 2);
+        // Keep register lookup local in this loop.  Self-hosted lowering can
+        // lose the receiver on nested `this.mapReg(...)` calls in a loop;
+        // `regMap` itself is immutable for an ARM64 backend.
+        const proMap = this.regMap || ARM64_REGMAP_STATIC;
         for (let i = 0; i < numPairs * 2; i += 2) {
-            const r1 = this.mapReg(savedRegs[i]);
-            const r2 = i + 1 < savedRegs.length ? this.mapReg(savedRegs[i + 1]) : Reg.XZR;
+            const r1v = savedRegs[i];
+            const r2v = i + 1 < savedRegs.length ? savedRegs[i + 1] : null;
+            const r1 = proMap[r1v] !== undefined ? proMap[r1v] : r1v;
+            const r2 = r2v !== null ? (proMap[r2v] !== undefined ? proMap[r2v] : r2v) : Reg.XZR;
             this.asm.stpPre(r1, r2, Reg.SP, -16);
         }
 
@@ -513,6 +597,7 @@ export class ARM64Backend extends Backend {
     }
 
     epilogue(savedRegs, stackSize) {
+        if (!this) throw new Error("BNULL_epilogue");
         // 恢复栈空间（与 prologue 对齐一致）
         const aligned = stackSize > 0 ? Math.ceil(stackSize / 16) * 16 : 0;
         if (aligned > 0) {
@@ -522,10 +607,13 @@ export class ARM64Backend extends Backend {
         // 恢复 callee-saved 寄存器（反序）
         // 计算实际要恢复的寄存器对数（向上取整确保偶数，与 prologue 一致）
         const numPairs = Math.ceil(savedRegs.length / 2);
+        const epiMap = this.regMap || ARM64_REGMAP_STATIC;
         for (let p = numPairs - 1; p >= 0; p--) {
             const i = p * 2;
-            const r1 = this.mapReg(savedRegs[i]);
-            const r2 = i + 1 < savedRegs.length ? this.mapReg(savedRegs[i + 1]) : Reg.XZR;
+            const r1v = savedRegs[i];
+            const r2v = i + 1 < savedRegs.length ? savedRegs[i + 1] : null;
+            const r1 = epiMap[r1v] !== undefined ? epiMap[r1v] : r1v;
+            const r2 = r2v !== null ? (epiMap[r2v] !== undefined ? epiMap[r2v] : r2v) : Reg.XZR;
             this.asm.ldpPost(r1, r2, Reg.SP, 16);
         }
 
@@ -535,10 +623,12 @@ export class ARM64Backend extends Backend {
     }
 
     call(label) {
+        if (!this) throw new Error("BNULL_call");
         this.asm.bl(label);
     }
 
     callIndirect(reg) {
+        if (!this) throw new Error("BNULL_callIndirect");
         // BLR Xn - 间接调用
         this.asm.blr(this.mapReg(reg));
     }
@@ -556,6 +646,7 @@ export class ARM64Backend extends Backend {
     stlr(val, addr) { this.asm.stlr(this.mapReg(val), this.mapReg(addr)); }
 
     jmpIndirect(reg) {
+        if (!this) throw new Error("BNULL_jmpIndirect");
         // BR Xn - 间接跳转 (不保存返回地址)
         this.asm.br(this.mapReg(reg));
     }
@@ -565,6 +656,7 @@ export class ARM64Backend extends Backend {
     }
 
     prepareCall(args) {
+        if (!this) throw new Error("BNULL_prepareCall");
         // 将参数放入寄存器
         for (let i = 0; i < args.length && i < 8; i++) {
             const arg = args[i];
@@ -579,6 +671,7 @@ export class ARM64Backend extends Backend {
     // ========== 栈操作 ==========
 
     push(reg) {
+        if (!this) throw new Error("BNULL_push");
         // 相邻 push/pop 配对窥孔(见 pop 注释)
         const start = this.asm.code.length;
         this.asm.stpPre(this.mapReg(reg), Reg.XZR, Reg.SP, -16);
@@ -586,6 +679,7 @@ export class ARM64Backend extends Backend {
     }
 
     pop(reg) {
+        if (!this) throw new Error("BNULL_pop");
         const p = this._pairPush;
         this._pairPush = null;
         if (p && p.end === this.asm.code.length) {
@@ -602,6 +696,7 @@ export class ARM64Backend extends Backend {
     // ========== 系统调用 ==========
 
     syscall(num) {
+        if (!this) throw new Error("BNULL_syscall");
         if (this.platform === "linux") {
             this.asm.movImm(Reg.X8, num);
             this.asm.svc(0);
@@ -614,6 +709,7 @@ export class ARM64Backend extends Backend {
 
     // 动态系统调用号：从寄存器读取调用号
     syscallReg(reg) {
+        if (!this) throw new Error("BNULL_syscallReg");
         const rs = this.mapReg(reg);
         if (this.platform === "linux") {
             this.asm.movReg(Reg.X8, rs);
@@ -632,6 +728,7 @@ export class ARM64Backend extends Backend {
     // Float to Int: 从 Number 对象中提取整数值
     // src 是指向 Number 对象的指针，dest 接收整数值
     f2i(dest, src) {
+        if (!this) throw new Error("BNULL_f2i");
         const rd = this.mapReg(dest);
         const rs = this.mapReg(src);
         const tmp = this.scratchReg(rd, rs);
@@ -684,11 +781,30 @@ export class ARM64Backend extends Backend {
     // 浮点取模: fpDest = fpA % fpB
     fmod(fpDest, fpA, fpB) {
         // 浮点取模: a % b = a - trunc(a / b) * b
-        // 使用 D7 作为临时寄存器
+        // 使用 D7 作为临时寄存器。单纯的 fsub 在结果为零时不保证保留
+        // dividend 的符号（例如 -0 % 1 会变成 +0），而 ECMAScript
+        // Number::remainder 要求零结果带 dividend 的 sign bit。
+        // X16 只在本段作为位模式暂存，不属于 VM 分配的寄存器集合。
+        const seq = (this._fmodSeq = (this._fmodSeq | 0) + 1);
+        const nonZero = `_xfmod_nonzero_${seq}`;
+        this.asm.fmovToInt(Reg.X16, fpA); // 保存原始 dividend 的位模式
         this.asm.fdiv(7, fpA, fpB); // D7 = a / b
         this.asm.frintz(7, 7); // D7 = trunc(D7)
         this.asm.fmul(7, 7, fpB); // D7 = D7 * b
         this.asm.fsub(fpDest, fpA, 7); // fpDest = a - D7
+
+        // 只对零结果修正。用位模式判零而不是 FCMPZ：除避免浮点条件码
+        // 在不同 CPU/NaN 模式下的差异外，左移一位会同时忽略 ±0 的 sign
+        // bit、保留所有非零/Inf/NaN payload，因此 b.ne 对其它结果旁路。
+        this.asm.fmovToInt(Reg.X17, fpDest);
+        this.asm.lslImm(Reg.X17, Reg.X17, 1);
+        this.asm.cmpImm(Reg.X17, 0);
+        // 由 dividend 位 63 重建 +0/-0。
+        this.asm.bne(nonZero);
+        this.asm.lsrImm(Reg.X16, Reg.X16, 63);
+        this.asm.lslImm(Reg.X16, Reg.X16, 63);
+        this.asm.fmovToFloat(fpDest, Reg.X16);
+        this.asm.label(nonZero);
     }
 
     // 浮点与零比较

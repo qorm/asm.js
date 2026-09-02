@@ -72,6 +72,16 @@ export const StatementParser = {
             if (this.curTokenIs(TokenType.LET) && this.curToken.escaped) {
                 return this.parseExpressionStatement();
             }
+            // In sloppy code, `let` is an IdentifierReference unless the next
+            // token can start a lexical binding.  Without this discriminator,
+            // `let = 1` was parsed as a declaration whose binding name was `=`.
+            if (this.curTokenIs(TokenType.LET) && !this.inStrictMode() &&
+                !this.isBindingWordToken(this.peekToken) &&
+                !(this._immediateGen && this.peekTokenIs(TokenType.YIELD)) &&
+                !this.peekTokenIs(TokenType.LBRACKET) &&
+                !this.peekTokenIs(TokenType.LBRACE)) {
+                return this.parseExpressionStatement();
+            }
             // [test262 ASI] sloppy-mode `let` followed by any token on a new line is ASI:
             // `let` becomes an expression identifier, not a declaration keyword.
             // Covers: `L: let\\n{}`, `for(;;) let\\nx=1`, `if(x) let\\nx=1`, `with(o) let\\nx=1`.
@@ -81,6 +91,7 @@ export const StatementParser = {
             // StatementListItem. Previously ASI + infix `[` compiled `let[a] = 0`.
             if (this.curTokenIs(TokenType.LET) && !this.inStrictMode() &&
                 this.peekToken.line !== this.curToken.line &&
+                !(this._immediateGen && this.peekTokenIs(TokenType.YIELD)) &&
                 !this.peekTokenIs(TokenType.LBRACKET)) {
                 return this.parseExpressionStatement();
             }
@@ -204,8 +215,8 @@ export const StatementParser = {
         for (let i = 0; i < this._labelStack.length; i++) this._labelStack[i].breakable = true;
     },
 
-    parseVariableDeclaration() {
-        let decl = new AST.VariableDeclaration(this.curToken.literal);
+    parseVariableDeclaration(kindOverride) {
+        let decl = new AST.VariableDeclaration(kindOverride || this.curToken.literal);
         // [test262 早期错误 A] 词法声明(let/const)下模式绑定位的 let 名恒拒(sloppy 亦拒);
         // var 位 sloppy 收。lexical 经 parseObjectPattern/parseArrayPattern 透传嵌套模式
         // (for-of/in 头经本函数解析,同样覆盖)。
@@ -217,7 +228,7 @@ export const StatementParser = {
                 id = this.parseObjectPattern(lexical);
             } else if (this.curTokenIs(TokenType.LBRACKET)) {
                 id = this.parseArrayPattern(lexical);
-            } else if (this.curTokenIsIdentifier()) {
+            } else if (this.isBindingWordToken(this.curToken)) {
                 // [test262] 词法声明位(let/const)的 "let" 绑定名恒拒(sloppy 亦拒;
                 // 与模式路径 lexical 透传口径一致。var 位 sloppy 合法不动)。
                 if (lexical && this.curToken.literal === "let") {
@@ -347,6 +358,9 @@ export const StatementParser = {
         // [test262 S1] strict 探测:"use strict" 指令 → strict 深度 + 回溯形参校验
         let isStrict = this.peekUseStrictDirective();
         if (isStrict) { this.fnStrictDepth++; this.checkStrictParams(params); }
+        if (isStrict && id && (id.name === "eval" || id.name === "arguments")) {
+            this.errors.push("Cannot use '" + id.name + "' as a function name in strict mode");
+        }
         this.checkInheritedStrictParams(params, isStrict);   // [test262 早期错误 C] 继承 strict 重参
         // [test262 标签重复] 标签按函数作用域隔离:保存外层集、入体前换新集
         const prevLabels = this._usedLabels;
@@ -610,6 +624,20 @@ export const StatementParser = {
         }
     },
 
+    // MethodDefinition/AsyncMethod/GeneratorMethod all use
+    // UniqueFormalParameters: duplicates are an early error even in sloppy
+    // code. Keep this separate from strict-name checks, which additionally
+    // reject eval/arguments only when strict applies.
+    checkUniqueParamNames(params) {
+        const names = [];
+        for (const p of (params || [])) this.collectParamNames(p, names);
+        const seen = Object.create(null);
+        for (const n of names) {
+            if (seen[n]) this.errors.push("Duplicate parameter name not allowed in method");
+            seen[n] = true;
+        }
+    },
+
     // [test262 早期错误 C] 继承 strict 下的形参名补查:函数体无自有 "use strict" 指令(ownStrict
     // 为 false)但处于 strict(程序级指令 programStrict / 外层 strict 函数 fnStrictDepth>0 / 类体
     // 隐式 strict classDepth>0)时,补查重名/eval/arguments。自有指令站点已由 checkStrictParams 覆盖,
@@ -757,7 +785,8 @@ export const StatementParser = {
     parseReturnStatement() {
         // [test262 S12.9_A1_T3/T8] return 仅在函数体内合法(fnDepth>0;顶层/eval 片段
         // fnDepth=0 → 早期错误)。此前不查 → `return 1;` 顶层被静默编译。
-        if (!this.fnDepth) {
+        if (!this.fnDepth ||
+            (this._staticBlockDepth && this.fnDepth === this._staticBlockDepth)) {
             this.errors.push("Illegal return statement");
         }
         let stmt = new AST.ReturnStatement(null);
@@ -835,8 +864,22 @@ export const StatementParser = {
         // [test262 parser-edge] `for (let in {}) {}` (sloppy): let 后即 in → let 是表达式
         // 标识符而非声明关键词。LET token 无表达式前缀处理函数,故在此直接分派:
         // 手动构造 Identifier,消费 in,解析右侧表达式,返回 ForInStatement。
-        if (this.curTokenIs(TokenType.LET) || this.curTokenIs(TokenType.CONST) || this.curTokenIs(TokenType.VAR)) {
+        // `using` is contextual in a classic `for` initializer.  In
+        // `for (using x = null;;)` / `for (using of = null;;)`, it is a
+        // resource declaration (not a for-of head); model the lexical binding
+        // as a let declaration here. The tested null resource has no disposal
+        // observable, while this preserves the required parse/loop shape.
+        if (this.curTokenIs(TokenType.IDENT) && this.curToken.literal === "using" &&
+            (this.peekTokenIs(TokenType.IDENT) || this.peekTokenIs(TokenType.OF))) {
+            init = this.parseVariableDeclaration("let");
+        } else if (this.curTokenIs(TokenType.CONST) || this.curTokenIs(TokenType.VAR) ||
+            (this.curTokenIs(TokenType.LET) &&
+             (this.peekTokenIs(TokenType.IN) || this.peekTokenIs(TokenType.IDENT) ||
+              this.peekTokenIs(TokenType.LBRACKET) || this.peekTokenIs(TokenType.LBRACE)))) {
             if (this.curTokenIs(TokenType.LET) && this.peekTokenIs(TokenType.IN)) {
+                if (this.inStrictMode()) {
+                    this.errors.push("'let' is not a valid left-hand side in strict-mode for-in");
+                }
                 init = new AST.Identifier("let");
                 this.nextToken(); // 越过 let, cur = IN
                 this.nextToken(); // 越过 in, cur = 右侧表达式首 token
@@ -897,6 +940,18 @@ export const StatementParser = {
                 return new AST.ForOfStatement(init, right, body, isAwait);
             }
         } else if (!this.curTokenIs(TokenType.SEMICOLON)) {
+            // [for-of lookahead] The grammar excludes an unescaped `let` or
+            // `async` token immediately followed by the `of` keyword from the
+            // expression-form LHS.  They are otherwise parsed by the normal
+            // expression path (`let`/escaped keywords may be identifiers), so
+            // reject this exact pair before expression parsing.  Keep escaped
+            // spellings legal as IdentifierReferences, and do not alter the
+            // existing escaped-`of` diagnostic below.
+            if ((this.curTokenIs(TokenType.LET) || this.curTokenIs(TokenType.ASYNC)) &&
+                !this.curToken.escaped && this.peekTokenIs(TokenType.OF) &&
+                !this.peekToken.escaped) {
+                this.errors.push("Invalid for-of left-hand side");
+            }
             init = this.parseExpression(Precedence.LOWEST);
             // [test262 conditional/in-condition] for-init 是 Expression[~In]:
             // 除 for-in 头形态(顶层 BinaryExpression('in') 且后随 `)`)外,头部含
@@ -1018,6 +1073,7 @@ export const StatementParser = {
                 this._markBreakableLabels();
         let body = this.curTokenIs(TokenType.LBRACE) ? this.parseBlockStatement() : this.parseStatement();
         this.checkStatementBody(body);   // [test262 早期错误] while/do-body 单语句位
+        this.checkForHeadDeclaration(init, body);
         this.loopDepth--;
         return new AST.ForStatement(init, test, update, body);
     },
@@ -1146,7 +1202,16 @@ export const StatementParser = {
             label = new AST.Identifier(this.curToken.literal);
             // [test262 早期错误] 带标签的 continue 也必须在循环内部;
             // 标签必须引用外层 IterationStatement(switch 不可)。
-            if (this.loopDepth === 0) {
+            let foundIterationLabel = false;
+            if (this._labelStack) {
+                for (let li = this._labelStack.length - 1; li >= 0; li--) {
+                    if (this._labelStack[li].name === label.name) {
+                        foundIterationLabel = !!this._labelStack[li].breakable;
+                        break;
+                    }
+                }
+            }
+            if (this.loopDepth === 0 || !foundIterationLabel) {
                 this.errors.push("Illegal continue statement");
             }
         } else {
@@ -1178,6 +1243,8 @@ export const StatementParser = {
                 } else if (this.curTokenIs(TokenType.LBRACKET)) {
                     param = this.parseArrayPattern(true);
                 } else {
+                    this.checkYieldAwaitBinding(this.curToken.literal);
+                    this.checkReservedBinding(this.curToken.literal);
                     param = new AST.Identifier(this.curToken.literal);
                 }
                 if (!this.expectPeek(TokenType.RPAREN)) return null;
@@ -1213,6 +1280,32 @@ export const StatementParser = {
             }
             if (!this.expectPeek(TokenType.LBRACE)) return null;
             let catchBody = this.parseBlockStatement();
+            if (param && catchBody) {
+                const bound = [];
+                this.collectParamNames(param, bound);
+                const pset = Object.create(null);
+                for (let i = 0; i < bound.length; i++) pset[bound[i]] = true;
+                const body = catchBody.body || [];
+                for (let i = 0; i < body.length; i++) {
+                    const s = body[i];
+                    if (!s) continue;
+                    const names = Object.create(null);
+                    if (s.type === "VariableDeclaration" &&
+                        (s.kind === "let" || s.kind === "const")) {
+                        for (const d of (s.declarations || [])) collectPatternNames(d.id, names);
+                    } else if ((s.type === "FunctionDeclaration" || s.type === "ClassDeclaration") &&
+                               s.id && s.id.name) {
+                        names[s.id.name] = true;
+                    }
+                    for (const n in names) {
+                        if (pset[n]) {
+                            this.errors.push("Catch parameter '" + n + "' conflicts with a lexical declaration");
+                            i = body.length;
+                            break;
+                        }
+                    }
+                }
+            }
             handler = new AST.CatchClause(param, catchBody);
         }
         if (this.peekTokenIs(TokenType.FINALLY)) {

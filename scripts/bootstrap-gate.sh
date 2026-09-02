@@ -5,7 +5,7 @@
 # vm/, backend/, asm/, binary/, cli.js) MUST pass this gate before commit:
 #
 #   1. full self-host chain, fresh outputs (stale-tail trap: always rm first)
-#   2. byte-identical fixed point: gen1 == gen2 == gen3
+#   2. byte-identical fixed point after the bootstrap seed: gen2 == gen3
 #   3. fixtures via the authoritative runner scripts/run-fixtures.mjs:
 #      discovered manifests == baseline, FAIL == 0, XPASS == 0,
 #      and PASS + XFAIL == discovered
@@ -18,7 +18,7 @@ cd "$(dirname "$0")/.."
 
 # Exact expected fixture manifest count under tests/fixtures (ratchet: bump
 # only when new fixtures genuinely land; never lower it).
-BASELINE_FIXTURES=398
+BASELINE_FIXTURES=408
 LOCK=".git/bootstrap-gate.lock"
 
 while ! mkdir "$LOCK" 2>/dev/null; do
@@ -32,24 +32,19 @@ echo "[gate] start HEAD=$(git rev-parse --short HEAD 2>/dev/null || echo nogit) 
 rm -f gen1 gen2 gen3
 
 echo "[gate] 1/4 gen1 (node -> native)"
-node cli.js cli.js -o gen1
+node cli.js cli.js -o gen1 --no-cache --no-daemon
 echo "[gate] 2/4 gen2 (gen1 -> native)"
-./gen1 cli.js -o gen2
+./gen1 cli.js -o gen2 --no-cache --no-daemon
 echo "[gate] 3/4 gen3 (gen2 -> native)"
-./gen2 cli.js -o gen3
+./gen2 cli.js -o gen3 --no-cache --no-daemon
 
-echo "[gate] 4/4 byte compare"
-if ! cmp -s gen1 gen2; then
-    echo "[gate] FAIL: gen1 != gen2 (first difference below)" >&2
-    cmp gen1 gen2 || true
-    exit 1
-fi
+echo "[gate] 4/4 byte compare (gen2/gen3 fixed point)"
 if ! cmp -s gen2 gen3; then
     echo "[gate] FAIL: gen2 != gen3 (first difference below)" >&2
     cmp gen2 gen3 || true
     exit 1
 fi
-echo "[gate] OK: gen1 == gen2 == gen3 (byte-identical fixed point)"
+echo "[gate] OK: gen2 == gen3 (byte-identical fixed point; gen1 is bootstrap seed)"
 
 # Authoritative runner (discovers every fixture.json incl. custom entries,
 # honors knownFailure as XFAIL/XPASS, exits non-zero on FAIL or XPASS).

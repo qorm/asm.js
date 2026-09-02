@@ -40,7 +40,11 @@ export const ClassParser = {
                 // `mixin(Base)`、括号 `(cond?A:B)` 等。CALL-1 优先级吞并成员/调用链但在
                 // 类体 `{` 处停(LBRACE 无中缀优先级)。裸标识符仍产出 Identifier 节点,
                 // 与旧 `new AST.Identifier` 同形 → 名字快路径与自举字节不变。
-                superClass = this.parseExpression(Precedence.CALL - 1);
+                superClass = this._parseClassHeritage();
+                if (superClass && superClass.type === "ArrowFunctionExpression" &&
+                    !superClass._parenthesized) {
+                    this.errors.push("ClassHeritage must be a LeftHandSideExpression");
+                }
                 if (!this.expectPeek(TokenType.LBRACE)) return null;
             } else if (!this.curTokenIs(TokenType.LBRACE)) {
                 return null;
@@ -49,7 +53,11 @@ export const ClassParser = {
             if (this.peekTokenIs(TokenType.EXTENDS)) {
                 this.nextToken();
                 this.nextToken();
-                superClass = this.parseExpression(Precedence.CALL - 1);
+                superClass = this._parseClassHeritage();
+                if (superClass && superClass.type === "ArrowFunctionExpression" &&
+                    !superClass._parenthesized) {
+                    this.errors.push("ClassHeritage must be a LeftHandSideExpression");
+                }
             }
             if (!this.expectPeek(TokenType.LBRACE)) return null;
         }
@@ -58,6 +66,16 @@ export const ClassParser = {
         let body = this.parseClassBody();
         this._classHasSuper = prevClassHasSuper;
         return new AST.ClassDeclaration(id, superClass, body);
+    },
+
+    // ClassHeritage 的 LeftHandSideExpression 在类定义的 strict 上下文中求值。
+    // 该 strict 语境必须覆盖 heritage 中的函数表达式/IIFE（例如 with 早期错误），
+    // 但不能提升 classDepth，否则会把 heritage 私有名归入错误的私有环境层。
+    _parseClassHeritage() {
+        this._classHeritageDepth = (this._classHeritageDepth || 0) + 1;
+        const expr = this.parseExpression(Precedence.CALL - 1);
+        this._classHeritageDepth = this._classHeritageDepth - 1;
+        return expr;
     },
 
     parseClassBody() {
@@ -164,16 +182,24 @@ export const ClassParser = {
             const e = entries[i];
             if (!e.name || e.name === "#" || e.name === "#constructor") continue;
             let rec = map[e.name];
-            if (!rec) { rec = { get: 0, set: 0, other: 0 }; map[e.name] = rec; }
+            if (!rec) {
+                rec = { get: 0, set: 0, other: 0, getStatic: null, setStatic: null };
+                map[e.name] = rec;
+            }
             if (e.category === "get") rec.get = rec.get + 1;
             else if (e.category === "set") rec.set = rec.set + 1;
             else rec.other = rec.other + 1;
+            if (e.category === "get") rec.getStatic = !!e.static;
+            if (e.category === "set") rec.setStatic = !!e.static;
         }
         const keys = Object.keys(map);
         for (let i = 0; i < keys.length; i++) {
             const rec = map[keys[i]];
             const total = rec.get + rec.set + rec.other;
-            if (rec.get > 1 || rec.set > 1 || (rec.other > 0 && total > 1)) {
+            const accessorPair = rec.get === 1 && rec.set === 1 && rec.other === 0 &&
+                rec.getStatic === rec.setStatic;
+            if (rec.get > 1 || rec.set > 1 || (rec.other > 0 && total > 1) ||
+                (total > 1 && !accessorPair)) {
                 this.errors.push("Duplicate private name '" + keys[i] + "'");
             }
         }
@@ -199,14 +225,17 @@ export const ClassParser = {
                 // —— 记深度,嵌套函数 fnDepth+1 → 不误拒(const await = 0 于箭头内合法)。
                 this.fnDepth++;
                 const prevStaticBlockDepth = this._staticBlockDepth;
+                const prevStaticBlockArrowDepth = this._staticBlockArrowDepth;
                 const prevImmediateGen = this._immediateGen;
                 this._staticBlockDepth = this.fnDepth;
+                this._staticBlockArrowDepth = 0;
                 // ClassStaticBlockStatementList 是 [~Yield]:外层生成器的 yield 不穿透。
                 this._immediateGen = false;
                 const block = this.parseBlockStatement();
                 if (block) this.checkLexVarConflict(block.body);
                 this._immediateGen = prevImmediateGen;
                 this._staticBlockDepth = prevStaticBlockDepth;
+                this._staticBlockArrowDepth = prevStaticBlockArrowDepth;
                 this.fnDepth--;
                 return new AST.StaticBlock(block ? block.body : []);
             }
@@ -223,7 +252,8 @@ export const ClassParser = {
         // 转义形态不作 IdentifierStart;NUL 非 ID_Continue)。中段转义(`Z\u200C`)
         // 合法(fixture class-valid-escaped-identifiers)。cook 按 latin1 UTF-8 字节串。
         if (this.curToken.escaped && typeof this.curToken.literal === "string" &&
-            (this.curToken.literal === "" ||  // \u0000 → cook ""
+            (this.curToken.literal === "" ||
+             this.curToken.literal.charCodeAt(0) === 0 ||
              this.curToken.literal.indexOf("\u00e2\u0080\u008c") === 0 ||
              this.curToken.literal.indexOf("\u00e2\u0080\u008d") === 0)) {
             this.errors.push("Class member names may not start with an escaped ZWNJ/ZWJ or NUL");
@@ -438,7 +468,7 @@ export const ClassParser = {
         }
         if (this.curToken.identEscaped && typeof this.curToken.literal === "string") {
             const nm = this.curToken.literal.slice(1); // 剥 '#'
-            if (nm === "" ||
+            if (nm === "" || nm.charCodeAt(0) === 0 ||
                 nm.indexOf("\u00e2\u0080\u008c") === 0 ||
                 nm.indexOf("\u00e2\u0080\u008d") === 0) {
                 this.errors.push("Private names may not start with an escaped ZWNJ/ZWJ or NUL");
@@ -470,7 +500,7 @@ export const ClassParser = {
         // 字段与非 get/set 方法归 "other";同名 get+set 各一合法,其余重复皆早期错误。
         if (this._curPrivateNames) {
             let category = (this.peekTokenIs(TokenType.LPAREN) && (kind === "get" || kind === "set")) ? kind : "other";
-            this._curPrivateNames.push({ name: name, category: category });
+            this._curPrivateNames.push({ name: name, category: category, static: isStatic });
         }
 
         // 检查是否是方法 (有括号)

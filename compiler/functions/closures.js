@@ -64,7 +64,23 @@ export const ClosureCompiler = {
         this.setupParamEvalVarNames(this._pendingParamEvalParams || []);
         if (!this.ctx.paramEvalVarNames) return;
         this.markParamEvalVarBoxes();
-        if (!skipWhenFdiTransfer) this.emitParamEvalVarSlots();
+        if (!skipWhenFdiTransfer) {
+            // Slot materialisation calls _alloc before formal parameters have
+            // been copied out of A0-A4. Preserve the incoming argument window;
+            // otherwise a function with parameter-eval vars observes the last
+            // allocator argument/result instead of undefined/its real actuals,
+            // and may skip every default expression.
+            const snaps = [];
+            for (let i = 0; i < 5; i++) {
+                const off = this.ctx.allocLocal(`__pev_argsnap_${this.nextLabelId()}_${i}`);
+                this.vm.store(VReg.FP, off, this.vm.getArgReg(i));
+                snaps.push(off);
+            }
+            this.emitParamEvalVarSlots();
+            for (let i = 0; i < 5; i++) {
+                this.vm.load(this.vm.getArgReg(i), VReg.FP, snaps[i]);
+            }
+        }
     },
 
     // 形参默认值 eval('var x') 须在独立 param 环境建 var;闭包共享 box,eval 后更新。
@@ -99,6 +115,29 @@ export const ClosureCompiler = {
         for (const k in obj) { any = true; break; }
         this.ctx.paramEvalVarNames = any ? new Set(Object.keys(obj)) : null;
         return any;
+    },
+
+    // EvalDeclarationInstantiation for a direct eval that runs while default
+    // parameters are being initialised: var declarations may not collide with
+    // any parameter binding in the separate parameter lexical environment.
+    // Literal eval source is known at compile time, so emit the required
+    // call-time SyntaxError at the default-expression branch itself. Dynamic
+    // source retains the normal runtime eval path.
+    emitParamEvalConflictSyntaxError(defaultExpr) {
+        if (!defaultExpr || !this.ctx.paramLexNames || this.ctx.paramLexNames.size === 0) return false;
+        const fake = {
+            type: "AssignmentPattern",
+            left: { type: "Identifier", name: "__param_eval_probe" },
+            right: defaultExpr,
+        };
+        const evalVars = collectParamEvalVarNames([fake]);
+        for (const name of this.ctx.paramLexNames) {
+            if (evalVars[name] === true) {
+                this.emitThrowSyntaxError("Identifier '" + name + "' has already been declared");
+                return true;
+            }
+        }
+        return false;
     },
 
     // 函数体 eval('var x') 与捕获同名:独立 var 槽(undefined),复合赋值 LHS 仍走 __cap_x。
@@ -246,19 +285,27 @@ export const ClosureCompiler = {
     emitCtorRestParam(restName, pos) {
         const vm = this.vm;
         const restOff = this.ctx.allocLocal(restName);
+        const argcOff = this.ctx.allocLocal(`__ctor_rest_argc_${pos}`);
+        if (this.ctx.ctorArgcOff != null) {
+            vm.load(VReg.V0, VReg.FP, this.ctx.ctorArgcOff);
+        } else {
+            vm.lea(VReg.V0, "_call_argc");
+            vm.load(VReg.V0, VReg.V0, 0);
+        }
+        vm.store(VReg.FP, argcOff, VReg.V0);
         const saved = [];
         // 形参 i 对应实参寄存器 A(i+1);最多收到 A5。
         for (let k = pos + 1; k <= 5; k++) {
             const so = this.ctx.allocLocal(`__ctor_rest_a_${pos}_${k}`);
             vm.store(VReg.FP, so, vm.getArgReg(k));
-            saved.push(so);
+            saved.push({ off: so, argIndex: k - 1 });
         }
         const spill = this.ctx._argvSpill;
         if (spill) {
             for (let k = 5; k < 16; k++) {
                 if (spill[k] === undefined) break;
                 if (k < pos + 1) continue;
-                saved.push(spill[k]);
+                saved.push({ off: spill[k], argIndex: k });
             }
         }
         vm.movImm(VReg.A0, 0);
@@ -267,10 +314,13 @@ export const ClosureCompiler = {
         vm.store(VReg.FP, restOff, VReg.RET);
         const done = this.ctx.newLabel("ctor_rest_done");
         for (let k = 0; k < saved.length; k++) {
-            vm.load(VReg.V0, VReg.FP, saved[k]);
-            vm.movImm64(VReg.V1, 0x7ffb000000000000n);
-            vm.cmp(VReg.V0, VReg.V1);
-            vm.jeq(done);
+            // Rest length is governed by the captured actual argc, not by an
+            // undefined sentinel: explicit undefined in the middle is data and
+            // must not truncate constructor(...args) forwarding.
+            vm.load(VReg.V0, VReg.FP, argcOff);
+            vm.cmpImm(VReg.V0, saved[k].argIndex);
+            vm.jle(done);
+            vm.load(VReg.V0, VReg.FP, saved[k].off);
             vm.load(VReg.A0, VReg.FP, restOff);
             vm.mov(VReg.A1, VReg.V0);
             vm.call("_array_push");
@@ -687,6 +737,9 @@ export const ClosureCompiler = {
             vm.jeq(calS0);
             vm.cmpImm(VReg.S0, 0);
             vm.jeq(calName);
+            // compilePlainFunctionNew 入口 S0=装箱 this(0x7FFD),非裸闭包;对 tag≠0 解引用 → SIGSEGV。
+            vm.cmpImm(VReg.V1, 0);
+            vm.jne(calName);
             vm.load(VReg.V0, VReg.S0, 0);
             vm.cmpImm(VReg.V0, 0xc105);
             vm.jeq(calS0);
@@ -876,10 +929,11 @@ export const ClosureCompiler = {
     },
 
 
-    // RET = 装箱函数。挂自有 prototype({w:true,e:false,c:false})及
-    // proto.constructor=fn({w:true,e:false,c:true}),与 _cpg_lazy_proto 同形。
+    // RET = 装箱函数。挂自有 prototype({w:true,e:false,c:false})。
+    // GeneratorFunction 的 prototype 对象不得有 own "constructor"；它从
+    // %GeneratorPrototype% / %AsyncGeneratorPrototype% 继承对应的 constructor。
     // 生成器函数值的 gOPD 只扫侧表、不触发惰性建,须在造值时落下。
-    emitFnOwnPrototype() {
+    emitFnOwnPrototype(isAsyncGenerator = false) {
         const vm = this.vm;
         const fnOff = this.ctx.allocLocal(`__fnown_${this.nextLabelId()}`);
         vm.store(VReg.FP, fnOff, VReg.RET);
@@ -887,14 +941,15 @@ export const ClosureCompiler = {
         vm.call("_box_obj_r");
         const protoOff = this.ctx.allocLocal(`__fnownp_${this.nextLabelId()}`);
         vm.store(VReg.FP, protoOff, VReg.RET);
-        vm.mov(VReg.A0, VReg.RET);
-        this.emitBoxedStringKey("constructor", VReg.A1);
-        vm.load(VReg.A2, VReg.FP, fnOff);
-        vm.call("_object_define");
-        vm.load(VReg.A0, VReg.FP, protoOff);
-        this.emitBoxedStringKey("constructor", VReg.A1);
-        vm.movImm(VReg.A2, 5);
-        vm.call("_object_set_prop_attr");
+        // Generator instances inherit from %GeneratorPrototype% and async
+        // generator instances from %AsyncGeneratorPrototype%.
+        vm.call(isAsyncGenerator ? "_ensure_asyncgen_proto" : "_ensure_gen_proto");
+        vm.mov(VReg.V1, VReg.RET);
+        vm.emitMaskLoad(VReg.V2);
+        vm.andMaskReg(VReg.V0, VReg.V1, VReg.V2);
+        vm.load(VReg.V1, VReg.FP, protoOff);
+        vm.andMaskReg(VReg.V1, VReg.V1, VReg.V2);
+        vm.store(VReg.V1, 16, VReg.V0);
         vm.load(VReg.A0, VReg.FP, fnOff);
         this.emitBoxedStringKey("prototype", VReg.A1);
         vm.load(VReg.A2, VReg.FP, protoOff);
@@ -1074,6 +1129,7 @@ export const ClosureCompiler = {
                 this.vm.pop(VReg.V3);
                 this.vm.push(VReg.V3);
                 this.vm.movImm64(VReg.V1, 0x7ffb000000000000n);
+                this.vm.pop(VReg.V3);
                 this.vm.push(VReg.V1);
                 this.vm.push(VReg.V3);
                 this.vm.call("_box_alloc");
@@ -1115,7 +1171,36 @@ export const ClosureCompiler = {
 
         // 生成器函数值自有 prototype({w:true,e:false,c:false})。gOPD 不走
         // _cpg_miss 惰性建,须在造值时落下,否则 function*(){} 无该自有属性。
-        if (isGeneratorFunction(expr)) this.emitFnOwnPrototype();
+        if (isGeneratorFunction(expr)) this.emitFnOwnPrototype(isAsyncFunction(expr));
+
+        // Runtime-compiled specialised functions live in mmap pages, outside
+        // the host executable's immutable func_meta table.  Register their
+        // code pointer/kind/name/arity at creation time so constructor,
+        // toStringTag, getPrototypeOf, instanceof and IsConstructor all see
+        // the same semantics as AOT functions.  Ordinary fragment functions
+        // keep the existing explicit new-Function shim path.
+        if (this.engineNoIC && (isGeneratorFunction(expr) || isAsyncFunction(expr))) {
+            let dynKind = isGeneratorFunction(expr)
+                ? (isAsyncFunction(expr) ? 3 : 1) : 2;
+            if (this._computeFunctionStrict(expr)) dynKind |= 0x100;
+            dynKind |= 0x200; // specialised functions lack [[Construct]]
+            let dynArity = 0;
+            const dynParams = expr.params || [];
+            for (let dpi = 0; dpi < dynParams.length; dpi++) {
+                const dp = dynParams[dpi];
+                if (!dp || dp.type === "AssignmentPattern" || dp.type === "RestElement" ||
+                    dp.type === "SpreadElement") break;
+                dynArity = dynArity + 1;
+            }
+            let dynName = "";
+            if (expr.id && expr.id.name) dynName = expr.id.name;
+            else if (typeof expr._fnHint === "string") dynName = expr._fnHint;
+            this.vm.mov(VReg.A0, VReg.RET);
+            this.vm.movImm(VReg.A1, dynKind);
+            this.vm.movImm(VReg.A2, dynArity);
+            this.vm.lea(VReg.A3, this.asm.addString(dynName));
+            this.vm.call("_dynamic_fn_meta_add");
+        }
 
         if (!this.pendingFunctions) {
             this.pendingFunctions = [];
@@ -1177,7 +1262,9 @@ export const ClosureCompiler = {
         if (!this.pendingFunctions || this.pendingFunctions.length === 0) {
             return;
         }
+        const _traceClass = typeof process !== "undefined" && process.env && process.env.ASMJS_TRACE_CLASS === "1";
         for (const func of this.pendingFunctions) {
+            if (_traceClass) console.log("GPF_BEGIN", func.label);
             // [m121-fix] 恢复逐函数 IC 池隔离。m118 整批共用导致跨函数 shape 毒化,
             // node/gen2 编出的自举产物在大图(cli/index)上 SEGV(把小整数当堆指针)。
             this._resetIcPropMaps();
@@ -1219,6 +1306,7 @@ export const ClosureCompiler = {
             this.ctx._pendingImmutableFromParent = func.immutableFromParent;
             this.ctx._pendingClassNameFromParent = func.classNameFromParent;
             if (isGeneratorFunction(func.expr) && !isAsyncFunction(func.expr)) {
+                if (_traceClass) console.log("GPF_GEN_STUB", func.label);
                 fdiList = this.emitGeneratorStub(func.label + "_gbody", true, undefined, func.captured);
             } else if (isGeneratorFunction(func.expr) && isAsyncFunction(func.expr)) {
                 // async function*：async 生成器 stub(构造器 _async_generator_new)
@@ -1229,7 +1317,9 @@ export const ClosureCompiler = {
                 // 的普通闭包路径都会调到本 stub(方法调用经 A5 传 this → CORO_THIS),统一。
                 this.emitAsyncMethodStub(func.label + "_gbody", true);
             }
+            if (_traceClass) console.log("GPF_BODY_BEGIN", func.label);
             this.compileFunctionBody(func.expr, func.captured, fdiList);
+            if (_traceClass) console.log("GPF_BODY_DONE", func.label);
             this._genStubFnExpr = null;
             this.ctx._pendingImmutableFromParent = null;
             this.ctx._pendingClassNameFromParent = null;
@@ -1244,14 +1334,18 @@ export const ClosureCompiler = {
             this.ctx.superInfoLabel = savedSuperInfoLabel;
             this.ctx.classInfoLabel = savedClassInfoLabel;
             this.ctx.inStaticMethod = savedInStaticMethod;
+            if (_traceClass) console.log("GPF_RESTORE", func.label);
         }
 
         this.pendingFunctions = [];
+        if (_traceClass) console.log("GPF_DONE");
     },
 
     // 编译函数体
     // [FDI eager] fdiList=生成器 pattern 形参在 stub 已完成绑定的叶名序(非生成器恒 null)。
     compileFunctionBody(expr, captured, fdiList = null) {
+        const _traceClass = typeof process !== "undefined" && process.env && process.env.ASMJS_TRACE_CLASS === "1";
+        if (_traceClass) console.log("CFB_BEGIN", expr && expr.type);
         const params = expr.params || [];
         const vm = this.vm;
 
@@ -1271,9 +1365,17 @@ export const ClosureCompiler = {
         const doP1 = !isAsync && !isGenerator && !this.engineNoIC && this._fnNeedsP1Record(expr);
         if (doP1) vm.beginRecord();
         const savedRegs = [VReg.S0, VReg.S1, VReg.S2, VReg.S3];
-        vm.prologue(8192, savedRegs);
+        // Large compiler methods (notably compileClassDeclaration) allocate
+        // more than the historical 8 KiB local area while self-hosting.  Keep
+        // enough headroom for this experiment; the frame-size policy will be
+        // centralized once the dynamic high-water mark is wired through.
+        vm.prologue(16384, savedRegs);
+        const prevFnFrameSize = this.ctx._fnFrameSize;
+        this.ctx._fnFrameSize = 16384;
 
         const prevLocals = this.ctx.locals;
+        const prevEngineLocalNames = this.ctx._engineLocalNames;
+        const prevEngineLocalOffsets = this.ctx._engineLocalOffsets;
         const prevLocalsUndo = this.ctx._localsUndo;
         const prevStackOffset = this.ctx.stackOffset;
         const prevReturnLabel = this.ctx.returnLabel;
@@ -1291,6 +1393,10 @@ export const ClosureCompiler = {
         const prevOuterWithScopes = this.ctx.outerWithScopes;
 
         this.ctx.locals = new Map();
+        if (prevEngineLocalNames && prevEngineLocalOffsets) {
+            this.ctx._engineLocalNames = [];
+            this.ctx._engineLocalOffsets = [];
+        }
         this.ctx.withScopes = [];
         this.ctx.outerWithScopes = [];
         this.ctx.localTemps = null;
@@ -1500,7 +1606,9 @@ export const ClosureCompiler = {
                 vm.jne(skip);
                 const _prevEvalParam = this.ctx._evalInParamInit;
                 this.ctx._evalInParamInit = true;
-                this.compileExpression(defaultExpr);
+                if (!this.emitParamEvalConflictSyntaxError(defaultExpr)) {
+                    this.compileExpression(defaultExpr);
+                }
                 this.ctx._evalInParamInit = _prevEvalParam;
                 vm.store(VReg.FP, offset, VReg.RET);
                 vm.label(skip);
@@ -1627,7 +1735,15 @@ export const ClosureCompiler = {
         // → arguments[i]=x 不回写形参,15.2.3.6-4-294-1 等 FAIL)。
         const mappedArgs = usesArguments && !fnStrict && this._isSimpleParamList(params);
         if (mappedArgs && paramOffsets.length > 0) {
+            const mappedParamIndex = new Array(paramOffsets.length);
+            const mappedParamNames = new Set();
+            for (let i = paramOffsets.length - 1; i >= 0; i--) {
+                const pn = paramOffsets[i].name;
+                mappedParamIndex[i] = !mappedParamNames.has(pn);
+                mappedParamNames.add(pn);
+            }
             for (let i = 0; i < paramOffsets.length; i++) {
+                if (!mappedParamIndex[i]) continue;
                 const param = paramOffsets[i];
                 if (innerBoxedVars.has(param.name)) continue;
                 vm.load(VReg.V1, VReg.FP, param.offset);
@@ -1644,7 +1760,8 @@ export const ClosureCompiler = {
             vm.call("_alloc");
             vm.store(VReg.FP, mapOff, VReg.RET);
             for (let i = 0; i < paramOffsets.length; i++) {
-                vm.load(VReg.V0, VReg.FP, paramOffsets[i].offset);
+                if (mappedParamIndex[i]) vm.load(VReg.V0, VReg.FP, paramOffsets[i].offset);
+                else vm.movImm(VReg.V0, 0);
                 vm.load(VReg.V1, VReg.FP, mapOff);
                 vm.store(VReg.V1, i * 8, VReg.V0);
             }
@@ -1730,6 +1847,7 @@ export const ClosureCompiler = {
             this.compileExpression(expr.body);
             hasImplicitReturn = true;
         }
+        if (_traceClass) console.log("CFB_STMTS_DONE", expr && expr.type);
 
         // 函数体自然落底(无显式 return):返回真正的 undefined(0x7FFB),而非裸 int 0
         // ——与 FunctionDeclaration / 显式 `return;` 对齐。此前 function 表达式落 0,
@@ -1748,11 +1866,15 @@ export const ClosureCompiler = {
         } else {
             // 普通函数 / 生成器 / async generator:epilogue 返回。
             // (生成器/async-gen 体经 _coroutine_entry 捕获返回 → _coroutine_return 置 COMPLETED。)
-            vm.epilogue(savedRegs, 8192);
+            vm.epilogue(savedRegs, 16384);
         vm.endRecord(); // [P1]
         }
+        if (_traceClass) console.log("CFB_EPILOGUE_DONE", expr && expr.type);
 
         this.ctx.locals = prevLocals;
+        this.ctx._fnFrameSize = prevFnFrameSize;
+        this.ctx._engineLocalNames = prevEngineLocalNames;
+        this.ctx._engineLocalOffsets = prevEngineLocalOffsets;
         this.ctx._localsUndo = prevLocalsUndo;
         this.ctx.stackOffset = prevStackOffset;
         this.ctx.returnLabel = prevReturnLabel;

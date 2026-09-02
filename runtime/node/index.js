@@ -25,9 +25,11 @@ import vm from "./vm.js";
 import child_process from "./child_process.js";
 import assert from "./assert.js";
 import querystring from "./querystring.js";
+import https from "./https.js";
+import tls from "./tls.js";
 
 // Re-export all modules as named exports (for backward compatibility)
-export { constants, _string, process, console, fs, path, os, buffer, util, events, stream, net, http, dns, timers, crypto, url, zlib, string_decoder, tty, vm, child_process, assert, querystring };
+export { constants, _string, process, console, fs, path, os, buffer, util, events, stream, net, http, dns, timers, crypto, url, zlib, string_decoder, tty, vm, child_process, assert, querystring, https, tls };
 
 // Re-export all OS functions directly (for import * as os from "os")
 export * from "./os.js";
@@ -55,6 +57,8 @@ export { default as nodeStringDecoder } from "./string_decoder.js";
 export { default as nodeTty } from "./tty.js";
 export { default as nodeVm } from "./vm.js";
 export { default as nodeChildProcess } from "./child_process.js";
+export { default as nodeHttps } from "./https.js";
+export { default as nodeTls } from "./tls.js";
 
 // Create comprehensive default export
 const nodeJS = {
@@ -80,6 +84,8 @@ const nodeJS = {
     child_process,
     assert,
     querystring,
+    https,
+    tls,
     versions: {
         node: "20.0.0",
         v8: "11.3.0",

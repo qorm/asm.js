@@ -113,6 +113,15 @@ function __re_uniName(tab, name) {
 // 解码花 50~70ms。拷贝只做一次(53KB 一遍),之后 indexOf/charCodeAt 都是常数级。
 var __RE_UTH = "";
 
+// Internal regexp scanner primitive.  The shim's strings are UTF-8-backed;
+// hot loops must read one backing byte, not invoke the public UTF-16
+// `String#charCodeAt` bridge (which rescans to a code-unit offset).  The
+// compiler lowers this helper's call site to `_str_charCodeAt_byte` based on
+// the shim source path, while public user calls continue using `_str_charCodeAt`.
+function __re_byteAt(s, pos) {
+    return s.charCodeAt(pos);
+}
+
 function __re_uniSrc() {
     if (__RE_UTH.length === 0) __RE_UTH = __RE_UT.slice(0, __RE_UT.length);
     return __RE_UTH;
@@ -173,6 +182,45 @@ function __re_uniHas(ti, cp) {
     var t = __re_uniTable(ti);
     var los = t.lo;
     var his = t.hi;
+    // Generated test262 property cases scan monotonically through a giant
+    // code-point string.  Reusing the previous interval turns the usual
+    // binary search into an amortised O(1) cursor walk while retaining the
+    // binary-search fallback for random access (and when a new scan rewinds).
+    var ci = t._cursor;
+    var cc = t._cursorCp;
+    // Repeated code points are common in generated property fixtures (large
+    // contiguous astral ranges).  Once the cursor has resolved a code point,
+    // return the cached membership directly instead of falling back to a
+    // binary search on every repetition.
+    if (ci !== undefined && cc !== undefined && cp === cc && t._cursorHit !== undefined) {
+        return t._cursorHit;
+    }
+    var rewound = ci === undefined || cc === undefined || cp < cc;
+    if (rewound) {
+        ci = 0;
+    }
+    while (ci < los.length && cp > his[ci]) {
+        ci = ci + 1;
+    }
+    t._cursor = ci;
+    t._cursorCp = cp;
+    if (ci < los.length && cp >= los[ci] && cp <= his[ci]) {
+        t._cursorHit = true;
+        return true;
+    }
+    // On a monotonic scan, landing in the gap before the cursor's next
+    // interval (or past the final interval) is a definitive miss.  The old
+    // implementation still entered a full binary search for every such code
+    // point; generated `\\P{Alphabetic}+` ranges contain hundreds of
+    // thousands of consecutive misses, turning that path into O(n log m).
+    // Keep the binary-search fallback below for a defensive non-monotonic
+    // probe, but make the common forward miss amortised O(1).
+    if (!rewound && ((ci < los.length && cp < los[ci]) || ci >= los.length)) {
+        t._cursorHit = false;
+        return false;
+    }
+    // Non-monotonic probes can land before the cursor; use the original
+    // binary search to preserve exact semantics without rebuilding tables.
     var a = 0;
     var b = los.length - 1;
     while (a <= b) {
@@ -180,8 +228,9 @@ function __re_uniHas(ti, cp) {
         var mid = (s - s % 2) / 2;
         if (cp < los[mid]) b = mid - 1;
         else if (cp > his[mid]) a = mid + 1;
-        else return true;
+        else { t._cursorHit = true; return true; }
     }
+    t._cursorHit = false;
     return false;
 }
 
@@ -204,12 +253,83 @@ function __re_uniMatch(ti, neg, ic, cp) {
     return false;
 }
 
+// Scan a whole UTF-8 string against one Unicode-property table.  The regular
+// matcher intentionally stays general, but generated test262 cases exercise
+// the exact shape /^\p{...}+$/u over million-code-point strings and repeat the
+// same scan for every canonical property alias.  Hoisting the decoded interval
+// arrays and cursor out of the per-code-point matcher removes several JS calls
+// per scalar while retaining a binary-search recovery for non-monotonic input.
+function __re_scanUnicode(s, n, table, ti, neg) {
+    if (n <= 0) return -1; // the specialised shape is one-or-more
+    var t = __re_uniTable(ti);
+    var los = t.lo;
+    var his = t.hi;
+    var count = los.length;
+    var ci = 0;
+    var prev = -1;
+    var p = 0;
+    while (p < n) {
+        var pk = __re_cpAt(s, p, n);
+        var adv = pk % 8;
+        if (adv < 1) adv = 1;
+        var cp = (pk - adv) / 8;
+
+        if (cp < prev) {
+            // Locate the first interval whose high endpoint is >= cp.  This is
+            // also the insertion point used by the following monotonic walk.
+            var a = 0;
+            var b = count - 1;
+            while (a <= b) {
+                var sum = a + b;
+                var mid = (sum - sum % 2) / 2;
+                if (cp > his[mid]) a = mid + 1;
+                else b = mid - 1;
+            }
+            ci = a;
+        } else {
+            while (ci < count && cp > his[ci]) ci = ci + 1;
+        }
+
+        var hit = ci < count && cp >= los[ci] && cp <= his[ci];
+        if ((neg && hit) || (!neg && !hit)) return -1;
+        prev = cp;
+        p = p + adv;
+    }
+    return p;
+}
+
+function __re_uniScanWhole(s, n, ti, neg) {
+    // Keep the table source as an explicit argument so the ARM64 compiler can
+    // lower this one whole-string operation to a leaf that decodes the compact
+    // interval stream without materialising JS arrays.  The portable body
+    // above intentionally remains the exact fallback for x64/wasm.
+    return __re_scanUnicode(s, n, __re_uniSrc(), ti, neg);
+}
+
+// Recognise only the semantics-complete full-string property form handled by
+// __re_uniScanWhole.  Anything with captures, alternatives, inline/global
+// modifiers, another quantifier, or a non-property atom stays on the normal
+// CPS matcher.
+function __re_fullUniAtom(prog, re, uni, anchored) {
+    if (!uni || anchored || prog.ncap !== 0) return null;
+    if (re.ignoreCase || re.multiline || re.dotAll || re.hasIndices) return null;
+    if (!prog.alts || prog.alts.length !== 1) return null;
+    var seq = prog.alts[0];
+    if (!seq || seq.length !== 3) return null;
+    if (seq[0].k !== "bol" || seq[2].k !== "eol") return null;
+    if (seq[0].fm || seq[2].fm) return null;
+    var rep = seq[1];
+    if (!rep || rep.k !== "rep" || rep.min !== 1 || rep.max !== -1 || rep.lazy) return null;
+    if (!rep.atom || rep.atom.k !== "up" || rep.atom.fi) return null;
+    return rep.atom;
+}
+
 // 就地解 UTF-8:返回 cp * 8 + 字节数(打包,免多返回值)。非法/截断序列按
 // 单字节字面处理(与引擎其余部分"字节串"的宽容姿态一致)。
 // 续字节(0x80-0xBF)返回高偏移哨兵:防止 0xA0 在 UTF-8 续字节位置误匹配
 // NBSP,进而误匹配 \s(如 U+180E 编码 E1 A0 8E 中 A0 字节会被当空格)。
 function __re_cpAt(s, pos, n) {
-    var c = s.charCodeAt(pos);
+    var c = __re_byteAt(s, pos);
     // ASCII (0x00-0x7F):合法 1 字节码点
     if (c < 128) return c * 8 + 1;
     // 续字节(0x80-0xBF):不能作为合法序列首字节,返回超高哨兵码点
@@ -217,33 +337,30 @@ function __re_cpAt(s, pos, n) {
     if (c < 192) return (c + 2097152) * 8 + 1;
     if (c >= 240) {
         if (pos + 3 >= n) return c * 8 + 1;
-        var a1 = s.charCodeAt(pos + 1);
-        var a2 = s.charCodeAt(pos + 2);
-        var a3 = s.charCodeAt(pos + 3);
+        var a1 = __re_byteAt(s, pos + 1);
+        var a2 = __re_byteAt(s, pos + 2);
+        var a3 = __re_byteAt(s, pos + 3);
         if (a1 < 128 || a1 >= 192 || a2 < 128 || a2 >= 192 || a3 < 128 || a3 >= 192) return c * 8 + 1;
         return ((c - 240) * 262144 + (a1 - 128) * 4096 + (a2 - 128) * 64 + (a3 - 128)) * 8 + 4;
     }
     if (c >= 224) {
         if (pos + 2 >= n) return c * 8 + 1;
-        var b1 = s.charCodeAt(pos + 1);
-        var b2 = s.charCodeAt(pos + 2);
+        var b1 = __re_byteAt(s, pos + 1);
+        var b2 = __re_byteAt(s, pos + 2);
         if (b1 < 128 || b1 >= 192 || b2 < 128 || b2 >= 192) return c * 8 + 1;
         return ((c - 224) * 4096 + (b1 - 128) * 64 + (b2 - 128)) * 8 + 3;
     }
     if (pos + 1 >= n) return c * 8 + 1;
-    var d1 = s.charCodeAt(pos + 1);
+    var d1 = __re_byteAt(s, pos + 1);
     if (d1 < 128 || d1 >= 192) return c * 8 + 1;
     return ((c - 192) * 64 + (d1 - 128)) * 8 + 2;
 }
 
 function __re_blen(s) {
     if (typeof s !== "string") return 0;
-    var i = 0;
-    while (true) {
-        var c = s.charCodeAt(i);
-        if (typeof c !== "number" || c !== c) return i;
-        i = i + 1;
-    }
+    // Internal regexp strings are UTF-8-backed; the compiler lowers this
+    // source-path length read to the byte length (not public UTF-16 units).
+    return s.length;
 }
 
 // UTF-8 字节偏移 ↔ UTF-16 码元偏移。u/v 下 lastIndex/index/indices 对外是
@@ -378,6 +495,11 @@ function __re_u16slice(s, a, b) {
     if (a > n16) a = n16;
     if (b > n16) b = n16;
     if (a >= b) return "";
+    // A complete UTF-16 slice is the original immutable string.  Returning
+    // it directly avoids the per-code-unit `u16to8` walk (quadratic for the
+    // large generated CharacterClassEscape fixtures) while preserving the
+    // observable value and representation.
+    if (a === 0 && b === n16) return s;
     if (nB === n16) return s.slice(a, b);
     var out = "";
     var i = a;
@@ -393,7 +515,15 @@ function __re_u16slice(s, a, b) {
             var hi = 55296 + (x - (x % 1024)) / 1024;
             var lo = 56320 + (x % 1024);
             if (i === start16 && (i + 1) < b) {
-                out = out + s.slice(bytePos, bytePos + adv);
+                // `s` is the runtime's UTF-8-backed string; its public slice
+                // takes UTF-16 code-unit offsets (not raw byte offsets).
+                // Using bytePos here re-sliced the tail (e.g. box1 became 27)
+                // when a match followed a multi-byte code point.
+                // Keep a complete astral scalar in canonical UTF-8.  Rebuilding
+                // the two UTF-16 surrogate units through public slice produces
+                // CESU-8, which compares differently from a source scalar even
+                // though charCodeAt exposes the same pair.
+                out = out + __re_utf8Str(cp);
                 i = i + 2;
             } else if (i === start16) {
                 out = out + __re_utf8Str(hi);
@@ -403,11 +533,30 @@ function __re_u16slice(s, a, b) {
                 i = i + 1;
             }
         } else {
-            out = out + s.slice(bytePos, bytePos + adv);
+            // As above, materialise one UTF-16 code unit through the public
+            // slice API; passing the backing byte offset is incorrect for
+            // non-ASCII prefixes.
+            out = out + s.slice(i, i + 1);
             i = i + 1;
         }
     }
     return out;
+}
+
+// Matcher offsets stay in UTF-8 bytes even in `u` mode.  Convert those byte
+// offsets before materialising an externally visible match/capture string;
+// slicing the backing byte string directly leaks trailing bytes (notably when
+// a source literal contains an encoded surrogate pair).
+function __re_uniSlice(s, a, b) {
+    // The matcher passes UTF-8 byte offsets.  A very common successful path
+    // (anchored full-string match, including the generated test262 property
+    // corpus) asks for the entire backing string.  Returning it directly is
+    // both semantically exact and avoids __re_u16slice's per-code-unit
+    // byte-offset rescan (quadratic for long astral strings).
+    var _nB = __re_blen(s);
+    if (a === 0 && b === _nB) return s;
+    if (a === b) return "";
+    return __re_u16slice(s, __re_u8to16(s, a), __re_u8to16(s, b));
 }
 
 function __re_matchStrUnits(mst, cs, pos, ic) {
@@ -467,6 +616,126 @@ function __re_isSpaceCode(c) {
     if (c === 8239 || c === 8287) return true;
     if (c === 12288 || c === 65279) return true;
     return false;
+}
+
+// Return the compact scanner kind for a character-class escape atom.
+// `__re_scanClass` is deliberately limited to a single \d/\D/\s/\S/\w/\W
+// item; mixed classes and Unicode-property classes retain the general matcher
+// path.  A negated one-item class (e.g. [^\d]) is equivalent to the opposite
+// escape and is safe to fold here as well.
+function __re_clsScanKind(node) {
+    if (node === undefined || node === null || node.k !== "cls" || node.v === 1) return -1;
+    var items = node.items;
+    if (items === undefined || items === null || items.length !== 1) return -1;
+    var it = items[0];
+    if (it === undefined || it === null || it.t !== 1) return -1;
+    var c = it.c;
+    var kind = -1;
+    if (c === "d") kind = 0;
+    else if (c === "D") kind = 1;
+    else if (c === "s") kind = 2;
+    else if (c === "S") kind = 3;
+    else if (c === "w") kind = 4;
+    else if (c === "W") kind = 5;
+    if (kind >= 0 && node.neg) {
+        if (kind === 0) kind = 1;
+        else if (kind === 1) kind = 0;
+        else if (kind === 2) kind = 3;
+        else if (kind === 3) kind = 2;
+        else if (kind === 4) kind = 5;
+        else kind = 4;
+    }
+    return kind;
+}
+
+// Semantic reference for the bulk scanner.  Native ARM64 lowers calls to the
+// five-argument `__re_scanClass` entry below; this JS implementation remains
+// the fallback for x64/wasm and for builds where the intrinsic is disabled.
+function __re_scanClassHit(c, kind, flags) {
+    var uni = flags % 2 >= 1;
+    var ic = flags >= 2;
+    if (kind === 0) return __re_isDigitCode(c);
+    if (kind === 1) return !__re_isDigitCode(c);
+    if (kind === 2) return __re_isSpaceCode(c);
+    if (kind === 3) return !__re_isSpaceCode(c);
+    if (kind === 4) return __re_isWordCode(c, ic, uni);
+    if (kind === 5) return !__re_isWordCode(c, ic, uni);
+    return false;
+}
+
+function __re_scanClass(s, pos, n, kind, flags) {
+    var p = pos;
+    if (p < 0) p = 0;
+    if (n < 0) n = 0;
+    while (p < n) {
+        var pk = __re_cpAt(s, p, n);
+        var adv = pk % 8;
+        if (adv < 1) adv = 1;
+        var cp = (pk - adv) / 8;
+        // In Unicode mode the matcher rejects malformed/continuation bytes
+        // for every character-class escape (`__re_clsPk` returns -1).  Stop at
+        // that byte rather than letting a negated class consume the sentinel.
+        // Legacy mode intentionally treats the raw byte as a UTF-16 unit and
+        // therefore keeps the original complement behavior.
+        if (flags % 2 >= 1 && cp > 1114111) return p;
+        if (!__re_scanClassHit(cp, kind, flags)) return p;
+        p = p + adv;
+    }
+    return p;
+}
+
+// Non-Unicode matcher adapter for the ARM64 bulk scanner.  The native leaf
+// always walks UTF-8 bytes, while legacy RegExp matching exposes UTF-16 code
+// unit offsets.  For the simple escape classes handled above, an astral code
+// point has the same membership for both surrogate units, so it is safe to
+// scan the code point once and translate the resulting byte endpoint.  Callers
+// pass the already-known UTF-16 length (`n16`) so the common full-suffix case
+// avoids a second O(n) conversion.  This helper is intentionally kept
+// separate from __re_scanClass: the compiler's exact-five-argument lowering
+// remains unchanged and the public UTF-16 paths retain their reference logic.
+function __re_scanClassUnits(s, pos, n, kind, flags, n16) {
+    var bytePos = pos === 0 ? 0 : __re_u16to8(s, pos);
+    var byteEnd = __re_scanClass(s, bytePos, n, kind, flags);
+    if (byteEnd >= n) return n16;
+    return __re_u8to16(s, byteEnd);
+}
+
+// Find the first matching byte for a bare class by scanning its complement.
+// Unicode malformed bytes are rejected by both positive and negative class
+// escapes, so skip such scanner stop points and continue after the byte.
+function __re_findClass(s, pos, n, kind, flags) {
+    var p = pos;
+    while (p < n) {
+        var q = __re_scanClass(s, p, n, kind, flags);
+        if (q >= n) return q;
+        if (flags % 2 >= 1) {
+            var pk = __re_cpAt(s, q, n);
+            var adv = pk % 8;
+            if (adv < 1) adv = 1;
+            var cp = (pk - adv) / 8;
+            if (cp > 1114111) {
+                p = q + 1;
+                continue;
+            }
+        }
+        return q;
+    }
+    return p;
+}
+
+// Exact whole-program shape used by generated CharacterClassEscape tests:
+// one unanchored class atom and no alternatives/captures.  Returning the node
+// (rather than a boolean) lets BuiltinExec derive flags and the compact kind
+// without re-reading unrelated AST fields.  More complex programs always use
+// the ordinary CPS search loop.
+function __re_bareClassNode(prog) {
+    if (prog === undefined || prog === null || prog.ncap !== 0) return null;
+    if (prog.alts === undefined || prog.alts === null || prog.alts.length !== 1) return null;
+    var seq = prog.alts[0];
+    if (seq === undefined || seq === null || seq.length !== 1) return null;
+    var node = seq[0];
+    if (__re_clsScanKind(node) < 0) return null;
+    return node;
 }
 
 function __re_hexVal(c) {
@@ -2571,6 +2840,38 @@ function __re_mNodeSimple(mst, node, pos) {
 function __re_mRep(mst, node, ck, cont) {
     var pos = ck % __RE_PK;
     var count = (ck - pos) / __RE_PK;
+    // Bulk-scan the common unbounded one-or-more character-class escapes.
+    // Keep this gate intentionally exact: a scanner returns only the first
+    // non-matching byte offset, so patterns with a different minimum/bound,
+    // lazy/behind direction, or a non-class atom must retain the CPS matcher.
+    // If the continuation rejects the greedy endpoint, fall through to the
+    // ordinary path so backtracking (e.g. /\d+\d/) remains observable.
+    if (count === 0 && node.min === 1 && node.max === -1 &&
+        !node.lazy && !mst.behind && node.atom && node.atom.k === "cls" &&
+        // The scanner consumes UTF-8 byte offsets.  Unicode matching already
+        // uses byte/code-point positions directly.  Legacy (non-/u) matching
+        // may use the adapter below, but only from the initial position: it
+        // translates the native endpoint back to UTF-16 units and leaves all
+        // arbitrary-position/backtracking cases on the reference matcher.
+        (mst.uni || (!mst.uni && pos === 0)) &&
+        (node.ge === undefined || node.ge < node.gs)) {
+        var scanKind = __re_clsScanKind(node.atom);
+        if (scanKind >= 0) {
+            var scanIc = node.atom.fi !== undefined ? node.atom.fi : mst.ic;
+            var scanFlags = (mst.uni ? 1 : 0) + (scanIc ? 2 : 0);
+            var scanEnd = mst.uni
+                ? __re_scanClass(mst.s, pos, mst.blen, scanKind, scanFlags)
+                : __re_scanClassUnits(mst.s, pos, mst.blen, scanKind, scanFlags, mst.n);
+            if (scanEnd > pos) {
+                var scanResult = cont(scanEnd);
+                if (scanResult >= 0) return scanResult;
+                // Continuation failure can require a shorter repetition; the
+                // generic branch below performs that backtracking safely.
+            } else {
+                return -1; // min=1: no first class atom matched.
+            }
+        }
+    }
     // 自动占有:后继与原子字符集无交,最长匹配失败则更短也救不了右边。
     // lookbehind 仍走原方向逻辑,不在此处占有。
     if (node.poss && !mst.behind && !node.lazy && __re_isSimpleAtom(node.atom) &&
@@ -2749,6 +3050,65 @@ export function __RE_flag_brand_check(re) {
     }
 }
 
+// RegExp.prototype.flags has deliberately different receiver semantics from
+// the individual flag accessors: it accepts any Object and performs Get in the
+// specified order, coercing each result with ToBoolean.  Keep this operation
+// in the shim rather than synthesising a long chain of compiler AST nodes; it
+// also preserves user getter side effects and abrupt completion order.
+export function __RE_proto_flags(re) {
+    if (re === undefined || re === null) {
+        throw new TypeError("RegExp.prototype.flags getter called on non-object");
+    }
+    var rt = typeof re;
+    if (rt !== "object" && rt !== "function") {
+        throw new TypeError("RegExp.prototype.flags getter called on non-object");
+    }
+    // The intrinsic prototype has no [[OriginalFlags]], but its flags getter
+    // is specified to return the empty string after the ordinary Get steps
+    // (all of its flag properties are absent/undefined).
+    if (re.__reProto === 1) return "";
+    var out = "";
+    if (re.hasIndices) out = out + "d";
+    if (re.global) out = out + "g";
+    if (re.ignoreCase) out = out + "i";
+    if (re.multiline) out = out + "m";
+    if (re.dotAll) out = out + "s";
+    if (re.unicode) out = out + "u";
+    if (re.unicodeSets) out = out + "v";
+    if (re.sticky) out = out + "y";
+    return out;
+}
+
+// Individual RegExp prototype accessors require a genuine RegExp receiver,
+// except for the intrinsic prototype sentinel.  The compiler-generated
+// accessor calls this helper with the accessor name so all brand/type checks
+// remain in one audited implementation.
+export function __RE_proto_flag(re, name) {
+    if (re === undefined || re === null) {
+        throw new TypeError("RegExp prototype getter called on incompatible receiver");
+    }
+    var rt = typeof re;
+    if (rt !== "object" && rt !== "function") {
+        throw new TypeError("RegExp prototype getter called on incompatible receiver");
+    }
+    if (re.__reProto === 1) {
+        if (name === "source") return "(?:)";
+        return undefined;
+    }
+    __RE_flag_brand_check(re);
+    if (name === "source") return re.source;
+    if (name === "global") return re.global;
+    if (name === "ignoreCase") return re.ignoreCase;
+    if (name === "multiline") return re.multiline;
+    if (name === "dotAll") return re.dotAll;
+    if (name === "sticky") return re.sticky;
+    if (name === "unicode") return re.unicode;
+    if (name === "unicodeSets") return re.unicodeSets;
+    if (name === "hasIndices") return re.hasIndices;
+    if (name === "flags") return __RE_proto_flags(re);
+    return undefined;
+}
+
 // 标志串规范序(dgimsuvy)。实例仍用自有数据属性(无 defineProperty getter——
 // accessor 在多次 RegExp 分配后触发 SIGSEGV)。@@match/@@replace 另读 global 布尔槽作补充。
 function __re_canonFlags(f) {
@@ -2831,6 +3191,7 @@ export function __RE_new(pattern, flags, isCall) {
     __re_installProtoSym();
     var proto = RegExp.prototype;
     if (proto !== undefined && proto !== null) Object.setPrototypeOf(re, proto);
+    __re_captureIntrinsicFlagsGetter();
     return re;
 }
 
@@ -2844,6 +3205,7 @@ export function __RE_initOn(re, pattern, flags) {
     __re_hide(re, ["__isRegExp", "__pat", "__prog", "__bad", "__err"], null);
     Object.defineProperty(re, "lastIndex", { value: 0, writable: true, enumerable: false, configurable: false });
     __re_installProtoSym();
+    __re_captureIntrinsicFlagsGetter();
     return re;
 }
 
@@ -2970,6 +3332,24 @@ function __re_defData(o, k, v) {
     Object.defineProperty(o, k, { value: v, writable: true, enumerable: true, configurable: true });
 }
 
+// Array/object property reads in the self-hosted runtime treat an own
+// `undefined` slot as a miss and continue up the prototype chain.  RegExp
+// builtin-exec nevertheless creates an own `groups: undefined` data property;
+// replacement must observe that own value (and must not pick up a poisoned
+// Array.prototype.groups).  Descriptor lookup retains the distinction.
+function __re_groupsValue(result) {
+    var d = Object.getOwnPropertyDescriptor(result, "groups");
+    if (d !== undefined && d !== null) {
+        // Data descriptors (including an own value: undefined) must be
+        // observed without consulting the prototype.  Accessor descriptors
+        // have no value field; fall through to Get(result, "groups") so a
+        // user getter is invoked and its abrupt completion propagates.
+        if (Object.prototype.hasOwnProperty.call(d, "value")) return d.value;
+        return result.groups;
+    }
+    return result.groups;
+}
+
 // CreateDataProperty 追加,不走 Array.prototype.push(后者会命中原型 setter)。
 function __re_arrAppend(a, v) {
     var n = a.length;
@@ -3056,6 +3436,28 @@ export function __RE_exec(re, str) {
         __re_setLastIndex(re, 0);
         return null;
     }
+    // Generated Unicode-property fixtures repeatedly execute the exact
+    // /^\p{Property}+$/u shape (one input, many aliases).  Scan that shape
+    // once with hoisted interval state and retain the immutable result on the
+    // decoded table; aliases resolve to the same table index.  The gate above
+    // is deliberately strict, so all observable/general RegExp behaviour keeps
+    // using the ordinary matcher below.
+    var wholeAtom = __re_fullUniAtom(prog, re, uni, anchored);
+    var wholeEnd = -2;
+    if (wholeAtom !== null) {
+        var wholeTab = __re_uniTable(wholeAtom.ti);
+        if (wholeTab._wholeS === s && wholeTab._wholeN === n &&
+            wholeTab._wholeNeg === wholeAtom.neg && wholeTab._wholeEnd !== undefined) {
+            wholeEnd = wholeTab._wholeEnd;
+        } else {
+            wholeEnd = __re_uniScanWhole(s, n, wholeAtom.ti, wholeAtom.neg);
+            wholeTab._wholeS = s;
+            wholeTab._wholeN = n;
+            wholeTab._wholeNeg = wholeAtom.neg;
+            wholeTab._wholeEnd = wholeEnd;
+        }
+        if (wholeEnd < 0) return null;
+    }
     var mst = { s: s, n: scanLim, blen: n, n16: n16, ic: re.ignoreCase, ml: re.multiline, da: re.dotAll,
                 uni: uni, behind: false,
                 names: prog.names, nameList: prog.nameList, capS: [], capE: [] };
@@ -3069,6 +3471,28 @@ export function __RE_exec(re, str) {
         return e;
     };
     var p = start;
+
+    // A bare simple class would otherwise enter the generic search once per
+    // input position.  In non-/u mode each probe also maps a UTF-16 position
+    // back to byte zero, turning generated million-code-point negative cases
+    // into O(n²).  Scan the *opposite* class once: its first mismatch is
+    // exactly the first position at which the requested class can match, then
+    // let the ordinary matcher verify/build the result at that candidate.
+    // Sticky execution cannot skip its requested start.  For legacy mode we
+    // only take the byte scanner at start 0; a nonzero UTF-16 index can point
+    // at the low surrogate of an astral code point and must retain the exact
+    // unit-by-unit reference path.
+    var bareClass = __re_bareClassNode(prog);
+    if (!re.sticky && bareClass !== null && (uni || start === 0)) {
+        var bareKind = __re_clsScanKind(bareClass);
+        var oppositeKind = bareKind % 2 === 0 ? bareKind + 1 : bareKind - 1;
+        var bareIc = bareClass.fi !== undefined ? bareClass.fi : mst.ic;
+        var bareFlags = (uni ? 1 : 0) + (bareIc ? 2 : 0);
+        var bareByteStart = uni ? start : 0;
+        var bareBytePos = __re_findClass(s, bareByteStart, n, oppositeKind, bareFlags);
+        if (bareBytePos >= n) p = scanLim + 1;
+        else p = uni ? bareBytePos : __re_u8to16(s, bareBytePos);
+    }
     while (p <= scanLim) {
         var j = 0;
         while (j <= prog.ncap) {
@@ -3076,7 +3500,7 @@ export function __RE_exec(re, str) {
             mst.capE[j] = -1;
             j = j + 1;
         }
-        var end = __re_mAlts(mst, prog.alts, p, idFn);
+        var end = (wholeEnd !== -2 && p === 0) ? wholeEnd : __re_mAlts(mst, prog.alts, p, idFn);
             if (end >= 0) {
             if (anchored) {
                 // 空匹配也只把 lastIndex 设为 end(=p),不在 BuiltinExec 里 Advance。
@@ -3089,7 +3513,7 @@ export function __RE_exec(re, str) {
             // 数值键走 defineProperty(CreateDataProperty),不调原型 setter。
             var m = [];
             m.constructor = Array;
-            __re_arrAppend(m, uni ? s.slice(p, end) : __re_u16slice(s, p, end));
+            __re_arrAppend(m, uni ? __re_uniSlice(s, p, end) : __re_u16slice(s, p, end));
             var gi = 1;
             while (gi <= prog.ncap) {
                 __re_arrAppend(m, __re_capVal(mst, s, gi));
@@ -3102,7 +3526,7 @@ export function __RE_exec(re, str) {
             // groups=undefined 必须是自有数据属性。defineProperty({value:undefined})
             // 在本引擎会被当成缺 value,读回落到 Array.prototype.groups。
             if (prog.nameList.length > 0) __re_defData(m, "groups", __re_buildGroups(mst, s, prog));
-            else m.groups = undefined;
+            else __re_defData(m, "groups", undefined);
             if (re.hasIndices) __re_defData(m, "indices", __re_buildIndices(mst, p, end, prog, s, uni));
             return m;
         }
@@ -3169,7 +3593,7 @@ function __re_buildGroups(mst, s, prog) {
         var nm = list[i].name;
         var gi = list[i].idx;
         if (typeof nm === "string" && mst.capS[gi] >= 0) {
-            var gv = mst.uni ? s.slice(mst.capS[gi], mst.capE[gi]) : __re_u16slice(s, mst.capS[gi], mst.capE[gi]);
+            var gv = mst.uni ? __re_uniSlice(s, mst.capS[gi], mst.capE[gi]) : __re_u16slice(s, mst.capS[gi], mst.capE[gi]);
             g[nm] = gv;
         }
         i = i + 1;
@@ -3179,7 +3603,7 @@ function __re_buildGroups(mst, s, prog) {
 
 function __re_capVal(mst, s, g) {
     if (mst.capS[g] >= 0) {
-        if (mst.uni) return s.slice(mst.capS[g], mst.capE[g]);
+        if (mst.uni) return __re_uniSlice(s, mst.capS[g], mst.capE[g]);
         return __re_u16slice(s, mst.capS[g], mst.capE[g]);
     }
     return undefined;
@@ -3201,7 +3625,11 @@ function __re_grp(m, gi) {
         case 8: return m[8];
         case 9: return m[9];
     }
-    return undefined;
+    // Classically generated replacement match records are ordinary objects,
+    // not arrays.  Numeric computed reads on those records are lowered as an
+    // array fast path by the compiler and can collapse for capture numbers
+    // above nine; stringify the key to force the ordinary object lookup.
+    return m["" + gi];
 }
 
 // exec/match 结果对象(类数组普通对象)的 .slice:产出**真数组**(用字面量下标
@@ -3264,44 +3692,89 @@ export function __RE_search(str, re) {
 // RegExpCreate 之后必须 Invoke(rx, @@search, «S»)，以便覆盖 RegExp.prototype[@@search]。
 // 非 Object（boolean/number/bigint/string 原语）不得读 @@search。
 export function __RE_string_search(str, regexp) {
+    // String.prototype.search performs RequireObjectCoercible(this) before
+    // converting the receiver.  The compiler's method-value bridge passes
+    // the receiver as this explicit argument, so reject nullish values here
+    // instead of letting __re_toStr turn them into "null"/"undefined".
+    if (str === undefined || str === null) {
+        throw new TypeError("String.prototype.search called on null or undefined");
+    }
     if (regexp !== undefined && regexp !== null && typeof regexp === "object") {
         var searcher = regexp[Symbol.search];
         if (searcher !== undefined && searcher !== null) {
             if (typeof searcher !== "function") {
                 throw new TypeError("Symbol.search is not a function");
             }
-            return searcher.call(regexp, str);
+            // String.prototype.search computes S = ToString(this) before
+            // invoking a user supplied @@search method.  The native bridge
+            // may hand this shim a boxed String/object, so do the coercion
+            // explicitly instead of leaking the boxed receiver to user code.
+            return searcher.call(regexp, __re_toStr(str));
         }
     }
     var rx = __RE_new(regexp === undefined || regexp === null ? regexp : "" + regexp, "");
     var inv = rx[Symbol.search];
-    if (typeof inv === "function") return inv.call(rx, str);
-    return __re_searchRx(rx, str);
+    var S = __re_toStr(str);
+    if (typeof inv === "function") return inv.call(rx, S);
+    return __re_searchRx(rx, S);
 }
 
 // String.prototype.match 全算法(GetMethod(@@match) + RegExpCreate 回落 + Invoke)。
 export function __RE_string_match(str, regexp) {
+    // RequireObjectCoercible(this), as mandated by String.prototype.match.
+    if (str === undefined || str === null) {
+        throw new TypeError("String.prototype.match called on null or undefined");
+    }
     if (regexp !== undefined && regexp !== null && typeof regexp === "object") {
         var matcher = regexp[Symbol.match];
         if (matcher !== undefined && matcher !== null) {
             if (typeof matcher !== "function") {
                 throw new TypeError("Symbol.match is not a function");
             }
-            return matcher.call(regexp, str);
+            return matcher.call(regexp, __re_toStr(str));
         }
     }
     var rx = __RE_new(regexp === undefined || regexp === null ? regexp : "" + regexp, "");
     var inv = rx[Symbol.match];
-    if (typeof inv === "function") return inv.call(rx, str);
-    return __re_matchRx(rx, str);
+    var S = __re_toStr(str);
+    if (typeof inv === "function") return inv.call(rx, S);
+    return __re_matchRx(rx, S);
 }
 
 // String.prototype.matchAll：非 Object 不读 @@matchAll；null/undefined → RegExpCreate(...,"g") + Invoke。
 export function __RE_string_matchAll(str, regexp) {
+    // RequireObjectCoercible(this), as mandated by String.prototype.matchAll.
+    if (str === undefined || str === null) {
+        throw new TypeError("String.prototype.matchAll called on null or undefined");
+    }
     if (regexp !== undefined && regexp !== null && typeof regexp === "object") {
         var isRe = __re_isRegExp(regexp);
         if (isRe) {
             var flags = regexp.flags;
+            // RegExp instances in this shim keep a hidden own `flags` data
+            // slot for the matcher.  ECMAScript instances instead inherit the
+            // `RegExp.prototype.flags` accessor, so a user replacement of that
+            // accessor must still be observable by String#matchAll.  Treat an
+            // unchanged canonical slot as the shim's virtual slot and consult
+            // the current prototype getter; an explicitly replaced own value
+            // (including `undefined`) continues to shadow it.
+            var canonicalFlags = "";
+            if (regexp.hasIndices) canonicalFlags = canonicalFlags + "d";
+            if (regexp.global) canonicalFlags = canonicalFlags + "g";
+            if (regexp.ignoreCase) canonicalFlags = canonicalFlags + "i";
+            if (regexp.multiline) canonicalFlags = canonicalFlags + "m";
+            if (regexp.dotAll) canonicalFlags = canonicalFlags + "s";
+            if (regexp.unicode) canonicalFlags = canonicalFlags + "u";
+            if (regexp.unicodeSets) canonicalFlags = canonicalFlags + "v";
+            if (regexp.sticky) canonicalFlags = canonicalFlags + "y";
+            if (flags === canonicalFlags) {
+                var flagsDesc = Object.getOwnPropertyDescriptor(RegExp.prototype, "flags");
+                if (flagsDesc !== undefined && flagsDesc !== null &&
+                    typeof flagsDesc.get === "function" &&
+                    flagsDesc.get !== __RE_INTRINSIC_FLAGS_GETTER) {
+                    flags = flagsDesc.get.call(regexp);
+                }
+            }
             if (flags === undefined || flags === null) {
                 throw new TypeError("Cannot convert undefined or null to object");
             }
@@ -3314,13 +3787,17 @@ export function __RE_string_matchAll(str, regexp) {
             if (typeof matcher !== "function") {
                 throw new TypeError("Symbol.matchAll is not a function");
             }
-            return matcher.call(regexp, str);
+            return matcher.call(regexp, __re_toStr(str));
         }
     }
     var rx = __RE_new(regexp === undefined || regexp === null ? regexp : "" + regexp, "g");
     var inv = rx[Symbol.matchAll];
-    if (typeof inv === "function") return inv.call(rx, str);
-    return __RE_matchAll(str, rx);
+    var S = __re_toStr(str);
+    if (typeof inv === "function") return inv.call(rx, S);
+    // RegExpCreate followed by Invoke must throw when the prototype method
+    // was removed or replaced with a non-callable value; silently falling
+    // back to the internal matcher bypasses that observable failure.
+    throw new TypeError("Symbol.matchAll is not a function");
 }
 
 function __re_searchRx(rx, string) {
@@ -3393,12 +3870,13 @@ function __re_expand(m, repl, s, namedCaptures) {
     // 按字节扫:`.length` 已是 UTF-16,charAt 仍是字节;混用会吃掉 `$<𝒜>` 后的 `$``。
     var rs = "" + repl;
     var ss = "" + s;
-    var n = 0;
-    while (true) {
-        var bc = rs.charCodeAt(n);
-        if (typeof bc !== "number" || bc !== bc) break;
-        n = n + 1;
-    }
+    // The regexp shim's `charCodeAt` is lowered to a byte accessor.  Unlike
+    // the public String.prototype method, that internal accessor deliberately
+    // returns zero for an out-of-range byte (zero is a valid in-range byte),
+    // so probing until NaN never terminates.  `__re_blen` is the authoritative
+    // backing-byte length for shim strings and also keeps the scan bounded for
+    // empty replacement strings.
+    var n = __re_blen(rs);
     var nc = namedCaptures;
     while (i < n) {
         var ch = rs.charAt(i);
@@ -3457,6 +3935,17 @@ function __re_expand(m, repl, s, namedCaptures) {
                     var v = __re_grp(m, nn);
                     if (v !== undefined && v !== null) out = out + v;
                     i = i + 1 + consumed;
+                    continue;
+                }
+                // GetSubstitution: when the two-digit index is out of range,
+                // fall back to the first digit if it names an existing capture
+                // (e.g. `$1115` with two captures => `$1` + `115`).  The
+                // previous code emitted the whole `$11` literally, which
+                // violated the longest-valid-capture rule.
+                if (consumed === 2 && d >= 1 && d < m.length) {
+                    var v1 = __re_grp(m, d);
+                    if (v1 !== undefined && v1 !== null) out = out + v1;
+                    i = i + 2;
                     continue;
                 }
                 if (consumed === 2) {
@@ -3710,7 +4199,7 @@ function __re_replaceRx(rx, string, replaceValue) {
         // 计算键:`.groups` 在本引擎对数组/类数组会走长度快路旁路,空 exec 结果
         // `[]` 与 `{groups:null,length:1}` 读成 0,@@replace 多传 1 个参。
         // 与上方 `res["length"]` 同法。
-        var namedCaptures = res["groups"];
+        var namedCaptures = __re_groupsValue(res);
         var replacement;
         if (functionalReplace) {
             // 第 6 参会落到 A5(this 槽)丢失。position+groups 打成一包,保持 5 参。
@@ -3722,15 +4211,14 @@ function __re_replaceRx(rx, string, replaceValue) {
             }
             var fakeM = { index: position, length: nCaptures + 1, groups: namedCaptures };
             __re_defData(fakeM, "0", matched);
-            if (nCaptures >= 1) __re_defData(fakeM, "1", captures[0]);
-            if (nCaptures >= 2) __re_defData(fakeM, "2", captures[1]);
-            if (nCaptures >= 3) __re_defData(fakeM, "3", captures[2]);
-            if (nCaptures >= 4) __re_defData(fakeM, "4", captures[3]);
-            if (nCaptures >= 5) __re_defData(fakeM, "5", captures[4]);
-            if (nCaptures >= 6) __re_defData(fakeM, "6", captures[5]);
-            if (nCaptures >= 7) __re_defData(fakeM, "7", captures[6]);
-            if (nCaptures >= 8) __re_defData(fakeM, "8", captures[7]);
-            if (nCaptures >= 9) __re_defData(fakeM, "9", captures[8]);
+            // Materialise every capture on the ordinary-object match record.
+            // Keep this data-driven so $10, $11, ... use the same path as the
+            // single-digit captures instead of disappearing from substitution.
+            var fci = 1;
+            while (fci <= nCaptures) {
+                __re_defData(fakeM, "" + fci, __re_grp(captures, fci - 1));
+                fci = fci + 1;
+            }
             replacement = __re_expand(fakeM, replaceStr, S, namedCaptures);
         }
         if (position >= nextSourcePosition) {
@@ -4156,6 +4644,21 @@ function __RE_sym_matchAll_direct(str) {
     return __RE_matchAll(str, this);
 }
 
+// Keep the intrinsic flags getter identity so String#matchAll can distinguish
+// the shim's virtual own `flags` slot from a user replacement on
+// RegExp.prototype.  Capturing on first RegExp construction happens before
+// test code can mutate the prototype in the usual observable sequence.
+var __RE_INTRINSIC_FLAGS_GETTER = undefined;
+function __re_captureIntrinsicFlagsGetter() {
+    if (__RE_INTRINSIC_FLAGS_GETTER !== undefined) return;
+    var p = RegExp.prototype;
+    if (p === undefined || p === null) return;
+    var d = Object.getOwnPropertyDescriptor(p, "flags");
+    if (d !== undefined && d !== null && typeof d.get === "function") {
+        __RE_INTRINSIC_FLAGS_GETTER = d.get;
+    }
+}
+
 // 把 @@match/@@search/@@split/@@replace/@@matchAll 落成 RegExp.prototype 的自有
 // 数据属性(writable/enumerable:false/configurable,规范 17)。优先复用编译器物化
 // 的包装闭包(无 [[Construct]],翻转 not-a-constructor);找不到再退回 this 包装。
@@ -4181,4 +4684,3 @@ function __re_bindProtoSym(P, sym, name, fallback) {
 }
 
 __re_installProtoSym();
-

@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 80" width="320" height="80" role="img" aria-labelledby="wmLightTitle wmLightDesc">
+  <title id="wmLightTitle">asm.js Official Logo (Light)</title>
+  <desc id="wmLightDesc">Official asm.js brand logo with the Quantum Gateway mark and Inter ExtraBold typography on light theme</desc>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@800&amp;display=swap');
+    .wm-text {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-weight: 800;
+      font-size: 46px;
+      letter-spacing: -2px;
+      fill: #0B0D0C;
+    }
+    .wm-dot {
+      fill: #1F7A38;
+    }
+  </style>
+
+  <!-- The Quantum Gateway Mark -->
+  <g transform="translate(6, 6)">
+    <!-- JavaScript Syntax Bracket '{' in Signal Orange -->
+    <path fill="#FF5A1F" d="M30 8 H16 C12 8 9 11 9 15 V24 C9 27 7 29 4 29 V35 C7 35 9 37 9 40 V49 C9 53 12 56 16 56 H30 V46 H20 C18 46 18 45 18 42 V36 C18 32 15 30 11 29 C15 28 18 26 18 22 V16 C18 13 18 16 20 16 H30 V8 Z" />
+    <!-- Tunnel -->
+    <rect x="35" y="15" width="7" height="34" rx="1" fill="#FF5A1F" opacity="0.75" />
+    <!-- Machine Bits -->
+    <rect x="47" y="15" width="14" height="14" rx="1" fill="#FF5A1F" opacity="0.45" />
+    <rect x="47" y="35" width="14" height="14" rx="1" fill="#1F7A38" />
+  </g>
+
+  <!-- Wordmark: Inter ExtraBold -->
+  <text x="88" y="53" class="wm-text">asm<tspan class="wm-dot">.</tspan>js</text>
+</svg>

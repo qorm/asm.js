@@ -1,0 +1,10 @@
+{
+  "description": "String.prototype.normalize validates and coerces its optional form argument before normalization.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "forms abc abc abc abc abc\ninvalid RangeError\nsymbol TypeError\nobject Error\nextracted RangeError",
+    "exitCode": 0
+  }
+}

@@ -291,6 +291,11 @@ export const AsyncCompiler = {
         vm.store(VReg.V1, 0, VReg.V2); // 清 pending(消费一次)
         vm.lea(VReg.V1, "_gen_return_value");
         vm.load(VReg.RET, VReg.V1, 0); // RET = 注入返回值
+        // A synchronous generator may be suspended inside a narrow
+        // destructuring AssignmentElement helper.  Close that helper's live
+        // iterator before running ordinary finally blocks when gen.return()
+        // is injected at the yield point.
+        if (this.emitPendingYieldIteratorCloses) this.emitPendingYieldIteratorCloses();
         this.emitPendingFinalizers(0, true);
         if (this.ctx.returnLabel) {
             vm.jmp(this.ctx.returnLabel);
@@ -304,8 +309,8 @@ export const AsyncCompiler = {
     // [收尾] yield* 委托:对可迭代对象取迭代器,逐值 yield 直到 done,表达式值 = 被委托者
     //  return 值(done 时 result.value)。生成器套生成器经协程 resumer 链(coroutine.js)嵌套。
     //  数组快路(tag 0x7ffe)按下标遍历,表达式值 = undefined(同 node)。
-    //  通用路:obj[Symbol.iterator]().next() 循环(生成器自迭代;普通迭代器对象命中)。
-    //  偏差:next(v) 恒以 undefined 调用(不转发外层 next 传入值)。
+    //  通用路:GetIterator 后缓存 [[NextMethod]],逐轮转发 next(v);外层 return/throw
+    //  按 GeneratorYield 委托算法转发给内层同名方法,并保留原始 IteratorResult。
     //  [async generator] async gen 体内 yield* 走异步迭代协议(Symbol.asyncIterator 优先,
     //  缺失则回退同步迭代器,复用 for-await-of 的脱糖风格),每轮 next() 结果 await 化。
     compileYieldStar(expr) {
@@ -317,7 +322,13 @@ export const AsyncCompiler = {
 
         const iterableTemp = this.ctx.allocLocal(`__ys_iterable_${this.nextLabelId()}`);
         const iteratorTemp = this.ctx.allocLocal(`__ys_iterator_${this.nextLabelId()}`);
+        const nextTemp = this.ctx.allocLocal(`__ys_next_${this.nextLabelId()}`);
         const resultTemp = this.ctx.allocLocal(`__ys_result_${this.nextLabelId()}`);
+        const recvName = `__ys_recv_${this.nextLabelId()}`;
+        const recvTemp = this.ctx.allocLocal(recvName);
+        const injectedName = `__ys_injected_${this.nextLabelId()}`;
+        const injectedTemp = this.ctx.allocLocal(injectedName);
+        const methodTemp = this.ctx.allocLocal(`__ys_method_${this.nextLabelId()}`);
         const arrTemp = this.ctx.allocLocal(`__ys_arr_${this.nextLabelId()}`);
         const idxTemp = this.ctx.allocLocal(`__ys_idx_${this.nextLabelId()}`);
 
@@ -326,7 +337,65 @@ export const AsyncCompiler = {
         const undefLabel = this.ctx.newLabel("ystar_undef");
         const iterLoopLabel = this.ctx.newLabel("ystar_iterloop");
         const iterDoneLabel = this.ctx.newLabel("ystar_iterdone");
+        const rawSuspendLabel = this.ctx.newLabel("ystar_raw_suspend");
+        const returnDelegateLabel = this.ctx.newLabel("ystar_return_delegate");
+        const throwDelegateLabel = this.ctx.newLabel("ystar_throw_delegate");
+        const outerReturnLabel = this.ctx.newLabel("ystar_outer_return");
         const endLabel = this.ctx.newLabel("ystar_end");
+
+        const emitResultObjectGuard = (prefix) => {
+            const ok = this.ctx.newLabel(prefix + "_obj_ok");
+            const bad = this.ctx.newLabel(prefix + "_obj_bad");
+            vm.load(VReg.RET, VReg.FP, resultTemp);
+            vm.shrImm(VReg.V1, VReg.RET, 48);
+            vm.cmpImm(VReg.V1, 0x7FFD); vm.jeq(ok);
+            vm.cmpImm(VReg.V1, 0x7FFE); vm.jeq(ok);
+            vm.cmpImm(VReg.V1, 0x7FFF); vm.jeq(ok);
+            vm.cmpImm(VReg.V1, 0); vm.jne(bad);
+            vm.cmpImm(VReg.RET, 0); vm.jeq(bad);
+            vm.movImm64(VReg.V2, vm.ptrFloor);
+            vm.cmp(VReg.RET, VReg.V2); vm.jge(ok);
+            vm.label(bad);
+            this.emitThrowTypeError("Iterator result is not an object");
+            vm.label(ok);
+        };
+        const emitGetNamedMethod = (name) => {
+            vm.load(VReg.A0, VReg.FP, iteratorTemp);
+            this.emitBoxedStringKey(name, VReg.A1);
+            vm.call("_object_get");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.load(VReg.A1, VReg.FP, iteratorTemp);
+            vm.call("_maybe_getter");
+            vm.store(VReg.FP, methodTemp, VReg.RET);
+        };
+        const emitJumpIfMethodMissing = (missingLabel) => {
+            vm.load(VReg.RET, VReg.FP, methodTemp);
+            vm.cmpImm(VReg.RET, 0); vm.jeq(missingLabel);
+            vm.shrImm(VReg.V1, VReg.RET, 48);
+            vm.cmpImm(VReg.V1, 0x7FFB); vm.jeq(missingLabel);
+            vm.cmpImm(VReg.V1, 0x7FFA); vm.jeq(missingLabel);
+        };
+        const emitResultDoneBranch = (doneLabel, notDoneLabel) => {
+            vm.load(VReg.A0, VReg.FP, resultTemp);
+            this.emitBoxedStringKey("done", VReg.A1);
+            vm.call("_object_get");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.load(VReg.A1, VReg.FP, resultTemp);
+            vm.call("_maybe_getter");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.call("_to_boolean");
+            vm.cmpImm(VReg.RET, 0);
+            vm.jne(doneLabel);
+            vm.jmp(notDoneLabel);
+        };
+        const emitResultValue = () => {
+            vm.load(VReg.A0, VReg.FP, resultTemp);
+            this.emitBoxedStringKey("value", VReg.A1);
+            vm.call("_object_get");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.load(VReg.A1, VReg.FP, resultTemp);
+            vm.call("_maybe_getter");
+        };
 
         this.compileExpression(expr.argument);
         vm.store(VReg.FP, iterableTemp, VReg.RET);
@@ -367,8 +436,7 @@ export const AsyncCompiler = {
         // compileMethodCall 崩 SIGBUS;数组耗尽仍走下方 undefLabel 返 undefined)。
         const notIterableLabel = this.ctx.newLabel("ystar_not_iterable");
         vm.load(VReg.A0, VReg.FP, iterableTemp);
-        this.emitBoxedStringKey("Symbol.iterator", VReg.A1);
-        vm.call("_object_get");
+        vm.call("_get_method_iterator");
         vm.mov(VReg.V6, VReg.RET);
         vm.shrImm(VReg.V0, VReg.RET, 48);
         vm.cmpImm(VReg.V0, 0x7ffb); // undefined
@@ -380,39 +448,162 @@ export const AsyncCompiler = {
         vm.load(VReg.V5, VReg.FP, iterableTemp);
         this.compileMethodCall(VReg.V6, VReg.V5, []);
         vm.store(VReg.FP, iteratorTemp, VReg.RET);
+        // GetIterator requires the method result to be an Object.
+        {
+            const iterObjOk = this.ctx.newLabel("ystar_iter_obj");
+            const iterObjBad = this.ctx.newLabel("ystar_iter_bad");
+            vm.shrImm(VReg.V1, VReg.RET, 48);
+            vm.cmpImm(VReg.V1, 0x7FFD); vm.jeq(iterObjOk);
+            vm.cmpImm(VReg.V1, 0x7FFE); vm.jeq(iterObjOk);
+            vm.cmpImm(VReg.V1, 0x7FFF); vm.jeq(iterObjOk);
+            vm.cmpImm(VReg.V1, 0); vm.jne(iterObjBad);
+            vm.cmpImm(VReg.RET, 0); vm.jeq(iterObjBad);
+            vm.movImm64(VReg.V2, vm.ptrFloor);
+            vm.cmp(VReg.RET, VReg.V2); vm.jge(iterObjOk);
+            vm.label(iterObjBad);
+            this.emitThrowTypeError("Result of iterator method is not an object");
+            vm.label(iterObjOk);
+        }
 
-        vm.label(iterLoopLabel);
-        // it.next()
+        // GetV(iterator,"next") exactly once and preserve the resulting
+        // method as the iterator record's [[NextMethod]].  Accessor errors are
+        // observable at GetIterator time; repeatedly reading .next per step is
+        // both semantically wrong and breaks stateful getters.
         vm.load(VReg.A0, VReg.FP, iteratorTemp);
         this.emitBoxedStringKey("next", VReg.A1);
         vm.call("_object_get");
-        vm.cmpImm(VReg.RET, 0);
-        vm.jeq(undefLabel);
+        vm.mov(VReg.A0, VReg.RET);
+        vm.load(VReg.A1, VReg.FP, iteratorTemp);
+        vm.call("_maybe_getter");
+        vm.store(VReg.FP, nextTemp, VReg.RET);
+        vm.movImm64(VReg.V0, 0x7ffb000000000000n);
+        vm.store(VReg.FP, recvTemp, VReg.V0); // initial received.[[Value]] = undefined
+
+        vm.label(iterLoopLabel);
+        // Call the cached [[NextMethod]].
+        vm.load(VReg.RET, VReg.FP, nextTemp);
         vm.mov(VReg.V6, VReg.RET);
         vm.load(VReg.V5, VReg.FP, iteratorTemp);
-        this.compileMethodCall(VReg.V6, VReg.V5, []);
+        this.compileMethodCall(VReg.V6, VReg.V5,
+            [{ type: "Identifier", name: recvName }]);
         vm.store(VReg.FP, resultTemp, VReg.RET);
-        // done?
-        vm.load(VReg.A0, VReg.FP, resultTemp);
-        this.emitBoxedStringKey("done", VReg.A1);
-        vm.call("_object_get");
-        vm.mov(VReg.A0, VReg.RET);
-        vm.call("_to_boolean");
-        vm.cmpImm(VReg.RET, 0);
-        vm.jne(iterDoneLabel);
-        // yield result.value
-        vm.load(VReg.A0, VReg.FP, resultTemp);
-        this.emitBoxedStringKey("value", VReg.A1);
-        vm.call("_object_get"); // RET = value
-        this.emitYieldValue();
-        vm.jmp(iterLoopLabel);
+        // IteratorNext requires an Object result before `done`/`value` Get.
+        {
+            const resObjOk = this.ctx.newLabel("ystar_res_obj");
+            const resObjBad = this.ctx.newLabel("ystar_res_bad");
+            vm.shrImm(VReg.V1, VReg.RET, 48);
+            vm.cmpImm(VReg.V1, 0x7FFD); vm.jeq(resObjOk);
+            vm.cmpImm(VReg.V1, 0x7FFE); vm.jeq(resObjOk);
+            vm.cmpImm(VReg.V1, 0x7FFF); vm.jeq(resObjOk);
+            vm.cmpImm(VReg.V1, 0); vm.jne(resObjBad);
+            vm.cmpImm(VReg.RET, 0); vm.jeq(resObjBad);
+            vm.movImm64(VReg.V2, vm.ptrFloor);
+            vm.cmp(VReg.RET, VReg.V2); vm.jge(resObjOk);
+            vm.label(resObjBad);
+            this.emitThrowTypeError("Iterator result is not an object");
+            vm.label(resObjOk);
+        }
+        emitResultDoneBranch(iterDoneLabel, rawSuspendLabel);
 
         vm.label(iterDoneLabel);
         // 表达式值 = result.value(被委托者 return 值)
-        vm.load(VReg.A0, VReg.FP, resultTemp);
-        this.emitBoxedStringKey("value", VReg.A1);
-        vm.call("_object_get");
+        emitResultValue();
         vm.jmp(endLabel);
+
+        // Suspend with the delegated IteratorResult itself.  Unlike ordinary
+        // yield, resume mode is handled here so return/throw can be forwarded
+        // to the inner iterator instead of immediately completing/throwing in
+        // the outer generator.
+        vm.label(rawSuspendLabel);
+        vm.load(VReg.RET, VReg.FP, resultTemp);
+        vm.lea(VReg.V1, "_gen_raw_yield");
+        vm.movImm(VReg.V2, 1);
+        vm.store(VReg.V1, 0, VReg.V2);
+        vm.lea(VReg.V1, "_scheduler_current");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.store(VReg.V1, 72, VReg.RET);
+        vm.call("_coroutine_yield");
+        // throw(e) takes precedence over return pending (the runtime sets only
+        // one mode for each resume).
+        vm.lea(VReg.V1, "_exception_pending");
+        vm.load(VReg.V2, VReg.V1, 0);
+        vm.cmpImm(VReg.V2, 0);
+        vm.jne(throwDelegateLabel);
+        vm.lea(VReg.V1, "_gen_return_pending");
+        vm.load(VReg.V2, VReg.V1, 0);
+        vm.cmpImm(VReg.V2, 0);
+        vm.jne(returnDelegateLabel);
+        vm.store(VReg.FP, recvTemp, VReg.RET);
+        vm.jmp(iterLoopLabel);
+
+        // received is a return completion: GetMethod(iterator,"return"),
+        // forward the injected value, and either raw-yield an unfinished
+        // result or complete the outer generator with the returned value.
+        vm.label(returnDelegateLabel);
+        vm.lea(VReg.V1, "_gen_return_value");
+        vm.load(VReg.V2, VReg.V1, 0);
+        vm.store(VReg.FP, injectedTemp, VReg.V2);
+        vm.lea(VReg.V1, "_gen_return_pending");
+        vm.movImm(VReg.V2, 0);
+        vm.store(VReg.V1, 0, VReg.V2);
+        emitGetNamedMethod("return");
+        emitJumpIfMethodMissing(outerReturnLabel);
+        vm.load(VReg.V6, VReg.FP, methodTemp);
+        vm.load(VReg.V5, VReg.FP, iteratorTemp);
+        this.compileMethodCall(VReg.V6, VReg.V5,
+            [{ type: "Identifier", name: injectedName }]);
+        vm.store(VReg.FP, resultTemp, VReg.RET);
+        emitResultObjectGuard("ystar_return");
+        {
+            const retDone = this.ctx.newLabel("ystar_return_done");
+            emitResultDoneBranch(retDone, rawSuspendLabel);
+            vm.label(retDone);
+            emitResultValue();
+            vm.store(VReg.FP, injectedTemp, VReg.RET);
+        }
+        vm.label(outerReturnLabel);
+        vm.load(VReg.RET, VReg.FP, injectedTemp);
+        this.emitPendingFinalizers(0, true);
+        if (this.ctx.returnLabel) vm.jmp(this.ctx.returnLabel);
+        else this.emitUnhandledExceptionExit();
+
+        // received is a throw completion.  Forward to iterator.throw when it
+        // exists.  If absent, IteratorClose via return() precedes the required
+        // TypeError.  A handled {done:true} result completes yield* normally.
+        vm.label(throwDelegateLabel);
+        vm.lea(VReg.V1, "_exception_value");
+        vm.load(VReg.V2, VReg.V1, 0);
+        vm.store(VReg.FP, injectedTemp, VReg.V2);
+        vm.lea(VReg.V1, "_exception_pending");
+        vm.movImm(VReg.V2, 0);
+        vm.store(VReg.V1, 0, VReg.V2);
+        const throwMissing = this.ctx.newLabel("ystar_throw_missing");
+        emitGetNamedMethod("throw");
+        emitJumpIfMethodMissing(throwMissing);
+        vm.load(VReg.V6, VReg.FP, methodTemp);
+        vm.load(VReg.V5, VReg.FP, iteratorTemp);
+        this.compileMethodCall(VReg.V6, VReg.V5,
+            [{ type: "Identifier", name: injectedName }]);
+        vm.store(VReg.FP, resultTemp, VReg.RET);
+        emitResultObjectGuard("ystar_throw");
+        {
+            const throwDone = this.ctx.newLabel("ystar_throw_done");
+            emitResultDoneBranch(throwDone, rawSuspendLabel);
+            vm.label(throwDone);
+            emitResultValue();
+            vm.jmp(endLabel);
+        }
+        vm.label(throwMissing);
+        const noClose = this.ctx.newLabel("ystar_throw_no_close");
+        emitGetNamedMethod("return");
+        emitJumpIfMethodMissing(noClose);
+        vm.load(VReg.V6, VReg.FP, methodTemp);
+        vm.load(VReg.V5, VReg.FP, iteratorTemp);
+        this.compileMethodCall(VReg.V6, VReg.V5, []);
+        vm.store(VReg.FP, resultTemp, VReg.RET);
+        emitResultObjectGuard("ystar_throw_close");
+        vm.label(noClose);
+        this.emitThrowTypeError("The iterator does not provide a 'throw' method");
 
         vm.label(undefLabel);
         vm.movImm64(VReg.RET, 0x7ffb000000000000n); // was lea+load _js const
@@ -986,7 +1177,7 @@ export const AsyncCompiler = {
             vm.call("_js_box_function");
             vm.lea(VReg.V1, slotLabel);
             vm.store(VReg.V1, 0, VReg.RET);
-            if (this.emitFnOwnPrototype) this.emitFnOwnPrototype();
+            if (this.emitFnOwnPrototype) this.emitFnOwnPrototype(ctorFn === "_async_generator_new");
             vm.label(haveFnL);
             vm.mov(VReg.A1, VReg.RET);
         } else {
@@ -2199,7 +2390,7 @@ export const AsyncCompiler = {
         vm.store(VReg.V0, 0, VReg.V1);     // 清 pending(已作为拒因交给 Promise)
         vm.label(skip);
         vm.movImm(VReg.RET, 0);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 8192);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], this.ctx._fnFrameSize || 16384);
     },
 
     // async 函数返回（RET 已经是返回值）
@@ -2238,7 +2429,7 @@ export const AsyncCompiler = {
         vm.label(noPromiseLabel);
         // 恢复返回值，然后正常 epilogue
         vm.pop(VReg.RET);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 8192);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], this.ctx._fnFrameSize || 16384);
     },
 
     // 生成调度器初始化调用

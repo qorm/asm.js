@@ -1,0 +1,10 @@
+{
+  "description": "Floating-point remainder preserves the dividend sign for zero results on ARM64",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "Infinity Infinity -Infinity -Infinity\n1 -1 1 -1",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200" role="img" aria-labelledby="stDarkTitle stDarkDesc">
+  <title id="stDarkTitle">asm.js Stacked Logo (Dark)</title>
+  <desc id="stDarkDesc">asm.js stacked combination mark with the Quantum Gateway and Inter ExtraBold typography</desc>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@800&amp;display=swap');
+    .wm-text-stacked {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-weight: 800;
+      font-size: 38px;
+      letter-spacing: -1.5px;
+      fill: #F1EEE4;
+      text-anchor: middle;
+    }
+    .wm-dot-stacked {
+      fill: #B7F34A;
+    }
+  </style>
+  <defs>
+    <filter id="fixedGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="0" stdDeviation="2" flood-color="#B7F34A" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <!-- Centered Quantum Gateway Mark at Top -->
+  <g transform="translate(64, 25)">
+    <path fill="#FF5A1F" d="M34 8 H18 C13 8 10 11 10 16 V28 C10 32 8 34 4 34 V42 C8 42 10 44 10 48 V60 C10 65 13 68 18 68 H34 V56 H22 C20 56 20 54 20 50 V43 C20 38 16 36 12 35 C16 34 20 32 20 27 V20 C20 16 20 20 22 20 H34 V8 Z" />
+    <rect x="40" y="18" width="8" height="40" rx="1" fill="#FF5A1F" opacity="0.65" />
+    <rect x="54" y="18" width="16" height="16" rx="1" fill="#FF5A1F" opacity="0.4" />
+    <rect x="54" y="42" width="16" height="16" rx="1" fill="#B7F34A" filter="url(#fixedGlow)" />
+  </g>
+
+  <!-- Wordmark centered below -->
+  <text x="100" y="160" class="wm-text-stacked">asm<tspan class="wm-dot-stacked">.</tspan>js</text>
+</svg>

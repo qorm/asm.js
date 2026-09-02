@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 80" width="320" height="80" role="img" aria-labelledby="ltDarkTitle ltDarkDesc">
+  <title id="ltDarkTitle">asm.js Standalone Logotype (Dark)</title>
+  <desc id="ltDarkDesc">Standalone precision vector wordmark with open, spacious typography</desc>
+  <g class="logotype" fill="#F1EEE4" transform="translate(-110, -14)">
+    <!-- 'a' -->
+    <path d="M168 40 H159 V46 C155 41 148 38 141 38 C128 38 119 47 119 58 C119 69 128 78 141 78 C148 78 155 75 159 70 V78 H168 V40 Z M143 70 C133 70 128 65 128 58 C128 51 133 46 143 46 C153 46 159 51 159 58 C159 65 153 70 143 70 Z" />
+
+    <!-- 's' -->
+    <path d="M224 49 L216 50 C215 44 210 42 205 42 C198 42 194 45 194 49 C194 53 198 55 206 57 C218 59 226 63 226 70 C226 77 217 82 205 82 C192 82 184 76 183 67 L192 66 C193 72 198 74 205 74 C212 74 217 71 217 67 C217 63 213 61 204 59 C192 56 184 52 184 45 C184 38 193 34 205 34 C216 34 223 39 224 49 Z" />
+
+    <!-- 'm' -->
+    <path d="M242 40 H251 V47 C254 41 261 38 268 38 C275 38 280 42 282 47 C286 41 293 38 300 38 C310 38 316 44 316 55 V78 H307 V56 C307 48 303 45 297 45 C291 45 287 49 287 56 V78 H278 V56 C278 48 274 45 268 45 C262 45 258 49 258 56 V78 H249 V40 H242 Z" />
+
+    <!-- '.' Fixed Point Dot (Proof Green) -->
+    <rect x="320" y="66" width="12" height="12" fill="#B7F34A" />
+
+    <!-- 'j' -->
+    <rect x="352" y="22" width="9" height="9" fill="#F1EEE4" />
+    <path d="M352 40 H361 V73 C361 82 355 87 345 87 H338 V79 H344 C349 79 352 77 352 73 V40 Z" />
+
+    <!-- 's' -->
+    <path d="M416 49 L408 50 C407 44 402 42 397 42 C390 42 386 45 386 49 C386 53 390 55 398 57 C410 59 418 63 418 70 C418 77 409 82 397 82 C384 82 376 76 375 67 L384 66 C385 72 390 74 397 74 C404 74 409 71 409 67 C409 63 405 61 396 59 C384 56 376 52 376 45 C376 38 385 34 397 34 C408 34 415 39 416 49 Z" />
+  </g>
+</svg>

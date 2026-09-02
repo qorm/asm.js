@@ -76,6 +76,10 @@ const DP_HAS_ENUMERABLE = 4;
 const DP_HAS_CONFIGURABLE = 8;
 const DP_HAS_GET = 16;
 const DP_HAS_SET = 32;
+// Internal packed-descriptor bit: Reflect.defineProperty requests a boolean
+// result on ordinary validation failure, while Object.defineProperty throws.
+// It is outside the six descriptor-field bits and never reaches attributes.
+const DP_REFLECT_MODE = 64;
 
 // [#61 P1] 属性描述符 Phase 1 —— 对象级 extensible/sealed/frozen 三位。
 // 存 type 字的 byte1(obj+1),语义取反(0=默认可扩展)。
@@ -129,6 +133,7 @@ export class ObjectGenerator {
         this.generateAccessorDefine();
         this.generatePrivateBrandCheck();
         this.generateObjectSet();
+        this.generateReflectSetReceiver();
         this.generateJsPropKey();
         this.generateObjectKeyEq();
         this.generateObjectHas();
@@ -140,7 +145,12 @@ export class ObjectGenerator {
         this.generateObjectGetOwnPropertyNames();
         this.generateObjectGopnClassinfoOrder();
         this.generateObjectGetOwnPropertySymbols();
-                this.generateObjectProtoToString();
+        this.generateObjectAllOwnKeys();
+        this.generateObjectGetOwnPropertyDescriptors();
+        this.generateIndexedIteratorProtos();
+        this.generateFunctionKindTagProtos();
+        this.generateObjectGetToStringTag();
+        this.generateObjectProtoToString();
         this.generateObjectProtoToLocaleString();
         this.generateSetIteratorStub(); // Set[@@iterator] 桩 + Iterator 原型 tag 链
         this.generateObjectValues();
@@ -158,6 +168,7 @@ export class ObjectGenerator {
         this.generateIsPrototypeOf();
         this.generateSetPrototypeOf();
         this.generateProtoAccessor(); // [__proto__] getter/setter on Object.prototype
+        this.generateObjectSetIntegrityLevel();
         this.generateObjectFreeze();
         this.generateObjectSeal();
         this.generateObjectPreventExtensions();
@@ -179,6 +190,7 @@ export class ObjectGenerator {
         this.generateObjectDefineProperty();
         this.generateObjectDefinePropertyDyn();
         this.generateArraySideElementHelpers(); // [W7b] 数组索引侧表 get/set(writable/accessor)
+        this.generateArrayTrimSparseSide();
         this.generateCanonicalArrayIndex();
         this.generateObjectNormalizeOrder();
         this.generateObjectApplyClearAttrs();
@@ -187,6 +199,7 @@ export class ObjectGenerator {
         this.generateGroupbyInvoke2();
         this.generateObjectGroupBy();
         this.generateClosurePropsHelpers();
+        this.generateClosurePropGetRaw();
         this.generateShapeTransitions(); // [shape v2 · T0] 转移节点/转移表(惰性,无调用方)
         // [Annex B] Object.prototype.__defineGetter__/__defineSetter__/__lookupGetter__/__lookupSetter__
         // 独立新 label,放 generate() 末尾,避开与 getPrototypeOf 刀的中段冲突。
@@ -510,6 +523,38 @@ export class ObjectGenerator {
     // 对象与其属性常驻),节点 24B {fn 裸指针键@0, props 对象裸指针@8, next@16}。非移动
     // mark-sweep GC → 裸指针键稳定。语义偏差:得过自定义属性的函数被侧表钉住不回收(有界泄漏,
     // 仅限用过 fn.x 的函数;库常在具名函数上挂属性,量小可接受)。
+    // _closure_prop_get_raw(A0=fn, A1=key) -> raw own side-table value.
+    // Unlike _closure_prop_get, this helper never invokes TYPE_GETTER.  The
+    // ordinary object Get path needs the marker so its caller can invoke the
+    // accessor with the original receiver (important for inherited static
+    // accessors such as MyRegExp[Symbol.species]).
+    generateClosurePropGetRaw() {
+        const vm = this.vm;
+        vm.label("_closure_prop_get_raw");
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.mov(VReg.S0, VReg.A0); // fn
+        vm.mov(VReg.S1, VReg.A1); // key
+        vm.call("_closure_props_find");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_cpgr_miss");
+        vm.mov(VReg.S2, VReg.RET); // boxed props
+        vm.mov(VReg.A0, VReg.S2);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_cpgr_miss");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_get"); // raw value/TYPE_GETTER marker
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
+        vm.label("_cpgr_miss");
+        vm.lea(VReg.RET, "_js_undefined");
+        vm.load(VReg.RET, VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
+    }
+
     generateClosurePropsHelpers() {
         const vm = this.vm;
         const MASK = 0x0000ffffffffffffn;
@@ -762,6 +807,21 @@ export class ObjectGenerator {
         vm.load(VReg.RET, VReg.V0, 0);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
         vm.label("_cpg_lazy_proto_mk");
+        // Async functions are non-constructors and have no own "prototype".
+        // They share the ordinary compact closure layout, so metadata is the
+        // authoritative discriminator before generic lazy creation.
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.V0, VReg.S1, VReg.V1);
+        vm.load(VReg.V2, VReg.V0, 0);
+        vm.cmpImm(VReg.V2, 0xc105); vm.jeq("_cpg_lazy_proto_meta_closure");
+        vm.cmpImm(VReg.V2, 0xa51c); vm.jeq("_cpg_lazy_proto_meta_closure");
+        vm.mov(VReg.A0, VReg.V0);
+        vm.jmp("_cpg_lazy_proto_meta_find");
+        vm.label("_cpg_lazy_proto_meta_closure");
+        vm.load(VReg.A0, VReg.V0, 8);
+        vm.label("_cpg_lazy_proto_meta_find");
+        vm.call("_func_meta_find");
+        vm.cmpImm(VReg.RET, 2); vm.jeq("_cpg_undef");
         // --- lazy F.prototype creation ---
         // 1. create prototype object (raw)
         vm.call("_object_new");                      // RET = raw prototype
@@ -772,7 +832,8 @@ export class ObjectGenerator {
         vm.movImm64(VReg.V1, 0x7ffd000000000000n);
         vm.or(VReg.RET, VReg.V2, VReg.V1);         // RET = boxed prototype
         vm.mov(VReg.S0, VReg.RET);                  // S0 = boxed proto (callee-saved, safe across calls)
-        // async function* F.prototype.[[Prototype]] = %AsyncGenerator.prototype%
+        // Generator/AsyncGenerator F.prototype inherits from its matching
+        // intrinsic generator prototype.
         vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
         vm.and(VReg.V0, VReg.S1, VReg.V1);
         vm.load(VReg.V2, VReg.V0, 0);
@@ -784,11 +845,17 @@ export class ObjectGenerator {
         vm.load(VReg.A0, VReg.V0, 8);
         vm.label("_cpg_lp_kind_lk");
         vm.call("_func_meta_find");
-        vm.cmpImm(VReg.RET, 3);
-        vm.jne("_cpg_lp_kind_skip");
+        vm.cmpImm(VReg.RET, 1); vm.jeq("_cpg_lp_kind_gen");
+        vm.cmpImm(VReg.RET, 3); vm.jeq("_cpg_lp_kind_asyncgen");
+        vm.jmp("_cpg_lp_kind_skip");
+        vm.label("_cpg_lp_kind_gen");
+        vm.call("_ensure_gen_proto");
+        vm.jmp("_cpg_lp_kind_link");
+        vm.label("_cpg_lp_kind_asyncgen");
         vm.call("_ensure_asyncgen_proto");
+        vm.label("_cpg_lp_kind_link");
         vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
-        vm.and(VReg.A0, VReg.RET, VReg.V1);         // raw AG.prototype
+        vm.and(VReg.A0, VReg.RET, VReg.V1);         // raw intrinsic generator proto
         vm.and(VReg.V0, VReg.S0, VReg.V1);          // raw F.prototype
         vm.store(VReg.V0, 16, VReg.A0);             // [[Prototype]]
         vm.label("_cpg_lp_kind_skip");
@@ -986,8 +1053,20 @@ export class ObjectGenerator {
         vm.load(VReg.A0, VReg.V0, 8);
         vm.label("_cpg_ctor_lk");
         vm.call("_func_meta_find");
-        vm.cmpImm(VReg.RET, 3);
-        vm.jne("_cpg_proto");
+        vm.cmpImm(VReg.RET, 1); vm.jeq("_cpg_ctor_genfunc");
+        vm.cmpImm(VReg.RET, 2); vm.jeq("_cpg_ctor_asyncfunc");
+        vm.cmpImm(VReg.RET, 3); vm.jeq("_cpg_ctor_asyncgenfunc");
+        vm.jmp("_cpg_proto");
+        vm.label("_cpg_ctor_genfunc");
+        vm.call("_ensure_genfunc_ctor");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+        vm.label("_cpg_ctor_asyncfunc");
+        vm.call("_ensure_asyncfunc_ctor");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+        vm.label("_cpg_ctor_asyncgenfunc");
+        // This also installs the configurable @@toStringTag on the existing
+        // AsyncGeneratorFunction prototype before exposing its constructor.
+        vm.call("_ensure_asyncgenfunc_tag_proto");
         vm.call("_ensure_asyncgenfunc");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
         vm.label("_cpg_proto");
@@ -1037,7 +1116,21 @@ export class ObjectGenerator {
         // _closure_prop_get → undefined → 放行。删除后重赋亦放行(墓碑 → undefined,
         // 且先清墓碑槽使新值按默认 attr=7 落回,符合 ES 删后重建语义)。
         vm.label("_closure_prop_set");
-        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.movImm(VReg.V0, 0);
+        vm.store(VReg.SP, 0, VReg.V0); // assignment mode: sloppy [[Set]]
+        vm.jmp("_cps_entry");
+
+        // Strict PutValue entry used by member assignments in strict code.
+        // Keep the closure side-table policy in one body, but carry the mode
+        // in this frame so nested calls cannot confuse it with the value/key.
+        vm.label("_closure_prop_set_strict");
+        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.movImm(VReg.V0, 2);
+        vm.store(VReg.SP, 0, VReg.V0); // strict assignment mode
+        vm.jmp("_cps_entry");
+
+        vm.label("_cps_entry");
         vm.mov(VReg.S0, VReg.A1); // key
         vm.mov(VReg.S1, VReg.A2); // val
         vm.mov(VReg.S2, VReg.A0); // fn
@@ -1087,7 +1180,14 @@ export class ObjectGenerator {
         vm.lea(VReg.V1, "_js_undefined");
         vm.load(VReg.V1, VReg.V1, 0);
         vm.cmp(VReg.RET, VReg.V1);
-        vm.jne("_cps_ignored");                // 有效存在且不可写 → 忽略本次赋值
+        vm.jeq("_cps_name_length_missing");
+        // name/length are non-writable.  Sloppy assignment is ignored; strict
+        // assignment must throw, matching OrdinarySet's [[Set]] result.
+        vm.load(VReg.V0, VReg.SP, 0);
+        vm.cmpImm(VReg.V0, 2);
+        vm.jeq("_cps_throw_readonly");
+        vm.jmp("_cps_ignored");
+        vm.label("_cps_name_length_missing");
         // 有效不存在:若侧表留有墓碑槽(曾删除),先移除,使下方常规写以默认 attr=7
         // 重建条目(否则 _object_set 命中路径的 writable 守卫见 0x80 无写位 → 静默丢弃,
         // 删后重赋永不生效)。
@@ -1142,6 +1242,39 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.RET, 0);
         vm.jne("_cps_own_set");
         vm.label("_cps_proto_walk");
+        // 函数实例的 `F.prototype = …` 必须落在 F 的自有侧表槽上;不能沿
+        // Function.prototype 链命中用户安装的 prototype 访问器(13.2-18-1)。
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_getStrContent");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, vm.asm.addString("prototype"));
+        vm.call("_strcmp");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_cps_proto_walk_chain");
+        vm.shrImm(VReg.V1, VReg.S2, 48);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_cps_proto_walk_ctor");
+        vm.cmpImm(VReg.V1, 0x7FFF);
+        vm.jeq("_cps_proto_walk_ctor");
+        vm.jmp("_cps_proto_walk_chain");
+        vm.label("_cps_proto_walk_ctor");
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.V0, VReg.S2, VReg.V1);
+        vm.load(VReg.V2, VReg.V0, 0);
+        vm.cmpImm(VReg.V2, 0xc105);
+        vm.jne("_cps_proto_walk_chain");
+        vm.load(VReg.V2, VReg.V0, 8);
+        vm.lea(VReg.V1, "_aref_generic");
+        vm.cmp(VReg.V2, VReg.V1);
+        vm.jeq("_cps_proto_walk_chain");
+        vm.lea(VReg.V1, "_aref_static_tramp");
+        vm.cmp(VReg.V2, VReg.V1);
+        vm.jeq("_cps_proto_walk_chain");
+        vm.lea(VReg.V1, "_bound_tramp");
+        vm.cmp(VReg.V2, VReg.V1);
+        vm.jeq("_cps_proto_walk_chain");
+        vm.jmp("_cps_own_set");
+        vm.label("_cps_proto_walk_chain");
         vm.mov(VReg.A0, VReg.S2);
         vm.call("_object_getPrototypeOf");
         vm.cmpImm(VReg.RET, 0);
@@ -1151,7 +1284,22 @@ export class ObjectGenerator {
         vm.jeq("_cps_own_set");
         vm.cmpImm(VReg.V2, 0x7FFA);
         vm.jeq("_cps_own_set");
-        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.S3, VReg.RET); // prototype
+        // %Array.prototype% is itself an Array exotic.  Its named accessors
+        // live in the closure side table; _object_get(array,key) would invoke
+        // the getter and discard the raw TYPE_GETTER marker needed by [[Set]].
+        vm.shrImm(VReg.V2, VReg.S3, 48);
+        vm.cmpImm(VReg.V2, 0x7FFE);
+        vm.jne("_cps_proto_lookup");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.call("_closure_props_find");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_cps_own_set");
+        vm.mov(VReg.S3, VReg.RET);
+        vm.label("_cps_proto_lookup");
+        vm.mov(VReg.A0, VReg.S3);
         vm.mov(VReg.A1, VReg.S0);
         vm.call("_object_get");
         vm.lea(VReg.V1, "_js_undefined");
@@ -1193,7 +1341,11 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.V1, 0xa51c);
         vm.jne("_cps_acc_call");
         vm.label("_cps_acc_clo");
-        vm.load(VReg.V0, VReg.V0, 8);
+        // Accessor bodies may close over lexical state.  Preserve the closure pointer in S0
+        // for the callee before extracting its code pointer; passing the property key in S0
+        // made captured setters dereference string storage as a closure (SIGSEGV/SIGBUS).
+        vm.mov(VReg.S0, VReg.V0);
+        vm.load(VReg.V0, VReg.S0, 8);
         vm.label("_cps_acc_call");
         // x64 V0≡RET: setCallArgcImm scratch-clobbers V0. Hold fn in V1
         // (same as _maybe_getter_call).
@@ -1207,12 +1359,26 @@ export class ObjectGenerator {
         vm.mov(VReg.A0, VReg.RET);
         vm.mov(VReg.A1, VReg.S0);
         vm.mov(VReg.A2, VReg.S1);
+        vm.load(VReg.V0, VReg.SP, 0);
+        vm.cmpImm(VReg.V0, 2);
+        vm.jeq("_cps_own_set_strict");
         vm.call("_object_set");
         vm.mov(VReg.RET, VReg.S1); // 返回被赋值
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 16);
+        vm.label("_cps_own_set_strict");
+        vm.call("_object_set_strict");
+        vm.mov(VReg.RET, VReg.S1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 16);
+        vm.label("_cps_throw_readonly");
+        vm.lea(VReg.A0, this.vm.asm.addString("Cannot assign to read only property"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
         vm.label("_cps_ignored");
         vm.mov(VReg.RET, VReg.S1);             // 返回 RHS(sloppy 赋值表达式值不变)
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 16);
 
         // [I6] _closure_prop_define(A0=fn, A1=key, A2=val) -> val。[[DefineOwnProperty]]
         // 语义(defineProperty 路由,经 _object_set_fnprops 的 define 标志分流到此):
@@ -1687,6 +1853,13 @@ export class ObjectGenerator {
         vm.asm.addDataQword(0);
         vm.asm.addDataLabel("_nsobj_object");
         vm.asm.addDataQword(0);
+        // Compiler-side Object materialisation uses a process-global ready
+        // bit so dynamic fragments can share the host singleton slots and
+        // avoid rebuilding the constructor/prototype on every eval. Declare
+        // it beside the runtime-owned slots; `_reEnsureSlot` will observe the
+        // existing label when the compiler emits its fragment references.
+        vm.asm.addDataLabel("_nsobj_object_ready");
+        vm.asm.addDataQword(0);
 
         vm.label("_object_proto_ensure");
         vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
@@ -1904,7 +2077,30 @@ export class ObjectGenerator {
         vm.label("_object_get_fnprops");
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S1);
+        vm.call("_closure_prop_get_raw");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jne("_object_get_fnprops_done");
+        // No own side-table key: retain metadata and Function.prototype
+        // fallback behaviour from the full helper.
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
         vm.call("_closure_prop_get");
+        // A function's own closure side table is only the first step of
+        // OrdinaryGet.  On a miss, continue through Function.prototype (and
+        // then Object.prototype) so inherited @@isConcatSpreadable and other
+        // properties are observable.
+        vm.store(VReg.SP, 0, VReg.RET);
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jne("_object_get_fnprops_done");
+        vm.call("_ensure_function_proto");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_get");
+        vm.label("_object_get_fnprops_done");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
 
         // 数组属性读:委托 _subscript_get(裸数组指针 + 原键)——其内按 ES 语义分派:
@@ -1935,6 +2131,13 @@ export class ObjectGenerator {
         vm.load(VReg.V1, VReg.V1, 0);
         vm.cmp(VReg.RET, VReg.V1);
         vm.jne("_object_get_done");
+        // arguments 对象: [[Prototype]] 是 Object.prototype (非 Array.prototype)
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V0, VReg.S0, VReg.V1);
+        vm.loadByte(VReg.V1, VReg.V0, 1);
+        vm.andImm(VReg.V1, VReg.V1, ARR_IS_ARGUMENTS);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_object_get_args_proto");
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_subscript_key_int"); // RET = idx >= 0 / -1
         vm.cmpImm(VReg.RET, 0);
@@ -1962,16 +2165,55 @@ export class ObjectGenerator {
         vm.mov(VReg.A0, VReg.S2);
         vm.mov(VReg.A1, VReg.S1);
         vm.call("_object_get");
+        vm.jmp("_object_get_done");
+        vm.label("_object_get_args_proto");
+        vm.lea(VReg.V0, "_nsobj_object_proto");
+        vm.load(VReg.S2, VReg.V0, 0);
+        vm.cmpImm(VReg.S2, 0);
+        vm.jne("_object_get_args_proto_ok");
+        vm.call("_object_proto_ensure");
+        vm.lea(VReg.V0, "_nsobj_object_proto");
+        vm.load(VReg.S2, VReg.V0, 0);
+        vm.label("_object_get_args_proto_ok");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_get");
         vm.label("_object_get_done");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
 
-        // 数组 Symbol 自有键:侧表(_closure_prop_get);accessor 由调用方 _maybe_getter。
+        // 数组 Symbol 自有键:侧表(_closure_prop_get);miss → Array.prototype(覆盖的 @@iterator 等)。
         vm.label("_object_get_array_sym");
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.A0, VReg.S0, VReg.V1);
         vm.mov(VReg.A1, VReg.S1);
         vm.call("_closure_prop_get");
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jne("_object_get_done");
+        // Honour per-array [[Prototype]] overrides for Symbol lookup as well.
+        // %Array.prototype% is a real array whose override is Object.prototype;
+        // falling straight back to the global array-prototype slot recurses on
+        // the same receiver for a missing Symbol key.
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_get_instance_proto");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_object_get_array_sym_default");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.shrImm(VReg.V1, VReg.S2, 48);
+        vm.cmpImm(VReg.V1, 0x7FFA); // explicit null prototype
+        vm.jeq("_object_get_notfound");
+        vm.jmp("_object_get_array_sym_proto");
+        vm.label("_object_get_array_sym_default");
+        vm.lea(VReg.V0, "_nsobj_array_proto");
+        vm.load(VReg.S2, VReg.V0, 0);
+        vm.cmpImm(VReg.S2, 0);
+        vm.jeq("_object_get_notfound");
+        vm.label("_object_get_array_sym_proto");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_get");
+        vm.jmp("_object_get_done");
 
         // 冷分支:接收者是装箱字符串(S0 保持**装箱**形态——本分支在 _object_get_tag_ok
         // 的脱壳之前分流)。按 ES 的 String exotic object 语义路由:
@@ -2244,7 +2486,7 @@ export class ObjectGenerator {
         vm.lea(VReg.A1, this.vm.asm.addString("description"));
         vm.call("_strcmp");
         vm.cmpImm(VReg.RET, 0);
-        vm.jne(notFoundLabel);
+        vm.jne("_object_get_symbol_proto");
         vm.load(VReg.RET, VReg.S0, 8); // desc 裸指针
         vm.cmpImm(VReg.RET, 0);
         vm.jne("_object_get_symbol_boxstr");
@@ -2256,6 +2498,16 @@ export class ObjectGenerator {
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
         vm.or(VReg.RET, VReg.RET, VReg.V1);
         vm.label("_object_get_symbol_ret");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
+
+        vm.label("_object_get_symbol_proto");
+        vm.call("_ensure_symbol_proto");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0); // getter receiver is the primitive Symbol
+        vm.call("_maybe_getter");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
 
         // Set(type=5):非属性堆。先查已物化的 Set.prototype;再对 @@iterator /
@@ -2338,14 +2590,23 @@ export class ObjectGenerator {
         // 旧路径 TYPE_PROMISE → notfound,覆盖的 then 永远 miss → 品牌 then2,
         // 永不 done 的 iterable 上 Promise.all/race 死循环(invoke-then-*-close)。
         vm.label("_object_get_promise_side");
+        // Presence and value are separate questions: an own property whose
+        // value is `undefined` still shadows Promise.prototype.  Testing the
+        // `_closure_prop_get` result against the undefined sentinel treated
+        // that valid hit as a miss (`p.then = undefined` then read the
+        // inherited intrinsic), which broke finally/Invoke semantics.
+        vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+        vm.or(VReg.A0, VReg.S0, VReg.V1);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_object_get_promise_own_miss");
         vm.movImm64(VReg.V1, 0x7ffd000000000000n);
         vm.or(VReg.A0, VReg.S0, VReg.V1);
         vm.mov(VReg.A1, VReg.S1);
         vm.call("_closure_prop_get");
-        vm.lea(VReg.V1, "_js_undefined");
-        vm.load(VReg.V1, VReg.V1, 0);
-        vm.cmp(VReg.RET, VReg.V1);
-        vm.jne("_object_get_promise_hit");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
+        vm.label("_object_get_promise_own_miss");
         // class extends Promise: _promise_super_init keeps subclass proto at +48.
         // Walk that before Promise.prototype so instance.constructor === SubPromise.
         vm.load(VReg.V2, VReg.S0, 48);
@@ -2371,9 +2632,6 @@ export class ObjectGenerator {
         vm.mov(VReg.A1, VReg.S1);
         vm.call("_object_get");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
-        vm.label("_object_get_promise_hit");
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
-
         // TypedArray 具名属性:侧表(ta.constructor=…)+原型链;整数键走元素读。
         // 此前一律 notfound → SpeciesConstructor 看不到覆盖的 constructor。
         vm.label("_object_get_ta_side");
@@ -2395,10 +2653,12 @@ export class ObjectGenerator {
         vm.load(VReg.V1, VReg.V1, 0);
         vm.cmp(VReg.RET, VReg.V1);
         vm.jeq("_object_get_notfound");
-        vm.shrImm(VReg.V0, VReg.RET, 48);
-        vm.cmpImm(VReg.V0, 0x7FFA);
+        // x64 aliases V0 with RET.  Keep the prototype tag check in V1 so
+        // the boxed prototype value remains intact for the delegated get.
+        vm.shrImm(VReg.V1, VReg.RET, 48);
+        vm.cmpImm(VReg.V1, 0x7FFA);
         vm.jeq("_object_get_notfound");
-        vm.cmpImm(VReg.V0, 0x7FFB);
+        vm.cmpImm(VReg.V1, 0x7FFB);
         vm.jeq("_object_get_notfound");
         vm.mov(VReg.A0, VReg.RET);
         vm.mov(VReg.A1, VReg.S1);
@@ -2464,8 +2724,10 @@ export class ObjectGenerator {
         vm.call("_get_ctor_proto");
         vm.cmpImm(VReg.RET, 0);
         vm.jeq("_object_get_notfound");
-        vm.shrImm(VReg.V0, VReg.RET, 48);
-        vm.cmpImm(VReg.V0, 0x7FFB);
+        // V0 == RET on x64; use V1 for the undefined guard to preserve the
+        // boxed ArrayBuffer.prototype passed to `_object_get` below.
+        vm.shrImm(VReg.V1, VReg.RET, 48);
+        vm.cmpImm(VReg.V1, 0x7FFB);
         vm.jeq("_object_get_notfound");
         vm.mov(VReg.A0, VReg.RET);
         vm.mov(VReg.A1, VReg.S1);
@@ -2750,11 +3012,15 @@ export class ObjectGenerator {
         vm.jeq("_ptf_revoked");
         vm.cmpImm(VReg.V1, 0x7FFB);
         vm.jeq("_ptf_revoked");
-        vm.load(VReg.A0, VReg.A0, 16); // handler(装箱)
+        vm.load(VReg.S1, VReg.A0, 16); // handler(装箱; getter receiver)
+        vm.mov(VReg.A0, VReg.S1);
         vm.mov(VReg.A1, VReg.A1);
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.A1, VReg.V1); // 装箱字符串键
-        vm.call("_object_get"); // RET = handler[name]
+        vm.call("_object_get"); // RET = handler[name] or raw accessor marker
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_maybe_getter"); // GetMethod performs ordinary [[Get]]
         // x64 V0≡RET: stash then tag-extract from S0.
         vm.mov(VReg.S0, VReg.RET);
         vm.shrImm(VReg.V2, VReg.S0, 48);
@@ -2766,6 +3032,13 @@ export class ObjectGenerator {
         vm.jeq("_ptf_none");
         vm.cmpImm(VReg.V2, 0x7FFA); // null
         vm.jeq("_ptf_none");
+        // A callable handler may be represented as a tagged function or as a
+        // raw closure pointer.  The former fast check misses the latter on
+        // x64; defer to the canonical IsCallable helper before rejecting it.
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_is_callable");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_ptf_ok");
         vm.lea(VReg.A0, vm.asm.addString("trap is not a function"));
         vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
         vm.and(VReg.A0, VReg.A0, VReg.V1);
@@ -3333,6 +3606,17 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.V0, 3);         // TYPE_FUNCTION / classinfo
         vm.jeq("_fcc_class");
         vm.load(VReg.S5, VReg.S3, 8);  // S5 = 真函数指针(V1=x64 RCX 与 A3 别名,禁跨装参)
+
+        // 内建基本类型包装构造器 (String, Number, Boolean)
+        vm.lea(VReg.V1, "_builtin_string");
+        vm.cmp(VReg.S5, VReg.V1);
+        vm.jeq("_fcc_builtin_string");
+        vm.lea(VReg.V1, "_builtin_number");
+        vm.cmp(VReg.S5, VReg.V1);
+        vm.jeq("_fcc_builtin_number");
+        vm.lea(VReg.V1, "_builtin_boolean");
+        vm.cmp(VReg.S5, VReg.V1);
+        vm.jeq("_fcc_builtin_boolean");
         // OrdinaryCreateFromConstructor(newTarget, "%Object.prototype%"):
         // proto = Get(newTarget, "prototype"), not Get(F, "prototype").
         // SuperCall Construct(fn, args, GetNewTarget()) for `class C extends fn`
@@ -3484,6 +3768,62 @@ export class ObjectGenerator {
         vm.or(VReg.RET, VReg.RET, VReg.V1);
         vm.label("_fcc_end");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
+        vm.label("_fcc_builtin_string");
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.call("_array_length");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_fcc_bstr_empty");
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.movImm(VReg.A1, 0);
+        vm.call("_array_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_valueToStr");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_string_new");
+        vm.jmp("_fcc_end");
+        vm.label("_fcc_bstr_empty");
+        vm.lea(VReg.A0, vm.asm.addString(""));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_string_new");
+        vm.jmp("_fcc_end");
+
+        vm.label("_fcc_builtin_number");
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.call("_array_length");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_fcc_bnum_zero");
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.movImm(VReg.A1, 0);
+        vm.call("_array_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_number_coerce");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_number_new");
+        vm.jmp("_fcc_end");
+        vm.label("_fcc_bnum_zero");
+        vm.movImm(VReg.A0, 0);
+        vm.call("_number_new");
+        vm.jmp("_fcc_end");
+
+        vm.label("_fcc_builtin_boolean");
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.call("_array_length");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_fcc_bbool_false");
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.movImm(VReg.A1, 0);
+        vm.call("_array_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_boolean");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_boolean_new");
+        vm.jmp("_fcc_end");
+        vm.label("_fcc_bbool_false");
+        vm.movImm(VReg.A0, 0);
+        vm.call("_boolean_new");
+        vm.jmp("_fcc_end");
+
         vm.label("_fcc_class_bad");
         vm.lea(VReg.A0, this.vm.asm.addString("value is not a constructor"));
         vm.call("_js_box_string");
@@ -3492,7 +3832,7 @@ export class ObjectGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
     }
 
-    // _object_defineProperty_proxy(A0=proxy_boxed, A1=key, A2=descObj) -> RET。
+    // _object_defineProperty_proxy(A0=proxy_boxed, A1=key, A2=descObj) -> boxed Boolean。
     // 有 defineProperty 陷阱 → handler.defineProperty(target, key, descObj);否则转发
     // target(尽力:仅落 descObj.value,attrs 不逐一转发,记偏差)。编译器在
     // Object.defineProperty(obj,...) 目标运行时为 proxy 时调用。
@@ -3514,11 +3854,12 @@ export class ObjectGenerator {
         vm.mov(VReg.A1, VReg.S1); // key
         vm.mov(VReg.A2, VReg.S2); // descObj
         vm.call("_aref_invoke_cb"); // RET = 陷阱布尔
-        // [不变式] 陷阱返 truthy 时校验(t372)。falsy → 直接合规。
+        // [不变式] 陷阱返 truthy 时校验(t372)。falsy 是 [[DefineOwnProperty]] false；
+        // 是否抛由下面的 DefinePropertyOrThrow 包装器决定。
         vm.mov(VReg.A0, VReg.RET);
         vm.call("_to_boolean");
         vm.cmpImm(VReg.RET, 0);
-        vm.jeq("_odpp_inv_ok");
+        vm.jeq("_odpp_false");
         // A:target 不可扩展且该键在 target 上不存在(新增属性)→ 抛。
         vm.load(VReg.A0, VReg.S0, 8); // target
         vm.call("_object_isExtensible");
@@ -3564,19 +3905,57 @@ export class ObjectGenerator {
         vm.label("_odpp_throwB");
         vm.call("_throw_proxy_invariant");
         vm.label("_odpp_inv_ok");
+        vm.lea(VReg.RET, "_js_true");
+        vm.load(VReg.RET, VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 16);
+        vm.label("_odpp_false");
+        vm.lea(VReg.RET, "_js_false");
+        vm.load(VReg.RET, VReg.RET, 0);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 16);
         vm.label("_odpp_fwd");
-        // 无陷阱:尽力把 descObj.value 落到 target
-        vm.mov(VReg.A0, VReg.S2);
-        vm.lea(VReg.A1, this.vm.asm.addString("value"));
-        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
-        vm.or(VReg.A1, VReg.A1, VReg.V1);
-        vm.call("_object_get"); // RET = descObj.value
-        vm.mov(VReg.A2, VReg.RET);
+        // 无陷阱:完整转发 descriptor；嵌套 Proxy 继续走其 [[DefineOwnProperty]]。
         vm.load(VReg.A0, VReg.S0, 8); // target
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, vm.ptrFloor);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jlt("_odpp_fwd_plain");
+        vm.loadByte(VReg.V1, VReg.V0, 0);
+        vm.cmpImm(VReg.V1, TYPE_PROXY);
+        vm.jne("_odpp_fwd_plain");
         vm.mov(VReg.A1, VReg.S1); // key
-        vm.call("_object_define");
+        vm.mov(VReg.A2, VReg.S2); // descriptor
+        vm.call("_object_defineProperty_proxy");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 16);
+        vm.label("_odpp_fwd_plain");
+        vm.load(VReg.A0, VReg.S0, 8);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_object_define_property_dyn");
+        vm.lea(VReg.RET, "_js_true");
+        vm.load(VReg.RET, VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 16);
+
+        // DefinePropertyOrThrow wrapper used by Object.defineProperty,
+        // SetIntegrityLevel and Annex-B defining accessors. Reflect.defineProperty
+        // intentionally calls the raw Boolean helper above.
+        vm.label("_object_defineProperty_proxy_or_throw");
+        vm.prologue(0, []);
+        vm.call("_object_defineProperty_proxy");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_boolean");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_odpp_ot_throw");
+        vm.lea(VReg.RET, "_js_true");
+        vm.load(VReg.RET, VReg.RET, 0);
+        vm.epilogue([], 0);
+        vm.label("_odpp_ot_throw");
+        vm.lea(VReg.A0, vm.asm.addString("Proxy defineProperty trap returned false"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
     }
 
     // _throw_proxy_invariant():置异常并跨函数 unwind(同 _throw_not_a_function 模式)。
@@ -3599,6 +3978,57 @@ export class ObjectGenerator {
     // invariants including symbol keys (gOPN filters strings only AFTER this).
     generateProxyOwnKeysValidate() {
         const vm = this.vm;
+        // CreateListFromArrayLike(trapResult, «String, Symbol»).  The ownKeys
+        // trap may return any object, not only an actual Array; length and each
+        // indexed value are ordinary observable Gets in that order.
+        vm.label("_proxy_ownkeys_to_list");
+        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.call("_dp_require_object");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_agen_tolength");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.movImm(VReg.S3, 0);
+        vm.label("_pok_list_loop");
+        vm.cmp(VReg.S3, VReg.S2);
+        vm.jge("_pok_list_done");
+        vm.scvtf(0, VReg.S3);
+        vm.fmovToInt(VReg.A0, 0);
+        vm.call("_valueToStr");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.call("_maybe_getter");
+        vm.mov(VReg.S4, VReg.RET);
+        vm.shrImm(VReg.V1, VReg.S4, 48);
+        vm.cmpImm(VReg.V1, 0x7FFC);
+        vm.jeq("_pok_list_push");
+        vm.mov(VReg.A0, VReg.S4);
+        vm.call("_is_symbol");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_pok_list_bad");
+        vm.label("_pok_list_push");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_array_push_own");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_pok_list_loop");
+        vm.label("_pok_list_done");
+        vm.movImm64(VReg.V1, 0x7FFE000000000000n);
+        vm.or(VReg.RET, VReg.S1, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 16);
+        vm.label("_pok_list_bad");
+        vm.lea(VReg.A0, vm.asm.addString("ownKeys trap result contains an invalid key"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+
         vm.label("_pok_array_has");
         vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
         vm.mov(VReg.S0, VReg.A0);
@@ -3681,7 +4111,7 @@ export class ObjectGenerator {
         vm.jmp("_pok_dup_i");
         vm.label("_pok_dup_done");
         vm.load(VReg.A0, VReg.S0, 8);
-        vm.call("_object_own_keys_all");
+        vm.call("_object_all_own_keys");
         vm.mov(VReg.S5, VReg.RET);
         vm.mov(VReg.A0, VReg.S5);
         vm.call("_array_length");
@@ -3698,6 +4128,8 @@ export class ObjectGenerator {
         vm.movImm(VReg.V0, 0);
         vm.label("_pok_ext_st");
         vm.store(VReg.SP, 16, VReg.V0);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_pok_nonext_exact");
         vm.movImm(VReg.S3, 0);
         vm.label("_pok_tk_i");
         vm.load(VReg.V0, VReg.SP, 8);
@@ -3755,6 +4187,31 @@ export class ObjectGenerator {
         vm.jeq("_pok_throw");
         vm.addImm(VReg.S3, VReg.S3, 1);
         vm.jmp("_pok_ex_i");
+        // For a non-extensible target, after duplicate rejection the trap list
+        // must be exactly targetKeys.  Compare cardinality and membership
+        // directly; configurability is irrelevant in this branch.
+        vm.label("_pok_nonext_exact");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_array_length");
+        vm.load(VReg.V0, VReg.SP, 8);
+        vm.cmp(VReg.RET, VReg.V0);
+        vm.jne("_pok_throw");
+        vm.movImm(VReg.S3, 0);
+        vm.label("_pok_nonext_exact_loop");
+        vm.load(VReg.V0, VReg.SP, 8);
+        vm.cmp(VReg.S3, VReg.V0);
+        vm.jge("_pok_ok");
+        vm.mov(VReg.A0, VReg.S5);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_array_get");
+        vm.mov(VReg.S4, VReg.RET);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_pok_array_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_pok_throw");
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_pok_nonext_exact_loop");
         vm.label("_pok_ok");
         vm.movImm(VReg.RET, 1);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
@@ -3921,9 +4378,14 @@ export class ObjectGenerator {
         vm.label("_ogic_maybe_getter");
         vm.cmpImm(VReg.RET, 0);
         vm.jeq("_ogic_ret"); // 零位原样返回(miss 哨兵与 +0.0 同位,见 _maybe_getter 注)
-        vm.mov(VReg.V1, VReg.A0); // this = 原 boxed obj(A0 全程未写)
+        // arm64 has RET === A0 (x0): loading the cached property value into RET
+        // already overwrote the original receiver.  V4 still holds the guarded
+        // ordinary object's raw pointer on every fast-path branch, so reconstruct
+        // the boxed receiver from it instead of passing an accessor marker as this.
+        vm.mov(VReg.A1, VReg.V4);
+        vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
         vm.mov(VReg.A0, VReg.RET);
-        vm.mov(VReg.A1, VReg.V1);
         vm.jmp("_maybe_getter"); // 尾跳:借用本次调用的返回地址
         vm.label("_ogic_ret");
         vm.ret();
@@ -4300,6 +4762,12 @@ export class ObjectGenerator {
         boxStr(VReg.S1);
         const appendIf = (key, letter, tag) => {
             const skip = "_rfg_" + tag;
+            vm.mov(VReg.A0, VReg.S0);
+            vm.lea(VReg.A1, vm.asm.addString(key));
+            boxStr(VReg.A1);
+            vm.call("_object_has");
+            vm.cmpImm(VReg.RET, 0);
+            vm.jeq(skip);
             vm.mov(VReg.A0, VReg.S0);
             vm.lea(VReg.A1, vm.asm.addString(key));
             boxStr(VReg.A1);
@@ -4723,6 +5191,11 @@ export class ObjectGenerator {
         // TYPE_OBJECT/TYPE_PROXY 的裸堆指针入此(装箱数组/字符串/数值在上面 tag 分派
         // 已短路)。
         vm.label("_odel_maybe_fn");
+        vm.cmpImm(VReg.V1, TYPE_TA_LO);
+        vm.jlt("_odel_maybe_array");
+        vm.cmpImm(VReg.V1, TYPE_TA_HI);
+        vm.jle("_odel_ta");
+        vm.label("_odel_maybe_array");
         vm.cmpImm(VReg.V1, 1); // TYPE_ARRAY → 元素/侧表删除
         vm.jeq("_odel_array");
         vm.mov(VReg.A0, VReg.S0);
@@ -4730,6 +5203,27 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.RET, 0);
         vm.jeq("_odel_true");
         vm.jmp("_odel_fn_raw");
+
+        // TypedArray integer-indexed elements are not deletable even though
+        // their reflected configurable field is true.  Named properties use
+        // ordinary side-table configurability.
+        vm.label("_odel_ta");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_canonical_array_index");
+        vm.movImm64(VReg.V1, 0xFFFFFFFFFFFFFFFFn);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_odel_ta_named");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_typed_array_length");
+        vm.cmp(VReg.S2, VReg.RET);
+        vm.jlt("_odel_false");
+        vm.jmp("_odel_true");
+        vm.label("_odel_ta_named");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_closure_prop_del");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
 
         // 数组 delete:规范数值索引 → 清槽为 hole(0),length 不变;非索引 → 侧表删。
         // S0=裸数组头,S1=已归一装箱键。
@@ -4745,6 +5239,29 @@ export class ObjectGenerator {
         vm.jge("_odel_true"); // 越界 delete → true(属性本不存在)
         vm.cmpImm(VReg.S2, 0);
         vm.jlt("_odel_true");
+        // freeze/seal make every existing array index non-configurable.  A
+        // missing hole still deletes successfully, so distinguish side-table
+        // and dense ownership before returning false.
+        vm.loadByte(VReg.V0, VReg.S0, 1);
+        vm.andImm(VReg.V0, VReg.V0, EXT_FROZEN | EXT_ARRAY_SEALED);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_odel_arr_integrity_ok");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S2);
+        vm.call("_array_side_elem_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_odel_false");
+        vm.load(VReg.V0, VReg.S0, 16); // capacity
+        vm.cmp(VReg.S2, VReg.V0);
+        vm.jge("_odel_true");
+        vm.load(VReg.V1, VReg.S0, 24);
+        vm.shl(VReg.V0, VReg.S2, 3);
+        vm.add(VReg.V0, VReg.V1, VReg.V0);
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_odel_true");
+        vm.jmp("_odel_false");
+        vm.label("_odel_arr_integrity_ok");
         // [L1-A] 侧表条目(defineProperty 落过 attr/accessor 的索引键)委托 props 对象删除:
         // _object_delete(props,key) 的 _odel_hit 守卫尊重 per-index configurable ——
         // configurable:false → 返 false 且**不清稠密槽**(此前无条件清槽返 true,
@@ -4826,7 +5343,8 @@ export class ObjectGenerator {
         vm.jmp("_odel_fn_raw");
     }
 
-    // _private_brand_check(A0=obj, A1=改写后的私有键, A2=模式 0=读/1=写) -> RET 0
+    // _private_brand_check(A0=obj, A1=改写后的私有键, A2=模式 0=读/1=写,
+    //                       A3=current method receiver) -> RET 0
     // 私有成员是「品牌」而非普通属性:接收者 own 上找不到该私有名即 TypeError(不是 undefined);
     // 私有方法不可写;只 get 的私有访问器写、只 set 的私有访问器读同样 TypeError。
     // 实例私有字段/方法/访问器挂实例 own 槽;静态私有挂定义它的 classinfo own 槽。
@@ -4845,6 +5363,63 @@ export class ObjectGenerator {
         vm.mov(VReg.S0, VReg.A0); // obj
         vm.mov(VReg.S1, VReg.A1); // key
         vm.mov(VReg.S2, VReg.A2); // mode
+        vm.mov(VReg.S3, VReg.A3); // current method receiver (0 when unavailable)
+
+        // A class expression/declaration is evaluated afresh at runtime.  A
+        // textual key such as "#C#m" therefore cannot by itself represent the
+        // spec's per-evaluation private brand.  Instance methods carry their
+        // current receiver in A3; comparing the candidate and current
+        // instance prototypes is a compact identity check that fixes the
+        // repeated-evaluation case while preserving the old own-key path for
+        // callers that do not provide A3.  Static members are deliberately
+        // left to the legacy path (their lexical owner is not the dynamic
+        // `this` receiver and needs a separate token).
+        vm.cmpImm(VReg.S3, 0);
+        vm.jeq("_pbc_no_receiver");
+        // Strip NaN-box object tags before pointer/type access and reject
+        // values outside the managed heap; this keeps malformed/primitive
+        // receivers on the normal TypeError path instead of dereferencing.
+        vm.emitMaskLoad(VReg.V4);
+        vm.andMaskReg(VReg.V5, VReg.S0, VReg.V4); // candidate raw pointer
+        vm.andMaskReg(VReg.V6, VReg.S3, VReg.V4); // current raw pointer
+        vm.cmpImm(VReg.V5, 0);
+        vm.jeq("_pbc_missing");
+        vm.cmpImm(VReg.V6, 0);
+        vm.jeq("_pbc_missing");
+        vm.lea(VReg.V4, "_heap_base");
+        vm.load(VReg.V4, VReg.V4, 0);
+        vm.cmp(VReg.V5, VReg.V4);
+        vm.jlt("_pbc_missing");
+        vm.cmp(VReg.V6, VReg.V4);
+        vm.jlt("_pbc_missing");
+        vm.lea(VReg.V4, "_heap_ptr");
+        vm.load(VReg.V4, VReg.V4, 0);
+        vm.cmp(VReg.V5, VReg.V4);
+        vm.jge("_pbc_missing");
+        vm.cmp(VReg.V6, VReg.V4);
+        vm.jge("_pbc_missing");
+        vm.loadByte(VReg.V4, VReg.V5, 0);
+        vm.loadByte(VReg.V7, VReg.V6, 0);
+        // TYPE_FUNCTION (3) is the naked class-info representation.  For an
+        // instance check both sides must be TYPE_OBJECT and share the same
+        // prototype pointer at +16; class-info values compare by identity.
+        vm.cmpImm(VReg.V4, 3);
+        vm.jne("_pbc_brand_instance");
+        vm.cmpImm(VReg.V7, 3);
+        vm.jne("_pbc_missing");
+        vm.cmp(VReg.V5, VReg.V6);
+        vm.jne("_pbc_missing");
+        vm.jmp("_pbc_no_receiver");
+        vm.label("_pbc_brand_instance");
+        vm.cmpImm(VReg.V4, 2);
+        vm.jne("_pbc_no_receiver");
+        vm.cmpImm(VReg.V7, 2);
+        vm.jne("_pbc_missing");
+        vm.load(VReg.V4, VReg.V5, 16);
+        vm.load(VReg.V6, VReg.V6, 16);
+        vm.cmp(VReg.V4, VReg.V6);
+        vm.jne("_pbc_missing");
+        vm.label("_pbc_no_receiver");
 
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S1);
@@ -5067,13 +5642,17 @@ export class ObjectGenerator {
         // 传入;getter 内 `this === obj` / `instanceof` 因而恒假(Object.create 以
         // RegExp/JSON 等作 Properties 时访问器描述符读回依赖正确 this)。已装箱
         // (high16≠0)或空 this 原样;裸堆指针按 type 字节补 0x7FFD/0x7FFE。
-        // V1 仍持函数指针,重装箱只用 V0。
+        // V1 仍持函数指针,重装箱只用 V0。classinfo(type=3) 的语言级
+        // 函数值表示就是裸指针，必须保持该表示：否则继承的 @@species
+        // getter 返回的装箱 this 与标识符读回的裸 classinfo 不再 SameValue。
         vm.shrImm(VReg.V0, VReg.S1, 48);
         vm.cmpImm(VReg.V0, 0);
         vm.jne("_maybe_getter_this_ok");
         vm.cmpImm(VReg.S1, 0);
         vm.jeq("_maybe_getter_this_ok");
         vm.loadByte(VReg.V0, VReg.S1, 0);
+        vm.cmpImm(VReg.V0, 3); // classinfo: naked is its canonical language value
+        vm.jeq("_maybe_getter_this_ok");
         vm.cmpImm(VReg.V0, 1); // TYPE_ARRAY
         vm.jeq("_maybe_getter_box_arr");
         vm.movImm64(VReg.V0, 0x7ffd000000000000n);
@@ -5129,13 +5708,16 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.V1, 0);
         vm.jeq("_maybe_setter_noset");
 
-        // Box raw this like _maybe_getter (high16=0 heap ptr).
+        // Box raw this like _maybe_getter (high16=0 heap ptr), while keeping
+        // classinfo naked because that is the canonical class value.
         vm.shrImm(VReg.V0, VReg.S1, 48);
         vm.cmpImm(VReg.V0, 0);
         vm.jne("_maybe_setter_this_ok");
         vm.cmpImm(VReg.S1, 0);
         vm.jeq("_maybe_setter_this_ok");
         vm.loadByte(VReg.V0, VReg.S1, 0);
+        vm.cmpImm(VReg.V0, 3); // classinfo
+        vm.jeq("_maybe_setter_this_ok");
         vm.cmpImm(VReg.V0, 1); // TYPE_ARRAY
         vm.jeq("_maybe_setter_box_arr");
         vm.movImm64(VReg.V0, 0x7ffd000000000000n);
@@ -5248,10 +5830,18 @@ export class ObjectGenerator {
         vm.load(VReg.V0, VReg.SP, 24);
         vm.cmpImm(VReg.V0, 1);
         vm.jeq("_object_set_fnprops_def");
+        vm.cmpImm(VReg.V0, 2);
+        vm.jeq("_object_set_fnprops_strict");
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S1);
         vm.mov(VReg.A2, VReg.S2);
         vm.call("_closure_prop_set");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
+        vm.label("_object_set_fnprops_strict");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_closure_prop_set_strict");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
         vm.label("_object_set_fnprops_def");
         vm.mov(VReg.A0, VReg.S0);
@@ -5376,7 +5966,7 @@ export class ObjectGenerator {
         vm.jeq("_object_set_ty_bail");
         // Symbol 标记块:写属性会把 desc 指针槽当 count 毁块 → 静默跳过
         vm.cmpImm(VReg.V1, TYPE_SYMBOL);
-        vm.jeq("_object_set_ty_bail");
+        vm.jeq("_object_set_reject");
         // Date(7):具名属性走闭包侧表(defineProperties 以 Date 作 Properties)。
         vm.cmpImm(VReg.V1, TYPE_DATE);
         vm.jeq("_object_set_date_side");
@@ -5501,13 +6091,6 @@ export class ObjectGenerator {
 
         // 找到已有属性，更新 value（S5 指向旧 props 数组内的属性，未增长，稳定）
         vm.label(foundLabel);
-        // [#61 P1] 冻结对象拒绝改写已有属性值(sloppy 静默,asm.js 无 strict)。
-        // byte1 & EXT_FROZEN;普通对象 byte1=0 一条 and 即过。seal/preventExtensions
-        // 不置 FROZEN 位,故仍可改写已有值(符合 ES 语义)。
-        vm.loadByte(VReg.V0, VReg.S0, 1);
-        vm.andImm(VReg.V0, VReg.V0, EXT_FROZEN);
-        vm.cmpImm(VReg.V0, 0);
-        vm.jne(doneLabel);
         // [#73c] [访问器] 旧值为 TYPE_GETTER 标记对象 → setter@16 分派（为 0 则静默
         // 返回）。此检查必须在 writable 守卫之前:访问器属性无 writable 语义,而
         // defineProperty({get,set}) 建标记时 attrs 缺省全 false(writable=0),若先跑
@@ -5564,6 +6147,9 @@ export class ObjectGenerator {
         vm.load(VReg.V0, VReg.S0, 8); // 真函数指针
         vm.label("_object_set_acc_call");
         vm.setCallArgcImm(1, VReg.V1, VReg.V2); // [argc ABI] setter(value)
+        // User functions read positional registers directly; argc metadata
+        // alone does not overwrite a stale property-key value in A1.
+        vm.movImm64(VReg.A1, 0x7ffb000000000000n);
         vm.callIndirect(VReg.V0);
         vm.jmp(doneLabel);
 
@@ -5590,6 +6176,14 @@ export class ObjectGenerator {
         // flags_ptr@40==0 → 全默认可写,一条 cmp 即过;materialize 后读 flags[S4]&bit0,
         // 清零 → 静默丢弃。S4=命中下标全程保活,仅用 V0 scratch。
         vm.label("_object_set_wcheck");
+        // Frozen data properties are non-writable, but a frozen accessor may
+        // still have a setter.  This guard belongs on the data path after the
+        // TYPE_GETTER dispatch above; placing it at `foundLabel` suppressed
+        // valid setter calls on Object.freeze({ set x(v) {} }).
+        vm.loadByte(VReg.V0, VReg.S0, 1);
+        vm.andImm(VReg.V0, VReg.V0, EXT_FROZEN);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_object_set_reject");
         vm.load(VReg.V0, VReg.S0, OBJECT_FLAGS_PTR_OFFSET);
         vm.cmpImm(VReg.V0, 0);
         vm.jeq("_object_set_plain");
@@ -5654,6 +6248,10 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.V0, 0);
         vm.jeq("_object_set_proto_miss"); // 链上无此键 → 正常追加 own
         vm.shrImm(VReg.V1, VReg.V0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFB); // undefined → 无继承属性
+        vm.jeq("_object_set_proto_miss");
+        vm.cmpImm(VReg.V1, 0x7FFA); // null
+        vm.jeq("_object_set_proto_miss");
         vm.cmpImm(VReg.V1, 0);
         vm.jne("_object_set_proto_data"); // 链上 tagged 数据属性
         vm.lea(VReg.V1, "_heap_base");
@@ -5673,19 +6271,58 @@ export class ObjectGenerator {
         vm.pop(VReg.A0); // proto boxed
         vm.mov(VReg.A1, VReg.S1); // key
         vm.call("_js_unbox");
-        // Builtin ctor proto (Promise/Map/…): no object props_ptr. Inherited
-        // statics are writable (attr 5) → own shadow. Scanning count@8/props@32
-        // on a 0xc105 block SIGSEGVs (Custom.resolve = fn).
-        vm.load(VReg.V1, VReg.RET, 0);
+        // 数组原型无 props_ptr@32:禁按对象头扫 writable(子类化 Array 写 length 等)。
+        vm.loadByte(VReg.V1, VReg.RET, 0);
+        vm.cmpImm(VReg.V1, 1); // TYPE_ARRAY
+        vm.jne("_object_set_proto_data_obj");
+        vm.mov(VReg.S4, VReg.RET); // proto raw array
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.V1, "_str_length_prop");
+        vm.movImm64(VReg.V2, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.V1, VReg.V2);
+        vm.call("_object_key_eq");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_object_set_proto_arr_len");
+        // 其它具名键:侧表有则查 attr,否则视为可写继承数据 → own 遮蔽
+        vm.movImm64(VReg.V1, 0x7ffe000000000000n);
+        vm.or(VReg.A0, VReg.S4, VReg.V1);
+        vm.call("_closure_props_find");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_object_set_append");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_get_attr");
+        vm.andImm(VReg.V0, VReg.RET, ATTR_WRITABLE);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_object_set_reject");
+        vm.jmp("_object_set_append");
+        vm.label("_object_set_proto_arr_len");
+        vm.loadByte(VReg.V0, VReg.S4, 1);
+        vm.andImm(VReg.V0, VReg.V0, 1); // ARR_LEN_NONWRITABLE
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_object_set_reject");
+        vm.jmp("_object_set_append");
+        vm.label("_object_set_proto_data_obj");
+        vm.mov(VReg.V2, VReg.RET); // proto raw (restore after unbox)
+        vm.cmpImm(VReg.V2, 0);
+        vm.jeq("_object_set_append");
+        vm.movImm64(VReg.V1, vm.ptrFloor);
+        vm.cmp(VReg.V2, VReg.V1);
+        vm.jlt("_object_set_append");
+        vm.load(VReg.V1, VReg.V2, 0);
         vm.cmpImm(VReg.V1, 0xc105);
         vm.jeq("_object_set_append");
         vm.cmpImm(VReg.V1, 0xa51c);
         vm.jeq("_object_set_append");
+        vm.load(VReg.V0, VReg.V2, OBJECT_PROPS_PTR_OFFSET);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_object_set_proto_up");
         // x64: V2=RDX / V3=R8 / V4=R9 皆 caller-saved,且 V2≡A2。
         // _object_key_eq 会毁掉它们 → 第二轮把残留串指针当对象扫 props_ptr 崩。
         // 栈槽:[SP+32]=proto raw [SP+40]=count [SP+48]=idx(本帧 64B,16/24 已占用)。
-        vm.store(VReg.SP, 32, VReg.RET); // proto raw
-        vm.mov(VReg.V2, VReg.RET);
+        vm.store(VReg.SP, 32, VReg.V2); // proto raw
         vm.load(VReg.V3, VReg.V2, 8); // count
         vm.store(VReg.SP, 40, VReg.V3);
         vm.movImm(VReg.V4, 0); // idx
@@ -5697,6 +6334,8 @@ export class ObjectGenerator {
         vm.jge("_object_set_proto_up"); // 本层无此键 → 再走 __proto__
         vm.load(VReg.V2, VReg.SP, 32); // reload proto (call 后 V2 已死)
         vm.load(VReg.V0, VReg.V2, OBJECT_PROPS_PTR_OFFSET);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_object_set_proto_up");
         vm.shl(VReg.V1, VReg.V4, 4);
         vm.add(VReg.V0, VReg.V0, VReg.V1);
         vm.load(VReg.A0, VReg.V0, 0);
@@ -5738,10 +6377,18 @@ export class ObjectGenerator {
         vm.store(VReg.SP, 32, VReg.V0);
         vm.label("_object_set_proto_up_ready");
         vm.load(VReg.V2, VReg.SP, 32);
+        vm.cmpImm(VReg.V2, 0);
+        vm.jeq("_object_set_append");
+        vm.movImm64(VReg.V1, vm.ptrFloor);
+        vm.cmp(VReg.V2, VReg.V1);
+        vm.jlt("_object_set_append");
         vm.loadByte(VReg.V1, VReg.V2, 0);
         vm.andImm(VReg.V1, VReg.V1, 0xff);
         vm.cmpImm(VReg.V1, 2); // TYPE_OBJECT:函数/Date 头无 props_ptr,停
         vm.jne("_object_set_append");
+        vm.load(VReg.V0, VReg.V2, OBJECT_PROPS_PTR_OFFSET);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_object_set_append");
         vm.load(VReg.V3, VReg.V2, 8); // count
         vm.store(VReg.SP, 40, VReg.V3);
         vm.movImm(VReg.V4, 0);
@@ -5941,11 +6588,121 @@ export class ObjectGenerator {
         vm.callIndirect(VReg.V2);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
         vm.label("_object_set_proxy_fwd");
-        // 无 set 陷阱 → 转发 target
+        // No set trap: target.[[Set]](key, value, receiver), not a direct
+        // write to target.  OrdinarySetWithOwnDescriptor first validates the
+        // target descriptor, then consults/defines the receiver's own
+        // descriptor.  With a Proxy receiver those two operations must expose
+        // getOwnPropertyDescriptor and defineProperty traps.
         vm.mov(VReg.A0, VReg.S3);
         vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_getOwnPropertyDescriptor");
+        vm.store(VReg.SP, 0, VReg.RET); // targetDesc
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_osp_fwd_inherited");
+        // Accessor target descriptor: dispatch its setter with receiver as this.
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, this.vm.asm.addString("set"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_osp_fwd_target_data");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S5);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_maybe_setter");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_osp_fwd_done");
+        vm.jmp("_object_set_reject");
+        vm.label("_osp_fwd_target_data");
+        // Non-writable target data property makes [[Set]] fail.
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.lea(VReg.A1, this.vm.asm.addString("writable"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_boolean");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_object_set_reject");
+        vm.jmp("_osp_fwd_receiver");
+
+        vm.label("_osp_fwd_inherited");
+        // A missing own descriptor may still resolve to an inherited setter.
+        vm.mov(VReg.A0, VReg.S3);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S5);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_maybe_setter");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_osp_fwd_done");
+
+        vm.label("_osp_fwd_receiver");
+        vm.mov(VReg.A0, VReg.S5);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_getOwnPropertyDescriptor");
+        vm.store(VReg.SP, 8, VReg.RET); // receiverDesc
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_osp_fwd_receiver_new");
+        // Existing receiver accessor or non-writable data descriptor rejects.
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, this.vm.asm.addString("set"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_object_set_reject");
+        vm.load(VReg.A0, VReg.SP, 8);
+        vm.lea(VReg.A1, this.vm.asm.addString("writable"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_boolean");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_object_set_reject");
+        // Existing writable data descriptor: DefineProperty(receiver,{value}).
+        vm.call("_object_new");
+        vm.call("_box_obj_r");
+        vm.mov(VReg.S3, VReg.RET);
+        vm.jmp("_osp_fwd_desc_value");
+
+        vm.label("_osp_fwd_receiver_new");
+        // Missing receiver property: CreateDataProperty shape (all true).
+        vm.call("_object_new");
+        vm.call("_box_obj_r");
+        vm.mov(VReg.S3, VReg.RET);
+        vm.movImm64(VReg.S4, 0x7ff9000000000001n); // true
+        for (const attrName of ["writable", "enumerable", "configurable"]) {
+            vm.mov(VReg.A0, VReg.S3);
+            vm.lea(VReg.A1, this.vm.asm.addString(attrName));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+            vm.or(VReg.A1, VReg.A1, VReg.V1);
+            vm.mov(VReg.A2, VReg.S4);
+            vm.call("_object_set");
+        }
+        vm.label("_osp_fwd_desc_value");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.lea(VReg.A1, this.vm.asm.addString("value"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
         vm.mov(VReg.A2, VReg.S2);
         vm.call("_object_set");
+        vm.mov(VReg.A0, VReg.S5);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.mov(VReg.A2, VReg.S3);
+        vm.call("_object_defineProperty_proxy");
+        vm.label("_osp_fwd_done");
+        vm.mov(VReg.RET, VReg.S2);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
         vm.label("_object_set_proxy_priv");
         vm.mov(VReg.A0, VReg.S0);
@@ -5997,6 +6754,152 @@ export class ObjectGenerator {
         vm.mov(VReg.A1, VReg.S1);
         vm.mov(VReg.A2, VReg.S3);
         vm.call("_object_defineProperty_proxy");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
+    }
+
+    // Reflect.set(target, key, value, receiver) -> boxed boolean.
+    // Implements the OrdinarySetWithOwnDescriptor path needed when receiver
+    // differs from target, including Proxy receiver MOP visibility.
+    generateReflectSetReceiver() {
+        const vm = this.vm;
+        const TRUE = 0x7ff9000000000001n;
+        const FALSE = 0x7ff9000000000002n;
+        const UNDEF = 0x7ffb000000000000n;
+        const key = (name) => {
+            vm.lea(VReg.A1, vm.asm.addString(name));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+            vm.or(VReg.A1, VReg.A1, VReg.V1);
+        };
+
+        vm.label("_reflect_set_receiver");
+        vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.mov(VReg.S0, VReg.A0); // target
+        vm.mov(VReg.S2, VReg.A2); // value
+        vm.mov(VReg.S3, VReg.A3); // receiver
+        vm.mov(VReg.A0, VReg.A1);
+        vm.call("_js_prop_key");
+        vm.mov(VReg.S1, VReg.RET); // key
+
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_getOwnPropertyDescriptor");
+        vm.store(VReg.SP, 0, VReg.RET); // targetDesc
+        vm.movImm64(VReg.V1, UNDEF);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_rsr_target_missing");
+
+        // Accessor descriptor: call [[Set]] with receiver as this.
+        vm.mov(VReg.A0, VReg.RET);
+        key("set");
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_rsr_target_data");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_maybe_setter");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_rsr_false");
+        vm.jmp("_rsr_true");
+
+        vm.label("_rsr_target_data");
+        vm.load(VReg.A0, VReg.SP, 0);
+        key("writable");
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_boolean");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_rsr_false");
+        vm.jmp("_rsr_receiver");
+
+        vm.label("_rsr_target_missing");
+        // No own descriptor: an inherited accessor still receives receiver.
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_maybe_setter");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_rsr_true");
+
+        vm.label("_rsr_receiver");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_getOwnPropertyDescriptor");
+        vm.store(VReg.SP, 8, VReg.RET); // receiverDesc
+        vm.movImm64(VReg.V1, UNDEF);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_rsr_receiver_new");
+        vm.mov(VReg.A0, VReg.RET);
+        key("set");
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_rsr_false");
+        vm.load(VReg.A0, VReg.SP, 8);
+        key("writable");
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_boolean");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_rsr_false");
+        vm.movImm(VReg.S4, 0); // value-only descriptor
+        vm.jmp("_rsr_make_desc");
+
+        vm.label("_rsr_receiver_new");
+        vm.movImm(VReg.S4, 1); // new property: W/E/C true
+        vm.label("_rsr_make_desc");
+        vm.call("_object_new");
+        vm.call("_box_obj_r");
+        vm.mov(VReg.S5, VReg.RET);
+        vm.cmpImm(VReg.S4, 0);
+        vm.jeq("_rsr_desc_value");
+        vm.movImm64(VReg.S4, TRUE);
+        for (const name of ["writable", "enumerable", "configurable"]) {
+            vm.mov(VReg.A0, VReg.S5);
+            key(name);
+            vm.mov(VReg.A2, VReg.S4);
+            vm.call("_object_set");
+        }
+        vm.label("_rsr_desc_value");
+        vm.mov(VReg.A0, VReg.S5);
+        key("value");
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_object_set");
+
+        // Proxy receiver must expose [[DefineOwnProperty]]; ordinary receiver
+        // can use the existing full dynamic descriptor path as well.
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V0, VReg.S3, VReg.V1);
+        vm.loadByte(VReg.V1, VReg.V0, 0);
+        vm.cmpImm(VReg.V1, TYPE_PROXY);
+        vm.jne("_rsr_define_ordinary");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.mov(VReg.A2, VReg.S5);
+        vm.call("_object_defineProperty_proxy");
+        vm.jmp("_rsr_true");
+        vm.label("_rsr_define_ordinary");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_object_define");
+        vm.cmpImm(VReg.S4, 0); // boxed true for new, zero for existing
+        vm.jeq("_rsr_true");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.movImm(VReg.A2, ATTR_DEFAULT);
+        vm.call("_object_set_prop_attr");
+
+        vm.label("_rsr_true");
+        vm.movImm64(VReg.RET, TRUE);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
+        vm.label("_rsr_false");
+        vm.movImm64(VReg.RET, FALSE);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
     }
 
@@ -6097,8 +7000,6 @@ export class ObjectGenerator {
         vm.push(VReg.S0); // 保对象(跨 user_tostr)
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_object_user_tostr");
-        vm.cmpImm(VReg.RET, 0);
-        vm.jeq("_jpk_otp_vo");
         vm.shrImm(VReg.V1, VReg.RET, 48);
         vm.cmpImm(VReg.V1, 0x7FFD);
         vm.jeq("_jpk_otp_vo"); // toString 仍对象 → 试 valueOf
@@ -6511,7 +7412,24 @@ export class ObjectGenerator {
         vm.label("_object_has_arr_done");
         vm.cmpImm(VReg.S3, 0); // 空串 → 侧表/false
         vm.jeq("_object_has_arr_side");
+        // TypedArray length is live with respect to resizable buffers; do not
+        // trust the cached header length for an out-of-bounds view.
+        vm.loadByte(VReg.V0, VReg.S0, 0);
+        vm.cmpImm(VReg.V0, TYPE_TA_LO);
+        vm.jlt("_object_has_len_ready");
+        vm.cmpImm(VReg.V0, TYPE_TA_HI);
+        vm.jgt("_object_has_len_ready");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_ta_is_oob");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_object_has_false");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_typed_array_length");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.jmp("_object_has_len_checked");
+        vm.label("_object_has_len_ready");
         vm.load(VReg.S2, VReg.S0, 8); // length @ +8
+        vm.label("_object_has_len_checked");
         vm.cmp(VReg.V3, VReg.S2);
         vm.jge("_object_has_arr_side"); // 越界索引仍可能在侧表(accessor define 未扩 length 的旧态)
         // TypedArray:界内 true。TYPE_ARRAY:槽!=0(真 hole);洞再查侧表
@@ -6534,8 +7452,14 @@ export class ObjectGenerator {
         vm.label("_object_has_arr_side");
         vm.loadByte(VReg.V0, VReg.S0, 0);
         vm.andImm(VReg.V0, VReg.V0, 0xff);
-        vm.cmpImm(VReg.V0, 1); // TYPE_ARRAY only
-        vm.jne("_object_has_false");
+        vm.cmpImm(VReg.V0, 1); // TYPE_ARRAY
+        vm.jeq("_object_has_array_side");
+        vm.cmpImm(VReg.V0, TYPE_TA_LO);
+        vm.jlt("_object_has_false");
+        vm.cmpImm(VReg.V0, TYPE_TA_HI);
+        vm.jgt("_object_has_false");
+        vm.jmp("_object_has_ta_side");
+        vm.label("_object_has_array_side");
         vm.mov(VReg.A0, VReg.S0); // 裸数组指针(侧表键)
         vm.call("_closure_props_find");
         vm.lea(VReg.V1, "_js_undefined");
@@ -6545,6 +7469,18 @@ export class ObjectGenerator {
         vm.mov(VReg.A0, VReg.RET); // props 对象
         vm.mov(VReg.A1, VReg.S1);  // key
         vm.call("_object_has");   // 递归:props 是 TYPE_OBJECT
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
+
+        vm.label("_object_has_ta_side");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_closure_props_find");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_object_has_false");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_has");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
 
         vm.label("_object_has_obj");
@@ -6729,11 +7665,24 @@ export class ObjectGenerator {
         vm.jeq("_prop_in_false");
         // Date(7)/Promise(11):ts/status 被当 count 野扫(`"foo" in date` SIGSEGV 根因)。
         vm.cmpImm(VReg.V0, TYPE_DATE);
-        vm.jeq("_prop_in_false");
+        vm.jeq("_prop_in_date_side");
         vm.cmpImm(VReg.V0, TYPE_PROMISE);
-        vm.jeq("_prop_in_false");
+        vm.jeq("_prop_in_date_side");
         // TEXT already handled above (before TA).
         vm.jmp("_prop_in_obj");
+
+        // Date/Promise own named properties live in the closure side table;
+        // ask the layout-aware own-property helper instead of interpreting
+        // timestamp/status as an ordinary object's property count.
+        vm.label("_prop_in_date_side");
+        vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+        vm.or(VReg.A0, VReg.S0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.S1, VReg.V1);
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_prop_in_true");
+        vm.jmp("_prop_in_false");
 
         vm.label("_prop_in_idx");
         // atoi(key content ptr = S1):全数字键 → idx;否则(含 "length")→ false(记偏差)。
@@ -6745,9 +7694,9 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.V0, 0);
         vm.jeq("_prop_in_arr_done");
         vm.cmpImm(VReg.V0, 48); // '0'
-        vm.jlt("_prop_in_false");
+        vm.jlt("_prop_in_idx_named");
         vm.cmpImm(VReg.V0, 57); // '9'
-        vm.jgt("_prop_in_false");
+        vm.jgt("_prop_in_idx_named");
         vm.subImm(VReg.V0, VReg.V0, 48);
         vm.movImm(VReg.V1, 10);
         vm.mul(VReg.V3, VReg.V3, VReg.V1);
@@ -6756,8 +7705,26 @@ export class ObjectGenerator {
         vm.addImm(VReg.V2, VReg.V2, 1);
         vm.jmp("_prop_in_arr_atoi");
         vm.label("_prop_in_arr_done");
-        vm.cmpImm(VReg.S3, 0);   // 空键 "" → false
-        vm.jeq("_prop_in_false");
+        vm.cmpImm(VReg.S3, 0);   // 空键 "" → 具名属性路径
+        vm.jeq("_prop_in_idx_named");
+        // TypedArray:OOB 视图按活长度判;勿读陈旧 length@8( rab.resize 后仍保留旧长)。
+        vm.loadByte(VReg.V0, VReg.S0, 0);
+        vm.cmpImm(VReg.V0, 1); // TYPE_ARRAY → 下方 length@8
+        vm.jeq("_prop_in_arr_len");
+        vm.cmpImm(VReg.V0, TYPE_TA_LO);
+        vm.jlt("_prop_in_arr_len");
+        vm.cmpImm(VReg.V0, TYPE_TA_HI);
+        vm.jgt("_prop_in_arr_len");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_ta_is_oob");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_prop_in_false");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_typed_array_length");
+        vm.cmp(VReg.V3, VReg.RET);
+        vm.jge("_prop_in_false");
+        vm.jmp("_prop_in_true");
+        vm.label("_prop_in_arr_len");
         vm.load(VReg.S2, VReg.S0, 8); // length @ block+8
         vm.cmp(VReg.V3, VReg.S2);
         vm.jge("_prop_in_arr_side");
@@ -6781,7 +7748,90 @@ export class ObjectGenerator {
         vm.call("_array_side_elem_has");
         vm.cmpImm(VReg.RET, 0);
         vm.jne("_prop_in_true");
-        vm.jmp("_prop_in_false");
+        vm.label("_prop_in_arr_proto");
+        // OrdinaryHasProperty continues through an array instance's custom
+        // prototype after own/side-table misses. The override is boxed (tagged
+        // null terminates the chain); recurse with the original key.
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_get_instance_proto");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_prop_in_arr_proto_ready");
+        // No per-instance override means the intrinsic Array.prototype, not
+        // the end of the chain.  The intrinsic array itself has an explicit
+        // Object.prototype override, so recursion then continues normally.
+        vm.call("_ensure_array_proto");
+        vm.lea(VReg.V0, "_nsobj_array_proto");
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_prop_in_false");
+        vm.label("_prop_in_arr_proto_ready");
+        // x64 V0 aliases RET: extracting the tag into V0 would replace the
+        // boxed prototype with 0x7FFD before _js_unbox and dereference 0x7FFD.
+        vm.shrImm(VReg.V1, VReg.RET, 48);
+        vm.cmpImm(VReg.V1, 0x7FFA);
+        vm.jeq("_prop_in_false");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_js_unbox");
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_prop_in");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 16);
+
+        // Named TypedArray keys: first consult ordinary side-table properties,
+        // then continue with the concrete TypedArray prototype chain.
+        vm.label("_prop_in_idx_named");
+        vm.loadByte(VReg.V0, VReg.S0, 0);
+        vm.cmpImm(VReg.V0, 1);
+        vm.jeq("_prop_in_arr_named");
+        vm.cmpImm(VReg.V0, TYPE_TA_LO);
+        vm.jlt("_prop_in_false");
+        vm.cmpImm(VReg.V0, TYPE_TA_HI);
+        vm.jgt("_prop_in_false");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_closure_props_find");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_prop_in_ta_proto");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.S1, VReg.V1);
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_prop_in_true");
+        vm.label("_prop_in_ta_proto");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_ta_getprototypeof");
+        vm.shrImm(VReg.V1, VReg.RET, 48);
+        vm.cmpImm(VReg.V1, 0x7FFA);
+        vm.jeq("_prop_in_false");
+        vm.cmpImm(VReg.V1, 0x7FFB);
+        vm.jeq("_prop_in_false");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_prop_in");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 16);
+
+        vm.label("_prop_in_arr_named");
+        // Array's exotic length is always an own property.
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.A1, vm.asm.addString("length"));
+        vm.call("_strcmp");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_prop_in_true");
+        // Other named/Symbol-like string keys live in the shared side table.
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_closure_props_find");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_prop_in_arr_proto");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.S1, VReg.V1);
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_prop_in_true");
+        vm.jmp("_prop_in_arr_proto");
         vm.label("_prop_in_obj");
 
         vm.load(VReg.S2, VReg.S0, 8); // count
@@ -6838,12 +7888,17 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.RET, 0);
         vm.jeq("_prop_in_proxy_fwd");
         // 调 has(target, key);_aref_invoke_cb 分派(this=undefined)
-        vm.mov(VReg.A3, VReg.RET);      // callback
+        // Preserve the trap before assembling arguments: arm64 RET aliases A0,
+        // while x64 A3 aliases V1.  S3 (the now-dead handler) avoids both.
+        vm.mov(VReg.S3, VReg.RET);
         vm.mov(VReg.A0, VReg.S2);       // target
+        // x64 V1 aliases A3 (RCX): finish boxing the key before loading the
+        // trap into A3, otherwise the tag mask replaces the callback.
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.S1, VReg.V1); // 装箱键(content→string)
         vm.lea(VReg.A2, "_js_undefined");
         vm.load(VReg.A2, VReg.A2, 0);
+        vm.mov(VReg.A3, VReg.S3);       // callback (last, after V1 scratch)
         vm.call("_aref_invoke_cb");
         vm.mov(VReg.A0, VReg.RET);
         vm.call("_to_boolean");
@@ -6901,6 +7956,23 @@ export class ObjectGenerator {
         vm.or(VReg.A1, VReg.S1, VReg.V1); // 装箱键
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_fn_has_own");         // RET = 裸 0/1
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_prop_in_true");
+        // 继承键(含 Function.prototype 上可枚举字段):走原型链,不触发
+        // _closure_prop_get(fun,"caller") 抛错(test262 13.2-18-1 verifyProperty/for-in)。
+        // S0 已在入口脱壳;gPO 的 0x7FFF 分派须装箱 fn 值(bind 继承 prop,15.2.3.6-4-595)。
+        vm.emitMaskLoad(VReg.V2);
+        vm.andMaskReg(VReg.A0, VReg.S0, VReg.V2);
+        vm.movImm64(VReg.V1, 0x7fff000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_object_getPrototypeOf");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_prop_in_false");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);       // 键 content 指针(同入口形态)
+        vm.call("_prop_in");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 16);
     }
 
@@ -6910,7 +7982,7 @@ export class ObjectGenerator {
     generateObjectForInKeys() {
         const vm = this.vm;
         vm.label("_object_forin_keys");
-        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.prologue(24, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
         vm.mov(VReg.S1, VReg.A0); // 当前对象
         vm.movImm(VReg.A0, 0);
         vm.call("_array_new_with_size"); // 裸头
@@ -6919,6 +7991,7 @@ export class ObjectGenerator {
         vm.call("_object_new");
         vm.call("_box_obj_r");
         vm.mov(VReg.S2, VReg.RET); // seen
+        vm.store(VReg.SP, 16, VReg.S2); // 保活 seen(_ensure_function_proto 等会腐蚀 S2)
         vm.label("_ofk_obj");
         vm.cmpImm(VReg.S1, 0);
         vm.jeq("_ofk_done");
@@ -6929,6 +8002,8 @@ export class ObjectGenerator {
         vm.jeq("_ofk_done");
         vm.cmpImm(VReg.V0, 0x7FFD);
         vm.jeq("_ofk_keys");
+        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jeq("_ofk_keys");
         vm.cmpImm(VReg.V0, 0x7FFF);
         vm.jeq("_ofk_keys");
         vm.cmpImm(VReg.V0, 0);
@@ -6936,12 +8011,14 @@ export class ObjectGenerator {
         vm.label("_ofk_keys");
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_object_keys");
+        vm.label("_ofk_keys_got");
         vm.store(VReg.SP, 0, VReg.RET);
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.V0, VReg.RET, VReg.V1);
         vm.load(VReg.S4, VReg.V0, 8);
         vm.movImm(VReg.S5, 0);
         vm.store(VReg.SP, 8, VReg.S5);
+        vm.load(VReg.S2, VReg.SP, 16); // 重载 seen(防上一步子调用腐蚀 S2)
         vm.label("_ofk_i");
         vm.load(VReg.S5, VReg.SP, 8);
         vm.cmp(VReg.S5, VReg.S4);
@@ -6958,7 +8035,10 @@ export class ObjectGenerator {
         vm.mov(VReg.A0, VReg.S2);
         vm.mov(VReg.A1, VReg.S3);
         vm.movImm64(VReg.A2, 0x7FF9000000000001n); // true
-        vm.call("_object_set");
+        // Internal [[Seen]] bookkeeping is a CreateDataProperty operation;
+        // using [[Set]] would invoke a user-installed Object.prototype setter
+        // (notably the empty-string setter in JSON wrapper tests).
+        vm.call("_object_define");
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S3);
         vm.call("_array_push_own");
@@ -6979,6 +8059,7 @@ export class ObjectGenerator {
         vm.load(VReg.S4, VReg.V0, 8);
         vm.movImm(VReg.S5, 0);
         vm.store(VReg.SP, 8, VReg.S5);
+        vm.load(VReg.S2, VReg.SP, 16);
         vm.label("_ofk_seen_i");
         vm.load(VReg.S5, VReg.SP, 8);
         vm.cmp(VReg.S5, VReg.S4);
@@ -6990,7 +8071,7 @@ export class ObjectGenerator {
         vm.mov(VReg.A0, VReg.S2);
         vm.mov(VReg.A1, VReg.S3);
         vm.movImm64(VReg.A2, 0x7FF9000000000001n);
-        vm.call("_object_set");
+        vm.call("_object_define");
         vm.load(VReg.S5, VReg.SP, 8);
         vm.addImm(VReg.S5, VReg.S5, 1);
         vm.store(VReg.SP, 8, VReg.S5);
@@ -6999,10 +8080,11 @@ export class ObjectGenerator {
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_object_getPrototypeOf");
         vm.mov(VReg.S1, VReg.RET);
+        vm.load(VReg.S2, VReg.SP, 16); // 重载 seen(防 getPrototypeOf 腐蚀 S2)
         vm.jmp("_ofk_obj");
         vm.label("_ofk_done");
         vm.mov(VReg.RET, VReg.S0);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 16);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 24);
     }
 
     // Object.keys(obj) -> 返回包含所有键的数组
@@ -7114,13 +8196,18 @@ export class ObjectGenerator {
         vm.mov(VReg.A2, VReg.A1);
         vm.mov(VReg.A3, VReg.S1);
         vm.call("_aref_invoke_cb"); // RET = 键数组
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_proxy_ownkeys_to_list");
         vm.mov(VReg.S1, VReg.RET);
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S1);
         vm.call("_proxy_ownkeys_validate");
+        vm.cmpImm(VReg.S5, 0);
+        vm.jeq("_object_keys_proxy_enum");
         vm.cmpImm(VReg.S5, 1);
         vm.jne("_object_keys_proxy_ret");
         // gOPN: validate full trap (incl. symbols) then keep strings only.
+        vm.label("_object_keys_proxy_filter_strings");
         vm.movImm(VReg.A0, 0);
         vm.call("_array_new_with_size");
         vm.mov(VReg.S2, VReg.RET);
@@ -7180,6 +8267,53 @@ export class ObjectGenerator {
         vm.movImm64(VReg.V1, 0x7FFE000000000000n);
         vm.or(VReg.RET, VReg.S2, VReg.V1);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 0);
+        vm.label("_object_keys_proxy_enum");
+        // EnumerableOwnPropertyNames: after the one validated ownKeys snapshot,
+        // query [[GetOwnProperty]] for every String key and keep enumerable ones.
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_array_length");
+        vm.mov(VReg.S3, VReg.RET);
+        vm.movImm(VReg.S4, 0);
+        vm.label("_object_keys_proxy_enum_loop");
+        vm.cmp(VReg.S4, VReg.S3);
+        vm.jge("_object_keys_proxy_enum_done");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_array_get");
+        vm.mov(VReg.S5, VReg.RET); // current key (mode no longer needed)
+        vm.mov(VReg.A0, VReg.S5);
+        vm.call("_is_symbol");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_object_keys_proxy_enum_next");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S5);
+        vm.call("_object_getOwnPropertyDescriptor");
+        vm.shrImm(VReg.V1, VReg.RET, 48);
+        vm.cmpImm(VReg.V1, 0x7FFB);
+        vm.jeq("_object_keys_proxy_enum_next");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, vm.asm.addString("enumerable"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_boolean");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_object_keys_proxy_enum_next");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.mov(VReg.A1, VReg.S5);
+        vm.call("_array_push_own");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.label("_object_keys_proxy_enum_next");
+        vm.addImm(VReg.S4, VReg.S4, 1);
+        vm.jmp("_object_keys_proxy_enum_loop");
+        vm.label("_object_keys_proxy_enum_done");
+        vm.movImm64(VReg.V1, 0x7FFE000000000000n);
+        vm.or(VReg.RET, VReg.S2, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 0);
         vm.label("_object_keys_proxy_fwd");
         // Missing trap → target.[[OwnPropertyKeys]]. Honor S5 so
         // _object_own_keys_all keeps symbols (isFrozen/proxy-no-ownkeys order).
@@ -7188,13 +8322,15 @@ export class ObjectGenerator {
         vm.jeq("_object_keys_proxy_fwd_all");
         vm.cmpImm(VReg.S5, 1);
         vm.jeq("_object_keys_proxy_fwd_own");
-        vm.call("_object_keys");
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 0);
+        vm.call("_object_all_own_keys");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.jmp("_object_keys_proxy_enum");
         vm.label("_object_keys_proxy_fwd_own");
-        vm.call("_object_own_keys");
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 0);
+        vm.call("_object_all_own_keys");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.jmp("_object_keys_proxy_filter_strings");
         vm.label("_object_keys_proxy_fwd_all");
-        vm.call("_object_own_keys_all");
+        vm.call("_object_all_own_keys");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 0);
         vm.label("_object_keys_np");
 
@@ -7281,6 +8417,18 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.RET, 0);
         vm.jne("_object_keys_next");
 
+        // Property tables created during host/global initialisation may retain
+        // a raw interned string pointer as the key.  OwnPropertyKeys must expose
+        // a String value, not that pointer's numeric bit pattern.  Symbols were
+        // filtered immediately above, so every remaining raw key is a string.
+        vm.shrImm(VReg.V0, VReg.S4, 48);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_object_keys_key_boxed");
+        vm.mov(VReg.A0, VReg.S4);
+        vm.call("_js_box_string");
+        vm.mov(VReg.S4, VReg.RET);
+        vm.label("_object_keys_key_boxed");
+
         // [L1-Object] 包装内部槽名过滤(双保险:即便旧对象 flags 未标非枚举,keys/gOPN
         // 也不暴露 `__boolean_value`/`__number_value`)。
         vm.shrImm(VReg.V0, VReg.S4, 48);
@@ -7361,10 +8509,9 @@ export class ObjectGenerator {
         vm.movImm(VReg.S1, 0);
         vm.jmp("_object_keys_idx_build");
 
-        // TypedArray → 索引键 ["0",...,"liveLen-1"](无侧表合并:TA 布局无 props)
+        // TypedArray → 索引键 ["0",...,"liveLen-1"] + 具名侧表键
         vm.label("_object_keys_ta");
         vm.mov(VReg.A0, VReg.S0); // 裸 TA(_typed_array_length 接受装箱/裸)
-        vm.movImm(VReg.S0, 0);
         vm.call("_typed_array_length");
         vm.mov(VReg.S1, VReg.RET);
         vm.jmp("_object_keys_idx_build");
@@ -7389,9 +8536,67 @@ export class ObjectGenerator {
         vm.cmp(VReg.S3, VReg.S1); vm.jge("_object_keys_idx_done");
         vm.scvtf(0, VReg.S3); vm.fmovToInt(VReg.A0, 0); // A0 = i 的 float64 位
         vm.call("_valueToStr"); // RET = boxed 字符串键
-        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.S4, VReg.RET);
+        // Strings and TypedArrays have every in-range index.  Array/Arguments
+        // indices may be holes or may have a side-table descriptor installed by
+        // defineProperty; the latter descriptor's enumerable bit controls keys
+        // and for-in even when a dense slot also exists.
+        vm.cmpImm(VReg.S0, 0);
+        vm.jeq("_object_keys_idx_emit");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V2, VReg.S0, VReg.V1);
+        vm.loadByte(VReg.V0, VReg.V2, 0);
+        vm.cmpImm(VReg.V0, 1); // TYPE_ARRAY / Arguments
+        vm.jne("_object_keys_idx_emit");
+        vm.loadByte(VReg.V0, VReg.V2, 1);
+        vm.andImm(VReg.V0, VReg.V0, ARR_HAS_SIDETABLE);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_object_keys_idx_dense");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_closure_props_find");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_object_keys_idx_dense");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_object_getOwnPropertyDescriptor");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_object_keys_idx_dense");
+        vm.cmpImm(VReg.S5, 0);
+        vm.jne("_object_keys_idx_emit");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, vm.asm.addString("enumerable"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_boolean");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_object_keys_idx_next");
+        vm.jmp("_object_keys_idx_emit");
+        vm.label("_object_keys_idx_dense");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V2, VReg.S0, VReg.V1);
+        vm.load(VReg.V1, VReg.V2, 16); // physical capacity
+        vm.cmp(VReg.S3, VReg.V1);
+        vm.jge("_object_keys_idx_next"); // sparse logical range has no dense slot
+        vm.load(VReg.V1, VReg.V2, 24); // data_ptr
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_object_keys_idx_next");
+        vm.shl(VReg.V0, VReg.S3, 3);
+        vm.add(VReg.V1, VReg.V1, VReg.V0);
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_object_keys_idx_next"); // hole
+        vm.label("_object_keys_idx_emit");
+        vm.mov(VReg.A1, VReg.S4);
         vm.mov(VReg.A0, VReg.S2);
         vm.call("_array_push_own");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.label("_object_keys_idx_next");
         vm.addImm(VReg.S3, VReg.S3, 1);
         vm.jmp("_object_keys_idx_loop");
         vm.label("_object_keys_idx_done");
@@ -7440,6 +8645,28 @@ export class ObjectGenerator {
         vm.mov(VReg.A0, VReg.S4);
         vm.mov(VReg.A1, VReg.S3);
         vm.call("_array_get");
+        // Arguments has an own legacy `callee` slot, but it is non-enumerable.
+        // The compact arguments side table does not otherwise need to expose
+        // that internal default attribute through Object.keys/for-in.
+        vm.cmpImm(VReg.S5, 0);
+        vm.jne("_object_keys_idx_side_push");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V2, VReg.S0, VReg.V1);
+        vm.loadByte(VReg.V1, VReg.V2, 1);
+        vm.andImm(VReg.V1, VReg.V1, ARR_IS_ARGUMENTS);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_object_keys_idx_side_push");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_getStrContent");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, vm.asm.addString("callee"));
+        vm.call("_strcmp");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_object_keys_idx_side_next");
+        vm.mov(VReg.A0, VReg.S4);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_array_get");
+        vm.label("_object_keys_idx_side_push");
         vm.mov(VReg.A1, VReg.RET);
         vm.mov(VReg.A0, VReg.S2);
         vm.call("_array_push_own");
@@ -7938,13 +9165,47 @@ export class ObjectGenerator {
         vm.lea(VReg.V1, "_nsobj_set_iter_proto");
         vm.store(VReg.V1, 0, VReg.A0);
         // @@toStringTag = "Set Iterator"
+        vm.lea(VReg.A0, "_symwk_toStringTag");
+        vm.lea(VReg.A1, vm.asm.addString("Symbol.toStringTag"));
+        vm.movImm64(VReg.V0, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V0);
+        vm.call("_symbol_wellknown");
+        vm.mov(VReg.S1, VReg.RET);
         vm.lea(VReg.V0, "_nsobj_set_iter_proto");
         vm.load(VReg.A0, VReg.V0, 0);
         vm.mov(VReg.A1, VReg.S1);
         vm.lea(VReg.A2, vm.asm.addString("Set Iterator"));
         vm.movImm64(VReg.V0, 0x7ffc000000000000n); vm.or(VReg.A2, VReg.A2, VReg.V0);
-        vm.call("_object_set");
+        vm.call("_object_define");
         vm.lea(VReg.V0, "_nsobj_set_iter_proto");
+        vm.load(VReg.A0, VReg.V0, 0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.movImm(VReg.A2, 4);
+        vm.call("_object_set_prop_attr");
+        // MapIteratorPrototype mirrors SetIteratorPrototype but has its own
+        // observable @@toStringTag and shares Iterator.prototype as parent.
+        vm.call("_object_new_raw");
+        vm.mov(VReg.S0, VReg.RET);
+        vm.lea(VReg.V0, "_nsobj_iterator_proto");
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.emitMaskLoad(VReg.V2);
+        vm.andMaskReg(VReg.V1, VReg.V1, VReg.V2);
+        vm.store(VReg.S0, 16, VReg.V1);
+        vm.movImm64(VReg.V0, 0x7ffd000000000000n);
+        vm.or(VReg.A0, VReg.S0, VReg.V0);
+        vm.lea(VReg.V1, "_nsobj_map_iter_proto");
+        vm.store(VReg.V1, 0, VReg.A0);
+        vm.lea(VReg.A0, "_symwk_toStringTag");
+        vm.lea(VReg.A1, vm.asm.addString("Symbol.toStringTag"));
+        vm.movImm64(VReg.V0, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V0);
+        vm.call("_symbol_wellknown");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.lea(VReg.V0, "_nsobj_map_iter_proto");
+        vm.load(VReg.A0, VReg.V0, 0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.lea(VReg.A2, vm.asm.addString("Map Iterator"));
+        vm.movImm64(VReg.V0, 0x7ffc000000000000n); vm.or(VReg.A2, VReg.A2, VReg.V0);
+        vm.call("_object_define");
+        vm.lea(VReg.V0, "_nsobj_map_iter_proto");
         vm.load(VReg.A0, VReg.V0, 0);
         vm.mov(VReg.A1, VReg.S1);
         vm.movImm(VReg.A2, 4);
@@ -7991,6 +9252,540 @@ export class ObjectGenerator {
         vm.epilogue([VReg.S0], 0);
     }
 
+    // Safe Get(O, @@toStringTag) shared by Object.prototype.toString. Primitive
+    // values are redirected to their materialized prototypes; compact exotics
+    // whose instance headers cannot hold ordinary properties use their prototype
+    // singleton as well. Returns undefined when no prototype has been materialized.
+    generateObjectGetToStringTag() {
+        const vm = this.vm;
+        vm.label("_object_get_tostring_tag");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0); // original this value
+        vm.shrImm(VReg.V0, VReg.S0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFA); vm.jeq("_ogtt_undef");
+        vm.cmpImm(VReg.V0, 0x7FFB); vm.jeq("_ogtt_undef");
+        vm.cmpImm(VReg.V0, 0x7FF9); vm.jeq("_ogtt_bool");
+        vm.cmpImm(VReg.V0, 0x7FFC); vm.jeq("_ogtt_string");
+        vm.cmpImm(VReg.V0, 0x7FF8); vm.jeq("_ogtt_number");
+        vm.cmpImm(VReg.V0, 0x7FFD); vm.jeq("_ogtt_direct");
+        vm.cmpImm(VReg.V0, 0x7FFE); vm.jeq("_ogtt_direct");
+        vm.cmpImm(VReg.V0, 0x7FFF); vm.jeq("_ogtt_function");
+        vm.cmpImm(VReg.V0, 0); vm.jne("_ogtt_number"); // raw float
+        vm.cmpImm(VReg.S0, 0); vm.jeq("_ogtt_number");
+        vm.movImm64(VReg.V1, vm.ptrFloor);
+        vm.cmp(VReg.S0, VReg.V1); vm.jlt("_ogtt_number");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_is_symbol");
+        vm.cmpImm(VReg.RET, 0); vm.jne("_ogtt_symbol");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_is_bigint");
+        vm.cmpImm(VReg.RET, 0); vm.jne("_ogtt_bigint");
+        vm.loadByte(VReg.V0, VReg.S0, 0);
+        vm.cmpImm(VReg.V0, TYPE_MAP); vm.jeq("_ogtt_map");
+        vm.cmpImm(VReg.V0, TYPE_SET); vm.jeq("_ogtt_set");
+        vm.cmpImm(VReg.V0, TYPE_PROMISE); vm.jeq("_ogtt_promise");
+        vm.jmp("_ogtt_direct");
+
+        vm.label("_ogtt_bool"); vm.lea(VReg.V0, "_nsobj_boolean_proto"); vm.jmp("_ogtt_slot");
+        vm.label("_ogtt_string"); vm.lea(VReg.V0, "_nsobj_string_proto"); vm.jmp("_ogtt_slot");
+        vm.label("_ogtt_number"); vm.lea(VReg.V0, "_nsobj_number_proto"); vm.jmp("_ogtt_slot");
+        vm.label("_ogtt_symbol"); vm.lea(VReg.V0, "_nsobj_symbol_proto"); vm.jmp("_ogtt_slot");
+        vm.label("_ogtt_bigint"); vm.lea(VReg.V0, "_nsobj_bigint_proto"); vm.jmp("_ogtt_slot");
+        vm.label("_ogtt_promise"); vm.lea(VReg.V0, "_nsobj_promise_proto"); vm.jmp("_ogtt_slot");
+        vm.label("_ogtt_map");
+        vm.load(VReg.V1, VReg.S0, 48);
+        vm.cmpImm(VReg.V1, 0); vm.jne("_ogtt_weakmap");
+        vm.lea(VReg.V0, "_nsobj_map_proto"); vm.jmp("_ogtt_slot");
+        vm.label("_ogtt_weakmap"); vm.lea(VReg.V0, "_nsobj_weakmap_proto"); vm.jmp("_ogtt_slot");
+        vm.label("_ogtt_set");
+        vm.load(VReg.V1, VReg.S0, 48);
+        vm.cmpImm(VReg.V1, 0); vm.jne("_ogtt_weakset");
+        vm.lea(VReg.V0, "_nsobj_set_proto"); vm.jmp("_ogtt_slot");
+        vm.label("_ogtt_weakset"); vm.lea(VReg.V0, "_nsobj_weakset_proto");
+        vm.label("_ogtt_slot");
+        vm.load(VReg.S1, VReg.V0, 0);
+        vm.cmpImm(VReg.S1, 0); vm.jeq("_ogtt_undef");
+        vm.jmp("_ogtt_get");
+        // Generator/Async/AsyncGenerator functions inherit @@toStringTag from
+        // a distinct intrinsic prototype.  Function values are represented by
+        // compact closure blocks, so recover their code pointer and use the
+        // compiler metadata table to select that materialized prototype.
+        vm.label("_ogtt_function");
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.V0, VReg.S0, VReg.V1);          // V0 = closure/raw code P
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.cmpImm(VReg.V1, 0xc105); vm.jeq("_ogtt_function_closure");
+        vm.cmpImm(VReg.V1, 0xa51c); vm.jeq("_ogtt_function_closure");
+        vm.mov(VReg.A0, VReg.V0);
+        vm.jmp("_ogtt_function_kind");
+        vm.label("_ogtt_function_closure");
+        vm.load(VReg.A0, VReg.V0, 8);
+        vm.label("_ogtt_function_kind");
+        vm.call("_func_meta_find");
+        vm.cmpImm(VReg.RET, 1); vm.jeq("_ogtt_genfunc");
+        vm.cmpImm(VReg.RET, 2); vm.jeq("_ogtt_asyncfunc");
+        vm.cmpImm(VReg.RET, 3); vm.jeq("_ogtt_asyncgenfunc");
+        vm.jmp("_ogtt_direct");
+        vm.label("_ogtt_genfunc");
+        vm.call("_ensure_genfunc_tag_proto");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.jmp("_ogtt_get");
+        vm.label("_ogtt_asyncfunc");
+        vm.call("_ensure_asyncfunc_tag_proto");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.jmp("_ogtt_get");
+        vm.label("_ogtt_asyncgenfunc");
+        vm.call("_ensure_asyncgenfunc_tag_proto");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.jmp("_ogtt_get");
+        vm.label("_ogtt_direct");
+        vm.mov(VReg.S1, VReg.S0);
+        vm.label("_ogtt_get");
+        vm.lea(VReg.A0, "_symwk_toStringTag");
+        vm.lea(VReg.A1, vm.asm.addString("Symbol.toStringTag"));
+        vm.movImm64(VReg.V0, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V0);
+        vm.call("_symbol_wellknown");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.call("_maybe_getter");
+        vm.shrImm(VReg.V0, VReg.RET, 48);
+        vm.cmpImm(VReg.V0, 0x7FFB);
+        vm.jne("_ogtt_done");
+        // Some compiler paths represent a computed well-known key by its
+        // canonical string alias. Consult that alias only for non-Proxies so
+        // Proxy get traps retain the single-Get observable contract.
+        vm.shrImm(VReg.V0, VReg.S1, 48);
+        vm.cmpImm(VReg.V0, 0x7FFD); vm.jne("_ogtt_alias");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V0, VReg.S1, VReg.V1);
+        vm.loadByte(VReg.V1, VReg.V0, 0);
+        vm.cmpImm(VReg.V1, TYPE_PROXY); vm.jeq("_ogtt_done");
+        vm.label("_ogtt_alias");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.A1, vm.asm.addString("Symbol.toStringTag"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.call("_maybe_getter");
+        vm.label("_ogtt_done");
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_ogtt_undef");
+        vm.lea(VReg.RET, "_js_undefined");
+        vm.load(VReg.RET, VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+    }
+
+    // Iterator prototype singletons used by the Array/String iterator shims.
+    // They are ordinary objects so test262 can mutate/delete @@toStringTag on
+    // the prototype and Object.prototype.toString observes the change.
+    generateIndexedIteratorProtos() {
+        const vm = this.vm;
+        for (const [slot, tag] of [["_nsobj_array_iter_proto", "Array Iterator"], ["_nsobj_string_iter_proto", "String Iterator"]]) {
+            vm.asm.addDataLabel(slot);
+            vm.asm.addDataQword(0);
+            vm.label(slot + "_ensure");
+            vm.prologue(0, [VReg.S0, VReg.S1]);
+            vm.lea(VReg.V0, slot);
+            vm.load(VReg.RET, VReg.V0, 0);
+            vm.cmpImm(VReg.RET, 0);
+            vm.jne(slot + "_done");
+            vm.call("_ensure_set_iter_protos");
+            vm.call("_object_new_raw");
+            vm.mov(VReg.S0, VReg.RET);
+            vm.lea(VReg.V0, "_nsobj_iterator_proto");
+            vm.load(VReg.V1, VReg.V0, 0);
+            vm.emitMaskLoad(VReg.V2);
+            vm.andMaskReg(VReg.V1, VReg.V1, VReg.V2);
+            vm.store(VReg.S0, 16, VReg.V1);
+            vm.lea(VReg.A0, "_symwk_toStringTag");
+            vm.lea(VReg.A1, vm.asm.addString("Symbol.toStringTag"));
+            vm.movImm64(VReg.V0, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V0);
+            vm.call("_symbol_wellknown");
+            vm.mov(VReg.S1, VReg.RET);
+            vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+            vm.or(VReg.A0, VReg.S0, VReg.V1);
+            vm.lea(VReg.V1, slot);
+            vm.store(VReg.V1, 0, VReg.A0);
+            vm.lea(VReg.A0, "_symwk_toStringTag");
+            vm.lea(VReg.A1, vm.asm.addString("Symbol.toStringTag"));
+            vm.movImm64(VReg.V0, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V0);
+            vm.call("_symbol_wellknown");
+            vm.mov(VReg.S1, VReg.RET);
+            vm.lea(VReg.V0, slot); vm.load(VReg.A0, VReg.V0, 0);
+            vm.mov(VReg.A1, VReg.S1);
+            vm.lea(VReg.A2, vm.asm.addString(tag));
+            vm.movImm64(VReg.V0, 0x7ffc000000000000n); vm.or(VReg.A2, VReg.A2, VReg.V0);
+            vm.call("_object_define");
+            vm.lea(VReg.V0, slot); vm.load(VReg.A0, VReg.V0, 0);
+            vm.mov(VReg.A1, VReg.S1); vm.movImm(VReg.A2, 4);
+            vm.call("_object_set_prop_attr");
+            vm.lea(VReg.V0, slot);
+            vm.load(VReg.RET, VReg.V0, 0);
+            vm.label(slot + "_done");
+            vm.epilogue([VReg.S0, VReg.S1], 0);
+        }
+    }
+
+    // Real %GeneratorFunction.prototype% / %AsyncFunction.prototype% tag
+    // objects. Their @@toStringTag properties are configurable and therefore
+    // must be stored state, not a hard-coded result in toString. Small
+    // constructor singletons expose those prototypes for fn.constructor.prototype.
+    generateFunctionKindTagProtos() {
+        const vm = this.vm;
+        // The eval shim is only linked for programs which actually invoke a
+        // dynamic function constructor.  Its module initialiser installs the
+        // three AOT maker closures into rooted runtime slots.
+        vm.label("_dynamic_fn_maker_set");
+        vm.lea(VReg.V0, "_dynamic_gen_maker"); vm.store(VReg.V0, 0, VReg.A0);
+        vm.lea(VReg.V0, "_dynamic_async_maker"); vm.store(VReg.V0, 0, VReg.A1);
+        vm.lea(VReg.V0, "_dynamic_asyncgen_maker"); vm.store(VReg.V0, 0, VReg.A2);
+        vm.lea(VReg.RET, "_js_undefined"); vm.load(VReg.RET, VReg.RET, 0);
+        vm.ret();
+
+        const emitDynamicCtorCall = (label, slot) => {
+            vm.label(label);
+            vm.prologue(96, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+            // Snapshot the constructor's source arguments before any helper
+            // call clobbers A0/RAX. `_fn_construct_call` uses the same
+            // ordinary-function A0..A4 convention for [[Call]] and
+            // [[Construct]]; `_call_argv` holds arguments 5..15.
+            vm.store(VReg.SP, 0, VReg.A0);
+            vm.store(VReg.SP, 8, VReg.A1);
+            vm.store(VReg.SP, 16, VReg.A2);
+            vm.store(VReg.SP, 24, VReg.A3);
+            vm.store(VReg.SP, 32, VReg.A4);
+            vm.lea(VReg.V0, "_call_argc"); vm.load(VReg.S4, VReg.V0, 0);
+            vm.lea(VReg.V0, "_call_new_target"); vm.load(VReg.S2, VReg.V0, 0);
+            // Build the actual CreateDynamicFunction argument list.
+            vm.mov(VReg.A0, VReg.S4); vm.call("_array_new_with_size");
+            vm.mov(VReg.S5, VReg.RET); // raw array
+            for (let i = 0; i < 16; i++) {
+                const skip = label + "_arg_skip_" + i;
+                vm.cmpImm(VReg.S4, i); vm.jle(skip);
+                if (i < 5) {
+                    vm.load(VReg.A2, VReg.SP, i * 8);
+                } else {
+                    vm.lea(VReg.V0, "_call_argv");
+                    vm.load(VReg.A2, VReg.V0, i * 8);
+                }
+                vm.mov(VReg.A0, VReg.S5); vm.movImm(VReg.A1, i);
+                vm.call("_array_set");
+                vm.label(skip);
+            }
+            vm.mov(VReg.A0, VReg.S5); vm.call("_box_arr_r");
+            vm.mov(VReg.S3, VReg.RET); // boxed args array
+            vm.lea(VReg.V0, slot); vm.load(VReg.S0, VReg.V0, 0);
+            vm.cmpImm(VReg.S0, 0); vm.jeq(label + "_missing");
+            vm.emitMaskLoad(VReg.V1); vm.andMaskReg(VReg.S0, VReg.S0, VReg.V1);
+            vm.load(VReg.S1, VReg.S0, 8);
+            // Maker ABI: (kind, argumentList, NewTarget), ordinary non-strict this.
+            const kind = slot.indexOf("asyncgen") >= 0 ? 3 :
+                (slot.indexOf("async") >= 0 ? 2 : 1);
+            vm.lea(VReg.V0, "_global_this"); vm.load(VReg.A0, VReg.V0, 0);
+            vm.call("_box_obj_r"); vm.mov(VReg.A5, VReg.RET);
+            vm.movImm(VReg.A0, kind); vm.scvtf(0, VReg.A0); vm.fmovToInt(VReg.A0, 0);
+            vm.mov(VReg.A1, VReg.S3);
+            vm.mov(VReg.A2, VReg.S2);
+            vm.lea(VReg.A3, "_js_undefined"); vm.load(VReg.A3, VReg.A3, 0);
+            vm.mov(VReg.A4, VReg.A3);
+            vm.lea(VReg.V0, "_call_argc"); vm.movImm(VReg.V1, 3); vm.store(VReg.V0, 0, VReg.V1);
+            vm.lea(VReg.V0, "_call_new_target"); vm.lea(VReg.V1, "_js_undefined"); vm.load(VReg.V1, VReg.V1, 0); vm.store(VReg.V0, 0, VReg.V1);
+            vm.callIndirect(VReg.S1);
+            vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 96);
+            vm.label(label + "_missing");
+            vm.call("_throw_not_a_function");
+        };
+        emitDynamicCtorCall("_dynamic_gen_ctor_call", "_dynamic_gen_maker");
+        emitDynamicCtorCall("_dynamic_async_ctor_call", "_dynamic_async_maker");
+        emitDynamicCtorCall("_dynamic_asyncgen_ctor_call", "_dynamic_asyncgen_maker");
+
+        // Register one mmap-backed function in the host metadata universe.
+        // Nodes deliberately start with the static table's 32-byte layout;
+        // next@32 and the optional exact [[Prototype]]@40 are dynamic-only.
+        vm.label("_dynamic_fn_meta_add");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.mov(VReg.S0, VReg.A0); // boxed function
+        vm.mov(VReg.S1, VReg.A1); // full kind bits (brand/strict/nonctor)
+        vm.mov(VReg.S2, VReg.A2); // canonical arity
+        vm.mov(VReg.V3, VReg.A3); // raw persistent name string
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V0, VReg.S0, VReg.V1);
+        vm.load(VReg.S3, VReg.V0, 8); // mmap code pointer
+        vm.push(VReg.S0); vm.push(VReg.V3);
+        vm.movImm(VReg.A0, 48); vm.call("_alloc");
+        vm.mov(VReg.V2, VReg.RET);
+        vm.pop(VReg.V3); vm.pop(VReg.S0);
+        vm.store(VReg.V2, 0, VReg.S3);
+        vm.store(VReg.V2, 8, VReg.S1);
+        vm.store(VReg.V2, 16, VReg.V3);
+        vm.store(VReg.V2, 24, VReg.S2);
+        vm.lea(VReg.V0, "_dynamic_func_meta_root");
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.store(VReg.V2, 32, VReg.V1);
+        vm.movImm(VReg.V1, 0); vm.store(VReg.V2, 40, VReg.V1);
+        vm.store(VReg.V0, 0, VReg.V2);
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+
+        // Persist GetPrototypeFromConstructor for one mmap-backed function.
+        // A0 is the boxed function and A1 the exact boxed prototype object.
+        vm.label("_dynamic_fn_meta_set_proto");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.emitMaskLoad(VReg.V1); vm.andMaskReg(VReg.S2, VReg.S0, VReg.V1);
+        vm.load(VReg.V0, VReg.S2, 0);
+        vm.cmpImm(VReg.V0, 0xc105); vm.jeq("_dfmsp_closure");
+        vm.cmpImm(VReg.V0, 0xa51c); vm.jeq("_dfmsp_closure");
+        vm.jmp("_dfmsp_code_ready");
+        vm.label("_dfmsp_closure");
+        vm.load(VReg.S2, VReg.S2, 8);
+        vm.label("_dfmsp_code_ready");
+        vm.lea(VReg.V0, "_dynamic_func_meta_root"); vm.load(VReg.V0, VReg.V0, 0);
+        vm.label("_dfmsp_loop");
+        vm.cmpImm(VReg.V0, 0); vm.jeq("_dfmsp_done");
+        vm.load(VReg.V1, VReg.V0, 0); vm.cmp(VReg.V1, VReg.S2); vm.jeq("_dfmsp_hit");
+        vm.load(VReg.V0, VReg.V0, 32); vm.jmp("_dfmsp_loop");
+        vm.label("_dfmsp_hit");
+        // Generic Get(classInfo, "prototype") currently yields the raw
+        // TYPE_OBJECT payload, while a direct Class.prototype expression is
+        // canonical 0x7FFD.  Store the canonical object value so SameValue and
+        // instanceof observe one identity across both access paths.
+        vm.shrImm(VReg.V1, VReg.S1, 48);
+        vm.cmpImm(VReg.V1, 0); vm.jne("_dfmsp_store");
+        vm.loadByte(VReg.V1, VReg.S1, 0);
+        vm.cmpImm(VReg.V1, TYPE_OBJECT); vm.jne("_dfmsp_store");
+        vm.movImm64(VReg.V1, 0x7ffd000000000000n); vm.or(VReg.S1, VReg.S1, VReg.V1);
+        vm.label("_dfmsp_store");
+        vm.store(VReg.V0, 40, VReg.S1);
+        vm.label("_dfmsp_done");
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+
+        // A0=code pointer -> the dynamic function's exact boxed [[Prototype]],
+        // or 0 when it should use the intrinsic kind fallback.
+        vm.label("_dynamic_fn_meta_proto");
+        vm.prologue(0, [VReg.S0]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.lea(VReg.V0, "_dynamic_func_meta_root"); vm.load(VReg.V0, VReg.V0, 0);
+        vm.label("_dfmp_loop");
+        vm.cmpImm(VReg.V0, 0); vm.jeq("_dfmp_none");
+        vm.load(VReg.V1, VReg.V0, 0); vm.cmp(VReg.V1, VReg.S0); vm.jeq("_dfmp_hit");
+        vm.load(VReg.V0, VReg.V0, 32); vm.jmp("_dfmp_loop");
+        vm.label("_dfmp_hit");
+        vm.load(VReg.RET, VReg.V0, 40);
+        vm.epilogue([VReg.S0], 0);
+        vm.label("_dfmp_none");
+        vm.movImm(VReg.RET, 0);
+        vm.epilogue([VReg.S0], 0);
+
+        // Runtime fallback for %Function% when a specialised constructor's
+        // [[Prototype]] is queried before a source-level `Function` identifier
+        // has materialised the compiler-side singleton.
+        vm.label("_function_empty_runtime");
+        vm.lea(VReg.RET, "_js_undefined");
+        vm.load(VReg.RET, VReg.RET, 0);
+        vm.ret();
+
+        vm.label("_function_ctor_runtime_call");
+        vm.prologue(0, [VReg.S0]);
+        vm.movImm(VReg.A0, 16); vm.call("_alloc"); vm.mov(VReg.S0, VReg.RET);
+        vm.movImm(VReg.V1, 0xc105); vm.store(VReg.S0, 0, VReg.V1);
+        vm.lea(VReg.V1, "_function_empty_runtime"); vm.store(VReg.S0, 8, VReg.V1);
+        vm.mov(VReg.A0, VReg.S0); vm.call("_js_box_function");
+        vm.epilogue([VReg.S0], 0);
+
+        vm.label("_ensure_function_ctor_runtime");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.lea(VReg.V0, "_fnctor_singleton"); vm.load(VReg.RET, VReg.V0, 0);
+        vm.cmpImm(VReg.RET, 0); vm.jne("_ensure_function_ctor_runtime_done");
+        vm.call("_ensure_function_proto"); vm.mov(VReg.S1, VReg.RET);
+        vm.movImm(VReg.A0, 16); vm.call("_alloc"); vm.mov(VReg.S0, VReg.RET);
+        vm.movImm(VReg.V1, 0xc105); vm.store(VReg.S0, 0, VReg.V1);
+        vm.lea(VReg.V1, "_function_ctor_runtime_call"); vm.store(VReg.S0, 8, VReg.V1);
+        vm.mov(VReg.A0, VReg.S0); vm.call("_js_box_function"); vm.mov(VReg.S0, VReg.RET);
+        vm.lea(VReg.V0, "_fnctor_singleton"); vm.store(VReg.V0, 0, VReg.S0);
+        for (const [name, emitValue] of [
+            ["name", () => {
+                vm.lea(VReg.A2, vm.asm.addString("Function"));
+                vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A2, VReg.A2, VReg.V1);
+            }],
+            ["length", () => {
+                vm.movImm(VReg.A2, 1); vm.scvtf(0, VReg.A2); vm.fmovToInt(VReg.A2, 0);
+            }],
+        ]) {
+            vm.mov(VReg.A0, VReg.S0);
+            vm.lea(VReg.A1, vm.asm.addString(name));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V1);
+            emitValue(); vm.call("_closure_prop_set");
+            vm.mov(VReg.A0, VReg.S0);
+            vm.lea(VReg.A1, vm.asm.addString(name));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V1);
+            vm.movImm(VReg.A2, 4); vm.call("_closure_prop_set_attr");
+        }
+        vm.mov(VReg.A0, VReg.S0);
+        vm.lea(VReg.A1, vm.asm.addString("prototype"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.mov(VReg.A2, VReg.S1); vm.call("_closure_prop_set");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.lea(VReg.A1, vm.asm.addString("prototype"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.movImm(VReg.A2, 0); vm.call("_closure_prop_set_attr");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.A1, vm.asm.addString("constructor"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.mov(VReg.A2, VReg.S0); vm.call("_object_define");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.A1, vm.asm.addString("constructor"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.movImm(VReg.A2, 5); vm.call("_object_set_prop_attr");
+        vm.label("_ensure_function_ctor_runtime_done");
+        vm.lea(VReg.V0, "_fnctor_singleton"); vm.load(VReg.RET, VReg.V0, 0);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+
+        const specs = [
+            ["genfunc", "_nsobj_genfunc_proto", "GeneratorFunction"],
+            ["asyncfunc", "_nsobj_asyncfunc_proto", "AsyncFunction"],
+        ];
+        for (const [pfx, protoSlot, tag] of specs) {
+            const ready = `_opts_${pfx}_tag_ready`;
+            const ctor = `_opts_${pfx}_ctor`;
+            vm.asm.addDataLabel(ready); vm.asm.addDataQword(0);
+            vm.asm.addDataLabel(ctor); vm.asm.addDataQword(0);
+            vm.label(`_ensure_${pfx}_tag_proto`);
+            vm.prologue(0, [VReg.S0, VReg.S1]);
+            vm.lea(VReg.V0, protoSlot);
+            vm.load(VReg.S0, VReg.V0, 0);
+            vm.cmpImm(VReg.S0, 0);
+            vm.jne(`_ensure_${pfx}_proto_have`);
+            vm.call("_object_new");
+            vm.call("_box_obj_r");
+            vm.mov(VReg.S0, VReg.RET);
+            // %GeneratorFunction.prototype% and %AsyncFunction.prototype%
+            // inherit from %Function.prototype% (they are non-callable ordinary
+            // intrinsic objects in the observable test262 surface).
+            vm.call("_ensure_function_proto");
+            vm.mov(VReg.S1, VReg.RET);
+            vm.emitMaskLoad(VReg.V1);
+            vm.andMaskReg(VReg.V0, VReg.S0, VReg.V1);
+            vm.andMaskReg(VReg.V1, VReg.S1, VReg.V1);
+            vm.store(VReg.V0, 16, VReg.V1);
+            vm.lea(VReg.V0, protoSlot); vm.store(VReg.V0, 0, VReg.S0);
+            vm.label(`_ensure_${pfx}_proto_have`);
+            vm.lea(VReg.V0, ready); vm.load(VReg.V1, VReg.V0, 0);
+            vm.cmpImm(VReg.V1, 0); vm.jne(`_ensure_${pfx}_proto_done`);
+            vm.lea(VReg.A0, "_symwk_toStringTag");
+            vm.lea(VReg.A1, vm.asm.addString("Symbol.toStringTag"));
+            vm.movImm64(VReg.V0, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V0);
+            vm.call("_symbol_wellknown");
+            vm.mov(VReg.S1, VReg.RET);
+            vm.mov(VReg.A0, VReg.S0); vm.mov(VReg.A1, VReg.S1);
+            vm.lea(VReg.A2, vm.asm.addString(tag));
+            vm.movImm64(VReg.V0, 0x7ffc000000000000n); vm.or(VReg.A2, VReg.A2, VReg.V0);
+            vm.call("_object_define");
+            vm.mov(VReg.A0, VReg.S0); vm.mov(VReg.A1, VReg.S1); vm.movImm(VReg.A2, 4);
+            vm.call("_object_set_prop_attr");
+            vm.lea(VReg.V0, ready); vm.movImm(VReg.V1, 1); vm.store(VReg.V0, 0, VReg.V1);
+            vm.label(`_ensure_${pfx}_proto_done`);
+            vm.mov(VReg.RET, VReg.S0);
+            vm.epilogue([VReg.S0, VReg.S1], 0);
+
+            vm.label(`_ensure_${pfx}_ctor`);
+            vm.prologue(0, [VReg.S0, VReg.S1]);
+            vm.lea(VReg.V0, ctor); vm.load(VReg.RET, VReg.V0, 0);
+            vm.cmpImm(VReg.RET, 0); vm.jne(`_ensure_${pfx}_ctor_done`);
+            vm.call(`_ensure_${pfx}_tag_proto`);
+            vm.mov(VReg.S1, VReg.RET);
+            vm.movImm(VReg.A0, 16); vm.call("_alloc"); vm.mov(VReg.S0, VReg.RET);
+            vm.movImm(VReg.V1, 0xc105); vm.store(VReg.S0, 0, VReg.V1);
+            vm.lea(VReg.V1, pfx === "genfunc"
+                ? "_dynamic_gen_ctor_call" : "_dynamic_async_ctor_call");
+            vm.store(VReg.S0, 8, VReg.V1);
+            vm.mov(VReg.A0, VReg.S0); vm.call("_js_box_function"); vm.mov(VReg.S0, VReg.RET);
+            vm.lea(VReg.V0, ctor); vm.store(VReg.V0, 0, VReg.S0);
+            vm.mov(VReg.A0, VReg.S0);
+            vm.lea(VReg.A1, vm.asm.addString("name"));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V1);
+            vm.lea(VReg.A2, vm.asm.addString(tag));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A2, VReg.A2, VReg.V1);
+            vm.call("_closure_prop_set");
+            vm.mov(VReg.A0, VReg.S0);
+            vm.lea(VReg.A1, vm.asm.addString("name"));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V1);
+            vm.movImm(VReg.A2, 4); vm.call("_closure_prop_set_attr");
+            vm.mov(VReg.A0, VReg.S0);
+            vm.lea(VReg.A1, vm.asm.addString("length"));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V1);
+            vm.movImm(VReg.A2, 1); vm.scvtf(0, VReg.A2); vm.fmovToInt(VReg.A2, 0);
+            vm.call("_closure_prop_set");
+            vm.mov(VReg.A0, VReg.S0);
+            vm.lea(VReg.A1, vm.asm.addString("length"));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V1);
+            vm.movImm(VReg.A2, 4); vm.call("_closure_prop_set_attr");
+            vm.mov(VReg.A0, VReg.S0);
+            vm.lea(VReg.A1, vm.asm.addString("prototype"));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V1);
+            vm.mov(VReg.A2, VReg.S1); vm.call("_closure_prop_set");
+            vm.mov(VReg.A0, VReg.S0);
+            vm.lea(VReg.A1, vm.asm.addString("prototype"));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V1);
+            vm.movImm(VReg.A2, 0); vm.call("_closure_prop_set_attr");
+            // intrinsicProto.constructor = intrinsic constructor,
+            // { writable:false, enumerable:false, configurable:true }.
+            vm.mov(VReg.A0, VReg.S1);
+            vm.lea(VReg.A1, vm.asm.addString("constructor"));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V1);
+            vm.mov(VReg.A2, VReg.S0); vm.call("_object_define");
+            vm.mov(VReg.A0, VReg.S1);
+            vm.lea(VReg.A1, vm.asm.addString("constructor"));
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V1);
+            vm.movImm(VReg.A2, 4); vm.call("_object_set_prop_attr");
+            if (pfx === "genfunc") {
+                // %GeneratorFunction.prototype%.prototype =
+                // %GeneratorPrototype%, with the same configurable-only shape.
+                vm.call("_ensure_gen_proto");
+                vm.mov(VReg.A2, VReg.RET);
+                vm.mov(VReg.A0, VReg.S1);
+                vm.lea(VReg.A1, vm.asm.addString("prototype"));
+                vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V1);
+                vm.call("_object_define");
+                vm.mov(VReg.A0, VReg.S1);
+                vm.lea(VReg.A1, vm.asm.addString("prototype"));
+                vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V1);
+                vm.movImm(VReg.A2, 4); vm.call("_object_set_prop_attr");
+            }
+            vm.label(`_ensure_${pfx}_ctor_done`);
+            vm.lea(VReg.V0, ctor); vm.load(VReg.RET, VReg.V0, 0);
+            vm.epilogue([VReg.S0, VReg.S1], 0);
+        }
+
+        vm.asm.addDataLabel("_opts_asyncgenfunc_tag_ready"); vm.asm.addDataQword(0);
+        vm.label("_ensure_asyncgenfunc_tag_proto");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.call("_ensure_asyncgenfunc");
+        vm.lea(VReg.V0, "_nsobj_asyncgenfunc_proto"); vm.load(VReg.S0, VReg.V0, 0);
+        vm.lea(VReg.V0, "_opts_asyncgenfunc_tag_ready"); vm.load(VReg.V1, VReg.V0, 0);
+        vm.cmpImm(VReg.V1, 0); vm.jne("_ensure_asyncgenfunc_tag_done");
+        vm.lea(VReg.A0, "_symwk_toStringTag");
+        vm.lea(VReg.A1, vm.asm.addString("Symbol.toStringTag"));
+        vm.movImm64(VReg.V0, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V0);
+        vm.call("_symbol_wellknown"); vm.mov(VReg.S1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0); vm.mov(VReg.A1, VReg.S1);
+        vm.lea(VReg.A2, vm.asm.addString("AsyncGeneratorFunction"));
+        vm.movImm64(VReg.V0, 0x7ffc000000000000n); vm.or(VReg.A2, VReg.A2, VReg.V0);
+        vm.call("_object_define");
+        vm.mov(VReg.A0, VReg.S0); vm.mov(VReg.A1, VReg.S1); vm.movImm(VReg.A2, 4);
+        vm.call("_object_set_prop_attr");
+        vm.lea(VReg.V0, "_opts_asyncgenfunc_tag_ready"); vm.movImm(VReg.V1, 1); vm.store(VReg.V0, 0, VReg.V1);
+        vm.label("_ensure_asyncgenfunc_tag_done");
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+    }
+
     // Object.prototype.toString.call(x) -> "[object Tag]"。规范:先 Get(@@toStringTag),
     // 字符串用之;否则 builtinTag(Array/Function/Error/…/Object)。Map/Set/Promise 等无
     // 独立 builtinTag——品牌仅来自可配置的原型 @@toStringTag;delete 后应回落 "Object"。
@@ -8008,6 +9803,30 @@ export class ObjectGenerator {
         vm.shrImm(VReg.V0, VReg.S0, 48);
         vm.cmpImm(VReg.V0, 0x7FFB); vm.jeq("_opts_undef");
         vm.cmpImm(VReg.V0, 0x7FFA); vm.jeq("_opts_null");
+        // IsArray must precede Get(@@toStringTag) for Proxies. A get trap may
+        // revoke the proxy, and the already-completed IsArray result remains
+        // usable (proxy-revoked-during-get-call).
+        vm.cmpImm(VReg.V0, 0x7FFD); vm.jne("_opts_early_tag");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V1, VReg.S0, VReg.V1);
+        vm.loadByte(VReg.V0, VReg.V1, 0);
+        vm.cmpImm(VReg.V0, TYPE_PROXY); vm.jeq("_opts_classify");
+        vm.label("_opts_early_tag");
+        // All non-nullish values consult @@toStringTag before builtin fallback.
+        // Remember a present non-undefined non-string value so simulated
+        // tag-only brands (notably Generator) can correctly fall back to Object.
+        vm.movImm(VReg.V0, 0);
+        vm.store(VReg.SP, 0, VReg.V0);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_get_tostring_tag");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.shrImm(VReg.V0, VReg.S2, 48);
+        vm.cmpImm(VReg.V0, 0x7FFC); vm.jeq("_opts_custom");
+        vm.cmpImm(VReg.V0, 0x7FFB); vm.jeq("_opts_classify");
+        vm.movImm(VReg.V0, 1);
+        vm.store(VReg.SP, 0, VReg.V0);
+        vm.label("_opts_classify");
+        vm.shrImm(VReg.V0, VReg.S0, 48);
         vm.cmpImm(VReg.V0, 0x7FFE); vm.jeq("_opts_arrayish");
         vm.cmpImm(VReg.V0, 0x7FFC); vm.jeq("_opts_string");
         vm.cmpImm(VReg.V0, 0x7FF9); vm.jeq("_opts_bool");
@@ -8038,7 +9857,7 @@ export class ObjectGenerator {
             vm.cmpImm(VReg.RET, 0); vm.jne("_opts_bigint");
             vm.mov(VReg.A0, VReg.S0);
             vm.call("_is_symbol");
-            vm.cmpImm(VReg.RET, 0); vm.jne("_opts_symbol");
+            vm.cmpImm(VReg.RET, 0); vm.jne("_opts_symbol_check");
             // ES Object.prototype.toString:ToObject 后先 IsArray。revoked proxy
             // 的 IsArray 抛 TypeError(handler 空);proxy-of-Array → Array 品牌。
             // 裸堆指针(high16=0)先 0x7FFD 装箱,否则 _is_array_value 不认 TYPE_PROXY。
@@ -8056,7 +9875,7 @@ export class ObjectGenerator {
             vm.andImm(VReg.V0, VReg.V0, 0xff);
             vm.cmpImm(VReg.V0, 8); vm.jeq("_opts_proxy");       // TYPE_PROXY
             vm.cmpImm(VReg.V0, 7); vm.jeq("_opts_date");        // TYPE_DATE
-            vm.cmpImm(VReg.V0, 11); vm.jeq("_opts_promise");    // TYPE_PROMISE
+            vm.cmpImm(VReg.V0, 11); vm.jeq("_opts_promise_check"); // TYPE_PROMISE
             // TypedArray(0x40-0x61)/ArrayBuffer(12)/DataView(14)
             vm.cmpImm(VReg.V0, 0x40); vm.jeq("_opts_int8array");
             vm.cmpImm(VReg.V0, 0x41); vm.jeq("_opts_int16array");
@@ -8086,18 +9905,45 @@ export class ObjectGenerator {
             vm.lea(VReg.A1, vm.asm.addString("Symbol.asyncIterator"));
             vm.movImm64(VReg.V0, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V0);
             vm.call("_object_has");
-            vm.cmpImm(VReg.RET, 0); vm.jne("_opts_asyncgenerator");
-            vm.jmp("_opts_generator");
+            vm.cmpImm(VReg.RET, 0); vm.jne("_opts_asyncgenerator_check");
+            vm.jmp("_opts_generator_check");
             vm.label("_opts_notgen");
         }
         vm.jmp("_opts_tag");
         // callable proxy → Function 品牌;非 callable 与旧行为一致走 Object。
         // revoked 已在上方 IsArray 抛出,不落到此。
         vm.label("_opts_proxy");
-        vm.load(VReg.A0, VReg.S1, 8); // target
+        // IsArray has completed; now perform the single observable Get.
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_get_tostring_tag");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.shrImm(VReg.V0, VReg.S2, 48);
+        vm.cmpImm(VReg.V0, 0x7FFC); vm.jeq("_opts_custom");
+        vm.label("_opts_proxy_unwrap");
+        vm.load(VReg.S0, VReg.S1, 8); // target (becomes the function value for metadata)
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V2, VReg.S0, VReg.V1);
+        vm.movImm64(VReg.V1, vm.ptrFloor);
+        vm.cmp(VReg.V2, VReg.V1); vm.jlt("_opts_proxy_callable");
+        vm.loadByte(VReg.V1, VReg.V2, 0);
+        vm.cmpImm(VReg.V1, TYPE_PROXY); vm.jne("_opts_proxy_callable");
+        vm.mov(VReg.S1, VReg.V2);
+        vm.jmp("_opts_proxy_unwrap");
+        vm.label("_opts_proxy_callable");
+        vm.mov(VReg.A0, VReg.S0);
         vm.call("_is_callable");
-        vm.cmpImm(VReg.RET, 0); vm.jne("_opts_func");
-        vm.jmp("_opts_plain");
+        vm.cmpImm(VReg.RET, 0); vm.jeq("_opts_plain");
+        // Proxy callable builtinTag is Function, but a string @@toStringTag
+        // inherited by the ultimate target (GeneratorFunction/AsyncFunction)
+        // still overrides it. Once that tag is deleted or made non-string,
+        // fall back to Function rather than the target's internal kind.
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_get_tostring_tag");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.shrImm(VReg.V0, VReg.S2, 48);
+        vm.cmpImm(VReg.V0, 0x7FFC); vm.jeq("_opts_custom");
+        vm.jmp("_opts_proxy_function");
+        ret("_opts_proxy_function", "[object Function]");
         vm.label("_opts_tag");
         // [Symbol.toStringTag] 优先(字符串则 "[object <tag>]")
         vm.lea(VReg.A0, "_symwk_toStringTag");
@@ -8126,13 +9972,19 @@ export class ObjectGenerator {
         vm.jmp("_opts_builtin_rest");
         vm.label("_opts_coll_map");
         vm.load(VReg.V0, VReg.S1, 48); // weakness
-        vm.cmpImm(VReg.V0, 0); vm.jne("_opts_weakmap");
+        vm.cmpImm(VReg.V0, 0); vm.jne("_opts_coll_weakmap");
         vm.lea(VReg.V0, "_nsobj_map_proto");
+        vm.jmp("_opts_coll_proto");
+        vm.label("_opts_coll_weakmap");
+        vm.lea(VReg.V0, "_nsobj_weakmap_proto");
         vm.jmp("_opts_coll_proto");
         vm.label("_opts_coll_set");
         vm.load(VReg.V0, VReg.S1, 48);
-        vm.cmpImm(VReg.V0, 0); vm.jne("_opts_weakset");
+        vm.cmpImm(VReg.V0, 0); vm.jne("_opts_coll_weakset");
         vm.lea(VReg.V0, "_nsobj_set_proto");
+        vm.jmp("_opts_coll_proto");
+        vm.label("_opts_coll_weakset");
+        vm.lea(VReg.V0, "_nsobj_weakset_proto");
         vm.label("_opts_coll_proto");
         vm.load(VReg.A0, VReg.V0, 0); // 原型单例(0=未物化)
         vm.cmpImm(VReg.A0, 0); vm.jeq("_opts_coll_brand"); // 未物化 → 内建 Map/Set
@@ -8157,13 +10009,30 @@ export class ObjectGenerator {
         vm.label("_opts_coll_brand");
         vm.loadByte(VReg.V0, VReg.S1, 0);
         vm.andImm(VReg.V0, VReg.V0, 0xff);
-        vm.cmpImm(VReg.V0, 4); vm.jeq("_opts_map");
-        vm.jmp("_opts_set");
+        vm.cmpImm(VReg.V0, 4); vm.jeq("_opts_maybe_weakmap");
+        vm.jmp("_opts_maybe_weakset");
         vm.label("_opts_builtin_rest");
         // 其余内建品牌:按类型字节 / 标志
         vm.loadByte(VReg.V0, VReg.S1, 0);
         vm.andImm(VReg.V0, VReg.V0, 0xff);
         vm.cmpImm(VReg.V0, 7); vm.jeq("_opts_date");   // TYPE_DATE([[DateValue]])
+        vm.cmpImm(VReg.V0, TYPE_OBJECT); vm.jne("_opts_not_wrapper");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.lea(VReg.A1, vm.asm.addString("__boolean_value"));
+        vm.movImm64(VReg.V0, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V0);
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0); vm.jne("_opts_bool");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.lea(VReg.A1, vm.asm.addString("__number_value"));
+        vm.movImm64(VReg.V0, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V0);
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0); vm.jne("_opts_number");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.lea(VReg.A1, vm.asm.addString("__value"));
+        vm.movImm64(VReg.V0, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V0);
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0); vm.jne("_opts_string");
+        vm.label("_opts_not_wrapper");
         // Error 品牌(__asmjs_err)
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_is_asmjs_err");
@@ -8208,30 +10077,31 @@ export class ObjectGenerator {
         ret("_opts_arguments", "[object Arguments]");
         ret("_opts_string", "[object String]");
         ret("_opts_bool", "[object Boolean]");
-        // 函数品牌:查 code_ptr→kind 侧表区分 Generator/Async/AsyncGenerator 函数。
-        // S0 = 函数 JSValue(tag 0x7fff);脱壳得闭包/裸函数指针 P。闭包(magic 0xc105/0xa51c)
-        // 的真 code_ptr 在 [P+8];裸函数指针 code_ptr = P。_func_meta_find 返回 kind。
+        vm.label("_opts_symbol_check");
+        vm.lea(VReg.V0, "_nsobj_symbol_proto");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmpImm(VReg.V0, 0); vm.jne("_opts_plain");
+        vm.jmp("_opts_symbol");
+        vm.label("_opts_promise_check");
+        vm.lea(VReg.V0, "_nsobj_promise_proto");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmpImm(VReg.V0, 0); vm.jne("_opts_plain");
+        vm.jmp("_opts_promise");
+        vm.label("_opts_generator_check");
+        vm.load(VReg.V0, VReg.SP, 0);
+        vm.cmpImm(VReg.V0, 0); vm.jne("_opts_plain");
+        vm.jmp("_opts_generator");
+        vm.label("_opts_asyncgenerator_check");
+        vm.load(VReg.V0, VReg.SP, 0);
+        vm.cmpImm(VReg.V0, 0); vm.jne("_opts_plain");
+        vm.jmp("_opts_asyncgenerator");
+        // The early Get(@@toStringTag) above supplies the specialised
+        // Generator/Async brands.  If that property was deleted or changed to
+        // a non-string value, the callable builtin fallback is always Function.
         vm.label("_opts_func");
-        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
-        vm.and(VReg.V0, VReg.S0, VReg.V1);          // V0 = P
-        vm.load(VReg.V1, VReg.V0, 0);               // V1 = [P](闭包 magic 或代码字节)
-        vm.cmpImm(VReg.V1, 0xc105); vm.jeq("_opts_func_clo");
-        vm.cmpImm(VReg.V1, 0xa51c); vm.jeq("_opts_func_clo");
-        vm.mov(VReg.A0, VReg.V0);                   // 裸函数指针:code_ptr = P
-        vm.jmp("_opts_func_lk");
-        vm.label("_opts_func_clo");
-        vm.load(VReg.A0, VReg.V0, 8);               // 闭包:code_ptr = [P+8]
-        vm.label("_opts_func_lk");
-        vm.call("_func_meta_find");                 // RET = kind
-        vm.cmpImm(VReg.RET, 1); vm.jeq("_opts_genfunc");
-        vm.cmpImm(VReg.RET, 2); vm.jeq("_opts_asyncfunc");
-        vm.cmpImm(VReg.RET, 3); vm.jeq("_opts_asyncgenfunc");
         vm.lea(VReg.A0, vm.asm.addString("[object Function]"));
         vm.call("_cstr_to_heap_str");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 16);
-        ret("_opts_genfunc", "[object GeneratorFunction]");
-        ret("_opts_asyncfunc", "[object AsyncFunction]");
-        ret("_opts_asyncgenfunc", "[object AsyncGeneratorFunction]");
         ret("_opts_number", "[object Number]");
         ret("_opts_date", "[object Date]");
         // Map/Set 头 +48 = weakness 标志(WeakMap/WeakSet 置 1)。S1 = 裸集合指针(type@0)。
@@ -8364,8 +10234,12 @@ export class ObjectGenerator {
         vm.shrImm(VReg.V0, VReg.A0, 48);
         vm.cmpImm(VReg.V0, 0x7FFA); vm.jeq("_ogops_nullish");
         vm.cmpImm(VReg.V0, 0x7FFB); vm.jeq("_ogops_nullish");
-        // Non-object types (number, bool, string, array, function) → empty array
+        // Plain objects keep keys inline. Arrays/functions cannot use the plain
+        // object layout; their named and Symbol properties live in the shared
+        // _closure_props_* side table, so enumerate that backing object below.
         vm.cmpImm(VReg.V0, 0x7FFD); vm.jeq("_ogops_obj");
+        vm.cmpImm(VReg.V0, 0x7FFE); vm.jeq("_ogops_side");
+        vm.cmpImm(VReg.V0, 0x7FFF); vm.jeq("_ogops_side");
         vm.cmpImm(VReg.V0, 0);      vm.jeq("_ogops_obj"); // bare pointer
         // Anything else → return empty array
         vm.label("_ogops_empty");
@@ -8381,13 +10255,40 @@ export class ObjectGenerator {
         vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
         vm.call("_throw_type_error"); // does not return
 
+        vm.label("_ogops_side");
+        // Symbol assignment and DefineOwnProperty both use this side table.
+        // Reusing the ordinary-object scan preserves the original creation
+        // order when defineProperty later changes an existing descriptor.
+        vm.call("_closure_props_find");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_ogops_empty");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_object_getOwnPropertySymbols");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+
         vm.label("_ogops_obj");
         vm.mov(VReg.S0, VReg.A0);
         vm.emitMaskLoad(VReg.V4);
         vm.andMaskReg(VReg.S0, VReg.S0, VReg.V4);
-        // Only TYPE_OBJECT has count/props_ptr at expected offsets.
-        // Proxy/Date/Map/Set/etc. have different layouts.
+        // high16==0 is shared by raw heap pointers, +0 and denormal Numbers.
+        // Do not dereference numeric payloads while performing ToObject; all
+        // primitive wrappers have no own Symbol keys and therefore return [].
+        vm.cmpImm(VReg.S0, 0);
+        vm.jeq("_ogops_empty");
+        vm.movImm64(VReg.V1, vm.ptrFloor);
+        vm.cmp(VReg.S0, VReg.V1);
+        vm.jlt("_ogops_empty");
+        // Proxy [[OwnPropertyKeys]] must run (and validate) even when the final
+        // Symbol-only filter would produce an empty list.  In particular,
+        // duplicate/missing *string* keys can still violate the ownKeys trap
+        // invariants observed by Object.getOwnPropertySymbols.
         vm.loadByte(VReg.V0, VReg.S0, 0);
+        vm.cmpImm(VReg.V0, TYPE_PROXY);
+        vm.jeq("_ogops_proxy");
+        // Only TYPE_OBJECT has count/props_ptr at expected offsets.
+        // Date/Map/Set/etc. have different layouts.
         vm.cmpImm(VReg.V0, TYPE_OBJECT);
         vm.jne("_ogops_empty");
         vm.load(VReg.S1, VReg.S0, 8); // count
@@ -8419,6 +10320,232 @@ export class ObjectGenerator {
         vm.mov(VReg.RET, VReg.S2);
         vm.or(VReg.RET, VReg.RET, VReg.V1);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+
+        vm.label("_ogops_proxy");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_own_keys_all"); // invokes/validates ownKeys; returns a fresh list
+        vm.mov(VReg.S1, VReg.RET);
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_array_length");
+        vm.mov(VReg.S3, VReg.RET);
+        vm.movImm(VReg.S4, 0);
+        vm.label("_ogops_proxy_loop");
+        vm.cmp(VReg.S4, VReg.S3);
+        vm.jge("_ogops_proxy_done");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_array_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_is_symbol");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_ogops_proxy_next");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_array_get");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_array_push_own");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.label("_ogops_proxy_next");
+        vm.addImm(VReg.S4, VReg.S4, 1);
+        vm.jmp("_ogops_proxy_loop");
+        vm.label("_ogops_proxy_done");
+        vm.movImm64(VReg.V1, 0x7FFE000000000000n);
+        vm.or(VReg.RET, VReg.S2, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+    }
+
+    // Complete own-key snapshot after Object-style ToObject coercion.  The
+    // low-level _object_own_keys_all walker is sufficient for ordinary objects
+    // and Proxy trap results, but indexed exotics synthesize string keys such
+    // as "length" while keeping Symbols in a side table.  Merge the two public
+    // reflection views for non-Proxies; a Proxy must use one validated trap
+    // invocation, never independent names/symbols queries.
+    generateObjectAllOwnKeys() {
+        const vm = this.vm;
+        const hiddenRegExpKeys = [
+            "source", "flags", "global", "ignoreCase", "multiline", "dotAll",
+            "sticky", "unicode", "unicodeSets", "hasIndices",
+            "__isRegExp", "__pat", "__prog", "__bad", "__err",
+        ];
+
+        vm.label("_object_all_own_keys");
+        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.mov(VReg.S0, VReg.A0); // original boxed/raw receiver
+        vm.movImm(VReg.S5, 0);    // RegExp shim brand
+
+        // A Proxy has to take the single [[OwnPropertyKeys]] route.  Guard raw
+        // numeric payloads before reading a heap type byte.
+        vm.shrImm(VReg.V0, VReg.S0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFD); vm.jeq("_oaok_heap");
+        vm.cmpImm(VReg.V0, 0); vm.jne("_oaok_collect");
+        vm.cmpImm(VReg.S0, 0); vm.jeq("_oaok_collect");
+        vm.label("_oaok_heap");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V2, VReg.S0, VReg.V1);
+        vm.movImm64(VReg.V1, vm.ptrFloor);
+        vm.cmp(VReg.V2, VReg.V1);
+        vm.jlt("_oaok_collect");
+        vm.loadByte(VReg.V0, VReg.V2, 0);
+        vm.cmpImm(VReg.V0, TYPE_PROXY);
+        vm.jeq("_oaok_proxy");
+        // RegExp is represented by a branded ordinary shim object.  Its engine
+        // state and emulated prototype accessors are storage slots, not ECMAScript
+        // own properties; retain only lastIndex and user-created keys.
+        vm.cmpImm(VReg.V0, TYPE_OBJECT);
+        vm.jne("_oaok_collect");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.lea(VReg.A1, vm.asm.addString("__isRegExp"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_has");
+        vm.mov(VReg.S5, VReg.RET);
+
+        vm.label("_oaok_collect");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_gopn");
+        vm.mov(VReg.S1, VReg.RET); // string keys, including indexed-exotic length
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_getOwnPropertySymbols");
+        vm.mov(VReg.S2, VReg.RET); // symbol keys
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.mov(VReg.S3, VReg.RET); // raw result
+
+        vm.movImm(VReg.S4, 0);
+        vm.label("_oaok_str_loop");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_array_length");
+        vm.cmp(VReg.S4, VReg.RET);
+        vm.jge("_oaok_sym_begin");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_array_get");
+        vm.store(VReg.SP, 0, VReg.RET);
+        vm.cmpImm(VReg.S5, 0);
+        vm.jeq("_oaok_str_push");
+        vm.shrImm(VReg.V0, VReg.RET, 48);
+        vm.cmpImm(VReg.V0, 0x7FFC);
+        vm.jne("_oaok_str_push");
+        for (const name of hiddenRegExpKeys) {
+            vm.load(VReg.A0, VReg.SP, 0);
+            vm.call("_getStrContent");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.lea(VReg.A1, vm.asm.addString(name));
+            vm.call("_strcmp");
+            vm.cmpImm(VReg.RET, 0);
+            vm.jeq("_oaok_str_next");
+        }
+        vm.label("_oaok_str_push");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.load(VReg.A1, VReg.SP, 0);
+        vm.call("_array_push_own");
+        vm.mov(VReg.S3, VReg.RET);
+        vm.label("_oaok_str_next");
+        vm.addImm(VReg.S4, VReg.S4, 1);
+        vm.jmp("_oaok_str_loop");
+
+        vm.label("_oaok_sym_begin");
+        vm.movImm(VReg.S4, 0);
+        vm.label("_oaok_sym_loop");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_array_length");
+        vm.cmp(VReg.S4, VReg.RET);
+        vm.jge("_oaok_done");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_array_get");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S3);
+        vm.call("_array_push_own");
+        vm.mov(VReg.S3, VReg.RET);
+        vm.addImm(VReg.S4, VReg.S4, 1);
+        vm.jmp("_oaok_sym_loop");
+
+        vm.label("_oaok_done");
+        vm.movImm64(VReg.V1, 0x7FFE000000000000n);
+        vm.or(VReg.RET, VReg.S3, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 16);
+
+        vm.label("_oaok_proxy");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_own_keys_all");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 16);
+
+        // Reflect.ownKeys differs only in rejecting primitives before the same
+        // complete snapshot operation.
+        vm.label("_reflect_ownKeys");
+        vm.prologue(0, [VReg.S0]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.shrImm(VReg.V1, VReg.S0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFD); vm.jeq("_row_ok");
+        vm.cmpImm(VReg.V1, 0x7FFE); vm.jeq("_row_ok");
+        vm.cmpImm(VReg.V1, 0x7FFF); vm.jeq("_row_ok");
+        vm.cmpImm(VReg.V1, 0); vm.jne("_row_bad");
+        vm.cmpImm(VReg.S0, 0); vm.jeq("_row_bad");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_is_symbol");
+        vm.cmpImm(VReg.RET, 0); vm.jne("_row_bad");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_is_bigint");
+        vm.cmpImm(VReg.RET, 0); vm.jne("_row_bad");
+        vm.movImm64(VReg.V1, vm.ptrFloor);
+        vm.cmp(VReg.S0, VReg.V1); vm.jlt("_row_bad");
+        vm.label("_row_ok");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_all_own_keys");
+        vm.epilogue([VReg.S0], 0);
+        vm.label("_row_bad");
+        vm.lea(VReg.A0, vm.asm.addString("Reflect.ownKeys called on non-object"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+    }
+
+    // Object.getOwnPropertyDescriptors(O): take one complete key snapshot,
+    // re-read each current own descriptor, and create a data property on the
+    // result.  Proxy getOwnPropertyDescriptor may report undefined for a key,
+    // in which case that key is omitted.
+    generateObjectGetOwnPropertyDescriptors() {
+        const vm = this.vm;
+        vm.label("_object_getOwnPropertyDescriptors");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.mov(VReg.S0, VReg.A0); // receiver
+        vm.call("_object_all_own_keys");
+        vm.mov(VReg.S1, VReg.RET); // boxed snapshot
+        vm.call("_object_new");
+        vm.mov(VReg.S2, VReg.RET); // raw result ordinary object
+        vm.movImm(VReg.S3, 0);
+        vm.label("_ogopds_loop");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_array_length");
+        vm.cmp(VReg.S3, VReg.RET);
+        vm.jge("_ogopds_done");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_array_get");
+        vm.mov(VReg.S4, VReg.RET); // key
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_object_getOwnPropertyDescriptor");
+        vm.mov(VReg.S5, VReg.RET);
+        vm.shrImm(VReg.V1, VReg.S5, 48);
+        vm.cmpImm(VReg.V1, 0x7FFB);
+        vm.jeq("_ogopds_next");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.mov(VReg.A2, VReg.S5);
+        vm.call("_object_define"); // CreateDataProperty(result, key, descriptor)
+        vm.label("_ogopds_next");
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_ogopds_loop");
+        vm.label("_ogopds_done");
+        vm.movImm64(VReg.V1, 0x7FFD000000000000n);
+        vm.or(VReg.RET, VReg.S2, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 0);
     }
 
     // Object.values(obj) -> 返回包含所有值的数组
@@ -8440,10 +10567,23 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.V0, 0x7FF8); vm.jeq("_object_values_empty");
         vm.cmpImm(VReg.V0, 0x7FF9); vm.jeq("_object_values_empty");
         vm.cmpImm(VReg.V0, 0x7FFD); vm.jeq("_object_values_legacy");
-        vm.cmpImm(VReg.V0, 0x7FFF); vm.jeq("_object_values_fn"); // [W-16] 见 _object_keys_fn
+        // Function values use the same generic descriptor-driven algorithm:
+        // name/length are normally non-enumerable, but defineProperty can make
+        // them enumerable and Object.values must observe that transition.
+        vm.cmpImm(VReg.V0, 0x7FFF); vm.jeq("_object_values_legacy");
         vm.cmpImm(VReg.V0, 0); vm.jne("_object_values_empty");
         vm.cmpImm(VReg.A0, 0); vm.jeq("_object_values_empty");
         vm.label("_object_values_legacy");
+
+        // EnumerableOwnProperties must snapshot [[OwnPropertyKeys]], then for
+        // each string key re-read the *current* own descriptor and finally Get
+        // the value.  The old loop walked the live props array by index and
+        // loaded its raw value slot: accessors leaked their marker pointer as a
+        // denormal Number, deletion shifted future entries, enumerability
+        // changes were ignored, and Proxy traps were bypassed by forwarding to
+        // the target.  Route ordinary objects and proxies through the generic
+        // snapshot algorithm below.
+        vm.jmp("_object_values_generic");
 
         vm.mov(VReg.S0, VReg.A0); // obj
 
@@ -8537,6 +10677,69 @@ export class ObjectGenerator {
         vm.movImm64(VReg.V1, 0x7FFE000000000000n);
         vm.mov(VReg.RET, VReg.S2);
         vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
+
+        vm.label("_object_values_generic");
+        vm.mov(VReg.S0, VReg.A0); // original receiver (boxed/raw)
+        vm.call("_object_gopn");  // snapshot of own string keys / Proxy ownKeys
+        vm.mov(VReg.S1, VReg.RET);
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.mov(VReg.S2, VReg.RET); // raw result array
+        vm.movImm(VReg.S3, 0);
+        vm.label("_object_values_generic_loop");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_array_length");
+        vm.cmp(VReg.S3, VReg.RET);
+        vm.jge("_object_values_generic_done");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_array_get");
+        vm.mov(VReg.S4, VReg.RET); // key
+        // Internal private names are not ECMAScript properties.
+        vm.shrImm(VReg.V1, VReg.S4, 48);
+        vm.cmpImm(VReg.V1, 0x7FFC);
+        vm.jne("_object_values_generic_desc");
+        vm.mov(VReg.A0, VReg.S4);
+        vm.call("_getStrContent");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_is_mangled_private_name");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_object_values_generic_next");
+        vm.label("_object_values_generic_desc");
+        // desc = O.[[GetOwnProperty]](key), observable for Proxy.
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_object_getOwnPropertyDescriptor");
+        vm.shrImm(VReg.V1, VReg.RET, 48); // preserve RET on x64 (V0 aliases it)
+        vm.cmpImm(VReg.V1, 0x7FFB);
+        vm.jeq("_object_values_generic_next");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, vm.asm.addString("enumerable"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_boolean");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_object_values_generic_next");
+        // value = Get(O, key), including accessor invocation / abrupt completion.
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.call("_maybe_getter");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_array_push_own");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.label("_object_values_generic_next");
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_object_values_generic_loop");
+        vm.label("_object_values_generic_done");
+        vm.movImm64(VReg.V1, 0x7ffe000000000000n);
+        vm.or(VReg.RET, VReg.S2, VReg.V1);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
 
         // ---- [test262 S1] 非对象目标分派处理(入口 high16 分派跳入)----
@@ -8685,10 +10888,15 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.V0, 0x7FF8); vm.jeq("_object_entries_empty");
         vm.cmpImm(VReg.V0, 0x7FF9); vm.jeq("_object_entries_empty");
         vm.cmpImm(VReg.V0, 0x7FFD); vm.jeq("_object_entries_legacy");
-        vm.cmpImm(VReg.V0, 0x7FFF); vm.jeq("_object_entries_fn"); // [W-16] 见 _object_keys_fn
+        vm.cmpImm(VReg.V0, 0x7FFF); vm.jeq("_object_entries_legacy");
         vm.cmpImm(VReg.V0, 0); vm.jne("_object_entries_empty");
         vm.cmpImm(VReg.A0, 0); vm.jeq("_object_entries_empty");
         vm.label("_object_entries_legacy");
+
+        // See `_object_values_generic`: entries uses the same key snapshot /
+        // current-descriptor / live-Get algorithm and only differs in packaging
+        // each accepted value as a fresh [key, value] pair.
+        vm.jmp("_object_entries_generic");
 
         vm.mov(VReg.S0, VReg.A0); // obj
 
@@ -8805,6 +11013,80 @@ export class ObjectGenerator {
         vm.movImm64(VReg.V1, 0x7FFE000000000000n);
         vm.mov(VReg.RET, VReg.S2);
         vm.or(VReg.RET, VReg.RET, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 16);
+
+        vm.label("_object_entries_generic");
+        vm.mov(VReg.S0, VReg.A0); // original receiver
+        vm.call("_object_gopn");
+        vm.mov(VReg.S1, VReg.RET); // snapshotted string keys
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.mov(VReg.S2, VReg.RET); // raw result
+        vm.movImm(VReg.S3, 0);
+        vm.label("_object_entries_generic_loop");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_array_length");
+        vm.cmp(VReg.S3, VReg.RET);
+        vm.jge("_object_entries_generic_done");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_array_get");
+        vm.mov(VReg.S4, VReg.RET); // key
+        vm.shrImm(VReg.V1, VReg.S4, 48);
+        vm.cmpImm(VReg.V1, 0x7FFC);
+        vm.jne("_object_entries_generic_desc");
+        vm.mov(VReg.A0, VReg.S4);
+        vm.call("_getStrContent");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_is_mangled_private_name");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_object_entries_generic_next");
+        vm.label("_object_entries_generic_desc");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_object_getOwnPropertyDescriptor");
+        vm.shrImm(VReg.V1, VReg.RET, 48);
+        vm.cmpImm(VReg.V1, 0x7FFB);
+        vm.jeq("_object_entries_generic_next");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, vm.asm.addString("enumerable"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_boolean");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_object_entries_generic_next");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.call("_maybe_getter");
+        vm.mov(VReg.S5, VReg.RET); // value
+        vm.movImm(VReg.A0, 2);
+        vm.call("_array_new_with_size");
+        vm.store(VReg.SP, 0, VReg.RET);
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.movImm(VReg.A1, 0);
+        vm.mov(VReg.A2, VReg.S4);
+        vm.call("_array_set");
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.movImm(VReg.A1, 1);
+        vm.mov(VReg.A2, VReg.S5);
+        vm.call("_array_set");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.load(VReg.A1, VReg.SP, 0);
+        vm.movImm64(VReg.V1, 0x7ffe000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_array_push_own");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.label("_object_entries_generic_next");
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_object_entries_generic_loop");
+        vm.label("_object_entries_generic_done");
+        vm.movImm64(VReg.V1, 0x7ffe000000000000n);
+        vm.or(VReg.RET, VReg.S2, VReg.V1);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 16);
 
         // ---- [test262 S1] 非对象目标分派处理(入口 high16 分派跳入)----
@@ -8990,16 +11272,16 @@ export class ObjectGenerator {
         vm.mov(VReg.A0, VReg.S1);
         vm.lea(VReg.A1, vm.asm.addString("__value")); boxStr(VReg.A1);
         vm.mov(VReg.A2, VReg.S0);
-        vm.call("_object_set");
+        vm.call("_object_define");
         // length
         vm.mov(VReg.A0, VReg.S0);
-        vm.call("_strlen");
-        vm.mov(VReg.S2, VReg.RET); // byte len (also char count for BMP/ASCII tests)
+        vm.call("_str_utf16_length");
+        vm.mov(VReg.S2, VReg.RET); // ECMAScript UTF-16 code-unit length
         vm.scvtf(0, VReg.S2);
         vm.fmovToInt(VReg.A2, 0);
         vm.mov(VReg.A0, VReg.S1);
         vm.lea(VReg.A1, vm.asm.addString("length")); boxStr(VReg.A1);
-        vm.call("_object_set");
+        vm.call("_object_define");
         // attrs: __value writable|configurable(5); length 全禁(0)
         vm.mov(VReg.A0, VReg.S1);
         vm.movImm(VReg.A1, 0);
@@ -9014,17 +11296,17 @@ export class ObjectGenerator {
         vm.label("_string_new_idx");
         vm.cmp(VReg.S3, VReg.S2);
         vm.jge("_string_new_done");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_str_utf16_at");
+        vm.store(VReg.SP, 0, VReg.RET);
         vm.scvtf(0, VReg.S3);
         vm.fmovToInt(VReg.A0, 0);
         vm.call("_valueToStr");
-        vm.store(VReg.SP, 0, VReg.RET);
-        vm.mov(VReg.A0, VReg.S0);
-        vm.mov(VReg.A1, VReg.S3);
-        vm.call("_str_charAt");
-        vm.mov(VReg.A2, VReg.RET);
+        vm.mov(VReg.A1, VReg.RET); // index key
+        vm.load(VReg.A2, VReg.SP, 0); // UTF-16 code-unit string
         vm.mov(VReg.A0, VReg.S1);
-        vm.load(VReg.A1, VReg.SP, 0);
-        vm.call("_object_set");
+        vm.call("_object_define");
         // idx = 2 + i (__value=0, length=1)
         vm.mov(VReg.A0, VReg.S1);
         vm.addImm(VReg.A1, VReg.S3, 2);
@@ -9068,7 +11350,15 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.V0, 0x7FF8); vm.jeq("_object_assign_tgt_num");
         vm.cmpImm(VReg.V0, 0); vm.jne("_object_assign_tgt_num"); // float / NaN
         vm.cmpImm(VReg.S0, 0); vm.jeq("_object_assign_tgt_num"); // +0.0
-        // high16==0 且非零 → 裸堆指针
+        // high16==0 且非零通常是裸堆指针,但 primitive Symbol also uses
+        // that representation and ToObject must create a Symbol wrapper.
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_is_symbol");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_object_assign_tgt_ok");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_symbol_wrap");
+        vm.mov(VReg.S0, VReg.RET);
         vm.jmp("_object_assign_tgt_ok");
 
         vm.label("_object_assign_tgt_str");
@@ -9216,6 +11506,15 @@ export class ObjectGenerator {
         vm.scvtf(0, VReg.S3); vm.fmovToInt(VReg.A0, 0);
         vm.call("_valueToStr");
         vm.store(VReg.SP, 0, VReg.RET);
+        // Object.assign copies own enumerable properties, not every position
+        // below Array length.  A sparse source hole must leave the target's
+        // existing element untouched (and inherited prototype elements are
+        // not source own properties either).
+        vm.mov(VReg.A0, VReg.S1);
+        vm.load(VReg.A1, VReg.SP, 0);
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_object_assign_arr_next");
         vm.mov(VReg.A0, VReg.S1);
         vm.mov(VReg.A1, VReg.S3);
         vm.call("_array_get");
@@ -9223,6 +11522,7 @@ export class ObjectGenerator {
         vm.mov(VReg.A0, VReg.S0);
         vm.load(VReg.A1, VReg.SP, 0);
         vm.call("_object_assign_set");
+        vm.label("_object_assign_arr_next");
         vm.addImm(VReg.S3, VReg.S3, 1);
         vm.jmp("_object_assign_arr_loop");
 
@@ -9298,6 +11598,8 @@ export class ObjectGenerator {
         vm.cmp(VReg.S3, VReg.V1);
         vm.jlt("_oas_do_set");
         vm.loadByte(VReg.V0, VReg.S3, 0);
+        vm.cmpImm(VReg.V0, 1); // TYPE_ARRAY
+        vm.jeq("_oas_array");
         vm.cmpImm(VReg.V0, TYPE_OBJECT);
         vm.jne("_oas_do_set"); // 数组等交 _object_set(本簇证据均为普通对象/String wrapper)
 
@@ -9370,6 +11672,23 @@ export class ObjectGenerator {
         vm.jne("_oas_throw");
         vm.jmp("_oas_do_set");
 
+        vm.label("_oas_array");
+        // `_object_set` routes non-index array names to the side table, but
+        // Array [[Set]] treats "length" as the exotic length property.  Use
+        // the shared strict length setter so Object.assign(target,{length:n})
+        // shrinks/grows the array and propagates RangeError/TypeError.
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.A1, "_str_length_prop");
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_key_eq");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_oas_do_set");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_agen_setlength_throw");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 16);
+
         vm.label("_oas_throw");
         vm.lea(VReg.A0, vm.asm.addString("Cannot assign to read only property"));
         boxStr(VReg.A0);
@@ -9398,6 +11717,47 @@ export class ObjectGenerator {
         vm.prologue(96, []);
 
         vm.store(VReg.SP, 72, VReg.A0);  // 原始装箱 src(供 [[Get]] / _maybe_getter this)
+        vm.store(VReg.SP, 80, VReg.A1);  // excluded(入口 ToObject helper 会破坏 A1)
+
+        // CopyDataProperties first applies ToObject to every non-nullish
+        // primitive. Number/Boolean/BigInt/Symbol wrappers have no enumerable
+        // own properties, so their rest result is an empty ordinary object.
+        // String wrappers do expose enumerable UTF-16 index properties; reuse
+        // _string_new so the existing object-copy loop sees the right keys.
+        vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFC); vm.jeq("_object_rest_src_string");
+        vm.cmpImm(VReg.V0, 0x7FF8); vm.jeq("_object_rest_src_empty");
+        vm.cmpImm(VReg.V0, 0x7FF9); vm.jeq("_object_rest_src_empty");
+        vm.cmpImm(VReg.V0, 0x7FFA); vm.jeq("_object_rest_src_nullish");
+        vm.cmpImm(VReg.V0, 0x7FFB); vm.jeq("_object_rest_src_nullish");
+        vm.cmpImm(VReg.V0, 0); vm.jeq("_object_rest_src_raw");
+        vm.cmpImm(VReg.V0, 0x7FFD); vm.jeq("_object_rest_src_ready");
+        vm.cmpImm(VReg.V0, 0x7FFE); vm.jeq("_object_rest_src_ready");
+        vm.cmpImm(VReg.V0, 0x7FFF); vm.jeq("_object_rest_src_ready");
+        // Ordinary positive/negative floating-point values.
+        vm.jmp("_object_rest_src_empty");
+
+        vm.label("_object_rest_src_string");
+        vm.load(VReg.A0, VReg.SP, 72);
+        vm.call("_string_new");
+        vm.store(VReg.SP, 72, VReg.RET);
+        vm.jmp("_object_rest_src_ready");
+
+        vm.label("_object_rest_src_raw");
+        // high16==0 is shared by raw heap pointers and +0/subnormals.
+        vm.load(VReg.V0, VReg.SP, 72);
+        vm.cmpImm(VReg.V0, 0); vm.jeq("_object_rest_src_empty");
+        vm.movImm64(VReg.V1, vm.ptrFloor);
+        vm.cmp(VReg.V0, VReg.V1); vm.jlt("_object_rest_src_empty");
+        vm.load(VReg.A0, VReg.SP, 72);
+        vm.call("_is_symbol");
+        vm.cmpImm(VReg.RET, 0); vm.jne("_object_rest_src_empty");
+        vm.load(VReg.A0, VReg.SP, 72);
+        vm.call("_is_bigint");
+        vm.cmpImm(VReg.RET, 0); vm.jne("_object_rest_src_empty");
+
+        vm.label("_object_rest_src_ready");
+        vm.load(VReg.A0, VReg.SP, 72);
 
         vm.emitMaskLoad(VReg.V4);
         vm.andMaskReg(VReg.V0, VReg.A0, VReg.V4);
@@ -9408,7 +11768,8 @@ export class ObjectGenerator {
         vm.mov(VReg.A0, VReg.V0);
         vm.call("_object_normalize_order");
         vm.load(VReg.V0, VReg.SP, 0);    // 重载(归一可能动 props 指针)
-        vm.andMaskReg(VReg.V0, VReg.A1, VReg.V4);
+        vm.load(VReg.V1, VReg.SP, 80);
+        vm.andMaskReg(VReg.V0, VReg.V1, VReg.V4);
         vm.store(VReg.SP, 24, VReg.V0);  // excluded 指针
 
         vm.call("_object_new");
@@ -9511,6 +11872,17 @@ export class ObjectGenerator {
         vm.store(VReg.SP, 16, VReg.V0);
         vm.jmp("_object_rest_loop");
 
+        vm.label("_object_rest_src_empty");
+        vm.call("_object_new");
+        vm.store(VReg.SP, 40, VReg.RET);
+        vm.jmp("_object_rest_done");
+
+        vm.label("_object_rest_src_nullish");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot convert undefined or null to object"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+
         vm.label("_object_rest_done");
         vm.load(VReg.RET, VReg.SP, 40);
         // [修复] _object_new 返回裸指针(装箱由调用方负责);补 0x7FFD 对象标签,
@@ -9591,6 +11963,10 @@ export class ObjectGenerator {
         // _nsobj_array_proto data slot (lazy, filled by _ensure_array_proto or emitArrayCtorObject).
         vm.asm.addDataLabel("_nsobj_array_proto");
         vm.asm.addDataQword(0);
+        // 0 while _nsobj_array_proto is merely the empty Array-exotic shell; set to 1
+        // by emitArrayCtorObject after all intrinsic Array.prototype methods land.
+        vm.asm.addDataLabel("_nsobj_array_ready");
+        vm.asm.addDataQword(0);
         // _nsobj_string_proto data slot (for getPrototypeOf <-> String.prototype).
         // Materialized by emitStringProtoObject (members.js). Declared here as runtime fallback
         // reference so _object_getPrototypeOf can read the slot even when emitStringProtoObject
@@ -9619,31 +11995,28 @@ export class ObjectGenerator {
             vm.asm.addDataQword(0);
         }
 
-        // _ensure_array_proto: fill _nsobj_array_proto if empty.
+        // _ensure_array_proto: fill _nsobj_array_proto if empty.  The intrinsic
+        // prototype is a real zero-length Array exotic whose own prototype is
+        // Object.prototype (stored in the per-array override table).
         vm.label("_ensure_array_proto");
         vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
         vm.lea(VReg.V0, "_nsobj_array_proto");
         vm.load(VReg.V0, VReg.V0, 0);
         vm.cmpImm(VReg.V0, 0);
         vm.jne("_eap_done");
-        vm.movImm(VReg.A0, 56);
-        vm.call("_alloc");
-        vm.mov(VReg.S2, VReg.RET);
-        vm.movImm(VReg.V1, 2); /* TYPE_OBJECT */
-        vm.store(VReg.S2, 0, VReg.V1);
-        vm.movImm(VReg.V1, 0);
-        vm.store(VReg.S2, 8, VReg.V1);
-        vm.store(VReg.S2, 16, VReg.V1);
-        vm.store(VReg.S2, 24, VReg.V1);
-        vm.store(VReg.S2, 32, VReg.V1);
-        vm.store(VReg.S2, 40, VReg.V1);
-        vm.store(VReg.S2, 48, VReg.V1);
-        vm.emitMaskLoad(VReg.V1);
-        vm.andMaskReg(VReg.V0, VReg.S2, VReg.V1);
-        vm.movImm64(VReg.V1, 0x7ffd000000000000n);
-        vm.or(VReg.V0, VReg.V0, VReg.V1);
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.call("_box_arr_r");
+        vm.mov(VReg.S0, VReg.RET);
+        // Initialise the Object.prototype override before publishing the
+        // intrinsic array. Publishing first lets lazy Object.prototype setup
+        // recurse through a half-built Array.prototype on hole lookup.
+        vm.call("_object_proto_ensure");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_set_instance_proto");
         vm.lea(VReg.V1, "_nsobj_array_proto");
-        vm.store(VReg.V1, 0, VReg.V0);
+        vm.store(VReg.V1, 0, VReg.S0);
         vm.label("_eap_done");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
 
@@ -9721,6 +12094,20 @@ export class ObjectGenerator {
         vm.mov(VReg.S0, VReg.RET);
         vm.lea(VReg.V1, "_nsobj_string_proto");
         vm.store(VReg.V1, 0, VReg.S0);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.lea(VReg.A1, vm.asm.addString("__value"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.lea(VReg.A2, vm.asm.addString(""));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A2, VReg.A2, VReg.V1);
+        vm.call("_object_set");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.lea(VReg.A1, vm.asm.addString("__value"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.movImm(VReg.A2, 0);
+        vm.call("_object_set_prop_attr");
         // valueOf 闭包(24B aref 蹦床:this=A5 → A0)
         vm.movImm(VReg.A0, 24);
         vm.call("_alloc");
@@ -9901,6 +12288,73 @@ export class ObjectGenerator {
         // Symbol 等非标准 tagged 值也会落此(偏差:Symbol→Number.prototype)。
         vm.jmp("_gpo_number_proto");
         vm.label("_gpo_function");
+        // The three dynamic-function constructors are subclasses of Function:
+        // their own [[Prototype]] is the Function constructor singleton, not
+        // Function.prototype.  Identity slots are zero until materialized.
+        for (const _slot of ["_opts_genfunc_ctor", "_opts_asyncfunc_ctor", "_asyncgenfunc_singleton"]) {
+            const _next = `_gpo_kind_ctor_next_${_slot}`;
+            vm.lea(VReg.V0, _slot);
+            vm.load(VReg.V0, VReg.V0, 0);
+            vm.cmpImm(VReg.V0, 0); vm.jeq(_next);
+            vm.cmp(VReg.S0, VReg.V0); vm.jeq("_gpo_kind_ctor_parent");
+            vm.label(_next);
+        }
+        // TypedArray 族构造器闭包 → %TypedArray%(harness: Object.getPrototypeOf(Int8Array))
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V2, VReg.S0, VReg.V1);
+        vm.load(VReg.V0, VReg.V2, 0);
+        vm.cmpImm(VReg.V0, 0xc105);
+        vm.jne("_gpo_ta_done");
+        vm.load(VReg.V0, VReg.V2, 16);
+        vm.cmpImm(VReg.V0, 0x70);
+        vm.jeq("_gpo_ta_done");
+        vm.cmpImm(VReg.V0, 0x40);
+        vm.jlt("_gpo_ta_done");
+        vm.cmpImm(VReg.V0, 0x61);
+        vm.jgt("_gpo_ta_done");
+        vm.call("_ta_intrinsic");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_ta_ensure_species");
+        vm.jmp("_gpo_ret");
+        vm.label("_gpo_ta_done");
+        // Function-kind intrinsics have distinct [[Prototype]] objects.  The
+        // compact function value does not carry a normal object proto slot, so
+        // select it from the code-pointer metadata table.
+        vm.load(VReg.V0, VReg.V2, 0);
+        vm.cmpImm(VReg.V0, 0xc105); vm.jeq("_gpo_function_meta_closure");
+        vm.cmpImm(VReg.V0, 0xa51c); vm.jeq("_gpo_function_meta_closure");
+        vm.mov(VReg.A0, VReg.V2);
+        vm.jmp("_gpo_function_meta_find");
+        vm.label("_gpo_function_meta_closure");
+        vm.load(VReg.A0, VReg.V2, 8);
+        vm.label("_gpo_function_meta_find");
+        // CreateDynamicFunction may select NewTarget.prototype rather than the
+        // intrinsic kind prototype.  Mmap closures keep that exact value in
+        // their dynamic metadata node because the compact closure layout has
+        // no ordinary-object [[Prototype]] slot.
+        vm.store(VReg.SP, 0, VReg.A0);
+        vm.call("_dynamic_fn_meta_proto");
+        vm.cmpImm(VReg.RET, 0); vm.jne("_gpo_ret");
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.call("_func_meta_find");
+        vm.cmpImm(VReg.RET, 1); vm.jeq("_gpo_genfunc_proto");
+        vm.cmpImm(VReg.RET, 2); vm.jeq("_gpo_asyncfunc_proto");
+        vm.cmpImm(VReg.RET, 3); vm.jeq("_gpo_asyncgenfunc_proto");
+        vm.jmp("_gpo_function_ordinary");
+        vm.label("_gpo_genfunc_proto");
+        vm.call("_ensure_genfunc_ctor");
+        vm.lea(VReg.V0, "_nsobj_genfunc_proto");
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.jmp("_gpo_ret");
+        vm.label("_gpo_asyncfunc_proto");
+        vm.call("_ensure_asyncfunc_ctor");
+        vm.lea(VReg.V0, "_nsobj_asyncfunc_proto");
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.jmp("_gpo_ret");
+        vm.label("_gpo_asyncgenfunc_proto");
+        vm.call("_ensure_asyncgenfunc_tag_proto");
+        vm.jmp("_gpo_ret");
+        vm.label("_gpo_function_ordinary");
         // Error 子类构造器:身份比对 _errctorref_* → 返 Error 构造器
         for (let _ei = 0; _ei < _gpoErrSubs.length; _ei = _ei + 1) {
             const _lab = "_gpo_errsub_" + _ei;
@@ -9916,6 +12370,9 @@ export class ObjectGenerator {
         vm.call("_ensure_function_proto");
         vm.lea(VReg.V0, "_nsobj_function_proto");
         vm.load(VReg.RET, VReg.V0, 0);
+        vm.jmp("_gpo_ret");
+        vm.label("_gpo_kind_ctor_parent");
+        vm.call("_ensure_function_ctor_runtime");
         vm.jmp("_gpo_ret");
         vm.label("_gpo_error_ctor");
         vm.call("_ensure_error_ctor");
@@ -10030,6 +12487,10 @@ export class ObjectGenerator {
         // arguments 异质对象(byte1 ARR_IS_ARGUMENTS):[[Prototype]] 是
         // Object.prototype,不是 Array.prototype(15.2.3.6-3-96-1 / 175-1)。
         vm.label("_gpo_array");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_array_get_instance_proto");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_gpo_array_override");
         vm.loadByte(VReg.V0, VReg.S1, 1);
         vm.andImm(VReg.V0, VReg.V0, ARR_IS_ARGUMENTS);
         vm.cmpImm(VReg.V0, 0);
@@ -10039,6 +12500,10 @@ export class ObjectGenerator {
         vm.load(VReg.RET, VReg.V0, 0);
         vm.cmpImm(VReg.RET, 0);
         vm.jeq("_object_getPrototypeOf_null");
+        vm.epilogue([VReg.S0, VReg.S1], 32);
+        vm.label("_gpo_array_override");
+        // The side table stores the exact boxed prototype (including tagged
+        // null), so return it without consulting the intrinsic Array.prototype.
         vm.epilogue([VReg.S0, VReg.S1], 32);
 
         vm.label("_gpo_object_proto");
@@ -10072,8 +12537,14 @@ export class ObjectGenerator {
         vm.jeq("_gpo_set");
         vm.cmpImm(VReg.V0, 11); // TYPE_PROMISE
         vm.jeq("_gpo_promise");
+        vm.cmpImm(VReg.V0, TYPE_SYMBOL);
+        vm.jeq("_gpo_symbol");
         vm.lea(VReg.RET, "_js_undefined");
         vm.load(VReg.RET, VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1], 32);
+
+        vm.label("_gpo_symbol");
+        vm.call("_ensure_symbol_proto");
         vm.epilogue([VReg.S0, VReg.S1], 32);
 
         vm.label("_gpo_map");
@@ -10224,14 +12695,41 @@ export class ObjectGenerator {
         vm.epilogue([VReg.S0, VReg.S1], 16); // 理论不达
     }
 
-    // Object.setPrototypeOf(obj, proto) -> obj
+    // Object.setPrototypeOf(obj, proto) -> obj; Reflect.setPrototypeOf -> boolean.
+    // Both share [[SetPrototypeOf]], but Object throws when the internal operation returns false
+    // while Reflect exposes that false result.  S2 is the mode (0=Object, 1=Reflect).
     generateSetPrototypeOf() {
         const vm = this.vm;
 
+        vm.label("_reflect_setPrototypeOf");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.movImm(VReg.S2, 1);
+        vm.jmp("_ospo_entry");
+
         vm.label("_object_setPrototypeOf");
-        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
+        vm.movImm(VReg.S2, 0);
+        vm.label("_ospo_entry");
         vm.mov(VReg.S0, VReg.A0); // boxed obj(陷阱/返回须跨 call 保活)
         vm.mov(VReg.S1, VReg.A1); // boxed proto
+
+        // Reflect requires an Object target (Object.setPrototypeOf merely
+        // RequireObjectCoercible-coerces primitives and returns them unchanged).
+        vm.cmpImm(VReg.S2, 0);
+        vm.jeq("_ospo_target_ok");
+        vm.shrImm(VReg.V5, VReg.S0, 48);
+        vm.cmpImm(VReg.V5, 0x7FFD); vm.jeq("_ospo_target_ok");
+        vm.cmpImm(VReg.V5, 0x7FFE); vm.jeq("_ospo_target_ok");
+        vm.cmpImm(VReg.V5, 0x7FFF); vm.jeq("_ospo_target_ok");
+        vm.cmpImm(VReg.V5, 0); vm.jne("_ospo_reflect_target_typeerr");
+        vm.cmpImm(VReg.S0, 0); vm.jeq("_ospo_reflect_target_typeerr");
+        vm.lea(VReg.V5, "_heap_base"); vm.load(VReg.V5, VReg.V5, 0);
+        vm.cmp(VReg.S0, VReg.V5); vm.jlt("_ospo_reflect_target_typeerr");
+        vm.lea(VReg.V5, "_heap_ptr"); vm.load(VReg.V5, VReg.V5, 0);
+        vm.cmp(VReg.S0, VReg.V5); vm.jge("_ospo_reflect_target_typeerr");
+        vm.loadByte(VReg.V5, VReg.S0, 0);
+        vm.cmpImm(VReg.V5, TYPE_SYMBOL); vm.jeq("_ospo_reflect_target_typeerr");
+        vm.label("_ospo_target_ok");
 
         // Type check: proto must be null or an Object (ES 19.1.2.18 step 3).
         // A0=obj (boxed), A1=proto (boxed). Same family as _object_create:
@@ -10297,40 +12795,99 @@ export class ObjectGenerator {
         vm.call("_proxy_trap_fn");
         vm.cmpImm(VReg.RET, 0);
         vm.jeq("_ospo_px_fwd");
-        vm.mov(VReg.A3, VReg.RET);
+        // Preserve the trap before assembling arguments: arm64 RET aliases A0,
+        // while x64 A3 aliases V1.  V6 is not touched by the sequence below.
+        vm.mov(VReg.V6, VReg.RET);
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.V2, VReg.S0, VReg.V1);
         vm.load(VReg.A0, VReg.V2, 8); // target
         vm.mov(VReg.A1, VReg.S1);     // proto
         vm.lea(VReg.A2, "_js_undefined");
         vm.load(VReg.A2, VReg.A2, 0);
+        vm.mov(VReg.A3, VReg.V6);     // trap (last, after V1 scratch)
         vm.call("_aref_invoke_cb");
-        vm.mov(VReg.RET, VReg.S0);
-        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_boolean");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_ospo_false");
+        vm.jmp("_object_setPrototypeOf_done");
         vm.label("_ospo_px_fwd");
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.V2, VReg.S0, VReg.V1);
         vm.load(VReg.A0, VReg.V2, 8); // target
         vm.mov(VReg.A1, VReg.S1);
+        vm.cmpImm(VReg.S2, 0);
+        vm.jeq("_ospo_px_fwd_object");
+        vm.call("_reflect_setPrototypeOf");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+        vm.label("_ospo_px_fwd_object");
         vm.call("_object_setPrototypeOf");
-        vm.mov(VReg.RET, VReg.S0);
-        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
         vm.label("_ospo_not_px");
+        // Object.prototype is the immutable-prototype exotic object.  Its current prototype is
+        // permanently null: retaining null succeeds; every different value returns false.
+        vm.lea(VReg.V0, "_nsobj_object_proto");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V0, VReg.V0, VReg.V1);
+        vm.cmp(VReg.V2, VReg.V0);
+        vm.jne("_ospo_not_immutable_proto");
+        vm.cmpImm(VReg.V3, 0);
+        vm.jeq("_object_setPrototypeOf_done");
+        vm.jmp("_ospo_false");
+        vm.label("_ospo_not_immutable_proto");
+        // Arrays store capacity at +16, not [[Prototype]]. Route their
+        // prototype mutation through the array side table instead of corrupting
+        // that header field.
+        vm.loadByte(VReg.V0, VReg.V2, 0);
+        vm.cmpImm(VReg.V0, 1); // TYPE_ARRAY
+        vm.jeq("_ospo_array");
+        // OrdinarySetPrototypeOf on a non-extensible object may only retain
+        // its current prototype; changing it must return false (the public
+        // Object.setPrototypeOf wrapper then throws TypeError).
+        vm.cmpImm(VReg.V0, TYPE_OBJECT);
+        vm.jne("_ospo_cycle_check");
+        vm.loadByte(VReg.V0, VReg.V2, 1);
+        vm.andImm(VReg.V0, VReg.V0, EXT_NONEXT);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_ospo_cycle_check");
+        vm.load(VReg.V0, VReg.V2, 16);
+        vm.cmp(VReg.V0, VReg.V3);
+        vm.jeq("_object_setPrototypeOf_done");
+        vm.jmp("_ospo_false");
+        vm.label("_ospo_cycle_check");
         // [#T2] Cycle check: walk the proposed proto chain and reject if target
         // appears (OrdinarySetPrototypeOf step 7). Guard: proto is null (V3==0)
         // or target traversal depth exceeds 8192 → throw TypeError.
         // Proxy(TYPE_PROXY=8):handler@16 非 __proto__,跳遍历防段错误。
         vm.cmpImm(VReg.V3, 0);
         vm.jeq("_ospo_store");
-        vm.load(VReg.V0, VReg.V3, 0);    // check type of proposed proto
-        vm.andImm(VReg.V0, VReg.V0, 0xff);
-        vm.cmpImm(VReg.V0, 8);           // TYPE_PROXY → 无 proto 链,跳遍历
-        vm.jeq("_ospo_store");
+        vm.loadByte(VReg.V0, VReg.V3, 0); // proposed proto 头类型
+        vm.cmpImm(VReg.V0, TYPE_PROXY);
+        vm.jeq("_ospo_store");            // Proxy:handler@16,非 __proto__
+        // 仅 TYPE_OBJECT/TYPE_CLOSURE 在 +16 存 __proto__。TA/Array/AB 等同址是
+        // data_ptr/length 等 → 误遍历致 SIGSEGV(buffer/this-inherits-typedarray)。
+        vm.cmpImm(VReg.V0, TYPE_OBJECT);
+        vm.jeq("_ospo_cycle_start");
+        vm.cmpImm(VReg.V0, 3);            // TYPE_CLOSURE(classinfo 同 JSObject 布局)
+        vm.jeq("_ospo_cycle_start");
+        vm.jmp("_ospo_store");
+        vm.label("_ospo_cycle_start");
         vm.mov(VReg.V4, VReg.V3); // cursor = proposed proto
         vm.movImm64(VReg.V0, 0);  // depth counter
         vm.label("_ospo_cycle_loop");
         vm.cmp(VReg.V4, VReg.V2);  // cursor == target? → cycle
         vm.jeq("_ospo_cycle");
+        // Stop as soon as the chain reaches an exotic [[GetPrototypeOf]]
+        // implementation. In particular, a Proxy stores its handler at +16;
+        // treating that field as an ordinary prototype pointer segfaults and
+        // also violates OrdinarySetPrototypeOf step 7.c.i.
+        vm.loadByte(VReg.V1, VReg.V4, 0);
+        vm.cmpImm(VReg.V1, TYPE_OBJECT);
+        vm.jeq("_ospo_cycle_load");
+        vm.cmpImm(VReg.V1, 3);
+        vm.jne("_ospo_store");
+        vm.label("_ospo_cycle_load");
         vm.load(VReg.V4, VReg.V4, 16); // cursor = cursor.__proto__
         vm.cmpImm(VReg.V4, 0);   // cursor == null? → ok
         vm.jeq("_ospo_store");
@@ -10338,12 +12895,21 @@ export class ObjectGenerator {
         vm.movImm64(VReg.V1, 8192);
         vm.cmp(VReg.V0, VReg.V1);
         vm.jlt("_ospo_cycle_loop");
-        // Depth exhausted or cycle detected → TypeError
+        // Depth exhausted or cycle detected → internal false.
         vm.label("_ospo_cycle");
+        vm.jmp("_ospo_false");
+
+        vm.label("_ospo_false");
+        vm.cmpImm(VReg.S2, 0);
+        vm.jne("_ospo_reflect_false");
         vm.lea(VReg.A0, vm.asm.addString("Cannot set prototype of object: cycle detected or immutable prototype"));
         vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.A0, VReg.A0, VReg.V1);
         vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
         vm.call("_throw_type_error"); // 不返回
+        vm.label("_ospo_reflect_false");
+        vm.lea(VReg.RET, "_js_false");
+        vm.load(VReg.RET, VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
         vm.label("_ospo_store");
         vm.store(VReg.V2, 16, VReg.V3);
         // [A2] 原型改写:保守形状置 0(键序未变;读侧形状只管自有键,置 0 无害)
@@ -10351,8 +12917,25 @@ export class ObjectGenerator {
         vm.store(VReg.V2, OBJECT_SHAPE_OFFSET, VReg.V1);
 
         vm.label("_object_setPrototypeOf_done");
+        vm.cmpImm(VReg.S2, 0);
+        vm.jne("_ospo_reflect_true");
         vm.mov(VReg.RET, VReg.S0); // 返回原始装箱 obj
-        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+        vm.label("_ospo_reflect_true");
+        vm.lea(VReg.RET, "_js_true");
+        vm.load(VReg.RET, VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+        vm.label("_ospo_array");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_array_set_instance_proto");
+        vm.jmp("_object_setPrototypeOf_done");
+
+        vm.label("_ospo_reflect_target_typeerr");
+        vm.lea(VReg.A0, vm.asm.addString("Reflect.setPrototypeOf called on non-object"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
     }
 
     // [__proto__] Object.prototype.__proto__ getter/setter
@@ -10410,9 +12993,24 @@ export class ObjectGenerator {
         vm.jeq("_proto_setter_recv");
         vm.cmpImm(VReg.V0, 0x7FFE);      // Array(亦 Object)
         vm.jeq("_proto_setter_recv");
-        vm.cmpImm(VReg.V0, 0);           // raw heap pointer
+        vm.cmpImm(VReg.V0, 0x7FFF);      // Function
         vm.jeq("_proto_setter_recv");
-        vm.jmp("_proto_setter_done");   // 非 Object/Null → undefined
+        vm.cmpImm(VReg.V0, 0);           // raw heap pointer candidate
+        vm.jne("_proto_setter_done");
+        vm.cmpImm(VReg.S1, 0);
+        vm.jeq("_proto_setter_done");
+        vm.lea(VReg.V1, "_heap_base");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.S1, VReg.V1);
+        vm.jlt("_proto_setter_done");
+        vm.lea(VReg.V1, "_heap_ptr");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.S1, VReg.V1);
+        vm.jge("_proto_setter_done");
+        vm.loadByte(VReg.V1, VReg.S1, 0);
+        vm.cmpImm(VReg.V1, TYPE_SYMBOL);
+        vm.jeq("_proto_setter_done");
+        vm.jmp("_proto_setter_recv");
 
         vm.label("_proto_setter_recv");
         // Type(O) 非 Object → 返回 undefined(基元 object-coercible)
@@ -10421,11 +13019,33 @@ export class ObjectGenerator {
         vm.jeq("_proto_setter_obj");
         vm.cmpImm(VReg.V0, 0x7FFE);
         vm.jeq("_proto_setter_obj");
-        vm.cmpImm(VReg.V0, 0);
+        vm.cmpImm(VReg.V0, 0x7FFF);
         vm.jeq("_proto_setter_obj");
-        vm.jmp("_proto_setter_done");
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_proto_setter_done");
+        vm.cmpImm(VReg.S0, 0);
+        vm.jeq("_proto_setter_done");
+        vm.lea(VReg.V1, "_heap_base");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.S0, VReg.V1);
+        vm.jlt("_proto_setter_done");
+        vm.lea(VReg.V1, "_heap_ptr");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.S0, VReg.V1);
+        vm.jge("_proto_setter_done");
+        vm.loadByte(VReg.V1, VReg.S0, 0);
+        vm.cmpImm(VReg.V1, TYPE_SYMBOL);
+        vm.jeq("_proto_setter_done");
+        vm.jmp("_proto_setter_obj");
 
         vm.label("_proto_setter_obj");
+        // Reuse the complete [[SetPrototypeOf]] implementation: Proxy traps
+        // (and abrupt completion), same-prototype success on non-extensible
+        // objects, cycle checks, and false→TypeError are all shared here.
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_setPrototypeOf");
+        vm.jmp("_proto_setter_done");
         // Debox;堆范围守卫
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.V0, VReg.S0, VReg.V1); // V0 = raw this
@@ -10537,6 +13157,26 @@ export class ObjectGenerator {
         const vm = this.vm;
         vm.label("_object_ctor_call");
         vm.prologue(0, []);
+        // When Construct(Object, args, NewTarget) has a distinct NewTarget,
+        // _fn_construct_call has already allocated the correct instance from
+        // NewTarget.prototype. Do not override it with an Object.prototype
+        // instance returned by this active-function body.
+        vm.lea(VReg.V0, "_call_new_target");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_oct_call_default");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jeq("_oct_call_default");
+        vm.lea(VReg.V1, "_nsobj_object");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jeq("_oct_call_default");
+        vm.lea(VReg.RET, "_js_undefined");
+        vm.load(VReg.RET, VReg.RET, 0);
+        vm.epilogue([], 0);
+        vm.label("_oct_call_default");
         // Construct(Object)/Object():空对象。ToObject 包装(Object(5)→Number)仍偏差。
         // 旧实现一律 TypeError,令 Array.from.call(Object, []) 无法 Construct。
         vm.call("_object_new");
@@ -10593,6 +13233,102 @@ export class ObjectGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
     }
 
+    // SetIntegrityLevel for Proxy objects. A0=proxy, A1=0(sealed)/1(frozen).
+    // The key list is snapshotted exactly once. Seal sends only
+    // {configurable:false}; freeze first observes the current descriptor and
+    // additionally sends writable:false for data properties. These deliberately
+    // remain partial descriptor objects because the shape is observable in the
+    // defineProperty trap.
+    generateObjectSetIntegrityLevel() {
+        const vm = this.vm;
+        const boxStr = (reg) => {
+            vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+            vm.and(reg, reg, VReg.V1);
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+            vm.or(reg, reg, VReg.V1);
+        };
+
+        vm.label("_object_set_integrity_proxy");
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.mov(VReg.S0, VReg.A0); // proxy
+        vm.store(VReg.SP, 8, VReg.A1); // level
+
+        // SetIntegrityLevel step 3. Object.freeze/seal require false → TypeError;
+        // _object_preventExtensions supplies that wrapper semantic.
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_preventExtensions");
+
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_all_own_keys");
+        vm.mov(VReg.S1, VReg.RET); // one validated [[OwnPropertyKeys]] snapshot
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_array_length");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.movImm(VReg.S3, 0);
+        vm.label("_osip_loop");
+        vm.cmp(VReg.S3, VReg.S2);
+        vm.jge("_osip_done");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_array_get");
+        vm.mov(VReg.S4, VReg.RET); // key
+        vm.movImm(VReg.V0, 0); // isAccessor=false (seal does not inspect)
+        vm.store(VReg.SP, 24, VReg.V0);
+
+        vm.load(VReg.V0, VReg.SP, 8);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_osip_make_desc");
+        // frozen: currentDesc = ? O.[[GetOwnProperty]](key); absent keys skip.
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_object_getOwnPropertyDescriptor");
+        vm.mov(VReg.S5, VReg.RET);
+        vm.shrImm(VReg.V1, VReg.S5, 48);
+        vm.cmpImm(VReg.V1, 0x7FFB);
+        vm.jeq("_osip_next");
+        vm.mov(VReg.A0, VReg.S5);
+        vm.lea(VReg.A1, vm.asm.addString("get"));
+        boxStr(VReg.A1);
+        vm.call("_object_has");
+        vm.store(VReg.SP, 24, VReg.RET); // completed accessor desc has own "get"
+
+        vm.label("_osip_make_desc");
+        vm.call("_object_new");
+        vm.call("_box_obj_r");
+        vm.store(VReg.SP, 0, VReg.RET); // partial descriptor
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, vm.asm.addString("configurable"));
+        boxStr(VReg.A1);
+        vm.lea(VReg.A2, "_js_false");
+        vm.load(VReg.A2, VReg.A2, 0);
+        vm.call("_object_set");
+
+        vm.load(VReg.V0, VReg.SP, 8);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_osip_define"); // sealed: configurable only
+        vm.load(VReg.V0, VReg.SP, 24);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_osip_define"); // frozen accessor: configurable only
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.lea(VReg.A1, vm.asm.addString("writable"));
+        boxStr(VReg.A1);
+        vm.lea(VReg.A2, "_js_false");
+        vm.load(VReg.A2, VReg.A2, 0);
+        vm.call("_object_set");
+
+        vm.label("_osip_define");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.load(VReg.A2, VReg.SP, 0);
+        vm.call("_object_defineProperty_proxy_or_throw");
+        vm.label("_osip_next");
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_osip_loop");
+        vm.label("_osip_done");
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 32);
+    }
+
     // Object.freeze(obj) -> obj(原对象)。对象级全冻(P1 位保留:FROZEN|SEALED|NONEXT)
     // + [P2] 精确:materialize flags 并对全属性清 writable|configurable(getOwnProperty-
     // Descriptor 可读回 writable:false)。对象级 FROZEN 在 _object_set 仍先行短路。
@@ -10604,6 +13340,29 @@ export class ObjectGenerator {
         vm.label("_object_freeze");
         vm.prologue(0, [VReg.S0, VReg.S1]);
         vm.mov(VReg.S1, VReg.A0); // boxed receiver(返回值)
+        // Proxy SetIntegrityLevel is fully observable; dispatch before the
+        // compact ordinary/exotic fast paths.
+        vm.shrImm(VReg.V1, VReg.S1, 48);
+        vm.cmpImm(VReg.V1, 0x7FFD);
+        vm.jeq("_ofrz_px_heap");
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_ofrz_not_px");
+        vm.cmpImm(VReg.S1, 0);
+        vm.jeq("_ofrz_not_px");
+        vm.label("_ofrz_px_heap");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.S0, VReg.S1, VReg.V1);
+        vm.movImm64(VReg.V1, vm.ptrFloor);
+        vm.cmp(VReg.S0, VReg.V1);
+        vm.jlt("_ofrz_not_px");
+        vm.loadByte(VReg.V1, VReg.S0, 0);
+        vm.cmpImm(VReg.V1, TYPE_PROXY);
+        vm.jne("_ofrz_not_px");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.movImm(VReg.A1, 1);
+        vm.call("_object_set_integrity_proxy");
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_ofrz_not_px");
         vm.shrImm(VReg.V1, VReg.A0, 48);
         vm.cmpImm(VReg.V1, 0x7FFE);
         vm.jeq("_ofrz_arr");
@@ -10640,6 +13399,29 @@ export class ObjectGenerator {
         vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
         vm.call("_throw_type_error");
         vm.label("_ofrz_not_ta");
+        // Date keeps user properties in the shared side table. Freeze both the
+        // compact instance header and that ordinary backing object.
+        vm.shrImm(VReg.V1, VReg.S1, 48);
+        vm.cmpImm(VReg.V1, 0x7FFD);
+        vm.jne("_ofrz_not_date");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.S0, VReg.S1, VReg.V1);
+        vm.loadByte(VReg.V1, VReg.S0, 0);
+        vm.cmpImm(VReg.V1, TYPE_DATE);
+        vm.jne("_ofrz_not_date");
+        vm.loadByte(VReg.V1, VReg.S0, 1);
+        vm.orImm(VReg.V1, VReg.V1, EXT_FROZEN | EXT_SEALED | EXT_NONEXT);
+        vm.storeByte(VReg.S0, 1, VReg.V1);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_closure_props_find");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_ofrz_ret");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_object_freeze");
+        vm.jmp("_ofrz_ret");
+        vm.label("_ofrz_not_date");
         vm.mov(VReg.A0, VReg.S1);
         this._extGuard("_ofrz", "_ofrz_ret");
         vm.mov(VReg.S0, VReg.V0); // raw obj
@@ -10695,6 +13477,14 @@ export class ObjectGenerator {
         vm.mov(VReg.S1, VReg.A0);
         // [proxy] SetIntegrityLevel → [[PreventExtensions]]。_object_preventExtensions
         // 已分派 preventExtensions 陷阱;此处复用,陷阱抛则 Object.seal 中断。
+        vm.shrImm(VReg.V1, VReg.S1, 48);
+        vm.cmpImm(VReg.V1, 0x7FFD);
+        vm.jeq("_osl_px_heap");
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_osl_not_px");
+        vm.cmpImm(VReg.S1, 0);
+        vm.jeq("_osl_not_px");
+        vm.label("_osl_px_heap");
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.S0, VReg.S1, VReg.V1);
         vm.cmpImm(VReg.S0, 0);
@@ -10706,8 +13496,8 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.V0, TYPE_PROXY);
         vm.jne("_osl_not_px");
         vm.mov(VReg.A0, VReg.S1);
-        vm.call("_object_preventExtensions");
-        vm.mov(VReg.RET, VReg.S1);
+        vm.movImm(VReg.A1, 0);
+        vm.call("_object_set_integrity_proxy");
         vm.epilogue([VReg.S0, VReg.S1], 0);
         vm.label("_osl_not_px");
         vm.shrImm(VReg.V1, VReg.S1, 48);
@@ -10715,6 +13505,26 @@ export class ObjectGenerator {
         vm.jeq("_osl_arr");
         vm.cmpImm(VReg.V1, 0x7FFF);
         vm.jeq("_osl_fn");
+        vm.cmpImm(VReg.V1, 0x7FFD);
+        vm.jne("_osl_not_date");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.S0, VReg.S1, VReg.V1);
+        vm.loadByte(VReg.V1, VReg.S0, 0);
+        vm.cmpImm(VReg.V1, TYPE_DATE);
+        vm.jne("_osl_not_date");
+        vm.loadByte(VReg.V1, VReg.S0, 1);
+        vm.orImm(VReg.V1, VReg.V1, EXT_SEALED | EXT_NONEXT);
+        vm.storeByte(VReg.S0, 1, VReg.V1);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_closure_props_find");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_osl_ret");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_object_seal");
+        vm.jmp("_osl_ret");
+        vm.label("_osl_not_date");
         this._extGuard("_osl", "_osl_ret");
         vm.mov(VReg.S0, VReg.V0);
         vm.loadByte(VReg.V1, VReg.S0, 1);
@@ -10793,7 +13603,7 @@ export class ObjectGenerator {
         vm.mov(VReg.A0, VReg.RET);
         vm.call("_to_boolean");
         vm.cmpImm(VReg.RET, 0);
-        vm.jeq("_opx_px_ok");
+        vm.jeq("_opx_px_false");
         vm.load(VReg.A0, VReg.S1, 8); // target
         vm.call("_object_isExtensible"); // RET = js_true/js_false
         vm.lea(VReg.V1, "_js_true");
@@ -10804,6 +13614,13 @@ export class ObjectGenerator {
         vm.label("_opx_px_ok");
         vm.mov(VReg.RET, VReg.S0);
         vm.epilogue([VReg.S0, VReg.S1], 16);
+        vm.label("_opx_px_false");
+        vm.lea(VReg.A0, vm.asm.addString("Proxy preventExtensions trap returned false"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
         vm.label("_opx_proxy_fwd");
         vm.load(VReg.A0, VReg.S1, 8); // target
         vm.call("_object_preventExtensions");
@@ -10878,7 +13695,7 @@ export class ObjectGenerator {
         vm.cmp(VReg.RET, VReg.V2);
         vm.jeq("_oti_false");
         vm.mov(VReg.A0, VReg.S0);
-        vm.call("_object_own_keys_all");
+        vm.call("_object_all_own_keys");
         vm.mov(VReg.S1, VReg.RET);
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_array_length");
@@ -11023,18 +13840,21 @@ export class ObjectGenerator {
         vm.call("_object_test_integrity");
         vm.epilogue([], 0);
         vm.label("_ifz_ds_obj");
-        this._extGuard("_ifz2", "_ifz_true"); // 非 TYPE_OBJECT → true
-        vm.loadByte(VReg.V1, VReg.V0, 1);
-        vm.andImm(VReg.V3, VReg.V1, EXT_FROZEN);
-        vm.cmpImm(VReg.V3, 0);
-        vm.jne("_ifz_true"); // FROZEN 位置 → true
-        // 空对象 + non-extensible → frozen true
-        vm.andImm(VReg.V3, VReg.V1, EXT_NONEXT);
-        vm.cmpImm(VReg.V3, 0);
-        vm.jeq("_ifz_false"); // 可扩展 → 非 frozen
-        vm.load(VReg.V3, VReg.V0, 8); // count
-        vm.cmpImm(VReg.V3, 0);
-        vm.jeq("_ifz_true"); // 空 + 不可扩展 → frozen
+        // Flags are only a fast mutation guard, not proof of integrity: users
+        // can manually make every property non-writable/non-configurable and
+        // then prevent extensions. Run the actual TestIntegrityLevel for
+        // ordinary objects/classinfo and Date side-table exotics.
+        vm.loadByte(VReg.V1, VReg.V0, 0);
+        vm.cmpImm(VReg.V1, TYPE_OBJECT);
+        vm.jeq("_ifz_test");
+        vm.cmpImm(VReg.V1, 3);
+        vm.jeq("_ifz_test");
+        vm.cmpImm(VReg.V1, TYPE_DATE);
+        vm.jne("_ifz_true");
+        vm.label("_ifz_test");
+        vm.movImm(VReg.A1, 1);
+        vm.call("_object_test_integrity");
+        vm.epilogue([], 0);
         vm.label("_ifz_false");
         vm.lea(VReg.RET, "_js_false");
         vm.load(VReg.RET, VReg.RET, 0);
@@ -11130,17 +13950,17 @@ export class ObjectGenerator {
         vm.call("_object_test_integrity");
         vm.epilogue([], 0);
         vm.label("_isl_ds_obj");
-        this._extGuard("_isl2", "_isl_true"); // 非 TYPE_OBJECT → true
-        vm.loadByte(VReg.V1, VReg.V0, 1);
-        vm.andImm(VReg.V3, VReg.V1, EXT_SEALED);
-        vm.cmpImm(VReg.V3, 0);
+        vm.loadByte(VReg.V1, VReg.V0, 0);
+        vm.cmpImm(VReg.V1, TYPE_OBJECT);
+        vm.jeq("_isl_test");
+        vm.cmpImm(VReg.V1, 3);
+        vm.jeq("_isl_test");
+        vm.cmpImm(VReg.V1, TYPE_DATE);
         vm.jne("_isl_true");
-        vm.andImm(VReg.V3, VReg.V1, EXT_NONEXT);
-        vm.cmpImm(VReg.V3, 0);
-        vm.jeq("_isl_false");
-        vm.load(VReg.V3, VReg.V0, 8); // count
-        vm.cmpImm(VReg.V3, 0);
-        vm.jeq("_isl_true");
+        vm.label("_isl_test");
+        vm.movImm(VReg.A1, 0);
+        vm.call("_object_test_integrity");
+        vm.epilogue([], 0);
         vm.label("_isl_false");
         vm.lea(VReg.RET, "_js_false");
         vm.load(VReg.RET, VReg.RET, 0);
@@ -11330,62 +14150,172 @@ export class ObjectGenerator {
         vm.epilogue([], 0);
     }
 
-    // Object.fromEntries(entries) -- runtime fallback for value-call path.
-    // The compiler emits an inline loop for static call sites; this helper
-    // handles the memoized-ref path (e.g. var f=Object.fromEntries; f(entries)).
+    // Object.fromEntries(entries) -- AddEntriesFromIterable with CreateDataProperty semantics.
+    // Entry processing is interleaved with iterator advancement; entry/coercion/define abrupt
+    // completions close the iterator, while IteratorStep failures do not.
     generateObjectFromEntries() {
         const vm = this.vm;
-        // 唯一标签:勿与其它 helper 共用 _str_0/_str_1(重复 registerRuntimeString 会自举振荡)
-        vm.asm.registerRuntimeString("_str_ofe_0", "0");
-        vm.asm.registerRuntimeString("_str_ofe_1", "1");
         vm.label("_object_fromEntries");
-        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
-        vm.mov(VReg.S0, VReg.A0);  // entries array
+        vm.prologue(128, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.mov(VReg.S0, VReg.A0);  // iterable
         vm.call("_object_new");
-        vm.call("_box_obj_r");     // RET = boxed result object
+        vm.call("_box_obj_r");
         vm.mov(VReg.S1, VReg.RET);
+
+        // GetIterator(iterable), with intrinsic Array/String fallback for runtime-only methods.
         vm.mov(VReg.A0, VReg.S0);
-        vm.call("_array_length");
-        vm.mov(VReg.S2, VReg.RET); // len
-        vm.movImm(VReg.S3, 0);     // i
+        vm.call("_get_method_iterator");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_ofe_default_iterator");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.call("_spread_call0");
+        vm.jmp("_ofe_check_iterator");
+
+        vm.label("_ofe_default_iterator");
+        // Present own undefined @@iterator suppresses the intrinsic fallback.
+        vm.lea(VReg.A0, "_symwk_iterator");
+        vm.lea(VReg.A1, vm.asm.addString("Symbol.iterator"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_symbol_wellknown");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_ofe_not_iterable");
+        vm.shrImm(VReg.V3, VReg.S0, 48);
+        vm.cmpImm(VReg.V3, 0x7FFE);
+        vm.jne("_ofe_default_string");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V3, VReg.S0, VReg.V1);
+        vm.loadByte(VReg.V3, VReg.V3, 0);
+        vm.cmpImm(VReg.V3, 1);
+        vm.jne("_ofe_not_iterable");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.movImm(VReg.A1, 0);
+        vm.call("_array_iterator_new");
+        vm.jmp("_ofe_check_iterator");
+        vm.label("_ofe_default_string");
+        vm.cmpImm(VReg.V3, 0x7FFC);
+        vm.jne("_ofe_not_iterable");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_str_iterator_new");
+
+        vm.label("_ofe_check_iterator");
+        vm.shrImm(VReg.V3, VReg.RET, 48);
+        vm.cmpImm(VReg.V3, 0x7FFD); vm.jeq("_ofe_iterator_ok");
+        vm.cmpImm(VReg.V3, 0x7FFE); vm.jeq("_ofe_iterator_ok");
+        vm.cmpImm(VReg.V3, 0x7FFF); vm.jne("_ofe_bad_iterator");
+        vm.label("_ofe_iterator_ok");
+        vm.mov(VReg.S2, VReg.RET); // iterator
+
         vm.label("_ofe_loop");
-        vm.cmp(VReg.S3, VReg.S2);
-        vm.jge("_ofe_done");
-        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A0, VReg.S2);
+        vm.lea(VReg.A1, vm.asm.addString("next"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S2);
+        vm.call("_maybe_getter");
+        vm.store(VReg.SP, 24, VReg.RET);
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_is_callable");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_ofe_bad_next");
+        vm.load(VReg.A0, VReg.SP, 24);
+        vm.mov(VReg.A1, VReg.S2);
+        vm.call("_spread_call0");
+        vm.mov(VReg.S3, VReg.RET); // iterator result
+        vm.shrImm(VReg.V3, VReg.S3, 48);
+        vm.cmpImm(VReg.V3, 0x7FFD); vm.jeq("_ofe_result_ok");
+        vm.cmpImm(VReg.V3, 0x7FFE); vm.jeq("_ofe_result_ok");
+        vm.cmpImm(VReg.V3, 0x7FFF); vm.jne("_ofe_bad_result");
+        vm.label("_ofe_result_ok");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.lea(VReg.A1, vm.asm.addString("done"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
         vm.mov(VReg.A1, VReg.S3);
-        vm.call("_array_get");     // RET = entry [k, v]
-        // Read key from entry[0]
-        vm.mov(VReg.V0, VReg.RET);
-        vm.store(VReg.SP, 0, VReg.V0);  // entry
-        vm.mov(VReg.A0, VReg.V0);
-        vm.lea(VReg.V1, "_str_ofe_0");
-        vm.movImm64(VReg.V2, 0x7ffc000000000000n);
-        vm.or(VReg.A1, VReg.V1, VReg.V2);
-        vm.call("_subscript_get"); // key = entry["0"]
-        vm.mov(VReg.S4, VReg.RET); // key (may be number)
-        // ToPropertyKey: ensure string key
-        vm.shrImm(VReg.V1, VReg.S4, 48);
-        vm.cmpImm(VReg.V1, 0x7FFC);
-        vm.jeq("_ofe_key_str");
-        vm.mov(VReg.A0, VReg.S4);
-        vm.call("_valueToStr");
-        vm.mov(VReg.S4, VReg.RET);
-        vm.label("_ofe_key_str");
-        // Read value from entry[1]
+        vm.call("_maybe_getter");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_boolean");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_ofe_done");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.lea(VReg.A1, vm.asm.addString("value"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_maybe_getter");
+        vm.mov(VReg.S3, VReg.RET); // entry
+
+        // From Type(entry) through CreateDataProperty, abrupt completion closes iterator.
+        vm.lea(VReg.V1, "_exc_ctx_top"); vm.load(VReg.V2, VReg.V1, 0);
+        vm.store(VReg.SP, 32, VReg.V2);
+        vm.lea(VReg.V2, "_ofe_catch"); vm.store(VReg.SP, 40, VReg.V2);
+        vm.mov(VReg.V2, VReg.SP); vm.store(VReg.SP, 48, VReg.V2);
+        vm.store(VReg.SP, 56, VReg.FP);
+        vm.store(VReg.SP, 64, VReg.S0); vm.store(VReg.SP, 72, VReg.S1);
+        vm.store(VReg.SP, 80, VReg.S2); vm.store(VReg.SP, 88, VReg.S3);
+        vm.store(VReg.SP, 96, VReg.S4); vm.store(VReg.SP, 104, VReg.S5);
+        vm.addImm(VReg.V2, VReg.SP, 32);
+        vm.lea(VReg.V1, "_exc_ctx_top"); vm.store(VReg.V1, 0, VReg.V2);
+
+        vm.shrImm(VReg.V3, VReg.S3, 48);
+        vm.cmpImm(VReg.V3, 0x7FFD); vm.jeq("_ofe_entry_ok");
+        vm.cmpImm(VReg.V3, 0x7FFE); vm.jeq("_ofe_entry_ok");
+        vm.cmpImm(VReg.V3, 0x7FFF); vm.jne("_ofe_bad_entry");
+        vm.label("_ofe_entry_ok");
+        vm.mov(VReg.A0, VReg.S3);
+        vm.lea(VReg.A1, vm.asm.addString("0"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET); vm.mov(VReg.A1, VReg.S3); vm.call("_maybe_getter");
+        vm.store(VReg.SP, 0, VReg.RET); // raw key; ToPropertyKey follows both Gets
+        vm.mov(VReg.A0, VReg.S3);
+        vm.lea(VReg.A1, vm.asm.addString("1"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET); vm.mov(VReg.A1, VReg.S3); vm.call("_maybe_getter");
+        vm.store(VReg.SP, 8, VReg.RET); // value
         vm.load(VReg.A0, VReg.SP, 0);
-        vm.lea(VReg.V1, "_str_ofe_1");
-        vm.movImm64(VReg.V2, 0x7ffc000000000000n);
-        vm.or(VReg.A1, VReg.V1, VReg.V2);
-        vm.call("_subscript_get"); // val = entry["1"]
-        vm.mov(VReg.A2, VReg.RET);
+        vm.call("_js_prop_key");
+        vm.store(VReg.SP, 0, VReg.RET); // normalized property key
+        vm.load(VReg.A2, VReg.SP, 8);
         vm.mov(VReg.A0, VReg.S1);
-        vm.mov(VReg.A1, VReg.S4);
-        vm.call("_object_set");
-        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.load(VReg.A1, VReg.SP, 0);
+        vm.call("_object_define"); // CreateDataProperty: never invokes inherited setters
+        vm.load(VReg.V1, VReg.SP, 32);
+        vm.lea(VReg.V0, "_exc_ctx_top"); vm.store(VReg.V0, 0, VReg.V1);
         vm.jmp("_ofe_loop");
+
         vm.label("_ofe_done");
         vm.mov(VReg.RET, VReg.S1);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 128);
+
+        vm.label("_ofe_catch");
+        vm.load(VReg.V1, VReg.SP, 32);
+        vm.lea(VReg.V0, "_exc_ctx_top"); vm.store(VReg.V0, 0, VReg.V1);
+        vm.mov(VReg.A0, VReg.S2); vm.call("_iterator_close_keep"); vm.call("_throw_unwind");
+
+        const ofeThrow = (label, message) => {
+            vm.label(label);
+            vm.lea(VReg.A0, vm.asm.addString(message));
+            vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.A0, VReg.A0, VReg.V1);
+            vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+            vm.call("_throw_type_error");
+        };
+        ofeThrow("_ofe_not_iterable", "object is not iterable");
+        ofeThrow("_ofe_bad_iterator", "Result of iterator method is not an object");
+        ofeThrow("_ofe_bad_next", "iterator next is not callable");
+        ofeThrow("_ofe_bad_result", "iterator result is not an object");
+        ofeThrow("_ofe_bad_entry", "Iterator value is not an entry object");
     }
 
     // Object.defineProperties(obj, props) -- runtime fallback for value-call path.
@@ -11402,20 +14332,17 @@ export class ObjectGenerator {
         vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
         vm.mov(VReg.S0, VReg.A0);  // obj
         vm.mov(VReg.S1, VReg.A1);  // props
-        // 接收者守卫(与 _object_define_property 对齐):原语 boolean/number/string/nullish → TypeError。
-        // 此前缺检 → defineProperties(true, {}) 静默成功(test262 15.2.3.7-1-*).
-        vm.shrImm(VReg.V1, VReg.S0, 48);
-        vm.cmpImm(VReg.V1, 0x7ffd); vm.jeq("_odps_recv_ok");
-        vm.cmpImm(VReg.V1, 0x7ffe); vm.jeq("_odps_recv_ok");
-        vm.cmpImm(VReg.V1, 0x7fff); vm.jeq("_odps_recv_ok");
-        vm.cmpImm(VReg.V1, 0); vm.jeq("_odps_recv_ok");
-        vm.lea(VReg.A0, vm.asm.addString("Cannot define properties, target is not an object"));
-        boxStr(VReg.A0);
-        vm.call("_throw_type_error");
+        // Receiver must be an Object (not ToObject-coercible).  Reuse the
+        // strict descriptor-object classifier so raw Symbol/BigInt/zero do not
+        // masquerade as heap pointers.
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_dp_require_object");
         vm.label("_odps_recv_ok");
-        // keys = Object.keys(props)
+        // ObjectDefineProperties snapshots the complete [[OwnPropertyKeys]]
+        // list, then consults each own descriptor's enumerable bit.  This is
+        // observable for Proxy and includes Symbol keys.
         vm.mov(VReg.A0, VReg.S1);
-        vm.call("_object_keys");
+        vm.call("_object_all_own_keys");
         vm.mov(VReg.S2, VReg.RET); // keys array
         vm.mov(VReg.A0, VReg.S2);
         vm.call("_array_length");
@@ -11428,6 +14355,23 @@ export class ObjectGenerator {
         vm.mov(VReg.A1, VReg.S4);
         vm.call("_array_get");     // key
         vm.mov(VReg.S5, VReg.RET); // key boxed (S5 callee-saved, survives calls)
+        // propDesc = props.[[GetOwnProperty]](key); absent/non-enumerable keys
+        // are skipped without performing Get(props, key).
+        vm.mov(VReg.A0, VReg.S1);
+        vm.mov(VReg.A1, VReg.S5);
+        vm.call("_object_getOwnPropertyDescriptor");
+        vm.store(VReg.SP, 0, VReg.RET);
+        vm.shrImm(VReg.V1, VReg.RET, 48);
+        vm.cmpImm(VReg.V1, 0x7FFB);
+        vm.jeq("_odps_next");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, vm.asm.addString("enumerable"));
+        boxStr(VReg.A1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_boolean");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_odps_next");
         // Read descriptor from props[key] — [[Get]] 须触发访问器并以 props 为 this
         vm.mov(VReg.A0, VReg.S1);
         vm.mov(VReg.A1, VReg.S5);
@@ -11439,6 +14383,7 @@ export class ObjectGenerator {
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S5);
         vm.call("_object_define_property_dyn");
+        vm.label("_odps_next");
         vm.addImm(VReg.S4, VReg.S4, 1);
         vm.jmp("_odps_loop");
         vm.label("_odps_done");
@@ -11449,14 +14394,7 @@ export class ObjectGenerator {
         // 与 _odps_recv_ok 同判据;原语 → TypeError(不返回)。
         vm.label("_object_define_properties_recv_check");
         vm.prologue(0, []);
-        vm.shrImm(VReg.V1, VReg.A0, 48);
-        vm.cmpImm(VReg.V1, 0x7ffd); vm.jeq("_odps_chk_ok");
-        vm.cmpImm(VReg.V1, 0x7ffe); vm.jeq("_odps_chk_ok");
-        vm.cmpImm(VReg.V1, 0x7fff); vm.jeq("_odps_chk_ok");
-        vm.cmpImm(VReg.V1, 0); vm.jeq("_odps_chk_ok");
-        vm.lea(VReg.A0, vm.asm.addString("Cannot define properties, target is not an object"));
-        boxStr(VReg.A0);
-        vm.call("_throw_type_error");
+        vm.call("_dp_require_object");
         vm.label("_odps_chk_ok");
         vm.epilogue([], 0);
     }
@@ -11598,6 +14536,8 @@ export class ObjectGenerator {
         vm.cmp(VReg.S0, VReg.V1);
         vm.jlt("_ospa_done");
         vm.loadByte(VReg.V1, VReg.S0, 0);
+        vm.cmpImm(VReg.V1, 1); // TYPE_ARRAY: named properties live in the side table
+        vm.jeq("_ospa_array_side");
         vm.cmpImm(VReg.V1, TYPE_OBJECT);
         vm.jeq("_ospa_type_ok");
         vm.cmpImm(VReg.V1, 3); // TYPE_FUNCTION (classinfo) — same layout as TYPE_OBJECT
@@ -11623,6 +14563,22 @@ export class ObjectGenerator {
         vm.mov(VReg.A1, VReg.S4);
         vm.mov(VReg.A2, VReg.S2);
         vm.call("_object_set_attr");
+        vm.jmp("_ospa_done");
+        // Array headers do not contain an ordinary object's props/flags fields.
+        // Named and Symbol properties (including methods on the real
+        // Array.prototype exotic) are stored in the per-array side-table
+        // object, so apply the attribute to that ordinary object instead.
+        vm.label("_ospa_array_side");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_closure_props_find");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_ospa_done");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.mov(VReg.A2, VReg.S2);
+        vm.call("_object_set_prop_attr");
         vm.label("_ospa_done");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
     }
@@ -11674,23 +14630,32 @@ export class ObjectGenerator {
         vm.movImm(VReg.RET, 1);
         vm.epilogue([], 0);
 
-        // _dp_require_object(d)。对象(0x7FFD)/数组(0x7FFE)/函数(0x7FFF)/裸堆指针(高16=0
-        // 且非空)放行;其余(数字/布尔/null/undefined/字符串)抛 TypeError。
+        // _dp_require_object(d)。对象/数组/函数/真实裸堆对象放行；raw Symbol、
+        // BigInt 与 denormal Number 也使用 high16==0，须显式排除并做堆界检查。
         vm.label("_dp_require_object");
-        vm.prologue(0, []);
-        vm.shrImm(VReg.V1, VReg.A0, 48);
+        vm.prologue(0, [VReg.S0]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.shrImm(VReg.V1, VReg.S0, 48);
         vm.cmpImm(VReg.V1, 0x7ffd); vm.jeq("_dpo_ok");
         vm.cmpImm(VReg.V1, 0x7ffe); vm.jeq("_dpo_ok");
         vm.cmpImm(VReg.V1, 0x7fff); vm.jeq("_dpo_ok");
         vm.cmpImm(VReg.V1, 0); vm.jne("_dpo_throw");
-        vm.cmpImm(VReg.A0, 0); vm.jeq("_dpo_throw");
+        vm.cmpImm(VReg.S0, 0); vm.jeq("_dpo_throw");
+        vm.mov(VReg.A0, VReg.S0); vm.call("_is_symbol");
+        vm.cmpImm(VReg.RET, 0); vm.jne("_dpo_throw");
+        vm.mov(VReg.A0, VReg.S0); vm.call("_is_bigint");
+        vm.cmpImm(VReg.RET, 0); vm.jne("_dpo_throw");
+        vm.lea(VReg.V1, "_heap_base"); vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.S0, VReg.V1); vm.jb("_dpo_throw");
+        vm.lea(VReg.V1, "_heap_ptr"); vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.S0, VReg.V1); vm.jae("_dpo_throw");
         vm.jmp("_dpo_ok");
         vm.label("_dpo_throw");
         vm.lea(VReg.A0, vm.asm.addString("Property description must be an object"));
         boxStr(VReg.A0);
         vm.call("_throw_type_error"); // 不返回
         vm.label("_dpo_ok");
-        vm.epilogue([], 0);
+        vm.epilogue([VReg.S0], 0);
     }
 
     // [#dp-mask] _object_define_property(obj_boxed, key, value, get, set, packed=(mask<<8)|attr)
@@ -11747,13 +14712,17 @@ export class ObjectGenerator {
         throwMsg("Invalid property descriptor: cannot both specify accessors and a value or writable attribute");
         vm.label("_dp_mix_ok");
 
-        // 类型字节守卫:仅普通对象(2)/classinfo(3)走强制路;数组(1)走 _dp_array
-        // 专用路径(不落 _dp_legacy,后者 _object_define 读 offset 32 props_ptr 越
-        // 数组 32B 头)。其余(Map/函数值侧表…)落 legacy 保持既有行为不回归。
+        // 类型字节守卫:仅普通对象(2)/classinfo(3)走强制路;数组(1)走 _dp_array。
+        // TypedArray 使用内联整数索引布局且没有 props_ptr，具名属性必须进入
+        // 闭包侧表（例如 SpeciesConstructor 依赖的自有 constructor 覆盖）。
+        // 其余非属性容器仍走 legacy，保持既有行为。
         vm.loadByte(VReg.V1, VReg.S0, 0);
         vm.cmpImm(VReg.V1, 2); vm.jeq("_dp_obj_ok");
         vm.cmpImm(VReg.V1, 3); vm.jeq("_dp_obj_ok");
         vm.cmpImm(VReg.V1, 1); vm.jeq("_dp_array");
+        vm.cmpImm(VReg.V1, TYPE_TA_LO); vm.jlt("_dp_legacy_check");
+        vm.cmpImm(VReg.V1, TYPE_TA_HI); vm.jle("_dp_ta");
+        vm.label("_dp_legacy_check");
         vm.jmp("_dp_legacy");
 
         // ============ ToPropertyDescriptor 验证(get/set 可调用性)============
@@ -11834,7 +14803,7 @@ export class ObjectGenerator {
         vm.loadByte(VReg.V0, VReg.S0, 1);
         vm.andImm(VReg.V0, VReg.V0, EXT_NONEXT);
         vm.cmpImm(VReg.V0, 0); vm.jeq("_dp_absent_ok");
-        throwMsg("Cannot define property, object is not extensible");
+        vm.jmp("_dp_validation_fail");
         vm.label("_dp_absent_ok");
         vm.movImm64(VReg.V0, 0x7ffb000000000000n);
         vm.store(VReg.SP, 24, VReg.V0);            // oldval = undefined
@@ -11858,7 +14827,7 @@ export class ObjectGenerator {
         vm.load(VReg.V0, VReg.SP, 64);             // attr
         vm.andImm(VReg.V1, VReg.V0, ATTR_CONFIGURABLE);
         vm.cmpImm(VReg.V1, 0); vm.jeq("_dp_chk2");
-        throwMsg("Cannot redefine property, property is not configurable");
+        vm.jmp("_dp_validation_fail");
         // (2) HAS_ENUMERABLE 且 enumerable 与当前不同 → 抛
         vm.label("_dp_chk2");
         vm.andImm(VReg.V1, VReg.V2, DP_HAS_ENUMERABLE);
@@ -11934,7 +14903,7 @@ export class ObjectGenerator {
         vm.jmp("_dp_apply");
 
         vm.label("_dp_throw_redef");
-        throwMsg("Cannot redefine property");
+        vm.jmp("_dp_validation_fail");
 
         // ============ 落值 + 落 attr ============
         vm.label("_dp_apply");
@@ -12266,6 +15235,38 @@ export class ObjectGenerator {
         vm.andImm(VReg.V0, VReg.V0, ARR_IS_ARGUMENTS);
         vm.cmpImm(VReg.V0, 0);
         vm.jne("_dp_array_side");
+        // ArraySetLength performs ToUint32 and ToNumber before validating the
+        // current length descriptor.  valueOf/@@toPrimitive may mutate the
+        // array, and an invalid value must win with RangeError over descriptor
+        // errors, so the two observable coercions happen first.
+        vm.load(VReg.V2, VReg.SP, 8);              // descriptor field mask
+        vm.andImm(VReg.V1, VReg.V2, DP_HAS_VALUE);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_dp_array_len_desc_validate");
+        vm.load(VReg.A0, VReg.SP, 72);
+        vm.call("_to_uint32");                   // coercion #1
+        vm.mov(VReg.S2, VReg.RET);                // newLen
+        vm.load(VReg.A0, VReg.SP, 72);
+        vm.call("_number_coerce");               // coercion #2
+        vm.store(VReg.SP, 48, VReg.RET);          // numberLen bits
+        vm.movImm64(VReg.V1, 0x7ff0000000000000n);
+        vm.mov(VReg.V0, VReg.RET);
+        vm.shlImm(VReg.V0, VReg.V0, 1);
+        vm.shrImm(VReg.V0, VReg.V0, 1);           // clear sign bit
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jae("_dp_array_len_range");            // NaN / infinities
+        vm.scvtf(0, VReg.S2);
+        vm.fmovToInt(VReg.V3, 0);
+        vm.load(VReg.V0, VReg.SP, 48);
+        vm.cmp(VReg.V3, VReg.V0);
+        vm.jeq("_dp_array_len_desc_validate");
+        vm.cmpImm(VReg.S2, 0);
+        vm.jne("_dp_array_len_range");
+        // Only +0/-0 may compare as zero; reject denormals flushed by FP mode.
+        vm.shlImm(VReg.V1, VReg.V0, 1);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_dp_array_len_range");
+        vm.label("_dp_array_len_desc_validate");
         // length [[Configurable]]/[[Enumerable]] 恒 false:试图改 true → TypeError
         // (15.2.3.7-6-a-116:defineProperties length:{configurable:true})
         vm.load(VReg.V2, VReg.SP, 8);              // mask
@@ -12288,36 +15289,10 @@ export class ObjectGenerator {
         vm.andImm(VReg.V1, VReg.V2, DP_HAS_GET | DP_HAS_SET);
         vm.cmpImm(VReg.V1, 0);
         vm.jeq("_dp_array_len_data");
-        throwMsg("Cannot redefine array length as accessor");
+        vm.jmp("_dp_validation_fail");
         vm.label("_dp_array_len_data");
-        // ArraySetLength:若有 [[Value]],先 ToUint32 再 ToNumber(各一次 valueOf),
-        // 再 OrdinaryDefineOwnProperty。旧路先写 writable 位再只 coerce 一次 →
-        // define-own-prop-length-coercion-order 不抛。
-        vm.andImm(VReg.V1, VReg.V2, DP_HAS_VALUE);
-        vm.cmpImm(VReg.V1, 0);
-        vm.jeq("_dp_array_len_odop");
-        vm.load(VReg.A0, VReg.SP, 72);
-        vm.call("_to_uint32"); // valueOf #1
-        vm.mov(VReg.S2, VReg.RET);
-        vm.load(VReg.A0, VReg.SP, 72);
-        vm.call("_number_coerce"); // valueOf #2
-        vm.store(VReg.SP, 48, VReg.RET);
-        vm.movImm64(VReg.V1, 0x7ff0000000000000n);
-        vm.mov(VReg.V0, VReg.RET);
-        vm.shlImm(VReg.V0, VReg.V0, 1);
-        vm.shrImm(VReg.V0, VReg.V0, 1);
-        vm.cmp(VReg.V0, VReg.V1);
-        vm.jae("_dp_array_len_range");
-        vm.scvtf(0, VReg.S2);
-        vm.fmovToInt(VReg.V3, 0);
-        vm.load(VReg.V0, VReg.SP, 48);
-        vm.cmp(VReg.V3, VReg.V0);
-        vm.jeq("_dp_array_len_odop");
-        vm.cmpImm(VReg.S2, 0);
-        vm.jne("_dp_array_len_range");
-        vm.shlImm(VReg.V1, VReg.V0, 1);
-        vm.cmpImm(VReg.V1, 0);
-        vm.jne("_dp_array_len_range");
+        // Value coercion/range validation was done before descriptor checks;
+        // continue with OrdinaryDefineOwnProperty using the saved newLen.
         vm.label("_dp_array_len_odop");
         // current [[Writable]] 在两次 coerce 之后重读(valueOf 可能已改 writable)。
         vm.loadByte(VReg.V0, VReg.S0, 1);
@@ -12342,9 +15317,7 @@ export class ObjectGenerator {
         vm.cmp(VReg.S2, VReg.V1);
         vm.jeq("_dp_array_done");
         vm.label("_dp_array_len_vapd_fail");
-        // Object.defineProperty 编译端见 boxed false 再抛;Reflect 原样返 false。
-        vm.movImm64(VReg.RET, 0x7ff9000000000000n);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 96);
+        vm.jmp("_dp_validation_fail");
         vm.label("_dp_array_len_apply");
         vm.load(VReg.V2, VReg.SP, 8);
         vm.andImm(VReg.V1, VReg.V2, DP_HAS_WRITABLE);
@@ -12367,6 +15340,16 @@ export class ObjectGenerator {
         vm.cmpImm(VReg.V1, 0);
         vm.jeq("_dp_array_done");
         vm.label("_dp_array_len_do");
+        // Remove sparse side-table indices first; the returned length may be
+        // raised to a non-configurable blocking index + 1 per ArraySetLength.
+        vm.store(VReg.SP, 16, VReg.S2);              // requested length
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.mov(VReg.A1, VReg.S2);
+        vm.call("_array_trim_sparse_side");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.load(VReg.V0, VReg.SP, 16);
+        vm.cmp(VReg.S2, VReg.V0);
+        vm.jne("_dp_array_len_sparse_stuck");
         vm.load(VReg.S3, VReg.S0, 8);
         vm.cmp(VReg.S2, VReg.S3);
         vm.jge("_dp_array_len_set");
@@ -12438,7 +15421,10 @@ export class ObjectGenerator {
         vm.label("_dp_array_len_stuck");
         vm.addImm(VReg.V0, VReg.S4, 1);
         vm.store(VReg.S0, 8, VReg.V0);
-        throwMsg("Cannot delete non-configurable array index when shortening length");
+        vm.jmp("_dp_validation_fail");
+        vm.label("_dp_array_len_sparse_stuck");
+        vm.store(VReg.S0, 8, VReg.S2);
+        vm.jmp("_dp_validation_fail");
         vm.label("_dp_array_len_set");
         vm.store(VReg.S0, 8, VReg.S2);
         vm.jmp("_dp_array_done");
@@ -12494,7 +15480,97 @@ export class ObjectGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 96);
 
         vm.label("_dp_array_idx_reject");
-        throwMsg("Cannot define property on array: length non-writable or not extensible");
+        vm.jmp("_dp_validation_fail");
+
+        // Ordinary validation failures are false for Reflect.defineProperty
+        // and abrupt TypeError completions for Object.defineProperty.  The
+        // packed descriptor mode bit makes this decision local to the call,
+        // so nested defineProperty from valueOf cannot leak a global mode.
+        vm.label("_dp_validation_fail");
+        vm.load(VReg.V0, VReg.SP, 8);
+        vm.andImm(VReg.V0, VReg.V0, DP_REFLECT_MODE);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_dp_validation_throw");
+        vm.movImm64(VReg.RET, 0x7ff9000000000000n); // boxed false
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 96);
+        vm.label("_dp_validation_throw");
+        throwMsg("Cannot redefine property");
+
+        // ============ TypedArray: integer-indexed + named side-table ==========
+        // S1 is the already ToPropertyKey-normalized key.  Ordinary named
+        // properties are defined on a side-table object so descriptor
+        // validation and attribute merging use the canonical object path.
+        vm.label("_dp_ta");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_canonical_array_index");
+        vm.mov(VReg.S2, VReg.RET);             // idx or -1 (non-index)
+        vm.movImm64(VReg.V1, 0xFFFFFFFFFFFFFFFFn);
+        vm.cmp(VReg.S2, VReg.V1);
+        vm.jeq("_dp_ta_named");
+
+        // Integer-indexed element descriptors may not become accessors,
+        // non-enumerable, non-writable, or configurable properties.
+        vm.load(VReg.V0, VReg.SP, 8);          // descriptor field mask
+        vm.andImm(VReg.V1, VReg.V0, DP_HAS_GET | DP_HAS_SET);
+        vm.cmpImm(VReg.V1, 0); vm.jne("_dp_ta_idx_reject");
+        vm.andImm(VReg.V1, VReg.V0, DP_HAS_CONFIGURABLE);
+        vm.cmpImm(VReg.V1, 0); vm.jeq("_dp_ta_idx_enum");
+        vm.load(VReg.V1, VReg.SP, 64);
+        vm.andImm(VReg.V1, VReg.V1, ATTR_CONFIGURABLE);
+        vm.cmpImm(VReg.V1, ATTR_CONFIGURABLE); vm.jne("_dp_ta_idx_reject");
+        vm.label("_dp_ta_idx_enum");
+        vm.load(VReg.V0, VReg.SP, 8);
+        vm.andImm(VReg.V1, VReg.V0, DP_HAS_ENUMERABLE);
+        vm.cmpImm(VReg.V1, 0); vm.jeq("_dp_ta_idx_write");
+        vm.load(VReg.V1, VReg.SP, 64);
+        vm.andImm(VReg.V1, VReg.V1, ATTR_ENUMERABLE);
+        vm.cmpImm(VReg.V1, ATTR_ENUMERABLE); vm.jne("_dp_ta_idx_reject");
+        vm.label("_dp_ta_idx_write");
+        vm.load(VReg.V0, VReg.SP, 8);
+        vm.andImm(VReg.V1, VReg.V0, DP_HAS_WRITABLE);
+        vm.cmpImm(VReg.V1, 0); vm.jeq("_dp_ta_idx_validate");
+        vm.load(VReg.V1, VReg.SP, 64);
+        vm.andImm(VReg.V1, VReg.V1, ATTR_WRITABLE);
+        vm.cmpImm(VReg.V1, ATTR_WRITABLE); vm.jne("_dp_ta_idx_reject");
+        vm.label("_dp_ta_idx_validate");
+        // ValidateTypedArray rejects detached/OOB receivers.  An out-of-range
+        // index is likewise a failed integer-indexed definition.
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.call("_tam_throw_if_detached");
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.call("_typed_array_length");
+        vm.cmp(VReg.S2, VReg.RET); vm.jge("_dp_ta_idx_reject");
+        vm.load(VReg.V0, VReg.SP, 8);
+        vm.andImm(VReg.V1, VReg.V0, DP_HAS_VALUE);
+        vm.cmpImm(VReg.V1, 0); vm.jeq("_dp_ta_done");
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.mov(VReg.A1, VReg.S2);
+        vm.load(VReg.A2, VReg.SP, 72);
+        vm.call("_typed_array_set");
+        vm.label("_dp_ta_done");
+        vm.load(VReg.RET, VReg.SP, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 96);
+        vm.label("_dp_ta_idx_reject");
+        vm.jmp("_dp_validation_fail");
+
+        vm.label("_dp_ta_named");
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.call("_closure_props_ensure");
+        vm.mov(VReg.S2, VReg.RET);             // boxed ordinary props object
+        vm.mov(VReg.A0, VReg.S2);
+        vm.mov(VReg.A1, VReg.S1);
+        // x64 V1 aliases A3 (RCX): build the packed descriptor before loading
+        // the getter into A3, otherwise the mask overwrites the getter and
+        // `_dp_check_accessor` reports "Getter must be a function".
+        vm.load(VReg.V1, VReg.SP, 8);
+        vm.shlImm(VReg.V1, VReg.V1, 8);
+        vm.load(VReg.V5, VReg.SP, 64);
+        vm.or(VReg.A5, VReg.V1, VReg.V5);
+        vm.load(VReg.A2, VReg.SP, 72);
+        vm.load(VReg.A3, VReg.SP, 80);
+        vm.load(VReg.A4, VReg.SP, 88);
+        vm.call("_object_define_property");
+        vm.load(VReg.RET, VReg.SP, 0);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 96);
 
         // ============ legacy:非普通对象(Map/…)旧行为;函数值走侧表 ============
@@ -12507,6 +15583,18 @@ export class ObjectGenerator {
         vm.shrImm(VReg.V0, VReg.A0, 48);
         vm.cmpImm(VReg.V0, 0x7FFF);
         vm.jeq("_dp_fn_side");
+        // Fixed-layout exotics cannot be passed to _object_define as ordinary
+        // object headers.  Their named properties use the same side table as
+        // arrays/functions; recurse there to retain full descriptor validation.
+        vm.loadByte(VReg.V1, VReg.S0, 0);
+        vm.cmpImm(VReg.V1, TYPE_DATE);
+        vm.jeq("_dp_array_side");
+        vm.cmpImm(VReg.V1, TYPE_PROMISE);
+        vm.jeq("_dp_array_side");
+        vm.cmpImm(VReg.V1, TYPE_MAP);
+        vm.jeq("_dp_array_side");
+        vm.cmpImm(VReg.V1, TYPE_SET);
+        vm.jeq("_dp_array_side");
         vm.load(VReg.V2, VReg.SP, 8);              // mask
         vm.andImm(VReg.V1, VReg.V2, DP_HAS_GET | DP_HAS_SET);
         vm.cmpImm(VReg.V1, 0); vm.jne("_dp_leg_acc");
@@ -12610,8 +15698,16 @@ export class ObjectGenerator {
             vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(reg, reg, VReg.V1);
             vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(reg, reg, VReg.V1);
         };
+        vm.label("_reflect_define_property_dyn");
+        vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.movImm(VReg.V0, DP_REFLECT_MODE);
+        vm.store(VReg.SP, 40, VReg.V0);
+        vm.jmp("_dpd_entry");
         vm.label("_object_define_property_dyn");
         vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.movImm(VReg.V0, 0);
+        vm.store(VReg.SP, 40, VReg.V0);
+        vm.label("_dpd_entry");
         vm.mov(VReg.S0, VReg.A0);                  // obj boxed
         vm.mov(VReg.S1, VReg.A1);                  // key
         vm.mov(VReg.S2, VReg.A2);                  // desc
@@ -12691,6 +15787,8 @@ export class ObjectGenerator {
         // Old order left A3=attr (tiny int) → "Getter must be a function"
         // on Object.defineProperty(o, k, descVar) (4-213).
         vm.load(VReg.V0, VReg.SP, 24);             // mask
+        vm.load(VReg.V1, VReg.SP, 40);             // Object=0 / Reflect=mode bit
+        vm.or(VReg.V0, VReg.V0, VReg.V1);
         vm.shlImm(VReg.V0, VReg.V0, 8);
         vm.load(VReg.V1, VReg.SP, 32);             // attr
         vm.or(VReg.A5, VReg.V0, VReg.V1);          // packed
@@ -12981,6 +16079,11 @@ export class ObjectGenerator {
         vm.mov(VReg.A2, VReg.S2);
         vm.call("_object_define");
         vm.label("_ases_sp_len");
+        // 2^32-1 and above are ordinary named properties, not ArrayIndex
+        // keys.  Store them in the side table but never raise [[ArrayLength]].
+        vm.movImm64(VReg.V0, 4294967295n);
+        vm.cmp(VReg.S1, VReg.V0);
+        vm.jge("_ases_done");
         vm.shrImm(VReg.V1, VReg.S0, 48);
         vm.cmpImm(VReg.V1, 0x7FFE);
         vm.jne("_ases_sp_raw");
@@ -12996,6 +16099,90 @@ export class ObjectGenerator {
         vm.jle("_ases_done");
         vm.store(VReg.V2, 8, VReg.V1);
         vm.jmp("_ases_done");
+    }
+
+    generateArrayTrimSparseSide() {
+        const vm = this.vm;
+        // Remove sparse side-table array-index properties when ArraySetLength
+        // shrinks below the dense capacity. Dense storage is handled by the
+        // caller's descending loop; this covers indices at or above capacity
+        // (including 2^32-2) without allocating a giant backing array.
+        // RET is the requested length on success or blockingIndex+1 when a
+        // non-configurable property stops deletion.
+        vm.label("_array_trim_sparse_side");
+        vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.S0, VReg.S0, VReg.V1);
+        // threshold = max(requested length, dense capacity)
+        vm.load(VReg.V0, VReg.S0, 16);
+        vm.cmp(VReg.S1, VReg.V0);
+        vm.jlt("_ats_threshold_len");
+        vm.mov(VReg.V0, VReg.S1);
+        vm.label("_ats_threshold_len");
+        vm.store(VReg.SP, 8, VReg.V0);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_closure_props_find");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.S2, VReg.V1);
+        vm.jeq("_ats_done");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.S2, VReg.S2, VReg.V1); // raw props object
+
+        vm.label("_ats_scan_restart");
+        vm.movImm(VReg.S3, 0);                  // scan position
+        vm.movImm64(VReg.S4, 0xFFFFFFFFFFFFFFFFn); // best index = -1
+        vm.movImm(VReg.S5, 0);                  // best position
+        vm.label("_ats_scan");
+        vm.load(VReg.V2, VReg.S2, 8);           // current property count
+        vm.cmp(VReg.S3, VReg.V2);
+        vm.jge("_ats_scan_done");
+        vm.load(VReg.V1, VReg.S2, OBJECT_PROPS_PTR_OFFSET);
+        vm.shlImm(VReg.V0, VReg.S3, 4);
+        vm.add(VReg.V1, VReg.V1, VReg.V0);
+        vm.load(VReg.A0, VReg.V1, 0);           // candidate key
+        vm.store(VReg.SP, 16, VReg.A0);
+        vm.call("_canonical_array_index");
+        vm.mov(VReg.V0, VReg.RET);
+        vm.movImm64(VReg.V1, 0xFFFFFFFFFFFFFFFFn);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jeq("_ats_next");                  // non-index key
+        vm.load(VReg.V1, VReg.SP, 8);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jlt("_ats_next");                  // below dense/specified bound
+        vm.cmp(VReg.V0, VReg.S4);
+        vm.jle("_ats_next");
+        vm.mov(VReg.S4, VReg.V0);
+        vm.mov(VReg.S5, VReg.S3);
+        vm.load(VReg.V1, VReg.SP, 16);
+        vm.store(VReg.SP, 0, VReg.V1);         // best key
+        vm.label("_ats_next");
+        vm.addImm(VReg.S3, VReg.S3, 1);
+        vm.jmp("_ats_scan");
+        vm.label("_ats_scan_done");
+        vm.movImm64(VReg.V1, 0xFFFFFFFFFFFFFFFFn);
+        vm.cmp(VReg.S4, VReg.V1);
+        vm.jeq("_ats_done");
+        // A non-configurable side property is the first deletion barrier.
+        vm.mov(VReg.A0, VReg.S2);
+        vm.mov(VReg.A1, VReg.S5);
+        vm.call("_object_get_attr");
+        vm.andImm(VReg.V0, VReg.RET, ATTR_CONFIGURABLE);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_ats_blocked");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.load(VReg.A1, VReg.SP, 0);
+        vm.call("_object_delete");
+        vm.jmp("_ats_scan_restart");
+        vm.label("_ats_blocked");
+        vm.addImm(VReg.RET, VReg.S4, 1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
+        vm.label("_ats_done");
+        vm.mov(VReg.RET, VReg.S1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
     }
 
     // _canonical_array_index(key_boxed) -> RET = 规范数组索引值(0..2^32-2)或 -1(非索引)。
@@ -13396,6 +16583,13 @@ export class ObjectGenerator {
         vm.jeq("_ogopd_obj");
         vm.cmpImm(VReg.V1, 1); // TYPE_ARRAY (allocator.js) — 数组头非对象布局,见 _ogopd_arr
         vm.jeq("_ogopd_arr");
+        vm.cmpImm(VReg.V1, TYPE_TA_LO);
+        vm.jlt("_ogopd_not_ta");
+        vm.cmpImm(VReg.V1, TYPE_TA_HI);
+        vm.jle("_ogopd_ta");
+        vm.label("_ogopd_not_ta");
+        vm.cmpImm(VReg.V1, TYPE_DATE);
+        vm.jeq("_ogopd_exotic_side");
         vm.cmpImm(VReg.V1, 3); // TYPE_FUNCTION (classinfo) — same layout as TYPE_OBJECT
         vm.jeq("_ogopd_obj");
         vm.cmpImm(VReg.V1, TYPE_PROXY);
@@ -13578,6 +16772,44 @@ export class ObjectGenerator {
         vm.load(VReg.RET, VReg.SP, 0);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
 
+        // ===== TypedArray own-property descriptor =====
+        // Integer-indexed elements expose the fixed descriptor shape
+        // (writable/enumerable/configurable all true); named properties are
+        // ordinary descriptors in the per-TA side table.
+        vm.label("_ogopd_ta");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_canonical_array_index");
+        vm.mov(VReg.S4, VReg.RET);
+        vm.movImm64(VReg.V1, 0xFFFFFFFFFFFFFFFFn);
+        vm.cmp(VReg.S4, VReg.V1);
+        vm.jeq("_ogopd_ta_named");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_typed_array_length");
+        vm.cmp(VReg.S4, VReg.RET);
+        vm.jge("_ogopd_undef");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.mov(VReg.A1, VReg.S4);
+        vm.call("_typed_array_get");
+        vm.mov(VReg.S5, VReg.RET);
+        vm.call("_object_new");
+        vm.movImm64(VReg.V1, 0x7ffd000000000000n);
+        vm.or(VReg.V0, VReg.RET, VReg.V1);
+        vm.store(VReg.SP, 0, VReg.V0);
+        vm.movImm(VReg.V2, ATTR_DEFAULT);
+        vm.store(VReg.SP, 32, VReg.V2);
+        vm.jmp("_ogopd_data");
+        vm.label("_ogopd_ta_named");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_closure_props_find");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_ogopd_undef");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_getOwnPropertyDescriptor");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
+
         vm.label("_ogopd_undef");
         vm.lea(VReg.RET, "_js_undefined");
         vm.load(VReg.RET, VReg.RET, 0);
@@ -13672,7 +16904,25 @@ export class ObjectGenerator {
         vm.movImm64(VReg.V1, 0x7ffd000000000000n);
         vm.or(VReg.V0, VReg.RET, VReg.V1);
         vm.store(VReg.SP, 0, VReg.V0); // desc boxed
-        vm.movImm(VReg.V2, ATTR_DEFAULT); // 7 = writable+enumerable+configurable
+        // Dense index descriptors derive integrity attributes from the Array
+        // exotic header.  freeze makes indices non-writable/non-configurable;
+        // seal keeps writable but clears configurable.  No per-index side
+        // table is needed for the dense common case.
+        vm.loadByte(VReg.V0, VReg.S2, 1);
+        vm.andImm(VReg.V1, VReg.V0, EXT_FROZEN);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_ogopd_arr_idx_frozen");
+        vm.andImm(VReg.V1, VReg.V0, EXT_ARRAY_SEALED);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_ogopd_arr_idx_sealed");
+        vm.movImm(VReg.V2, ATTR_DEFAULT); // 7 = W+E+C
+        vm.jmp("_ogopd_arr_idx_attr");
+        vm.label("_ogopd_arr_idx_frozen");
+        vm.movImm(VReg.V2, ATTR_ENUMERABLE); // E only
+        vm.jmp("_ogopd_arr_idx_attr");
+        vm.label("_ogopd_arr_idx_sealed");
+        vm.movImm(VReg.V2, ATTR_WRITABLE | ATTR_ENUMERABLE); // W+E
+        vm.label("_ogopd_arr_idx_attr");
         vm.store(VReg.SP, 32, VReg.V2); // attr
         vm.jmp("_ogopd_data");
         vm.label("_ogopd_arr_side_hit");
@@ -13785,6 +17035,20 @@ export class ObjectGenerator {
         vm.call("_object_getOwnPropertyDescriptor");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
 
+        // Date and similar fixed-layout exotics keep user-defined properties
+        // in _closure_props_* rather than in their compact instance header.
+        vm.label("_ogopd_exotic_side");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_closure_props_find");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_ogopd_undef");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_getOwnPropertyDescriptor");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
+
         // ===== Proxy getOwnPropertyDescriptor 陷阱(S2=裸 proxy, S1=装箱键)=====
         vm.label("_ogopd_proxy");
         vm.mov(VReg.A0, VReg.S2);
@@ -13869,6 +17133,28 @@ export class ObjectGenerator {
         vm.call("_strcmp");
         vm.cmpImm(VReg.RET, 0);
         vm.jeq("_ogopd_fn_len");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_getStrContent");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, vm.asm.addString("prototype"));
+        vm.call("_strcmp");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_ogopd_fn_side");
+        // 惰性创建 F.prototype,使 gOPD 在首次读前也能看到自有属性(test262 13.2-18-1)。
+        vm.mov(VReg.A0, VReg.S0);
+        vm.lea(VReg.A1, vm.asm.addString("prototype"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_closure_prop_get");
+        vm.mov(VReg.S5, VReg.RET); // prototype 对象
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.S5, VReg.V1);
+        vm.jeq("_ogopd_undef");
+        // 读侧表真实描述符(%TypedArray%.prototype attr=0;用户函数惰性建 attr=1)
+        vm.jmp("_ogopd_fn_side");
+
+        // (legacy hardcoded prototype desc removed — always use side table attrs)
 
         // 普通自有属性:侧表 props 对象上的真实描述符(无侧表/键 miss → undefined)
         vm.label("_ogopd_fn_side");
@@ -13992,6 +17278,11 @@ export class ObjectGenerator {
         vm.loadByte(VReg.V1, VReg.S0, 0);
         vm.cmpImm(VReg.V1, 1); // TYPE_ARRAY — 数组头非对象布局,专用分支(见 _opie_arr)
         vm.jeq("_opie_arr");
+        vm.cmpImm(VReg.V1, TYPE_TA_LO);
+        vm.jlt("_opie_not_ta");
+        vm.cmpImm(VReg.V1, TYPE_TA_HI);
+        vm.jle("_opie_ta");
+        vm.label("_opie_not_ta");
         vm.cmpImm(VReg.V1, TYPE_OBJECT);
         vm.jeq("_opie_obj");
         // classinfo(type=3):props/flags 与普通对象同布局。此前恒 false →
@@ -14027,6 +17318,23 @@ export class ObjectGenerator {
         vm.label("_opie_false");
         vm.lea(VReg.RET, "_js_false");
         vm.load(VReg.RET, VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+
+        // TypedArray indexed and named properties are both covered by the
+        // canonical own-descriptor implementation; returning its enumerable
+        // field keeps side-table attributes and integer-index rules aligned.
+        vm.label("_opie_ta");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_getOwnPropertyDescriptor");
+        vm.shrImm(VReg.V1, VReg.RET, 48);
+        vm.cmpImm(VReg.V1, 0x7FFD);
+        vm.jne("_opie_false");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, this.vm.asm.addString("enumerable"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
 
         // ===== [L1-A] TYPE_ARRAY:数组自有属性 enumerable 位(S0=裸数组头, S1=键)=====
@@ -14153,54 +17461,178 @@ export class ObjectGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 16);
     }
 
-    // [ES2024] Object.groupBy(items, cb) -> boxed 普通对象 {key: [元素...]}
-    // items 视作数组(可迭代但仅数组布局);key 经通用值->字符串归一(装箱串键);
-    // 分组值是装箱数组。用 _object_new(非 JS {} 字典) 建结果,避免 [#32] 字典污染。
+    // [ES2024] Object.groupBy(items, cb) -> null-prototype object {key: [元素...]}
+    // Always consume through GetIterator.  Besides accepting strings/custom iterables, this
+    // preserves the observable next/callback interleaving and honours overridden array
+    // iterators.  Abrupt callback/ToPropertyKey completion closes the iterator before rethrow.
     generateObjectGroupBy() {
         const vm = this.vm;
         const MASK48 = 0x0000ffffffffffffn;
-        const TAG_STRING = 0x7ffc000000000000n;
         const TAG_ARRAY = 0x7ffe000000000000n;
         vm.label("_object_groupBy");
-        vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
-        vm.mov(VReg.S0, VReg.A0); // items(boxed 数组)
+        vm.prologue(128, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.mov(VReg.S0, VReg.A0); // items
         vm.mov(VReg.S1, VReg.A1); // cb
-        // GroupBy step 2: If IsCallable(callbackfn) is false, throw TypeError.
+
+        // Object.groupBy steps 1-2: RequireObjectCoercible(items), then IsCallable(cb).
+        vm.shrImm(VReg.V3, VReg.S0, 48);
+        vm.cmpImm(VReg.V3, 0x7FFA);
+        vm.jeq("_ogb_nullish");
+        vm.cmpImm(VReg.V3, 0x7FFB);
+        vm.jeq("_ogb_nullish");
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_is_callable");
         vm.cmpImm(VReg.RET, 0);
         vm.jeq("_ogb_not_callable");
-        vm.mov(VReg.A0, VReg.S0);
-        vm.call("_array_length");
-        vm.mov(VReg.S3, VReg.RET); // length
-        // 结果对象(boxed) -> S2
-        vm.call("_object_new");
+
+        // OrdinaryObjectCreate(null).  _object_new_raw deliberately leaves __proto__ at 0.
+        vm.call("_object_new_raw");
         vm.mov(VReg.A0, VReg.RET);
         vm.call("_js_box_object");
         vm.mov(VReg.S2, VReg.RET);
-        vm.movImm(VReg.S4, 0); // index
+
+        // iteratorRecord = GetIterator(items).
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_get_method_iterator");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_ogb_default_iterator");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.call("_spread_call0");
+        vm.jmp("_ogb_check_iterator");
+
+        // Dynamic Get cannot see compiler-intrinsic Array/String prototype methods when the
+        // corresponding prototype object has not been materialised.  A missing method on a
+        // genuine intrinsic receiver therefore falls back to the same iterator objects used by
+        // arr.values()/String.prototype[@@iterator].  Explicit/custom callable methods won above.
+        vm.label("_ogb_default_iterator");
+        // A present own override whose value was undefined must suppress the intrinsic fallback
+        // (GetMethod then fails).  Arrays keep computed/symbol properties in their side table.
+        vm.lea(VReg.A0, "_symwk_iterator");
+        vm.lea(VReg.A1, vm.asm.addString("Symbol.iterator"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_symbol_wellknown");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_ogb_not_iterable");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.lea(VReg.A1, vm.asm.addString("Symbol.iterator"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_ogb_not_iterable");
+        vm.shrImm(VReg.V3, VReg.S0, 48);
+        vm.cmpImm(VReg.V3, 0x7FFE);
+        vm.jne("_ogb_default_string");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V3, VReg.S0, VReg.V1);
+        vm.loadByte(VReg.V3, VReg.V3, 0);
+        vm.cmpImm(VReg.V3, 1); // TYPE_ARRAY
+        vm.jne("_ogb_not_iterable");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.movImm(VReg.A1, 0); // values
+        vm.call("_array_iterator_new");
+        vm.jmp("_ogb_check_iterator");
+        vm.label("_ogb_default_string");
+        vm.cmpImm(VReg.V3, 0x7FFC);
+        vm.jne("_ogb_not_iterable");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_str_iterator_new");
+
+        vm.label("_ogb_check_iterator");
+        vm.shrImm(VReg.V3, VReg.RET, 48);
+        vm.cmpImm(VReg.V3, 0x7FFD);
+        vm.jeq("_ogb_iterator_ok");
+        vm.cmpImm(VReg.V3, 0x7FFE);
+        vm.jeq("_ogb_iterator_ok");
+        vm.cmpImm(VReg.V3, 0x7FFF);
+        vm.jne("_ogb_bad_iterator");
+        vm.label("_ogb_iterator_ok");
+        vm.mov(VReg.S3, VReg.RET); // iterator
+        vm.movImm(VReg.S4, 0);     // index
 
         vm.label("_ogb_loop");
-        vm.cmp(VReg.S4, VReg.S3);
-        vm.jge("_ogb_done");
-        // element = items[index]
-        vm.mov(VReg.A0, VReg.S0);
-        vm.mov(VReg.A1, VReg.S4);
-        vm.call("_array_get");
-        vm.store(VReg.SP, 0, VReg.RET); // element @ [SP+0]
-        // key = valueToStr(cb(element, index)) 装箱为 0x7ffc 串
-        vm.mov(VReg.A1, VReg.RET); // element
+        // next = Get(iterator, "next"); Call(next, iterator); IteratorComplete/Value.
+        vm.mov(VReg.A0, VReg.S3);
+        vm.lea(VReg.A1, vm.asm.addString("next"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_maybe_getter");
+        vm.store(VReg.SP, 24, VReg.RET);
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_is_callable");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_ogb_bad_next");
+        vm.load(VReg.A0, VReg.SP, 24);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_spread_call0");
+        vm.mov(VReg.S5, VReg.RET); // iterator result
+        vm.shrImm(VReg.V3, VReg.S5, 48);
+        vm.cmpImm(VReg.V3, 0x7FFD);
+        vm.jeq("_ogb_result_ok");
+        vm.cmpImm(VReg.V3, 0x7FFE);
+        vm.jeq("_ogb_result_ok");
+        vm.cmpImm(VReg.V3, 0x7FFF);
+        vm.jne("_ogb_bad_result");
+        vm.label("_ogb_result_ok");
+        vm.mov(VReg.A0, VReg.S5);
+        vm.lea(VReg.A1, vm.asm.addString("done"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S5);
+        vm.call("_maybe_getter");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_boolean");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_ogb_done");
+        vm.mov(VReg.A0, VReg.S5);
+        vm.lea(VReg.A1, vm.asm.addString("value"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S5);
+        vm.call("_maybe_getter");
+        vm.store(VReg.SP, 0, VReg.RET); // element
+
+        // Only callback/coercion/group insertion abrupt completions perform IteratorClose.
+        vm.lea(VReg.V1, "_exc_ctx_top");
+        vm.load(VReg.V2, VReg.V1, 0);
+        vm.store(VReg.SP, 32, VReg.V2);
+        vm.lea(VReg.V2, "_ogb_catch");
+        vm.store(VReg.SP, 40, VReg.V2);
+        vm.mov(VReg.V2, VReg.SP);
+        vm.store(VReg.SP, 48, VReg.V2);
+        vm.store(VReg.SP, 56, VReg.FP);
+        vm.store(VReg.SP, 64, VReg.S0);
+        vm.store(VReg.SP, 72, VReg.S1);
+        vm.store(VReg.SP, 80, VReg.S2);
+        vm.store(VReg.SP, 88, VReg.S3);
+        vm.store(VReg.SP, 96, VReg.S4);
+        vm.store(VReg.SP, 104, VReg.S5);
+        vm.addImm(VReg.V2, VReg.SP, 32);
+        vm.lea(VReg.V1, "_exc_ctx_top");
+        vm.store(VReg.V1, 0, VReg.V2);
+
+        // key = ToPropertyKey(Call(cb, undefined, «element, index»)).
+        vm.load(VReg.A1, VReg.SP, 0);
         vm.mov(VReg.A0, VReg.S1); // cb
         vm.scvtf(0, VReg.S4);
         vm.fmovToInt(VReg.A2, 0); // index number
         vm.call("_groupby_invoke2");
         vm.mov(VReg.A0, VReg.RET);
-        vm.call("_valueToStr"); // RET 裸串指针
-        vm.movImm64(VReg.V1, MASK48);
-        vm.and(VReg.RET, VReg.RET, VReg.V1);
-        vm.movImm64(VReg.V1, TAG_STRING);
-        vm.or(VReg.RET, VReg.RET, VReg.V1);
-        vm.store(VReg.SP, 8, VReg.RET); // key @ [SP+8]
+        vm.call("_js_prop_key");
+        vm.store(VReg.SP, 8, VReg.RET); // key
+
         // 已有分组?_object_get 未命中返回 undefined(high16≠0x7ffe)。
         vm.mov(VReg.A0, VReg.S2);
         vm.load(VReg.A1, VReg.SP, 8);
@@ -14226,18 +17658,55 @@ export class ObjectGenerator {
         vm.load(VReg.A0, VReg.SP, 16);
         vm.load(VReg.A1, VReg.SP, 0);
         vm.call("_array_push_own");
+        // Pop the temporary exception context before requesting the next item.
+        vm.load(VReg.V1, VReg.SP, 32);
+        vm.lea(VReg.V0, "_exc_ctx_top");
+        vm.store(VReg.V0, 0, VReg.V1);
         vm.addImm(VReg.S4, VReg.S4, 1);
         vm.jmp("_ogb_loop");
 
         vm.label("_ogb_done");
         vm.mov(VReg.RET, VReg.S2);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
-        vm.label("_ogb_not_callable");
-        vm.lea(VReg.A0, vm.asm.addString("Object.groupBy callback must be a function"));
-        vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 128);
+
+        vm.label("_ogb_catch");
+        vm.load(VReg.V1, VReg.SP, 32);
+        vm.lea(VReg.V0, "_exc_ctx_top");
+        vm.store(VReg.V0, 0, VReg.V1);
+        vm.mov(VReg.A0, VReg.S3);
+        vm.call("_iterator_close_keep");
+        vm.call("_throw_unwind");
+
+        vm.label("_ogb_nullish");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot convert undefined or null to object"));
+        vm.movImm64(VReg.V1, MASK48); vm.and(VReg.A0, VReg.A0, VReg.V1);
         vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
         vm.call("_throw_type_error");
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
+        vm.label("_ogb_not_callable");
+        vm.lea(VReg.A0, vm.asm.addString("Object.groupBy callback must be a function"));
+        vm.movImm64(VReg.V1, MASK48); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+        vm.label("_ogb_not_iterable");
+        vm.lea(VReg.A0, vm.asm.addString("object is not iterable"));
+        vm.movImm64(VReg.V1, MASK48); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+        vm.label("_ogb_bad_iterator");
+        vm.lea(VReg.A0, vm.asm.addString("Result of iterator method is not an object"));
+        vm.movImm64(VReg.V1, MASK48); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+        vm.label("_ogb_bad_next");
+        vm.lea(VReg.A0, vm.asm.addString("iterator next is not callable"));
+        vm.movImm64(VReg.V1, MASK48); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+        vm.label("_ogb_bad_result");
+        vm.lea(VReg.A0, vm.asm.addString("iterator result is not an object"));
+        vm.movImm64(VReg.V1, MASK48); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
     }
 
     // [Annex B] Object.prototype.__defineGetter__/__defineSetter__/__lookupGetter__/__lookupSetter__
@@ -14325,7 +17794,7 @@ export class ObjectGenerator {
             vm.mov(VReg.A0, VReg.S0);
             vm.mov(VReg.A1, VReg.S1);
             vm.mov(VReg.A2, VReg.S3);
-            vm.call("_object_defineProperty_proxy");
+            vm.call("_object_defineProperty_proxy_or_throw");
             vm.jmp(pfx + "_done");
             vm.label(pfx + "_plain");
             vm.mov(VReg.A0, VReg.S0);

@@ -84,6 +84,13 @@ export class ARM64Assembler {
         this.undefinedSymbolList = []; // 未定义符号列表
         this.branchRelocations = []; // 需要重定位的分支指令
         this._fwdB = null; // 前向 B:label → [codeOffset…]，定义时即时回填
+        // Route-B fragments execute the assembler inside the self-hosted
+        // runtime.  Its Map implementation is intentionally compact and can
+        // lose equal-but-distinct string keys under heavy allocation.  Keep a
+        // tiny opt-in linear side table for branch labels; normal AOT builds
+        // leave these fields null and retain the Map fast path.
+        this._engineFwdNames = null;
+        this._engineFwdOffsets = null;
         this._stringInternMap = new Map(); // str -> labelIndex
         this._stringLabels = []; // labelIndex -> "_str_N"
         this.dataLabels = [];
@@ -171,6 +178,34 @@ export class ARM64Assembler {
         return Reg.X15;
     }
 
+    _engineStringEqual(a, b) {
+        if (a === b) return true;
+        if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
+        for (let i = 0; i < a.length; i++) {
+            if (a.charCodeAt(i) !== b.charCodeAt(i)) return false;
+        }
+        return true;
+    }
+
+    _engineLabelOffset(name) {
+        const names = this._engineLabelNames;
+        const offsets = this._engineLabelOffsets;
+        if (!names || !offsets) return undefined;
+        for (let i = names.length - 1; i >= 0; i--) {
+            if (this._engineStringEqual(names[i], name)) return offsets[i];
+        }
+        return undefined;
+    }
+
+    _engineFwdIndex(name) {
+        const names = this._engineFwdNames;
+        if (!names) return -1;
+        for (let i = 0; i < names.length; i++) {
+            if (names[i] !== undefined && this._engineStringEqual(names[i], name)) return i;
+        }
+        return -1;
+    }
+
     label(name) {
         // 如果标签以 _ 开头，说明是全局标签，不加前缀
         let fullName = name;
@@ -179,9 +214,33 @@ export class ARM64Assembler {
             fullName = this.labelPrefix + name;
         }
         const at = this.code.length;
+        if (this._engineLabelNames && typeof fullName === "string" &&
+            (fullName.indexOf("heritage") >= 0 || fullName.indexOf("skip_proto") >= 0)) {
+            console.log("AL_LABEL", fullName, at, this._engineLabelNames ? 1 : 0);
+        }
+        if (this._engineLabelNames && this._engineLabelOffsets) {
+            this._engineLabelNames.push(fullName);
+            this._engineLabelOffsets.push(at);
+        }
         this.labels.set(fullName, at);
+        // Complete forward branches without consulting the self-hosted Map.
+        const engineFwdNames = this._engineFwdNames;
+        const engineFwdOffsets = this._engineFwdOffsets;
+        if (engineFwdNames && engineFwdOffsets) {
+            const fi = this._engineFwdIndex(fullName);
+            if (fi >= 0) {
+                const list = engineFwdOffsets[fi];
+                for (let i = 0; i < list.length; i++) {
+                    const offset = list[i];
+                    const imm26 = ((at - offset) / 4) & 67108863;
+                    this._codeWrite32(offset, 335544320 | imm26);
+                }
+                engineFwdNames[fi] = undefined;
+                engineFwdOffsets[fi] = undefined;
+            }
+        }
         // 回填此前对该标签的前向 B(免入 fixup 队列)
-        const fwd = this._fwdB;
+        const fwd = this._engineFwdNames ? null : this._fwdB;
         if (fwd) {
             const list = fwd.get(fullName);
             if (list) {
@@ -638,52 +697,46 @@ export class ARM64Assembler {
 
     // ==================== 比较指令 ====================
 
-    // Check if immediate fits in 12-bit rotated encoding
-    // ARM64 immediate format: 12-bit value rotated by even 0-30 bits
+    // ARM64 CMP/ADD/SUB (immediate): 12-bit unsigned immediate (0..4095)
+    // optionally shifted left by 12.
     canEncodeImm(imm) {
-        const b = BigInt(imm) & 0xFFFFFFFFFFFFFFFFn;
-        if (b === 0n) return true;
-
-        // Check all even rotations 0-30 (ARM64 uses even rotations)
-        for (let r = 0; r < 32; r += 2) {
-            const rotated = ((b >> BigInt(r)) | (b << BigInt(64 - r))) & 0xFFFFFFFFFFFFFFFFn;
-            // `&& rotated >= 0n`：表示无关消歧。rotated 掩到 64 位可含高位，自举产物的
-            // BigInt 关系比较改为有符号后，高位值会被当负数 → `<= 0xFFF` 误真;加 `>=0n`
-            // 守卫在有符号语义下排除之（gen0/node 恒真，无行为改变）。
-            if (rotated <= 0xFFFn && rotated >= 0n) return true;
-        }
+        const b = BigInt(imm);
+        if (b >= 0n && b <= 4095n) return true;
+        if (b >= 0n && (b & 0xFFFn) === 0n && (b >> 12n) <= 4095n) return true;
         return false;
     }
 
     cmpImm(rn, imm) {
-        // For 0, always works
         if (imm === 0) {
             let word = (0xF100001F | (rn << 5)) >>> 0;
             this.emit32(word);
             return;
         }
 
-        // Check if immediate fits in 12-bit rotated encoding
-        if (!this.canEncodeImm(imm)) {
-            // For -1, use "movn x16, #0" (move negative of 0 = all 1s) + cmpReg
-            if (imm === -1) {
-                // movn x16, #0 encodes as 0x92800010
-                this.emit32(0x92800010);
-                this.cmpReg(rn, 16);
-                return;
-            }
+        const b = BigInt(imm);
+        if (b >= 0n && b <= 4095n) {
+            let imm12 = Number(b & 0xFFFn);
+            let word = (0xF100001F | (imm12 << 10) | (rn << 5)) >>> 0;
+            this.emit32(word);
+            return;
+        }
 
-            // For non-encodable immediates, use movImm64 to load full value into X16
-            // then compare registers
-            this.movImm64(16, BigInt(imm)); // Use X16 as temp register
+        if (b >= 0n && (b & 0xFFFn) === 0n && (b >> 12n) <= 4095n) {
+            let imm12 = Number((b >> 12n) & 0xFFFn);
+            let word = (0xF140001F | (imm12 << 10) | (rn << 5)) >>> 0; // bit 22 = 1 (LSL #12)
+            this.emit32(word);
+            return;
+        }
+
+        if (imm === -1) {
+            this.emit32(0x92800010); // movn x16, #0
             this.cmpReg(rn, 16);
             return;
         }
 
-        // Standard case - 12-bit immediate
-        let imm12 = Number(BigInt(imm) & 0xFFFn);
-        let word = (0xF100001F | (imm12 << 10) | (rn << 5)) >>> 0;
-        this.emit32(word);
+        // For non-encodable immediates, load full value into X16 then compare registers
+        this.movImm64(16, BigInt(imm));
+        this.cmpReg(rn, 16);
     }
 
     cmpReg(rn, rm) {
@@ -901,15 +954,40 @@ export class ARM64Assembler {
         }
         fullName = this._resolveLabelFast(fullName);
         const offset = this.code.length;
+        if (this._engineLabelNames && typeof fullName === "string" &&
+            (fullName.indexOf("heritage") >= 0 || fullName.indexOf("skip_proto") >= 0)) {
+            console.log("AL_BRANCH", fullName, offset, this._engineLabelNames ? 1 : 0,
+                this._engineLabelNames ? this._engineLabelOffset(fullName) : this.labels.get(fullName));
+        }
         // 后向/已定义标签:相对位移与 VAddr 无关,即时编码免入 fixup 队列
         // (自编译 ~200 万条 bl 中绝大部分目标已在 labels 中)。
-        const labelOffset = this.labels.get(fullName);
+        let labelOffset;
+        if (this._engineLabelNames && this._engineLabelOffsets) {
+            labelOffset = this._engineLabelOffset(fullName);
+        } else {
+            labelOffset = this.labels.get(fullName);
+        }
         if (labelOffset !== undefined) {
             const imm26 = ((labelOffset - offset) / 4) & 67108863;
             this.emit32(335544320 | imm26); // 0x14000000 | imm26
             return;
         }
         // 前向 B:记入 _fwdB,等 label() 回填;未定义的在 fixupAll 开头转入 pendingFixups
+        if (this._engineLabelNames && this._engineLabelOffsets) {
+            if (!this._engineFwdNames) {
+                this._engineFwdNames = [];
+                this._engineFwdOffsets = [];
+            }
+            let fi = this._engineFwdIndex(fullName);
+            if (fi < 0) {
+                fi = this._engineFwdNames.length;
+                this._engineFwdNames.push(fullName);
+                this._engineFwdOffsets.push([]);
+            }
+            this._engineFwdOffsets[fi].push(offset);
+            this.emit32(335544320); // 0x14000000
+            return;
+        }
         if (!this._fwdB) this._fwdB = new Map();
         let list = this._fwdB.get(fullName);
         if (!list) {
@@ -941,7 +1019,12 @@ export class ARM64Assembler {
         }
         fullName = this._resolveLabelFast(fullName);
         const offset = this.code.length;
-        const labelOffset = this.labels.get(fullName);
+        let labelOffset;
+        if (this._engineLabelNames && this._engineLabelOffsets) {
+            labelOffset = this._engineLabelOffset(fullName);
+        } else {
+            labelOffset = this.labels.get(fullName);
+        }
         if (labelOffset !== undefined) {
             const imm26 = ((labelOffset - offset) / 4) & 67108863;
             this.emit32(2483027968 | imm26); // 0x94000000 | imm26
@@ -1029,7 +1112,12 @@ export class ARM64Assembler {
             fullName = this._resolveLabelFast(fullName);
         }
         const offset = this.code.length;
-        const labelOffset = this.labels.get(fullName);
+        let labelOffset;
+        if (this._engineLabelNames && this._engineLabelOffsets) {
+            labelOffset = this._engineLabelOffset(fullName);
+        } else {
+            labelOffset = this.labels.get(fullName);
+        }
         if (labelOffset !== undefined) {
             const delta = (labelOffset - offset) / 4;
             if (delta >= -262144 && delta <= 262143) {
@@ -1053,7 +1141,12 @@ export class ARM64Assembler {
             fullName = this._resolveLabelFast(fullName);
         }
         const offset = this.code.length;
-        const labelOffset = this.labels.get(fullName);
+        let labelOffset;
+        if (this._engineLabelNames && this._engineLabelOffsets) {
+            labelOffset = this._engineLabelOffset(fullName);
+        } else {
+            labelOffset = this.labels.get(fullName);
+        }
         if (labelOffset !== undefined) {
             const delta = (labelOffset - offset) / 4;
             if (delta >= -262144 && delta <= 262143) {
@@ -1616,7 +1709,14 @@ export class ARM64Assembler {
             // UTF-16(每次从串头扫 → 长串 O(n²));charCodeAt 才是 O(1) 字节,扫到 NaN 停。
             if (process.release) {
                 for (let j = 0; j < str.length; j = j + 1) {
-                    this.data.push(str.codePointAt(j) & 0xff);
+                    // Toolchain strings are byte-preserving latin1 strings,
+                    // including when this assembler runs inside a native
+                    // self-hosted compiler.  `codePointAt` is UTF-8 aware in
+                    // the runtime lowering and would decode a multi-byte
+                    // sequence before truncating it, corrupting the first
+                    // byte (e.g. E5 90 8D -> 0D 90 8D).  Read the raw byte
+                    // code unit just like the non-Node branch below.
+                    this.data.push(str.charCodeAt(j) & 0xff);
                 }
             } else {
                 let j = 0;
@@ -1653,11 +1753,16 @@ export class ARM64Assembler {
         if (fwd && fwd.size !== 0) {
             const names = [];
             fwd.forEach(function (_list, name) { names.push(name); });
+            // Keep the assembler receiver out of the callback.  This method
+            // is itself executed by the self-hosted compiler, where a
+            // `this.pendingFixups` member read from a plain callback can lose
+            // its receiver and silently emit malformed branch fixups.
+            const pending = this.pendingFixups;
             for (let ni = 0; ni < names.length; ni++) {
                 const name = names[ni];
                 const list = fwd.get(name);
                 for (let i = 0; i < list.length; i++) {
-                    this.pendingFixups.pushRaw(FIXUP_TYPE.b, list[i], name);
+                    pending.pushRaw(FIXUP_TYPE.b, list[i], name);
                 }
             }
             this._fwdB = null;

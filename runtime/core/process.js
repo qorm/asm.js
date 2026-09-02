@@ -34,10 +34,11 @@ export class ProcessGenerator {
     // ============================================================
     // 事件循环（微任务 / setImmediate / setTimeout(0)）
     //
-    // 队列为单链表，节点布局（24 字节）：
+    // 队列为单链表，节点布局（32 字节）：
     //   [0]  next    下一节点裸指针（0=末尾）
     //   [8]  cb      回调值（NaN-boxed 函数/闭包）
     //   [16] handle  句柄对象（NaN-boxed 对象；微任务为 0）
+    //   [24] refed   1=阻止事件循环退出，0=仅在其它 refed 工作存活时执行
     // 句柄对象带 "cancelled" 属性（JS 布尔）。clearTimeout/clearImmediate
     // 把它置 true；drain 时跳过已取消项。
     // 头尾指针存于数据段（_ev_*_head/_ev_*_tail），被 GC 根扫描覆盖，
@@ -64,18 +65,20 @@ export class ProcessGenerator {
         vm.or(VReg.RET, VReg.S0, VReg.V1);
         vm.epilogue([VReg.S0], 16);
 
-        // _ev_new_node(A0=cb, A1=handle) -> RET = 节点裸指针
+        // _ev_new_node(A0=cb, A1=handle, A2=refed) -> RET = 节点裸指针
         vm.label("_ev_new_node");
-        vm.prologue(16, [VReg.S0, VReg.S1]);
+        vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2]);
         vm.mov(VReg.S0, VReg.A0); // cb
         vm.mov(VReg.S1, VReg.A1); // handle
-        vm.movImm(VReg.A0, 24);
+        vm.mov(VReg.S2, VReg.A2); // refed
+        vm.movImm(VReg.A0, 32);
         vm.call("_alloc");
         vm.movImm(VReg.V1, 0);
         vm.store(VReg.RET, 0, VReg.V1);  // next = 0
         vm.store(VReg.RET, 8, VReg.S0);  // cb
         vm.store(VReg.RET, 16, VReg.S1); // handle
-        vm.epilogue([VReg.S0, VReg.S1], 16); // RET = node
+        vm.store(VReg.RET, 24, VReg.S2); // refed
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32); // RET = node
 
         // _ev_append(A0=node, A1=&head, A2=&tail)
         vm.label("_ev_append");
@@ -92,7 +95,7 @@ export class ProcessGenerator {
         vm.label("_ev_append_done");
         vm.epilogue([], 0);
 
-        // _ev_set_timeout(A0=cb) -> RET = handle
+        // _ev_set_timeout(A0=cb) -> RET = refed handle
         vm.label("_ev_set_timeout");
         vm.prologue(16, [VReg.S0, VReg.S1]);
         vm.mov(VReg.S0, VReg.A0); // cb
@@ -100,6 +103,28 @@ export class ProcessGenerator {
         vm.mov(VReg.S1, VReg.RET); // handle
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S1);
+        vm.movImm(VReg.A2, 1);
+        vm.call("_ev_new_node");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, "_ev_timeout_head");
+        vm.lea(VReg.A2, "_ev_timeout_tail");
+        vm.call("_ev_append");
+        vm.lea(VReg.V0, "_ev_refed_count");
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.addImm(VReg.V1, VReg.V1, 1);
+        vm.store(VReg.V0, 0, VReg.V1);
+        vm.mov(VReg.RET, VReg.S1);
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+
+        // _ev_set_timeout_unref(A0=cb) -> RET = unref handle
+        vm.label("_ev_set_timeout_unref");
+        vm.prologue(16, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.call("_ev_make_handle");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.movImm(VReg.A2, 0);
         vm.call("_ev_new_node");
         vm.mov(VReg.A0, VReg.RET);
         vm.lea(VReg.A1, "_ev_timeout_head");
@@ -108,7 +133,7 @@ export class ProcessGenerator {
         vm.mov(VReg.RET, VReg.S1);
         vm.epilogue([VReg.S0, VReg.S1], 16);
 
-        // _ev_set_immediate(A0=cb) -> RET = handle
+        // _ev_set_immediate(A0=cb) -> RET = refed handle
         vm.label("_ev_set_immediate");
         vm.prologue(16, [VReg.S0, VReg.S1]);
         vm.mov(VReg.S0, VReg.A0);
@@ -116,11 +141,16 @@ export class ProcessGenerator {
         vm.mov(VReg.S1, VReg.RET);
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S1);
+        vm.movImm(VReg.A2, 1);
         vm.call("_ev_new_node");
         vm.mov(VReg.A0, VReg.RET);
         vm.lea(VReg.A1, "_ev_imm_head");
         vm.lea(VReg.A2, "_ev_imm_tail");
         vm.call("_ev_append");
+        vm.lea(VReg.V0, "_ev_refed_count");
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.addImm(VReg.V1, VReg.V1, 1);
+        vm.store(VReg.V0, 0, VReg.V1);
         vm.mov(VReg.RET, VReg.S1);
         vm.epilogue([VReg.S0, VReg.S1], 16);
 
@@ -130,6 +160,7 @@ export class ProcessGenerator {
         vm.mov(VReg.S0, VReg.A0);
         vm.mov(VReg.A0, VReg.S0);
         vm.movImm(VReg.A1, 0); // handle = 0（微任务无句柄）
+        vm.movImm(VReg.A2, 0); // microtasks 不计入 active handle
         vm.call("_ev_new_node");
         vm.mov(VReg.A0, VReg.RET);
         vm.lea(VReg.A1, "_ev_micro_head");
@@ -174,6 +205,19 @@ export class ProcessGenerator {
         vm.label("_ev_is_cancelled_yes");
         vm.movImm(VReg.RET, 1);
         vm.epilogue([VReg.S0], 16);
+
+        // _ev_consume_ref(A0=node):refed 节点出队时撤销 active 计数。
+        vm.label("_ev_consume_ref");
+        vm.prologue(0, []);
+        vm.load(VReg.V0, VReg.A0, 24);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_ev_consume_ref_done");
+        vm.lea(VReg.V1, "_ev_refed_count");
+        vm.load(VReg.V2, VReg.V1, 0);
+        vm.subImm(VReg.V2, VReg.V2, 1);
+        vm.store(VReg.V1, 0, VReg.V2);
+        vm.label("_ev_consume_ref_done");
+        vm.epilogue([], 0);
 
         // _ev_invoke(A0=cbvalue)：以 0 参数调用回调（支持闭包/裸函数指针）
         vm.label("_ev_invoke");
@@ -231,6 +275,11 @@ export class ProcessGenerator {
         vm.call("_promise_drain_reactions"); // RET = 排空的反应数
         vm.cmpImm(VReg.RET, 0);
         vm.jne("_ev_run_micro");
+        // 只剩 unref timeout/immediate 时允许退出；微任务已在上方排空。
+        vm.lea(VReg.V0, "_ev_refed_count");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_ev_run_done");
         // ---- 一个 setImmediate ----
         vm.lea(VReg.V0, "_ev_imm_head");
         vm.load(VReg.S0, VReg.V0, 0);
@@ -245,6 +294,8 @@ export class ProcessGenerator {
         vm.movImm(VReg.V1, 0);
         vm.store(VReg.V0, 0, VReg.V1);
         vm.label("_ev_imm_notempty");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_ev_consume_ref");
         vm.load(VReg.A0, VReg.S0, 16); // handle
         vm.call("_ev_is_cancelled");
         vm.cmpImm(VReg.RET, 0);
@@ -268,6 +319,8 @@ export class ProcessGenerator {
         vm.movImm(VReg.V1, 0);
         vm.store(VReg.V0, 0, VReg.V1);
         vm.label("_ev_to_notempty");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_ev_consume_ref");
         vm.load(VReg.A0, VReg.S0, 16);
         vm.call("_ev_is_cancelled");
         vm.cmpImm(VReg.RET, 0);
@@ -1009,6 +1062,7 @@ export class ProcessGenerator {
         // [gOPN 15.2.3.4-4-1] Object.getOwnPropertyNames(this) 须含 ES5 全局自有键。
         // 值可与裸标识符单例不同(规范外 ===);只要求 own 名存在。
         globalCtorRef("String", "_builtin_string");
+        globalCtorRef("Symbol", "_symbol_new");
         globalCtorRef("Date", "_date_new");
         globalCtorRef("Error", "_object_ctor_call");
         globalCtorRef("EvalError", "_object_ctor_call");
@@ -1048,8 +1102,9 @@ export class ProcessGenerator {
         globalData("NaN", () => vm.movImm64(VReg.RET, 0x7FF0000000000001n), 0);
         globalData("Infinity", () => vm.movImm64(VReg.RET, 0x7ff0000000000000n), 0);
         globalData("undefined", () => vm.movImm64(VReg.RET, 0x7ffb000000000000n), 0);
-        globalData("Math", () => { vm.call("_object_new"); vm.call("_box_obj_r"); });
-        globalData("JSON", () => { vm.call("_object_new"); vm.call("_box_obj_r"); });
+        // 全局内建对象属性：writable + configurable，non-enumerable（attr=0b101）。
+        globalData("Math", () => { vm.call("_object_new"); vm.call("_box_obj_r"); }, 5);
+        globalData("JSON", () => { vm.call("_object_new"); vm.call("_box_obj_r"); }, 5);
 
         // 返回 process 对象 (从全局加载，确保是正确的装箱值或指针)
         vm.lea(VReg.V1, "_process_global");

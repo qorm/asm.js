@@ -1,0 +1,10 @@
+{
+  "description": "Map for-of skips deleted entries and observes delete-plus-reinsert in insertion order.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "0 01",
+    "exitCode": 0
+  }
+}

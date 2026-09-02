@@ -114,7 +114,13 @@ class _process {
     static callbackify() { }
 
     static nextTick(callback, ...args) {
-        __asmjsNextTick?.(() => callback(...args)) || callback(...args);
+        // The runtime shim is compiled as part of the target program.  The
+        // old optional call referenced `__asmjsNextTick`, which is only an
+        // internal compiler spelling and is not a lexical binding in this
+        // module; evaluating it therefore raised ReferenceError before the
+        // callback could be queued.  Use the public compiler bridge directly,
+        // matching runtime/node/timers.js and the global queueMicrotask path.
+        __asmjs_queueMicrotask(() => callback(...args));
     }
 
     static send(message, sendHandle, options, callback) {

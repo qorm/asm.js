@@ -31,9 +31,46 @@ function __jsonQuote(s) {
         else if (c === 8) out += "\\b";
         else if (c === 12) out += "\\f";
         else if (c < 32) out += "\\u" + __jsonHex4(c);
+        // asm.js 内部字符串是 UTF-8 字节串；孤立 UTF-16 代理项以 CESU-8
+        // (ED A0..BF 80..BF) 保留。well-formed JSON.stringify 必须把它重新
+        // 转义成单个 \uXXXX，不能把三个无效 UTF-8 字节原样输出。合法代理对
+        // 在 lexer 中已合成标准四字节 UTF-8，不会进入此分支。
+        else if (c === 0xed && i + 2 < s.length) {
+            const c2 = s.charCodeAt(i + 1);
+            const c3 = s.charCodeAt(i + 2);
+            const cu = ((c & 15) << 12) | ((c2 & 63) << 6) | (c3 & 63);
+            if (c2 >= 0xa0 && c2 <= 0xbf && c3 >= 0x80 && c3 <= 0xbf &&
+                cu >= 0xd800 && cu <= 0xdfff) {
+                out += "\\u" + __jsonHex4(cu);
+                i += 2;
+            } else {
+                out += s.charAt(i);
+            }
+        }
         else out += s.charAt(i);
     }
     return out + '"';
+}
+
+// Number 包装对象按 ToNumber/OrdinaryToPrimitive(number) 解包。不能直接依赖
+// 编译器的 Number(obj) 快路：该快路只读内部槽，会跳过用户覆盖的 valueOf/toString，
+// 从而吞掉 abrupt completion，并把 replacer 返回的 new Number(42) 固定序列化为 42。
+function __jsonNumberObjectValue(obj) {
+    const valueOf = obj.valueOf;
+    if (typeof valueOf === "function") {
+        const p = valueOf.call(obj);
+        if (p === null || (typeof p !== "object" && typeof p !== "function")) {
+            return Number(p);
+        }
+    }
+    const toString = obj.toString;
+    if (typeof toString === "function") {
+        const p = toString.call(obj);
+        if (p === null || (typeof p !== "object" && typeof p !== "function")) {
+            return Number(p);
+        }
+    }
+    throw new TypeError("Cannot convert object to primitive value");
 }
 
 // 纯 JS 数字→串(不依赖原生浮点转串 —— _floatToString 的 len 头历史性不可靠,
@@ -124,7 +161,7 @@ function __jsonSer(value, indent, depth) {
             return value.__boolean_value ? "true" : "false";
         }
         if (value instanceof Number) {
-            const __nv = Number(value);
+            const __nv = __jsonNumberObjectValue(value);
             const __nfs = "" + __nv;
             if (__nfs === "NaN" || __nfs === "Infinity" || __nfs === "-Infinity") return "null";
             return __nfs;
@@ -263,7 +300,7 @@ function __jsonGap(space) {
     // 规范:Type(space) 是 Object 且带 [[NumberData]]/[[StringData]] 时先 ToNumber/ToString。
     // 必须 instanceof,不能 Get 内部槽(与 __jsonSer 同一 Proxy 陷阱)。
     if (space !== null && typeof space === "object") {
-        if (space instanceof Number) space = Number(space);
+        if (space instanceof Number) space = __jsonNumberObjectValue(space);
         else if (space instanceof String) space = String(space);
     }
     const t = typeof space;
@@ -324,7 +361,12 @@ export function __JSON_stringify(v, replacer, space) {
     }
     __js_gap = __jsonGap(space);
     const holder = {};
-    holder[""] = v;
+    // SerializeJSONProperty creates the wrapper's empty-string property as a
+    // data property; assignment would incorrectly invoke Object.prototype['']
+    // setters installed by user code.
+    Object.defineProperty(holder, "", {
+        value: v, writable: true, enumerable: true, configurable: true
+    });
     const result = __jsonPropV(holder, "", v, "", 0);
     __js_replacer = savedRep;
     __js_proplist = savedPl;
@@ -458,26 +500,31 @@ function __jpString() {
 function __jpNumber() {
     let sign = 1;
     if (__jp_s.charCodeAt(__jp_i) === 45) { sign = -1; __jp_i = __jp_i + 1; }
-    let intPart = 0;
+    // Accumulate one decimal significand and apply the net power of ten once.
+    // Splitting `1.1` as `1 + 1/10` and then applying `e-1` double-rounds to
+    // 0.11000000000000001 instead of the correctly rounded 0.11.
+    let significand = 0;
     let sawDigit = false;
     while (__jp_i < __jp_s.length) {
         const c = __jp_s.charCodeAt(__jp_i);
-        if (c >= 48 && c <= 57) { intPart = intPart * 10 + (c - 48); sawDigit = true; __jp_i = __jp_i + 1; }
+        if (c >= 48 && c <= 57) { significand = significand * 10 + (c - 48); sawDigit = true; __jp_i = __jp_i + 1; }
         else break;
     }
     if (!sawDigit) __jsonErr("bad number");
-    let value = intPart;
+    let fracDigits = 0;
     if (__jp_i < __jp_s.length && __jp_s.charCodeAt(__jp_i) === 46) {
         __jp_i = __jp_i + 1;
-        let frac = 0;
-        let scale = 1;
         while (__jp_i < __jp_s.length) {
             const c = __jp_s.charCodeAt(__jp_i);
-            if (c >= 48 && c <= 57) { frac = frac * 10 + (c - 48); scale = scale * 10; __jp_i = __jp_i + 1; }
+            if (c >= 48 && c <= 57) {
+                significand = significand * 10 + (c - 48);
+                fracDigits = fracDigits + 1;
+                __jp_i = __jp_i + 1;
+            }
             else break;
         }
-        value = value + frac / scale;
     }
+    let exp = 0;
     if (__jp_i < __jp_s.length) {
         const c = __jp_s.charCodeAt(__jp_i);
         if (c === 101 || c === 69) { // e/E
@@ -492,10 +539,19 @@ function __jpNumber() {
                 if (c3 >= 48 && c3 <= 57) { ex = ex * 10 + (c3 - 48); __jp_i = __jp_i + 1; }
                 else break;
             }
-            let p = 1;
-            for (let k = 0; k < ex; k++) p = p * 10;
-            value = (esign > 0) ? value * p : value / p;
+            exp = esign > 0 ? ex : -ex;
         }
+    }
+    let power = exp - fracDigits;
+    let value = significand;
+    if (power >= 0) {
+        let scale = 1;
+        for (let k = 0; k < power; k++) scale = scale * 10;
+        value = significand * scale;
+    } else {
+        let scale = 1;
+        for (let k = 0; k < -power; k++) scale = scale * 10;
+        value = significand / scale;
     }
     return sign * value;
 }
@@ -630,7 +686,11 @@ export function __JSON_parse(text, reviver) {
     if (__jp_i < __jp_s.length) __jsonErr("trailing garbage");
     if (typeof reviver === "function") {
         const root = {};
-        root[""] = v;
+        // Parse's wrapper is CreateDataPropertyOrThrow, not [[Set]]; this must
+        // ignore an inherited Object.prototype[''] setter.
+        Object.defineProperty(root, "", {
+            value: v, writable: true, enumerable: true, configurable: true
+        });
         __jpRecordSource(root, "", v, topSrc);
         const result = __jpInternalize(root, "", v, reviver);
         __jpClearSources();

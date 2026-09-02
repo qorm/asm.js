@@ -334,7 +334,13 @@ export class JSValueGenerator {
         vm.lea(VReg.S4, "_heap_ptr");
         vm.load(VReg.S4, VReg.S4, 0);
         vm.cmp(VReg.S0, VReg.S4);
-        vm.jge("_vc_throw");
+        // A direct code pointer lives outside the managed heap.  User
+        // functions exposed through object properties can arrive in this
+        // naked form (especially method shorthand), so consult the function
+        // metadata table before rejecting it.  This keeps arbitrary heap
+        // pointers guarded by the magic check below while allowing only
+        // compiler-registered executable entries.
+        vm.jge("_vc_text_candidate");
         vm.load(VReg.S4, VReg.S0, 0);          // 块头 magic / type
         vm.cmpImm(VReg.S4, 0xc105);            // CLOSURE_MAGIC
         vm.jeq("_vc_raw_ok");
@@ -342,10 +348,38 @@ export class JSValueGenerator {
         vm.jne("_vc_throw");
         vm.label("_vc_raw_ok");
         vm.epilogue([VReg.S4], 0);
+        vm.label("_vc_text_candidate");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_func_meta_entry");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_vc_throw");
+        vm.epilogue([VReg.S4], 0);
         vm.label("_vc_throw");
         vm.call("_throw_not_a_function");      // 不返回(_throw_unwind)
         // _throw_not_a_function:置 _exception_value="not a function"、pending=1,跨函数 unwind。
         vm.label("_throw_not_a_function");
+        // Temporary route-B diagnosis: when GC_DIAG is enabled, dump the
+        // caller return offset so dynamic class/eval failures can be mapped
+        // back to the fragment instruction site.  Keep this opt-in and
+        // arm64-only; normal binaries are byte-for-byte unaffected.
+        if (process.env.GC_DIAG && vm.backend && vm.backend.name === "arm64") {
+            vm.lea(VReg.V0, "_start");
+            vm.sub(VReg.A0, VReg.LR, VReg.V0);
+            vm.call("_gc_diag_hex");
+            // The helper is reached through `_vc_throw`, so LR at entry only
+            // identifies the helper itself.  The caller's return address is
+            // the saved LR in the validation frame (`[FP+8]`); print it too,
+            // followed by the rejected callee value, to identify the precise
+            // self-hosted compiler dispatch site without a debugger.
+            vm.lea(VReg.V0, "_start");
+            vm.load(VReg.V1, VReg.FP, 8);
+            vm.sub(VReg.A0, VReg.V1, VReg.V0);
+            vm.call("_gc_diag_hex");
+            vm.mov(VReg.A0, VReg.S0);
+            vm.call("_gc_diag_hex");
+            vm.movImm(VReg.A0, 10);
+            vm.call("_print_char");
+        }
         // [test262 S1] 抛真 TypeError 对象(原抛裸字符串 → e instanceof TypeError / e.name 失败)。
         // 构造 boxed "not a function" 消息后委托 _throw_type_error(构造 {name,message,__asmjs_err,cause}
         // 并 _throw_unwind)。bl 不改 SP(arm64),_throw_type_error 自管帧,frameless 调用安全。
@@ -945,7 +979,22 @@ export class JSValueGenerator {
         vm.jeq("_iof_user_unbox");
         vm.cmpImm(VReg.V1, 0x7FFE);
         vm.jeq("_iof_user_unbox");
+        // Dynamic GeneratorFunction/AsyncFunction instances are boxed compact
+        // closures (0x7FFF).  They have a conceptual [[Prototype]] supplied
+        // by dynamic metadata, not an inline object-layout slot, so seed the
+        // ordinary walk through the shared GetPrototypeOf path.
+        vm.cmpImm(VReg.V1, 0x7FFF);
+        vm.jeq("_iof_user_fn");
         vm.jmp("_iof_false");
+        vm.label("_iof_user_fn");
+        vm.store(VReg.SP, 8, VReg.V2); // preserve target prototype raw
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_getPrototypeOf");
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.V3, VReg.RET, VReg.V1);
+        vm.load(VReg.V2, VReg.SP, 8);
+        vm.movImm(VReg.V4, 64);
+        vm.jmp("_iof_user_loop");
         vm.label("_iof_user_unbox");
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.S0, VReg.S0, VReg.V1); // S0 = 裸实例指针
@@ -984,6 +1033,64 @@ export class JSValueGenerator {
         vm.movImm(VReg.V4, 64);
         vm.jmp("_iof_user_loop");
         vm.label("_iof_proto_ld16");
+        vm.loadByte(VReg.V1, VReg.S0, 0);
+        // Array instances keep custom [[Prototype]] in the side table (their
+        // compact header has no proto word).  Consult it before the generic
+        // +16 object-layout walk; otherwise +16 is capacity and
+        // `new Subclass() instanceof Subclass` always returns false.
+        vm.cmpImm(VReg.V1, 1); // TYPE_ARRAY
+        vm.jne("_iof_proto_promise_check");
+        vm.store(VReg.SP, 0, VReg.V2); // target prototype raw
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_get_instance_proto");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_iof_array_singleton");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V3, VReg.RET, VReg.V1);
+        vm.load(VReg.V2, VReg.SP, 0);
+        vm.movImm(VReg.V4, 64);
+        vm.jmp("_iof_user_loop");
+        vm.label("_iof_array_singleton");
+        vm.lea(VReg.V1, "_nsobj_array_proto");
+        vm.load(VReg.RET, VReg.V1, 0);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_iof_array_singleton_ready");
+        vm.call("_ensure_array_proto");
+        vm.lea(VReg.V1, "_nsobj_array_proto");
+        vm.load(VReg.RET, VReg.V1, 0);
+        vm.label("_iof_array_singleton_ready");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V3, VReg.RET, VReg.V1);
+        vm.load(VReg.V2, VReg.SP, 0);
+        vm.movImm(VReg.V4, 64);
+        vm.jmp("_iof_user_loop");
+
+        // ArrayBuffer also stores data_ptr at +16, so use the same instance
+        // prototype side table as TypedArray rather than interpreting the
+        // data address as an object link.  A missing entry falls back to the
+        // intrinsic ArrayBuffer.prototype singleton (pseudo type 0x70).
+        vm.label("_iof_arraybuffer_check");
+        vm.store(VReg.SP, 0, VReg.V2); // target prototype raw
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_ta_lookup_instance_proto");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_iof_arraybuffer_singleton");
+        vm.mov(VReg.V3, VReg.RET);
+        vm.load(VReg.V2, VReg.SP, 0);
+        vm.movImm(VReg.V4, 64);
+        vm.jmp("_iof_user_loop");
+        vm.label("_iof_arraybuffer_singleton");
+        vm.movImm(VReg.A0, 0x70); // ArrayBuffer pseudo type
+        vm.call("_get_ctor_proto");
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.V3, VReg.RET, VReg.V1);
+        vm.load(VReg.V2, VReg.SP, 0);
+        vm.movImm(VReg.V4, 64);
+        vm.jmp("_iof_user_loop");
+
+        vm.label("_iof_proto_promise_check");
+        vm.cmpImm(VReg.V1, 12); // TYPE_ARRAY_BUFFER: data_ptr@16, not proto
+        vm.jeq("_iof_arraybuffer_check");
         vm.loadByte(VReg.V1, VReg.S0, 0);
         vm.cmpImm(VReg.V1, 11); // TYPE_PROMISE:proto@48,非 value@16
         vm.jne("_iof_proto_obj16");
@@ -1073,6 +1180,23 @@ export class JSValueGenerator {
         vm.load(VReg.V1, VReg.V1, 0);
         vm.cmp(VReg.V2, VReg.V1);
         vm.jge("_iof_false");
+        // Function objects use compact closure blocks and therefore do not
+        // carry an object-layout __proto__ at +16.  Ask the shared
+        // getPrototypeOf implementation for their conceptual intrinsic
+        // prototype (including dynamic function metadata), then enter the
+        // ordinary prototype walk with that object as the first link.
+        vm.shrImm(VReg.V1, VReg.S0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFF);
+        vm.jne("_iof_boxed_proto_walk");
+        vm.store(VReg.SP, 0, VReg.V2);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_getPrototypeOf");
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.V3, VReg.RET, VReg.V1);
+        vm.load(VReg.V2, VReg.SP, 0);
+        vm.movImm(VReg.V4, 64);
+        vm.jmp("_iof_user_loop");
+        vm.label("_iof_boxed_proto_walk");
         vm.jmp("_iof_proto_walk"); // V2=目标prototype, S0=实例(待脱壳),复走上溯逻辑
 
         vm.label("_iof_true");
@@ -1375,6 +1499,15 @@ export class JSValueGenerator {
         vm.loadByte(VReg.V0, VReg.V0, 0);
         vm.cmpImm(VReg.V0, 1); // TYPE_ARRAY
         vm.jne("_fpg_arr_push_live");
+        // Sparse / maximum-length arrays must use generic Set.  Dense append
+        // would try to allocate length+1 slots; at 2^32-1 the property key is
+        // the named key "4294967295" and the subsequent length Set throws.
+        vm.emitMaskLoad(VReg.V4);
+        vm.andMaskReg(VReg.V0, VReg.S0, VReg.V4);
+        vm.load(VReg.V0, VReg.V0, 8);
+        vm.movImm(VReg.V1, 0x10000000); // dense soft cap shared with array Set
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jge("_fpg_arr_push_live");
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S1);
         vm.call("_array_push");

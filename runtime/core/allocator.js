@@ -2531,6 +2531,33 @@ export class AllocatorGenerator {
         vm.epilogue([], 0);
     }
 
+    // Register the writable data tail of a live eval/new Function mmap.
+    // Fragments are intentionally never unmapped, so a simple heap-linked list
+    // is sufficient and lets string helpers distinguish fragment literals from
+    // arbitrary pointers above the shared heap.
+    generateEngineDataRegister() {
+        const vm = this.vm;
+        vm.label("_engine_data_register");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0); // start
+        vm.mov(VReg.S1, VReg.A1); // end (exclusive)
+        vm.cmp(VReg.S0, VReg.S1);
+        vm.jge("_engine_data_register_done");
+        vm.movImm(VReg.A0, 24);
+        vm.call("_alloc");
+        // x64 aliases V0 with RET, so preserve the freshly allocated node
+        // before using V0 for the range-list head address.
+        vm.mov(VReg.V2, VReg.RET);
+        vm.store(VReg.V2, 0, VReg.S0);
+        vm.store(VReg.V2, 8, VReg.S1);
+        vm.lea(VReg.V0, "_engine_data_ranges");
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.store(VReg.V2, 16, VReg.V1);
+        vm.store(VReg.V0, 0, VReg.V2);
+        vm.label("_engine_data_register_done");
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+    }
+
     // [引擎库 P1] _engine_reloc_exec(A0=fragPtr, A1=fragLen, A2=relocPtr, A3=relocByteLen)
     // -> 执行结果。mmap RW → memcpy → 按 reloc(每条 8 字节:slotOff(4,LE)+symId(4,LE))
     // 用 _engine_symaddr(symId) 填 mem+slotOff 的 8 字节 addr_slot → mprotect RX → 跳入。
@@ -2631,9 +2658,15 @@ export class AllocatorGenerator {
         vm.addImm(VReg.S3, VReg.S3, 8);
         vm.jmp("_erx_split");
         vm.label("_erx_splitdone");
+        // Keep the split across allocation; register [mem+split, mem+fragLen)
+        // so _getStrContent can safely use fragment-local literal bytes.
+        vm.mov(VReg.S3, VReg.V0);
+        vm.add(VReg.A0, VReg.S0, VReg.S3);
+        vm.add(VReg.A1, VReg.S0, VReg.S2);
+        vm.call("_engine_data_register");
         // mprotect RX —— 长度按分界偏移向上取整到页倍数(数据区已 16KB 对齐 → 恰好不含数据)。
         vm.mov(VReg.A0, VReg.S0);
-        vm.addImm(VReg.A1, VReg.V0, 4095);
+        vm.addImm(VReg.A1, VReg.S3, 4095);
         vm.movImm64(VReg.V0, 0xfffffffffffff000n);
         vm.and(VReg.A1, VReg.A1, VReg.V0);
         vm.movImm(VReg.A2, 5);
@@ -2740,8 +2773,12 @@ export class AllocatorGenerator {
         vm.addImm(VReg.S3, VReg.S3, 8);
         vm.jmp("_erxf_split");
         vm.label("_erxf_splitdone");
+        vm.mov(VReg.S3, VReg.V0);
+        vm.add(VReg.A0, VReg.S0, VReg.S3);
+        vm.add(VReg.A1, VReg.S0, VReg.S2);
+        vm.call("_engine_data_register");
         vm.mov(VReg.A0, VReg.S0);
-        vm.addImm(VReg.A1, VReg.V0, 4095);
+        vm.addImm(VReg.A1, VReg.S3, 4095);
         vm.movImm64(VReg.V0, 0xfffffffffffff000n);
         vm.and(VReg.A1, VReg.A1, VReg.V0);
         vm.movImm(VReg.A2, 5);
@@ -2793,6 +2830,7 @@ export class AllocatorGenerator {
         this.generateEngineSmoke();
         this.generateEngineExec();
         this.generateEngineIflush();
+        this.generateEngineDataRegister();
         // 注意:不要在这里调 generateEngineSymaddr——此时 _alloc 等主体尚未发射,
         // 且末尾 generateRuntime 会再调一次;两次共用 _esym_* 标签名会让第二次的
         // 前向 jne 误绑到第一次的旧标签 → symId 查表落空返 0 → 片段 trampoline
@@ -4304,6 +4342,11 @@ export class AllocatorGenerator {
         asm.addDataLabel("_heap_base");
         asm.addDataQword(0);
 
+        // Linked list of live engine fragment data ranges:
+        // {start@0,end@8,next@16}. Fragments are never unmapped.
+        asm.addDataLabel("_engine_data_ranges");
+        asm.addDataQword(0);
+
         // parseFloat 宽松解析开关:1 = _str_to_num 尾部遇非数字字符时不判 NaN,以已解析
         // 前缀收尾(parseFloat("3.14px")=3.14)。Number() 保持 0(严格,尾部垃圾→NaN)。
         asm.addDataLabel("_parse_lenient");
@@ -4316,12 +4359,20 @@ export class AllocatorGenerator {
         asm.addDataLabel("_call_argc");
         asm.addDataQword(0);
 
-        // [argv 溢出槽] 寄存器窗口(A0-A4 = 实参 0-4,A5 = this)之外的实参 5..15。
+        // [argv 溢出槽] 寄存器窗口(A0-A4 = 实参 0-4,A5 = this)之外的实参。
         // 调用点在**全部实参求值完毕后**(与 _call_argc 同一时刻)写入,被调方在 prologue
         // 立即快照进本帧槽 —— 两者之间无分配,故槽内值不需要作 GC 根(被调方帧槽随栈扫描)。
-        // 与 _call_argc 同一"最后写、最先读"契约;超过 16 个实参仍按旧约定截断。
+        // 与 _call_argc 同一"最后写、最先读"契约。普通调用仍只填前 16 槽；
+        // 变参内建（当前为 String.prototype.concat）可显式使用到 128 槽。
         asm.addDataLabel("_call_argv");
-        for (let i = 0; i < 16; i = i + 1) asm.addDataQword(0);
+        for (let i = 0; i < 128; i = i + 1) asm.addDataQword(0);
+
+        // One-shot argc marker for the widened concat call-site ABI.  Zero
+        // means that the ordinary `_call_argc` value is authoritative;
+        // non-zero stores (actual argc + 1) and are consumed/cleared by the
+        // concat trampoline before any nested conversion call.
+        asm.addDataLabel("_call_argc_ext");
+        asm.addDataQword(0);
 
         // [new.target ABI] Construct writes NewTarget (boxed fn / naked classinfo);
         // Call writes JS_UNDEFINED. Callee prologue snapshots into __new_target.
@@ -4513,6 +4564,21 @@ export class AllocatorGenerator {
         asm.addDataLabel("_fnctor_singleton");
         asm.addDataQword(0);
 
+        // Dynamic specialised-function support.  The eval shim installs three
+        // ordinary AOT maker closures here during module initialisation; the
+        // intrinsic constructors tail into those closures.  Dynamic metadata
+        // entries begin with the same 32-byte layout as _func_meta_table and
+        // append next@32 plus optional exact [[Prototype]]@40. They are rooted
+        // by this head pointer.
+        asm.addDataLabel("_dynamic_gen_maker");
+        asm.addDataQword(0);
+        asm.addDataLabel("_dynamic_async_maker");
+        asm.addDataQword(0);
+        asm.addDataLabel("_dynamic_asyncgen_maker");
+        asm.addDataQword(0);
+        asm.addDataLabel("_dynamic_func_meta_root");
+        asm.addDataQword(0);
+
         // [shape v2 · T0] 形状转移表根(运行时首条转移边写入时惰性建表)。
         // 数据段锚槽 → 根扫描覆盖 → 表与堆上转移节点不被回收。见 SHAPE_TRANSITIONS_DESIGN.md §3/§4。
         asm.addDataLabel("_shape_transition_root");
@@ -4544,6 +4610,9 @@ export class AllocatorGenerator {
         asm.addDataLabel("_ev_timeout_head");
         asm.addDataQword(0);
         asm.addDataLabel("_ev_timeout_tail");
+        asm.addDataQword(0);
+        // refed immediate/timeout 节点数；为 0 时仅剩 unref 工作，事件循环可退出。
+        asm.addDataLabel("_ev_refed_count");
         asm.addDataQword(0);
 
         // [#74] Promise 反应微任务队列头尾指针(GC 根扫描区,排队回调/结算值存活)。

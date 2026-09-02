@@ -112,6 +112,15 @@ export class X64Assembler {
 
     label(name) {
         this.labels.set(name, this.offset());
+        // Route-B/engine fragments may be compiled by the self-hosted x64
+        // compiler. Its compact Map can retain an entry but miss a later
+        // lookup when equal label strings are distinct values. Keep an opt-in
+        // side table for fragment-local labels; normal AOT builds leave this
+        // disabled and unchanged.
+        if (this._engineLabelNames && this._engineLabelOffsets) {
+            this._engineLabelNames.push(name);
+            this._engineLabelOffsets.push(this.offset());
+        }
     }
 
     rex(w, r, x, b) {

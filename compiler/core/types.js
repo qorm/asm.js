@@ -164,12 +164,11 @@ export function inferType(node, ctx) {
                     case "Int":
                         return Type.INT64; // Int 是 Int64 的别名
                     case "Float":
-                    case "Number":
                         return Type.NUMBER;
+                    case "Number":
                     case "String":
-                        return Type.STRING;
                     case "Boolean":
-                        return Type.BOOLEAN;
+                        return Type.OBJECT;
                     case "Array":
                         return Type.ARRAY;
                     case "Object":
@@ -273,6 +272,15 @@ export function inferType(node, ctx) {
 
         case "CallExpression":
             // 函数调用的返回类型
+            // Object(x) always returns an Object value (either x itself when
+            // already an object, or a wrapper/new ordinary object). Keeping
+            // this as UNKNOWN made `"" + Object(sym)` take the string-concat
+            // shortcut (string hint) instead of the `+` operator's default
+            // ToPrimitive hint (valueOf first).
+            if (node.callee && node.callee.type === "Identifier" &&
+                node.callee.name === "Object") {
+                return Type.OBJECT;
+            }
             // __RE_new(正则 shim 构造)/ RegExp(..) 作函数调用(无 new,codegen 脱糖到
             // __RE_new)均返回 RegExp shim 对象 → 静态 REGEXP(令 RegExp("x").test() 等
             // 方法分派命中 shim)。

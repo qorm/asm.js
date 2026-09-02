@@ -83,6 +83,36 @@ export const BuiltinArrayMethodCompiler = {
 
     // 编译数组方法
     compileArrayMethod(arrayExpr, method, args) {
+        // The property name alone does not prove the receiver is an Array:
+        // `obj.push = Array.prototype.push; obj.push(...)` is intentionally
+        // generic.  For the common ABI-sized, non-spread form evaluate the
+        // receiver and arguments once in source order, then let the runtime
+        // distinguish dense arrays from arbitrary array-like objects.  The
+        // one-argument true-array path remains the hot `_array_push` fast path
+        // inside `_fpg_arr_push`.
+        if (method === "push" && !argsHasSpread(args) && args.length <= 4) {
+            const pushId = this.nextLabelId();
+            const recvOff = this.ctx.allocLocal(`__push_recv_${pushId}`);
+            const argOffs = [];
+            this.compileExpression(arrayExpr);
+            this.vm.store(VReg.FP, recvOff, VReg.RET);
+            for (let i = 0; i < args.length; i++) {
+                const off = this.ctx.allocLocal(`__push_arg${i}_${pushId}`);
+                this.compileExpression(args[i]);
+                this.vm.store(VReg.FP, off, VReg.RET);
+                argOffs.push(off);
+            }
+            this.vm.setCallArgcImm(args.length, VReg.V0, VReg.V1);
+            this.vm.load(VReg.A0, VReg.FP, recvOff);
+            const argRegs = [VReg.A1, VReg.A2, VReg.A3, VReg.A4];
+            for (let i = 0; i < argRegs.length; i++) {
+                if (i < argOffs.length) this.vm.load(argRegs[i], VReg.FP, argOffs[i]);
+                else this.vm.movImm64(argRegs[i], 0x7ffb000000000000n);
+            }
+            this.vm.call("_fpg_arr_push");
+            return true;
+        }
+
         // push 方法特殊处理：需要更新数组引用（因为扩容可能重新分配）
         if (method === "push") {
             if (args.length > 0) {
@@ -260,88 +290,46 @@ export const BuiltinArrayMethodCompiler = {
                     this.compileExpressionAsInt(args[0]);
                     this.vm.mov(VReg.A1, VReg.RET); // index (int)
                     this.vm.pop(VReg.A0); // arr JSValue
-                    // unbox JSValue 得到裸指针
-                    this.vm.call("_js_unbox");
-                    this.vm.mov(VReg.A0, VReg.RET);
+                    // `_array_at` accepts the boxed array directly and masks
+                    // its 0x7FFE tag itself.  Do not call `_js_unbox` here:
+                    // that helper is a normal call and may clobber A1 on x64,
+                    // turning every `arr.at(nonzero)` into `arr.at(0)`.
                     this.vm.call("_array_at");
                 } else {
-                    this.vm.mov(VReg.A0, VReg.RET);
-                    this.vm.call("_js_unbox");
                     this.vm.mov(VReg.A0, VReg.RET);
                     this.vm.movImm(VReg.A1, 0); // ToInteger(undefined)=0
                     this.vm.call("_array_at");
                 }
                 break;
             case "slice":
-                // arr.slice(start, end?)
-                // [species] check this.constructor[Symbol.species]; propagate errors
+                // Route every receiver through the spec helper.  The old dense
+                // fast path coerced arguments to int32 before the algorithm,
+                // losing explicit undefined, ±Infinity, inherited elements and
+                // 53-bit indices.  Evaluate arguments left-to-right first, then
+                // perform ToObject/ToLength/species/HasProperty/Get at runtime.
                 {
-                const _ssFb = this.ctx.newLabel("sl_spec_fb");
-                const _ssEnd = this.ctx.newLabel("sl_spec_done");
                 const _ssRecv = this.ctx.allocLocal(`__sl_spec_r_${this.nextLabelId()}`);
-                this.vm.store(VReg.FP, _ssRecv, VReg.RET);
-
-                // tag guard: 非真数组(0x7FFE) → 跳过 species check,直落 _agen_slice
-                this.vm.load(VReg.V0, VReg.FP, _ssRecv);
-                this.vm.shrImm(VReg.V0, VReg.V0, 48);
-                this.vm.cmpImm(VReg.V0, 0x7FFE);
-                this.vm.jne(_ssFb);
-
-                this.vm.load(VReg.A0, VReg.FP, _ssRecv);
-                this.vm.call("_array_species_check");
-                this.vm.cmpImm(VReg.RET, 0);
-                this.vm.jne(_ssFb);
-                // fast path: default species
-                this.vm.load(VReg.RET, VReg.FP, _ssRecv);
-                this.vm.push(VReg.RET);
-                if (args.length >= 1) {
-                    this.compileExpressionAsInt(args[0]);
-                    this.vm.mov(VReg.A1, VReg.RET);
-                } else {
-                    this.vm.movImm(VReg.A1, 0);
-                }
-                if (args.length >= 2) {
-                    this.vm.push(VReg.A1);
-                    this.compileExpressionAsInt(args[1]);
-                    this.vm.mov(VReg.A2, VReg.RET);
-                    this.vm.pop(VReg.A1);
-                } else {
-                    this.vm.movImm(VReg.A2, 2147483647);
-                }
-                this.vm.pop(VReg.A0);
-                this.vm.call("_js_unbox");
-                this.vm.mov(VReg.A0, VReg.RET);
-                this.vm.call("_array_slice");
-                this.vm.call("_box_arr_r");
-                this.vm.jmp(_ssEnd);
-                // fallback: non-default species
-                // 实参求值会毁 A0,先落栈再装参(同 concat)。
-                this.vm.label(_ssFb);
-                {
                 const sOff = this.ctx.allocLocal(`__sl_a1_${this.nextLabelId()}`);
                 const eOff = this.ctx.allocLocal(`__sl_a2_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, _ssRecv, VReg.RET);
                 if (args.length >= 1) {
                     this.compileExpression(args[0]);
                     this.vm.store(VReg.FP, sOff, VReg.RET);
                 } else {
-                    this.vm.movImm(VReg.V0, 0);
-                    this.vm.scvtf(0, VReg.V0);
-                    this.vm.fmovToInt(VReg.V0, 0);
-                    this.vm.store(VReg.FP, sOff, VReg.V0);
+                    this.vm.movImm64(VReg.RET, 0x7ffb000000000000n);
+                    this.vm.store(VReg.FP, sOff, VReg.RET);
                 }
                 if (args.length >= 2) {
                     this.compileExpression(args[1]);
                     this.vm.store(VReg.FP, eOff, VReg.RET);
                 } else {
-                    this.vm.movImm64(VReg.V0, 0x7ffb000000000000n); // undefined → 到末尾
-                    this.vm.store(VReg.FP, eOff, VReg.V0);
+                    this.vm.movImm64(VReg.RET, 0x7ffb000000000000n); // undefined → 到末尾
+                    this.vm.store(VReg.FP, eOff, VReg.RET);
                 }
                 this.vm.load(VReg.A0, VReg.FP, _ssRecv);
                 this.vm.load(VReg.A1, VReg.FP, sOff);
                 this.vm.load(VReg.A2, VReg.FP, eOff);
                 this.vm.call("_agen_slice");
-                }
-                this.vm.label(_ssEnd);
                 }
                 break;
             case "indexOf":
@@ -372,46 +360,29 @@ export const BuiltinArrayMethodCompiler = {
                 this.vm.call("_aref_arr_indexOf"); // RET = 装箱数字
                 break;
             case "includes":
-                // arr.includes(value, fromIndex?) -> 返回 _js_true 或 _js_false
-                // leftover-arg: includes() ≡ includes(undefined) → SameValueZero
-                // search for undefined. args==0 used to leave leftover RET (the
-                // array) so [0].includes() was leftover 0 / leftover-boolean.
-                // Missing searchElement is 0x7FFB. 1-arg / 2-arg emit unchanged.
+                // Route even statically-known arrays through the live generic
+                // helper.  It preserves ToLength-before-fromIndex ordering,
+                // full 64-bit ToInteger values, Proxy Get order, RAB resize
+                // timing and SameValueZero; the old direct helper truncated
+                // fromIndex with _to_int32 and compared raw float bit patterns.
                 if (args.length > 0) {
                     this.vm.push(VReg.RET);
                     this.compileExpression(args[0]);
+                    this.vm.push(VReg.RET);
                     if (args.length > 1) {
-                        // fromIndex:先存 value,编译第二参转裸 int 入 A2(与 indexOf 同)
-                        this.vm.push(VReg.RET);
                         this.compileExpression(args[1]);
-                        if (this.vm.backend.name === "x64") this.vm.mov(VReg.A0, VReg.RET);
-                        this.vm.call("_to_int32");
-                        this.vm.mov(VReg.A2, VReg.RET);
-                        this.vm.pop(VReg.A1); // value
                     } else {
-                        this.vm.mov(VReg.A1, VReg.RET);
-                        this.vm.movImm(VReg.A2, 0);
+                        this.vm.movImm64(VReg.RET, 0x7ffb000000000000n);
                     }
-                    this.vm.pop(VReg.A0);
+                    this.vm.mov(VReg.A2, VReg.RET); // boxed fromIndex
+                    this.vm.pop(VReg.A1);           // searchElement
+                    this.vm.pop(VReg.A0);           // receiver
                 } else {
                     this.vm.mov(VReg.A0, VReg.RET);
                     this.vm.movImm64(VReg.A1, 0x7ffb000000000000n);
-                    this.vm.movImm(VReg.A2, 0);
+                    this.vm.movImm64(VReg.A2, 0x7ffb000000000000n);
                 }
-                // unbox JSValue 得到裸指针(_js_unbox 保 A1,不碰 A2)
-                this.vm.call("_js_unbox");
-                this.vm.mov(VReg.A0, VReg.RET);
-                this.vm.call("_array_includes");
-                // 转换为布尔单例
-                const trueLabel = `_includes_true_${this.nextLabelId()}`;
-                const doneLabel = `_includes_done_${this.nextLabelId()}`;
-                this.vm.cmpImm(VReg.RET, 0);
-                this.vm.jne(trueLabel);
-                this.vm.movImm64(VReg.RET, 0x7ff9000000000000n);
-                this.vm.jmp(doneLabel);
-                this.vm.label(trueLabel);
-                this.vm.movImm64(VReg.RET, 0x7ff9000000000001n);
-                this.vm.label(doneLabel);
+                this.vm.call("_agen_includes");
                 break;
             case "forEach":
                 // arr.forEach(callback) - 编译时展开循环
@@ -481,73 +452,49 @@ export const BuiltinArrayMethodCompiler = {
                 }
                 break;
             case "toReversed": {
-                // [#35] 非破坏反转:slice 全拷贝后原地 reverse 拷贝(接收者已在 RET)
+                // [ES2023] 非破坏反转必须按 len-1 → 0 的顺序执行 Get；不能
+                // 先升序 slice 再 reverse（会错过 accessor/prototype/hole 语义）。
+                // 运行时 helper 同时覆盖真数组与泛型类数组接收者。
                 this.vm.mov(VReg.A0, VReg.RET);
-                this.vm.call("_js_unbox");
-                this.vm.mov(VReg.A0, VReg.RET);
-                this.vm.movImm(VReg.A1, 0);
-                this.vm.movImm(VReg.A2, 2147483647);
-                this.vm.call("_array_slice");
-                this.vm.call("_box_arr_r"); // box->helper
-                this.vm.mov(VReg.A0, VReg.RET);
-                this.vm.call("_array_reverse");
+                this.vm.call("_agen_toReversed");
                 break;
             }
             case "toSorted": {
-                // ES:IsCallable(comparefn) 先于 ToObject / LengthOfArrayLike / slice。
-                // 旧路先 slice 再 sort,comparefn=null 会先读 length(getter 抛 Test262Error)。
+                // ES2023 toSorted：IsCallable(comparefn) → ToObject/LengthOfArrayLike
+                // → 按升序 Get 快照（hole 变 undefined）→ 稳定排序。统一委托
+                // `_agen_toSorted`，避免旧的 slice+原地 sort 路径丢失 getter/length
+                // 动态变化、超 2^32 长度和 hole 稠密化语义。
                 const tsRecvOff = this.ctx.allocLocal(`__tosorted_recv_${this.nextLabelId()}`);
                 this.vm.store(VReg.FP, tsRecvOff, VReg.RET);
                 if (args.length > 0) {
                     this.compileExpression(args[0]);
                     const tsCmpOff = this.ctx.allocLocal(`__tosorted_cmp_${this.nextLabelId()}`);
                     this.vm.store(VReg.FP, tsCmpOff, VReg.RET);
-                    const tsCmpSkip = this.ctx.newLabel("tosorted_cmp_skip");
-                    this.vm.shrImm(VReg.V0, VReg.RET, 48);
-                    this.vm.cmpImm(VReg.V0, 0x7FFB);
-                    this.vm.jeq(tsCmpSkip);
-                    this.vm.load(VReg.A0, VReg.FP, tsCmpOff);
-                    this.vm.call("_aref_require_cb");
-                    this.vm.label(tsCmpSkip);
-                }
-                this.vm.load(VReg.A0, VReg.FP, tsRecvOff);
-                this.vm.call("_js_unbox");
-                this.vm.mov(VReg.A0, VReg.RET);
-                this.vm.movImm(VReg.A1, 0);
-                this.vm.movImm(VReg.A2, 2147483647);
-                this.vm.call("_array_slice");
-                this.vm.call("_box_arr_r");
-                const tsName = `__tosorted_${this.nextLabelId()}`;
-                const tsOff = this.ctx.allocLocal(tsName);
-                this.vm.store(VReg.FP, tsOff, VReg.RET);
-                const tsIdent = { type: "Identifier", name: tsName };
-                if (args.length > 0) {
-                    this.compileArraySort(tsIdent, args[0]);
+                    this.vm.load(VReg.A0, VReg.FP, tsRecvOff);
+                    this.vm.load(VReg.A1, VReg.FP, tsCmpOff);
                 } else {
-                    this.compileArraySortDefault(tsIdent);
+                    this.vm.load(VReg.A0, VReg.FP, tsRecvOff);
+                    this.vm.movImm64(VReg.A1, 0x7ffb000000000000n); // undefined
                 }
+                this.vm.call("_agen_toSorted");
                 break;
             }
             case "with": {
-                // [#73b] arr.with(idx, val) 非破坏:全拷贝 → 归一负 idx → copy[idx]=val
-                // → 返回副本。接收者已在 RET(line 428)。委托 _array_with 运行时(内部
-                // slice 全拷贝 + _array_set)。越界不抛 RangeError(记偏差)。
-                this.vm.push(VReg.RET); // 原数组 boxed
-                if (args.length >= 1) {
-                    this.compileExpressionAsInt(args[0]);
-                } else {
-                    this.vm.movImm(VReg.RET, 0);
-                }
-                this.vm.push(VReg.RET); // idx(裸 int)
-                if (args.length >= 2) {
-                    this.compileExpression(args[1]);
-                } else {
-                    this.vm.movImm64(VReg.RET, 0x7ffb000000000000n); // was lea+load _js const
-                }
-                this.vm.mov(VReg.A2, VReg.RET); // val(先落 A2,pop 会冲 RET/A0)
-                this.vm.pop(VReg.A1);           // idx
-                this.vm.pop(VReg.A0);           // arr boxed
-                this.vm.call("_array_with");
+                // ES2023 with：ToObject/LengthOfArrayLike/ToIntegerOrInfinity 之后
+                // 按升序 Get 快照并 CreateDataProperty；统一委托泛型 helper，覆盖
+                // holes、原型 getter、动态 length、RangeError 和 primitive receiver。
+                const withRecvOff = this.ctx.allocLocal(`__with_recv_${this.nextLabelId()}`);
+                const withIdxOff = this.ctx.allocLocal(`__with_idx_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, withRecvOff, VReg.RET);
+                if (args.length >= 1) this.compileExpression(args[0]);
+                else this.vm.movImm64(VReg.RET, 0x7ffb000000000000n); // undefined
+                this.vm.store(VReg.FP, withIdxOff, VReg.RET);
+                if (args.length >= 2) this.compileExpression(args[1]);
+                else this.vm.movImm64(VReg.RET, 0x7ffb000000000000n); // undefined
+                this.vm.mov(VReg.A2, VReg.RET);
+                this.vm.load(VReg.A1, VReg.FP, withIdxOff);
+                this.vm.load(VReg.A0, VReg.FP, withRecvOff);
+                this.vm.call("_agen_with");
                 break;
             }
             case "find":
@@ -573,7 +520,7 @@ export const BuiltinArrayMethodCompiler = {
             case "reduce":
                 // arr.reduce(callback, initialValue?)
                 if (args.length > 0) {
-                    this.compileArrayReduce(arrayExpr, args[0], args[1]);
+                    this.compileArrayReduce(arrayExpr, args[0], args[1], args.length >= 2);
                 } else {
                     this.vm.call("_throw_not_a_function");
                 }
@@ -581,7 +528,7 @@ export const BuiltinArrayMethodCompiler = {
             case "reduceRight":
                 // arr.reduceRight(callback, initialValue?) —— 从右往左
                 if (args.length > 0) {
-                    this.compileArrayReduceRight(arrayExpr, args[0], args[1]);
+                    this.compileArrayReduceRight(arrayExpr, args[0], args[1], args.length >= 2);
                 } else {
                     this.vm.call("_throw_not_a_function");
                 }
@@ -646,30 +593,22 @@ export const BuiltinArrayMethodCompiler = {
                 break;
             }
             case "lastIndexOf":
-                // 接收者已在 RET(line 148),勿二次求值(同 join 理由)。
-                // A0=arr, A1=value, A2=fromIndex(从此下标向前搜;缺省用 INT_MAX 哨兵,
-                // 运行时钳到 len-1)。此前不传 fromIndex → 恒从末尾搜,忽略第 2 参。
-                // leftover-arg: lastIndexOf() === lastIndexOf(undefined) -> Strict
-                // Equality search for undefined. args==0 used to pass leftover 0
-                // so [undefined].lastIndexOf() was -1 and [0].lastIndexOf() was 0.
-                // Missing searchElement is 0x7FFB. 1-arg / 2-arg emit unchanged.
+                // Preserve boxed fromIndex so the runtime can check length==0
+                // before coercion and retain ±Infinity/full 64-bit values.
                 this.vm.push(VReg.RET);
                 if (args.length >= 2) {
-                    // fromIndex 存栈,先算 value 再算 fromIndex(保持求值序 value→from)
                     this.compileExpression(args[0]); this.vm.push(VReg.RET);
-                    this.compileExpressionAsInt(args[1]); this.vm.mov(VReg.A2, VReg.RET);
+                    this.compileExpression(args[1]); this.vm.mov(VReg.A2, VReg.RET);
                     this.vm.pop(VReg.A1);
                 } else if (args.length === 1) {
                     this.compileExpression(args[0]); this.vm.mov(VReg.A1, VReg.RET);
-                    this.vm.movImm(VReg.A2, 2147483647);
+                    this.vm.movImm64(VReg.A2, 0x7ff0000000000000n); // omitted → +Infinity
                 } else {
                     this.vm.movImm64(VReg.A1, 0x7ffb000000000000n);
-                    this.vm.movImm(VReg.A2, 2147483647);
+                    this.vm.movImm64(VReg.A2, 0x7ff0000000000000n); // omitted → +Infinity
                 }
                 this.vm.pop(VReg.A0);
-                this.vm.call("_array_lastIndexOf");
-                // 裸整数结果装箱为 Number(否则打印成乱码浮点/-NaN)
-                this.boxIntAsNumber(VReg.RET);
+                this.vm.call("_aref_arr_lastIndexOf");
                 break;
             case "sort":
                 // arr.sort(comparator) - 原地排序，调用用户比较器。
@@ -768,23 +707,16 @@ export const BuiltinArrayMethodCompiler = {
                 this.vm.jmp(_ccSpecEnd);
 
                 // fallback: non-default species / 非数组 this -> _agen_concat
-                // 实参 compileExpression 会毁 A0..A4,须先全部落栈再装参。
+                // 把完整参数列表（含 spread）打包，避免 A1..A4 四参窗口截断，
+                // 并让所有实参先按调用语义从左到右求值。
                 this.vm.label(_ccSpecFb);
                 {
-                const argSlots = [];
-                for (let ci = 0; ci < Math.min(args.length, 4); ci++) {
-                    this.compileExpression(args[ci]);
-                    const off = this.ctx.allocLocal(`__cc_arg_${ci}_${this.nextLabelId()}`);
-                    this.vm.store(VReg.FP, off, VReg.RET);
-                    argSlots.push(off);
-                }
+                this.compileArrayExpressionWithSpread(args);
+                const packedOff = this.ctx.allocLocal(`__cc_packed_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, packedOff, VReg.RET);
                 this.vm.load(VReg.A0, VReg.FP, _ccRecvSp);
-                if (argSlots.length > 0) this.vm.load(VReg.A1, VReg.FP, argSlots[0]);
-                if (argSlots.length > 1) this.vm.load(VReg.A2, VReg.FP, argSlots[1]);
-                if (argSlots.length > 2) this.vm.load(VReg.A3, VReg.FP, argSlots[2]);
-                if (argSlots.length > 3) this.vm.load(VReg.A4, VReg.FP, argSlots[3]);
-                this.emitSetCallArgc(Math.min(args.length, 4));
-                this.vm.call("_agen_concat");
+                this.vm.load(VReg.A1, VReg.FP, packedOff);
+                this.vm.call("_agen_concat_packed");
                 }
                 this.vm.label(_ccSpecEnd);
                 break;
@@ -876,123 +808,77 @@ export const BuiltinArrayMethodCompiler = {
                 }
                 break;
             case "splice": {
-                // arr.splice(start, delCount?, ...items) -> removed 数组(原地)。接收者已在 RET。
-                // start/delCount 编成裸 int(delCount 省略 → 大 sentinel,运行时钳到 len-start);
-                // ...items 编成 ArrayExpression 数组(真 arg 节点作 elements,gen2 安全)。
-                // [species] check this.constructor[Symbol.species]; propagate errors
-                const _spId = this.nextLabelId();
-                const _spSpecFb = this.ctx.newLabel("sp_spec_fb");
-                const _spSpecEnd = this.ctx.newLabel("sp_spec_done");
-                const _spRecvSp = this.ctx.allocLocal(`__sp_spec_r_${_spId}`);
-
-                // Save receiver (already in RET from compileExpression at line 203)
-                this.vm.store(VReg.FP, _spRecvSp, VReg.RET);
-
-                // tag guard: 非真数组(0x7FFE) → 跳过 species check,直落 _agen_splice
-                this.vm.load(VReg.V0, VReg.FP, _spRecvSp);
-                this.vm.shrImm(VReg.V0, VReg.V0, 48);
-                this.vm.cmpImm(VReg.V0, 0x7FFE);
-                this.vm.jne(_spSpecFb);
-
-                this.vm.load(VReg.A0, VReg.FP, _spRecvSp);
-                this.vm.call("_array_species_check");
-                this.vm.cmpImm(VReg.RET, 0);
-                this.vm.jne(_spSpecFb);
-
-                // fast path: default species
-                this.vm.load(VReg.RET, VReg.FP, _spRecvSp);
-                const spArrOff = this.ctx.allocLocal(`__splice_arr_${_spId}`);
-                this.vm.store(VReg.FP, spArrOff, VReg.RET);
-                const spStartOff = this.ctx.allocLocal(`__splice_start_${_spId}`);
-                if (args.length > 0) { this.compileExpressionAsInt(args[0]); }
-                else { this.vm.movImm(VReg.RET, 0); }
-                this.vm.store(VReg.FP, spStartOff, VReg.RET);
-                const spDelOff = this.ctx.allocLocal(`__splice_del_${_spId}`);
-                if (args.length > 1) { this.compileExpressionAsInt(args[1]); }
-                else if (args.length === 1) { this.vm.movImm(VReg.RET, 0x7fffffff); } // start 在、del 省略 → 删到尾
-                else { this.vm.movImm(VReg.RET, 0); } // start 也不在 → actualDeleteCount = 0
-                this.vm.store(VReg.FP, spDelOff, VReg.RET);
-                // items 数组
-                this.compileExpression({ type: "ArrayExpression", elements: args.slice(2) });
-                this.vm.mov(VReg.A3, VReg.RET);
-                this.vm.load(VReg.A0, VReg.FP, spArrOff);
-                this.vm.load(VReg.A1, VReg.FP, spStartOff);
-                this.vm.load(VReg.A2, VReg.FP, spDelOff);
-                this.vm.call("_array_splice");
-                this.vm.jmp(_spSpecEnd);
-
-                // fallback: non-default species / 非数组 this -> _agen_splice_items
-                // 实参求值会毁 A0,先落栈再装参。
-                this.vm.label(_spSpecFb);
-                {
-                const stOff = this.ctx.allocLocal(`__sp_fb_s_${_spId}`);
-                const dlOff = this.ctx.allocLocal(`__sp_fb_d_${_spId}`);
-                const itOff = this.ctx.allocLocal(`__sp_fb_i_${_spId}`);
+                // Preserve the call's normal evaluation order: receiver is
+                // already evaluated, then all arguments are evaluated from
+                // left to right before the splice algorithm observes length,
+                // coerces start/deleteCount, or resolves @@species.
+                //
+                // The former default-species fast path coerced both numeric
+                // arguments to int32 here, losing ±Infinity and 53-bit values,
+                // and performed the species check before argument side effects.
+                // Use the shared live helper for arrays and array-likes alike.
+                const spId = this.nextLabelId();
+                const recvOff = this.ctx.allocLocal(`__splice_recv_${spId}`);
+                const startOff = this.ctx.allocLocal(`__splice_start_${spId}`);
+                const delOff = this.ctx.allocLocal(`__splice_del_${spId}`);
+                const itemsOff = this.ctx.allocLocal(`__splice_items_${spId}`);
+                this.vm.store(VReg.FP, recvOff, VReg.RET);
                 if (args.length >= 1) {
                     this.compileExpression(args[0]);
-                    this.vm.store(VReg.FP, stOff, VReg.RET);
+                    this.vm.store(VReg.FP, startOff, VReg.RET);
                 } else {
                     this.vm.movImm(VReg.V0, 0);
                     this.vm.scvtf(0, VReg.V0);
                     this.vm.fmovToInt(VReg.V0, 0);
-                    this.vm.store(VReg.FP, stOff, VReg.V0);
+                    this.vm.store(VReg.FP, startOff, VReg.V0);
                 }
                 if (args.length >= 2) {
                     this.compileExpression(args[1]);
-                    this.vm.store(VReg.FP, dlOff, VReg.RET);
+                    this.vm.store(VReg.FP, delOff, VReg.RET);
                 } else if (args.length === 1) {
                     this.vm.movImm64(VReg.V0, 0x7ffb000000000000n); // undefined → 删到尾
-                    this.vm.store(VReg.FP, dlOff, VReg.V0);
+                    this.vm.store(VReg.FP, delOff, VReg.V0);
                 } else {
                     // start not present → actualDeleteCount = 0 (not delete-to-end)
                     this.vm.movImm(VReg.V0, 0);
                     this.vm.scvtf(0, VReg.V0);
                     this.vm.fmovToInt(VReg.V0, 0);
-                    this.vm.store(VReg.FP, dlOff, VReg.V0);
+                    this.vm.store(VReg.FP, delOff, VReg.V0);
                 }
-                if (args.length >= 3) {
-                    this.compileExpression({ type: "ArrayExpression", elements: args.slice(2) });
-                    this.vm.store(VReg.FP, itOff, VReg.RET);
-                } else {
-                    this.vm.movImm(VReg.V0, 0);
-                    this.vm.store(VReg.FP, itOff, VReg.V0);
-                }
-                this.vm.load(VReg.A0, VReg.FP, _spRecvSp);
-                this.vm.load(VReg.A1, VReg.FP, stOff);
-                this.vm.load(VReg.A2, VReg.FP, dlOff);
-                this.vm.load(VReg.A3, VReg.FP, itOff);
+                this.compileExpression({ type: "ArrayExpression", elements: args.slice(2) });
+                this.vm.store(VReg.FP, itemsOff, VReg.RET);
+                this.vm.load(VReg.A0, VReg.FP, recvOff);
+                this.vm.load(VReg.A1, VReg.FP, startOff);
+                this.vm.load(VReg.A2, VReg.FP, delOff);
+                this.vm.load(VReg.A3, VReg.FP, itemsOff);
+                this.vm.movImm(VReg.A4, Math.min(args.length, 2));
                 this.vm.call("_agen_splice_items");
-                }
-                this.vm.label(_spSpecEnd);
                 break;
             }
             case "toSpliced": {
-                // [ES2023] arr.toSpliced(start, delCount?, ...items) -> 新数组(非破坏)。
-                // 同 splice 参数处理,call `_array_toSpliced`(内部全拷贝→splice 副本→返副本)。
-                // leftover-arg: toSpliced() start not present → actualDeleteCount=0
-                // (copy of receiver). args==0 used to pass del=INT_MAX → leftover empty.
-                // 1-arg / 2-arg emit unchanged (same helper).
+                // ES2023 toSpliced：参数保持装箱值，由运行时执行完整
+                // ToIntegerOrInfinity/缺参分支；items 先按实参顺序收成数组，再由规范
+                // helper 只读取未删除的原元素并用 CreateDataProperty 构造稠密结果。
                 const id = this.nextLabelId();
                 const tsArrOff = this.ctx.allocLocal(`__tospliced_arr_${id}`);
                 this.vm.store(VReg.FP, tsArrOff, VReg.RET);
                 const tsStartOff = this.ctx.allocLocal(`__tospliced_start_${id}`);
-                if (args.length > 0) { this.compileExpressionAsInt(args[0]); }
-                else { this.vm.movImm(VReg.RET, 0); }
+                if (args.length > 0) { this.compileExpression(args[0]); }
+                else { this.vm.movImm64(VReg.RET, 0x7ffb000000000000n); }
                 this.vm.store(VReg.FP, tsStartOff, VReg.RET);
                 const tsDelOff = this.ctx.allocLocal(`__tospliced_del_${id}`);
-                // leftover-arg: toSpliced() start not present → actualDeleteCount=0
-                // (copy). args==0 used to pass del=INT_MAX → leftover empty [].
-                // 1-arg (start present, deleteCount missing) still INT_MAX sentinel.
-                if (args.length > 1) { this.compileExpressionAsInt(args[1]); }
-                else if (args.length === 0) { this.vm.movImm(VReg.RET, 0); }
-                else { this.vm.movImm(VReg.RET, 0x7fffffff); }
+                if (args.length > 1) { this.compileExpression(args[1]); }
+                else { this.vm.movImm64(VReg.RET, 0x7ffb000000000000n); }
                 this.vm.store(VReg.FP, tsDelOff, VReg.RET);
-                this.compileExpression({ type: "ArrayExpression", elements: args.slice(2) });
+                const tsItems = args.slice(2);
+                if (argsHasSpread(tsItems)) this.compileArrayExpressionWithSpread(tsItems);
+                else this.compileExpression({ type: "ArrayExpression", elements: tsItems });
                 this.vm.mov(VReg.A3, VReg.RET);
+                this.vm.movImm(VReg.A4, args.length);
                 this.vm.load(VReg.A0, VReg.FP, tsArrOff);
                 this.vm.load(VReg.A1, VReg.FP, tsStartOff);
                 this.vm.load(VReg.A2, VReg.FP, tsDelOff);
-                this.vm.call("_array_toSpliced");
+                this.vm.call("_agen_toSpliced_packed");
                 break;
             }
             case "values":
@@ -1774,7 +1660,7 @@ export const BuiltinArrayMethodCompiler = {
     },
 
     // 编译 arr.reduce(callback, initialValue?)
-    compileArrayReduce(arrayExpr, callbackExpr, initialValueExpr) {
+    compileArrayReduce(arrayExpr, callbackExpr, initialValueExpr, hasInitialValue) {
         const arrOffset = this.ctx.allocLocal(`__reduce_arr_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, arrOffset, VReg.RET);
 
@@ -1785,13 +1671,18 @@ export const BuiltinArrayMethodCompiler = {
 
         // 求值初始值（如提供，存 slot 供 tag guard 和 fallback 共用）
         const rinitOff = this.ctx.allocLocal(`__reduce_init_${this.nextLabelId()}`);
-        if (initialValueExpr) {
+        if (hasInitialValue) {
             this.compileExpression(initialValueExpr);
             this.vm.store(VReg.FP, rinitOff, VReg.RET);
         } else {
             this.vm.movImm64(VReg.RET, 0x7ffb000000000000n);
             this.vm.store(VReg.FP, rinitOff, VReg.RET);
         }
+
+        // _agen_reduce 的一等方法入口还要服务 `.call`，统一从 _call_argc
+        // 区分缺参和显式 undefined。这里是静态内联调用，实参求值完成后写入
+        // 同一 ABI，避免 fallback 观察到上一轮 JS 调用留下的 argc。
+        this.emitSetCallArgc(hasInitialValue ? 2 : 1);
 
         // tag guard: 非真数组(0x7FFE)时走 _agen_reduce 安全包装
         const reduceFallbackLbl = this.ctx.newLabel("reduce_fallback");
@@ -1807,6 +1698,7 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.load(VReg.A1, VReg.FP, cbOffset);
         this.vm.load(VReg.A2, VReg.FP, rinitOff);
         this.vm.movImm(VReg.A3, 0);
+        this.vm.movImm(VReg.A4, hasInitialValue ? 1 : 0);
         this.vm.call("_array_reduce_rt");
         this.vm.jmp(reduceDoneLbl);
 
@@ -1822,7 +1714,7 @@ export const BuiltinArrayMethodCompiler = {
 
     // 编译 arr.reduceRight(callback, initialValue?) —— reduce 的镜像:从 len-1 递减到 0。
     // 无初值时以末元素为初值、索引从 len-2 起;回调签名同 reduce(acc, cur, idx, arr)。
-    compileArrayReduceRight(arrayExpr, callbackExpr, initialValueExpr) {
+    compileArrayReduceRight(arrayExpr, callbackExpr, initialValueExpr, hasInitialValue) {
         const arrOffset = this.ctx.allocLocal(`__rredr_arr_${this.nextLabelId()}`);
         this.vm.store(VReg.FP, arrOffset, VReg.RET);
 
@@ -1833,13 +1725,16 @@ export const BuiltinArrayMethodCompiler = {
 
         // 求值初始值（如提供，存 slot 供 tag guard 和 fallback 共用）
         const rinitOff = this.ctx.allocLocal(`__rredr_init_${this.nextLabelId()}`);
-        if (initialValueExpr) {
+        if (hasInitialValue) {
             this.compileExpression(initialValueExpr);
             this.vm.store(VReg.FP, rinitOff, VReg.RET);
         } else {
             this.vm.movImm64(VReg.RET, 0x7ffb000000000000n);
             this.vm.store(VReg.FP, rinitOff, VReg.RET);
         }
+
+        // 同 reduce：在所有实参求值之后刷新 argc，供泛型入口保留参数存在性。
+        this.emitSetCallArgc(hasInitialValue ? 2 : 1);
 
         // tag guard: 非真数组(0x7FFE)时走 _agen_reduceRight 安全包装
         const rrFallbackLbl = this.ctx.newLabel("rredr_fallback");
@@ -1855,6 +1750,7 @@ export const BuiltinArrayMethodCompiler = {
         this.vm.load(VReg.A1, VReg.FP, cbOffset);
         this.vm.load(VReg.A2, VReg.FP, rinitOff);
         this.vm.movImm(VReg.A3, 0);
+        this.vm.movImm(VReg.A4, hasInitialValue ? 1 : 0);
         this.vm.call("_array_reduceRight_rt");
         this.vm.jmp(rrDoneLbl);
 

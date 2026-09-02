@@ -42,6 +42,7 @@ export class MathGenerator {
         this.generateAcosh();
         this.generateAtanh();
         this.generateFround();
+        this.generateF16Round();
         this.generateClz32();
     }
 
@@ -108,6 +109,13 @@ export class MathGenerator {
         const vm = this.vm;
         vm.label("_math_sin");
         vm.prologue(0, [VReg.S0, VReg.S1]);
+        // sin(±0) 必须原样保留零的符号；范围归约里的加减会把 -0 变成 +0。
+        vm.shlImm(VReg.V2, VReg.A0, 1);
+        vm.cmpImm(VReg.V2, 0);
+        vm.jne("_msin_nonzero");
+        vm.mov(VReg.RET, VReg.A0);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_msin_nonzero");
         vm.movImm64(VReg.V1, 0x7FF0000000000000n);
         vm.and(VReg.V0, VReg.A0, VReg.V1);
         vm.cmp(VReg.V0, VReg.V1);
@@ -256,6 +264,24 @@ export class MathGenerator {
         vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2]);
         vm.mov(VReg.S0, VReg.A0);                     // y 位
         vm.mov(VReg.S1, VReg.A1);                     // x 位
+        // 任一 NaN → NaN。必须先于 x==0 特判，否则 atan2(NaN, 0) 会误返 π/2。
+        vm.movImm64(VReg.V1, 0x7ff0000000000000n);
+        vm.and(VReg.V2, VReg.S0, VReg.V1);
+        vm.cmp(VReg.V2, VReg.V1); vm.jne("_matan2_x_nan_chk");
+        vm.movImm64(VReg.V1, 0x000fffffffffffffn);
+        vm.and(VReg.V2, VReg.S0, VReg.V1);
+        vm.cmpImm(VReg.V2, 0); vm.jne("_matan2_nan");
+        vm.label("_matan2_x_nan_chk");
+        vm.movImm64(VReg.V1, 0x7ff0000000000000n);
+        vm.and(VReg.V2, VReg.S1, VReg.V1);
+        vm.cmp(VReg.V2, VReg.V1); vm.jne("_matan2_not_nan");
+        vm.movImm64(VReg.V1, 0x000fffffffffffffn);
+        vm.and(VReg.V2, VReg.S1, VReg.V1);
+        vm.cmpImm(VReg.V2, 0); vm.jeq("_matan2_not_nan");
+        vm.label("_matan2_nan");
+        vm.movImm64(VReg.RET, 0x7ff0000000000001n);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+        vm.label("_matan2_not_nan");
         // x==0 分支(位:±0 都算 0):判 x 的非符号位是否全 0
         vm.movImm64(VReg.V1, 0x7fffffffffffffffn); vm.and(VReg.V0, VReg.S1, VReg.V1);
         vm.cmpImm(VReg.V0, 0); vm.jne("_matan2_xnz");
@@ -267,7 +293,19 @@ export class MathGenerator {
         vm.label("_matan2_neghalf");
         vm.movImm64(VReg.RET, 0xbff921fb54442d18n); vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0); // -π/2
         vm.label("_matan2_zero");
-        vm.movImm(VReg.RET, 0); vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0); // 0
+        // y=±0,x=+0 → y；x=-0 → ±π（符号取 y）。
+        vm.shrImm(VReg.V2, VReg.S1, 63);
+        vm.cmpImm(VReg.V2, 0); vm.jne("_matan2_zero_xneg");
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+        vm.label("_matan2_zero_xneg");
+        vm.shrImm(VReg.V2, VReg.S0, 63);
+        vm.cmpImm(VReg.V2, 0); vm.jne("_matan2_zero_negpi");
+        vm.movImm64(VReg.RET, 0x400921fb54442d18n);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
+        vm.label("_matan2_zero_negpi");
+        vm.movImm64(VReg.RET, 0xc00921fb54442d18n);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 0);
         vm.label("_matan2_xnz");
         // a = atan(y/x)
         vm.fmovToFloat(0, VReg.S0); vm.fmovToFloat(1, VReg.S1); vm.fdiv(0, 0, 1);
@@ -387,11 +425,138 @@ export class MathGenerator {
         vm.ret();
     }
 
+    // _math_f16round(A0=x bits) -> binary16 round-to-nearest-ties-even,
+    // converted back to an exactly representable binary64 value.  Implemented
+    // from the binary64 fields so the semantics are identical on arm64/x64
+    // without relying on optional native FP16 instructions.
+    generateF16Round() {
+        const vm = this.vm;
+        const SAVED = [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4];
+        vm.label("_math_f16round");
+        vm.prologue(0, SAVED);
+        vm.mov(VReg.S0, VReg.A0); // original bits
+        vm.movImm64(VReg.V5, 0x8000000000000000n);
+        vm.and(VReg.S1, VReg.S0, VReg.V5); // sign
+        vm.shrImm(VReg.S2, VReg.S0, 52);
+        vm.andImm(VReg.S2, VReg.S2, 0x7ff); // binary64 exponent
+        vm.movImm64(VReg.V5, 0x000fffffffffffffn);
+        vm.and(VReg.S3, VReg.S0, VReg.V5); // fraction
+
+        vm.cmpImm(VReg.S2, 0x7ff);
+        vm.jeq("_mf16_special");
+        // Zero and every binary64 subnormal are far below half's minimum
+        // subnormal (2^-24), so they round to signed zero.
+        vm.cmpImm(VReg.S2, 0);
+        vm.jeq("_mf16_zero");
+        vm.subImm(VReg.S2, VReg.S2, 1023); // unbiased exponent e
+        vm.cmpImm(VReg.S2, 15);
+        vm.jgt("_mf16_inf");
+        vm.movImm64(VReg.V5, 0x0010000000000000n);
+        vm.or(VReg.S3, VReg.S3, VReg.V5); // 53-bit significand
+        vm.cmpImm(VReg.S2, -14);
+        vm.jge("_mf16_normal");
+        vm.cmpImm(VReg.S2, -25);
+        vm.jlt("_mf16_zero");
+
+        // Half subnormal: n = roundTiesEven(x / 2^-24).
+        // shift = 28-e maps the binary64 significand to integer n.
+        vm.movImm(VReg.V6, 28);
+        vm.sub(VReg.V6, VReg.V6, VReg.S2);
+        vm.shr(VReg.S4, VReg.S3, VReg.V6); // q
+        vm.shl(VReg.V5, VReg.S4, VReg.V6);
+        vm.sub(VReg.V5, VReg.S3, VReg.V5); // remainder
+        vm.subImm(VReg.V6, VReg.V6, 1);
+        vm.movImm(VReg.S0, 1);
+        vm.shl(VReg.S0, VReg.S0, VReg.V6); // halfway
+        vm.cmp(VReg.V5, VReg.S0);
+        vm.jgt("_mf16_sub_up");
+        vm.jlt("_mf16_sub_rounded");
+        vm.andImm(VReg.V6, VReg.S4, 1);
+        vm.cmpImm(VReg.V6, 0);
+        vm.jeq("_mf16_sub_rounded");
+        vm.label("_mf16_sub_up");
+        vm.addImm(VReg.S4, VReg.S4, 1);
+        vm.label("_mf16_sub_rounded");
+        vm.cmpImm(VReg.S4, 0);
+        vm.jeq("_mf16_zero");
+        vm.cmpImm(VReg.S4, 1024);
+        vm.jeq("_mf16_sub_to_normal");
+        // n * 2^-24 is exactly representable in binary64.
+        vm.scvtf(0, VReg.S4);
+        vm.movImm64(VReg.V5, 0x3e70000000000000n); // 2^-24
+        vm.fmovToFloat(1, VReg.V5);
+        vm.fmul(0, 0, 1);
+        vm.cmpImm(VReg.S1, 0);
+        vm.jeq("_mf16_sub_positive");
+        vm.fneg(0, 0);
+        vm.label("_mf16_sub_positive");
+        vm.fmovToInt(VReg.RET, 0);
+        vm.epilogue(SAVED, 0);
+
+        vm.label("_mf16_sub_to_normal");
+        vm.movImm(VReg.S2, -14);
+        vm.jmp("_mf16_build_normal");
+
+        // Half normal: retain 11 significand bits and round discarded 42 bits.
+        vm.label("_mf16_normal");
+        vm.shrImm(VReg.S4, VReg.S3, 42); // q (implicit bit + 10 fraction bits)
+        vm.movImm64(VReg.V5, 0x000003ffffffffffn); // low 42 bits
+        vm.and(VReg.V5, VReg.S3, VReg.V5);
+        vm.movImm64(VReg.V6, 0x0000020000000000n); // halfway = 2^41
+        vm.cmp(VReg.V5, VReg.V6);
+        vm.jgt("_mf16_norm_up");
+        vm.jlt("_mf16_norm_rounded");
+        vm.andImm(VReg.V6, VReg.S4, 1);
+        vm.cmpImm(VReg.V6, 0);
+        vm.jeq("_mf16_norm_rounded");
+        vm.label("_mf16_norm_up");
+        vm.addImm(VReg.S4, VReg.S4, 1);
+        vm.label("_mf16_norm_rounded");
+        vm.cmpImm(VReg.S4, 2048);
+        vm.jne("_mf16_build_normal");
+        vm.movImm(VReg.S4, 1024);
+        vm.addImm(VReg.S2, VReg.S2, 1);
+        vm.cmpImm(VReg.S2, 15);
+        vm.jgt("_mf16_inf");
+
+        vm.label("_mf16_build_normal");
+        vm.subImm(VReg.S4, VReg.S4, 1024);
+        vm.shlImm(VReg.S4, VReg.S4, 42);
+        vm.addImm(VReg.S2, VReg.S2, 1023);
+        vm.shlImm(VReg.S2, VReg.S2, 52);
+        vm.or(VReg.RET, VReg.S1, VReg.S2);
+        vm.or(VReg.RET, VReg.RET, VReg.S4);
+        vm.epilogue(SAVED, 0);
+
+        vm.label("_mf16_special");
+        vm.cmpImm(VReg.S3, 0);
+        vm.jne("_mf16_nan");
+        vm.label("_mf16_inf");
+        vm.movImm64(VReg.V5, 0x7ff0000000000000n);
+        vm.or(VReg.RET, VReg.S1, VReg.V5);
+        vm.epilogue(SAVED, 0);
+        vm.label("_mf16_nan");
+        vm.movImm64(VReg.RET, 0x7ff0000000000001n);
+        vm.epilogue(SAVED, 0);
+        vm.label("_mf16_zero");
+        vm.mov(VReg.RET, VReg.S1); // preserve -0
+        vm.epilogue(SAVED, 0);
+    }
+
     // _math_clz32(A0=x 位) -> RET=前导零数(ToUint32 后 32 位)。x 已是 canonical float:
     // 先 fcvtzs 取 int(截断),取低 32 位,循环数前导零。0 → 32。
     generateClz32() {
         const vm = this.vm;
         vm.label("_math_clz32");
+        // ToUint32(NaN/±Infinity) = +0。
+        vm.movImm64(VReg.V1, 0x7ff0000000000000n);
+        vm.and(VReg.V2, VReg.A0, VReg.V1);
+        vm.cmp(VReg.V2, VReg.V1);
+        vm.jne("_mclz_finite");
+        vm.movImm(VReg.V2, 32);
+        vm.scvtf(0, VReg.V2); vm.fmovToInt(VReg.RET, 0);
+        vm.ret();
+        vm.label("_mclz_finite");
         vm.fmovToFloat(0, VReg.A0);
         vm.fcvtzs(VReg.V0, 0);                         // 截断为 int
         vm.movImm64(VReg.V1, 0xffffffffn); vm.and(VReg.V0, VReg.V0, VReg.V1); // 低 32 位(ToUint32 近似)
@@ -460,6 +625,13 @@ export class MathGenerator {
         const vm = this.vm;
         vm.label("_math_log1p");
         vm.prologue(0, []);
+        // log1p(±0)=±0；1+x 会把 -0 消成 +1，须提前返回。
+        vm.shlImm(VReg.V2, VReg.A0, 1);
+        vm.cmpImm(VReg.V2, 0);
+        vm.jne("_mlog1p_nonzero");
+        vm.mov(VReg.RET, VReg.A0);
+        vm.epilogue([], 0);
+        vm.label("_mlog1p_nonzero");
         vm.fmovToFloat(0, VReg.A0);
         vm.movImm64(VReg.V1, 0x3ff0000000000000n); // 1.0
         vm.fmovToFloat(1, VReg.V1);
@@ -998,6 +1170,14 @@ export class MathGenerator {
         vm.and(VReg.V2, VReg.A0, VReg.V1);           // V2 = |x| 位
         vm.cmpImm(VReg.V2, 0);
         vm.jeq("_mcbrt_zero");                       // ±0 → 原样返回
+        // ±Infinity 原样；NaN 透传给调用点统一归一。位技巧/牛顿迭代会把 Inf 污成 NaN。
+        vm.movImm64(VReg.V1, 0x7ff0000000000000n);
+        vm.and(VReg.V4, VReg.V2, VReg.V1);
+        vm.cmp(VReg.V4, VReg.V1);
+        vm.jne("_mcbrt_finite");
+        vm.mov(VReg.RET, VReg.V3);
+        vm.ret();
+        vm.label("_mcbrt_finite");
         vm.fmovToFloat(0, VReg.V2);                  // d0 = a = |x|
         // 初值:i = a_bits/3 + 0x2A9F76253119D200
         vm.movImm(VReg.V1, 3);
@@ -1080,6 +1260,24 @@ export class MathGenerator {
         // 先保存 x 位:arm64 上 RET≡A0≡X0(返回值/首参同寄存器),下面 fmovToInt
         // 写 RET 会覆盖 A0,故末尾符号判定须读保存副本。
         vm.mov(VReg.V3, VReg.A0);                  // V3 = x 位(保号用)
+        // |x|<0.5 → 带 x 符号的 0。直接算 x+0.5 会把最大的小于 0.5 的
+        // representable 数舍入成 1.0，进而错误返回 1。
+        vm.movImm64(VReg.V1, 0x7fffffffffffffffn);
+        vm.and(VReg.V2, VReg.V3, VReg.V1);
+        vm.movImm64(VReg.V1, 0x3fe0000000000000n);
+        vm.cmp(VReg.V2, VReg.V1);
+        vm.jge("_math_round_ge_half");
+        vm.movImm64(VReg.V1, 0x8000000000000000n);
+        vm.and(VReg.RET, VReg.V3, VReg.V1);
+        vm.ret();
+        vm.label("_math_round_ge_half");
+        // |x|>=2^52 已无小数，结果就是 x；加 0.5 可能把奇整数改成相邻偶数。
+        vm.movImm64(VReg.V1, 0x4330000000000000n);
+        vm.cmp(VReg.V2, VReg.V1);
+        vm.jlt("_math_round_body");
+        vm.mov(VReg.RET, VReg.V3);
+        vm.ret();
+        vm.label("_math_round_body");
         vm.fmovToFloat(0, VReg.A0);                // d0 = x
         vm.movImm64(VReg.V1, 0x3FE0000000000000n); // GP V1 = 0.5 的位模式
         vm.fmovToFloat(1, VReg.V1);                // d1 = 0.5

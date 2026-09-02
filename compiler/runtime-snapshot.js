@@ -12,9 +12,19 @@ import { ByteBuffer } from "../asm/byte-buffer.js";
 import { FixupBuffer } from "../asm/fixup-buffer.js";
 import { SYM_NAMES } from "../engine/symbols.js";
 
-const SNAPSHOT_VERSION = 42;
+// Snapshot contents include the assembler representation and the backend's
+// code-generation cursors.  Bump this whenever either shape changes: old
+// snapshots are not safe to append to because a restored prefix must be
+// indistinguishable from one emitted by a fresh compiler.
+// Compiler emitter modules are part of the snapshotted runtime as well.  A
+// snapshot built with an older `compiler/functions/*` (or context/expressions)
+// can otherwise be restored after those files change, so the self-hosted
+// engine executes stale lowering code and bootstrap failures become
+// non-reproducible.  Bump the format and include the whole compiler tree in
+// the manifest below.
+const SNAPSHOT_VERSION = 47;
 const snapshots = new Map();
-const TOOLCHAIN_DIRS = ["runtime", "asm", "backend", "vm", "engine"];
+const TOOLCHAIN_DIRS = ["runtime", "asm", "backend", "vm", "engine", "compiler"];
 const TOOLCHAIN_FILES = ["compiler/index.js", "compiler/runtime-snapshot.js"];
 
 function clone(value) {
@@ -40,7 +50,15 @@ function clone(value) {
 }
 
 function codegenFlags(env) {
-    return ["NO_IC", "NOCTX", "ALLOC_DBG", "GEN_DBG", "P1_ON", "P1_OFF", "P1_STATS"]
+    // Every variable below is read while generateEntry()/generateRuntime()
+    // emits the snapshotted prefix.  Omitting one lets a diagnostic/GC build
+    // reuse a prefix emitted with different instructions or data labels.
+    return [
+        "NO_IC", "NOCTX", "ALLOC_DBG", "GEN_DBG", "P1_ON", "P1_OFF", "P1_STATS",
+        "ASMJS_WASM_SEG", "ASMJS_FULL_FIXUP",
+        "GC_SHADOW", "GC_DISABLE", "GC_THRESHOLD", "GC_FULLONLY",
+        "GC_SHADOW_BISECT", "GC_DIAG", "GC_POISON", "GC_STATS", "ASMJS_IC_STATS",
+    ]
         .map((name) => name + "=" + (env[name] || "")).join(",");
 }
 
@@ -104,14 +122,41 @@ function toolchainDir(env, key) {
             c === 46 || c === 95 || c === 45;
         safe += ok ? key.charAt(i) : "_";
     }
+    // Keep the directory component short enough for the temporary sibling
+    // (`<dir>.tmp-<pid>`) and metadata filenames.  Diagnostic/GC flags make a
+    // readable key exceed macOS NAME_MAX; retain a prefix for inspection and a
+    // deterministic FNV-1a suffix for collision resistance.
+    if (safe.length > 180) {
+        let hash = 2166136261;
+        for (let i = 0; i < key.length; i++) {
+            hash = Math.imul(hash ^ key.charCodeAt(i), 16777619) >>> 0;
+        }
+        safe = safe.slice(0, 160) + "_" + hash.toString(16);
+    }
     return path.join(base, safe);
 }
 
 function captureCompiler(compiler) {
     const asm = {};
     for (const name of Object.keys(compiler.asm)) asm[name] = clone(compiler.asm[name]);
+    // The backend is intentionally not cloned wholesale (it owns the live VM
+    // and assembler).  These are the small pieces of mutable codegen state
+    // that affect labels, stack homes, or the interpretation of a following
+    // instruction.  Keeping the list explicit avoids serialising static ABI
+    // maps and makes the snapshot format stable across backend refactors.
+    const backendState = {};
+    const backend = compiler.vm && compiler.vm.backend;
+    const backendFields = ["s5StackOffset", "_fmodSeq", "_cmpFloat", "_pairPush"];
+    if (backend) {
+        for (const name of backendFields) {
+            if (Object.prototype.hasOwnProperty.call(backend, name)) {
+                backendState[name] = clone(backend[name]);
+            }
+        }
+    }
     return {
         asm,
+        backendState,
         ctxLabelCounter: compiler.ctx.labelCounter,
         compilerLabelCounter: compiler.labelCounter,
     };
@@ -125,6 +170,11 @@ function applyCompiler(compiler, snapshot) {
     // 二次编译 _start 前几字节全 0 → 入口即 SIGSEGV。须在覆盖 _byteCode
     // 之前记下活汇编器形态,再把 ByteBuffer 摊回 number[]。
     const wantsByteCode = !!compiler.asm._byteCode;
+    const wantsByteData = !!compiler.asm._byteData;
+    const hadData = Object.prototype.hasOwnProperty.call(compiler.asm, "data");
+    const hadDataSection = Object.prototype.hasOwnProperty.call(compiler.asm, "dataSection");
+    const dataSectionAliased = hadData && hadDataSection &&
+        compiler.asm.data === compiler.asm.dataSection;
     for (const name of Object.keys(snapshot.asm)) compiler.asm[name] = clone(snapshot.asm[name]);
     compiler.ctx.labelCounter = snapshot.ctxLabelCounter;
     compiler.labelCounter = snapshot.compilerLabelCounter;
@@ -134,6 +184,45 @@ function applyCompiler(compiler, snapshot) {
         for (let i = 0; i < bytes.length; i++) arr[i] = bytes[i];
         compiler.asm.code = arr;
         compiler.asm._byteCode = false;
+    }
+
+    // ARM64 stores data in ByteBuffer, while x64/wasm32 use number[].  Disk
+    // snapshots carry a Uint8Array payload and decode it as a plain array;
+    // restore the representation expected by the live assembler before the
+    // program-specific data labels are appended.  Conversely, don't leave a
+    // synthetic `data` property on x64, whose assembler uses dataSection until
+    // finalisation.
+    if (wantsByteData && compiler.asm.data && !compiler.asm.data._asmjsByteBuffer) {
+        compiler.asm.data = ByteBuffer.fromBytes(compiler.asm.data);
+        compiler.asm._byteData = true;
+    } else if (!wantsByteData && compiler.asm.data && compiler.asm.data._asmjsByteBuffer) {
+        const bytes = compiler.asm.data.slice();
+        const arr = new Array(bytes.length);
+        for (let i = 0; i < bytes.length; i++) arr[i] = bytes[i];
+        compiler.asm.data = arr;
+        if (!Object.prototype.hasOwnProperty.call(compiler.asm, "_byteData")) {
+            delete compiler.asm._byteData;
+        } else {
+            compiler.asm._byteData = false;
+        }
+    }
+    if (!hadData && !wantsByteData && Object.prototype.hasOwnProperty.call(compiler.asm, "data") &&
+        (!compiler.asm.data || compiler.asm.data.length === 0)) {
+        delete compiler.asm.data;
+    }
+    // Wasm's dataSection is a deliberate alias of data.  clone() breaks that
+    // identity, which would make later addData* calls invisible to consumers
+    // reading the other name.
+    if (dataSectionAliased && compiler.asm.data && compiler.asm.dataSection) {
+        compiler.asm.dataSection = compiler.asm.data;
+    }
+
+    const backend = compiler.vm && compiler.vm.backend;
+    const backendState = snapshot.backendState || {};
+    if (backend) {
+        for (const name of Object.keys(backendState)) {
+            backend[name] = clone(backendState[name]);
+        }
     }
 }
 
@@ -161,6 +250,7 @@ function encodeMeta(snapshot) {
         version: SNAPSHOT_VERSION,
         ctxLabelCounter: snapshot.ctxLabelCounter,
         compilerLabelCounter: snapshot.compilerLabelCounter,
+        backendState: snapshot.backendState || {},
         asm,
     };
 }
@@ -191,6 +281,7 @@ function decodeSnapshot(meta, codeBytes, dataBytes) {
     }
     return {
         asm,
+        backendState: meta.backendState || {},
         ctxLabelCounter: meta.ctxLabelCounter,
         compilerLabelCounter: meta.compilerLabelCounter,
     };
@@ -223,7 +314,13 @@ function saveDiskSnapshot(compiler, key, snapshot, env) {
         ? snapshot.asm.code.slice()
         : new Uint8Array(0);
     const dataSrc = snapshot.asm.data || [];
-    const data = dataSrc instanceof Uint8Array ? dataSrc : Uint8Array.from(dataSrc);
+    // ByteBuffer is array-like only through get()/slice(); Uint8Array.from on
+    // it silently produces zeroes because it has no numeric properties.  Use
+    // the same byte extraction as the code path so ARM64 data constants survive
+    // a disk round-trip as well.
+    const data = dataSrc && dataSrc._asmjsByteBuffer && dataSrc.slice
+        ? dataSrc.slice()
+        : dataSrc instanceof Uint8Array ? dataSrc : Uint8Array.from(dataSrc);
     const tmp = dir + ".tmp-" + process.pid;
     fs.mkdirSync(tmp, { recursive: true });
     try {
@@ -251,6 +348,14 @@ export function restoreRuntimeSnapshot(compiler, key) {
 }
 
 export function saveRuntimeSnapshot(compiler, key) {
+    // Native self-hosted CLIs are single-build processes: process.release is
+    // absent, so they cannot load/save the disk cache and will never reuse the
+    // module-level snapshot before exit. Deep-cloning the full assembler here
+    // only exercises self-hosted Map iterator/destructuring while committing
+    // gen2, which can recurse until stack exhaustion. _commitRuntimeSnapshot
+    // has already resolved runtime fixups and marked the boundary before this
+    // call, so skipping the otherwise-dead copy preserves generated output.
+    if (!process.release) return;
     const snapshot = captureCompiler(compiler);
     snapshots.set(key, snapshot);
     try { saveDiskSnapshot(compiler, key, snapshot, process.env); }

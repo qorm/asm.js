@@ -87,11 +87,14 @@ export const BuiltinMathMethodCompiler = {
                 this.vm.movImm64(VReg.RET, isMin ? 0x7FF0000000000000n : 0xFFF0000000000000n);
             } else if (args.length === 1) {
                 this.compileExpression(args[0]);
+                this.emitNumberCoerceFast();
             } else {
                 this.compileExpression(args[0]); // RET = 累加器(首参)
+                this.emitNumberCoerceFast();
                 for (let k = 1; k < args.length; k++) {
                     this.vm.push(VReg.RET);
                     this.compileExpression(args[k]);
+                    this.emitNumberCoerceFast();
                     this.vm.pop(VReg.V1); // V1 = acc, RET = 本参
                     this.emitMinMaxStep(isMin); // RET = min/max(acc, 本参)，含 NaN 传播
                 }
@@ -157,7 +160,7 @@ export const BuiltinMathMethodCompiler = {
                 this.compileExpression(args[0]);
                 this.emitNumberCoerceFast();
                 this.vm.mov(VReg.A0, VReg.RET);
-                this.vm.call(methodName === "f16round" ? "_math_fround" : "_math_" + methodName);
+                this.vm.call("_math_" + methodName);
                 this.emitMathNanNormalize(); // 硬件 NaN(0x7FF8…)→ 可打印 0x7FF0…1
             } else {
                 this.vm.movImm64(VReg.RET, 0x7ff0000000000001n); // 无参 → NaN(可打印)
@@ -362,6 +365,7 @@ export const BuiltinMathMethodCompiler = {
         const idxOff = this.ctx.allocLocal(`__hyp_idx_${id}`);
         const lenOff = this.ctx.allocLocal(`__hyp_len_${id}`);
         const sumOff = this.ctx.allocLocal(`__hyp_sum_${id}`);
+        const infOff = this.ctx.allocLocal(`__hyp_inf_${id}`);
         vm.store(VReg.FP, arrOff, VReg.RET);
         vm.load(VReg.A0, VReg.FP, arrOff);
         vm.call("_array_length");
@@ -369,6 +373,7 @@ export const BuiltinMathMethodCompiler = {
         // sum = +0.0(位全零)
         vm.movImm(VReg.V0, 0);
         vm.store(VReg.FP, sumOff, VReg.V0);
+        vm.store(VReg.FP, infOff, VReg.V0);
         // idx = 0
         vm.movImm(VReg.V0, 0);
         vm.store(VReg.FP, idxOff, VReg.V0);
@@ -382,6 +387,19 @@ export const BuiltinMathMethodCompiler = {
         vm.load(VReg.A0, VReg.FP, arrOff);
         vm.load(VReg.A1, VReg.FP, idxOff);
         vm.call("_array_get");        // RET = elem 位
+        // Math.hypot 对每个参数依次 ToNumber；对象 getter/符号异常必须传播。
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_number_coerce");
+        // 任一 ±Infinity 最终支配 NaN，但仍须继续转换后续参数以保副作用/异常顺序。
+        vm.movImm64(VReg.V1, 0x7fffffffffffffffn);
+        vm.and(VReg.V2, VReg.RET, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ff0000000000000n);
+        const hypNotInf = this.ctx.newLabel("hyp_not_inf");
+        vm.cmp(VReg.V2, VReg.V1);
+        vm.jne(hypNotInf);
+        vm.movImm(VReg.V0, 1);
+        vm.store(VReg.FP, infOff, VReg.V0);
+        vm.label(hypNotInf);
         vm.fmovToFloat(1, VReg.RET);  // d1 = x
         vm.fmul(1, 1, 1);             // d1 = x*x
         vm.load(VReg.V1, VReg.FP, sumOff);
@@ -394,10 +412,19 @@ export const BuiltinMathMethodCompiler = {
         vm.store(VReg.FP, idxOff, VReg.V0);
         vm.jmp(loopL);
         vm.label(doneL);
+        const hypFinite = this.ctx.newLabel("hyp_finite");
+        vm.load(VReg.V0, VReg.FP, infOff);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq(hypFinite);
+        vm.movImm64(VReg.RET, 0x7ff0000000000000n);
+        const hypEnd = this.ctx.newLabel("hyp_end");
+        vm.jmp(hypEnd);
+        vm.label(hypFinite);
         vm.load(VReg.V1, VReg.FP, sumOff);
         vm.fmovToFloat(0, VReg.V1);
         vm.fsqrt(0, 0);               // sqrt(Σ x²)
         vm.fmovToInt(VReg.RET, 0);
         this.emitMathNanNormalize();  // 任一实参 NaN → sqrt(NaN)=硬件 NaN → 可打印归一
+        vm.label(hypEnd);
     },
 };

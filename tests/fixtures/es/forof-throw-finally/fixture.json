@@ -1,0 +1,10 @@
+{
+  "description": "A throw from a for-of body finally block runs once, propagates the original value, and closes the iterator.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "1 1 true",
+    "exitCode": 0
+  }
+}

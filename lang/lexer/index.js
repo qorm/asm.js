@@ -6,7 +6,11 @@ import { TokenType, newToken, lookupIdent } from "./token.js";
 // native 下 s[i]/.length 走 UTF-16(每次从串头扫),charCodeAt 才是 O(1) 字节。
 // 字节码压进 Uint8Array(紧凑、填充快);读字符再查 BYTE_CHARS——避免「整文件
 // 单字符字符串数组」的分配/GC 税。
-const BYTE_CHARS = ["\0"];
+// NUL 是词法器的 EOF 哨兵和转义结果。集中成一个模块级值，避免每次
+// readChar/peekChar 返回 `"\0"` 都走 `_nstr_to_heap_str` 分配（自举编译大型
+// compiler source 时会造成高频短命堆串和不稳定 GC 压力）。
+const NUL_CHAR = String.fromCharCode(0);
+const BYTE_CHARS = [NUL_CHAR];
 for (let _bi = 1; _bi < 256; _bi = _bi + 1) BYTE_CHARS.push(String.fromCharCode(_bi));
 
 // Unicode 空白 UTF-8 前缀(模块级常驻,勿在热路径 fromCharCode)
@@ -62,7 +66,7 @@ export class Lexer {
         // 跳过 Shebang (#!)
         // Hashbang comments are terminated by any LineTerminator: LF, CR, LS, PS.
         if (this.ch === "#" && this.peekChar() === "!") {
-            while (this.ch !== "\n" && this.ch !== "\r" && this.ch !== "\0") {
+            while (this.ch !== "\n" && this.ch !== "\r" && this.ch !== NUL_CHAR) {
                 this.readChar();
             }
             this.skipWhitespace();
@@ -96,7 +100,7 @@ export class Lexer {
     // 读取下一个字符
     readChar() {
         if (this.readPosition >= this.inputLength) {
-            this.ch = "\0";
+            this.ch = NUL_CHAR;
         } else {
             const codes = this.codes;
             this.ch = codes ? BYTE_CHARS[codes[this.readPosition]] : this.input[this.readPosition];
@@ -113,7 +117,7 @@ export class Lexer {
     // 查看下一个字符
     peekChar() {
         if (this.readPosition >= this.inputLength) {
-            return "\0";
+            return NUL_CHAR;
         }
         const codes = this.codes;
         return codes ? BYTE_CHARS[codes[this.readPosition]] : this.input[this.readPosition];
@@ -123,7 +127,7 @@ export class Lexer {
     peekCharN(n) {
         let pos = this.readPosition + n - 1;
         if (pos >= this.inputLength) {
-            return "\0";
+            return NUL_CHAR;
         }
         const codes = this.codes;
         return codes ? BYTE_CHARS[codes[pos]] : this.input[pos];
@@ -134,10 +138,12 @@ export class Lexer {
     // fromCharCode(码点) 直接存(g1 截低字节 → mojibake;node 存码点、发射器再 UTF-8 编码 →
     // 两侧字节分歧)。源码本身按 latin1(逐字节)读入,故原始 UTF-8 字符已是字节序列直接透传;
     // 发射器(asm/*.js)逐字节透传,故此处产出的 UTF-8 字节原样进产物,node/g1 一致且正确。
-    // cp===0 或 NaN 产空串(A 的 NUL-drop:asm.js C-string 无法承载内嵌 NUL)。
+    // NaN 仍产空串；码点 0 必须保留为单字节 NUL。静态字面量编译时会把含 NUL
+    // 的值转入带显式 length 的堆字符串，不能在词法阶段丢失该码点，否则
+    // `"\u0000"` 会错误地变成空串，JSON/RegExp 等全部观察到错误语义。
     _cpToUtf8(cp) {
         if (cp !== cp) return "";
-        if (cp === 0) return "";
+        if (cp === 0) return NUL_CHAR;
         if (cp < 0x80) return String.fromCharCode(cp);
         if (cp < 0x800) {
             return String.fromCharCode(0xc0 | (cp >> 6)) +
@@ -226,7 +232,7 @@ export class Lexer {
     _seek(i) {
         const len = this.inputLength;
         if (i >= len) {
-            this.ch = "\0";
+            this.ch = NUL_CHAR;
             this.position = len;
             this.readPosition = len + 1;
             return;
@@ -326,7 +332,7 @@ export class Lexer {
                         this.column = column;
                         this._seek(i);
                     } else {
-                        while (this.ch !== "\n" && this.ch !== "\0") {
+                        while (this.ch !== "\n" && this.ch !== NUL_CHAR) {
                             this.readChar();
                         }
                     }
@@ -335,10 +341,10 @@ export class Lexer {
                     // 多行注释
                     this.readChar();
                     this.readChar();
-                    while (!(this.ch === "*" && this.peekChar() === "/") && this.ch !== "\0") {
+                    while (!(this.ch === "*" && this.peekChar() === "/") && this.ch !== NUL_CHAR) {
                         this.readChar();
                     }
-                    if (this.ch !== "\0") {
+                    if (this.ch !== NUL_CHAR) {
                         this.readChar();
                         this.readChar();
                     }
@@ -535,9 +541,8 @@ export class Lexer {
                 } else if (this.ch === "'") {
                     result = result + "'";
                 } else if (this.ch === "0") {
-                    // 与 \x00/\u0000 一样走 _cpToUtf8(0)→空串。asm.js 字符串是
-                    // C-string:fromCharCode(0) 在 node 能做成 length-1 的 NUL 键,
-                    // 自举运行时拼接即截断成 "" → intern 池差 2 字节 → gen1≠gen2。
+                    // 与 \x00/\u0000 一样走 _cpToUtf8(0)，保留一个真实 NUL；
+                    // compileStringValue 会将含 NUL 的静态值复制到带 length 头的堆串。
                     result = result + this._cpToUtf8(0);
                 } else if (this.ch === "b") {
                     result = result + String.fromCharCode(8);
@@ -584,7 +589,7 @@ export class Lexer {
         let result = ""; // cooked（转义已 cook）
         let raw = "";    // raw（源文本原样,转义反斜杠保留;供 tagged template / String.raw）
 
-        while (this.ch !== "`" && this.ch !== "\0") {
+        while (this.ch !== "`" && this.ch !== NUL_CHAR) {
             // 检查 ${
             if (this.ch === "$" && this.peekChar() === "{") {
                 this.readChar(); // 跳过 $
@@ -609,7 +614,7 @@ export class Lexer {
                 } else if (this.ch === "$") {
                     result = result + "$";
                 } else if (this.ch === "0") {
-                    // \0：cooked 与 \x00 相同丢弃 NUL(见 readString);raw 仍保留 \\0。
+                    // \0：cooked 保留 NUL；raw 仍保留原始 \\0。
                     result = result + this._cpToUtf8(0);
                 } else if (this.ch === "\n" || this.ch === "\u2028" || this.ch === "\u2029") {
                     // 模板里的 LineContinuation:cooked 不产字符(raw 已原样保留)
@@ -747,7 +752,7 @@ export class Lexer {
         // 的 "\0" 守卫取齐:遇 EOF/换行退出,ch 非 "/" → 落到下方 ILLEGAL(未闭合正则)。
         // 字符类内的 / 是类字符,不是结束符(/[/]/ 合法)。
         let inClass = false;
-        while (this.ch !== "\0" && this.ch !== "\n") {
+        while (this.ch !== NUL_CHAR && this.ch !== "\n") {
             if (this.ch === "\\") {
                 result += this.ch;
                 this.readChar();
@@ -1072,7 +1077,7 @@ export class Lexer {
             let ttok = newToken(type, value, startLine, startColumn);
             ttok.templateRaw = raw; // tagged template / String.raw 用的原始文本
             return ttok;
-        } else if (this.ch === "\0") {
+        } else if (this.ch === NUL_CHAR) {
             tok = newToken(TokenType.EOF, "", startLine, startColumn);
         } else if (this.isLetter(this.ch) || (this.ch === "\\" && this.peekChar() === "u")) {
             let ident = this.readIdentifier();

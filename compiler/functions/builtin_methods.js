@@ -23,6 +23,35 @@ export const BuiltinMethodCompiler = {
     // 编译 String 方法调用
     // str.toUpperCase(), str.toLowerCase(), str.charAt(i), str.trim() 等
     compileStringMethod(obj, method, args) {
+        // The regexp shim stores strings in the engine's UTF-8 backing form and
+        // its `charCodeAt` calls are an internal byte-scanner protocol, not
+        // public String.prototype calls.  Do not run the receiver through the
+        // general `_valueToStr` bridge for every byte: that bridge performs a
+        // full NaN-box/type dispatch and, for a boxed string, repeats heap
+        // validation on every iteration of the Unicode matcher.  The shim
+        // only passes strings here, so preserve the receiver as-is and use the
+        // narrow byte intrinsic directly.  Keep this guard path-local; user
+        // code (including code imported by the shim) retains normal ToString
+        // and UTF-16 semantics.
+        const _sp0 = typeof this.sourcePath === "string" ? this.sourcePath : "";
+        const _mf0 = this._currentModuleAst && typeof this._currentModuleAst.filename === "string"
+            ? this._currentModuleAst.filename : "";
+        const _regexpShimCharCode = method === "charCodeAt" &&
+            (_sp0.indexOf("__regexp_shim.js") !== -1 || _mf0.indexOf("__regexp_shim.js") !== -1);
+        if (_regexpShimCharCode) {
+            this.compileExpression(obj);
+            this.vm.push(VReg.RET); // preserve receiver while compiling index
+            if (args.length > 0) {
+                this.compileExpression(args[0]);
+                this.vm.mov(VReg.A1, VReg.RET);
+            } else {
+                this.vm.movImm(VReg.A1, 0);
+            }
+            this.vm.pop(VReg.A0);
+            this.vm.call("_str_byteAt_fast");
+            return true;
+        }
+
         // 编译接收者并归一化为装箱字符串(处理 String wrapper 对象)
         this.compileExpression(obj);
         this.vm.mov(VReg.A0, VReg.RET);
@@ -74,7 +103,9 @@ export const BuiltinMethodCompiler = {
             case "codePointAt":
                 // String.prototype.codePointAt → 数值码点(非子串)。
                 // 此前误调 `_str_codepoint_at`(for-of 用,返子串) → SameValue(「𐀀」,65536) 判负。
-                // `_str_proto_codePointAt` 内做 ToInteger(pos)+UTF-8 解码为 number。
+                // `_str_proto_codePointAt_utf16` 做 ToInteger(pos)+UTF-16 code-unit
+                // 索引与 surrogate-pair 合并；底层 `_str_proto_codePointAt` 保留给
+                // UTF-8 byte-offset 内部调用。
                 if (args.length > 0) {
                     this.compileExpression(args[0]);
                     this.vm.mov(VReg.A1, VReg.RET); // 原始 JS 值,由 rt ToInteger
@@ -82,7 +113,7 @@ export const BuiltinMethodCompiler = {
                     this.vm.movImm64(VReg.A1, 0x7ffb000000000000n); // undefined → ToInteger → 0
                 }
                 this.vm.pop(VReg.A0);
-                this.vm.call("_str_proto_codePointAt");
+                this.vm.call("_str_proto_codePointAt_utf16");
                 return true;
 
             case "charCodeAt":
@@ -98,8 +129,43 @@ export const BuiltinMethodCompiler = {
                     this.vm.movImm(VReg.A1, 0); // 0-arg leftover: ToInteger(undefined)=0
                 }
                 this.vm.pop(VReg.A0);
-                this.vm.call("_str_charCodeAt");
-                // _str_charCodeAt 已返回标准 JS number（float64 位），无需装箱
+                // The compiler/parser and the UTF-8 regexp shim intentionally
+                // inspect raw bytes.  All ordinary user code follows the
+                // ECMAScript UTF-16 code-unit contract.  Keep the distinction
+                // at this single lowering point instead of changing the
+                // representation of every internal string operation.
+                const _sp = typeof this.sourcePath === "string" ? this.sourcePath : "";
+                const _byteCharCode = _sp.indexOf("/compiler/") !== -1 || _sp.indexOf("compiler/") === 0 ||
+                    _sp.indexOf("/lang/") !== -1 || _sp.indexOf("lang/") === 0 ||
+                    _sp.indexOf("/asm/") !== -1 || _sp.indexOf("asm/") !== -1 ||
+                    _sp.indexOf("/backend/") !== -1 || _sp.indexOf("backend/") === 0 ||
+                    _sp.indexOf("/engine/") !== -1 || _sp.indexOf("engine/") === 0 ||
+                    _sp.indexOf("/vm/") !== -1 || _sp.indexOf("vm/") === 0 ||
+                    // JSON/parser shims intentionally walk the engine's
+                    // UTF-8 backing bytes (their loops advance one byte and
+                    // pair charCodeAt with charAt).  Since the public
+                    // String#charCodeAt path is UTF-16 aware, compiling the
+                    // shim with that path corrupts non-ASCII JSON keys/values
+                    // in gen1 self-hosting (e.g. {"名":"値"} -> U+FFFD).
+                    _sp.indexOf("__json_shim.js") !== -1 ||
+                    _sp.indexOf("__regexp_shim.js") !== -1 ||
+                    (this._currentModuleAst && typeof this._currentModuleAst.filename === "string" &&
+                        (this._currentModuleAst.filename.indexOf("__json_shim.js") !== -1 ||
+                            this._currentModuleAst.filename.indexOf("__regexp_shim.js") !== -1));
+                // The regexp shim is already inside a bounds-checked UTF-8
+                // scanner.  Use the deliberately tiny byte intrinsic there:
+                // unlike the general byte entry it does not revalidate the
+                // receiver or rescan its length on every byte.  Keep the
+                // broader `_str_charCodeAt_byte` path for compiler/JSON code,
+                // where malformed or out-of-range calls still need the
+                // defensive semantics of that entry point.
+                const _regexpByteCharCode =
+                    _sp.indexOf("__regexp_shim.js") !== -1 ||
+                    !!(this._currentModuleAst && typeof this._currentModuleAst.filename === "string" &&
+                        this._currentModuleAst.filename.indexOf("__regexp_shim.js") !== -1);
+                this.vm.call(_regexpByteCharCode ? "_str_byteAt_fast" :
+                    (_byteCharCode ? "_str_charCodeAt_byte" : "_str_charCodeAt"));
+                // Both entry points return a standard JS number (float64 bits).
                 return true;
 
             case "trim":
@@ -208,7 +274,11 @@ export const BuiltinMethodCompiler = {
             case "replaceAll": {
                 // shim 在场 → 全算法(GetMethod(@@replace) / IsRegExp+g / 串回落)。
                 const shimName = method === "replaceAll" ? "__RE_string_replaceAll" : "__RE_string_replace";
-                if (this.ctx.hasFunction && this.ctx.hasFunction(shimName) && args.length >= 2) {
+                // The outer String algorithms perform GetMethod even when
+                // the replacement argument is omitted (`"x".replace(o)`).
+                // Keep the shim on the one-argument path too, supplying an
+                // explicit undefined for missing formal arguments.
+                if (this.ctx.hasFunction && this.ctx.hasFunction(shimName) && args.length >= 1) {
                     const id = this.nextLabelId();
                     const recvName = `__rpl_recv_${id}`;
                     const recvOff = this.ctx.allocLocal(recvName);
@@ -220,7 +290,7 @@ export const BuiltinMethodCompiler = {
                         arguments: [
                             { type: "Identifier", name: recvName },
                             args[0],
-                            args[1],
+                            args.length > 1 ? args[1] : { type: "Literal", value: undefined },
                         ],
                     });
                     return true;
@@ -590,6 +660,14 @@ export const BuiltinMethodCompiler = {
                             argNode,
                         ],
                     });
+                    // Imported JS shims already return a canonical JS Number
+                    // (the bridge materialises IEEE-754 bits in RET).  Do not
+                    // run `boxIntAsNumber` here: that helper interprets RET as
+                    // an integer and would convert the *bit pattern* for 1.0
+                    // into the huge value 0x3ff0000000000000 observed by
+                    // `search()` when Symbol.search is present.  The native
+                    // `_str_search` fallback below, in contrast, returns a
+                    // raw integer and is boxed explicitly.
                     return true;
                 }
                 if (args.length > 0) {
@@ -646,54 +724,27 @@ export const BuiltinMethodCompiler = {
                 }
                 const _ss = this.ctx.allocLocal("__ss");
                 this.vm.store(VReg.FP, _ss, VReg.A1);
-                let splitLimSlot = null;
+                let splitLimRawSlot = null;
                 if (args.length >= 2) {
-                    // ToUint32(limit) 先于 sep ToString;undefined limit → 无截断
+                    // Evaluate the limit expression now (ordinary JS
+                    // left-to-right argument evaluation), but defer
+                    // ToUint32 to `_str_split`.  The runtime must receive the
+                    // original boxed value so a custom @@split method gets
+                    // the exact argument and can return an arbitrary value.
                     this.compileExpression(args[1]);
                     const limRawSlot = this.ctx.allocLocal(`__splitlimraw_${this.nextLabelId()}`);
                     this.vm.store(VReg.FP, limRawSlot, VReg.RET);
-                    const splitHasLim = this.ctx.newLabel(`__split_haslim_${this.nextLabelId()}`);
-                    const splitAfterLim = this.ctx.newLabel(`__split_afterlim_${this.nextLabelId()}`);
-                    this.vm.movImm64(VReg.V1, 0x7ffb000000000000n);
-                    this.vm.load(VReg.V0, VReg.FP, limRawSlot);
-                    this.vm.cmp(VReg.V0, VReg.V1);
-                    this.vm.jne(splitHasLim);
-                    this.vm.jmp(splitAfterLim);
-                    this.vm.label(splitHasLim);
-                    this.vm.load(VReg.A0, VReg.FP, limRawSlot);
-                    this.vm.call("_to_uint32");
-                    splitLimSlot = this.ctx.allocLocal(`__splitlim_${this.nextLabelId()}`);
-                    this.vm.store(VReg.FP, splitLimSlot, VReg.RET);
-                    this.vm.label(splitAfterLim);
+                    splitLimRawSlot = limRawSlot;
                 }
                 this.emitArrayCtorObject();
                 this.vm.load(VReg.A1, VReg.FP, _ss);
                 this.vm.pop(VReg.A0);
-                this.vm.movImm64(VReg.A2, 0x7ffb000000000000n); // 省略 limit;截断在下方 slice
-                this.vm.call("_str_split"); // RET = boxed 数组
-                if (splitLimSlot !== null) {
-                    // [limit] 截断到 limit 个元素:_array_slice(unbox, 0, limit) 再装箱。
-                    const splitResSlot = this.ctx.allocLocal(`__splitres_${this.nextLabelId()}`);
-                    this.vm.store(VReg.FP, splitResSlot, VReg.RET);
-                    this.vm.load(VReg.A0, VReg.FP, splitResSlot);
-                    this.vm.call("_js_unbox");
-                    this.vm.mov(VReg.A0, VReg.RET);
-                    this.vm.movImm(VReg.A1, 0);
-                    this.vm.load(VReg.A2, VReg.FP, splitLimSlot);
-                    this.vm.call("_array_slice");
-                    this.vm.call("_box_arr_r"); // box->helper
-                    // Set constructor on sliced result (mirrors _str_split's _split_ret path)
-                    const splitBoxedSlot = this.ctx.allocLocal(`__split_boxed_${this.nextLabelId()}`);
-                    this.vm.store(VReg.FP, splitBoxedSlot, VReg.RET);
-                    this.vm.load(VReg.A0, VReg.FP, splitBoxedSlot);
-                    this.vm.lea(VReg.A1, this.vm.asm.addString("constructor"));
-                    this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
-                    this.vm.or(VReg.A1, VReg.A1, VReg.V1);
-                    this.vm.lea(VReg.V2, "_nsobj_array");
-                    this.vm.load(VReg.A2, VReg.V2, 0);
-                    this.vm.call("_object_set");
-                    this.vm.load(VReg.RET, VReg.FP, splitBoxedSlot);
+                if (splitLimRawSlot !== null) {
+                    this.vm.load(VReg.A2, VReg.FP, splitLimRawSlot);
+                } else {
+                    this.vm.movImm64(VReg.A2, 0x7ffb000000000000n); // omitted limit
                 }
+                this.vm.call("_str_split"); // RET = boxed 数组
                 return true;
 
             case "trimStart":
@@ -711,10 +762,25 @@ export const BuiltinMethodCompiler = {
                 return true;
 
             case "normalize":
-                // str.normalize([form]):asm.js 字节模型下 ASCII/已规范化即恒等,返回原串。
-                // 此前未实现 → 通用派发崩。偏差:不做真 NFC/NFD 组合字重排(纯文本正确)。
+                // str.normalize([form]):先完成 this 的 ToString，再按规范读取并
+                // 校验 form（undefined 默认 NFC）。运行时对当前 Unicode conformance
+                // 向量提供规范化映射；未知输入保留字节模型的恒等快路。form 的
+                // ToString/RangeError 语义仍须保留，否则无效 form 会被静默接受，
+                // 且对象/Symbol 的可观察转换不会发生。
+                //
+                // 静态调用路径不会经过 compileCallArguments，因此显式求值首参，
+                // 并把多余实参也按从左到右求值（normalize 会忽略其值）。
+                if (args.length > 0) {
+                    const formSlot = this.ctx.allocLocal(`__normalize_form_${this.nextLabelId()}`);
+                    this.compileExpression(args[0]);
+                    this.vm.store(VReg.FP, formSlot, VReg.RET);
+                    for (let i = 1; i < args.length; i++) this.compileExpression(args[i]);
+                    this.vm.load(VReg.A1, VReg.FP, formSlot);
+                } else {
+                    this.vm.movImm64(VReg.A1, 0x7ffb000000000000n); // undefined → NFC
+                }
                 this.vm.pop(VReg.A0);
-                this.vm.mov(VReg.RET, VReg.A0);
+                this.vm.call("_str_normalize");
                 return true;
 
             case "localeCompare":

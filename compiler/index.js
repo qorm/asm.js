@@ -16,7 +16,7 @@ import { execSync, execFileSync } from "child_process";
 
 // 语言前端
 import { Lexer, Parser } from "../lang/index.js";
-import { analyzeCapturedVariables, analyzeSharedVariables, analyzeTopLevelSharedVariables, analyzeDirectEvalBoxedVars, collectLocalDeclarations, collectLexicalDeclarations, collectVarDeclarations, collectPatternNames } from "../lang/analysis/closure.js";
+import { analyzeCapturedVariables, analyzeSharedVariables, analyzeTopLevelSharedVariables, analyzeDirectEvalBoxedVars, collectDirectEvalSourceRefs, collectLocalDeclarations, collectLexicalDeclarations, collectVarDeclarations, collectPatternNames } from "../lang/analysis/closure.js";
 import { renameBlockScopedBindings } from "../lang/analysis/blockscope.js";
 
 // 虚拟机和汇编器
@@ -567,6 +567,25 @@ export class Compiler {
         };
         const nestedBoxedVars = analyzeSharedVariables(moduleBodyFunc);
         for (const name of nestedBoxedVars) boxedVars.add(name);
+        // Direct eval source is parsed at runtime, so ordinary closure
+        // analysis cannot see names referenced by eval-created accessors.
+        // Promote only names that are actual module locals; this gives the
+        // eval fragment a shared box for getter/setter writes while avoiding
+        // accidental boxing of globals/builtins.  `collectDirectEvalSourceRefs`
+        // conservatively covers accessor bodies (see closure.js).
+        // `analyzeSharedVariables` above has already indexed direct eval on
+        // this synthetic body (`_he`).  Avoid walking/parsing every module's
+        // full AST when no direct eval is present (the compiler itself has a
+        // very large module graph).
+        if (moduleBodyFunc.body._he === 1) {
+            const moduleLocals = {};
+            collectLocalDeclarations(moduleBodyFunc.body, moduleLocals);
+            const evalRefs = collectDirectEvalSourceRefs(moduleAst);
+            for (let i = 0; i < evalRefs.length; i++) {
+                const name = evalRefs[i];
+                if (moduleLocals[name] === true) boxedVars.add(name);
+            }
+        }
         meta.boxedVars = boxedVars;
     }
 
@@ -702,6 +721,7 @@ export class Compiler {
         }
         if (!shimMeta) return;
         const expSym = this.getFunctionSymbolForModule(shimMeta, "__NUM_toExponential");
+        const fixSym = this.getFunctionSymbolForModule(shimMeta, "__NUM_toFixed");
         const preSym = this.getFunctionSymbolForModule(shimMeta, "__NUM_toPrecision");
         const tlsSym = this.getFunctionSymbolForModule(shimMeta, "__NUM_toLocaleString");
         if (!dictGet(this.ctx.functions, expSym) || !dictGet(this.ctx.functions, preSym)) return;
@@ -715,6 +735,9 @@ export class Compiler {
             }
             if (!hasShimImport) continue;
             if (!dictGet(meta.functionAliases, "__NUM_toExponential")) dictSet(meta.functionAliases, "__NUM_toExponential", expSym);
+            if (fixSym && dictGet(this.ctx.functions, fixSym) && !dictGet(meta.functionAliases, "__NUM_toFixed")) {
+                dictSet(meta.functionAliases, "__NUM_toFixed", fixSym);
+            }
             if (!dictGet(meta.functionAliases, "__NUM_toPrecision")) dictSet(meta.functionAliases, "__NUM_toPrecision", preSym);
             if (tlsSym && dictGet(this.ctx.functions, tlsSym) && !dictGet(meta.functionAliases, "__NUM_toLocaleString")) {
                 dictSet(meta.functionAliases, "__NUM_toLocaleString", tlsSym);
@@ -826,6 +849,24 @@ export class Compiler {
         moduleCtx.inStaticMethod = savedCtx.inStaticMethod;
         moduleCtx._isModuleMain = true;
 
+        // [L4.2] 字符串累加逃逸扫描上下文。模块顶层变量可能通过 export
+        // 被外部持有，先登记导出名以禁用原地追加；其余分析按模块 AST 惰性建立。
+        const ipExported = new Set();
+        const moduleBody = moduleMeta.ast && moduleMeta.ast.body || [];
+        for (const st of moduleBody) {
+            if (!st || st.type !== "ExportDeclaration") continue;
+            const d = st.declaration;
+            if (d && (d.type === "FunctionDeclaration" || d.type === "ClassDeclaration")) {
+                if (d.id && d.id.name) ipExported.add(d.id.name);
+            } else if (d && d.declarations) {
+                for (const dd of d.declarations) if (dd.id && dd.id.type === "Identifier") ipExported.add(dd.id.name);
+            } else if (st.isDefault && d && d.type === "Identifier") ipExported.add(d.name);
+            if (st.specifiers) for (const sp of st.specifiers) if (sp.local && sp.local.name) ipExported.add(sp.local.name);
+        }
+        moduleCtx._ipExportedNames = ipExported;
+        moduleCtx._ipScanRoot = { params: [], body: { type: "BlockStatement", body: moduleBody } };
+        moduleCtx._ipIndex = null;
+
         this.ctx = moduleCtx;
         this.sourcePath = moduleMeta.ast.filename;
         this._currentModuleAst = moduleMeta.ast;
@@ -868,15 +909,15 @@ export class Compiler {
         const importSource = stmt.source && stmt.source.value;
         if (!importSource) return;
 
-        const resolvedPath = resolveModulePath(importSource, this.sourcePath, this.nodeShimPath, path, fs);
-        if (!resolvedPath) {
-            return; // 暂不支持其他类型的导入
-        }
-
-        // 找到对应的模块记录
+        // resolveImports already resolved this exact AST statement and stored
+        // its canonical path. Re-resolving here needlessly probes the native
+        // filesystem again (including file.js + "/." directory detection) and
+        // can diverge from the module graph used by every later lookup.
         const currentModuleAst = this._currentModuleAst;
-        const importRecord = this.getImportRecordForStatement(currentModuleAst, stmt, resolvedPath);
+        const importRecord = this.getImportRecordForStatement(currentModuleAst, stmt);
         if (!importRecord) return;
+        const resolvedPath = importRecord.importInfo.resolvedPath;
+        if (!resolvedPath) return;
 
         const { specifiers } = importRecord.importInfo;
 
@@ -934,6 +975,30 @@ export class Compiler {
                 if (needsBox && !globalLabel) {
                     continue;
                 } else if (!needsBox && !actualOffset) {
+                    continue;
+                }
+
+                // `node:process`'s default export is a compatibility class
+                // used by the host-side module graph, but Node's public
+                // default binding is the live process object.  The native
+                // runtime initializes that object in `_process_init` before
+                // `_main`; bind the target import directly to it instead of
+                // exposing the shim class (whose `typeof` is "function").
+                // Keep namespace/named exports on the normal module path.
+                const isNodeProcessDefault =
+                    (resolvedPath.endsWith("runtime/node/process.js") ||
+                     resolvedPath.endsWith("runtime\\node\\process.js"));
+                if (isNodeProcessDefault) {
+                    this.vm.lea(VReg.V0, "_process_global");
+                    this.vm.load(VReg.RET, VReg.V0, 0);
+                    this.vm.call("_box_obj_r");
+                    if (needsBox) {
+                        this.vm.lea(VReg.V2, globalLabel);
+                        this.vm.load(VReg.V2, VReg.V2, 0);
+                        this.vm.store(VReg.V2, BOX_VALUE_OFFSET, VReg.RET);
+                    } else {
+                        this.vm.store(VReg.FP, actualOffset, VReg.RET);
+                    }
                     continue;
                 }
 
@@ -1010,6 +1075,28 @@ export class Compiler {
                 if (needsBox && !globalLabel) {
                     continue;
                 } else if (!needsBox && !actualOffset) {
+                    continue;
+                }
+
+                // The compatibility module exposes a named `process` binding
+                // alongside its default.  Both forms denote Node's live
+                // process object; route this one named export through the
+                // same runtime cell as the default import (other named
+                // exports continue to use the module namespace/class path).
+                const isNodeProcessNamed = importedName === "process" &&
+                    (resolvedPath.endsWith("runtime/node/process.js") ||
+                     resolvedPath.endsWith("runtime\\node\\process.js"));
+                if (isNodeProcessNamed) {
+                    this.vm.lea(VReg.V0, "_process_global");
+                    this.vm.load(VReg.RET, VReg.V0, 0);
+                    this.vm.call("_box_obj_r");
+                    if (needsBox) {
+                        this.vm.lea(VReg.V2, globalLabel);
+                        this.vm.load(VReg.V2, VReg.V2, 0);
+                        this.vm.store(VReg.V2, BOX_VALUE_OFFSET, VReg.RET);
+                    } else {
+                        this.vm.store(VReg.FP, actualOffset, VReg.RET);
+                    }
                     continue;
                 }
 
@@ -1535,15 +1622,19 @@ export class Compiler {
     }
 
     parse(source) {
+        const traceParse = typeof process !== "undefined" && process.env && process.env.ASMJS_TRACE_IMPORT === "1";
+        if (traceParse) console.log("TRACE_PARSE_BEGIN", this.sourcePath, typeof source, source && source.length);
         const byteLen = this._nextParseByteLen;
         this._nextParseByteLen = undefined;
         const lexer = new Lexer(source, byteLen);
         const parser = new Parser(lexer);
         const ast = parser.parseProgram();
+        if (traceParse) console.log("TRACE_PARSE_DONE", this.sourcePath, ast && ast.body && ast.body.length, parser.errors && parser.errors.length);
         if (parser.errors && parser.errors.length > 0) {
             // [test262] 早期错误/语法错误须以 SyntaxError 品牌抛出(eval/new Function 路径
             // 直接把此处异常传播到 assert.throws(SyntaxError, ...);此前裸 Error 记 FAIL)。
-            throw new SyntaxError("Syntax errors:\n  " + parser.errors.join("\n  "));
+            const where = this.sourcePath ? " in " + this.sourcePath : "";
+            throw new SyntaxError("Syntax errors" + where + ":\n  " + parser.errors.join("\n  "));
         }
         // [批次D] 块级改名延后到 _collectFnNameHints 之后(见 _renameModulesBlockScope):
         // NamedEvaluation 在用户原名上采集 hints,避免 indexOf("$blk$") 在自举下
@@ -1635,8 +1726,17 @@ export class Compiler {
             const filePath = moduleAst.filename || "";
             for (let j = 0; j < moduleAst.body.length; j++) {
                 const stmt = moduleAst.body[j];
-                if (stmt && stmt.type === "ClassDeclaration" && stmt.id && stmt.id.name) {
-                    this._devirtRegisterClass(stmt, filePath);
+                // The parser represents every `export class C {}` as an
+                // ExportDeclaration wrapper.  Devirtualization must register
+                // the wrapped class too; otherwise infrastructure classes
+                // (notably Compiler/VirtualMachine) never enter the field/type
+                // table and `this.vm.call(...)` is mistaken for Function#call
+                // by the generic member-call lowering during self-hosting.
+                const classStmt = stmt && stmt.type === "ExportDeclaration" && stmt.declaration
+                    ? stmt.declaration : stmt;
+                if (classStmt && classStmt.type === "ClassDeclaration" &&
+                    classStmt.id && classStmt.id.name) {
+                    this._devirtRegisterClass(classStmt, filePath);
                 }
             }
             if (typeof this._devirtScanShadows === "function") {
@@ -1652,8 +1752,11 @@ export class Compiler {
         const visit = (ast, filePath) => {
             if (!ast || !ast.body) return;
             for (const stmt of ast.body) {
-                if (stmt.type === "ClassDeclaration" && stmt.id && stmt.id.name) {
-                    this._devirtRegisterClass(stmt, filePath);
+                const classStmt = stmt && stmt.type === "ExportDeclaration" && stmt.declaration
+                    ? stmt.declaration : stmt;
+                if (classStmt && classStmt.type === "ClassDeclaration" &&
+                    classStmt.id && classStmt.id.name) {
+                    this._devirtRegisterClass(classStmt, filePath);
                 } else if ((stmt.type === "ImportDeclaration" ||
                             (stmt.type === "ExportNamedDeclaration" && stmt.source) ||
                             (stmt.type === "ExportAllDeclaration" && stmt.source)) && stmt.source) {
@@ -1814,6 +1917,8 @@ export class Compiler {
     // compileCallExpression 改派为 __JSON_stringify/__JSON_parse。
     // 用 indexOf 而非正则(本代码在 gen1 运行,§1.6 禁正则)。
     readModuleSource(filePath) {
+        const traceRead = typeof process !== "undefined" && process.env && process.env.ASMJS_TRACE_IMPORT === "1";
+        if (traceRead) console.log("TRACE_READ_BEGIN", filePath);
         // 按 latin1(逐字节)读源,**不用 "utf-8"**。asm.js 字符串是逐字节的(fromCharCode 截为
         // 字节,无法承载真码点)。node 下 "utf-8" 解成码点(你=1 char),而自编译器/出厂产物的
         // readFileSync 忽略 encoding、拿原始字节(你=3 char)→ 字符串常量发射器对二者产不同字节
@@ -1822,6 +1927,7 @@ export class Compiler {
         // (asm/*.js),故源码字面量 UTF-8 字节原样进产物,node/g1 一致且正确、gen1==gen2==gen3。
         // ASCII 不受影响(字节==码点);编译器自身源 ASCII 干净(A 的 0da5ba69)。
         let src = fs.readFileSync(filePath, "latin1");
+        if (traceRead) console.log("TRACE_READ_DONE", filePath, typeof src, src && src.length, typeof fs.readFileSync);
         // gen1: readFileSync 已累计字节数 → 交给 Lexer 免二次扫长
         let srcByteLen = (typeof fs.__lastReadByteLength === "number" &&
             fs.__lastReadByteLength > 0) ? fs.__lastReadByteLength : 0;
@@ -1859,10 +1965,26 @@ export class Compiler {
         // 使用的原键不受影响。
         const _absFilePath = path.resolve(filePath);
         if (_absFilePath !== filePath) this._cjsFlags[_absFilePath] = isCjs;
-        // 仅当源码文本含 globalThis 才镜像顶层 var(unscopables-with)。
-        // harness 无此词,绝大多数测例不付 _object_define。
+        // Toolchain sources are a closed ESM tree (compiler/lang/asm/backend/
+        // vm/engine). Keep this path bit once: the self-hosted compiler must
+        // not run the expensive source-level eval/module scanners over its own
+        // ~8MB graph. User/runtime files stay on the precise scanners below.
+        const isToolchainSource = isToolchainSourcePath(filePath);
+        // Script 顶层 `var` 是 global object 的 own binding，即使测试源码没有
+        // 直接写 `globalThis` 也必须可由回调的 `this` 观察到（例如
+        // `var i = -1; Array.from(a, function () { ++this.i; })`）。此前按
+        // `src.includes("globalThis")` 选择性镜像，令 `this.i` 从 undefined
+        // 开始并把后续索引错位。只对真正的 Script 入口镜像；ESM/CJS 模块
+        // 保持模块作用域，不把内部依赖的顶层变量泄漏到 globalThis。
         if (!this._scriptGlobalMirrorByFile) this._scriptGlobalMirrorByFile = {};
-        this._scriptGlobalMirrorByFile[filePath] = src.indexOf("globalThis") !== -1;
+        // Every file in the toolchain tree has a real top-level ESM
+        // declaration (source-tree invariant); avoid invoking the self-hosted
+        // RegExp engine on this hot path. Ordinary files retain the lexical
+        // check so script/global mirror semantics do not change.
+        const hasModuleSyntax = isToolchainSource
+            ? true
+            : /(^|\n)\s*(?:import|export)\b/.test(src);
+        this._scriptGlobalMirrorByFile[filePath] = !isCjs && !hasModuleSyntax;
         if (_absFilePath !== filePath) {
             this._scriptGlobalMirrorByFile[_absFilePath] = this._scriptGlobalMirrorByFile[filePath];
         }
@@ -1878,7 +2000,13 @@ export class Compiler {
         if (filePath.indexOf("__json_shim.js") === -1 &&
             !sourceHasTopShimImport(src, "__json_shim") &&
             (src.indexOf("JSON") !== -1 || src.indexOf("structuredClone") !== -1)) {
-            const jsonKind = sourceHasJsonShimTrigger(src);
+            // The native runtime stores source files as UTF-8-backed strings:
+            // `src.length` is therefore a UTF-16 code-unit count, while the
+            // compiler's byte scanner (and `_str_charCodeAt_byte`) advances in
+            // raw file-byte offsets.  `readFileSync` records the exact byte
+            // count for us; pass it through so a non-ASCII comment/prefix
+            // cannot make the scanner stop before a real JSON.stringify call.
+            const jsonKind = sourceHasJsonShimTrigger(src, srcByteLen > 0 ? srcByteLen : undefined);
             if (jsonKind) {
                 const hasRaw = jsonKind === "json-raw";
                 const inj = hasRaw
@@ -1906,7 +2034,9 @@ export class Compiler {
             // 禁对 `Symbol.match`/`Symbol.replace` 一律注入——IsRegExp 测例太多,
             // 会把冷编译从 ~220ms 拖到 250ms+。工具链源不含这两词形作代码。
             if (!needReShim && !isToolchainSourcePath(filePath) &&
-                (src.indexOf("Symbol.search") !== -1 || src.indexOf("Symbol.matchAll") !== -1)) {
+                (src.indexOf("Symbol.search") !== -1 || src.indexOf("Symbol.matchAll") !== -1 ||
+                 src.indexOf("Symbol.replace") !== -1 ||
+                 src.indexOf(".match") !== -1 || src.indexOf(".search") !== -1)) {
                 needReShim = sourceHasRegExpCall(src);
             }
             // 工具链源(compiler/lang/asm/…)按约定无正则字面量 → 跳过字面量扫描。
@@ -1915,7 +2045,7 @@ export class Compiler {
                 needReShim = sourceHasRegexLiteral(src);
             }
             if (needReShim) {
-                const inj = 'import { __RE_new, __RE_test, __RE_exec, __RE_match, __RE_matchAll, __RE_replace, __RE_split, __RE_escape, __RE_search, __RE_toString, __RE_compile, __RE_sym_match, __RE_sym_search, __RE_sym_split, __RE_sym_replace, __RE_sym_matchAll, __RE_string_match, __RE_string_matchAll, __RE_string_search, __RE_string_replace, __RE_string_replaceAll } from "__regexp_shim";\n';
+                const inj = 'import { __RE_new, __RE_initOn, __RE_test, __RE_exec, __RE_match, __RE_matchAll, __RE_replace, __RE_split, __RE_escape, __RE_search, __RE_toString, __RE_compile, __RE_sym_match, __RE_sym_search, __RE_sym_split, __RE_sym_replace, __RE_sym_matchAll, __RE_string_match, __RE_string_matchAll, __RE_string_search, __RE_string_replace, __RE_string_replaceAll, __RE_proto_flags, __RE_proto_flag } from "__regexp_shim";\n';
                 bumpSrc(injectShimImport(src, inj));
                 if (process.env.ASMJS_SHIM_DEBUG) {
                     console.error("[shim] regexp shim injected: " + filePath);
@@ -1937,10 +2067,25 @@ export class Compiler {
         // 故禁止裸 indexOf:hasFunction("/generateBoxFunction()/注释里的 eval("x")
         // 均曾误命中。手写扫描跳过字符串/模板/注释,整词匹配(与 sourceHasRegExpCall 同族)。
         // 廉价门控:必须出现 eval(/Function( 才扫(裸 "Function"/"eval" 注释不再触发)。
+        const specialCtorAlias = !isToolchainSource &&
+            src.indexOf(".constructor") !== -1 &&
+            (src.indexOf("function*") !== -1 || src.indexOf("function *") !== -1 ||
+             src.indexOf("async function") !== -1 ||
+             (src.indexOf("async") !== -1 && src.indexOf("=>") !== -1));
         if (filePath.indexOf("__eval_shim.js") === -1 &&
             !sourceHasTopShimImport(src, "__eval_shim") &&
-            (src.indexOf("eval(") !== -1 || src.indexOf("Function(") !== -1) &&
-            sourceHasEvalOrFunctionCtor(src)) {
+            // No toolchain module executes global eval/new Function; keeping
+            // this guard outside the scanner is the key bootstrap fast path.
+            !isToolchainSource &&
+            // A direct call has `eval(`, but indirect-eval sites commonly pass
+            // the intrinsic as a value (`factory(eval)`, `const e = eval`).
+            // Include the bare-token cheap gate as well; the scanner below
+            // still skips strings/comments and verifies identifier boundaries.
+            (src.indexOf("eval") !== -1 || src.indexOf("Function(") !== -1 ||
+             src.indexOf("Generator" + "Function") !== -1 ||
+             src.indexOf("Async" + "Function") !== -1 ||
+             src.indexOf("AsyncGenerator" + "Function") !== -1 || specialCtorAlias) &&
+            (sourceHasEvalOrFunctionCtor(src, true) || specialCtorAlias)) {
             const inj = 'import { __eval, __makeFunction, __eval_direct } from "__eval_shim";\n';
             bumpSrc(injectShimImport(src, inj));
             // [W-35] eval/new Function 的源码在编译期不可见,里面可以有 \p{…};
@@ -1957,14 +2102,15 @@ export class Compiler {
         // (official precision-cannot-be-coerced .call(1, fn/NaN/{})).
         // 检测串拆开拼接,免本文件/codegen 自身的注释命中而误注入自举产物(gate 零影响)。
         const expMethodText = ".toExp" + "onential(";
+        const fixMethodText = ".toFi" + "xed(";
         const preMethodText = ".toPre" + "cision(";
         const tlsMethodText = ".toLoca" + "leString(";
         const preExtractText = "prototype.toPre" + "cision";
         if (filePath.indexOf("__number_shim.js") === -1 &&
             src.indexOf("__number_shim") === -1 &&
-            (src.indexOf(expMethodText) !== -1 || src.indexOf(preMethodText) !== -1 ||
+            (src.indexOf(expMethodText) !== -1 || src.indexOf(fixMethodText) !== -1 || src.indexOf(preMethodText) !== -1 ||
              src.indexOf(tlsMethodText) !== -1 || src.indexOf(preExtractText) !== -1)) {
-            bumpSrc(injectShimImport(src, 'import { __NUM_toExponential, __NUM_toPrecision, __NUM_toLocaleString } from "__number_shim";\n'));
+            bumpSrc(injectShimImport(src, 'import { __NUM_toExponential, __NUM_toFixed, __NUM_toPrecision, __NUM_toLocaleString } from "__number_shim";\n'));
         }
         // [Date shim] 源码用 toLocaleString/toLocaleDateString/toLocaleTimeString 方法时
         // 前置注入 __date_shim(路线同 Number shim);调用点由 compileCallExpression 在
@@ -1989,6 +2135,7 @@ export class Compiler {
             bumpSrc(this._wrapCjsSource(src, filePath));
         }
         this._nextParseByteLen = srcByteLen > 0 ? srcByteLen : undefined;
+        if (traceRead) console.log("TRACE_READ_RETURN", filePath, src && src.length);
         return src;
     }
 
@@ -2172,6 +2319,7 @@ export class Compiler {
             fnCtx.inAsyncFunction = false;
             fnCtx.inAsyncGenerator = false;
             fnCtx.inCoroBody = false;
+            fnCtx._fnFrameSize = 0;
             fnCtx._inFunctionBody = false;
             fnCtx._isModuleMain = false;
             fnCtx.functions = savedCtx.functions;
@@ -2680,19 +2828,25 @@ export class Compiler {
 
     compileProgram(ast) {
         const vm = this.vm;
+        const traceProgram = typeof process !== "undefined" && process.env && process.env.ASMJS_TRACE_IMPORT === "1";
+        const traceP = (s) => { if (traceProgram) console.log("TRACE_PROG", s); };
 
         ast.filename = this.sourcePath;
         this.resetModuleCompilationState();
         this.compiledFiles.add(ast.filename);
         this._injectImplicitGlobalImports(ast);
         let sub = this._phaseStart("prog_resolve");
+        traceP("resolve_begin");
         this.resolveImports(ast, this._moduleOrder);
+        traceP("resolve_done modules=" + this._moduleOrder.length);
         this._phaseEnd("prog_resolve", sub);
         // 模块图已解析完毕:在已缓存 AST 上登记类,避免 _devirtPrepass 再读盘再 parse。
         // shim 模块不登记(注入类会把去虚拟化放得过宽)。
         if (this.arch !== "x64" && !this._envDevirtOff) {
             const subD = this._phaseStart("prog_devirt");
+            traceP("devirt_begin");
             this._devirtPrepassModules(this._moduleOrder);
+            traceP("devirt_done");
             this._phaseEnd("prog_devirt", subD);
         }
         // [W-35] 全部模块都读完(_reUniPropSeen 已定型)后才决定 Unicode 属性表的去留。
@@ -2702,14 +2856,17 @@ export class Compiler {
         this.moduleRegistrySize = Math.max(1, this._moduleOrder.length);
 
         this._moduleExportsList = [];
+        traceP("meta_begin");
 
         for (let moduleIdx = 0; moduleIdx < this._moduleOrder.length; moduleIdx++) {
             this.createModuleMeta(this._moduleOrder[moduleIdx], moduleIdx);
         }
+        traceP("meta_done");
 
         // [W-24] 函数名推断预扫:须在块级改名之前(原名)且在任何函数体发射之前。
         sub = this._phaseStart("prog_analysis");
         this._genStubClassMeths = [];
+        traceP("analysis_begin");
         for (const moduleAst of this._moduleOrder) {
             this._collectFnNameHints(moduleAst);
         }
@@ -2721,6 +2878,7 @@ export class Compiler {
         for (const moduleAst of this._moduleOrder) {
             this.collectFunctions(moduleAst, this.getModuleMeta(moduleAst));
         }
+        traceP("analysis_done");
         this._phaseEnd("prog_analysis", sub);
 
         // [CJS cyclic require] 找出参与 require 环的本地 CJS 模块并登记惰性初始化函数。
@@ -2740,9 +2898,11 @@ export class Compiler {
         this.registerDateShimAliases();
 
         for (const moduleAst of this._moduleOrder) {
+            traceP("exports_collect " + (moduleAst.filename || ""));
             const moduleExports = collectModuleExports(moduleAst, this._moduleOrder, this.nodeShimPath, this._moduleExportsList, path, fs);
             this._moduleExportsList.push(moduleExports);
         }
+        traceP("exports_done");
         for (let moduleIdx = 0; moduleIdx < this._moduleOrder.length; moduleIdx++) {
             const moduleAst = this._moduleOrder[moduleIdx];
             const moduleMeta = this.getModuleMeta(moduleAst);
@@ -2763,6 +2923,7 @@ export class Compiler {
         }
 
         sub = this._phaseStart("prog_main_body");
+        traceP("main_begin");
         this._resetIcPropMaps();
         vm.label("_main");
         // _main 是整程序入口,体量远超 REC_CAP,录制必白冲;不 beginRecord。
@@ -2802,10 +2963,12 @@ export class Compiler {
 
         for (const moduleAst of this._moduleOrder) {
             const moduleMeta = this.getModuleMeta(moduleAst);
+            traceP("preinit " + (moduleAst.filename || ""));
             this.withModuleCompileContext(moduleMeta, () => {
                 this.preinitializeModuleFunctionBindings(moduleMeta);
                 this.populateModuleNamespace(moduleMeta, { functionsOnly: true });
             });
+            traceP("preinit_done " + (moduleAst.filename || ""));
         }
 
         // Link function/class imports before any module top-level code runs.
@@ -2830,11 +2993,13 @@ export class Compiler {
             // [CJS cyclic require] 环内本地 CJS 模块不在此内联执行——其模块体已编成
             // 独立函数 __cjs_init_m<idx>,由首次 require 惰性触发(_cjs_require_lazy)。
             if (moduleMeta.lazyCjs) continue;
+            traceP("module_begin " + (moduleAst.filename || ""));
             this.withModuleCompileContext(moduleMeta, () => {
                 // Refresh imports immediately before evaluation so modules that
                 // were already fully initialized can provide their latest
                 // namespace values to this module.
                 for (const stmt of moduleAst.body) {
+                    traceP("stmt " + (moduleAst.filename || "") + " " + (stmt.type || ""));
                     if (stmt.type === "ImportDeclaration") {
                         this.compileImportBindingInitialization(stmt);
                     }
@@ -2868,6 +3033,7 @@ export class Compiler {
 
                 this.populateModuleNamespace(moduleMeta, { skipFunctions: true });
             });
+            traceP("module_done " + (moduleAst.filename || ""));
         }
 
         vm.movImm(VReg.RET, 0);
@@ -3538,6 +3704,33 @@ export class Compiler {
     // 让 codegen 阶段合成的 __RE_* 调用在任意作用域解析到 _user_ 直呼标签。
     linkSynthesizedShimImports(shimTag) {
         if (!this.imports) return;
+        // Synthetic accessors (notably the RegExp.prototype flag getters) are
+        // compiled from AST nodes created by the compiler rather than from a
+        // source-level identifier occurrence.  Their delayed function context
+        // therefore may not carry an alias for a helper that is present in the
+        // injected import list but never appears textually in the module body.
+        // Keep the normal per-specifier linking below, and additionally publish
+        // the two RegExp accessor helpers to every importer of the shim.  This
+        // is alias metadata only: no code is emitted unless a synthetic getter
+        // actually calls the helper.
+        const eagerRegExpHelpers = shimTag === "__regexp_shim"
+            ? ["__RE_proto_flags", "__RE_proto_flag"] : [];
+        let eagerSymbols = null;
+        if (eagerRegExpHelpers.length > 0) {
+            const sourceMeta = this._moduleOrder
+                .map((ast) => this.getModuleMeta(ast))
+                .find((meta) => meta && meta.ast && meta.ast.filename &&
+                    meta.ast.filename.indexOf(shimTag) !== -1);
+            if (sourceMeta) {
+                eagerSymbols = {};
+                for (const name of eagerRegExpHelpers) {
+                    const sym = dictGet(sourceMeta.functionAliases, name);
+                    if (sym && typeof sym === "string" && dictGet(this.ctx.functions, sym)) {
+                        eagerSymbols[name] = sym;
+                    }
+                }
+            }
+        }
         for (const rec of this.imports) {
             const info = rec && rec.importInfo;
             if (!info || !info.resolvedPath) continue;
@@ -3545,6 +3738,14 @@ export class Compiler {
             const importerMeta = this.getModuleMeta(info.moduleAst);
             const sourceMeta = this.getModuleMetaByPath(info.resolvedPath);
             if (!importerMeta || !sourceMeta) continue;
+            if (eagerSymbols) {
+                for (const name of eagerRegExpHelpers) {
+                    const sym = eagerSymbols[name];
+                    if (sym && !dictGet(importerMeta.functionAliases, name)) {
+                        dictSet(importerMeta.functionAliases, name, sym);
+                    }
+                }
+            }
             for (const spec of info.specifiers || []) {
                 if (spec.type !== "ImportSpecifier") continue;
                 const localName = spec.local && spec.local.name;
@@ -3647,6 +3848,11 @@ export class Compiler {
         const boxedVars = analyzeSharedVariables(func);
         this._addDirectEvalBoxedVars(func, boxedVars);
         this.ctx.boxedVars = boxedVars;
+        // [L4.2] 普通函数启用保守字符串累加逃逸扫描；async/generator 经过
+        // 协程栈与跨帧生命周期，本阶段暂不启用原地 append。
+        this.ctx._ipScanRoot = (isAsync || _isGenFuncDecl(func)) ? null : func;
+        this.ctx._ipExportedNames = null;
+        this.ctx._ipIndex = null;
         this.ctx.lexLocalNames = {};
         this.ctx.paramBindingNames = {};
         this.ctx._tdzClearedLocals = new Set();
@@ -3665,7 +3871,25 @@ export class Compiler {
         const fnStrict = typeof this._computeFunctionStrict === "function"
             ? this._computeFunctionStrict(func) : false;
         func._fnStrict = fnStrict;
-        this.registerFuncMeta(funcLabel, func, name);
+        // The eval shim exports callable helpers as ordinary function
+        // declarations, but those helpers intentionally have no [[Construct]]
+        // (notably the global `eval` value).  Mark them in the same metadata
+        // bit used by `_is_nonctor_fn`; otherwise Promise.*.call(eval) treats
+        // the direct code pointer as a constructible function and enters the
+        // combinator with an invalid receiver/iterable.
+        const _evalShimNonCtor = !!(ownerMeta && ownerMeta.ast &&
+            typeof ownerMeta.ast.filename === "string" &&
+            ownerMeta.ast.filename.indexOf("__eval_shim.js") !== -1 &&
+            func && func.id &&
+            (func.id.name === "__eval" || func.id.name === "__eval_direct" ||
+             func.id.name === "__makeFunction"));
+        // Keep the shim export name on the metadata entry as well as the
+        // non-constructor bit.  Promise static guards run in a frameless
+        // trampoline (where making a nested metadata call is not ABI-safe),
+        // so they use the tiny pointer table emitted from these entries.
+        const _evalShimName = _evalShimNonCtor && func && func.id &&
+            typeof func.id.name === "string" ? func.id.name : "";
+        this.registerFuncMeta(funcLabel, func, name, _evalShimNonCtor, _evalShimName);
         this.ctx.inStrictFunction = fnStrict;
         const prevCurrentFnName = this.ctx.currentFnName;
         this.ctx.currentFnName = name || (func.id && func.id.name) || null;
@@ -3702,7 +3926,14 @@ export class Compiler {
         if (!isAsync && !isGenerator && !p1Skip && this._fnNeedsP1Record(func)) {
             vm.beginRecord();
         }
-        vm.prologue(8192, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        // Module-level user functions include large compiler helpers (for
+        // example StaticLinker.getLinkedCode, whose local-home high-water is
+        // ~31 KiB while self-hosting).  The historical 8 KiB frame lets those
+        // FP slots overwrite the caller before any explicit error is raised.
+        // Keep the frame 16-byte aligned; `_main` retains its compact entry
+        // frame above.
+        vm.prologue(32768, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        this.ctx._fnFrameSize = 32768;
 
         const params = func.params || [];
         const _isCoroBody = isGenerator || isAsyncGen;
@@ -3857,7 +4088,9 @@ export class Compiler {
                 vm.jne(skip);
                 const _prevEvalParam = this.ctx._evalInParamInit;
                 this.ctx._evalInParamInit = true;
-                this.compileExpression(defaultExpr);
+                if (!this.emitParamEvalConflictSyntaxError(defaultExpr)) {
+                    this.compileExpression(defaultExpr);
+                }
                 this.ctx._evalInParamInit = _prevEvalParam;
                 vm.store(VReg.FP, offset, VReg.RET);
                 vm.label(skip);
@@ -3894,7 +4127,19 @@ export class Compiler {
         // (formal-parameters-after-reassignment-non-strict)。
         const mappedArgs = declUsesArguments && !fnStrict && this._isSimpleParamList(params);
         if (mappedArgs && paramOffsets.length > 0) {
+            // Duplicate sloppy parameters map only the last occurrence of each
+            // name.  Earlier entries must contain a null ParameterMap slot;
+            // treating their raw argument values as box pointers crashes on
+            // `function(a,a,a){ return arguments }`.
+            const mappedParamIndex = new Array(paramOffsets.length);
+            const mappedParamNames = new Set();
+            for (let i = paramOffsets.length - 1; i >= 0; i--) {
+                const pn = paramOffsets[i].name;
+                mappedParamIndex[i] = !mappedParamNames.has(pn);
+                mappedParamNames.add(pn);
+            }
             for (let i = 0; i < paramOffsets.length; i++) {
+                if (!mappedParamIndex[i]) continue;
                 const param = paramOffsets[i];
                 if (boxedVars.has(param.name)) continue;
                 vm.load(VReg.V1, VReg.FP, param.offset);
@@ -3910,7 +4155,8 @@ export class Compiler {
             vm.call("_alloc");
             vm.store(VReg.FP, mapOff, VReg.RET);
             for (let i = 0; i < paramOffsets.length; i++) {
-                vm.load(VReg.V0, VReg.FP, paramOffsets[i].offset);
+                if (mappedParamIndex[i]) vm.load(VReg.V0, VReg.FP, paramOffsets[i].offset);
+                else vm.movImm(VReg.V0, 0);
                 vm.load(VReg.V1, VReg.FP, mapOff);
                 vm.store(VReg.V1, i * 8, VReg.V0);
             }
@@ -3991,7 +4237,7 @@ export class Compiler {
             vm.endRecord(); // [P1] async 未开录,安全 no-op
         } else {
             // 普通/生成器/async-gen:epilogue(协程体经 _coroutine_entry → _coroutine_return)
-            vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 8192);
+            vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32768);
         vm.endRecord(); // [P1]
         }
         this.ctx.exceptionLabel = prevDeclExcLabel;
@@ -4098,7 +4344,7 @@ export class Compiler {
     // members.js _fnNameLength 的编译期算法逐字同源)。供运行期函数值 .length 反射
     // (读取器 _func_meta_arity)。**布局变更须原子**:改条目宽度必须同时改
     // _func_meta_init / _func_meta_entry 的步长与数据段每条 qword 数(见下方三处)。
-    registerFuncMeta(label, expr, nameHint, nonCtor) {
+    registerFuncMeta(label, expr, nameHint, nonCtor, shimName) {
         if (!expr) return;
         const isAsync = isAsyncFunction(expr);
         const isGen = _isGenFuncDecl(expr);
@@ -4136,7 +4382,9 @@ export class Compiler {
         // 此前 guard(kind===0 && name==="")跳过匿名非 async/gen 函数 → 运行期
         // _func_meta_arity 返 -1 → fn.length 得 undefined(应得规范 arity,含 0)。
         if (!this._funcMeta) this._funcMeta = [];
-        this._funcMeta.push({ label: label, kind: kind, name: name, arity: _fnArity(expr) });
+        const _shim = shimName === "__eval" || shimName === "__eval_direct" ||
+            shimName === "__makeFunction" ? shimName : "";
+        this._funcMeta.push({ label: label, kind: kind, name: name, arity: _fnArity(expr), shimName: _shim });
     }
 
     // [W-24 函数元数据·名字推断] ES NamedEvaluation 的**廉价确定子集**:把匿名函数/箭头
@@ -4248,6 +4496,19 @@ export class Compiler {
         for (let i = 0; i < entries.length; i++) {
             vm.lea(VReg.V1, entries[i].label);
             vm.store(VReg.S0, 0, VReg.V1);      // entry.code_ptr = &label
+            // The eval shim exports are the only non-constructible functions
+            // that are materialized as tagged, direct code pointers in module
+            // namespaces.  Publish their addresses in the compact table used
+            // by Promise static guards; ordinary user functions remain on the
+            // metadata/hash path and keep the existing ABI.
+            let shimSlot = -1;
+            if (entries[i].shimName === "__eval") shimSlot = 0;
+            else if (entries[i].shimName === "__eval_direct") shimSlot = 1;
+            else if (entries[i].shimName === "__makeFunction") shimSlot = 2;
+            if (shimSlot >= 0) {
+                vm.lea(VReg.V2, "_eval_nonctor_table");
+                vm.store(VReg.V2, shimSlot * 8, VReg.V1);
+            }
             if (entries[i].name !== "") {
                 vm.lea(VReg.V1, this.asm.addString(entries[i].name));
                 vm.store(VReg.S0, 16, VReg.V1); // entry.name_ptr = &name_str
@@ -4319,6 +4580,23 @@ export class Compiler {
         vm.mov(VReg.RET, VReg.S1);                      // RET = entry_ptr
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
         vm.label("_fme_nf");
+        // mmap-backed functions cannot be inserted into the immutable AOT
+        // table.  Dynamic constructors register compatible entries in this
+        // rooted list; consult it only after the hash/static scan misses.
+        vm.lea(VReg.V0, "_dynamic_func_meta_root");
+        vm.load(VReg.S1, VReg.V0, 0);
+        vm.label("_fme_dyn_loop");
+        vm.cmpImm(VReg.S1, 0);
+        vm.jeq("_fme_really_nf");
+        vm.load(VReg.V1, VReg.S1, 0);
+        vm.cmp(VReg.V1, VReg.S3);
+        vm.jeq("_fme_dyn_hit");
+        vm.load(VReg.S1, VReg.S1, 32);
+        vm.jmp("_fme_dyn_loop");
+        vm.label("_fme_dyn_hit");
+        vm.mov(VReg.RET, VReg.S1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+        vm.label("_fme_really_nf");
         vm.movImm(VReg.RET, 0);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
 
@@ -4397,6 +4675,16 @@ export class Compiler {
         vm.label("_fmarity_nf");
         vm.movImm(VReg.RET, -1);
         vm.epilogue([], 0);
+
+        // Eval/new Function shim code pointers are kept in a tiny side table.
+        // The Promise static guard cannot safely call the ordinary metadata
+        // helper from its frameless trampoline, so it compares the tagged
+        // receiver payload against these three initialized addresses inline.
+        // This table is code/data addresses only and lives after _data_gc_end.
+        this.asm.addDataLabel("_eval_nonctor_table");
+        this.asm.addDataQword(0); // __eval
+        this.asm.addDataQword(0); // __eval_direct
+        this.asm.addDataQword(0); // __makeFunction
 
         // 数据表(须在 _data_gc_end 之后声明,不入 GC 根扫描:只存 code/data 常量地址,非堆指针)。
         this.asm.addDataLabel("_func_meta_count");
@@ -4683,12 +4971,36 @@ function regexCanStartAfter(src, prevEnd) {
     }
     const w0 = src.charCodeAt(s);
     if (w0 >= 48 && w0 <= 57) return false; // 数字字面量 → 除法
-    const word = src.slice(s, prevEnd + 1);
-    return word === "return" || word === "case" || word === "typeof" ||
-        word === "in" || word === "of" || word === "instanceof" ||
-        word === "new" || word === "delete" || word === "void" ||
-        word === "throw" || word === "do" || word === "else" ||
-        word === "yield" || word === "await";
+    // `src` is scanned in UTF-8 byte offsets while public `slice` follows
+    // UTF-16 units.  Compare the ASCII keyword directly at the byte range so
+    // a non-ASCII prefix cannot shift the extracted token and hide a regex.
+    const end = prevEnd + 1;
+    const len = end - s;
+    // Narrow by token length first: most identifiers take the cheap default
+    // path without invoking the byte comparator repeatedly.
+    if (len === 2) {
+        return sourceByteEquals(src, s, end, "in") ||
+            sourceByteEquals(src, s, end, "of") ||
+            sourceByteEquals(src, s, end, "do");
+    }
+    if (len === 3) return sourceByteEquals(src, s, end, "new");
+    if (len === 4) {
+        return sourceByteEquals(src, s, end, "case") ||
+            sourceByteEquals(src, s, end, "void") ||
+            sourceByteEquals(src, s, end, "else");
+    }
+    if (len === 5) {
+        return sourceByteEquals(src, s, end, "throw") ||
+            sourceByteEquals(src, s, end, "yield") ||
+            sourceByteEquals(src, s, end, "await");
+    }
+    if (len === 6) {
+        return sourceByteEquals(src, s, end, "return") ||
+            sourceByteEquals(src, s, end, "typeof") ||
+            sourceByteEquals(src, s, end, "delete");
+    }
+    if (len === 10) return sourceByteEquals(src, s, end, "instanceof");
+    return false;
 }
 
 // 从 "/"(下标 i)起,同一行内是否有形如正则字面量的闭合体
@@ -4789,14 +5101,14 @@ function sourceHasBareNewRegExp(src) {
                     (d >= 97 && d <= 122) || d === 95 || d === 36) i++;
                 else break;
             }
-            if (i - s === newKw.length && src.slice(s, i) === newKw) {
+            if (i - s === newKw.length && sourceByteEquals(src, s, i, newKw)) {
                 let j = i;
                 while (j < n) {
                     const w = src.charCodeAt(j);
                     if (w === 32 || w === 9 || w === 13 || w === 10) j++;
                     else break;
                 }
-                if (j + reKw.length <= n && src.slice(j, j + reKw.length) === reKw) {
+                if (j + reKw.length <= n && sourceByteEquals(src, j, j + reKw.length, reKw)) {
                     const after = j + reKw.length < n ? src.charCodeAt(j + reKw.length) : 0;
                     if (!((after >= 48 && after <= 57) || (after >= 65 && after <= 90) ||
                           (after >= 97 && after <= 122) || after === 95 || after === 36)) {
@@ -4830,8 +5142,23 @@ function sourceHasBareNewRegExp(src) {
 // 调用点仅在源码无正则字面量时才到达(见 readModuleSource 的 || 顺序),故
 // "/" 一律按行注释/块注释/除法处理,不必再做正则字面量启发式。
 
-function sourceHasJsonShimTrigger(src) {
-    const n = src.length;
+// Compare an ASCII token against a source buffer whose indices are byte
+// offsets.  The self-hosted compiler stores source as latin1/UTF-8 bytes;
+// avoid `slice` (public String methods count UTF-16 units on non-ASCII data).
+function sourceByteEquals(src, start, end, token) {
+    if (end - start !== token.length) return false;
+    for (let k = 0; k < token.length; k++) {
+        if (src.charCodeAt(start + k) !== token.charCodeAt(k)) return false;
+    }
+    return true;
+}
+
+function sourceHasJsonShimTrigger(src, byteLength) {
+    // In native builds `src.length` counts decoded UTF-16 units, but all
+    // offsets below are byte-oriented (see sourceByteEquals).  Use the
+    // readFileSync byte hint whenever available; host Node has no hint and
+    // continues to use its ordinary string length.
+    const n = byteLength !== undefined ? byteLength : src.length;
     let i = 0;
     let inTplText = false;
     const tplBrace = [];
@@ -4937,9 +5264,17 @@ function sourceHasJsonShimTrigger(src) {
                             (d >= 97 && d <= 122) || d === 95 || d === 36) j++;
                         else break;
                     }
-                    const prop = src.slice(ps, j);
-                    if (prop === "stringify" || prop === "parse" ||
-                        prop === "rawJSON" || prop === "isRawJSON") {
+                    // `src` is a latin1/UTF-8 byte string in gen1.  Calling
+                    // the public UTF-16 `slice` here would reinterpret byte
+                    // offsets after a non-ASCII literal and make an otherwise
+                    // valid `JSON.stringify` token disappear.  Compare the
+                    // ASCII property directly at byte offsets instead.
+                    let prop = "";
+                    if (sourceByteEquals(src, ps, j, "stringify")) prop = "stringify";
+                    else if (sourceByteEquals(src, ps, j, "parse")) prop = "parse";
+                    else if (sourceByteEquals(src, ps, j, "rawJSON")) prop = "rawJSON";
+                    else if (sourceByteEquals(src, ps, j, "isRawJSON")) prop = "isRawJSON";
+                    if (prop !== "") {
                         if (prop === "rawJSON" || prop === "isRawJSON") hasRaw = true;
                         if (!hit) hit = "JSON." + prop;
                     }
@@ -4963,7 +5298,7 @@ function sourceHasJsonShimTrigger(src) {
     return hasRaw ? "json-raw" : hit;
 }
 
-function sourceHasEvalOrFunctionCtor(src) {
+function sourceHasEvalOrFunctionCtor(src, allowBareEval = false) {
     const n = src.length;
     let i = 0;
     let inTplText = false;
@@ -5052,6 +5387,21 @@ function sourceHasEvalOrFunctionCtor(src) {
                 if (j < n && src.charCodeAt(j) === 41) {
                     j = skipWs(j + 1);
                     if (j < n && src.charCodeAt(j) === 40) return true;
+                    // Bare `eval` used as a value (most notably
+                    // `factory(eval)` / `const e = eval`) must materialize
+                    // the eval shim too.  Do not treat an object-literal key
+                    // (`{ eval: ... }`) as a reference; `.`-qualified names
+                    // are likewise handled by their own property paths.
+                    if (allowBareEval) return true;
+                }
+                if (allowBareEval && (j >= n ||
+                    (src.charCodeAt(j) !== 58 && src.charCodeAt(j) !== 46))) {
+                    // Any non-call delimiter is a value position in the
+                    // grammar (assignment/return/comma/semicolon/etc.).
+                    // The lexical scanner has already ruled out comments and
+                    // strings, so this conservative trigger is safe; local
+                    // bindings still win in compileIdentifier.
+                    return true;
                 }
                 continue;
             }
@@ -5063,6 +5413,17 @@ function sourceHasEvalOrFunctionCtor(src) {
                 let j = skipWs(i);
                 if (j < n && src.charCodeAt(j) === 40) return true;
                 continue;
+            }
+            // GeneratorFunction( / AsyncFunction( / AsyncGeneratorFunction(.
+            // These are normally local aliases obtained from a specialised
+            // function's `.constructor`; invoking them still requires route B.
+            if (len === 17 || len === 13 || len === 22) {
+                const word = src.slice(s, i);
+                if (word === "GeneratorFunction" || word === "AsyncFunction" ||
+                    word === "AsyncGeneratorFunction") {
+                    const j = skipWs(i);
+                    if (j < n && src.charCodeAt(j) === 40) return true;
+                }
             }
             // new Function(
             if (len === 3 && src.charCodeAt(s) === 110 && src.charCodeAt(s + 1) === 101 &&
@@ -5174,7 +5535,7 @@ function sourceHasRegExpCall(src) {
                     (d >= 97 && d <= 122) || d === 95 || d === 36) i++;
                 else break;
             }
-            if (i - s === target.length && src.slice(s, i) === target) {
+            if (i - s === target.length && sourceByteEquals(src, s, i, target)) {
                 let j = i;
                 while (j < n) { // 允许 RegExp ( 之间有空白
                     const w = src.charCodeAt(j);
@@ -5191,7 +5552,7 @@ function sourceHasRegExpCall(src) {
                         if (w === 32 || w === 9 || w === 13 || w === 10) k++;
                         else break;
                     }
-                    if (k + 6 <= n && src.slice(k, k + 6) === "escape") {
+                    if (k + 6 <= n && sourceByteEquals(src, k, k + 6, "escape")) {
                         const after = k + 6 < n ? src.charCodeAt(k + 6) : 0;
                         if (!((after >= 48 && after <= 57) || (after >= 65 && after <= 90) ||
                               (after >= 97 && after <= 122) || after === 95 || after === 36)) {
@@ -5202,10 +5563,20 @@ function sourceHasRegExpCall(src) {
                     // 否则 String#match 走 _str_match、@@split 走空壳。只认
                     // `prototype[Symbol`——`RegExp.prototype.exec` 名/描述符测例
                     // 不得灌 360KB shim(会改 .name 并拖慢编译)。
-                    if (k + 9 <= n && src.slice(k, k + 9) === "prototype") {
+                    if (k + 9 <= n && sourceByteEquals(src, k, k + 9, "prototype")) {
                         const after = k + 9 < n ? src.charCodeAt(k + 9) : 0;
                         if (!((after >= 48 && after <= 57) || (after >= 65 && after <= 90) ||
                               (after >= 97 && after <= 122) || after === 95 || after === 36)) {
+                            // Reading/reflecting any RegExp.prototype property
+                            // (including the ordinary string-named accessors
+                            // source/flags/global/…) needs the real shim.  The
+                            // earlier trigger only recognized
+                            // `prototype[Symbol.*]`, so accessor-only tests were
+                            // compiled with the placeholder getter whose
+                            // synthetic helper aliases did not exist.
+                            return true;
+                            /* istanbul ignore next -- retained below as
+                             * documentation for the old Symbol-specific scan. */
                             let p = k + 9;
                             while (p < n) {
                                 const w = src.charCodeAt(p);
@@ -5219,7 +5590,7 @@ function sourceHasRegExpCall(src) {
                                     if (w === 32 || w === 9 || w === 13 || w === 10) p++;
                                     else break;
                                 }
-                                if (p + 6 <= n && src.slice(p, p + 6) === "Symbol") return true;
+                                if (p + 6 <= n && sourceByteEquals(src, p, p + 6, "Symbol")) return true;
                             }
                         }
                     }
@@ -5232,7 +5603,7 @@ function sourceHasRegExpCall(src) {
                     if (w === 32 || w === 9 || w === 13 || w === 10) k--;
                     else break;
                 }
-                if (k >= 7 && src.slice(k - 7, k) === "extends") {
+                if (k >= 7 && sourceByteEquals(src, k - 7, k, "extends")) {
                     const prev = k >= 8 ? src.charCodeAt(k - 8) : 0;
                     if (!((prev >= 48 && prev <= 57) || (prev >= 65 && prev <= 90) ||
                           (prev >= 97 && prev <= 122) || prev === 95 || prev === 36)) {
@@ -5243,7 +5614,7 @@ function sourceHasRegExpCall(src) {
             // Symbol.search / Symbol.matchAll:无 `RegExp(` / 字面量也须注入,
             // 否则 `"ab3c".search({[Symbol.search]:null,toString:()=>"\\d"})`
             // 与 `"a1b1c".matchAll(1)` 走原生 indexOf、无 .index。
-            if (i - s === 6 && src.slice(s, i) === "Symbol") {
+            if (i - s === 6 && sourceByteEquals(src, s, i, "Symbol")) {
                 let j = i;
                 while (j < n) {
                     const w = src.charCodeAt(j);
@@ -5257,20 +5628,60 @@ function sourceHasRegExpCall(src) {
                         if (w === 32 || w === 9 || w === 13 || w === 10) k++;
                         else break;
                     }
-                    if (k + 6 <= n && src.slice(k, k + 6) === "search") {
+                    if (k + 6 <= n && sourceByteEquals(src, k, k + 6, "search")) {
                         const after = k + 6 < n ? src.charCodeAt(k + 6) : 0;
                         if (!((after >= 48 && after <= 57) || (after >= 65 && after <= 90) ||
                               (after >= 97 && after <= 122) || after === 95 || after === 36)) {
                             return true;
                         }
                     }
-                    if (k + 8 <= n && src.slice(k, k + 8) === "matchAll") {
+                    if (k + 8 <= n && sourceByteEquals(src, k, k + 8, "matchAll")) {
                         const after = k + 8 < n ? src.charCodeAt(k + 8) : 0;
                         if (!((after >= 48 && after <= 57) || (after >= 65 && after <= 90) ||
                               (after >= 97 && after <= 122) || after === 95 || after === 36)) {
                             return true;
                         }
                     }
+                    // String.prototype.replace also performs the observable
+                    // GetMethod(@@replace) step.  Unlike match/search it was
+                    // historically omitted from the cheap trigger to avoid
+                    // broad shim injection; a real `Symbol.replace` token is
+                    // unambiguous (the scanner is already skipping strings
+                    // and comments), so inject the protocol shim here.
+                    if (k + 7 <= n && sourceByteEquals(src, k, k + 7, "replace")) {
+                        const after = k + 7 < n ? src.charCodeAt(k + 7) : 0;
+                        if (!((after >= 48 && after <= 57) || (after >= 65 && after <= 90) ||
+                              (after >= 97 && after <= 122) || after === 95 || after === 36)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            // String.prototype.match/matchAll/search calls also need the
+            // RegExp shim when the source contains no regexp literal or
+            // `RegExp(...)` spelling (for example `"x".matchAll(null)`).
+            // Detect the call form in code, rather than key text in comments
+            // or strings, so ordinary property names do not inject the large
+            // shim accidentally.  A preceding dot covers direct, optional,
+            // and parenthesised receivers; computed `obj["matchAll"]()` is
+            // handled by the Symbol.matchAll trigger above when applicable.
+            if ((i - s === 5 && sourceByteEquals(src, s, i, "match")) ||
+                (i - s === 8 && sourceByteEquals(src, s, i, "matchAll")) ||
+                (i - s === 6 && sourceByteEquals(src, s, i, "search"))) {
+                let p = s - 1;
+                while (p >= 0) {
+                    const w = src.charCodeAt(p);
+                    if (w === 32 || w === 9 || w === 13 || w === 10) p--;
+                    else break;
+                }
+                if (p >= 0 && src.charCodeAt(p) === 46) {
+                    let q = i;
+                    while (q < n) {
+                        const w = src.charCodeAt(q);
+                        if (w === 32 || w === 9 || w === 13 || w === 10) q++;
+                        else break;
+                    }
+                    if (q < n && src.charCodeAt(q) === 40) return true;
                 }
             }
             continue;
@@ -5494,13 +5905,18 @@ function resolveModulePath(importSource, sourcePath, nodeShimPath, pathMod, fsMo
 
 function resolveModulePathUncached(importSource, sourcePath, nodeShimPath, pathMod, fsMod, forRequire) {
     if (!importSource) return "";
+    const traceImport = typeof process !== "undefined" && process.env && process.env.ASMJS_TRACE_IMPORT === "1";
+    if (traceImport) console.log("TRACE_IMPORT_BEGIN", importSource, sourcePath);
 
     const normalizedSource = normalizeNodeModuleName(importSource);
     // 裸内建模块（单段 "fs" 或子路径 "fs/promises"）。子路径映射到
     // runtime/node/<subpath>.js（如 node:fs/promises → runtime/node/fs/promises.js）。
     if (isBareModuleName(normalizedSource) || isBareSubpath(normalizedSource)) {
+        if (traceImport) console.log("TRACE_IMPORT_BUILTIN", normalizedSource);
         const builtinPath = pathMod.resolve(runtimeNodeBase(pathMod, fsMod), "runtime/node", normalizedSource + ".js");
+        if (traceImport) console.log("TRACE_IMPORT_PATH", builtinPath, typeof fsMod.existsSync);
         if (fsMod.existsSync(builtinPath)) {
+            if (traceImport) console.log("TRACE_IMPORT_HIT", builtinPath);
             return builtinPath;
         }
     }
@@ -5523,17 +5939,26 @@ function resolveModulePathUncached(importSource, sourcePath, nodeShimPath, pathM
     }
 
     const absSourcePath = pathMod.resolve(sourcePath || ".");
+    if (traceImport) console.log("TRACE_IMPORT_ABS", typeof pathMod.resolve, absSourcePath, typeof absSourcePath, typeof absSourcePath.endsWith);
     // sourcePath 已是目录（resolveImports 传入前做过 dirname）。用 ".js 结尾=文件" 判断，
     // 不用 statSync().isDirectory()——自举运行时该 shim 恒返 false，会把目录再 dirname 一层
     // （"a/compiler"→"a/"）致相对导入丢一段路径（"a/../lang"），模块读空 → gen2 空壳根因。
     let currentDir = absSourcePath;
     if ((absSourcePath.endsWith(".js") || absSourcePath.endsWith(".mjs")) && !pathIsDirectory(fsMod, absSourcePath)) {
+        if (traceImport) console.log("TRACE_IMPORT_FILEDIR", absSourcePath, typeof pathMod.dirname);
         currentDir = pathMod.dirname(absSourcePath);
     }
 
+    if (traceImport) console.log("TRACE_IMPORT_ARGS", typeof currentDir, typeof currentDir.startsWith, typeof importSource, typeof importSource.startsWith, currentDir, importSource);
+    // Avoid the runtime path shim's variadic `resolve` path here. In a
+    // self-hosted compiler a namespace-bound `path.resolve` can lose its
+    // Array helper bindings while compiling the module graph (`not a
+    // function`); concatenating and folding segments is deterministic and
+    // uses only the local resolver primitives.
     let resolvedPath = importSource.startsWith("/")
         ? importSource
-        : pathMod.resolve(currentDir, importSource);
+        : normalizePathSegments(currentDir + "/" + importSource);
+    if (traceImport) console.log("TRACE_IMPORT_REL", resolvedPath, typeof fsMod.existsSync);
 
     if (!resolvedPath.endsWith(".js") && !fsMod.existsSync(resolvedPath)) {
         if (fsMod.existsSync(resolvedPath + ".js")) {
@@ -5552,7 +5977,15 @@ function resolveModulePathUncached(importSource, sourcePath, nodeShimPath, pathM
 // clone 目录即 "asm.js")。node 下 statSync 实辨;native stat 的 isDirectory 恒
 // false,用 existsSync(p+"/.") 区分目录与文件,不能再靠后缀启发式 dirname。
 function pathIsDirectory(fsMod, p) {
-    try { if (fsMod.statSync(p).isDirectory()) return true; } catch (e) {}
+    try {
+        const st = fsMod.statSync(p);
+        if (typeof process !== "undefined" && process.env && process.env.ASMJS_TRACE_IMPORT === "1") {
+            console.log("TRACE_IMPORT_STAT", p, typeof fsMod.statSync, st && typeof st.isDirectory);
+        }
+        if (st && typeof st.isDirectory === "function" && st.isDirectory()) return true;
+    } catch (e) {
+        if (typeof process !== "undefined" && process.env && process.env.ASMJS_TRACE_IMPORT === "1") console.log("TRACE_IMPORT_STAT_ERR", p, e && e.message);
+    }
     // native statSync 的 isDirectory 恒 false(把一切当文件)。仓库目录名是 asm.js,
     // 不能靠 ".js 后缀=文件" 再 dirname,否则相对导入丢一层 → gen2 空壳。
     // Unix:目录可 open("dir/."),文件 "file/." 失败。
@@ -5688,6 +6121,10 @@ function resolveConditionTarget(v, forRequire) {
 // If _moduleOrder and _moduleExportsList are provided, resolve export * from other modules
 function collectModuleExports(moduleAst, _moduleOrder = null, _nodeShimPath = null, _moduleExportsList = null, _path = null, _fs = null) {
     const exports = [];
+    const moduleResolveBase = _path && moduleAst && moduleAst.filename
+        ? (_moduleOrder && _moduleOrder[_moduleOrder.length - 1] === moduleAst
+            ? moduleAst.filename : _path.dirname(moduleAst.filename))
+        : (moduleAst && moduleAst.filename);
 
     for (const stmt of moduleAst.body) {
         // Debug: log all statement types for index.js
@@ -5726,7 +6163,7 @@ function collectModuleExports(moduleAst, _moduleOrder = null, _nodeShimPath = nu
                     const sourcePath = stmt.source.value;
                     if (sourcePath && _moduleOrder && _nodeShimPath) {
                         // Resolve the source module index
-                        let resolvedPath = resolveModulePath(sourcePath, moduleAst.filename, _nodeShimPath, _path, _fs);
+                        let resolvedPath = resolveModulePath(sourcePath, moduleResolveBase, _nodeShimPath, _path, _fs);
 
                         // Find the module index
                         let sourceModuleIndex = -1;
@@ -5768,7 +6205,7 @@ function collectModuleExports(moduleAst, _moduleOrder = null, _nodeShimPath = nu
                     // Regular export with specifiers
                     let sourceModuleIndex = undefined;
                     if (stmt.source && _moduleOrder && _nodeShimPath) {
-                        const resolvedPath = resolveModulePath(stmt.source.value, moduleAst.filename, _nodeShimPath, _path, _fs);
+                        const resolvedPath = resolveModulePath(stmt.source.value, moduleResolveBase, _nodeShimPath, _path, _fs);
                         const sourceAst = _moduleOrder.find((mod) => mod.filename === resolvedPath);
                         if (sourceAst) {
                             sourceModuleIndex = _moduleOrder.indexOf(sourceAst);
@@ -5796,7 +6233,7 @@ function collectModuleExports(moduleAst, _moduleOrder = null, _nodeShimPath = nu
             const sourcePath = stmt.source ? stmt.source.value : null;
             if (sourcePath && _moduleOrder && _nodeShimPath) {
                 // Resolve the source module index
-                const resolvedPath = resolveModulePath(sourcePath, moduleAst.filename, _nodeShimPath, _path, _fs);
+                const resolvedPath = resolveModulePath(sourcePath, moduleResolveBase, _nodeShimPath, _path, _fs);
 
                 // Find the module index
                 let sourceModuleIndex = -1;

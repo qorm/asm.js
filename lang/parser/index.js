@@ -20,6 +20,9 @@ export class Parser {
         this.errors = [];
         // 类体嵌套深度：#x 私有成员访问仅在类体内合法（>0），类外 obj.#x 报语法错
         this.classDepth = 0;
+        // ClassHeritage 的表达式在类定义的 strict 上下文中解析，但尚未进入
+        // ClassBody（不能直接借用 classDepth，否则 heritage 中的私有名作用域会错位）。
+        this._classHeritageDepth = 0;
         // [test262 S1] 函数嵌套深度(任意函数:声明/表达式/箭头/类方法):供 new.target/super 等
         // 元属性上下文校验。函数入口 +1、出口 -1。
         this.fnDepth = 0;
@@ -47,6 +50,9 @@ export class Parser {
         // [Wave 8] 字段初始化器上下文(ContainsArguments/ContainsSuperCall):字段 init 解析时置真,
         // 穿透箭头(继承)但遇函数表达式/声明边界复位(新作用域自有 arguments/home object)。
         this._inFieldInit = false;
+        // static block 的 ContainsArguments 语义穿透箭头函数和嵌套 class 的计算键，
+        // 但不穿透普通函数/方法。用 fnDepth + 当前箭头层数区分这两种边界。
+        this._staticBlockArrowDepth = 0;
         // [L2-④] 形参解析中:async 函数(含 async-gen)形参含 await 表达式是早期错误;
         // generator 形参含 yield 表达式是早期错误。嵌套函数边界须复位此标志。
         this._inFormalParams = false;

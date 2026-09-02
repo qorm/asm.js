@@ -69,9 +69,17 @@ export class SubscriptGenerator {
         vm.lea(VReg.V0, "_nsobj_string_proto");
         vm.load(VReg.S2, VReg.V0, 0);
         vm.cmpImm(VReg.S2, 0);
+        vm.jne("_subscript_get_str_proto_ready");
+        vm.call("_ensure_string_proto");
+        vm.lea(VReg.V0, "_nsobj_string_proto");
+        vm.load(VReg.S2, VReg.V0, 0);
+        vm.cmpImm(VReg.S2, 0);
         vm.jeq("_subscript_get_str_undef");
+        vm.label("_subscript_get_str_proto_ready");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_js_prop_key");
+        vm.mov(VReg.A1, VReg.RET);
         vm.mov(VReg.A0, VReg.S2);
-        vm.mov(VReg.A1, VReg.S1);
         vm.call("_object_get");
         vm.mov(VReg.A0, VReg.RET);
         vm.mov(VReg.A1, VReg.S0); // original string as getter this
@@ -88,6 +96,8 @@ export class SubscriptGenerator {
         // IC miss; (0)[Symbol.iterator] is high16=0 (looks like a ptr) or a
         // float64 tag and used to SIGSEGV in unbox+load type.
         vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0x7FF9); // Boolean primitive → Boolean.prototype
+        vm.jeq("_subscript_get_bool_proto");
         vm.cmpImm(VReg.V0, 0); // naked heap / +0
         vm.jeq("_subscript_get_objlike");
         vm.cmpImm(VReg.V0, 0x7FFD);
@@ -98,16 +108,56 @@ export class SubscriptGenerator {
         vm.jeq("_subscript_get_objlike");
         vm.jmp("_subscript_get_str_undef");
 
+        // GetV(Boolean, key):ToObject is observational here only through the
+        // prototype lookup; accessors still receive the original primitive as
+        // their this value.  This is needed for user-installed well-known
+        // methods such as Boolean.prototype[Symbol.iterator].
+        vm.label("_subscript_get_bool_proto");
+        vm.mov(VReg.S0, VReg.A0);
+        vm.lea(VReg.V0, "_nsobj_boolean_proto");
+        vm.load(VReg.A0, VReg.V0, 0);
+        vm.cmpImm(VReg.A0, 0);
+        vm.jeq("_subscript_get_str_undef");
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.call("_maybe_getter");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
+
         vm.label("_subscript_get_objlike");
         // [code ptr] 函数值(0x7FFF)的载荷可能是**代码段标签**(类方法/顶层函数声明以裸
         // label 存原型),不是堆块:按对象头 load [P] 会把指令字节当 type 读 → 具名键
         // (`m[k]`,k="length"/"name")恒 undefined、数字键(`m[0]`)被当数组下标解引用
         // 而 SIGSEGV。堆内指针(真闭包块/classinfo)仍按原路分派,字节不变。
         vm.shrImm(VReg.V0, VReg.A0, 48);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_subscript_get_tagged_fnptr");
+        // Accessor descriptors store runtime getter/setter TEXT labels without a 0x7FFF tag.
+        // Recognise registered raw code pointers before interpreting their first instruction as
+        // an object/array type byte (verifyProperty's dynamic `obj[name]` path).
+        vm.mov(VReg.S2, VReg.A0);
+        vm.cmpImm(VReg.S2, 0);
+        vm.jeq("_subscript_get_not_fnptr_restore");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_func_meta_entry");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_subscript_get_codeptr");
+        vm.label("_subscript_get_not_fnptr_restore");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.jmp("_subscript_get_not_fnptr");
+        vm.label("_subscript_get_tagged_fnptr");
         vm.cmpImm(VReg.V0, 0x7FFF);
         vm.jne("_subscript_get_not_fnptr");
         vm.emitMaskLoad(VReg.V1);
         vm.andMaskReg(VReg.S2, VReg.A0, VReg.V1);
+        // Prefer the exact metadata table over coarse heap-range classification.  In the AOT
+        // image a TEXT label may numerically fall inside the allocator's broad address window.
+        vm.mov(VReg.A0, VReg.S2);
+        vm.call("_func_meta_entry");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_subscript_get_codeptr");
+        vm.mov(VReg.A0, VReg.S2); // restore base for the non-function path
         vm.lea(VReg.V1, "_heap_base");
         vm.load(VReg.V1, VReg.V1, 0);
         vm.cmp(VReg.S2, VReg.V1);
@@ -156,6 +206,11 @@ export class SubscriptGenerator {
         vm.cmpImm(VReg.V0, 7); // TYPE_DATE
         vm.jeq("_subscript_get_object");
 
+        // Symbol primitive GetV: look through %Symbol.prototype% while keeping
+        // the original primitive as the receiver for an accessor.
+        vm.cmpImm(VReg.V0, 61); // TYPE_SYMBOL
+        vm.jeq("_subscript_get_symbol_proto");
+
         // 字符串：str[i] 返回单字符（TYPE_STRING=6）
         vm.cmpImm(VReg.V0, 6);
         vm.jeq("_subscript_get_string");
@@ -201,6 +256,18 @@ export class SubscriptGenerator {
         vm.cmpImm(VReg.V1, 0x7FF8);
         vm.jeq("_subscript_get_syscall");
         vm.jmp("_subscript_get_objkey");
+
+        vm.label("_subscript_get_symbol_proto");
+        vm.mov(VReg.S2, VReg.S0); // original primitive symbol
+        vm.call("_ensure_symbol_proto");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S2);
+        vm.call("_maybe_getter");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
+
         vm.label("_subscript_get_syscall");
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_syscall_arg");
@@ -534,10 +601,20 @@ export class SubscriptGenerator {
 
         // hole / >=length: Get on Array.prototype with this=数组(镜像 _agen_get_arr_proto)
         vm.label("_subscript_get_arr_proto");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_get_instance_proto");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_subscript_get_arr_proto_override");
+        vm.lea(VReg.V0, "_nsobj_array_proto");
+        vm.load(VReg.S2, VReg.V0, 0);
+        vm.cmpImm(VReg.S2, 0);
+        vm.jne("_subscript_get_arr_proto_ready");
+        vm.call("_ensure_array_proto");
         vm.lea(VReg.V0, "_nsobj_array_proto");
         vm.load(VReg.S2, VReg.V0, 0);
         vm.cmpImm(VReg.S2, 0);
         vm.jeq("_subscript_get_arr_oob");
+        vm.label("_subscript_get_arr_proto_ready");
         vm.scvtf(0, VReg.S1);
         vm.fmovToInt(VReg.A0, 0);
         vm.call("_js_prop_key");
@@ -550,6 +627,12 @@ export class SubscriptGenerator {
         vm.or(VReg.A1, VReg.S0, VReg.V1);
         vm.call("_maybe_getter");
         vm.jmp("_subscript_get_done");
+        vm.label("_subscript_get_arr_proto_override");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.shrImm(VReg.V1, VReg.S2, 48);
+        vm.cmpImm(VReg.V1, 0x7FFA);
+        vm.jeq("_subscript_get_arr_oob");
+        vm.jmp("_subscript_get_arr_proto_ready");
 
         vm.label("_subscript_get_done");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
@@ -602,10 +685,75 @@ export class SubscriptGenerator {
         vm.andImm(VReg.V0, VReg.S3, 0xff);
         vm.cmpImm(VReg.V0, 1); // 仅普通数组有属性侧表
         vm.jne("_subscript_get_arr_oob");
+        // Array named properties live in the closure side table, but
+        // _closure_prop_get is no longer own-only: it now performs a Function-style
+        // prototype walk on miss.  Using it here let Object.prototype.toString escape
+        // before the Array prototype stage below.  Test presence first so an own
+        // `undefined` still shadows the prototype, then read the side-table object.
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S1);
-        vm.call("_closure_prop_get"); // miss → undefined
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_subscript_get_named_own_miss");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_closure_props_find");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.call("_maybe_getter");
+        vm.jmp("_subscript_get_done");
+        vm.label("_subscript_get_named_own_miss");
+        // Respect per-array [[Prototype]] overrides before the intrinsic
+        // default. This is required for %Array.prototype% itself, whose
+        // override is Object.prototype; looking back through the global
+        // Array.prototype slot would recurse into the same array forever.
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_get_instance_proto");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_subscript_get_named_default_proto");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.shrImm(VReg.V1, VReg.S2, 48);
+        vm.cmpImm(VReg.V1, 0x7FFA); // explicit null prototype
+        vm.jeq("_subscript_get_arr_oob");
+        vm.jmp("_subscript_get_named_proto");
+        vm.label("_subscript_get_named_default_proto");
+        vm.lea(VReg.V0, "_nsobj_array_proto");
+        vm.load(VReg.S2, VReg.V0, 0);
+        vm.cmpImm(VReg.S2, 0);
+        vm.jeq("_subscript_get_arr_oob");
+        // _ensure_array_proto may have planted an empty Array exotic prototype before
+        // emitArrayCtorObject installs the intrinsic methods.  In that partial state,
+        // OrdinaryGet(proto,"toString") walks into Object.prototype and makes a direct
+        // arr.toString() observe "[object Array]" instead of the intrinsic Array method.
+        // Return miss only for this representation-only hole.  Once the Array ctor has
+        // been materialized, a deleted Array.prototype.toString must continue through to
+        // Object.prototype; and an own replacement on the partial proto must win too.
+        vm.lea(VReg.V0, "_nsobj_array_ready");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_subscript_get_named_proto");
+        vm.mov(VReg.A0, VReg.S1);
+        vm.lea(VReg.V0, "_str_key_toString");
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.V0, VReg.V1);
+        vm.call("_object_key_eq");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_subscript_get_named_proto");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_subscript_get_arr_oob");
+        vm.label("_subscript_get_named_proto");
+        vm.mov(VReg.A0, VReg.S2);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.call("_maybe_getter");
+        vm.jmp("_subscript_get_done");
         vm.label("_subscript_get_named_len");
         // arguments.length is an ordinary data property (may be a string).
         vm.loadByte(VReg.V0, VReg.S0, 1);
@@ -644,8 +792,16 @@ export class SubscriptGenerator {
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_js_prop_key");
         vm.mov(VReg.A1, VReg.RET);
-        vm.mov(VReg.A0, VReg.S0);
-        vm.call("_closure_prop_get");
+        vm.movImm64(VReg.V1, 0x7fff000000000000n);
+        vm.or(VReg.A0, VReg.S0, VReg.V1);
+        // Use the ordinary function-object Get path so a miss continues
+        // through Function.prototype/Object.prototype (numeric indices on
+        // Function.prototype are observable by concat).
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.movImm64(VReg.V1, 0x7fff000000000000n);
+        vm.or(VReg.A1, VReg.S0, VReg.V1);
+        vm.call("_maybe_getter");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 64);
 
         // null/undefined 基对象:ToObject(base) 先于 ToPropertyKey(key)
@@ -938,18 +1094,70 @@ export class SubscriptGenerator {
         vm.cmpImm(VReg.V0, 0);
         vm.jne("_sss_dense_ok"); // 既有稠密元素 → 直写
         vm.label("_sss_try_proto_set");
-        // 同 _array_push:查 Array.prototype[idx] 访问器,命中 setter 则分派不建 own。
+        // 查实际 [[Prototype]] 上的索引访问器。普通数组默认走
+        // %Array.prototype%；%Array.prototype% 自身有 Object.prototype override，
+        // 不能再回查自己，否则首次写数字索引会递归。
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_array_get_instance_proto");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_sss_proto_selected");
         vm.lea(VReg.V0, "_nsobj_array_proto");
-        vm.load(VReg.A0, VReg.V0, 0);
-        vm.cmpImm(VReg.A0, 0);
+        vm.load(VReg.RET, VReg.V0, 0);
+        vm.label("_sss_proto_selected");
+        vm.shrImm(VReg.V1, VReg.RET, 48);
+        vm.cmpImm(VReg.V1, 0x7FFA); // explicit null prototype
         vm.jeq("_sss_dense_ok");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_sss_dense_ok");
+        vm.store(VReg.SP, 16, VReg.RET);
         vm.scvtf(0, VReg.S1);
         vm.fmovToInt(VReg.A0, 0);
         vm.call("_js_prop_key");
-        vm.mov(VReg.A1, VReg.RET);
-        vm.lea(VReg.V0, "_nsobj_array_proto");
-        vm.load(VReg.A0, VReg.V0, 0);
-        vm.call("_object_get"); // 返 TYPE_GETTER 标记块(不调 getter)
+        vm.store(VReg.SP, 8, VReg.RET); // keep key across prototype-kind dispatch
+        vm.load(VReg.A0, VReg.SP, 16);
+        vm.shrImm(VReg.V1, VReg.A0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFE);
+        vm.jeq("_sss_proto_get_array_side");
+        vm.load(VReg.A1, VReg.SP, 8);
+        vm.call("_object_get"); // ordinary object lookup returns raw accessor marker
+        vm.jmp("_sss_proto_get_done");
+        vm.label("_sss_proto_get_array_side");
+        // Array exotic prototypes keep indexed descriptors in their ordinary
+        // side table.  Going through `_object_get(array, key)` would invoke the
+        // accessor and turn a setter-only descriptor into undefined.
+        vm.call("_closure_props_find");
+        vm.lea(VReg.V1, "_js_undefined");
+        vm.load(VReg.V1, VReg.V1, 0);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jeq("_sss_proto_array_parent");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.load(VReg.A1, VReg.SP, 8);
+        // The side-table object is only a descriptor store.  Check own before
+        // Get so a miss can continue through the array object's real
+        // prototype (not the side-table object's unrelated chain).
+        vm.store(VReg.SP, 0, VReg.A0);
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_sss_proto_array_parent");
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.load(VReg.A1, VReg.SP, 8);
+        vm.call("_object_get");
+        vm.jmp("_sss_proto_get_done");
+        vm.label("_sss_proto_array_parent");
+        // %Array.prototype% is itself an Array exotic.  Its indexed own
+        // descriptor missed, so continue to its explicit Object.prototype
+        // override; this is where Object.prototype numeric setters live.
+        vm.load(VReg.A0, VReg.SP, 16);
+        vm.call("_array_get_instance_proto");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_sss_dense_ok");
+        vm.shrImm(VReg.V1, VReg.RET, 48);
+        vm.cmpImm(VReg.V1, 0x7FFA);
+        vm.jeq("_sss_dense_ok");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.load(VReg.A1, VReg.SP, 8);
+        vm.call("_object_get");
+        vm.label("_sss_proto_get_done");
         vm.mov(VReg.V0, VReg.RET);
         vm.cmpImm(VReg.V0, 0);
         vm.jeq("_sss_dense_ok");
@@ -1171,6 +1379,7 @@ export class SubscriptGenerator {
         vm.movImm64(VReg.V1, 0x7ffe000000000000n);
         vm.or(VReg.A0, VReg.S0, VReg.V1); // 裸头 → 装箱数组,供 _js_set_length 识别
         vm.mov(VReg.A1, VReg.S2);
+        vm.load(VReg.A2, VReg.SP, 24); // 0=sloppy, 2=strict
         vm.call("_js_set_length");
         vm.mov(VReg.RET, VReg.S2);
         vm.jmp("_subscript_set_done");
@@ -1470,19 +1679,68 @@ export class SubscriptGenerator {
         vm.label("_subscript_key_int");
         vm.prologue(0, [VReg.S0, VReg.S1]);
         vm.mov(VReg.S0, VReg.A0);
-        // Symbol 键不是数组索引(曾把符号裸指针当整数下标,空串 toStringTag Get 恒 miss)。
+        // Symbol 键不是数组索引
         vm.call("_is_symbol");
         vm.cmpImm(VReg.RET, 0);
         vm.jne("_ski_neg1");
         vm.mov(VReg.A0, VReg.S0);
         vm.shrImm(VReg.V1, VReg.A0, 48);
         vm.cmpImm(VReg.V1, 0x7FFC);
-        vm.jne("_ski_not_str");
-        vm.call("_canonical_array_index"); // RET = idx / -1
+        vm.jeq("_ski_str");
+        // Static string-index call sites pass a small integer index as a
+        // naked (high16 == 0) value.  This is distinct from a boxed Number
+        // (whose high bits carry the IEEE-754 exponent) and must not fall
+        // through the float decoder: treating raw `1` as double bits makes
+        // `_ski_float` classify it as NaN and sends `s[1]` to the named-key
+        // miss path.  Raw heap pointers can also have high16 == 0, but as a
+        // property key they are never a valid canonical array index; passing
+        // them through as a large integer consequently has the same miss
+        // result while preserving the fast path for ordinary indices.
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_ski_raw_int");
+        vm.cmpImm(VReg.V1, 0x7FF8);
+        vm.jeq("_ski_int32");
+        vm.cmpImm(VReg.V1, 0x7FF8);
+        vm.jlt("_ski_float");
+        vm.cmpImm(VReg.V1, 0x7FFF);
+        vm.jgt("_ski_float");
+        vm.jmp("_ski_neg1");
+
+        vm.label("_ski_str");
+        vm.call("_canonical_array_index");
         vm.epilogue([VReg.S0, VReg.S1], 0);
-        vm.label("_ski_not_str");
-        vm.call("_syscall_arg");
+
+        vm.label("_ski_int32");
+        vm.shlImm(VReg.V0, VReg.S0, 32);
+        vm.sarImm(VReg.RET, VReg.V0, 32);
+        vm.cmpImm(VReg.RET, 0);
+        vm.jge("_ski_int32_ok");
+        vm.jmp("_ski_neg1");
+        vm.label("_ski_int32_ok");
         vm.epilogue([VReg.S0, VReg.S1], 0);
+
+        vm.label("_ski_raw_int");
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+
+        vm.label("_ski_float");
+        vm.fmovToFloat(0, VReg.S0);
+        vm.fcmp(0, 0);
+        vm.jnan("_ski_neg1");
+        vm.movImm(VReg.V0, 0);
+        vm.scvtf(1, VReg.V0);
+        vm.fcmp(0, 1);
+        vm.jflt("_ski_neg1");
+        vm.movImm64(VReg.V0, 4294967294n);
+        vm.scvtf(1, VReg.V0);
+        vm.fcmp(0, 1);
+        vm.jfgt("_ski_neg1");
+        vm.fcvtzs(VReg.RET, 0);
+        vm.scvtf(1, VReg.RET);
+        vm.fcmp(0, 1);
+        vm.jne("_ski_neg1");
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+
         vm.label("_ski_neg1");
         vm.movImm64(VReg.RET, 0xFFFFFFFFFFFFFFFFn);
         vm.epilogue([VReg.S0, VReg.S1], 0);
@@ -1533,7 +1791,7 @@ export class SubscriptGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 16);
     }
 
-    // _js_set_length(A0=obj, A1=boxed value) -> undefined
+    // _js_set_length(A0=obj, A1=boxed value, A2=strict?1:0) -> boxed success
     // [#63] arr.length = N 的赋值路径。运行时按值形态分派：
     //   - 数组(装箱 0x7FFE / 裸 TYPE_ARRAY=1)：ToNumber 后须为 [0,2^32-1] 整数,
     //     否则 RangeError;再截断/扩容写 length@8。
@@ -1547,6 +1805,7 @@ export class SubscriptGenerator {
         vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
         vm.store(VReg.SP, 0, VReg.A0);  // 原 obj(fallback 用)
         vm.store(VReg.SP, 8, VReg.A1);  // 原 boxed value
+        vm.store(VReg.SP, 24, VReg.A2); // strict assignment mode (Reflect uses 0)
         vm.mov(VReg.S0, VReg.A0); // obj
         vm.mov(VReg.S1, VReg.A1); // boxed value
 
@@ -1584,26 +1843,39 @@ export class SubscriptGenerator {
         vm.andImm(VReg.V0, VReg.V0, 32); // ARR_IS_ARGUMENTS
         vm.cmpImm(VReg.V0, 0);
         vm.jne("_js_set_length_fallback");
-        // 数组:boxed value → 有限整数 ∈[0,2^32-1]
+        // ArraySetLength observes two conversions: ToUint32 first and
+        // ToNumber second.  Keep the original value in S1 so user
+        // valueOf/@@toPrimitive is invoked twice, then compare the resulting
+        // number exactly instead of truncating fractional/negative values.
         vm.mov(VReg.A0, VReg.S1);
+        vm.call("_to_uint32");
+        vm.mov(VReg.S2, VReg.RET);                // newLen
+        vm.mov(VReg.S1, VReg.RET);                // use integer length for the write path
+        vm.load(VReg.A0, VReg.SP, 8);
         vm.call("_number_coerce");
-        vm.mov(VReg.S1, VReg.RET); // float bits
-        vm.shrImm(VReg.V1, VReg.S1, 52);
-        vm.andImm(VReg.V1, VReg.V1, 0x7FF);
-        vm.cmpImm(VReg.V1, 0x7FF);
-        vm.jeq("_js_set_length_range_err"); // Inf/NaN
-        vm.fmovToFloat(0, VReg.S1);
-        vm.fcvtzs(VReg.S1, 0); // S1 = 裸 n
-        vm.cmpImm(VReg.S1, 0);
-        vm.jlt("_js_set_length_range_err");
-        vm.movImm64(VReg.V0, 0xFFFFFFFFn);
-        vm.cmp(VReg.S1, VReg.V0);
-        vm.jgt("_js_set_length_range_err");
+        vm.store(VReg.SP, 16, VReg.RET);          // numberLen bits
+        vm.movImm64(VReg.V1, 0x7ff0000000000000n);
+        vm.mov(VReg.V0, VReg.RET);
+        vm.shlImm(VReg.V0, VReg.V0, 1);
+        vm.shrImm(VReg.V0, VReg.V0, 1);           // clear sign bit
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jae("_js_set_length_range_err");      // NaN / infinities
+        vm.scvtf(0, VReg.S2);
+        vm.fmovToInt(VReg.V3, 0);
+        vm.load(VReg.V0, VReg.SP, 16);
+        vm.cmp(VReg.V3, VReg.V0);
+        vm.jeq("_js_set_length_writable_chk2");
+        vm.cmpImm(VReg.S2, 0);
+        vm.jne("_js_set_length_range_err");
+        vm.shlImm(VReg.V1, VReg.V0, 1);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_js_set_length_range_err");
+        vm.label("_js_set_length_writable_chk2");
         // [W7b] ARR_LEN_NONWRITABLE → 静默忽略(sloppy [[Set]])
         vm.loadByte(VReg.V0, VReg.S0, 1);
         vm.andImm(VReg.V0, VReg.V0, 1);
         vm.cmpImm(VReg.V0, 0);
-        vm.jne("_js_set_length_done");
+        vm.jne("_js_set_length_nonwritable");
         vm.label("_js_set_length_do_array");
         vm.loadByte(VReg.V0, VReg.S0, 0);
         vm.cmpImm(VReg.V0, 1);             // TYPE_ARRAY
@@ -1615,6 +1887,18 @@ export class SubscriptGenerator {
         vm.jgt("_js_set_length_grow");     // n > len：扩展
         // n < len：自高向低 DeleteProperty(含侧表 accessor)+清稠密槽。
         // 旧路径只擦稠密 → length=0 后 `0 in arr` 仍 true(get_if_present_with_delete)。
+        // First remove sparse side-table indices at/above dense capacity; a
+        // non-configurable sparse key determines the final length before any
+        // lower dense keys are considered.
+        vm.store(VReg.SP, 32, VReg.S1);       // requested length
+        vm.mov(VReg.A0, VReg.S0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_array_trim_sparse_side");
+        vm.mov(VReg.S1, VReg.RET);            // requested or blocking index+1
+        vm.load(VReg.V0, VReg.SP, 32);
+        vm.cmp(VReg.S1, VReg.V0);
+        vm.jne("_js_set_length_sparse_block");
+
         vm.movImm64(VReg.V1, 0x7ffe000000000000n);
         vm.or(VReg.S3, VReg.S0, VReg.V1);   // S3 = 装箱数组(供 _object_delete)
         // i 从 min(oldLen, capacity)-1 起:skip-fill 抬 length 后 capacity 仍小,
@@ -1667,9 +1951,31 @@ export class SubscriptGenerator {
 
         vm.label("_js_set_length_set");
         vm.store(VReg.S0, 8, VReg.S1);     // length = n
+        vm.jmp("_js_set_length_done");
+
+        vm.label("_js_set_length_sparse_block");
+        vm.store(VReg.S0, 8, VReg.S1);
+        vm.jmp("_js_set_length_nonwritable");
+
+        vm.label("_js_set_length_nonwritable");
+        // [[Set]] on a non-writable length silently fails in sloppy mode and
+        // throws in strict mode.  Reflect.set consumes the boxed boolean.
+        vm.load(VReg.V0, VReg.SP, 24);
+        vm.cmpImm(VReg.V0, 2);
+        vm.jeq("_js_set_length_reflect_false");
+        vm.cmpImm(VReg.V0, 0);
+        vm.jeq("_js_set_length_done");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot assign to read only property 'length'"));
+        vm.call("_js_box_string");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_throw_type_error");
+
+        vm.label("_js_set_length_reflect_false");
+        vm.movImm64(VReg.RET, 0x7ff9000000000000n); // boxed false
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 48);
 
         vm.label("_js_set_length_done");
-        vm.movImm(VReg.RET, 0);
+        vm.movImm64(VReg.RET, 0x7ff9000000000001n); // boxed true
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 48);
 
         vm.label("_js_set_length_range_err");
@@ -1685,8 +1991,27 @@ export class SubscriptGenerator {
         vm.lea(VReg.V0, "_str_length_prop");
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.V0, VReg.V1);
+        // Preserve the assignment mode selected by the caller.  Function
+        // values (and other non-array objects) reach this fallback as well;
+        // routing every write through the sloppy entry used to silently
+        // ignore `Function.length = ...` in strict code.  `_object_set_strict`
+        // uses the same ABI and raises TypeError for the non-writable built-in
+        // length property; the zero marker continues through the legacy
+        // sloppy path.  Marker 2 is reserved by the Array/Reflect caller for
+        // a boolean (non-throw) result and must not accidentally become a
+        // throwing `_object_set_strict` call for Reflect.set on a function.
+        vm.load(VReg.V2, VReg.SP, 24);
+        vm.cmpImm(VReg.V2, 1);
+        vm.jne("_js_set_length_fallback_sloppy");
+        // Load the value only after the mode branch: on x64 V2 aliases A2, so
+        // reading SP+24 before this point would overwrite the value argument.
+        vm.load(VReg.A2, VReg.SP, 8); // 原 boxed value
+        vm.call("_object_set_strict");
+        vm.jmp("_js_set_length_fallback_done");
+        vm.label("_js_set_length_fallback_sloppy");
         vm.load(VReg.A2, VReg.SP, 8); // 原 boxed value
         vm.call("_object_set");
+        vm.label("_js_set_length_fallback_done");
         vm.movImm(VReg.RET, 0);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 48);
     }
@@ -1808,6 +2133,84 @@ export class SubscriptGenerator {
         vm.call("_number_coerce"); // RET = float64 位
         vm.fmovToFloat(0, VReg.RET);
         vm.fcvtzs(VReg.RET, 0); // 原始整数
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+
+        // Public String#length bridge.  The historical `_js_length` ABI is
+        // intentionally byte-oriented because compiler/runtime code uses it
+        // for UTF-8 backing-store offsets.  User expressions can produce a
+        // string through an unknown value (for example `"𝐁".match(/./u)[0]`),
+        // so a compile-time String type is not sufficient.  This entry keeps
+        // every non-string path on the old implementation and only changes
+        // the boxed/raw string cases to UTF-16 code-unit length.
+        vm.label("_js_length_public");
+        vm.prologue(16, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.shrImm(VReg.V0, VReg.S0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFC);
+        vm.jeq("_js_length_public_boxed_str");
+        // Raw heap strings are returned by a few internal bridges.  Validate
+        // the pointer and block type before looking behind it; arbitrary
+        // numeric payloads must remain on the legacy path.
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_js_length_public_fallback");
+        vm.cmpImm(VReg.S0, 0);
+        vm.jeq("_js_length_public_fallback");
+        vm.lea(VReg.V0, "_heap_base");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.addImm(VReg.V0, VReg.V0, 16);
+        vm.cmp(VReg.S0, VReg.V0);
+        vm.jlt("_js_length_public_fallback");
+        vm.lea(VReg.V0, "_heap_ptr");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmp(VReg.S0, VReg.V0);
+        vm.jge("_js_length_public_fallback");
+        vm.loadByte(VReg.V0, VReg.S0, -16);
+        vm.cmpImm(VReg.V0, 6);
+        vm.jne("_js_length_public_fallback");
+        vm.label("_js_length_public_boxed_str");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_str_utf16_length");
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+        vm.label("_js_length_public_fallback");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_js_length");
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+
+        // Dynamic/property-read counterpart.  `_js_length_dyn` returns a
+        // boxed value (needed to preserve undefined for ordinary objects), so
+        // box the UTF-16 count only for string receivers and delegate all
+        // other values unchanged.
+        vm.label("_js_length_dyn_public");
+        vm.prologue(16, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.shrImm(VReg.V0, VReg.S0, 48);
+        vm.cmpImm(VReg.V0, 0x7FFC);
+        vm.jeq("_js_length_dyn_public_str");
+        vm.cmpImm(VReg.V0, 0);
+        vm.jne("_js_length_dyn_public_fallback");
+        vm.cmpImm(VReg.S0, 0);
+        vm.jeq("_js_length_dyn_public_fallback");
+        vm.lea(VReg.V0, "_heap_base");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.addImm(VReg.V0, VReg.V0, 16);
+        vm.cmp(VReg.S0, VReg.V0);
+        vm.jlt("_js_length_dyn_public_fallback");
+        vm.lea(VReg.V0, "_heap_ptr");
+        vm.load(VReg.V0, VReg.V0, 0);
+        vm.cmp(VReg.S0, VReg.V0);
+        vm.jge("_js_length_dyn_public_fallback");
+        vm.loadByte(VReg.V0, VReg.S0, -16);
+        vm.cmpImm(VReg.V0, 6);
+        vm.jne("_js_length_dyn_public_fallback");
+        vm.label("_js_length_dyn_public_str");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_str_utf16_length");
+        vm.scvtf(0, VReg.RET);
+        vm.fmovToInt(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+        vm.label("_js_length_dyn_public_fallback");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_js_length_dyn");
         vm.epilogue([VReg.S0, VReg.S1], 16);
     }
 }

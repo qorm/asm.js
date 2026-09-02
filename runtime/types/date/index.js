@@ -188,6 +188,48 @@ export class DateGenerator {
         vm.or(VReg.RET, VReg.RET, VReg.V1);
         vm.epilogue([VReg.S0], 16);
 
+        // _date_new_single(A0=value) - one-argument Date constructor path.
+        // The argument is evaluated by the compiler exactly once, then the
+        // constructor applies ToPrimitive(default).  A primitive String is
+        // parsed as a date string; every other primitive is converted with
+        // ToNumber before TimeClip.  Keeping this dispatch in one runtime
+        // helper avoids accidentally storing an object/closure NaN-box as the
+        // timestamp (the old fast path did exactly that for `new Date(obj)`).
+        vm.label("_date_new_single");
+        vm.prologue(16, [VReg.S0]);
+        vm.mov(VReg.S0, VReg.A0); // original argument / GC-visible root
+        // Date object input copies [[DateValue]] directly; it must not invoke
+        // an overridden @@toPrimitive/valueOf/toString on that Date.
+        vm.shrImm(VReg.V1, VReg.S0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFD);
+        vm.jne("_date_new_single_toprim");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V1, VReg.S0, VReg.V1);
+        vm.loadByte(VReg.V0, VReg.V1, 0);
+        vm.cmpImm(VReg.V0, TYPE_DATE);
+        vm.jne("_date_new_single_toprim");
+        vm.load(VReg.A0, VReg.V1, 8);
+        vm.call("_date_new_ts");
+        vm.epilogue([VReg.S0], 16);
+
+        vm.label("_date_new_single_toprim");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_js_toprimitive");
+        vm.mov(VReg.S0, VReg.RET); // primitive result (preserved across calls)
+        vm.shrImm(VReg.V1, VReg.S0, 48);
+        vm.cmpImm(VReg.V1, 0x7FFC); // boxed String primitive
+        vm.jeq("_date_new_single_string");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_number_coerce");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_date_new_ts");
+        vm.epilogue([VReg.S0], 16);
+
+        vm.label("_date_new_single_string");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_date_new_from_string");
+        vm.epilogue([VReg.S0], 16);
+
         // _date_new - 创建新的 Date 对象
         // A0 = 时间戳（可选，0 表示使用当前时间）—— 仅无参 new Date() 用此 0→now 语义
         vm.label("_date_new");

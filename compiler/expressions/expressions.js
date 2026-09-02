@@ -59,7 +59,7 @@ function floatToF32Bits(value) {
 }
 
 // 导入拆分的模块
-import { LiteralCompiler } from "./literals.js";
+import { LiteralCompiler, parseStringNumericLiteral } from "./literals.js";
 import { OperatorCompiler } from "./operators.js";
 import { AssignmentCompiler } from "./assignments.js";
 import { MemberCompiler } from "./members.js";
@@ -259,7 +259,12 @@ export const ExpressionCompiler = {
         if (expr.callee && expr.callee.type === "MemberExpression") {
             const obj = expr.callee.object;
             const prop = expr.callee.property;
-            if (obj.type === "Identifier" && obj.name === "Number" && prop.type === "Identifier") {
+            const numberSubtype = prop && prop.type === "Identifier" &&
+                (prop.name === "Int8" || prop.name === "Int16" || prop.name === "Int32" ||
+                 prop.name === "Int64" || prop.name === "Uint8" || prop.name === "Uint16" ||
+                 prop.name === "Uint32" || prop.name === "Uint64" || prop.name === "Float16" ||
+                 prop.name === "Float32" || prop.name === "Float64");
+            if (obj.type === "Identifier" && obj.name === "Number" && numberSubtype) {
                 const subtypeName = prop.name;
                 const args = expr.arguments || [];
                 this.compileNumberSubtype(subtypeName, args);
@@ -327,7 +332,17 @@ export const ExpressionCompiler = {
                 // linux-x64 (4-405 / 4-581). Object(0) already used this order.
                 this.emitNumberCtorObject();
                 if (args.length > 0) {
-                    this.compileExpression(args[0]);
+                    const numberArg = args[0];
+                    if (numberArg.type === "Literal" && typeof numberArg.value === "string") {
+                        // Match the Number("literal") call fast path: parsing a known
+                        // StringNumericLiteral at compile time avoids the runtime decimal
+                        // accumulator's long-mantissa rounding loss.  _number_new still
+                        // performs its normal wrapper allocation and prototype setup.
+                        const parsed = parseStringNumericLiteral(numberArg.value);
+                        this.compileNumericLiteral(parsed);
+                    } else {
+                        this.compileExpression(numberArg);
+                    }
                 } else {
                     this.vm.movImm(VReg.RET, 0);
                 }
@@ -419,8 +434,16 @@ export const ExpressionCompiler = {
                 break;
             }
 
+            case "Symbol":
+                // %Symbol% has [[Call]] but deliberately no [[Construct]]. Evaluate
+                // arguments before reporting the failed construction attempt.
+                for (let si = 0; si < args.length; si++) this.compileExpression(args[si]);
+                this.emitThrowTypeError("Symbol is not a constructor");
+                break;
+
             case "Promise":
                 // new Promise(executor) - executor 收到 resolve/reject 闭包
+                if (this.emitPromiseCtorObject) this.emitPromiseCtorObject();
                 if (args.length > 0) {
                     this.compileExpression(args[0]);
                     this.vm.mov(VReg.A0, VReg.RET);
@@ -552,10 +575,13 @@ export const ExpressionCompiler = {
                         this.vm.mov(VReg.A0, VReg.RET);
                         this.vm.call("_date_new_from_string");
                     } else {
-                        // new Date(timestamp) - 从时间戳创建(不做 0→now 特判)
+                        // new Date(value) - ToPrimitive(default), then String
+                        // parse or ToNumber timestamp.  The runtime helper
+                        // keeps the evaluated argument alive and ensures it is
+                        // evaluated only once (objects may run user getters).
                         this.compileExpression(arg);
                         this.vm.mov(VReg.A0, VReg.RET);
-                        this.vm.call("_date_new_ts");
+                        this.vm.call("_date_new_single");
                     }
                 } else {
                     // new Date() - 传入 0，让 _date_new 获取当前时间
@@ -1884,6 +1910,61 @@ export const ExpressionCompiler = {
                 this.vm.movImm(VReg.A3, elemSize);
                 this.vm.call("_ta_track_add");         // RET 原样返回视图
             }
+        } else if (args.length >= 2) {
+            // arg0 静态非 AB 但 argc≥2 → 仍可能是 new TA(buf,off,len);运行时判别,
+            // 勿把 buf 单独送 _typed_array_from(会丢 off/len 并误登记 length-tracking)。
+            const log2elem = { 1: 0, 2: 1, 4: 2, 8: 3 }[elemSize];
+            const id = this.nextLabelId();
+            const fromL = `_tavdyn_${id}_from`;
+            const doneL = `_tavdyn_${id}_done`;
+            const bufOff = this.ctx.allocLocal(`__tav_buf_${id}`);
+            const boOff = this.ctx.allocLocal(`__tav_bo_${id}`);
+            const autoLen = args.length < 3;
+            this.compileExpression(args[0]);
+            this.vm.store(VReg.FP, bufOff, VReg.RET);
+            this.vm.load(VReg.V0, VReg.FP, bufOff);
+            this.vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+            this.vm.and(VReg.V0, VReg.V0, VReg.V1);
+            this.vm.cmpImm(VReg.V0, 4095);
+            this.vm.jle(fromL);
+            this.vm.loadByte(VReg.V1, VReg.V0, 0);
+            this.vm.cmpImm(VReg.V1, 12); // TYPE_ARRAY_BUFFER
+            this.vm.jne(fromL);
+            if (args.length >= 2) { this.compileExpressionAsInt(args[1]); }
+            else { this.vm.movImm(VReg.RET, 0); }
+            this.vm.store(VReg.FP, boOff, VReg.RET);
+            if (!autoLen) {
+                this.compileExpressionAsInt(args[2]);
+                this.vm.mov(VReg.A3, VReg.RET);
+            } else {
+                this.vm.load(VReg.A0, VReg.FP, bufOff);
+                this.vm.call("_arraybuffer_bytelength");
+                this.vm.load(VReg.V1, VReg.FP, boOff);
+                this.vm.sub(VReg.RET, VReg.RET, VReg.V1);
+                this.vm.shrImm(VReg.A3, VReg.RET, log2elem);
+            }
+            this.vm.load(VReg.A1, VReg.FP, bufOff);
+            this.vm.load(VReg.A2, VReg.FP, boOff);
+            this.vm.movImm(VReg.A0, arrayType);
+            this.vm.call("_typed_array_view");
+            if (autoLen) {
+                this.vm.mov(VReg.A0, VReg.RET);
+                this.vm.load(VReg.A1, VReg.FP, bufOff);
+                this.vm.load(VReg.A2, VReg.FP, boOff);
+                this.vm.movImm(VReg.A3, elemSize);
+                this.vm.call("_ta_track_add");
+            }
+            this.vm.jmp(doneL);
+            this.vm.label(fromL);
+            this.vm.load(VReg.RET, VReg.FP, bufOff);
+            if (inferType(args[0], this.ctx) === Type.TYPED_ARRAY) {
+                this.vm.mov(VReg.A0, VReg.RET);
+                this.vm.call("_ta_to_array");
+            }
+            this.vm.mov(VReg.A1, VReg.RET);
+            this.vm.movImm(VReg.A0, arrayType);
+            this.vm.call("_typed_array_from");
+            this.vm.label(doneL);
         } else if (args.length > 0) {
             // 变量/表达式参数:运行时判数组(拷贝元素)还是数字(当长度)。原一律当长度 →
             // `new Uint8Array(变量数组)` 把数组误当长度 → 空数组(bug,引擎库 P4 blocker)。
@@ -1977,12 +2058,15 @@ export const ExpressionCompiler = {
             return true;
         }
         if (name === "indexOf" || name === "includes") {
-            if (args.length === 0) return true;
             this.compileExpression(obj);
             vm.push(VReg.RET);
             vm.mov(VReg.A0, VReg.RET);
             vm.call("_tam_throw_if_detached"); // ValidateTypedArray 在 ToInteger(fromIndex) 之前
-            this.compileExpression(args[0]);
+            if (args.length >= 1) {
+                this.compileExpression(args[0]);
+            } else {
+                vm.movImm64(VReg.RET, 0x7ffb000000000000n); // 缺省 searchElement = undefined
+            }
             vm.mov(VReg.A1, VReg.RET);
             // fromIndex:装箱传入;indexOf 在 _ta_indexof 内捕 origLen 后再 ToInteger。
             // includes 仍走旧约定(裸 int,缺省 0)。
@@ -2001,11 +2085,11 @@ export const ExpressionCompiler = {
             } else {
                 if (args.length >= 2) {
                     vm.push(VReg.A1);
-                    this.compileExpressionAsInt(args[1]);
+                    this.compileExpression(args[1]);
                     vm.mov(VReg.A2, VReg.RET);
                     vm.pop(VReg.A1);
                 } else {
-                    vm.movImm(VReg.A2, 0);
+                    vm.movImm64(VReg.A2, 0x7ffb000000000000n);
                 }
                 vm.pop(VReg.A0);
                 vm.call("_ta_includes");
@@ -2021,8 +2105,16 @@ export const ExpressionCompiler = {
             if (args.length === 0) return true;
             this.compileExpression(obj);
             vm.push(VReg.RET);
+            vm.mov(VReg.A0, VReg.RET);
+            vm.call("_tam_validate");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.call("_tam_throw_if_detached");
+            vm.mov(VReg.A0, VReg.RET);
+            vm.call("_typed_array_length");    // origLen(coerce 前)
+            vm.push(VReg.RET);
             this.compileExpressionAsInt(args[0]);
-            vm.mov(VReg.A1, VReg.RET);
+            vm.mov(VReg.A2, VReg.RET);
+            vm.pop(VReg.A1);
             vm.pop(VReg.A0);
             vm.call("_ta_at");
             return true;
@@ -2032,7 +2124,8 @@ export const ExpressionCompiler = {
             // _typed_array_view 建真视图,byteOffset = src.byteOffset + begin*elemSize)。
             // slice:ValidateTypedArray 在 ToInteger(start/end) 之前;装箱 start/end 交给
             // _ta_slice(内部先捕 srcLength 再 ToInteger,以正确处理 mid-coerce resize)。
-            // subarray:**先** ToInteger,TypeError 来自随后 TypedArrayCreate(detached buffer)。
+            // subarray:装箱 start/end 交给 _ta_subarray(内部先捕 srcLength 再 ToInteger,
+            // 以正确处理 mid-coerce resize;OOB 视图 len=0 允许空 subarray)。
             this.compileExpression(obj);
             vm.push(VReg.RET);
             if (name === "slice") {
@@ -2049,10 +2142,13 @@ export const ExpressionCompiler = {
                 vm.call("_ta_slice");
                 return true;
             }
-            if (args.length >= 1) { this.compileExpressionAsInt(args[0]); vm.mov(VReg.A1, VReg.RET); }
-            else vm.movImm(VReg.A1, 0);
-            if (args.length >= 2) { vm.push(VReg.A1); this.compileExpressionAsInt(args[1]); vm.mov(VReg.A2, VReg.RET); vm.pop(VReg.A1); }
-            else vm.movImm(VReg.A2, 2147483647);
+            if (args.length >= 1) { this.compileExpression(args[0]); }
+            else vm.movImm64(VReg.RET, 0x7ffb000000000000n);
+            vm.push(VReg.RET);
+            if (args.length >= 2) { this.compileExpression(args[1]); }
+            else vm.movImm64(VReg.RET, 0x7ffb000000000000n);
+            vm.mov(VReg.A2, VReg.RET);
+            vm.pop(VReg.A1);
             vm.pop(VReg.A0);
             vm.call("_ta_subarray");
             return true;
@@ -2061,12 +2157,29 @@ export const ExpressionCompiler = {
             if (args.length === 0) return true;
             this.compileExpression(obj);
             vm.push(VReg.RET);
+            vm.mov(VReg.A0, VReg.RET);
+            vm.call("_tam_throw_if_detached");
+            vm.call("_tam_throw_if_immutable_write");
             this.compileExpression(args[0]);
             vm.mov(VReg.A1, VReg.RET); // value(装箱)
-            if (args.length >= 2) { vm.push(VReg.A1); this.compileExpressionAsInt(args[1]); vm.mov(VReg.A2, VReg.RET); vm.pop(VReg.A1); }
-            else vm.movImm(VReg.A2, 0);
-            if (args.length >= 3) { vm.push(VReg.A1); vm.push(VReg.A2); this.compileExpressionAsInt(args[2]); vm.mov(VReg.A3, VReg.RET); vm.pop(VReg.A2); vm.pop(VReg.A1); }
-            else vm.movImm(VReg.A3, 2147483647);
+            if (args.length >= 2) {
+                vm.push(VReg.A1);
+                this.compileExpression(args[1]);
+                vm.mov(VReg.A0, VReg.RET);
+                vm.movImm(VReg.A1, 0);
+                vm.call("_aref_argint_d");
+                vm.mov(VReg.A2, VReg.RET);
+                vm.pop(VReg.A1);
+            } else vm.movImm(VReg.A2, 0);
+            if (args.length >= 3) {
+                vm.push(VReg.A1); vm.push(VReg.A2);
+                this.compileExpression(args[2]);
+                vm.mov(VReg.A0, VReg.RET);
+                vm.movImm(VReg.A1, 2147483647);
+                vm.call("_aref_argint_d");
+                vm.mov(VReg.A3, VReg.RET);
+                vm.pop(VReg.A2); vm.pop(VReg.A1);
+            } else vm.movImm(VReg.A3, 2147483647);
             vm.pop(VReg.A0);
             vm.call("_ta_fill");
             return true;
@@ -2078,12 +2191,18 @@ export const ExpressionCompiler = {
             vm.push(VReg.RET);
             vm.mov(VReg.A0, VReg.RET);
             vm.call("_tam_throw_if_detached");
-            if (args.length >= 1) { this.compileExpressionAsInt(args[0]); vm.mov(VReg.A1, VReg.RET); }
-            else vm.movImm(VReg.A1, 0);
-            if (args.length >= 2) { vm.push(VReg.A1); this.compileExpressionAsInt(args[1]); vm.mov(VReg.A2, VReg.RET); vm.pop(VReg.A1); }
-            else vm.movImm(VReg.A2, 0);
-            if (args.length >= 3) { vm.push(VReg.A1); vm.push(VReg.A2); this.compileExpressionAsInt(args[2]); vm.mov(VReg.A3, VReg.RET); vm.pop(VReg.A2); vm.pop(VReg.A1); }
-            else vm.movImm(VReg.A3, 2147483647);
+            vm.call("_tam_throw_if_immutable_write");
+            if (args.length >= 1) { this.compileExpression(args[0]); }
+            else vm.movImm64(VReg.RET, 0x7ffb000000000000n);
+            vm.push(VReg.RET);
+            if (args.length >= 2) { this.compileExpression(args[1]); }
+            else vm.movImm64(VReg.RET, 0x7ffb000000000000n);
+            vm.push(VReg.RET);
+            if (args.length >= 3) { this.compileExpression(args[2]); }
+            else vm.movImm64(VReg.RET, 0x7ffb000000000000n);
+            vm.mov(VReg.A3, VReg.RET);
+            vm.pop(VReg.A2);
+            vm.pop(VReg.A1);
             vm.pop(VReg.A0);
             vm.call("_ta_copywithin");
             return true;
@@ -2092,6 +2211,9 @@ export const ExpressionCompiler = {
             if (args.length === 0) return true;
             this.compileExpression(obj);
             vm.push(VReg.RET);
+            vm.mov(VReg.A0, VReg.RET);
+            vm.call("_tam_throw_if_detached");
+            vm.call("_tam_throw_if_immutable_write");
             this.compileExpression(args[0]);
             vm.mov(VReg.A1, VReg.RET); // src(装箱数组)
             // offset 保持装箱: _ta_set 内做 ToIntegerOrInfinity
@@ -2107,15 +2229,17 @@ export const ExpressionCompiler = {
             // 走既有数值插入排序,否则 validate-callable 后按 ToNumber(cmp(a,b)) 定序)。
             // 此前从不编译 args[0],传入的比较函数被静默忽略。
             this.compileExpression(obj);
+            vm.mov(VReg.A0, VReg.RET);
+            vm.call("_tam_throw_if_detached");
+            vm.call("_tam_throw_if_immutable_write");
             if (name === "sort") {
-                vm.push(VReg.RET);
+                vm.push(VReg.A0);
                 if (args.length >= 1) { this.compileExpression(args[0]); vm.mov(VReg.A1, VReg.RET); }
                 else vm.movImm64(VReg.A1, 0x7FFB000000000000n); // undefined → 数值序
                 vm.pop(VReg.A0);
                 vm.call("_ta_sort_cmp");
                 return true;
             }
-            vm.mov(VReg.A0, VReg.RET);
             vm.call("_ta_reverse");
             return true;
         }
@@ -2315,6 +2439,7 @@ export const ExpressionCompiler = {
             vm.call("_ta_need_fn");               // validate callable(TypeError if not)
             vm.pop(VReg.A1);                      // cb
             if (hasInit) vm.pop(VReg.A2); else vm.movImm64(VReg.A2, 0x7ffb000000000000n);
+            if (hasInit) vm.movImm(VReg.A3, 1); else vm.movImm(VReg.A3, 0);
             vm.pop(VReg.A0);                      // ta
             vm.call(name === "reduce" ? "_ta_reduce" : "_ta_reduceRight");
             return true;
@@ -2402,6 +2527,34 @@ export const ExpressionCompiler = {
         this.vm.movImm64(VReg.V7, 0x0000ffffffffffffn);
         this.vm.and(VReg.S1, VReg.V6, VReg.V7);
 
+        // Reject primitive constructor values before any Proxy/closure/class
+        // layout probe dereferences the masked payload.  A tagged Boolean true
+        // becomes address 1 after masking; the old late guard therefore
+        // SIGSEGVed in `new true` at load [S1] instead of throwing TypeError.
+        // ArgumentListEvaluation has already completed above, preserving the
+        // required observable evaluation order.
+        {
+            const ptrOk = this.ctx.newLabel("dnew_ptr_ok");
+            const ptrBad = this.ctx.newLabel("dnew_ptr_bad");
+            this.vm.load(VReg.V1, VReg.FP, dnFnValSlot);
+            this.vm.shrImm(VReg.V1, VReg.V1, 48);
+            this.vm.cmpImm(VReg.V1, 0x7FFD); // object/classinfo
+            this.vm.jeq(ptrOk);
+            this.vm.cmpImm(VReg.V1, 0x7FFF); // function/closure
+            this.vm.jeq(ptrOk);
+            this.vm.cmpImm(VReg.V1, 0);      // raw heap/code pointer
+            this.vm.jne(ptrBad);
+            this.vm.movImm64(VReg.V2, this.vm.ptrFloor);
+            this.vm.cmp(VReg.S1, VReg.V2);
+            this.vm.jge(ptrOk);
+            this.vm.label(ptrBad);
+            this.vm.lea(VReg.A0, this.asm.addString("value is not a constructor"));
+            this.vm.call("_js_box_string");
+            this.vm.mov(VReg.A0, VReg.RET);
+            this.vm.call("_throw_type_error"); // does not return
+            this.vm.label(ptrOk);
+        }
+
         // [Proxy construct] 值为 Proxy(块 type@0==8)→ 构造走 construct 陷阱蹦床
         // (须在解 props_ptr 前判别;S1 已去 tag)。
         const dynNewProxyEndL = this.ctx.newLabel("dnew_pxend");
@@ -2453,6 +2606,16 @@ export const ExpressionCompiler = {
             // to fix not-a-constructor tests.
             this.vm.label(dnewNotTa);
             const dnewConstructable = this.ctx.newLabel("dnew_constructable");
+            // Dynamic generator/async functions carry non-constructor status
+            // in the host metadata side table.  Check it at the language
+            // EvaluateNew seam so the normal exception context catches the
+            // TypeError (throwing from inside _fn_construct_call bypassed that
+            // seam and corrupted the helper's native frame).
+            this.vm.mov(VReg.A0, VReg.S1);
+            this.vm.call("_is_nonctor_fn");
+            this.vm.cmpImm(VReg.RET, 0);
+            this.vm.jne("_dnew_not_ctor_throw");
+            this.vm.load(VReg.V1, VReg.S1, 8); // restore fnptr clobbered by helper
             this.vm.lea(VReg.V0, "_aref_generic");
             this.vm.cmp(VReg.V1, VReg.V0);
             this.vm.jeq("_dnew_not_ctor_throw");
@@ -2465,6 +2628,28 @@ export const ExpressionCompiler = {
             this.vm.mov(VReg.A0, VReg.RET);
             this.vm.call("_throw_type_error"); // does not return
             this.vm.label(dnewConstructable);
+            // Promise validates the executor before
+            // GetPrototypeFromConstructor(NewTarget).  Generic
+            // _fn_construct_call reads newTarget.prototype first, so an empty
+            // args list with a poisoned newTarget prototype exposed the getter
+            // instead of throwing the required executor TypeError.
+            const dnewNotPromiseCtor = this.ctx.newLabel("dnew_not_promise_ctor");
+            this.vm.load(VReg.V1, VReg.S1, 8);
+            this.vm.lea(VReg.V0, "_promise_ctor_call");
+            this.vm.cmp(VReg.V1, VReg.V0);
+            this.vm.jne(dnewNotPromiseCtor);
+            this.vm.load(VReg.A0, VReg.FP, dnArgsSlot);
+            this.vm.movImm(VReg.A1, 0);
+            this.vm.call("_array_get");
+            this.vm.mov(VReg.A0, VReg.RET);
+            this.vm.call("_pnpc_is_callable");
+            this.vm.cmpImm(VReg.RET, 0);
+            this.vm.jne(dnewNotPromiseCtor);
+            this.vm.lea(VReg.A0, this.asm.addString("Promise executor is not callable"));
+            this.vm.call("_js_box_string");
+            this.vm.mov(VReg.A0, VReg.RET);
+            this.vm.call("_throw_type_error");
+            this.vm.label(dnewNotPromiseCtor);
             this.vm.load(VReg.RET, VReg.FP, dnArgsSlot); // RET = 实参 boxed 数组
             this.vm.mov(VReg.A1, VReg.RET); // 先取 RET(与 A0 同物理寄存器 X0/RAX!)
             this.vm.load(VReg.A0, VReg.FP, dnFnValSlot);

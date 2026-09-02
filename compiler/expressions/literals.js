@@ -29,8 +29,12 @@ function floatToInt64Bits(value) {
     let biasedExp = e + 1023;
     if (biasedExp >= 2047) return sign | 0x7ff0000000000000n; // 溢出 Infinity
     if (biasedExp <= 0) {
-        // 次正规（|value| < 2^-1022）——编译器数字字面量不会到这么小，安全兜底
-        return sign;
+        // Subnormal payload = original * 2^1074. `value` is the normalized
+        // mantissa and original=value*2^e, leaving an exact power-of-two scale.
+        let sub = value;
+        let shift = e + 1074;
+        while (shift > 0) { sub = sub * 2; shift = shift - 1; }
+        return sign | BigInt(Math.round(sub));
     }
 
     // 尾数 52 位：(value-1)*2^52 对规格化 double 恰为整数（无舍入）
@@ -48,6 +52,36 @@ function floatToInt64Bits(value) {
 // 获取数值的 IEEE 754 float64 位模式（供外部使用）
 export function getFloat64Bits(value) {
     return floatToInt64Bits(value);
+}
+
+// Lexer string literals are stored as byte-preserving UTF-8 strings so the
+// native and self-hosted compilers emit identical bytes.  Before asking the
+// host to parse a known StringNumericLiteral, map ECMAScript's Unicode white
+// space (whether represented as a real code unit or its UTF-8 byte sequence)
+// to ASCII space.  Internal spaces still make the numeric literal invalid;
+// only the host Number parser performs the actual grammar/rounding work.
+export function parseStringNumericLiteral(value) {
+    var out = "";
+    for (var i = 0; i < value.length; i++) {
+        var c = value.charCodeAt(i);
+        var isSingle = c === 0x00A0 || c === 0x1680 ||
+            (c >= 0x2000 && c <= 0x200A) || c === 0x2028 || c === 0x2029 ||
+            c === 0x202F || c === 0x205F || c === 0x3000 || c === 0xFEFF;
+        if (isSingle) { out = out + " "; continue; }
+        var c1 = i + 1 < value.length ? value.charCodeAt(i + 1) : -1;
+        var c2 = i + 2 < value.length ? value.charCodeAt(i + 2) : -1;
+        if (c === 0xC2 && c1 === 0xA0) { out = out + " "; i = i + 1; continue; }
+        if (c === 0xE1 && c1 === 0x9A && c2 === 0x80) { out = out + " "; i = i + 2; continue; }
+        if (c === 0xE2 && c1 === 0x80 &&
+            ((c2 >= 0x80 && c2 <= 0x8A) || c2 === 0xA8 || c2 === 0xA9 || c2 === 0xAF)) {
+            out = out + " "; i = i + 2; continue;
+        }
+        if (c === 0xE2 && c1 === 0x81 && c2 === 0x9F) { out = out + " "; i = i + 2; continue; }
+        if (c === 0xE3 && c1 === 0x80 && c2 === 0x80) { out = out + " "; i = i + 2; continue; }
+        if (c === 0xEF && c1 === 0xBB && c2 === 0xBF) { out = out + " "; i = i + 2; continue; }
+        out = out + value.charAt(i);
+    }
+    return Number(out);
 }
 
 // 直接从 bits 创建数字字面量（用于常量折叠等优化）
@@ -114,7 +148,7 @@ export const LiteralCompiler = {
         const label = this.asm.addString(str);
         // 数据段是 C 串:_strlen 扫到 NUL 即停。含嵌入 0 字节的字面量
         // (如 "\u0000")必须拷进带 length 头的堆串,否则 /\x00/.exec("\u0000") 对空输入。
-        // 用 charCodeAt===0 探测,勿写 "\0" 字面量(自举后该针本身会被截成空串)。
+        // 用 charCodeAt===0 探测，显式区分嵌入 NUL 与普通 C 串终止符。
         let hasNul = false;
         for (let ni = 0; ni < str.length; ni = ni + 1) {
             if (str.charCodeAt(ni) === 0) { hasNul = true; break; }

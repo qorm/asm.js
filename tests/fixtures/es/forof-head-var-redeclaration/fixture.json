@@ -1,0 +1,10 @@
+{
+  "description": "A body var redeclaration preserves the for-of head binding value.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "1 99",
+    "exitCode": 0
+  }
+}

@@ -610,7 +610,9 @@ export class VirtualMachine {
     // 寄存器到寄存器
     mov(dest, src) {
         if (this._recN >= 0) { const k = this._recN; if (k < REC_CAP) { this._recOp[k] = RC_MOV; this._recA[k] = dest; this._recB[k] = src; this._recC[k] = 0; this._recN = k + 1; return; } this._flushRecordVerbatim(); }
-        this.backend.mov(dest, src);
+        const b = this.backend;
+        if (!b) throw new Error("VMBACKENDNULL_mov");
+        b.mov(dest, src);
     }
 
     // 立即数到寄存器
@@ -1008,6 +1010,8 @@ export class VirtualMachine {
 
     // 调用函数
     call(label) {
+        if (!this.backend) throw new Error("VM_BACKEND_MISSING:" + label);
+        if (!this.backend.regMap) throw new Error("VM_REGMAP_MISSING:" + label);
         if (this._recN >= 0) { const k = this._recN; if (k < REC_CAP) { this._recOp[k] = RC_CALL; this._recA[k] = label; this._recB[k] = 0; this._recC[k] = 0; this._recN = k + 1; return; } this._flushRecordVerbatim(); }
         this.backend.call(label);
     }

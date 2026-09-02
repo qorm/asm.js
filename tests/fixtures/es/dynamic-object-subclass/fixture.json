@@ -1,0 +1,10 @@
+{
+  "description": "Dynamic class extends Object reuses the host Object/Object.prototype singletons",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ok",
+    "exitCode": 0
+  }
+}

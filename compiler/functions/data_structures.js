@@ -574,18 +574,37 @@ export const DataStructureCompiler = {
                 continue;
             }
 
-            const keyLabel = this.asm.addString(keyName);
+            // 含 NUL 的静态键不能直接把数据段 C 串装箱：_tag_str_a1 只保存裸指针，
+            // 后续 _object_key_eq/_strlen 会在第一个 NUL 处截断。先按显式长度构造
+            // 标准堆串；属性值先落局部槽，避免构造键时覆盖 RET/A*。
+            let keyHasNul = false;
+            for (let ki = 0; ki < keyName.length; ki = ki + 1) {
+                if (keyName.charCodeAt(ki) === 0) { keyHasNul = true; break; }
+            }
+            const keyLabel = keyHasNul ? null : this.asm.addString(keyName);
             this.compileExpression(prop.value);
-            this.vm.mov(VReg.A2, VReg.RET);
+            let valueOffset = null;
+            if (keyHasNul) {
+                valueOffset = this.ctx.allocLocal(`__objv_nulkey_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, valueOffset, VReg.RET);
+                this.compileStringValue(keyName); // RET = boxed NUL-transparent key
+                this.vm.mov(VReg.A1, VReg.RET);   // object boxing below overwrites RET/A0
+            } else {
+                this.vm.mov(VReg.A2, VReg.RET);
+            }
             // Box the object pointer before calling _object_set (expects JSValue with tag 0x7FFD)
             this.vm.load(VReg.V0, VReg.FP, objOffset);  // V0 = raw object pointer
             this.vm.emitMaskLoad(VReg.V1);  // V1 = MASK
             this.vm.andMaskReg(VReg.V0, VReg.V0, VReg.V1);  // V0 = V0 & MASK
             this.vm.movImm64(VReg.V1, 0x7ffd000000000000n);  // V1 = TAG (object)
             this.vm.or(VReg.A0, VReg.V0, VReg.V1);  // A0 = boxed object JSValue
-            this.vm.lea(VReg.A1, keyLabel);
-            // Box the property key label as a JSValue string (TAG_STRING_BASE = 0x7FFC...)
-            this.vm.call("_tag_str_a1"); // key box->helper
+            if (keyHasNul) {
+                this.vm.load(VReg.A2, VReg.FP, valueOffset);
+            } else {
+                this.vm.lea(VReg.A1, keyLabel);
+                // Box the property key label as a JSValue string (TAG_STRING_BASE = 0x7FFC...)
+                this.vm.call("_tag_str_a1"); // key box->helper
+            }
             this.vm.call("_object_define");
         }
 

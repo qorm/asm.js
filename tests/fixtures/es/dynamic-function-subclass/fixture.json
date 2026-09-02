@@ -1,0 +1,10 @@
+{
+  "description": "GeneratorFunction subclasses preserve exact constructor argument forwarding, NewTarget.prototype, instanceof, and generator prototype descriptors",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ok",
+    "exitCode": 0
+  }
+}

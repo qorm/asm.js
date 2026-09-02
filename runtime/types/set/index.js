@@ -1356,11 +1356,9 @@ export class SetGenerator {
             vm.movImm(VReg.S4, 0); // 0 = 内建 _set_add
             vm.label("_scf_have_adder");
             vm.mov(VReg.A0, VReg.S1);
-            keyStr(VReg.A1, "Symbol.iterator");
-            vm.call("_object_get");
-            vm.shrImm(VReg.V3, VReg.RET, 48);
-            vm.cmpImm(VReg.V3, 0x7FFF);
-            vm.jne("_scf_not_iter");
+            vm.call("_get_method_iterator"); // well-known Symbol, then legacy string key
+            vm.cmpImm(VReg.RET, 0);
+            vm.jeq("_scf_not_iter");
             vm.mov(VReg.A0, VReg.RET);
             vm.mov(VReg.A1, VReg.S1);
             vm.call("_spread_call0");

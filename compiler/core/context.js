@@ -43,6 +43,10 @@ export class CompileContext {
         this.functions = {}; // 函数声明: 符号名 -> AST 节点(Map 在 gen1 上常数税更重,实测慢于 {})
         this.functionAliases = {}; // 当前编译单元中的函数别名: 本地名 -> 符号名
         this.isAsync = false; // 是否是异步函数
+        // User-function local frame size (bytes) allocated by prologue().
+        // emitAsyncResolve/Reject must restore the same amount; compileFunction
+        // uses 32768 while compileFunctionBody uses 16384.
+        this._fnFrameSize = 0;
 
         // 使用函数名作为标签前缀，避免跨函数标签冲突
         this.labelPrefix = this.funcName + "_";
@@ -89,6 +93,12 @@ export class CompileContext {
         // 用户函数 LSRA:局部名 → T*(与 spill home 同槽)。raVm 在 beginRecord 期间挂上。
         this.raVm = null;
         this.localTemps = null;
+        // Engine fragments run inside the self-hosted x64 compiler. Its compact
+        // Map can lose equal string keys, so fragments opt into a tiny
+        // content-based side table for local bindings. Normal AOT contexts keep
+        // this disabled (null) and retain the O(1) Map-only path.
+        this._engineLocalNames = null;
+        this._engineLocalOffsets = null;
     }
 
     // 兼容旧接口
@@ -167,6 +177,10 @@ export class CompileContext {
             }
         }
         this.locals.set(name, off);
+        if (this._engineLocalNames && this._engineLocalOffsets) {
+            this._engineLocalNames.push(name);
+            this._engineLocalOffsets.push(off);
+        }
         this.varTypes[name] = type;
         // 录制中 / 在线 RA 为普通局部绑 T*(跳过 __ 合成名);装箱/裸 int 读路径仍走 FP,忽略 T*。
         // 关:RA_NO_TEMP=1
@@ -187,6 +201,24 @@ export class CompileContext {
     getLocal(name) {
         const v = this.locals.get(name);
         if (v && typeof v !== "number") return 0;
+        // Valid local offsets are strictly negative; a self-hosted Map miss can
+        // surface as numeric zero, which must still reach the fallback table.
+        if (typeof v === "number" && v < 0) return v;
+        // Self-hosted fragment fallback: compare string contents, not object
+        // identity, and search backwards to preserve shadowing semantics.
+        const names = this._engineLocalNames;
+        const offs = this._engineLocalOffsets;
+        if (names && offs && typeof name === "string") {
+            for (let i = names.length - 1; i >= 0; i--) {
+                const a = names[i];
+                if (typeof a !== "string" || a.length !== name.length) continue;
+                let same = true;
+                for (let j = 0; j < name.length; j++) {
+                    if (a.charCodeAt(j) !== name.charCodeAt(j)) { same = false; break; }
+                }
+                if (same) return offs[i];
+            }
+        }
         return v;
     }
 
@@ -238,6 +270,7 @@ export class CompileContext {
             scopeDepth: this.scopeDepth - 1,
             breakLabel: this.breakLabel,
             continueLabel: this.continueLabel,
+            engineLocalLength: this._engineLocalNames ? this._engineLocalNames.length : 0,
         };
     }
 
@@ -257,6 +290,10 @@ export class CompileContext {
         this.scopeDepth = saved.scopeDepth;
         this.breakLabel = saved.breakLabel;
         this.continueLabel = saved.continueLabel;
+        if (this._engineLocalNames && this._engineLocalOffsets && saved.engineLocalLength != null) {
+            this._engineLocalNames.length = saved.engineLocalLength;
+            this._engineLocalOffsets.length = saved.engineLocalLength;
+        }
     }
 
     // 检查当前是否在嵌套作用域中（非顶层）
@@ -361,6 +398,7 @@ export class CompileContext {
         newCtx.superClassExpr = this.superClassExpr;
         newCtx.superInfoLabel = this.superInfoLabel;
         newCtx.inStaticMethod = this.inStaticMethod; // 静态方法内 super.m() 走父类对象(非 prototype)
+        newCtx._fnFrameSize = this._fnFrameSize;
         // [支柱②] 去虚拟化局部 new 跟踪(函数作用域):浅拷贝——方法见外层类型,
         // 方法内自有赋值不回写外层(语义按函数作用域隔离)。
         // 避免 `{...}` 展开(gen1 上更贵);空表不分配。
@@ -377,6 +415,10 @@ export class CompileContext {
         }
         // LSRA:子帧共享同一 VM,录制期 allocLocal 可绑 T*
         newCtx.raVm = this.raVm;
+        if (this._engineLocalNames && this._engineLocalOffsets) {
+            newCtx._engineLocalNames = [];
+            newCtx._engineLocalOffsets = [];
+        }
         return newCtx;
     }
 }

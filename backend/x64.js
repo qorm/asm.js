@@ -1173,9 +1173,8 @@ export class X64Backend extends Backend {
     }
 
     // 动态系统调用号：从寄存器读取调用号（__syscall 内建用）。
-    // 调用者用 V1(=RCX) 传号，A0..A2 已就位。号必须进 RAX。
-    // 注意 x64 上 V1==A3==RCX：>=4 参数的系统调用会冲突(A3 被号覆盖)，
-    // 但 self-host 的 I/O(write/read/open/close/exit 等)均 <=3 参数，未触发。
+    // lowering 使用 V0(=RAX) 传号，避免覆盖 A3(=RCX)；A3 在 syscall 前
+    // 搬到内核 ABI 要求的 R10，因此 getsockopt/setsockopt 等 5 参数调用可用。
     syscallReg(reg) {
         const rs = this._getReg(reg, Reg.RAX);
         if (rs !== Reg.RAX) {

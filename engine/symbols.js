@@ -4,7 +4,7 @@
 // 分派表都由本表派生,顺序即 ABI。
 export const SYM_NAMES = [
     "_number_coerce", "_js_add", "_valueToStr", "_strconcat",
-    "_object_get_ic", "_subscript_get", "_math_sqrt", "_js_band",
+    "_object_get_ic", "_subscript_get", "_math_sqrt", "_math_f16round", "_js_band",
     "_js_bor", "_js_bxor", "_js_bshl", "_js_bshr",
     "_js_bushr", "_to_boolean", "_js_relcmp", "_math_abs",
     "_math_floor", "_math_ceil", "_math_round", "_math_pow",
@@ -79,6 +79,7 @@ export const SYM_NAMES = [
     "_set_coerce_arg", "_set_delete", "_set_entries", "_set_has",
     "_set_new", "_set_values", "_str_concat_ip", "_str_index_char",
     "_str_localeCompare", "_str_match", "_str_matchAll", "_str_proto_codePointAt",
+    "_str_proto_codePointAt_utf16",
     "_str_search", "_str_substr", "_str_trimEnd", "_str_trimStart",
     "_string_new", "_strlen", "_subscript_key_int", "_symbol_new",
     "_symbol_to_string", "_syscall_ptr", "_ta_at", "_ta_buffer",
@@ -91,7 +92,8 @@ export const SYM_NAMES = [
     "_typed_array_set", "_typed_array_view", "_win_build_argv",
     // 取地址(lea)引用的运行时代码标签:闭包/构造器 trampoline、内建函数值体。
     // 片段里当函数指针存进闭包对象,故也要能按 symId 拿宿主地址。
-    "_aref_generic", "_aref_static_tramp", "_bound_tramp", "_builtin_number",
+    "_aref_generic", "_aref_static_tramp", "_aref_bi_toLocaleString", "_aref_bi_toString",
+    "_aref_bi_valueOf", "_bound_tramp", "_builtin_number",
     "_date_call", "_fp_throw_accessor", "_object_ctor_call", "_print_wrapper",
     "_spawn_tramp", "_ta_ctor_tramp", "_thread_smoke_child",
     // resizable ArrayBuffer(末尾追加)
@@ -100,7 +102,8 @@ export const SYM_NAMES = [
     "_ab_maxbytelength_prop_dyn", "_ab_resizable_prop_dyn", "_ta_track_div",
     "_ta_link_ctor",
     // ArrayBuffer detach(末尾追加)
-    "_arraybuffer_detach", "_ta_is_detached", "_tam_throw_if_detached",
+    "_arraybuffer_detach", "_arraybuffer_is_immutable", "_arraybuffer_transfer_to_immutable",
+    "_ta_is_detached", "_tam_throw_if_detached", "_tam_throw_if_immutable_write",
     "_ta_throw_detached", "_ta_is_oob",
     // TypedArray [[DefineOwnProperty]] / Reflect.defineProperty(末尾追加)
     "_object_define_own", "_object_define_own_dyn",
@@ -160,6 +163,90 @@ export const SYM_NAMES = [
     "_tag_str_r",
     // TA 子类实例原型侧表(末尾追加;class extends Uint8Array 的 super()/instanceof)
     "_ta_bind_instance_proto", "_ta_lookup_instance_proto",
+    // Array generic Get/HasProperty by index(for-of / callbacks;末尾追加)
+    "_agen_has_idx", "_agen_get_idx", "_typed_array_get",
+    // Array 裸值调用(for-of eval 空数组路径;末尾追加)
+    "_array_ctor_call",
+    // Array generic 方法入口(members.js → eval 片段 adrp;末尾追加)
+    "_agen_at", "_agen_copyWithin", "_agen_entries", "_agen_every",
+    "_agen_fill", "_agen_find", "_agen_findIndex", "_agen_findLast",
+    "_agen_findLastIndex", "_agen_flat", "_agen_flatMap", "_agen_forEach",
+    "_agen_includes", "_agen_indexOf", "_agen_join", "_agen_keys",
+    "_agen_lastIndexOf", "_agen_reduce", "_agen_reduceRight", "_agen_reverse",
+    "_agen_shift", "_agen_some", "_agen_toReversed", "_agen_toSorted",
+    "_agen_toSpliced", "_agen_unshift", "_agen_values", "_agen_with",
+    // Array 物化静态/泛型 push(for-of eval emitArrayCtorObject;末尾追加)
+    "_fpg_arr_push", "_isarray_ref", "_array_from_ref", "_array_of_ref",
+    "_get_this",
+    // Construct NewTarget 槽(.data;与 _call_argc 同族;末尾追加)
+    "_call_new_target",
+    // 宿主 Array.prototype 单例槽(for-of eval 读默认 @@iterator;末尾追加)
+    "_nsobj_array_proto",
+    // eval/new Function 片段 class 前预热 %TypedArray%(末尾追加)
+    "_ta_eval_prewarm",
+    // Object.prototype 物化(emitObjectCtorObject;末尾追加)
+    "_aref_obj_valueOf", "_is_prototype_of",
+    "_aref_obj_defineGetter", "_aref_obj_defineSetter",
+    "_aref_obj_lookupGetter", "_aref_obj_lookupSetter",
+    // Object 静态方法物化(emitObjectCtorObject;末尾追加)
+    "_object_keys", "_object_gopn", "_object_freeze",
+    "_object_seal", "_object_preventExtensions",
+    "_object_isFrozen", "_object_isSealed", "_object_isExtensible",
+    "_object_getPrototypeOf", "_object_define_properties_dyn",
+    "_object_fromEntries", "_object_is_value",
+    // %TypedArray%[@@species] 惰装(勿内联 _ta_intrinsic;末尾追加)
+    "_ta_ensure_species",
+    // Function intrinsic runtime materialisation + late singleton slot.
+    // Append-only: engine fragment symbol ids are an ABI.
+    "_ensure_function_ctor_runtime", "_fnctor_singleton",
+    // Arguments iterator installation is emitted by dynamically compiled
+    // Function bodies that reference `arguments`.
+    "_args_install_iterator",
+    // Dynamic GeneratorFunction / AsyncFunction / AsyncGeneratorFunction
+    // fragments use the same coroutine/runtime entry points as AOT functions.
+    // Append-only: fragment relocation ids are an ABI.
+    "_ensure_gen_proto", "_gen_return_pending", "_gen_return_value",
+    "_coroutine_resume", "_ensure_asyncgen_proto", "_async_generator_new",
+    "_agen_return_queued", "_agen_unwrap_pending", "_agen_unwrap_return_p",
+    "_agen_unwrap_value",
+    // Runtime registration used by the eval/new-Function shim.  The shim
+    // calls this through a compiler-recognised intrinsic, so normal programs
+    // that do not use dynamic function constructors pay no code-size cost.
+    "_dynamic_fn_maker_set", "_dynamic_fn_meta_add",
+    "_nsobj_promise",
+    "_ta_dynamic_ctor_ref",
+    // eval fragments that allocate ordinary objects may lazily materialise
+    // Object.prototype through _object_new.
+    "_object_proto_ensure",
+    "_array_set_instance_proto",
+    "_agen_toString",
+    // eval/new Function fragments may materialise Number.prototype method
+    // closures whose helper labels live in the host runtime. Keep append-only.
+    "_aref_num_toString", "_aref_num_valueOf",
+    // Dynamically compiled fragments can enter with/for-of paths that need
+    // primitive Symbol boxing and the shared @@iterator lookup helper.
+    // Append-only: fragment relocation ids are an ABI.
+    "_symbol_wrap", "_bigint_wrap", "_get_method_iterator", "_spread_call0",
+    // Generic for-of body abrupt completion closes the active iterator while
+    // preserving the original throw completion. Dynamic eval/new-Function
+    // fragments emit this helper too, so it belongs in the append-only ABI.
+    "_iterator_close_keep",
+    // One-shot marker used by the variadic String.prototype.concat trampoline
+    // to carry an argument count beyond the ordinary 16-slot call ABI.
+    "_call_argc_ext",
+    // Object.getOwnPropertyDescriptors runtime helper. Append-only: symbol
+    // ids are part of the engine/fragment relocation ABI.
+    "_object_getOwnPropertyDescriptors",
+    // Dynamic class fragments resolve Function.prototype through the lazy
+    // runtime materialiser rather than recursively emitting it in the
+    // pending-function compiler. Append-only ABI entry.
+    "_ensure_function_proto",
+    // Class heritage expression validation (IsConstructor) is emitted by
+    // route-B dynamic class fragments. Keep this at the ABI tail so existing
+    // fragment relocation ids remain stable.
+    "_pspc_is_ctor",
+    // Object intrinsic singleton slots shared by dynamic fragments.
+    "_nsobj_object", "_nsobj_object_proto", "_nsobj_object_ready",
 ];
 
 // 表中**不是代码标签**的名字:.data 段全局槽(数据段在 _engine_symaddr 生成之后才发射)
@@ -168,10 +255,18 @@ export const SYM_NAMES = [
 // (如 `eval("x")` 读 _global_this → ldr [0] → SIGSEGV)。
 export const SYM_LATE_LABELS = new Set([
     "_heap_base", "_heap_ptr", "_exception_value", "_exception_pending",
-    "_exc_ctx_top", "_call_argc", "_call_argv", "_global_this",
+    "_exc_ctx_top", "_call_argc", "_call_argv", "_call_argc_ext", "_global_this",
+    "_call_new_target", "_nsobj_array_proto", "_fnctor_singleton",
     "_func_meta_strict", "_func_meta_entry", "_func_meta_init", "_main",
     "_symwk_iterator", "_symwk_asyncIterator", "_symwk_hasInstance",
     "_symwk_isConcatSpreadable", "_symwk_match", "_symwk_matchAll",
     "_symwk_replace", "_symwk_search", "_symwk_species", "_symwk_split",
     "_symwk_toPrimitive", "_symwk_toStringTag", "_symwk_unscopables",
+    "_gen_return_pending", "_gen_return_value", "_agen_return_queued",
+    "_agen_unwrap_pending", "_agen_unwrap_return_p", "_agen_unwrap_value",
+    "_dynamic_fn_maker_set", "_dynamic_fn_meta_add",
+    "_nsobj_promise",
+    "_nsobj_object", "_nsobj_object_proto", "_nsobj_object_ready",
+    // `_pspc_is_ctor` is a runtime code label (not a data slot); it is listed
+    // here only when a platform build emits the promise generator lazily.
 ]);

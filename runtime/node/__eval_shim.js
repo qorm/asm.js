@@ -85,6 +85,14 @@ export function __eval_direct(x, fp, layout) {
 // compileFunctionBody 处理),直接返回。用户调用它走标准闭包调用约定(callIndirect 到片段页
 // 内的函数体),无需手工载参。片段 mmap 页执行后不释放,故闭包函数指针恒有效。
 export function __makeFunction(names, body) {
+    const _traceClass = typeof process !== "undefined" && process.env && process.env.ASMJS_TRACE_CLASS === "1";
+    if (_traceClass) console.log("MF_ENTER", names && names.length, body && body.length);
+    if (typeof print === "function") print("MF_BEGIN");
+    // A caught exception must not poison the next dynamic compilation.  The
+    // host exception channel is normally cleared by catch dispatch, but route
+    // B can be entered immediately after a caught native helper error (the
+    // test262 well-known-intrinsics probe does exactly this).
+    __engine_clear_pending_exception();
     const src = typeof body === "string" ? body : "";
     // 形参串:各字符串实参本身可含逗号(new Function("a,b","...") 合法),原样拼接为形参列表
     // (默认值/rest/解构由 parser 处理,无需在此拆分)。
@@ -94,9 +102,13 @@ export function __makeFunction(names, body) {
     }
     const wrapped = "(function(" + params.join(",") + "){" + src + "})";
     const r = compileFragment(wrapped, HOST_TARGET);
+    if (_traceClass) console.log("MF_COMPILED", r && r.bytes && r.bytes.length, r && r.relocs && r.relocs.length);
+    if (typeof print === "function") print("MF_COMPILED");
     const fragArr = new Uint8Array(r.bytes);
     const relocArr = new Uint8Array(relocsToBytes(r.relocs));
     const fn = __engine_exec_reloc(fragArr, relocArr);
+    if (_traceClass) console.log("MF_EXEC", typeof fn);
+    if (typeof print === "function") print("MF_EXEC:" + String(fn));
     // 片段函数的 func_meta 不在宿主进程表 → gOPD(fn,"length") 恒 undefined
     // (15.2.3.3-4-187)。按形参列表粗算 arity 并 DefineOwnProperty 落侧表。
     var arity = 0;
@@ -115,5 +127,61 @@ export function __makeFunction(names, body) {
         enumerable: false,
         configurable: true,
     });
+    if (typeof print === "function") print("MF_END");
     return fn;
 }
+
+// CreateDynamicFunction for the three specialised intrinsic constructors.
+// `kind` is 1=generator, 2=async, 3=async-generator and `args` is the boxed
+// argument list assembled by the native constructor trampoline.  Keeping the
+// parser/compiler in this JS shim gives these constructors the same syntax,
+// default/rest parameter, and early-error behaviour as new Function.
+export function __makeFunctionKind(kind, args, newTarget) {
+    __engine_clear_pending_exception();
+    const list = [];
+    const n = Array.isArray(args) ? args.length : 0;
+    for (let i = 0; i < n; i++) list.push(args[i]);
+    const body = list.length > 0 ? String(list[list.length - 1]) : "";
+    const params = [];
+    for (let i = 0; i + 1 < list.length; i++) params.push(list[i]);
+    const psrc = params.map((x) => String(x)).join(",");
+    let prefix = "function";
+    if (kind === 1) prefix = "function*";
+    else if (kind === 2) prefix = "async function";
+    else if (kind === 3) prefix = "async function*";
+    const wrapped = "(" + prefix + " anonymous(" + psrc + "){" + body + "})";
+    const r = compileFragment(wrapped, HOST_TARGET);
+    const fragArr = new Uint8Array(r.bytes);
+    const relocArr = new Uint8Array(relocsToBytes(r.relocs));
+    const fn = __engine_exec_reloc(fragArr, relocArr);
+    const fm = r.functionMeta;
+    const arity = fm && typeof fm.arity === "number" ? fm.arity :
+        (params.length > 0 ? 1 + psrc.split(",").length - 1 : 0);
+    // Dynamic functions receive the standard anonymous name and the same
+    // configurable, non-enumerable, non-writable name/length descriptors as
+    // the spec's CreateDynamicFunction operation.
+    Object.defineProperty(fn, "name", {
+        value: "anonymous", writable: false, enumerable: false, configurable: true,
+    });
+    Object.defineProperty(fn, "length", {
+        value: arity, writable: false, enumerable: false, configurable: true,
+    });
+    // GetPrototypeFromConstructor(NewTarget, fallbackProto).  Fragment
+    // closures have no spare inline [[Prototype]] slot, so persist the exact
+    // result in their dynamic metadata node.  Calls (rather than Construct)
+    // have undefined NewTarget and already use the intrinsic fallback.
+    if (newTarget !== undefined) {
+        let proto = newTarget.prototype;
+        const protoType = typeof proto;
+        if (proto === null || (protoType !== "object" && protoType !== "function")) {
+            proto = Object.getPrototypeOf(fn);
+        }
+        __engine_set_dynamic_function_proto(fn, proto);
+    }
+    return fn;
+}
+
+// The three native intrinsic constructor singletons dispatch through this
+// maker.  Registration is a no-op for programs whose source never triggers
+// the eval shim import.
+__engine_set_dynamic_fn_maker(__makeFunctionKind, __makeFunctionKind, __makeFunctionKind);

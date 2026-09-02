@@ -8,6 +8,12 @@ import { JS_NULL, JS_UNDEFINED, JS_FALSE, JS_TRUE, JS_TAG_BOOL_BASE, JS_TAG_INT3
 const TYPE_NUMBER = 13;
 const TYPE_FLOAT64 = 29;
 
+// Correctly-rounded 10^e for -100 <= e <= 100.  Keep these as source
+// BigInt literals (rather than calling BigInt()/DataView while gen1 runs):
+// asm.js can emit literal 64-bit constants, but its bootstrap runtime cannot
+// execute arbitrary-precision BigInt construction during code generation.
+const STR_POW10_TENS_BITS = [0x2b2bff2ee48e0530n,0x2d404bd984990e6fn,0x2f52f8ac174d6123n,0x316615e91d8f359dn,0x3379b604aaaca626n,0x358dee7a4ad4b81fn,0x37a16c262777579cn,0x39b4484bfeebc2a0n,0x3bc79ca10c924223n,0x3ddb7cdfd9d7bdbbn,0x3ff0000000000000n,0x4202a05f20000000n,0x4415af1d78b58c40n,0x46293e5939a08cean,0x483d6329f1c35ca5n,0x4a511b0ec57e649an,0x4c63e9e4e4c2f344n,0x4e772ebad6ddc73dn,0x508afcef51f0fb5fn,0x529f6b0f092959c7n,0x54b249ad2594c37dn];
+
 export class CoercionGenerator {
     constructor(vm) {
         this.vm = vm;
@@ -478,6 +484,76 @@ export class CoercionGenerator {
         vm.jfgt("_bigint_cmp_gt");
         vm.movImm(VReg.RET, 0);
         vm.epilogue([VReg.S0, VReg.S1], 16);
+
+        // BigInt.prototype 方法(_aref_generic 蹦床 A0=this)。编译期物化须有链接符号。
+        const BI_STRTAG = 0x7ffc000000000000n;
+        const BI_MASK = 0x0000ffffffffffffn;
+        vm.label("_abi_recv_i64");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.S0);            // candidate payload (primitive BigInt)
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_is_bigint");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_abi_ri_prim");
+        vm.movImm64(VReg.V1, BI_MASK);
+        vm.and(VReg.A0, VReg.S0, VReg.V1);
+        vm.lea(VReg.A1, vm.asm.addString("__bigint_value"));
+        vm.movImm64(VReg.V2, BI_STRTAG);
+        vm.or(VReg.A1, VReg.A1, VReg.V2);
+        vm.call("_object_get");
+        vm.mov(VReg.S1, VReg.RET);            // boxed wrapper's [[BigIntData]]
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_is_bigint");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_abi_ri_bad");
+        vm.label("_abi_ri_prim");
+        vm.mov(VReg.A0, VReg.S1);             // _is_bigint clobbers A0/RET on arm64
+        vm.load(VReg.RET, VReg.A0, 0);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_abi_ri_bad");
+        vm.lea(VReg.A0, vm.asm.addString("Method BigInt.prototype called on incompatible receiver"));
+        vm.movImm64(VReg.V1, BI_STRTAG);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+
+        vm.label("_aref_bi_valueOf");
+        vm.prologue(0, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_is_bigint");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_abiv_ok");
+        vm.movImm64(VReg.V1, BI_MASK);
+        vm.and(VReg.A0, VReg.S0, VReg.V1);
+        vm.lea(VReg.A1, vm.asm.addString("__bigint_value"));
+        vm.movImm64(VReg.V2, BI_STRTAG);
+        vm.or(VReg.A1, VReg.A1, VReg.V2);
+        vm.call("_object_get");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_is_bigint");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_abiv_bad");
+        vm.mov(VReg.S0, VReg.S1);
+        vm.label("_abiv_ok");
+        vm.mov(VReg.RET, VReg.S0);
+        vm.epilogue([VReg.S0, VReg.S1], 0);
+        vm.label("_abiv_bad");
+        vm.lea(VReg.A0, vm.asm.addString("Method BigInt.prototype.valueOf called on incompatible receiver"));
+        vm.movImm64(VReg.V1, BI_STRTAG);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+
+        vm.label("_aref_bi_toString");
+        vm.prologue(0, [VReg.S0]);
+        vm.call("_abi_recv_i64");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_intToStr");
+        vm.epilogue([VReg.S0], 0);
+
+        vm.label("_aref_bi_toLocaleString");
+        vm.jmp("_aref_bi_toString");
     }
 
     // _js_parseInt(A0 = 字符串, A1 = radix JSValue) -> float64 位模式整数
@@ -747,9 +823,8 @@ export class CoercionGenerator {
         vm.jmp("_js_parseFloat_str");
         vm.label("_js_parseFloat_strobj_miss");
         // leftover-arg ToString of generic 0x7FFD: OrdinaryToPrimitive
-        // hint String. parseFloat({toString:()=>0}) leftover NaN vs 0
-        // (official A1_T7). _valueToStr treats toString()=>+0 as miss
-        // (RET==0) and uses valueOf. _parse_otp_string keeps +0.
+        // hint String. parseFloat({toString:()=>0}) must preserve +0
+        // (official A1_T7); the miss sentinel is now the original object.
         // Number/String wrappers already unboxed above.
         // Scratch V5/V6 (linux-x64 V0=RET). S0 is the object.
         vm.mov(VReg.A0, VReg.S0);
@@ -784,9 +859,8 @@ export class CoercionGenerator {
 
         // leftover wrapper boxing RET: OrdinaryToPrimitive hint String then
         // ToString. A0 = 0x7FFD generic obj. RET = boxed string.
-        // _object_user_tostr miss / toString()=>+0 both return RET==0.
-        // _valueToStr treats that as miss and uses valueOf (A1_T7 CHECK#2
-        // leftover 1 vs 0). Here RET==0 is +0.0 primitive → "0".
+        // _object_user_tostr returns the original object on miss, so a
+        // toString()=>+0 result remains an unambiguous primitive → "0".
         // Still-object tags → valueOf; both objects → TypeError.
         // Scratch V5/V6 (linux-x64 V0=RET).
         vm.label("_parse_otp_string");
@@ -1606,7 +1680,10 @@ export class CoercionGenerator {
      */
     generateStrToNum() {
         const vm = this.vm;
-
+        // Correctly-rounded decimal powers used by the common scientific-
+        // notation path.  Building the bits through the same self-host-safe
+        // literal splitter keeps gen1/gen2 deterministic and turns ninety
+        // successive divisions (ninety rounding points) into one multiply.
         vm.label("_str_to_num");
         vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
 
@@ -1647,13 +1724,63 @@ export class CoercionGenerator {
         vm.jeq("_str_to_num_skip_char");
         vm.cmpImm(VReg.V0, 10); // 换行
         vm.jeq("_str_to_num_skip_char");
+        vm.cmpImm(VReg.V0, 11); // 垂直制表
+        vm.jeq("_str_to_num_skip_char");
+        vm.cmpImm(VReg.V0, 12); // 换页
+        vm.jeq("_str_to_num_skip_char");
         vm.cmpImm(VReg.V0, 13); // 回车
         vm.jeq("_str_to_num_skip_char");
+        // ECMAScript StrWhiteSpace also includes the UTF-8 encodings of NBSP,
+        // line/paragraph separators, U+1680, U+2000..U+200A, U+202F,
+        // U+205F, U+3000 and BOM.  Runtime strings are byte-oriented, so match
+        // the sequences explicitly rather than treating their leading byte as
+        // a number character.
+        vm.cmpImm(VReg.V0, 0xC2); vm.jeq("_str_to_num_ws_c2");
+        vm.cmpImm(VReg.V0, 0xE1); vm.jeq("_str_to_num_ws_e1");
+        vm.cmpImm(VReg.V0, 0xE2); vm.jeq("_str_to_num_ws_e2");
+        vm.cmpImm(VReg.V0, 0xE3); vm.jeq("_str_to_num_ws_e3");
+        vm.cmpImm(VReg.V0, 0xEF); vm.jeq("_str_to_num_ws_ef");
         vm.jmp("_str_to_num_parse_start");
 
         vm.label("_str_to_num_skip_char");
         vm.addImm(VReg.S0, VReg.S0, 1);
         vm.jmp("_str_to_num_skip_ws");
+
+        vm.label("_str_to_num_ws_c2");
+        vm.loadByte(VReg.V1, VReg.S0, 1);
+        vm.cmpImm(VReg.V1, 0xA0);
+        vm.jne("_str_to_num_parse_start");
+        vm.addImm(VReg.S0, VReg.S0, 2);
+        vm.jmp("_str_to_num_skip_ws");
+        vm.label("_str_to_num_ws_e1");
+        vm.loadByte(VReg.V1, VReg.S0, 1); vm.cmpImm(VReg.V1, 0x9A); vm.jne("_str_to_num_parse_start");
+        vm.loadByte(VReg.V1, VReg.S0, 2); vm.cmpImm(VReg.V1, 0x80); vm.jne("_str_to_num_parse_start");
+        vm.addImm(VReg.S0, VReg.S0, 3); vm.jmp("_str_to_num_skip_ws");
+        vm.label("_str_to_num_ws_e2");
+        vm.loadByte(VReg.V1, VReg.S0, 1);
+        vm.cmpImm(VReg.V1, 0x80); vm.jeq("_str_to_num_ws_e2_80");
+        vm.cmpImm(VReg.V1, 0x81); vm.jeq("_str_to_num_ws_e2_81");
+        vm.jmp("_str_to_num_parse_start");
+        vm.label("_str_to_num_ws_e2_80");
+        vm.loadByte(VReg.V1, VReg.S0, 2);
+        vm.cmpImm(VReg.V1, 0x80); vm.jlt("_str_to_num_parse_start");
+        vm.cmpImm(VReg.V1, 0x8A); vm.jle("_str_to_num_ws_e2_3");
+        vm.cmpImm(VReg.V1, 0xA8); vm.jeq("_str_to_num_ws_e2_3");
+        vm.cmpImm(VReg.V1, 0xA9); vm.jeq("_str_to_num_ws_e2_3");
+        vm.cmpImm(VReg.V1, 0xAF); vm.jeq("_str_to_num_ws_e2_3");
+        vm.jmp("_str_to_num_parse_start");
+        vm.label("_str_to_num_ws_e2_81");
+        vm.loadByte(VReg.V1, VReg.S0, 2); vm.cmpImm(VReg.V1, 0x9F); vm.jne("_str_to_num_parse_start");
+        vm.label("_str_to_num_ws_e2_3");
+        vm.addImm(VReg.S0, VReg.S0, 3); vm.jmp("_str_to_num_skip_ws");
+        vm.label("_str_to_num_ws_e3");
+        vm.loadByte(VReg.V1, VReg.S0, 1); vm.cmpImm(VReg.V1, 0x80); vm.jne("_str_to_num_parse_start");
+        vm.loadByte(VReg.V1, VReg.S0, 2); vm.cmpImm(VReg.V1, 0x80); vm.jne("_str_to_num_parse_start");
+        vm.addImm(VReg.S0, VReg.S0, 3); vm.jmp("_str_to_num_skip_ws");
+        vm.label("_str_to_num_ws_ef");
+        vm.loadByte(VReg.V1, VReg.S0, 1); vm.cmpImm(VReg.V1, 0xBB); vm.jne("_str_to_num_parse_start");
+        vm.loadByte(VReg.V1, VReg.S0, 2); vm.cmpImm(VReg.V1, 0xBF); vm.jne("_str_to_num_parse_start");
+        vm.addImm(VReg.S0, VReg.S0, 3); vm.jmp("_str_to_num_skip_ws");
 
         // 检查符号
         // 寄存器分配:
@@ -1880,8 +2007,18 @@ export class CoercionGenerator {
         vm.jeq("_str_to_num_skip_trail_char");
         vm.cmpImm(VReg.V0, 10); // 换行
         vm.jeq("_str_to_num_skip_trail_char");
+        vm.cmpImm(VReg.V0, 11); // 垂直制表
+        vm.jeq("_str_to_num_skip_trail_char");
+        vm.cmpImm(VReg.V0, 12); // 换页
+        vm.jeq("_str_to_num_skip_trail_char");
         vm.cmpImm(VReg.V0, 13); // 回车
         vm.jeq("_str_to_num_skip_trail_char");
+        vm.cmpImm(VReg.V0, 0xC2); vm.jeq("_str_to_num_tws_c2");
+        vm.cmpImm(VReg.V0, 0xE1); vm.jeq("_str_to_num_tws_e1");
+        vm.cmpImm(VReg.V0, 0xE2); vm.jeq("_str_to_num_tws_e2");
+        vm.cmpImm(VReg.V0, 0xE3); vm.jeq("_str_to_num_tws_e3");
+        vm.cmpImm(VReg.V0, 0xEF); vm.jeq("_str_to_num_tws_ef");
+        vm.label("_str_to_num_trailing_nonws");
         // 不是空白,检查是否是结束符
         vm.cmpImm(VReg.V0, 0); // 结束符
         vm.jeq("_str_to_num_finish"); // 是结束符,有效
@@ -1897,6 +2034,39 @@ export class CoercionGenerator {
         vm.addImm(VReg.S0, VReg.S0, 1);
         vm.loadByte(VReg.V0, VReg.S0, 0);
         vm.jmp("_str_to_num_skip_trailing_ws");
+
+        vm.label("_str_to_num_tws_c2");
+        vm.loadByte(VReg.V1, VReg.S0, 1); vm.cmpImm(VReg.V1, 0xA0); vm.jne("_str_to_num_trailing_nonws");
+        vm.addImm(VReg.S0, VReg.S0, 2); vm.loadByte(VReg.V0, VReg.S0, 0); vm.jmp("_str_to_num_skip_trailing_ws");
+        vm.label("_str_to_num_tws_e1");
+        vm.loadByte(VReg.V1, VReg.S0, 1); vm.cmpImm(VReg.V1, 0x9A); vm.jne("_str_to_num_trailing_nonws");
+        vm.loadByte(VReg.V1, VReg.S0, 2); vm.cmpImm(VReg.V1, 0x80); vm.jne("_str_to_num_trailing_nonws");
+        vm.addImm(VReg.S0, VReg.S0, 3); vm.loadByte(VReg.V0, VReg.S0, 0); vm.jmp("_str_to_num_skip_trailing_ws");
+        vm.label("_str_to_num_tws_e2");
+        vm.loadByte(VReg.V1, VReg.S0, 1);
+        vm.cmpImm(VReg.V1, 0x80); vm.jeq("_str_to_num_tws_e2_80");
+        vm.cmpImm(VReg.V1, 0x81); vm.jeq("_str_to_num_tws_e2_81");
+        vm.jmp("_str_to_num_trailing_nonws");
+        vm.label("_str_to_num_tws_e2_80");
+        vm.loadByte(VReg.V1, VReg.S0, 2);
+        vm.cmpImm(VReg.V1, 0x80); vm.jlt("_str_to_num_trailing_nonws");
+        vm.cmpImm(VReg.V1, 0x8A); vm.jle("_str_to_num_tws_e2_3");
+        vm.cmpImm(VReg.V1, 0xA8); vm.jeq("_str_to_num_tws_e2_3");
+        vm.cmpImm(VReg.V1, 0xA9); vm.jeq("_str_to_num_tws_e2_3");
+        vm.cmpImm(VReg.V1, 0xAF); vm.jeq("_str_to_num_tws_e2_3");
+        vm.jmp("_str_to_num_trailing_nonws");
+        vm.label("_str_to_num_tws_e2_81");
+        vm.loadByte(VReg.V1, VReg.S0, 2); vm.cmpImm(VReg.V1, 0x9F); vm.jne("_str_to_num_trailing_nonws");
+        vm.label("_str_to_num_tws_e2_3");
+        vm.addImm(VReg.S0, VReg.S0, 3); vm.loadByte(VReg.V0, VReg.S0, 0); vm.jmp("_str_to_num_skip_trailing_ws");
+        vm.label("_str_to_num_tws_e3");
+        vm.loadByte(VReg.V1, VReg.S0, 1); vm.cmpImm(VReg.V1, 0x80); vm.jne("_str_to_num_trailing_nonws");
+        vm.loadByte(VReg.V1, VReg.S0, 2); vm.cmpImm(VReg.V1, 0x80); vm.jne("_str_to_num_trailing_nonws");
+        vm.addImm(VReg.S0, VReg.S0, 3); vm.loadByte(VReg.V0, VReg.S0, 0); vm.jmp("_str_to_num_skip_trailing_ws");
+        vm.label("_str_to_num_tws_ef");
+        vm.loadByte(VReg.V1, VReg.S0, 1); vm.cmpImm(VReg.V1, 0xBB); vm.jne("_str_to_num_trailing_nonws");
+        vm.loadByte(VReg.V1, VReg.S0, 2); vm.cmpImm(VReg.V1, 0xBF); vm.jne("_str_to_num_trailing_nonws");
+        vm.addImm(VReg.S0, VReg.S0, 3); vm.loadByte(VReg.V0, VReg.S0, 0); vm.jmp("_str_to_num_skip_trailing_ws");
 
         // 无数字输入处理(空字符串或纯空白)。leftover-number boxing leftover 0
         // ToNumber: Number("")=0; parseFloat("") leftover 0 vs NaN (official
@@ -1975,6 +2145,24 @@ export class CoercionGenerator {
         vm.label("_str_to_num_apply_exp");
         vm.cmpImm(VReg.S5, 0);
         vm.jeq("_str_to_num_apply_sign");
+        // Multiples of ten use a directly embedded, correctly-rounded scale.
+        // This avoids both accumulated division error and runtime data-table
+        // address fixups in self-hosted snapshots.  Other exponents retain the
+        // general fallback below.
+        for (let pi = 0; pi < STR_POW10_TENS_BITS.length; pi++) {
+            const nextPow = "_str_to_num_exp_tens_next_" + pi;
+            vm.cmpImm(VReg.S5, -100 + pi * 10);
+            vm.jne(nextPow);
+            vm.movImm64(VReg.V1, STR_POW10_TENS_BITS[pi]);
+            vm.jmp("_str_to_num_exp_tens_ready");
+            vm.label(nextPow);
+        }
+        vm.jmp("_str_to_num_exp_fallback");
+        vm.label("_str_to_num_exp_tens_ready");
+        vm.fmovToFloat(1, VReg.V1);
+        vm.fmul(0, 0, 1);
+        vm.jmp("_str_to_num_apply_sign");
+        vm.label("_str_to_num_exp_fallback");
         vm.mov(VReg.V0, VReg.S5);
         vm.movImm(VReg.V2, 0);
         vm.cmpImm(VReg.V0, 0);
@@ -2403,12 +2591,30 @@ export class CoercionGenerator {
         vm.call("_number_coerce");
         vm.epilogue([VReg.S0, VReg.S1], 64);
         vm.label("_num_coerce_obj_tostring");
-        // OrdinaryToPrimitive hint Number 第二步:toString → 再 ToNumber(串)
+        // OrdinaryToPrimitive hint Number 第二步:invoke toString exactly
+        // once, then ToNumber its primitive result.  Calling _valueToStr on
+        // the original object restarted OrdinaryToPrimitive and observed the
+        // valueOf getter twice (and could run user code twice).
         vm.mov(VReg.A0, VReg.S0);
-        vm.call("_valueToStr");
-        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_object_user_tostr");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.shrImm(VReg.V0, VReg.S1, 48);
+        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.jeq("_num_coerce_obj_toprim_fail");
+        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.jeq("_num_coerce_obj_toprim_fail");
+        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.jeq("_num_coerce_obj_toprim_fail");
+        vm.mov(VReg.A0, VReg.S1);
         vm.call("_number_coerce");
         vm.epilogue([VReg.S0, VReg.S1], 64);
+        vm.label("_num_coerce_obj_toprim_fail");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot convert object to primitive value"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
 
         vm.label("_num_coerce_undefined");
         // undefined → NaN。必须用 0x7ff0000000000001(high16=0x7ff0 的信号 NaN),不能用
@@ -2801,7 +3007,8 @@ export class CoercionGenerator {
 
     /**
      * _to_integer: ToIntegerOrInfinity → 有符号 int64。
-     * NaN → 0; ±Inf 走 fcvtzs 饱和( +Inf=INT64_MAX, -Inf=INT64_MIN )。
+     * NaN → 0; ±Inf 显式映射到 INT64_MAX / INT64_MIN。不能依赖
+     * fcvtzs/cvttsd2si 的越界结果：部分后端对 +Inf 也返回 INT64_MIN。
      * 禁当 ToInt32:2^53 级下标会被截成低 32 位。
      */
     generateToInteger() {
@@ -2819,6 +3026,14 @@ export class CoercionGenerator {
         vm.and(VReg.V1, VReg.RET, VReg.V1);
         vm.cmpImm(VReg.V1, 0);
         vm.jne("_to_integer_zero"); // NaN
+        vm.shrImm(VReg.V1, VReg.RET, 63);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_to_integer_neg_inf");
+        vm.movImm64(VReg.RET, 0x7FFFFFFFFFFFFFFFn);
+        vm.epilogue([VReg.S0], 32);
+        vm.label("_to_integer_neg_inf");
+        vm.movImm64(VReg.RET, 0x8000000000000000n);
+        vm.epilogue([VReg.S0], 32);
         vm.label("_to_integer_finite");
         vm.fcvtzs(VReg.RET, 0);
         vm.epilogue([VReg.S0], 32);

@@ -523,6 +523,12 @@ function bsWalkTry(node, st) {
                     bsRegIdentity(st, frame, idn.name);
                 }
             }
+            // Destructuring catch parameters may contain default expressions whose
+            // closures are evaluated in the fresh catch lexical environment. Walk
+            // those defaults while the catch frame is active so references such as
+            // `function () { return x; }` bind to the renamed catch parameter,
+            // rather than accidentally capturing an outer `x`.
+            bsWalkPatternDefaults(node.handler.param, st);
         }
         bsWalkStmt(node.handler.body, st);
         bsPopFrame(st);

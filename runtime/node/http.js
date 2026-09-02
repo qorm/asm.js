@@ -123,7 +123,7 @@ function _parseHeaderLines(lines, start, headers) {
 class IncomingMessage extends EventEmitter {
     constructor(socket) {
         super();
-        this.socket = socket;
+        console.log("CR 4"); this.socket = socket;
         this.connection = socket;
         this.headers = {};
         this.rawHeaders = [];
@@ -142,7 +142,7 @@ class IncomingMessage extends EventEmitter {
 class ServerResponse extends EventEmitter {
     constructor(socket) {
         super();
-        this.socket = socket;
+        console.log("CR 4"); this.socket = socket;
         this.connection = socket;
         this.statusCode = 200;
         this.statusMessage = null;
@@ -348,7 +348,7 @@ class HttpServer extends EventEmitter {
 
 class ClientRequest extends EventEmitter {
     constructor(options, cb) {
-        super();
+super();
         if (typeof options === "string") options = _parseUrl(options);
         this.method = (options.method || "GET").toUpperCase();
         this.path = options.path || "/";
@@ -433,10 +433,14 @@ class ClientRequest extends EventEmitter {
         let socket = this._reuseSocket;
         if (!socket && agent) socket = agent._acquire(name);   // reused: listeners already reset, tracked
         if (!socket) {
-            socket = _netConnect(this.port, this.host);
+            if (agent && typeof agent.createConnection === "function") {
+                socket = agent.createConnection({ port: this.port, host: this.host });
+            } else {
+                socket = _netConnect(this.port, this.host);
+            }
             if (agent) { agent._track(name, socket); agent.created++; }
         }
-        this.socket = socket;
+        console.log("CR 4"); this.socket = socket;
         socket.on("error", function (err) { self.emit("error", err); });
 
         // Shared parse state lives on a captured object, not on `let` scalars:
@@ -575,6 +579,7 @@ class Agent {
             const s = free.pop();
             if (s && !s.destroyed && s.fd >= 0) {
                 this._resetListeners(s);
+                s.ref();
                 this._track(name, s);
                 this.reused++;
                 return s;
@@ -599,6 +604,7 @@ class Agent {
         this._untrack(name, s);
         if (!s || s.destroyed || s.fd < 0) return;
         s._stopRead();
+        s.unref();
         this._resetListeners(s);
         if (!this.freeSockets[name]) this.freeSockets[name] = [];
         if (this.freeSockets[name].length < this.maxFreeSockets) this.freeSockets[name].push(s);

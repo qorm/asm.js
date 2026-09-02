@@ -1,0 +1,10 @@
+{
+  "description": "var keyed destructuring writes an existing with binding while leaving the function var untouched",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "7 undefined undefined\n",
+    "exitCode": 0
+  }
+}

@@ -66,7 +66,10 @@ export function getSyscall(name) {
             if (name === "bind") return 49;
             if (name === "listen") return 50;
             if (name === "setsockopt") return 54;
+            if (name === "getsockopt") return 55;
             if (name === "getsockname") return 51;
+            if (name === "getpeername") return 52;
+            if (name === "fcntl") return 72;
             // net readiness polling (async event loop): poll(2)
             if (name === "poll") return 7;
             if (name === "shutdown") return 48; // half-close (SHUT_WR) on socket.end()
@@ -97,7 +100,10 @@ export function getSyscall(name) {
         if (name === "accept") return 202;
         if (name === "connect") return 203;
         if (name === "setsockopt") return 208;
-        if (name === "getsockname") return 205;
+        if (name === "getsockopt") return 209;
+        if (name === "getsockname") return 204;
+        if (name === "getpeername") return 205;
+        if (name === "fcntl") return 25;
         // net readiness polling (async event loop): linux-arm64 has no poll(2);
         // use ppoll (73). net's poll pump detects arm64 and passes a timespec.
         if (name === "poll") return 73;
@@ -131,7 +137,10 @@ export function getSyscall(name) {
     if (name === "bind") return 33554536;       // 0x2000068 (bind = 104)
     if (name === "listen") return 33554538;     // 0x200006A (listen = 106)
     if (name === "setsockopt") return 33554537; // 0x2000069 (setsockopt = 105)
+    if (name === "getsockopt") return 33554550; // 0x2000076 (getsockopt = 118)
     if (name === "getsockname") return 33554464; // 0x2000020 (getsockname = 32)
+    if (name === "getpeername") return 33554463; // 0x200001F (getpeername = 31)
+    if (name === "fcntl") return 33554524;       // 0x200005C (fcntl = 92)
     if (name === "poll") return 33554662;        // 0x20000E6 (poll = 230)
     if (name === "shutdown") return 33554566;    // 0x2000086 (shutdown = 134)
     if (name === "sendmsg") return 33554460;     // 0x200001C (sendmsg = 28, dgram/UDP)

@@ -1,0 +1,10 @@
+{
+  "description": "var keyed destructuring inside with resolves the binding before reading the source property",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "binding::source,binding::sourceKey,sourceKey,binding::varTarget,get source,binding::defaultValue\n",
+    "exitCode": 0
+  }
+}

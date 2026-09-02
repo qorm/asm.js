@@ -95,9 +95,14 @@ export const ExpressionParser = {
             return new AST.PrivateIdentifier(pname);
         }
         // [Wave 8] 字段初始化器 ContainsArguments:init 上下文(穿透箭头)内 `arguments`
-        // 标识符引用是早期错误(函数边界已复位 _inFieldInit)。
-        if (this._inFieldInit && this.curToken.literal === "arguments") {
-            this.errors.push(`'arguments' is not allowed in class field initializer at line ${this.curToken.line}`);
+        // 标识符引用是早期错误(函数边界已复位 _inFieldInit)。静态初始化块同样禁止
+        // ContainsArguments；其语义穿透嵌套 class 的计算属性名与箭头，但不穿透普通
+        // 函数/方法，故用 fnDepth 与箭头层数判定当前是否仍在该语境。
+        if (this.curToken.literal === "arguments" &&
+            (this._inFieldInit ||
+             (this._staticBlockDepth &&
+              this.fnDepth === this._staticBlockDepth + (this._staticBlockArrowDepth || 0)))) {
+            this.errors.push(`'arguments' is not allowed in class field/static initializer at line ${this.curToken.line}`);
         }
         // [Wave 8] yield/await 作标识符引用(仅转义形态 yield/await 落此路径;未转义
         // 走 YIELD/AWAIT 记号)在生成器/异步函数内是早期错误。绑定位由 checkYieldAwaitBinding 覆盖。
@@ -307,10 +312,29 @@ export const ExpressionParser = {
 
     // quasi 的 raw 源文本(反斜杠转义原样);缺失时回退 cooked。
     _quasiRawText(q) {
+        let raw = "";
         if (q && q.value && q.value.rawText !== undefined && q.value.rawText !== null) {
-            return q.value.rawText;
+            raw = q.value.rawText;
+        } else {
+            raw = q && q.value ? q.value.cooked : "";
         }
-        return q && q.value ? q.value.cooked : "";
+        // ECMAScript Template Raw Strings canonicalize every LineTerminatorSequence
+        // (CRLF, CR, and LF) to a single LF.  The lexer intentionally preserves the
+        // source bytes in `rawText` for escapes, so perform this small normalization
+        // at the parser boundary used by String.raw and custom tagged templates.
+        // Avoid String#replace here: this code is itself compiled by the bootstrap
+        // compiler, whose regexp/string shim may not yet be available.
+        let out = "";
+        for (let i = 0; i < raw.length; i++) {
+            const c = raw.charAt(i);
+            if (c === "\r") {
+                out = out + "\n";
+                if (i + 1 < raw.length && raw.charAt(i + 1) === "\n") i = i + 1;
+            } else {
+                out = out + c;
+            }
+        }
+        return out;
     },
 
     parseTemplateLiteral() {
@@ -479,13 +503,18 @@ export const ExpressionParser = {
     // [test262 S1] 当前是否处于 strict 模式:顶层程序指令 或 函数体 "use strict" 指令。
     inStrictMode() {
         // 类体隐式 strict(classDepth>0):类名不可用 let/yield/static、delete 标识符抛错等
-        return this.programStrict || this.fnStrictDepth > 0 || this.classDepth > 0;
+        return this.programStrict || this.fnStrictDepth > 0 || this.classDepth > 0 ||
+            this._classHeritageDepth > 0;
     },
 
     parseAwaitExpression() {
         // [L2-④] await 只能在 async 函数(含 async-gen)内出现;非异步上下文(模块顶层/
         // 类体隐式 strict/strict 模式)中 await 是保留字,恒 SyntaxError。
         if (!this._immediateAsync) {
+            if (this._staticBlockDepth && !this._immediateGen &&
+                this.fnDepth === this._staticBlockDepth + (this._staticBlockArrowDepth || 0)) {
+                this.errors.push("Cannot use 'await' as an identifier in a class static block");
+            }
             return this.parseIdentifier();
         }
         if (this._inFormalParams && this.fnAsyncDepth > 0) {
@@ -525,6 +554,13 @@ export const ExpressionParser = {
         // ** 右结合:右操作数用 precedence-1,使 2**3**2 解析为 2**(3**2)=512(非 (2**3)**2=64)。
         const rightPrec = operator === "**" ? precedence - 1 : precedence;
         const right = this.parseExpression(rightPrec);
+        // The special PrivateIdentifier `in` production requires a
+        // ShiftExpression on the right. An unparenthesized arrow function is
+        // an AssignmentExpression and therefore cannot occupy that position.
+        if (operator === "in" && left && left.type === "PrivateIdentifier" &&
+            right && right.type === "ArrowFunctionExpression" && !right._parenthesized) {
+            this.errors.push("PrivateIdentifier in requires a ShiftExpression right-hand side");
+        }
         // YieldExpression 只在 AssignmentExpression 位:`yield 3 + yield 4` 的右
         // 操作数不得是未加括号的 yield(yield-weak-binding)。`(yield) + 1` 合法。
         if (this.fnGenDepth > 0) {
@@ -575,7 +611,7 @@ export const ExpressionParser = {
         const isPattern = t === "ArrayExpression" || t === "ObjectExpression" ||
                           t === "ArrayPattern" || t === "ObjectPattern";
         if (isPattern) {
-            if (!allowPattern) this.errors.push("Invalid left-hand side in assignment");
+            if (!allowPattern) this.errors.push("Invalid left-hand side in assignment at " + this.curToken.line + ":" + this.curToken.col + " left.type=" + t);
             else this.checkPatternTargets(left);
             return;
         }
@@ -583,15 +619,15 @@ export const ExpressionParser = {
             // [test262 S1] strict 下 eval/arguments 不可作赋值/自增左值(`(arguments) = 20`)。
             // 非 strict 一律放行;自举源码无 "use strict" 指令 → 此分支对其恒不触发。
             if (this.inStrictMode() && (left.name === "eval" || left.name === "arguments")) {
-                this.errors.push("Invalid left-hand side in assignment");
+                this.errors.push("Invalid left-hand side in assignment at " + this.curToken.line + ":" + this.curToken.col + " left.type=" + t);
             }
             return;
         }
         if (t === "MemberExpression") {
-            if (left.optional === true) this.errors.push("Invalid left-hand side in assignment");
+            if (left.optional === true) this.errors.push("Invalid left-hand side in assignment at " + this.curToken.line + ":" + this.curToken.col + " left.type=" + t);
             return;
         }
-        this.errors.push("Invalid left-hand side in assignment");
+        this.errors.push("Invalid left-hand side in assignment at " + this.curToken.line + ":" + this.curToken.col + " left.type=" + t);
     },
 
     // [test262 S1 早期错误] 解构赋值模式内层目标位的最小校验:只拒 **SequenceExpression**
@@ -670,7 +706,7 @@ export const ExpressionParser = {
         let consequent = this.parseExpression(Precedence.ASSIGN - 1);
         if (!this.expectPeek(TokenType.COLON)) return null;
         this.nextToken();
-        return new AST.ConditionalExpression(test, consequent, this.parseExpression(Precedence.TERNARY - 1));
+        return new AST.ConditionalExpression(test, consequent, this.parseExpression(Precedence.ASSIGN - 1));
     },
 
     parseGroupedOrArrow() {
@@ -856,10 +892,12 @@ export const ExpressionParser = {
         {
             const seenArrow = new Map();
             for (let ai = 0; ai < params.length; ai++) {
-                const pn = {};
-                collectPatternNames(params[ai], pn);
-                for (const nm in pn) {
-                    if (!Object.prototype.hasOwnProperty.call(pn, nm)) continue;
+                // Preserve duplicates inside one binding pattern. The generic
+                // object collector intentionally de-duplicates keys.
+                const pn = [];
+                this.collectParamNames(params[ai], pn);
+                for (let pi = 0; pi < pn.length; pi++) {
+                    const nm = pn[pi];
                     if (seenArrow.get(nm) !== undefined) {
                         this.errors.push("Duplicate parameter name not allowed in arrow function");
                         break;
@@ -870,6 +908,7 @@ export const ExpressionParser = {
         }
         // [test262 S1] 箭头函数体开始:供 new.target 上下文校验
         this.fnDepth++;
+        if (this._staticBlockDepth) this._staticBlockArrowDepth++;
         const prevLabelsArrow = this._usedLabels;
         this._usedLabels = new Set();
         const prevLabelStackArrow = this._labelStack;
@@ -900,6 +939,7 @@ export const ExpressionParser = {
             isExpression = true;
         }
         this.fnDepth--;
+        if (this._staticBlockDepth) this._staticBlockArrowDepth--;
         this._usedLabels = prevLabelsArrow;
         this._labelStack = prevLabelStackArrow;
         return new AST.ArrowFunctionExpression(params, body, false, isExpression);
@@ -913,6 +953,11 @@ export const ExpressionParser = {
         }
         this.nextToken();
         while (!this.curTokenIs(TokenType.RBRACE) && !this.curTokenIs(TokenType.EOF)) {
+            // PrivateIdentifier 只属于类元素/私有品牌表达式，不能充当
+            // ObjectBindingPattern/ObjectAssignmentPattern 的 PropertyName。
+            if (this.curToken.literal && this.curToken.literal.charAt(0) === "#") {
+                this.errors.push("Private names are not allowed in object destructuring patterns");
+            }
             // [rest] 对象解构 rest:{a, ...rest} —— 收集其余自有属性成新对象。
             // rest 必须在末位;推入 SpreadElement(Identifier) 后结束。
             if (this.curTokenIs(TokenType.SPREAD)) {
@@ -1347,6 +1392,7 @@ export const ExpressionParser = {
                 // [test262] super.x 在对象方法内合法(parseSuperExpression 判 _inObjMethod)
                 this._inObjMethod = (this._inObjMethod || 0) + 1;
                 let params = this.parseFunctionParams();
+                this.checkUniqueParamNames(params);
                 // [L2-④] getter 不得有形参,setter 必须恰 1 个非 rest 形参
                 // (class methods already check this in classes.js; object literals did not).
                 if (accessorKind === "get" && params.length > 0) {
@@ -1371,6 +1417,8 @@ export const ExpressionParser = {
                 if (isStrict) { this.fnStrictDepth++; this.checkStrictParams(params); }
                 this.checkInheritedStrictParams(params, isStrict);   // [test262 早期错误 C] 继承 strict 重参
                 let body = this.parseBlockStatement();
+                this.checkFormalLexicalConflict(params, body);
+                this.checkLexVarConflict(body && body.body);
                 this.fnDepth--;
                 this._inObjMethod = this._inObjMethod - 1;
                 if (isStrict) this.fnStrictDepth--;
@@ -1462,6 +1510,9 @@ export const ExpressionParser = {
             if (!this.expectPeek(TokenType.LBRACE)) { this.fnDepth--; if (isGenerator) this.fnGenDepth--; this._immediateGen = prevImmediateGen; this._inFieldInit = prevInFieldInit; this._inFormalParams = prevInFormalFE; return null; }
             let isStrict = this.peekUseStrictDirective();
             if (isStrict) { this.fnStrictDepth++; this.checkStrictParams(params); }
+            if (isStrict && (id.name === "eval" || id.name === "arguments")) {
+                this.errors.push("Cannot use '" + id.name + "' as a function name in strict mode");
+            }
             this.checkInheritedStrictParams(params, isStrict);   // [test262 早期错误 C] 继承 strict 重参
             const prevLabelsFE1 = this._usedLabels;
             this._usedLabels = new Set();
@@ -1626,6 +1677,9 @@ export const ExpressionParser = {
             this.nextToken(); // 到 .
             if (!this.expectPeek(TokenType.IDENT)) return null;
             let property = new AST.Identifier(this.curToken.literal); // "target"
+            if (this.curToken.escaped || this.curToken.literal !== "target") {
+                this.errors.push("The new.target meta-property must use the exact token 'target'");
+            }
             // [test262 早期错误] new.target 只能在函数体内出现;全局代码/类外部非法。
             // 类方法内合法(方法体解析时 fnDepth>0)。
             if (this.fnDepth === 0) {

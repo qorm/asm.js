@@ -649,92 +649,170 @@ export class MapGenerator {
         const MASK48 = 0x0000ffffffffffffn;
         const TAG_ARRAY = 0x7ffe000000000000n;
         vm.label("_map_groupBy");
-        vm.prologue(48, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.prologue(128, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
         vm.mov(VReg.S0, VReg.A0); // items
         vm.mov(VReg.S1, VReg.A1); // cb
-        // RequireObjectCoercible(items)
+        // RequireObjectCoercible(items), then IsCallable(cb).
         vm.shrImm(VReg.V3, VReg.S0, 48);
         vm.cmpImm(VReg.V3, 0x7FFA);
-        vm.jeq("_mgb_coercible");
+        vm.jeq("_mgb_nullish");
         vm.cmpImm(VReg.V3, 0x7FFB);
-        vm.jne("_mgb_coerced");
-        vm.label("_mgb_coercible");
-        vm.lea(VReg.A0, vm.asm.addString("Cannot convert undefined or null to object"));
-        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
-        vm.and(VReg.A0, VReg.A0, VReg.V1);
-        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
-        vm.or(VReg.A0, VReg.A0, VReg.V1);
-        vm.call("_throw_type_error");
-        vm.label("_mgb_coerced");
-        // IsCallable(callbackfn)
+        vm.jeq("_mgb_nullish");
         vm.mov(VReg.A0, VReg.S1);
         vm.call("_is_callable");
         vm.cmpImm(VReg.RET, 0);
-        vm.jne("_mgb_cb_ok");
-        vm.lea(VReg.A0, vm.asm.addString("Map.groupBy callback is not a function"));
-        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
-        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.jeq("_mgb_not_callable");
+
+        // map = new Map()
+        vm.call("_map_new");
+        vm.mov(VReg.S2, VReg.RET); // 裸 Map
+
+        // iteratorRecord = GetIterator(items).
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_get_method_iterator");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_mgb_default_iterator");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.call("_spread_call0");
+        vm.jmp("_mgb_check_iterator");
+
+        vm.label("_mgb_default_iterator");
+        // A present own override whose value was undefined must suppress the intrinsic fallback
+        vm.lea(VReg.A0, "_symwk_iterator");
+        vm.lea(VReg.A1, vm.asm.addString("Symbol.iterator"));
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
-        vm.or(VReg.A0, VReg.A0, VReg.V1);
-        vm.call("_throw_type_error");
-        vm.label("_mgb_cb_ok");
-        // 非数组 → GetIterator 校验后收成数组(字符串/自定义 iterable;
-        // 不可迭代 → TypeError,避免 _array_length 解引用崩)。
-        vm.shrImm(VReg.V3, VReg.S0, 48);
-        vm.cmpImm(VReg.V3, 0x7FFE);
-        vm.jeq("_mgb_isarr");
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_symbol_wellknown");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_mgb_not_iterable");
         vm.mov(VReg.A0, VReg.S0);
         vm.lea(VReg.A1, vm.asm.addString("Symbol.iterator"));
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.A1, VReg.V1);
-        vm.call("_object_get");
-        vm.shrImm(VReg.V3, VReg.RET, 48);
-        vm.cmpImm(VReg.V3, 0x7FFF);
-        vm.jeq("_mgb_iter_ok");
-        vm.lea(VReg.A0, vm.asm.addString("object is not iterable"));
-        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
-        vm.and(VReg.A0, VReg.A0, VReg.V1);
-        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
-        vm.or(VReg.A0, VReg.A0, VReg.V1);
-        vm.call("_throw_type_error");
-        vm.label("_mgb_iter_ok");
-        vm.movImm(VReg.A0, 0);
-        vm.call("_array_new_with_size");
-        vm.call("_box_arr_r");
-        vm.mov(VReg.A0, VReg.RET);
-        vm.mov(VReg.A1, VReg.S0);
-        vm.movImm(VReg.A2, 0);
-        vm.movImm(VReg.A3, 0);
-        vm.call("_array_from_iter_into");
-        vm.mov(VReg.S0, VReg.RET);
-        vm.label("_mgb_isarr");
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_mgb_not_iterable");
+        vm.shrImm(VReg.V3, VReg.S0, 48);
+        vm.cmpImm(VReg.V3, 0x7FFE);
+        vm.jne("_mgb_default_string");
+        vm.emitMaskLoad(VReg.V1);
+        vm.andMaskReg(VReg.V3, VReg.S0, VReg.V1);
+        vm.loadByte(VReg.V3, VReg.V3, 0);
+        vm.cmpImm(VReg.V3, 1); // TYPE_ARRAY
+        vm.jne("_mgb_not_iterable");
         vm.mov(VReg.A0, VReg.S0);
-        vm.call("_array_length");
-        vm.mov(VReg.S3, VReg.RET); // length
-        vm.call("_map_new");
-        vm.mov(VReg.S2, VReg.RET); // 裸 Map
-        vm.movImm(VReg.S4, 0); // index
+        vm.movImm(VReg.A1, 0); // values
+        vm.call("_array_iterator_new");
+        vm.jmp("_mgb_check_iterator");
+        vm.label("_mgb_default_string");
+        vm.cmpImm(VReg.V3, 0x7FFC);
+        vm.jne("_mgb_not_iterable");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_str_iterator_new");
+
+        vm.label("_mgb_check_iterator");
+        vm.shrImm(VReg.V3, VReg.RET, 48);
+        vm.cmpImm(VReg.V3, 0x7FFD);
+        vm.jeq("_mgb_iterator_ok");
+        vm.cmpImm(VReg.V3, 0x7FFE);
+        vm.jeq("_mgb_iterator_ok");
+        vm.cmpImm(VReg.V3, 0x7FFF);
+        vm.jne("_mgb_bad_iterator");
+        vm.label("_mgb_iterator_ok");
+        vm.mov(VReg.S3, VReg.RET); // iterator
+        vm.movImm(VReg.S4, 0);     // index
 
         vm.label("_mgb_loop");
-        vm.cmp(VReg.S4, VReg.S3);
-        vm.jge("_mgb_done");
-        vm.mov(VReg.A0, VReg.S0);
-        vm.mov(VReg.A1, VReg.S4);
-        vm.call("_array_get");
-        vm.store(VReg.SP, 0, VReg.RET); // element @ [SP+0]
-        vm.mov(VReg.A1, VReg.RET); // element
+        // next = Get(iterator, "next"); Call(next, iterator); IteratorComplete/Value.
+        vm.mov(VReg.A0, VReg.S3);
+        vm.lea(VReg.A1, vm.asm.addString("next"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_maybe_getter");
+        vm.store(VReg.SP, 24, VReg.RET);
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_is_callable");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_mgb_bad_next");
+        vm.load(VReg.A0, VReg.SP, 24);
+        vm.mov(VReg.A1, VReg.S3);
+        vm.call("_spread_call0");
+        vm.mov(VReg.S5, VReg.RET); // iterator result
+        vm.shrImm(VReg.V3, VReg.S5, 48);
+        vm.cmpImm(VReg.V3, 0x7FFD);
+        vm.jeq("_mgb_result_ok");
+        vm.cmpImm(VReg.V3, 0x7FFE);
+        vm.jeq("_mgb_result_ok");
+        vm.cmpImm(VReg.V3, 0x7FFF);
+        vm.jne("_mgb_bad_result");
+        vm.label("_mgb_result_ok");
+        vm.mov(VReg.A0, VReg.S5);
+        vm.lea(VReg.A1, vm.asm.addString("done"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S5);
+        vm.call("_maybe_getter");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_boolean");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_mgb_done");
+        vm.mov(VReg.A0, VReg.S5);
+        vm.lea(VReg.A1, vm.asm.addString("value"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S5);
+        vm.call("_maybe_getter");
+        vm.store(VReg.SP, 0, VReg.RET); // element
+
+        // Only callback/group insertion abrupt completions perform IteratorClose.
+        vm.lea(VReg.V1, "_exc_ctx_top");
+        vm.load(VReg.V2, VReg.V1, 0);
+        vm.store(VReg.SP, 32, VReg.V2);
+        vm.lea(VReg.V2, "_mgb_catch");
+        vm.store(VReg.SP, 40, VReg.V2);
+        vm.mov(VReg.V2, VReg.SP);
+        vm.store(VReg.SP, 48, VReg.V2);
+        vm.store(VReg.SP, 56, VReg.FP);
+        vm.store(VReg.SP, 64, VReg.S0);
+        vm.store(VReg.SP, 72, VReg.S1);
+        vm.store(VReg.SP, 80, VReg.S2);
+        vm.store(VReg.SP, 88, VReg.S3);
+        vm.store(VReg.SP, 96, VReg.S4);
+        vm.store(VReg.SP, 104, VReg.S5);
+        vm.addImm(VReg.V2, VReg.SP, 32);
+        vm.lea(VReg.V1, "_exc_ctx_top");
+        vm.store(VReg.V1, 0, VReg.V2);
+
+        // key = Call(cb, undefined, «element, index»)
+        vm.load(VReg.A1, VReg.SP, 0);
         vm.mov(VReg.A0, VReg.S1); // cb
         vm.scvtf(0, VReg.S4);
         vm.fmovToInt(VReg.A2, 0); // index number
         vm.call("_groupby_invoke2");
-        vm.store(VReg.SP, 8, VReg.RET); // key(回调原值) @ [SP+8]
+        // -0 normalized to +0
+        vm.movImm64(VReg.V1, 0x8000000000000000n);
+        vm.cmp(VReg.RET, VReg.V1);
+        vm.jne("_mgb_not_negzero");
+        vm.movImm(VReg.RET, 0);
+        vm.label("_mgb_not_negzero");
+        vm.store(VReg.SP, 8, VReg.RET); // key
+
         // 已有分组?_map_get 未命中返回 0;命中返回装箱数组(high16==0x7ffe)。
-        // (勿用 _map_has:它返回装箱布尔 _js_true/_js_false,均非 0。)
         vm.mov(VReg.A0, VReg.S2);
         vm.load(VReg.A1, VReg.SP, 8);
         vm.call("_map_get");
         vm.store(VReg.SP, 16, VReg.RET); // 先落栈:命中即为现存数组;否则即将被新数组覆盖
-        // [x64 死表] 用 V3(≠RET)取 high16;勿用 V0(x64 V0==RET==RAX,shr 会毁 RET)。
         vm.shrImm(VReg.V3, VReg.RET, 48);
         vm.cmpImm(VReg.V3, 0x7ffe);
         vm.jeq("_mgb_push"); // 现存数组已在 [SP+16]
@@ -753,13 +831,56 @@ export class MapGenerator {
         vm.label("_mgb_push");
         vm.load(VReg.A0, VReg.SP, 16);
         vm.load(VReg.A1, VReg.SP, 0);
-        vm.call("_array_push");
+        vm.call("_array_push_own");
+        // Pop the temporary exception context before requesting the next item.
+        vm.load(VReg.V1, VReg.SP, 32);
+        vm.lea(VReg.V0, "_exc_ctx_top");
+        vm.store(VReg.V0, 0, VReg.V1);
         vm.addImm(VReg.S4, VReg.S4, 1);
         vm.jmp("_mgb_loop");
 
         vm.label("_mgb_done");
         vm.mov(VReg.RET, VReg.S2);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 128);
+
+        vm.label("_mgb_catch");
+        vm.load(VReg.V1, VReg.SP, 32);
+        vm.lea(VReg.V0, "_exc_ctx_top");
+        vm.store(VReg.V0, 0, VReg.V1);
+        vm.mov(VReg.A0, VReg.S3);
+        vm.call("_iterator_close_keep");
+        vm.call("_throw_unwind");
+
+        vm.label("_mgb_nullish");
+        vm.lea(VReg.A0, vm.asm.addString("Cannot convert undefined or null to object"));
+        vm.movImm64(VReg.V1, MASK48); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+        vm.label("_mgb_not_callable");
+        vm.lea(VReg.A0, vm.asm.addString("Map.groupBy callback must be a function"));
+        vm.movImm64(VReg.V1, MASK48); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+        vm.label("_mgb_not_iterable");
+        vm.lea(VReg.A0, vm.asm.addString("object is not iterable"));
+        vm.movImm64(VReg.V1, MASK48); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+        vm.label("_mgb_bad_iterator");
+        vm.lea(VReg.A0, vm.asm.addString("Result of iterator method is not an object"));
+        vm.movImm64(VReg.V1, MASK48); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+        vm.label("_mgb_bad_next");
+        vm.lea(VReg.A0, vm.asm.addString("iterator next is not callable"));
+        vm.movImm64(VReg.V1, MASK48); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+        vm.label("_mgb_bad_result");
+        vm.lea(VReg.A0, vm.asm.addString("iterator result is not an object"));
+        vm.movImm64(VReg.V1, MASK48); vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
 
         // ============================================================
         // [I2 一等值] Map.prototype 方法值闭包用的 _aref_generic 安全 wrapper 族。
@@ -1036,11 +1157,9 @@ export class MapGenerator {
             vm.label("_mcf_have_adder");
             // GetIterator
             vm.mov(VReg.A0, VReg.S1);
-            keyStr(VReg.A1, "Symbol.iterator");
-            vm.call("_object_get");
-            vm.shrImm(VReg.V3, VReg.RET, 48);
-            vm.cmpImm(VReg.V3, 0x7FFF);
-            vm.jne("_mcf_not_iter");
+            vm.call("_get_method_iterator"); // well-known Symbol, then legacy string key
+            vm.cmpImm(VReg.RET, 0);
+            vm.jeq("_mcf_not_iter");
             vm.mov(VReg.A0, VReg.RET);
             vm.mov(VReg.A1, VReg.S1);
             vm.call("_spread_call0");
