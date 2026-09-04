@@ -1,0 +1,10 @@
+{
+  "description": "ToNumbers of a length-tracking TypedArray after RAB shrink-to-zero then grow reads live length, not a neighbouring string.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "6\n9,0,0,0,0,0",
+    "exitCode": 0
+  }
+}

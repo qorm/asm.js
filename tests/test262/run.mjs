@@ -470,10 +470,11 @@ function compileInfrastructureFailure(comp) {
   return /compiler worker (exited|startup)|compile pool closed/i.test(err);
 }
 function isParserRejection(comp) {
-  // The compiler's parser path prefixes diagnostics with `Syntax errors ...`.
-  // Do not award a negative test for an opaque/internal compile exception.
+  // Parser diagnostics: `Syntax errors in <file>:` (compileFile) or a
+  // thrown `SyntaxError: Identifier 'f' has already been declared` (cli
+  // uncaught). Do not award a negative test for an opaque/internal exception.
   return !!comp && comp.ok === false && comp.code === 1 &&
-    /(^|\n)\s*Syntax errors?\b/i.test(String(comp.stderr || ""));
+    /(^|\n)\s*Syntax errors?\b|(^|\n)\s*SyntaxError:/i.test(String(comp.stderr || ""));
 }
 function compileDetail(comp) {
   const bits = [];

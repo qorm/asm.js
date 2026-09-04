@@ -1,0 +1,10 @@
+{
+  "description": "Each evaluation of a class creates a distinct private static brand",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "test262\ntest262\ntrue\ntrue",
+    "exitCode": 0
+  }
+}

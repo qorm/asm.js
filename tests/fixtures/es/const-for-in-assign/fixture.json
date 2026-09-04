@@ -1,0 +1,10 @@
+{
+  "description": "Assignment to a for-in const binding is a runtime TypeError",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true",
+    "exitCode": 0
+  }
+}

@@ -55,9 +55,12 @@ const CORO_PREBOUND = 168;
 // _call_argv 拷入,_coroutine_entry 写回,使 async/generator 体能读到第 6+ 实参。
 const CORO_ARGV = 176;
 const CORO_ARGV_SLOTS = 11; // 索引 5..15
+// +264: async-generator next() queue head while +88 is busy (await).
+// Node: +0 next, +8 promise, +16 resume value.
+const CORO_AGEN_NEXTQ = 264;
 
 const TYPE_COROUTINE = 10;
-const COROUTINE_SIZE = 176 + CORO_ARGV_SLOTS * 8; // 264
+const COROUTINE_SIZE = 264 + 8; // 272
 // 生成器/async 体跑在这块独立栈上。64KB 够普通 yield/await,但直接/间接 eval
 // 会在**同一栈**上跑 compileFragment(整份编译器,多层 8KB prologue)→ 溢栈 SIGSEGV
 // (function* g(){ return eval("1+1") } 的根因)。256KB 覆盖该路径;主栈仍数 MB。
@@ -733,6 +736,33 @@ export class CoroutineGenerator {
         vm.movImm(VReg.A0, 0);
         vm.call("_promise_new");
         vm.mov(VReg.S3, VReg.RET); // S3 = P(boxed)
+        // Busy in await (+88!=0): enqueue this next() instead of double-resume.
+        vm.load(VReg.V1, VReg.S1, 88);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_agn_go");
+        vm.movImm(VReg.A0, 24);
+        vm.call("_alloc");
+        vm.movImm(VReg.V1, 0);
+        vm.store(VReg.RET, 0, VReg.V1);
+        vm.store(VReg.RET, 8, VReg.S3);
+        vm.store(VReg.RET, 16, VReg.S2);
+        vm.load(VReg.V1, VReg.S1, 264);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_agn_q_walk");
+        vm.store(VReg.S1, 264, VReg.RET);
+        vm.jmp("_agn_q_done");
+        vm.label("_agn_q_walk");
+        vm.load(VReg.V2, VReg.V1, 0);
+        vm.cmpImm(VReg.V2, 0);
+        vm.jeq("_agn_q_tail");
+        vm.mov(VReg.V1, VReg.V2);
+        vm.jmp("_agn_q_walk");
+        vm.label("_agn_q_tail");
+        vm.store(VReg.V1, 0, VReg.RET);
+        vm.label("_agn_q_done");
+        vm.mov(VReg.RET, VReg.S3);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+        vm.label("_agn_go");
         vm.store(VReg.S1, 88, VReg.S3); // coro+88 = 当前挂起的 next Promise
         // resume(coro, v)
         vm.mov(VReg.A1, VReg.S2);
@@ -1140,6 +1170,7 @@ export class CoroutineGenerator {
         vm.store(VReg.S2, CORO_ARG4, VReg.V2);
         vm.store(VReg.S2, CORO_THIS, VReg.V1); // this=0(async 协程不写 → undefined 语义)
         vm.store(VReg.S2, CORO_EXC_TOP, VReg.V1); // 新协程异常链为空
+        vm.store(VReg.S2, 264, VReg.V1); // agen next queue
         vm.store(VReg.S2, CORO_PREBOUND, VReg.V1); // [FDI eager] 默认无 transfer 数组
         // [argc] 快照创建点 _call_argc(生成器 stub/async 调用点刚写,此处仍新鲜)
         vm.lea(VReg.V2, "_call_argc");
@@ -1298,12 +1329,53 @@ export class CoroutineGenerator {
         const vm = this.vm;
         const arch = this.arch;
 
+        vm.label("_coro_unlink_ready");
+        vm.prologue(16, [VReg.S0, VReg.S1]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.lea(VReg.V0, "_scheduler_ready_head");
+        vm.load(VReg.S1, VReg.V0, 0);
+        vm.cmpImm(VReg.S1, 0);
+        vm.jeq("_cul_done");
+        vm.cmp(VReg.S1, VReg.S0);
+        vm.jne("_cul_walk");
+        vm.load(VReg.V1, VReg.S0, 80);
+        vm.store(VReg.V0, 0, VReg.V1);
+        vm.lea(VReg.V0, "_scheduler_ready_tail");
+        vm.load(VReg.V2, VReg.V0, 0);
+        vm.cmp(VReg.V2, VReg.S0);
+        vm.jne("_cul_clear");
+        vm.store(VReg.V0, 0, VReg.V1);
+        vm.jmp("_cul_clear");
+        vm.label("_cul_walk");
+        vm.load(VReg.V1, VReg.S1, 80);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_cul_done");
+        vm.cmp(VReg.V1, VReg.S0);
+        vm.jeq("_cul_cut");
+        vm.mov(VReg.S1, VReg.V1);
+        vm.jmp("_cul_walk");
+        vm.label("_cul_cut");
+        vm.load(VReg.V2, VReg.S0, 80);
+        vm.store(VReg.S1, 80, VReg.V2);
+        vm.lea(VReg.V0, "_scheduler_ready_tail");
+        vm.load(VReg.V1, VReg.V0, 0);
+        vm.cmp(VReg.V1, VReg.S0);
+        vm.jne("_cul_clear");
+        vm.store(VReg.V0, 0, VReg.S1);
+        vm.label("_cul_clear");
+        vm.movImm(VReg.V1, 0);
+        vm.store(VReg.S0, 80, VReg.V1);
+        vm.label("_cul_done");
+        vm.epilogue([VReg.S0, VReg.S1], 16);
+
         vm.label("_coroutine_yield");
         vm.prologue(32, [VReg.S0, VReg.S1]);
 
         // 获取当前协程
         vm.lea(VReg.S0, "_scheduler_current");
         vm.load(VReg.S0, VReg.S0, 0);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_coro_unlink_ready");
 
         // [批次D] 分代写屏障:协程块(+72 yield 值/上下文字段)与协程栈块都是
         // 被直接裸写的容器——挂起期间若 minor GC(主栈分配触发),old 容器里的

@@ -1,0 +1,10 @@
+{
+  "description": "Direct eval with an empty spread argument list returns undefined",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true\n1",
+    "exitCode": 0
+  }
+}

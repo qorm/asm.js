@@ -1,0 +1,10 @@
+{
+  "description": "Direct eval inside a class method can call a private method on this",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "Test262\ntrue",
+    "exitCode": 0
+  }
+}

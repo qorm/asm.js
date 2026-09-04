@@ -331,7 +331,11 @@ export function analyzeCapturedVariables(funcExpr, outerLocals, functions) {
     const captured = [];
     for (let i = 0; i < candidates.length; i++) {
         const name = candidates[i];
-        if (functions && typeof functions[name] === "object" && functions[name]) continue;
+        // Function declarations keep a stable identity via _funcclosure_ /
+        // hasFunction; class names are mutable lexical bindings and must be
+        // captured when nested functions close over them.
+        if (functions && typeof functions[name] === "object" && functions[name] &&
+            functions[name].type === "FunctionDeclaration") continue;
         if (outerLocalsHas(outerLocals, name)) captured.push(name);
     }
     return captured;
@@ -363,8 +367,13 @@ export function collectLocalDeclarations(node, vars) {
         t === "BreakStatement" || t === "ContinueStatement" ||
         t === "ThrowStatement" || t === "EmptyStatement" ||
         t === "DebuggerStatement" || t === "FunctionDeclaration" ||
-        t === "ClassDeclaration" || t === "ClassExpression" ||
+        t === "ClassExpression" ||
         t === "FunctionExpression" || t === "ArrowFunctionExpression") {
+        return;
+    }
+
+    if (t === "ClassDeclaration") {
+        if (node.id && node.id.name) vars[node.id.name] = true;
         return;
     }
 
@@ -602,6 +611,14 @@ export function collectBodyEvalVarNames(body) {
     const out = {};
     if (body) collectEvalVarNamesFromNode(body, out);
     return out;
+}
+
+// True if a direct eval('var name') appears in this subtree (not nested functions).
+export function nodeEvalDeclaresVar(node, name) {
+    if (!name) return false;
+    const out = {};
+    collectEvalVarNamesFromNode(node, out);
+    return out[name] === true;
 }
 
 // 仅收集 `var` 绑定名(不含 let/const)。用于作用域入口初始化为 undefined
@@ -1317,8 +1334,13 @@ export function collectDirectEvalSourceRefs(node) {
         // capture-layout builder when eval source contains `this`.
         if (t === "ThisExpression") { add("__this"); return; }
         if (t === "FunctionDeclaration" || t === "FunctionExpression" ||
-            t === "ArrowFunctionExpression" || t === "ClassDeclaration" ||
-            t === "ClassExpression") return;
+            t === "ClassDeclaration" || t === "ClassExpression") return;
+        // Arrows inherit the eval caller's ThisBinding / Super. Walk their
+        // bodies so `eval("()=>this")` captures __this.
+        if (t === "ArrowFunctionExpression") {
+            walkSourceNode(n.body);
+            return;
+        }
         if (t === "VariableDeclarator") {
             if (n.init) walkSourceNode(n.init);
             return;

@@ -764,6 +764,18 @@ export class ArrayBufferGenerator {
     generateDataViewNew() {
         const vm = this.vm;
         const MASK = 0x0000ffffffffffffn;
+        vm.asm.addDataLabel("_nsobj_dataview");
+        vm.asm.addDataQword(0);
+        vm.asm.addDataLabel("_nsobj_dataview_proto");
+        vm.asm.addDataQword(0);
+        vm.label("_dataview_ctor_call");
+        vm.prologue(16, [VReg.S0]);
+        vm.lea(VReg.A0, vm.asm.addString("Constructor DataView requires 'new'"));
+        vm.call("_js_box_string");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_throw_type_error");
+        vm.epilogue([VReg.S0], 16);
+
         vm.label("_dataview_new");
         vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
         vm.mov(VReg.S1, VReg.A1); // byteOffset
@@ -1741,9 +1753,11 @@ export class TypedArrayGenerator {
     generateTypedArrayFrom() {
         const vm = this.vm;
         vm.label("_typed_array_from");
-        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
         vm.mov(VReg.S0, VReg.A0); // type
         vm.mov(VReg.S1, VReg.A1); // srcArg(boxed)
+        vm.store(VReg.SP, 0, VReg.S0);
+        vm.store(VReg.SP, 8, VReg.S1);
         vm.shrImm(VReg.V0, VReg.S1, 48);
         vm.cmpImm(VReg.V0, 0x7FFE);
         vm.jeq("_taf_array");     // 普通数组 → 逐元素拷贝
@@ -1790,7 +1804,7 @@ export class TypedArrayGenerator {
         vm.mov(VReg.A3, VReg.S4);
         vm.call("_ta_track_add");           // 缺省长度 → 跟踪视图
         vm.mov(VReg.RET, VReg.S2);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 16);
         vm.label("_taf_notptr");
         vm.shrImm(VReg.V0, VReg.S1, 48);
         vm.cmpImm(VReg.V0, 0x7FFD);
@@ -1820,7 +1834,7 @@ export class TypedArrayGenerator {
         vm.jmp("_taf_loop");
         vm.label("_taf_done");
         vm.mov(VReg.RET, VReg.S2);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 16);
         // 数字:当长度
         vm.label("_taf_len");
         vm.mov(VReg.A0, VReg.S1);
@@ -1828,10 +1842,26 @@ export class TypedArrayGenerator {
         vm.mov(VReg.A1, VReg.RET);
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_typed_array_new");
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 16);
         // boxed 对象/array-like:len = ToInteger(obj.length),逐索引 obj[i] → ta[i]。
         // 此前落 _taf_len 把 tagged 指针当长度 → ~1e10 长度 → 段错/超时(~56 崩溃簇根因)。
         vm.label("_taf_obj");
+        // Same GetIterator-first rule as `_tact_obj_iter`: `new Uint8Array(obj)`
+        // compiled as `_typed_array_from` used to only read `.length`.
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_get_method_iterator");
+        vm.shrImm(VReg.V2, VReg.RET, 48);
+        vm.cmpImm(VReg.V2, 0x7FFF);
+        vm.jne("_taf_obj_len");
+        vm.movImm(VReg.A0, 0);
+        vm.call("_array_new_with_size");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.call("_array_spread_into");
+        vm.call("_box_arr_r");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.jmp("_taf_array");
+        vm.label("_taf_obj_len");
         vm.lea(VReg.A1, vm.asm.addString("length"));
         vm.movImm64(VReg.V1, 0x0000ffffffffffffn); vm.and(VReg.A1, VReg.A1, VReg.V1);
         vm.movImm64(VReg.V1, 0x7ffc000000000000n); vm.or(VReg.A1, VReg.A1, VReg.V1); // boxed "length"
@@ -1859,7 +1889,7 @@ export class TypedArrayGenerator {
         vm.jmp("_taf_obj_loop");
         vm.label("_taf_obj_done");
         vm.mov(VReg.RET, VReg.S2);
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 16);
     }
 
     // _ta_to_array(ta) -> 装箱普通 Array(0x7FFE)。逐元素 _typed_array_get(得 canonical
@@ -4195,7 +4225,12 @@ export class TypedArrayGenerator {
         // delayed SIGSEGV after constructing a TA from an iterable.
         vm.prologue(48, [VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
         vm.movImm(VReg.V0, 0);
+        vm.store(VReg.SP, 0, VReg.V0);
         vm.store(VReg.SP, 8, VReg.V0);        // boxed buffer 原值(0=裸指针路径)
+        vm.store(VReg.SP, 16, VReg.V0);
+        vm.store(VReg.SP, 24, VReg.V0);
+        vm.store(VReg.SP, 32, VReg.V0);
+        vm.store(VReg.SP, 40, VReg.V0);
         vm.load(VReg.S1, VReg.S0, 16);        // S1 = type(closure@16)
         vm.lea(VReg.V5, "_call_argc");
         vm.load(VReg.S2, VReg.V5, 0);         // S2 = argc
@@ -4377,13 +4412,13 @@ export class TypedArrayGenerator {
         vm.shrImm(VReg.V0, VReg.V0, 48);
         vm.cmpImm(VReg.V0, 0x7FFF);                // 函数?
         vm.jne("_tact_obj_len");
-        vm.movImm(VReg.A0, 0);
-        vm.call("_array_new_with_size");
-        vm.call("_box_arr_r");                     // RET = 空数组(boxed)
+        // Delegate to `_typed_array_from`, which owns the iterator-spread
+        // frame. Inlining spread here smashed the trampoline/construct
+        // frames (delayed SIGSEGV on Number([]) / TA.set).
+        vm.mov(VReg.A0, VReg.S1);
         vm.mov(VReg.A1, VReg.S3);
-        vm.call("_array_spread_into");             // A0=arr,A1=src → RET=arr
-        vm.mov(VReg.S3, VReg.RET);
-        vm.jmp("_tact_from");
+        vm.call("_typed_array_from");
+        vm.jmp("_tact_done");
         vm.label("_tact_obj_len");
         vm.lea(VReg.A1, "_str_k_length");
         vm.movImm64(VReg.V1, STR_TAG);
@@ -4434,6 +4469,7 @@ export class TypedArrayGenerator {
         vm.movImm(VReg.A1, 0);
         vm.call("_typed_array_new");
         vm.label("_tact_done");
+
         vm.epilogue([VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 48);
         vm.label("_tact_view_oob");
         vm.call("_ta_throw_range");
@@ -4441,6 +4477,15 @@ export class TypedArrayGenerator {
         // ---- _ta_construct(A0=fn 值, A1=实参 boxed 数组) -> RET = 蹦床返回值(原样)。
         vm.label("_ta_construct");
         vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5]);
+        vm.movImm(VReg.V0, 0);
+        vm.store(VReg.SP, 0, VReg.V0);
+        vm.store(VReg.SP, 8, VReg.V0);
+        vm.store(VReg.SP, 16, VReg.V0);
+        vm.store(VReg.SP, 24, VReg.V0);
+        vm.store(VReg.SP, 32, VReg.V0);
+        vm.store(VReg.SP, 40, VReg.V0);
+        vm.store(VReg.SP, 48, VReg.V0);
+        vm.store(VReg.SP, 56, VReg.V0);
         vm.mov(VReg.S1, VReg.A0);
         vm.store(VReg.SP, 0, VReg.A1);
         vm.movImm64(VReg.V1, MASK);
@@ -4470,6 +4515,18 @@ export class TypedArrayGenerator {
         vm.load(VReg.A4, VReg.SP, 40);
         vm.lea(VReg.V5, "_call_argc");
         vm.store(VReg.V5, 0, VReg.S2);
+        vm.load(VReg.S1, VReg.S3, 16);        // type/pseudo @closure+16
+        vm.cmpImm(VReg.S1, 0x70);             // ArrayBuffer pseudo
+        vm.jeq("_tac_do_tramp");
+        vm.cmpImm(VReg.S2, 1);
+        vm.jne("_tac_do_tramp");
+        // 1-arg TA: same helper as static `new Uint8Array(x)`. Avoid the
+        // trampoline frame, which delayed-SIGSEGV'd after iterable spread.
+        vm.mov(VReg.A0, VReg.S1);
+        vm.load(VReg.A1, VReg.SP, 8);
+        vm.call("_typed_array_from");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
+        vm.label("_tac_do_tramp");
         vm.load(VReg.S5, VReg.S3, 8);         // fnptr
         vm.mov(VReg.S0, VReg.S3);             // S0 = 闭包块(调用约定)
         vm.callIndirect(VReg.S5);

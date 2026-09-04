@@ -345,7 +345,11 @@ export const ExpressionParser = {
         }
         let quasi = {
             type: "TemplateElement",
-            value: { raw: this.curToken.literal, cooked: this.curToken.literal, rawText: this.curToken.templateRaw },
+            value: {
+                raw: this.curToken.literal,
+                cooked: this.curToken.cookedInvalid ? undefined : this.curToken.literal,
+                rawText: this.curToken.templateRaw,
+            },
             tail: true,
         };
         return new AST.TemplateLiteral([quasi], []);
@@ -423,7 +427,11 @@ export const ExpressionParser = {
         }
         let firstQuasi = {
             type: "TemplateElement",
-            value: { raw: this.curToken.literal, cooked: this.curToken.literal, rawText: this.curToken.templateRaw },
+            value: {
+                raw: this.curToken.literal,
+                cooked: this.curToken.cookedInvalid ? undefined : this.curToken.literal,
+                rawText: this.curToken.templateRaw,
+            },
             tail: false,
         };
         quasis.push(firstQuasi);
@@ -440,7 +448,11 @@ export const ExpressionParser = {
 
             let quasi = {
                 type: "TemplateElement",
-                value: { raw: this.curToken.literal, cooked: this.curToken.literal, rawText: this.curToken.templateRaw },
+                value: {
+                    raw: this.curToken.literal,
+                    cooked: this.curToken.cookedInvalid ? undefined : this.curToken.literal,
+                    rawText: this.curToken.templateRaw,
+                },
                 tail: this.curToken.type === TokenType.TEMPLATE_TAIL,
             };
             // [Wave 8 续] 中段/尾段 quasi 同样校验(tagged 已跳过)。
@@ -1616,6 +1628,11 @@ export const ExpressionParser = {
             next.type === TokenType.GET || next.type === TokenType.SET ||
             next.type === TokenType.AS || next.type === TokenType.FROM ||
             next.type === TokenType.STATIC) {
+            // [no LineTerminator here] `async\nidentifier =>` is `async;` then
+            // an arrow, not an async arrow.
+            if (next.lineBreakBefore || next.line !== this.curToken.line) {
+                return this.parseIdentifier();
+            }
             const saved = this.saveState();
             this.nextToken(); // consume async, curToken now the param token
             const couldBeParam = this.isBindingWordToken(this.curToken);
@@ -1653,7 +1670,7 @@ export const ExpressionParser = {
         // [test262 indirect-eval-contains-superproperty] super 仅类体/对象方法内合法:
         // eval 片段/顶层/普通函数内 `super.x` 是早期错误(此前"零误拒"静默接受,
         // 运行期才抛 ReferenceError/TypeError)。类字段箭头等 classDepth>0 位放行。
-        if (!this.classDepth && !this._inObjMethod) {
+        if (!this.classDepth && !this._inObjMethod && !this._evalAllowSuper) {
             this.errors.push(`super is only valid inside classes or object methods at line ${this.curToken.line}`);
         }
         // [Wave 8] 字段初始化器 ContainsSuperCall:init 上下文(穿透箭头)内 `super(...)`
@@ -1693,6 +1710,13 @@ export const ExpressionParser = {
         // 停在第一个标识符（new ns.Foo() 误解析成 (new ns).Foo()）；用 CALL 精度
         // 可吞并成员链 ns.Foo 但在 LPAREN(CALL) 处停下，随后由本函数消费实参。
         let callee = this.parseExpression(Precedence.CALL);
+        // Tagged template binds tighter than `new`: `new tag\`x\`` is
+        // `new (tag\`x\`)`, not `(new tag)\`x\``. Pratt CALL==CALL so the
+        // template infix is not consumed above; attach it here.
+        if (this.peekTokenIs(TokenType.TEMPLATE_STRING) || this.peekTokenIs(TokenType.TEMPLATE_HEAD)) {
+            this.nextToken();
+            callee = this.parseTaggedTemplate(callee);
+        }
         let args = [];
         if (this.peekTokenIs(TokenType.LPAREN)) {
             this.nextToken();
@@ -1865,6 +1889,9 @@ export const ExpressionParser = {
             this.nextToken(); // .
             if (!this.expectPeek(TokenType.IDENT)) return null;
             let property = new AST.Identifier(this.curToken.literal); // "meta"
+            if (this._scriptGoal) {
+                this.errors.push("Cannot use import.meta outside a module");
+            }
             return new AST.MetaProperty(meta, property);
         }
         // 动态 import() - 简单实现为 CallExpression

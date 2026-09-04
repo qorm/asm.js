@@ -1,0 +1,10 @@
+{
+  "description": "delete Promise.prototype[@@toStringTag] is not resurrected; Object.prototype.toString falls back to Object.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "[object Promise]\n[object Object]\nundefined",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "Calling an unresolvable identifier throws ReferenceError",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true",
+    "exitCode": 0
+  }
+}

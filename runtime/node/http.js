@@ -123,7 +123,7 @@ function _parseHeaderLines(lines, start, headers) {
 class IncomingMessage extends EventEmitter {
     constructor(socket) {
         super();
-        console.log("CR 4"); this.socket = socket;
+        this.socket = socket;
         this.connection = socket;
         this.headers = {};
         this.rawHeaders = [];
@@ -142,7 +142,7 @@ class IncomingMessage extends EventEmitter {
 class ServerResponse extends EventEmitter {
     constructor(socket) {
         super();
-        console.log("CR 4"); this.socket = socket;
+        this.socket = socket;
         this.connection = socket;
         this.statusCode = 200;
         this.statusMessage = null;
@@ -440,7 +440,7 @@ super();
             }
             if (agent) { agent._track(name, socket); agent.created++; }
         }
-        console.log("CR 4"); this.socket = socket;
+        this.socket = socket;
         socket.on("error", function (err) { self.emit("error", err); });
 
         // Shared parse state lives on a captured object, not on `let` scalars:

@@ -1,0 +1,10 @@
+{
+  "description": "for await (async of iterable) may bind the identifier async; for (async of ...) stays illegal.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "7",
+    "exitCode": 0
+  }
+}

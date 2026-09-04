@@ -785,9 +785,32 @@ export class ARM64Backend extends Backend {
         // dividend 的符号（例如 -0 % 1 会变成 +0），而 ECMAScript
         // Number::remainder 要求零结果带 dividend 的 sign bit。
         // X16 只在本段作为位模式暂存，不属于 VM 分配的寄存器集合。
+        // finite % ±Inf → dividend (IEEE 0*Inf is NaN; x64 fmod already special-cases this).
         const seq = (this._fmodSeq = (this._fmodSeq | 0) + 1);
         const nonZero = `_xfmod_nonzero_${seq}`;
+        const formula = `_xfmod_formula_${seq}`;
+        const done = `_xfmod_done_${seq}`;
         this.asm.fmovToInt(Reg.X16, fpA); // 保存原始 dividend 的位模式
+        // |b| Inf check without X15 (X15 ≡ V7). D6 is unused by fmod callers
+        // (operands are D0/D1; D7 is the formula temp).
+        this.asm.fabs(6, fpB); // D6 = |b|
+        this.asm.fmovToInt(Reg.X17, 6);
+        this.asm.lsrImm(Reg.X17, Reg.X17, 52); // exponent
+        this.asm.cmpImm(Reg.X17, 0x7ff);
+        this.asm.jne(formula);
+        this.asm.fmovToInt(Reg.X17, 6);
+        this.asm.lslImm(Reg.X17, Reg.X17, 12); // drop sign+exp; remainder is mantissa
+        this.asm.cmpImm(Reg.X17, 0);
+        this.asm.jne(formula); // NaN divisor
+        // b is ±Inf: finite a → a; Inf/NaN a → formula (NaN)
+        this.asm.fabs(6, fpA);
+        this.asm.fmovToInt(Reg.X17, 6);
+        this.asm.lsrImm(Reg.X17, Reg.X17, 52);
+        this.asm.cmpImm(Reg.X17, 0x7ff);
+        this.asm.jge(formula);
+        this.asm.fmovToFloat(fpDest, Reg.X16);
+        this.asm.jmp(done);
+        this.asm.label(formula);
         this.asm.fdiv(7, fpA, fpB); // D7 = a / b
         this.asm.frintz(7, 7); // D7 = trunc(D7)
         this.asm.fmul(7, 7, fpB); // D7 = D7 * b
@@ -805,6 +828,7 @@ export class ARM64Backend extends Backend {
         this.asm.lslImm(Reg.X16, Reg.X16, 63);
         this.asm.fmovToFloat(fpDest, Reg.X16);
         this.asm.label(nonZero);
+        this.asm.label(done);
     }
 
     // 浮点与零比较

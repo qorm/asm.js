@@ -1,0 +1,10 @@
+{
+  "description": "Line terminator between continue and Identifier is ASI; unlabeled continue targets the inner loop",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "2",
+    "exitCode": 0
+  }
+}

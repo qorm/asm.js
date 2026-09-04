@@ -40,21 +40,16 @@ export const AsyncCompiler = {
         vm.push(VReg.RET);
         vm.call("_is_promise_or_thenable");
         vm.cmpImm(VReg.RET, 0);
-        vm.pop(VReg.RET);           // RET = 被 await 的值(还原)
+        vm.pop(VReg.RET);
         vm.jeq(awaitDone);
         }
 
-        // [test262] Promise 直接 await;thenable 经 _Promise_resolve adopt 后再 await。
-        // [A5] _Promise_resolve 把 A5 当构造器 C。await 在方法/静态方法体内时 A5 仍是
-        // this(类对象或实例)→ 被误判为 Promise 子类 → NewPromiseCapability(C) 失败
-        // 「Promise resolve or reject function is not callable」
-        // (static async + await Promise / Promise.all([C.$()…]) 族)。显式置 %Promise%。
         vm.mov(VReg.A0, VReg.RET);
         vm.lea(VReg.A5, "_nsobj_promise");
         vm.load(VReg.A5, VReg.A5, 0);
-        vm.call("_Promise_resolve"); // RET = 装箱 promise(原 promise 直返 / 新建+adopt)
+        vm.call("_Promise_resolve");
         vm.mov(VReg.A0, VReg.RET);
-        vm.call(agenAwait ? "_promise_await_job" : "_promise_await");
+        vm.call("_promise_await_job");
         // RET = resolved 值；若被 reject，_promise_await 已置 _exception_pending
 
         // 检查 await 期间是否产生异常（promise 被 reject）
@@ -117,7 +112,7 @@ export const AsyncCompiler = {
             vm.pop(VReg.RET);           // RET = yield 值(还原)
             vm.jeq(yieldDone);          // 非 Promise → 值即产出值
             vm.mov(VReg.A0, VReg.RET);
-            vm.call("_promise_await");
+            vm.call("_promise_await_job");
             const yieldExcLabel = this.ctx.newLabel("ayieldval_no_exc");
             vm.push(VReg.RET);
             vm.lea(VReg.V0, "_exception_pending");
@@ -161,6 +156,18 @@ export const AsyncCompiler = {
         vm.pop(VReg.V1); // coro
         vm.movImm(VReg.V0, 0);
         vm.store(VReg.V1, 88, VReg.V0); // 清 +88
+        const nextQSkip = this.ctx.newLabel("ayield_nextq_skip");
+        const afterYieldL = this.ctx.newLabel("ayield_after");
+        vm.load(VReg.V2, VReg.V1, 264);
+        vm.cmpImm(VReg.V2, 0);
+        vm.jeq(nextQSkip);
+        vm.load(VReg.V0, VReg.V2, 0);
+        vm.store(VReg.V1, 264, VReg.V0);
+        vm.load(VReg.V0, VReg.V2, 8);
+        vm.store(VReg.V1, 88, VReg.V0);
+        vm.load(VReg.RET, VReg.V2, 16);
+        vm.jmp(afterYieldL);
+        vm.label(nextQSkip);
         // return() while this next() was still in Await (+88≠0) only queued.
         // next() is now fulfilled; consume the queue as a return resumption
         // (star: _agen_raw_yield → __YsaTakeReturn → await recv).
@@ -199,6 +206,7 @@ export const AsyncCompiler = {
         vm.label(noQueuedL);
         // 挂起;恢复后 RET = coro+72(next(v) 注入值)
         vm.call("_coroutine_yield");
+        vm.label(afterYieldL);
         // [agen.throw] 恢复后异常注入检查(与 emitYieldValue 同构)
         const contLabel = this.ctx.newLabel("ayield_no_exc");
         vm.push(VReg.RET);

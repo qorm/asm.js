@@ -1,0 +1,10 @@
+{
+  "description": "Tagged template illegal escapes: cooked is undefined, raw keeps source.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "undef\n\\01\nundef\n\\9\nundef\n\\xg\nundef\ninner\nright",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "Tagged template object and its raw array are frozen.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "TypeError\nraw TypeError\ntrue",
+    "exitCode": 0
+  }
+}

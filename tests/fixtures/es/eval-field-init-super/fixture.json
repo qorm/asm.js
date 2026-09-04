@@ -1,0 +1,10 @@
+{
+  "description": "Direct eval in a derived class field initializer may evaluate super.x",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true",
+    "exitCode": 0
+  }
+}

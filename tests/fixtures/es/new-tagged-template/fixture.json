@@ -1,0 +1,10 @@
+{
+  "description": "new tag`x` is new (tag`x`), not (new tag)`x`.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "first\ntrue\nundefined\nsecond\nx",
+    "exitCode": 0
+  }
+}

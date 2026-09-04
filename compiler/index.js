@@ -1621,14 +1621,38 @@ export class Compiler {
         return this.labelCounter++;
     }
 
-    parse(source) {
+    parse(source, opts) {
         const traceParse = typeof process !== "undefined" && process.env && process.env.ASMJS_TRACE_IMPORT === "1";
         if (traceParse) console.log("TRACE_PARSE_BEGIN", this.sourcePath, typeof source, source && source.length);
         const byteLen = this._nextParseByteLen;
         this._nextParseByteLen = undefined;
         const lexer = new Lexer(source, byteLen);
         const parser = new Parser(lexer);
+        if (opts) {
+            if (opts.classDepth > 0) parser.classDepth = opts.classDepth;
+            if (opts.fnDepth > 0) parser.fnDepth = opts.fnDepth;
+            if (opts.allowSuper) parser._evalAllowSuper = true;
+            if (opts.inFieldInit) parser._inFieldInit = true;
+            if (opts.strict) parser.programStrict = true;
+            if (opts.scriptGoal) parser._scriptGoal = true;
+            if (opts.classDepth > 0 && !parser._privateNamesByDepth) parser._privateNamesByDepth = {};
+            if (opts.privateNames && opts.privateNames.length > 0) {
+                if (parser.classDepth < 1) parser.classDepth = 1;
+                const depth = parser.classDepth;
+                const entries = [];
+                for (let i = 0; i < opts.privateNames.length; i++) {
+                    entries.push({ name: opts.privateNames[i] });
+                }
+                if (!parser._privateNamesByDepth) parser._privateNamesByDepth = {};
+                parser._privateNamesByDepth[depth] = entries;
+                parser._curPrivateNames = entries;
+            }
+        }
         const ast = parser.parseProgram();
+        if (opts && parser._validatePrivateRefs &&
+            ((opts.privateNames && opts.privateNames.length > 0) || opts.classDepth > 0)) {
+            parser._validatePrivateRefs();
+        }
         if (traceParse) console.log("TRACE_PARSE_DONE", this.sourcePath, ast && ast.body && ast.body.length, parser.errors && parser.errors.length);
         if (parser.errors && parser.errors.length > 0) {
             // [test262] 早期错误/语法错误须以 SyntaxError 品牌抛出(eval/new Function 路径
@@ -2331,6 +2355,9 @@ export class Compiler {
             fnCtx.superClassExpr = savedCtx.superClassExpr;
             fnCtx.superInfoLabel = savedCtx.superInfoLabel;
             fnCtx.inStaticMethod = savedCtx.inStaticMethod;
+            fnCtx.inClassMethod = false;
+            fnCtx.inFieldInit = false;
+            fnCtx.inObjectMethod = false;
             if (ownerMeta) {
                 fnCtx.functionAliases = ownerMeta.functionAliases;
                 fnCtx.mainCapturedVars = ownerMeta.mainCapturedVars;
@@ -2666,7 +2693,9 @@ export class Compiler {
 
         for (const name of moduleMeta.boxedVars || []) {
             const bindingKind = this.getModuleBindingKind(moduleMeta.ast, name);
-            if (bindingKind !== "function" && bindingKind !== "class") {
+            // Classes are TDZ until ClassDefinitionEvaluation; do not prefill
+            // a function stub into the captured box.
+            if (bindingKind !== "function") {
                 continue;
             }
 
@@ -4215,8 +4244,21 @@ export class Compiler {
 
         if (func.body) {
             if (func.body.type === "BlockStatement") {
+                // Direct-child FunctionDeclaration hoist (ES 10.5), same as
+                // compileFunctionBody. `function FACTORY(){ this.id = func();
+                // function func(){...} }` must see func before the statement.
+                if (!this.ctx._preboundFnDecls) this.ctx._preboundFnDecls = new Set();
+                for (let fi = 0; fi < func.body.body.length; fi++) {
+                    const fd = func.body.body[fi];
+                    if (fd && fd.type === "FunctionDeclaration" && fd.id && fd.id.name) {
+                        this.compileNestedFunctionDeclaration(fd);
+                        this.ctx._preboundFnDecls.add(fd.id.name);
+                    }
+                }
                 this.emitTdzBlockPrologue(func.body);
                 for (const stmt of func.body.body) {
+                    if (stmt && stmt.type === "FunctionDeclaration" && stmt.id && stmt.id.name &&
+                        this.ctx._preboundFnDecls.has(stmt.id.name)) continue;
                     this.compileStatement(stmt);
                 }
             } else {
@@ -4434,8 +4476,10 @@ export class Compiler {
                     hints.set(node.init, node.id.name);
                 }
             } else if (t === "AssignmentExpression") {
+                // IsIdentifierRef is false for CoverParenthesizedExpression:
+                // `(fn) = function(){}` must not NamedEvaluation to "fn".
                 if (node.operator === "=" && node.left && node.left.type === "Identifier" &&
-                    isAnonFn(node.right)) {
+                    !node.left._parenthesized && isAnonFn(node.right)) {
                     hints.set(node.right, node.left.name);
                 }
             } else if (t === "Property") {
@@ -4509,10 +4553,8 @@ export class Compiler {
                 vm.lea(VReg.V2, "_eval_nonctor_table");
                 vm.store(VReg.V2, shimSlot * 8, VReg.V1);
             }
-            if (entries[i].name !== "") {
-                vm.lea(VReg.V1, this.asm.addString(entries[i].name));
-                vm.store(VReg.S0, 16, VReg.V1); // entry.name_ptr = &name_str
-            }
+            vm.lea(VReg.V1, this.asm.addString(entries[i].name || ""));
+            vm.store(VReg.S0, 16, VReg.V1); // entry.name_ptr = &name_str
             vm.movImm(VReg.A0, 24);
             vm.call("_alloc");
             vm.mov(VReg.S2, VReg.RET);

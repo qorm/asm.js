@@ -18,6 +18,9 @@ export class Parser {
         this.curToken = null;
         this.peekToken = null;
         this.errors = [];
+        // Direct eval fragments inherit the caller's class/function context
+        // (private names, super, new.target) via Compiler.parse opts.
+        this._evalAllowSuper = false;
         // 类体嵌套深度：#x 私有成员访问仅在类体内合法（>0），类外 obj.#x 报语法错
         this.classDepth = 0;
         // ClassHeritage 的表达式在类定义的 strict 上下文中解析，但尚未进入
@@ -47,6 +50,8 @@ export class Parser {
         // [test262 S1] 程序级 strict:脚本首条 "use strict" 指令 → 顶层 strict(供 delete 裸变量
         // 等早期错误判定;函数级 strict 仍由 fnStrictDepth 跟踪)。parseProgram 起始探测。
         this.programStrict = false;
+        // compileFragment / Function constructor parse as Script, not Module.
+        this._scriptGoal = false;
         // [Wave 8] 字段初始化器上下文(ContainsArguments/ContainsSuperCall):字段 init 解析时置真,
         // 穿透箭头(继承)但遇函数表达式/声明边界复位(新作用域自有 arguments/home object)。
         this._inFieldInit = false;

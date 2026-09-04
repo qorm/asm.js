@@ -1215,6 +1215,35 @@ export const OperatorCompiler = {
         const mightBeNaN = !(numTy(inferType(expr.left, this.ctx)) &&
                              numTy(inferType(expr.right, this.ctx)));
 
+        // `-` `*` `/` `%`: Evaluate lhs → Evaluate rhs → ToNumeric(lhs) → ToNumeric(rhs).
+        // compileOperandAsFloat ToNumber's immediately, so lhs.valueOf would throw
+        // before rhs is evaluated (modulus/subtraction/division order-of-evaluation).
+        // Integer fast-path above already returned. `+` stays on the concat/add path.
+        if (op === "-" || op === "*" || op === "/" || op === "%") {
+            this.compileExpression(expr.left);
+            const arL = this.ctx.allocLocal(`__ar_l_${this.nextLabelId()}`);
+            this.vm.store(VReg.FP, arL, VReg.RET);
+            this.compileExpression(expr.right);
+            const arR = this.ctx.allocLocal(`__ar_r_${this.nextLabelId()}`);
+            this.vm.store(VReg.FP, arR, VReg.RET);
+            this.vm.load(VReg.RET, VReg.FP, arL);
+            this.emitNumberCoerceFast();
+            this.vm.store(VReg.FP, arL, VReg.RET);
+            this.vm.load(VReg.RET, VReg.FP, arR);
+            this.emitNumberCoerceFast();
+            this.vm.mov(VReg.V1, VReg.RET);
+            this.vm.load(VReg.RET, VReg.FP, arL);
+            this.vm.fmovToFloat(0, VReg.RET);
+            this.vm.fmovToFloat(1, VReg.V1);
+            if (op === "-") this.vm.fsub(0, 0, 1);
+            else if (op === "*") this.vm.fmul(0, 0, 1);
+            else if (op === "/") this.vm.fdiv(0, 0, 1);
+            else this.vm.fmod(0, 0, 1);
+            this.vm.fmovToInt(VReg.RET, 0);
+            if (mightBeNaN) this.emitNaNCanon();
+            return;
+        }
+
         // `**`:Evaluate lhs → Evaluate rhs → ToNumeric(lhs) → ToNumeric(rhs)。
         // compileOperandAsFloat 会立刻 ToNumber,lhs.valueOf 会在 rhs 求值前抛
         // (exponentiation/order-of-evaluation)。数值热路径(+-*/)不走此分支。

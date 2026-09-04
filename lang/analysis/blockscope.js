@@ -402,7 +402,10 @@ function bsWalkForEach(node, st) {
                 const idn = ids[j];
                 if (isLet && bsRenameable(idn.name)) {
                     const nn = bsNewName(st, idn.name);
-                    frame.m[idn.name] = { bs: 1, n: nn, d: true, f: st.fnDepth, blk: null, t: 0 };
+                    frame.m[idn.name] = {
+                        bs: 1, n: nn, d: true, f: st.fnDepth, blk: null, t: 0,
+                        c: node.left.kind === "const", v: false,
+                    };
                     idn.name = nn;
                 } else {
                     bsRegIdentity(st, frame, idn.name);

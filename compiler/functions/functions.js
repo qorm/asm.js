@@ -11,7 +11,7 @@ import { BuiltinArrayMethodCompiler } from "./builtin_array_methods.js";
 import { BuiltinCollectionMethodCompiler } from "./builtin_collection_methods.js";
 import { DataStructureCompiler } from "./data_structures.js";
 import { ClosureCompiler } from "./closures.js";
-import { ASYNC_CLOSURE_MAGIC, isAsyncFunction, isGeneratorFunction } from "../async/index.js";
+import { ASYNC_CLOSURE_MAGIC } from "../async/index.js";
 import { OperatorCompiler } from "../expressions/operators.js";
 import { collectDirectEvalSourceRefs } from "../../lang/analysis/closure.js";
 import { parseStringNumericLiteral } from "../expressions/literals.js";
@@ -1357,6 +1357,249 @@ export const FunctionCompiler = {
         this.ctx.exceptionLabel = savedExceptionLabel;
     },
 
+    _directEvalParseOpts() {
+        const opts = { scriptGoal: true };
+        if (this.ctx && this.ctx.inStrictFunction) opts.strict = true;
+        else if (this._currentModuleAst && this._currentModuleAst._bsStrict) opts.strict = true;
+        const names = [];
+        const scopes = this._privateScopes;
+        if (scopes) {
+            for (let i = 0; i < scopes.length; i++) {
+                const sc = scopes[i];
+                if (!sc || !sc.names) continue;
+                for (const n of sc.names) names.push(n);
+            }
+        }
+        if (names.length > 0) {
+            opts.privateNames = names;
+            opts.classDepth = 1;
+        }
+        if (this.ctx.inClass || this.ctx.inClassMethod || this.ctx.inObjectMethod || this.ctx.superClass) {
+            opts.allowSuper = true;
+            if (!opts.classDepth) opts.classDepth = 1;
+        }
+        if (this.ctx._inFunctionBody || this.ctx.inClass || this.ctx.inClassMethod) {
+            opts.fnDepth = 1;
+        }
+        return opts;
+    },
+
+    _evalAstContainsFunction(ast) {
+        const walk = (n) => {
+            if (!n || typeof n !== "object") return false;
+            if (Array.isArray(n)) {
+                for (let i = 0; i < n.length; i++) if (walk(n[i])) return true;
+                return false;
+            }
+            const t = n.type;
+            if (t === "FunctionExpression" || t === "FunctionDeclaration" ||
+                t === "ArrowFunctionExpression" || t === "ClassExpression" ||
+                t === "ClassDeclaration") return true;
+            for (const k in n) {
+                if (k === "type" || k === "loc" || k === "range" || k === "start" || k === "end") continue;
+                if (walk(n[k])) return true;
+            }
+            return false;
+        };
+        return walk(ast);
+    },
+
+    _evalInitEarlyError(ast) {
+        const walk = (n) => {
+            if (!n || typeof n !== "object") return null;
+            if (Array.isArray(n)) {
+                for (let i = 0; i < n.length; i++) {
+                    const err = walk(n[i]);
+                    if (err) return err;
+                }
+                return null;
+            }
+            const t = n.type;
+            if (t === "FunctionExpression" || t === "FunctionDeclaration" ||
+                t === "ClassExpression" || t === "ClassDeclaration") return null;
+            if (t === "Identifier" && n.name === "arguments") return "arguments";
+            if (t === "MetaProperty" && n.meta && n.meta.name === "new" &&
+                n.property && n.property.name === "target") return "new.target";
+            if (t === "CallExpression" && n.callee && n.callee.type === "SuperExpression") {
+                return "super()";
+            }
+            for (const k in n) {
+                if (k === "type" || k === "loc" || k === "range" || k === "start" || k === "end") continue;
+                const err = walk(n[k]);
+                if (err) return err;
+            }
+            return null;
+        };
+        return walk(ast);
+    },
+
+    _directEvalLayoutStr(evalArg) {
+        const parts = [];
+        const literalEvalRefs = {};
+        if (evalArg && evalArg.type === "Literal" && typeof evalArg.value === "string") {
+            const refs = collectDirectEvalSourceRefs({
+                type: "CallExpression",
+                callee: { type: "Identifier", name: "eval" },
+                arguments: [evalArg],
+            });
+            for (let i = 0; i < refs.length; i++) literalEvalRefs[refs[i]] = true;
+        }
+        if (this.ctx.locals) {
+            for (const key of this.ctx.locals.keys()) {
+                if (key.length >= 2 && key.charCodeAt(0) === 95 &&
+                    key.charCodeAt(1) === 95 && literalEvalRefs[key] !== true) continue;
+                const off = this.ctx.getLocal(key);
+                if (!off || typeof off !== "number") continue;
+                if (this.ctx.isRawIntVar && this.ctx.isRawIntVar(key)) continue;
+                if (this.ctx.getFpAccum && this.ctx.getFpAccum(key) > 0) continue;
+                // Eval of `()=>this` (and similar) creates an escaping arrow
+                // that must share a heap box for __this; the fragment frame
+                // dies when eval returns.
+                const boxed = (this.ctx.boxedVars && this.ctx.boxedVars.has(key)) ||
+                    (key === "__this" && literalEvalRefs["__this"] === true);
+                parts.push(key + ":" + off + (boxed ? ":b" : ""));
+            }
+        }
+        if (this.ctx._evalInParamInit && this.ctx.paramLexNames) {
+            for (const pn of this.ctx.paramLexNames) parts.push("!lex:" + pn);
+        }
+        // Sloppy direct eval: var names must not collide with body let/const.
+        if (!this.ctx.inStrictFunction && this.ctx.lexLocalNames) {
+            for (const n in this.ctx.lexLocalNames) {
+                if (this.ctx.lexLocalNames[n]) parts.push("!lex:" + n);
+            }
+        }
+        let ctxFlags = "";
+        if (this.ctx.inClass || this.ctx.inClassMethod || this.ctx.inObjectMethod || this.ctx.superClass) ctxFlags += "s";
+        if (this.ctx._inFunctionBody || this.ctx.inClass || this.ctx.inClassMethod) ctxFlags += "n";
+        if (this.ctx.inStrictFunction) ctxFlags += "t";
+        if (this.ctx.inFieldInit) ctxFlags += "i";
+        if (this.ctx.inClassMethod) ctxFlags += "m";
+        if (ctxFlags) parts.push("!ctx:" + ctxFlags);
+        const scopes = this._privateScopes;
+        if (scopes) {
+            for (let i = 0; i < scopes.length; i++) {
+                const sc = scopes[i];
+                if (!sc || !sc.names || !sc.className) continue;
+                for (const n of sc.names) {
+                    parts.push("!priv:" + n + ":" + sc.className);
+                }
+            }
+        }
+        return parts.join(",");
+    },
+
+    _compileDirectEvalCall(expr) {
+        const evalArgs = expr.arguments || [];
+        let hasSpread = false;
+        for (let i = 0; i < evalArgs.length; i++) {
+            if (evalArgs[i] && evalArgs[i].type === "SpreadElement") { hasSpread = true; break; }
+        }
+        const JS_UNDEF = 0x7ffb000000000000n;
+        if (evalArgs.length === 0) {
+            this.vm.movImm64(VReg.RET, JS_UNDEF);
+            return true;
+        }
+
+        const firstArg = evalArgs[0];
+        if (!hasSpread && firstArg && firstArg.type === "Literal" && typeof firstArg.value === "string") {
+            let nestedAst = null;
+            try {
+                nestedAst = this.parse(firstArg.value, this._directEvalParseOpts());
+            } catch (_e) {
+                nestedAst = null;
+            }
+            if (nestedAst && nestedAst.body) {
+                if (this.ctx.inFieldInit) {
+                    const early = this._evalInitEarlyError(nestedAst);
+                    if (early) {
+                        this.emitThrowSyntaxError("eval in class field initializer contains " + early);
+                        return true;
+                    }
+                }
+                let onlyExpr = true;
+                for (let i = 0; i < nestedAst.body.length; i++) {
+                    const st = nestedAst.body[i];
+                    if (!st) continue;
+                    if (st.type !== "ExpressionStatement" && st.type !== "EmptyStatement") {
+                        onlyExpr = false;
+                        break;
+                    }
+                }
+                // Nested functions/arrows/classes need the eval environment
+                // (lexical this, new.target, private names) as a real fragment.
+                // Inlining `()=>this` into a caller that never used `this`
+                // captures a missing __this slot.
+                if (onlyExpr && this._evalAstContainsFunction(nestedAst)) onlyExpr = false;
+                if (onlyExpr) {
+                    let any = false;
+                    for (let i = 0; i < nestedAst.body.length; i++) {
+                        const st = nestedAst.body[i];
+                        if (st && st.type === "ExpressionStatement" && st.expression) {
+                            this.compileExpression(st.expression);
+                            any = true;
+                        }
+                    }
+                    if (!any) this.vm.movImm64(VReg.RET, JS_UNDEF);
+                    return true;
+                }
+            }
+        }
+
+        const layoutStr = this._directEvalLayoutStr(hasSpread ? null : firstArg);
+        const useDirect = layoutStr.length > 0;
+        const calleeName = useDirect ? "__eval_direct" : "__eval";
+
+        if (hasSpread) {
+            this.compileArrayExpressionWithSpread(evalArgs);
+            const arrName = `__evalsp_arr_${this.nextLabelId()}`;
+            const arrOff = this.ctx.allocLocal(arrName);
+            this.vm.store(VReg.FP, arrOff, VReg.RET);
+            this.vm.mov(VReg.A0, VReg.RET);
+            this.vm.call("_array_length");
+            const emptyL = this.ctx.newLabel("evalsp_empty");
+            const doneL = this.ctx.newLabel("evalsp_done");
+            this.vm.cmpImm(VReg.RET, 0);
+            this.vm.jeq(emptyL);
+            this.vm.load(VReg.A0, VReg.FP, arrOff);
+            this.vm.movImm(VReg.A1, 0);
+            this.vm.call("_array_get");
+            const srcName = `__evalsp_src_${this.nextLabelId()}`;
+            this.ctx.allocLocal(srcName);
+            this.vm.store(VReg.FP, this.ctx.getLocal(srcName), VReg.RET);
+            const srcId = { type: "Identifier", name: srcName };
+            this.compileExpression({
+                type: "CallExpression",
+                callee: { type: "Identifier", name: calleeName },
+                arguments: useDirect
+                    ? [
+                        srcId,
+                        { type: "CallExpression", callee: { type: "Identifier", name: "__eval_frame_ptr" }, arguments: [] },
+                        { type: "Literal", value: layoutStr },
+                    ]
+                    : [srcId],
+            });
+            this.vm.jmp(doneL);
+            this.vm.label(emptyL);
+            this.vm.movImm64(VReg.RET, JS_UNDEF);
+            this.vm.label(doneL);
+            return true;
+        }
+
+        this.compileExpression({
+            type: "CallExpression",
+            callee: { type: "Identifier", name: calleeName },
+            arguments: useDirect
+                ? [
+                    firstArg,
+                    { type: "CallExpression", callee: { type: "Identifier", name: "__eval_frame_ptr" }, arguments: [] },
+                    { type: "Literal", value: layoutStr },
+                ]
+                : evalArgs,
+        });
+        return true;
+    },
+
     // 编译函数调用
     compileCallExpression(expr) {
         // OptionalChain continuation: `a?.b.c()` / `a?.b.c(++x)` must skip
@@ -1608,91 +1851,14 @@ export const FunctionCompiler = {
             }
         }
 
-        // eval(x) → route B 引擎:运行时编译执行(__eval_shim 的 import 由 readModuleSource
-        // 按"源码含 eval("注入)。仅当 eval 未被用户局部/函数遮蔽时改派(否则尊重用户绑定)。
-        // **直接 eval 词法捕获**:此调用点是直接 eval(callee 为裸标识符 eval;间接形
-        // `(0,eval)(x)`/别名/成员形的 callee 非 Identifier "eval",天然走全局 __eval 路径)。
-        // 把外层函数的局部名→FP 槽偏移序列化成 layoutStr,连同调用者 FP(__eval_frame_ptr())
-        // 传给 __eval_direct → 片段 copy-in/copy-out 读写这些槽(见 engine/compile.js)。
-        // 装箱(被真闭包捕获)/循环寄存器驻留(rawInt/fpAccum,槽可能陈旧)的变量不纳入捕获。
-        // 无可捕获局部(如全局作用域)时 layoutStr 为空 → 退回 __eval(间接/全局语义)。
+        // eval(x) → route B 引擎。空参数列表返回 undefined;字面量表达式直编进
+        // 当前词法环境(含私有名/super);spread/非字面量走 __eval / __eval_direct。
         if (callee.type === "Identifier" && callee.name === "eval" &&
             !(this.ctx.getLocal && this.ctx.getLocal("eval")) &&
             !(this.ctx.getFunction && this.ctx.getFunction("eval"))) {
-            // A route-B fragment cannot link the host's user-level __eval
-            // closure as a runtime symbol.  For the common constant direct-
-            // eval expression, compile the expression into the current
-            // fragment instead.  This also preserves the caller's bindings
-            // and completion value (`eval("x++")` in a loop) without a nested
-            // mmap/compile cycle.  Keep the fast path deliberately narrow;
-            // declarations and statement sequences retain the general route.
-            if (this.engineNoIC && expr.arguments.length === 1 &&
-                expr.arguments[0] && expr.arguments[0].type === "Literal" &&
-                typeof expr.arguments[0].value === "string") {
-                const nestedAst = this.parse(expr.arguments[0].value);
-                if (nestedAst.body && nestedAst.body.length === 1 &&
-                    nestedAst.body[0].type === "ExpressionStatement") {
-                    this.compileExpression(nestedAst.body[0].expression);
-                    return;
-                }
-            }
-            let layoutStr = "";
-            if (expr.arguments.length === 1 && this.ctx.locals) {
-                const parts = [];
-                const literalEvalRefs = {};
-                if (expr.arguments[0] && expr.arguments[0].type === "Literal" &&
-                    typeof expr.arguments[0].value === "string") {
-                    const refs = collectDirectEvalSourceRefs(expr);
-                    for (let i = 0; i < refs.length; i++) literalEvalRefs[refs[i]] = true;
-                }
-                for (const key of this.ctx.locals.keys()) {
-                    // Most __* locals are compiler temporaries.  A user binding
-                    // with that prefix is nevertheless observable by direct eval;
-                    // admit it only when a literal eval source explicitly refers
-                    // to the name (including a nested literal eval).
-                    if (key.length >= 2 && key.charCodeAt(0) === 95 &&
-                        key.charCodeAt(1) === 95 && literalEvalRefs[key] !== true) continue;
-                    const off = this.ctx.getLocal(key);
-                    if (!off || typeof off !== "number") continue;
-                    if (this.ctx.isRawIntVar && this.ctx.isRawIntVar(key)) continue; // 循环裸 int 驻留:槽可能陈旧
-                    if (this.ctx.getFpAccum && this.ctx.getFpAccum(key) > 0) continue; // FP 累加器驻留:同上
-                    // 装箱变量(被真闭包捕获,或含 eval 帧模型升级——见 analyzeDirectEvalBoxedVars):
-                    // 调用者槽存 box 指针。片段 copy-in **复用同一 box**(不新建值快照)→ eval 内逃逸
-                    // 闭包的写、以及调用者 eval 后续对该变量的写,皆经共享 box 联动(逃逸捕获正确)。标 `:b`。
-                    const boxed = this.ctx.boxedVars && this.ctx.boxedVars.has(key);
-                    parts.push(key + ":" + off + (boxed ? ":b" : ""));
-                }
-                // During default-parameter evaluation, direct eval's varEnv
-                // is separated from the parameter lexical environment.  A
-                // `var` whose name conflicts with any parameter binding is a
-                // runtime SyntaxError (EvalDeclarationInstantiation).  Pass
-                // those lexical names even when no ordinary capture exists;
-                // engine/compile.js checks `!lex:` entries before emitting or
-                // executing the fragment.
-                if (this.ctx._evalInParamInit && this.ctx.paramLexNames) {
-                    for (const pn of this.ctx.paramLexNames) parts.push("!lex:" + pn);
-                }
-                layoutStr = parts.join(",");
-            }
-            if (layoutStr.length > 0) {
-                this.compileExpression({
-                    type: "CallExpression",
-                    callee: { type: "Identifier", name: "__eval_direct" },
-                    arguments: [
-                        expr.arguments[0],
-                        { type: "CallExpression", callee: { type: "Identifier", name: "__eval_frame_ptr" }, arguments: [] },
-                        { type: "Literal", value: layoutStr },
-                    ],
-                });
-                return;
-            }
-            this.compileExpression({
-                type: "CallExpression",
-                callee: { type: "Identifier", name: "__eval" },
-                arguments: expr.arguments,
-            });
-            return;
+            if (this._compileDirectEvalCall(expr)) return;
         }
+
 
         // RegExp shim 分派(批次D):接收者/实参静态类型为 REGEXP 时改派纯 JS 引擎
         //   re.test(s) → __RE_test(re, s)      re.exec(s) → __RE_exec(re, s)
@@ -1906,32 +2072,60 @@ export const FunctionCompiler = {
             if (superName && thisOffset && ERR_TYPES.indexOf(superName) >= 0) {
                 const isAgg = superName === "AggregateError";
                 const msgIdx = isAgg ? 1 : 0;
+                const errArgs = expr.arguments || [];
+                const errArgv = this.ctx.allocLocal(`__superr_argv_${this.nextLabelId()}`);
+                if (errArgs.some((a) => a && a.type === "SpreadElement")) {
+                    this.compileArrayExpressionWithSpread(errArgs);
+                } else {
+                    this.compileArrayExpression({ type: "ArrayExpression", elements: errArgs });
+                }
+                this.vm.store(VReg.FP, errArgv, VReg.RET);
+                this.vm.load(VReg.A0, VReg.FP, errArgv);
+                this.vm.call("_array_length");
+                const errN = this.ctx.allocLocal(`__superr_n_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, errN, VReg.RET);
                 // errors(仅 AggregateError):this.errors = arg0
-                if (isAgg && expr.arguments.length > 0 && expr.arguments[0]) {
+                if (isAgg) {
+                    const eSkip = this.ctx.newLabel("superr_noerr");
+                    this.vm.load(VReg.V0, VReg.FP, errN);
+                    this.vm.cmpImm(VReg.V0, 1);
+                    this.vm.jlt(eSkip);
+                    this.vm.load(VReg.A0, VReg.FP, errArgv);
+                    this.vm.movImm(VReg.A1, 0);
+                    this.vm.call("_array_get");
                     const eSlot = this.ctx.allocLocal(`__superr_e_${this.nextLabelId()}`);
-                    this.compileExpression(expr.arguments[0]);
                     this.vm.store(VReg.FP, eSlot, VReg.RET);
                     this.vm.load(VReg.A0, VReg.FP, thisOffset);
                     this.emitBoxedStringKey("errors", VReg.A1);
                     this.vm.load(VReg.A2, VReg.FP, eSlot);
                     this.vm.call("_object_set");
+                    this.vm.label(eSkip);
                 }
-                // message = 指定参数(无则空串);undefined/非串走 _error_msg_norm 归一
-                if (expr.arguments.length > msgIdx && expr.arguments[msgIdx]) {
-                    this.compileExpression(expr.arguments[msgIdx]);
-                    this.vm.mov(VReg.A0, VReg.RET);
-                    this.vm.call("_error_msg_norm");
-                } else {
-                    this.vm.lea(VReg.RET, this.asm.addString(""));
-                    this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
-                    this.vm.or(VReg.RET, VReg.RET, VReg.V1);
-                }
+                // message: only when the argument is present and not undefined.
+                // Own data property is writable/configurable, not enumerable.
+                const errMsgSkip = this.ctx.newLabel("superr_nomsg");
+                this.vm.load(VReg.V0, VReg.FP, errN);
+                this.vm.cmpImm(VReg.V0, msgIdx + 1);
+                this.vm.jlt(errMsgSkip);
+                this.vm.load(VReg.A0, VReg.FP, errArgv);
+                this.vm.movImm(VReg.A1, msgIdx);
+                this.vm.call("_array_get");
+                this.vm.shrImm(VReg.V1, VReg.RET, 48);
+                this.vm.cmpImm(VReg.V1, 0x7ffb);
+                this.vm.jeq(errMsgSkip);
+                this.vm.mov(VReg.A0, VReg.RET);
+                this.vm.call("_error_msg_norm");
                 const msgSlot = this.ctx.allocLocal(`__superr_m_${this.nextLabelId()}`);
                 this.vm.store(VReg.FP, msgSlot, VReg.RET);
                 this.vm.load(VReg.A0, VReg.FP, thisOffset);
                 this.emitBoxedStringKey("message", VReg.A1);
                 this.vm.load(VReg.A2, VReg.FP, msgSlot);
                 this.vm.call("_object_set");
+                this.vm.load(VReg.A0, VReg.FP, thisOffset);
+                this.emitBoxedStringKey("message", VReg.A1);
+                this.vm.movImm(VReg.A2, 5); // w:1 e:0 c:1
+                this.vm.call("_object_set_prop_attr");
+                this.vm.label(errMsgSkip);
                 // __asmjs_err = true(instanceof Error 族依赖此标记)
                 this.vm.load(VReg.A0, VReg.FP, thisOffset);
                 this.emitBoxedStringKey("__asmjs_err", VReg.A1);
@@ -2106,7 +2300,8 @@ export const FunctionCompiler = {
             // representation (Map/ArrayBuffer raw pointers, Number boxed
             // wrapper), which the constructor return path already preserves.
             if (thisOffset != null && !this.ctx.superClassExpr &&
-                (superName === "Map" || superName === "ArrayBuffer" || superName === "Number")) {
+                (superName === "Map" || superName === "ArrayBuffer" || superName === "Number" ||
+                 superName === "String")) {
                 const builtinArgs = expr.arguments || [];
                 const hasSpread = builtinArgs.some((a) => a && a.type === "SpreadElement");
                 const firstArgOff = this.ctx.allocLocal(`__super_builtin_arg_${this.nextLabelId()}`);
@@ -2121,6 +2316,8 @@ export const FunctionCompiler = {
                     // _number_new installs Number.prototype methods through
                     // this materialized singleton (not the minimal lazy shell).
                     this.emitNumberCtorObject();
+                } else if (superName === "String") {
+                    this.emitStringCtorObject();
                 }
                 // The synthetic derived constructor forwards its rest array as
                 // `super(...__superargs)`.  We only need the first expanded
@@ -2181,12 +2378,30 @@ export const FunctionCompiler = {
                     this.vm.call("_to_uint32");
                     this.vm.mov(VReg.A0, VReg.RET);
                     this.vm.call("_arraybuffer_new");
+                } else if (superName === "String") {
+                    const strEmpty = this.ctx.newLabel("super_str_empty");
+                    const strReady = this.ctx.newLabel("super_str_ready");
+                    if (this.ctx.ctorArgcOff != null) {
+                        this.vm.load(VReg.V0, VReg.FP, this.ctx.ctorArgcOff);
+                        this.vm.cmpImm(VReg.V0, 0);
+                        this.vm.jeq(strEmpty);
+                    }
+                    this.vm.load(VReg.A0, VReg.FP, firstArgOff);
+                    this.vm.call("_valueToStr");
+                    this.vm.jmp(strReady);
+                    this.vm.label(strEmpty);
+                    this.vm.lea(VReg.RET, this.asm.addString(""));
+                    this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+                    this.vm.or(VReg.RET, VReg.RET, VReg.V1);
+                    this.vm.label(strReady);
+                    this.vm.mov(VReg.A0, VReg.RET);
+                    this.vm.call("_string_new");
                 } else {
                     this.vm.load(VReg.A0, VReg.FP, firstArgOff);
                     this.vm.call("_number_new");
                 }
                 this.vm.store(VReg.FP, thisOffset, VReg.RET);
-                if (superName === "ArrayBuffer" && this.ctx.classInfoLabel) {
+                if ((superName === "ArrayBuffer" || superName === "Map") && this.ctx.classInfoLabel) {
                     // ArrayBuffer's compact header uses +16 for data_ptr, so
                     // retain a derived constructor's [[Prototype]] in the
                     // shared TA/AB side table (the same table is keyed by raw
@@ -2201,6 +2416,17 @@ export const FunctionCompiler = {
                     this.vm.or(VReg.A1, VReg.A1, VReg.V2);
                     this.vm.load(VReg.A0, VReg.FP, thisOffset);
                     this.vm.call("_ta_bind_instance_proto");
+                }
+                if ((superName === "String" || superName === "Number") && this.ctx.classInfoLabel) {
+                    this.vm.lea(VReg.V0, this.ctx.classInfoLabel);
+                    this.vm.load(VReg.V0, VReg.V0, 0);
+                    this.vm.load(VReg.V1, VReg.V0, 32);
+                    this.vm.load(VReg.A1, VReg.V1, 24);
+                    this.vm.emitMaskLoad(VReg.V2);
+                    this.vm.andMaskReg(VReg.V0, VReg.A1, VReg.V2);
+                    this.vm.load(VReg.A0, VReg.FP, thisOffset);
+                    this.vm.andMaskReg(VReg.A0, VReg.A0, VReg.V2);
+                    this.vm.store(VReg.A0, 16, VReg.V0);
                 }
                 // Return the actual builtin object through the constructor
                 // trampoline; otherwise the outer `new Sub(...)` path may
@@ -2265,6 +2491,94 @@ export const FunctionCompiler = {
                 this.vm.label(superSetDone);
                 this.vm.load(VReg.RET, VReg.FP, superSetObj);
                 this.vm.store(VReg.FP, thisOffset, VReg.RET);
+                if (this.ctx.classInfoLabel) {
+                    this.vm.lea(VReg.V0, this.ctx.classInfoLabel);
+                    this.vm.load(VReg.V0, VReg.V0, 0);
+                    this.vm.load(VReg.V1, VReg.V0, 32);
+                    this.vm.load(VReg.A1, VReg.V1, 24);
+                    this.vm.emitMaskLoad(VReg.V2);
+                    this.vm.andMaskReg(VReg.A1, VReg.A1, VReg.V2);
+                    this.vm.movImm64(VReg.V2, 0x7ffd000000000000n);
+                    this.vm.or(VReg.A1, VReg.A1, VReg.V2);
+                    this.vm.load(VReg.A0, VReg.FP, thisOffset);
+                    this.vm.call("_ta_bind_instance_proto");
+                    this.vm.load(VReg.RET, VReg.FP, thisOffset);
+                }
+                this.emitMarkSuperCalled();
+                return;
+            }
+            if (superName === "DataView" && thisOffset != null && !this.ctx.superClassExpr) {
+                this.emitDataViewCtorObject();
+                const dvArgs = expr.arguments || [];
+                const dvBufOff = this.ctx.allocLocal(`__super_dv_buf_${this.nextLabelId()}`);
+                const dvOffOff = this.ctx.allocLocal(`__super_dv_off_${this.nextLabelId()}`);
+                const dvLenOff = this.ctx.allocLocal(`__super_dv_len_${this.nextLabelId()}`);
+                const dvArgv = this.ctx.allocLocal(`__super_dv_argv_${this.nextLabelId()}`);
+                if (dvArgs.some((a) => a && a.type === "SpreadElement")) {
+                    this.compileArrayExpressionWithSpread(dvArgs);
+                } else {
+                    this.compileArrayExpression({ type: "ArrayExpression", elements: dvArgs });
+                }
+                this.vm.store(VReg.FP, dvArgv, VReg.RET);
+                this.vm.load(VReg.A0, VReg.FP, dvArgv);
+                this.vm.call("_array_length");
+                const dvN = this.ctx.allocLocal(`__super_dv_n_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, dvN, VReg.RET);
+                this.vm.load(VReg.A0, VReg.FP, dvArgv);
+                this.vm.movImm(VReg.A1, 0);
+                this.vm.call("_array_get");
+                this.vm.store(VReg.FP, dvBufOff, VReg.RET);
+                const dvHasOff = this.ctx.newLabel("super_dv_has_off");
+                const dvOffReady = this.ctx.newLabel("super_dv_off_ready");
+                this.vm.load(VReg.V0, VReg.FP, dvN);
+                this.vm.cmpImm(VReg.V0, 2);
+                this.vm.jge(dvHasOff);
+                this.vm.movImm(VReg.RET, 0);
+                this.vm.jmp(dvOffReady);
+                this.vm.label(dvHasOff);
+                this.vm.load(VReg.A0, VReg.FP, dvArgv);
+                this.vm.movImm(VReg.A1, 1);
+                this.vm.call("_array_get");
+                this.vm.mov(VReg.A0, VReg.RET);
+                this.vm.call("_to_uint32");
+                this.vm.label(dvOffReady);
+                this.vm.store(VReg.FP, dvOffOff, VReg.RET);
+                const dvHasLen = this.ctx.newLabel("super_dv_has_len");
+                const dvLenReady = this.ctx.newLabel("super_dv_len_ready");
+                this.vm.load(VReg.V0, VReg.FP, dvN);
+                this.vm.cmpImm(VReg.V0, 3);
+                this.vm.jge(dvHasLen);
+                this.vm.load(VReg.A0, VReg.FP, dvBufOff);
+                this.vm.call("_arraybuffer_bytelength");
+                this.vm.load(VReg.V1, VReg.FP, dvOffOff);
+                this.vm.sub(VReg.RET, VReg.RET, VReg.V1);
+                this.vm.jmp(dvLenReady);
+                this.vm.label(dvHasLen);
+                this.vm.load(VReg.A0, VReg.FP, dvArgv);
+                this.vm.movImm(VReg.A1, 2);
+                this.vm.call("_array_get");
+                this.vm.mov(VReg.A0, VReg.RET);
+                this.vm.call("_to_uint32");
+                this.vm.label(dvLenReady);
+                this.vm.store(VReg.FP, dvLenOff, VReg.RET);
+                this.vm.load(VReg.A0, VReg.FP, dvBufOff);
+                this.vm.load(VReg.A1, VReg.FP, dvOffOff);
+                this.vm.load(VReg.A2, VReg.FP, dvLenOff);
+                this.vm.call("_dataview_new");
+                this.vm.store(VReg.FP, thisOffset, VReg.RET);
+                if (this.ctx.classInfoLabel) {
+                    this.vm.lea(VReg.V0, this.ctx.classInfoLabel);
+                    this.vm.load(VReg.V0, VReg.V0, 0);
+                    this.vm.load(VReg.V1, VReg.V0, 32);
+                    this.vm.load(VReg.A1, VReg.V1, 24);
+                    this.vm.emitMaskLoad(VReg.V2);
+                    this.vm.andMaskReg(VReg.A1, VReg.A1, VReg.V2);
+                    this.vm.movImm64(VReg.V2, 0x7ffd000000000000n);
+                    this.vm.or(VReg.A1, VReg.A1, VReg.V2);
+                    this.vm.load(VReg.A0, VReg.FP, thisOffset);
+                    this.vm.call("_ta_bind_instance_proto");
+                }
+                this.vm.load(VReg.RET, VReg.FP, thisOffset);
                 this.emitMarkSuperCalled();
                 return;
             }
@@ -2584,6 +2898,7 @@ export const FunctionCompiler = {
             callee.object.type === "SuperExpression") {
             const thisOffset = this.ctx.getLocal("__this");
             const methodName = this.getMemberPropertyName(callee.property);
+            this.emitGuardDerivedThis();
             // Object-literal / base-class: no classinfo. Get(GetPrototypeOf(this), name)
             // then Call with this. Same HomeObject≈this approximation as super.prop GET.
             if (!this.ctx.superClass) {
@@ -2700,19 +3015,27 @@ export const FunctionCompiler = {
                 !(this.ctx.getLocal && this.ctx.getLocal("Function")) &&
                 !(this.ctx.getFunction && this.ctx.getFunction("Function"))) {
                 const args = expr.arguments || [];
-                const bodyArg = args.length > 0 ? args[args.length - 1]
-                    : { type: "Literal", value: "" };
-                const nameArgs = [];
-                for (let ni = 0; ni < args.length - 1; ni++) nameArgs.push(args[ni]);
-                this.compileExpression({
-                    type: "CallExpression",
-                    callee: { type: "Identifier", name: "__makeFunction" },
-                    arguments: [
-                        { type: "ArrayExpression", elements: nameArgs },
-                        bodyArg,
-                    ],
-                });
-                return;
+                if (!this.engineNoIC &&
+                    this.getFunctionLabel && this.getFunctionLabel("__makeFunction")) {
+                    const bodyArg = args.length > 0 ? args[args.length - 1]
+                        : { type: "Literal", value: "" };
+                    const nameArgs = [];
+                    for (let ni = 0; ni < args.length - 1; ni++) nameArgs.push(args[ni]);
+                    this.compileExpression({
+                        type: "CallExpression",
+                        callee: { type: "Identifier", name: "__makeFunction" },
+                        arguments: [
+                            { type: "ArrayExpression", elements: nameArgs },
+                            bodyArg,
+                        ],
+                    });
+                    return;
+                }
+                if (this.engineNoIC) {
+                    this.compileCallArguments(args);
+                    this.vm.call("_dynamic_function_ctor_call");
+                    return;
+                }
             }
             // Array(...) 无 new 与 new Array(...) 同义(ES 规范)。此前 Array(5) 落通用路径
             // 得数字 5(Array 标识符=1 当函数调)。排除用户局部/函数同名。
@@ -3100,6 +3423,17 @@ export const FunctionCompiler = {
                 this.vm.load(VReg.A0, VReg.FP, arStrsOff);
                 this.emitBoxedStringKey("raw", VReg.A1);
                 this.vm.call("_closure_prop_set"); // 侧表:strs.raw = rawArr
+                this.vm.load(VReg.A0, VReg.FP, arStrsOff);
+                this.emitBoxedStringKey("raw", VReg.A1);
+                this.vm.movImm(VReg.A2, 0); // enumerable:false writable:false configurable:false
+                this.vm.call("_closure_prop_set_attr");
+                this.vm.load(VReg.A0, VReg.FP, arStrsOff);
+                this.vm.call("_object_freeze");
+                this.vm.load(VReg.A0, VReg.FP, arStrsOff);
+                this.emitBoxedStringKey("raw", VReg.A1);
+                this.vm.call("_object_get");
+                this.vm.mov(VReg.A0, VReg.RET);
+                this.vm.call("_object_freeze");
                 this.vm.load(VReg.RET, VReg.FP, arStrsOff);
                 this.vm.lea(VReg.V1, siteLabel);
                 this.vm.store(VReg.V1, 0, VReg.RET); // 缓存模板对象(数据根 → 常驻)
@@ -3915,15 +4249,19 @@ export const FunctionCompiler = {
                     return;
                 }
 
-                // 检查是否是 async 函数(async generator 除外:后者像生成器一样正常调用,
-                // 运行函数标签处的 async-gen stub 建 async-gen 对象,不走 Promise 化调用)。
-                if (isAsyncFunction(funcDef) && !isGeneratorFunction(funcDef)) {
-                    // async 函数调用：创建协程并返回 Promise
-                    this.compileAsyncFunctionCall(callee.name, expr.arguments);
-                    return;
-                }
+                // Named `async function f()` already emits a stub at funcLabel
+                // (coro + Promise + AsyncFunctionStart).  Wrapping that stub in
+                // compileAsyncFunctionCall created a second Promise that adopted
+                // the inner one via .then() → extra SpeciesConstructor Get.
+                // Call the stub like a normal function.
 
                 this.compileCallArguments(expr.arguments);
+                // Bare f() must OrdinaryCallBindThis: sloppy → globalThis,
+                // strict → undefined. Previously A5 was leftover, so
+                // `function f(){ return this }` and `eval("()=>this")` inside
+                // a sloppy function saw a garbage this.
+                this.vm.lea(VReg.S1, funcLabel);
+                this.emitOrdinaryCallBindThis(VReg.S1);
                 this.vm.call(funcLabel);
                 return;
             }
@@ -6930,7 +7268,7 @@ export const FunctionCompiler = {
             if (!callee.computed && this._isPrivateMemberKey && this._isPrivateMemberKey(prop)) {
                 const mangled = this.manglePrivateName(prop.name);
                 this.vm.load(VReg.RET, VReg.SP, 0);
-                this.emitPrivateBrandCheck(mangled, 0);
+                this.emitPrivateBrandCheck(mangled, 0, !!(obj && obj.type === "ThisExpression"));
                 this.vm.load(VReg.A0, VReg.SP, 0);
                 this.emitBoxedStringKey(mangled, VReg.A1);
                 this.vm.call("_object_get");
@@ -7100,10 +7438,25 @@ export const FunctionCompiler = {
                 const funcLabel = this.getFunctionLabel(callee.name);
                 if (funcLabel) {
                     this.compileCallArguments(expr.arguments);
+                    this.vm.lea(VReg.S1, funcLabel);
+                    this.emitOrdinaryCallBindThis(VReg.S1);
                     this.vm.call(funcLabel);
+                    return;
                 }
             }
-            // 否则：局部变量通过闭包机制，外部符号通过 IAT，其他标识符被忽略
+            const shimLabel = this.getFunctionLabel && this.getFunctionLabel(callee.name);
+            if (shimLabel) {
+                this.compileCallArguments(expr.arguments);
+                this.vm.lea(VReg.S1, shimLabel);
+                this.emitOrdinaryCallBindThis(VReg.S1);
+                this.vm.call(shimLabel);
+                return;
+            }
+            // Unresolvable / global identifier call: GetValue(ref) then Call.
+            // `x()` with no binding must throw ReferenceError (S11.2.3_A2).
+            this.compileExpression(callee);
+            this.vm.mov(VReg.V6, VReg.RET);
+            this.compileClosureCall(VReg.V6, expr.arguments);
         } else {
             // 对于间接调用，先计算 callee，然后使用闭包调用机制
             this.compileExpression(callee);
@@ -7157,8 +7510,11 @@ export const FunctionCompiler = {
                 // [ext] 扩展至逻辑赋值运算符(??=/&&=/||=)
                 const isLogicalAssign = node.operator === "??=" ||
                     node.operator === "&&=" || node.operator === "||=";
+                // IsIdentifierRef is false for CoverParenthesizedExpression:
+                // `(fn) = function(){}` must not NamedEvaluation to "fn".
                 if ((node.operator === "=" || isLogicalAssign) &&
-                    node.left && node.left.type === "Identifier" && isAnonCallable(node.right)) {
+                    node.left && node.left.type === "Identifier" &&
+                    !node.left._parenthesized && isAnonCallable(node.right)) {
                     hints.set(node.right, node.left.name);
                 }
             } else if (t === "AssignmentPattern") {

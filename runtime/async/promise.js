@@ -447,8 +447,9 @@ export class PromiseGenerator {
     // promise 结算(resolve/reject)后,已注册的 .then/.catch 回调不再同步直调,而是排入
     // 微任务队列,在本轮同步"job"结束后统一排空(_promise_drain_reactions 由入口在
     // _main → _scheduler_run 之后调用,先于 _ev_run)。这样 `Promise.resolve().then(cb)`
-    // 里的 cb 排到后续同步代码之后 —— s1|s2|t。await 不走此队列(仍经协程挂起/唤醒),
-    // 故 async-await 语义不受影响。一次 _promise_drain_reactions 内部循环排空整条链
+    // 里的 cb 排到后续同步代码之后 —— s1|s2|t。await of a settled promise also
+    // enqueues a resume reaction on this queue (spec Await / PerformPromiseThen).
+    // 一次 _promise_drain_reactions 内部循环排空整条链
     // (排空中新入队的反应追加到队尾、同循环内消费),故入口单次调用即可,不需外层循环。
     //
     // 反应节点(32 字节):+0 next(裸)、+8 callback(值)、+16 value、+24 next_promise(boxed,0=无)
@@ -1935,57 +1936,14 @@ export class PromiseGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32);
     }
 
-    // _promise_await(A0=promise) -> value
-    // 已 settled:同步返回(普通 async 函数热路径)。pending:挂起等结算。
-    // _promise_await_job:已 settled 也经微任务恢复(async generator 规范 Await)。
+    // _promise_await / _promise_await_job(A0=promise) -> value
+    // Await is PerformPromiseThen + suspend (spec 6.2.3.1): already-settled
+    // promises still resume on a later microtask so later sync jobs (Promise
+    // executor / .then enqueue) run first.  Do not drain inside await.
     generatePromiseAwait() {
         const vm = this.vm;
 
         vm.label("_promise_await");
-        vm.prologue(32, [VReg.S0, VReg.S1]);
-        vm.call("_js_unbox");
-        vm.mov(VReg.S0, VReg.RET);
-
-        // Pending value@+16 is 0. After yield, a still-pending promise used to
-        // fall through to ful_fast and return 0 — `await p.then(v=>v+1)` and
-        // AFS `await wrap.then(onFul,onRej)` both became 0, so for-await looped
-        // and closed the sync iterator twice. Drain queued reactions first
-        // (then-derived settle this turn); never treat PENDING as fulfilled.
-        vm.label("_paw_check");
-        vm.load(VReg.V1, VReg.S0, 8);
-        vm.cmpImm(VReg.V1, PROMISE_FULFILLED);
-        vm.jeq("_paw_ful_fast");
-        vm.cmpImm(VReg.V1, PROMISE_REJECTED);
-        vm.jeq("_paw_rej_fast");
-        vm.store(VReg.SP, 0, VReg.S0);
-        vm.call("_promise_drain_reactions");
-        vm.load(VReg.S0, VReg.SP, 0);
-        vm.load(VReg.V1, VReg.S0, 8);
-        vm.cmpImm(VReg.V1, PROMISE_FULFILLED);
-        vm.jeq("_paw_ful_fast");
-        vm.cmpImm(VReg.V1, PROMISE_REJECTED);
-        vm.jeq("_paw_rej_fast");
-
-        vm.lea(VReg.S1, "_scheduler_current");
-        vm.load(VReg.S1, VReg.S1, 0);
-        vm.store(VReg.S0, 40, VReg.S1);
-        vm.call("_coroutine_yield");
-        vm.jmp("_paw_check");
-
-        vm.label("_paw_ful_fast");
-        vm.load(VReg.RET, VReg.S0, 16);
-        vm.epilogue([VReg.S0, VReg.S1], 32);
-
-        vm.label("_paw_rej_fast");
-        vm.load(VReg.S1, VReg.S0, 16);
-        vm.lea(VReg.V0, "_exception_value");
-        vm.store(VReg.V0, 0, VReg.S1);
-        vm.lea(VReg.V0, "_exception_pending");
-        vm.movImm(VReg.V1, 1);
-        vm.store(VReg.V0, 0, VReg.V1);
-        vm.movImm64(VReg.RET, JS_UNDEFINED);
-        vm.epilogue([VReg.S0, VReg.S1], 32);
-
         vm.label("_promise_await_job");
         vm.prologue(32, [VReg.S0, VReg.S1, VReg.S2]);
         vm.call("_js_unbox");
@@ -1993,20 +1951,44 @@ export class PromiseGenerator {
 
         vm.lea(VReg.S1, "_scheduler_current");
         vm.load(VReg.S1, VReg.S1, 0);
-        vm.store(VReg.S0, 40, VReg.S1);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_make_paw_resume_cb");
+        vm.mov(VReg.S2, VReg.RET);
 
         vm.load(VReg.V1, VReg.S0, 8);
         vm.cmpImm(VReg.V1, PROMISE_PENDING);
-        vm.jeq("_pawj_yield");
-        vm.call("_ensure_paw_resume_cb");
-        vm.mov(VReg.A0, VReg.RET);
+        vm.jeq("_pawj_pending");
+        vm.mov(VReg.A0, VReg.S2);
         vm.mov(VReg.A1, VReg.S1);
         vm.movImm(VReg.A2, 0);
         vm.call("_promise_enqueue_reaction");
+        vm.jmp("_pawj_yield");
+
+        vm.label("_pawj_pending");
+        vm.movImm(VReg.A0, HANDLER_SIZE);
+        vm.call("_alloc");
+        vm.store(VReg.RET, 0, VReg.S2);
+        vm.movImm(VReg.V1, 0);
+        vm.store(VReg.RET, 8, VReg.V1);
+        vm.store(VReg.RET, 16, VReg.V1);
+        vm.mov(VReg.A1, VReg.RET);
+        vm.addImm(VReg.A0, VReg.S0, 24);
+        vm.call("_promise_append_handler");
+        vm.movImm(VReg.A0, HANDLER_SIZE);
+        vm.call("_alloc");
+        vm.store(VReg.RET, 0, VReg.S2);
+        vm.movImm(VReg.V1, 0);
+        vm.store(VReg.RET, 8, VReg.V1);
+        vm.store(VReg.RET, 16, VReg.V1);
+        vm.mov(VReg.A1, VReg.RET);
+        vm.addImm(VReg.A0, VReg.S0, 32);
+        vm.call("_promise_append_handler");
 
         vm.label("_pawj_yield");
         vm.call("_coroutine_yield");
         vm.load(VReg.V1, VReg.S0, 8);
+        vm.cmpImm(VReg.V1, PROMISE_PENDING);
+        vm.jeq("_pawj_yield");
         vm.cmpImm(VReg.V1, PROMISE_REJECTED);
         vm.jeq("_pawj_rej");
 
@@ -2023,38 +2005,31 @@ export class PromiseGenerator {
         vm.movImm64(VReg.RET, JS_UNDEFINED);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2], 32);
 
+        // invoke1 leaves S0 = unboxed closure; +16 is the waiting coro.
         vm.label("_paw_resume_tramp");
         vm.prologue(0, [VReg.S0]);
-        vm.mov(VReg.S0, VReg.A0);
+        vm.load(VReg.A0, VReg.S0, 16);
         vm.movImm64(VReg.A1, 0x7ffb000000000000n);
-        vm.mov(VReg.A0, VReg.S0);
         vm.call("_coroutine_resume");
         vm.epilogue([VReg.S0], 0);
 
-        vm.label("_ensure_paw_resume_cb");
-        vm.prologue(0, [VReg.S0]);
-        vm.lea(VReg.V0, "_paw_resume_cb");
-        vm.load(VReg.V0, VReg.V0, 0);
-        vm.cmpImm(VReg.V0, 0);
-        vm.jne("_epaw_done");
-        vm.movImm(VReg.A0, 16);
+        vm.label("_make_paw_resume_cb");
+        vm.prologue(16, [VReg.S0]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.movImm(VReg.A0, 24);
         vm.call("_alloc");
-        vm.mov(VReg.S0, VReg.RET);
         vm.movImm(VReg.V1, 0xc105);
-        vm.store(VReg.S0, 0, VReg.V1);
+        vm.store(VReg.RET, 0, VReg.V1);
         vm.lea(VReg.V1, "_paw_resume_tramp");
-        vm.store(VReg.S0, 8, VReg.V1);
-        vm.mov(VReg.A0, VReg.S0);
+        vm.store(VReg.RET, 8, VReg.V1);
+        vm.store(VReg.RET, 16, VReg.S0);
+        vm.mov(VReg.A0, VReg.RET);
         vm.call("_js_box_function");
-        vm.lea(VReg.V1, "_paw_resume_cb");
-        vm.store(VReg.V1, 0, VReg.RET);
-        vm.label("_epaw_done");
-        vm.lea(VReg.V0, "_paw_resume_cb");
-        vm.load(VReg.RET, VReg.V0, 0);
-        vm.epilogue([VReg.S0], 0);
+        vm.epilogue([VReg.S0], 16);
     }
 
     // Promise.resolve(value) -> boxed promise
+
     generatePromiseResolveStatic() {
         const vm = this.vm;
         vm.label("_Promise_resolve");
@@ -2116,6 +2091,9 @@ export class PromiseGenerator {
         vm.mov(VReg.A0, VReg.S0);
         this.emitStringConst(VReg.A1, "constructor");
         vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.call("_maybe_getter");
         vm.cmp(VReg.RET, VReg.S2);
         vm.jne("_prs_cap");
         vm.mov(VReg.RET, VReg.S0);
@@ -2144,12 +2122,24 @@ export class PromiseGenerator {
         vm.mov(VReg.A0, VReg.S0);
         this.emitStringConst(VReg.A1, "constructor");
         vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S0);
+        vm.call("_maybe_getter");
         vm.mov(VReg.S1, VReg.RET);
         vm.lea(VReg.V0, "_nsobj_promise");
         vm.load(VReg.S2, VReg.V0, 0);
         vm.cmpImm(VReg.S2, 0);
         vm.jeq("_prs_same");
         vm.cmp(VReg.S1, VReg.S2);
+        vm.jeq("_prs_same");
+        // Native brand with default proto@+48=0: Promise.prototype.constructor
+        // may still be Object.prototype.constructor.  Wrapping would add a
+        // then-job so `await asyncFn()` takes two ticks.  Get already ran
+        // (getter side effects).  Subclass instances keep proto@+48 set.
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_js_unbox");
+        vm.load(VReg.V1, VReg.RET, 48);
+        vm.cmpImm(VReg.V1, 0);
         vm.jne("_prs_new");
         vm.label("_prs_same");
         vm.mov(VReg.RET, VReg.S0);
@@ -4550,34 +4540,16 @@ export class PromiseGenerator {
         vm.mov(VReg.S0, VReg.RET);
         vm.lea(VReg.V1, "_nsobj_promise_proto");
         vm.store(VReg.V1, 0, VReg.S0);
-        vm.label("_epp_have_obj");
-        vm.mov(VReg.A0, VReg.S0);
-        this.emitStringConst(VReg.A1, "then");
-        vm.call("_object_has");
-        vm.cmpImm(VReg.RET, 0);
-        vm.jne("_epp_methods_done");
-        this._hangArefMethod(VReg.S0, "then", "_aref_promise_then");
-        this._hangArefMethod(VReg.S0, "catch", "_aref_promise_catch");
-        this._hangArefMethod(VReg.S0, "finally", "_aref_promise_finally");
-        vm.label("_epp_methods_done");
-        // Promise.prototype has a configurable, non-enumerable
-        // @@toStringTag data property with value "Promise".  Without
-        // materialising it, Object.prototype.toString cannot distinguish a
-        // real Promise once the prototype singleton exists (the generic
-        // object path deliberately treats a materialised prototype with no
-        // tag as an ordinary Object).  Install it lazily and preserve any
-        // user-defined override when the prototype was already initialised.
+        // First materialisation only: install configurable @@toStringTag.
+        // Re-installing on later ensures resurrected a deleted tag
+        // (toString.call(promise) stayed "[object Promise]" after
+        // delete Promise.prototype[Symbol.toStringTag]).
         vm.lea(VReg.A0, "_symwk_toStringTag");
         vm.lea(VReg.A1, vm.asm.addString("Symbol.toStringTag"));
         vm.movImm64(VReg.V0, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.A1, VReg.V0);
         vm.call("_symbol_wellknown");
         vm.mov(VReg.S1, VReg.RET);
-        vm.mov(VReg.A0, VReg.S0);
-        vm.mov(VReg.A1, VReg.S1);
-        vm.call("_object_has");
-        vm.cmpImm(VReg.RET, 0);
-        vm.jne("_epp_tag_done");
         vm.mov(VReg.A0, VReg.S0);
         vm.mov(VReg.A1, VReg.S1);
         vm.lea(VReg.A2, vm.asm.addString("Promise"));
@@ -4588,7 +4560,16 @@ export class PromiseGenerator {
         vm.mov(VReg.A1, VReg.S1);
         vm.movImm(VReg.A2, 4); // writable=false, enumerable=false, configurable=true
         vm.call("_object_set_prop_attr");
-        vm.label("_epp_tag_done");
+        vm.label("_epp_have_obj");
+        vm.mov(VReg.A0, VReg.S0);
+        this.emitStringConst(VReg.A1, "then");
+        vm.call("_object_has");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_epp_methods_done");
+        this._hangArefMethod(VReg.S0, "then", "_aref_promise_then");
+        this._hangArefMethod(VReg.S0, "catch", "_aref_promise_catch");
+        this._hangArefMethod(VReg.S0, "finally", "_aref_promise_finally");
+        vm.label("_epp_methods_done");
         vm.label("_epp_done");
         vm.mov(VReg.RET, VReg.S0);
         vm.epilogue([VReg.S0, VReg.S1], 16);

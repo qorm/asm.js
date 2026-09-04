@@ -1,0 +1,10 @@
+{
+  "description": "TypedArray from custom iterable (static and dynamic ctor); Number([]) and set/toSorted stay safe.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "9\n1,0,0,1,0,42,42,0,1\n9\n0\n1,0,0,1,0,42,42,0,1\nTypeError",
+    "exitCode": 0
+  }
+}

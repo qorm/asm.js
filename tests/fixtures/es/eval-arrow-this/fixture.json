@@ -1,0 +1,10 @@
+{
+  "description": "Direct eval of ()=>this captures the enclosing function this, not a missing __this slot",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true",
+    "exitCode": 0
+  }
+}

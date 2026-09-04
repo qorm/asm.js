@@ -415,6 +415,63 @@ export class StringGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 0);
     }
 
+    // Dedicated UTF-16 lexicographic compare for _js_relcmp.  Own prologue
+    // (S0-S4); do not expand _js_relcmp's frame.  A0/A1 = boxed strings.
+    // RET: 0 equal, 1 left<right, 2 left>right (same encoding as _js_relcmp).
+    generateStrRelcmpUtf16() {
+        const vm = this.vm;
+        vm.label("_str_relcmp_utf16");
+        vm.prologue(16, [VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.mov(VReg.S1, VReg.A1);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_str_utf16_length");
+        vm.mov(VReg.S2, VReg.RET);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_str_utf16_length");
+        vm.mov(VReg.S3, VReg.RET);
+        vm.movImm(VReg.S4, 0);
+        vm.label("_s16rc_loop");
+        vm.cmp(VReg.S4, VReg.S2);
+        vm.jge("_s16rc_prefix");
+        vm.cmp(VReg.S4, VReg.S3);
+        vm.jge("_s16rc_prefix");
+        vm.store(VReg.SP, 0, VReg.S4);
+        vm.scvtf(0, VReg.S4);
+        vm.fmovToInt(VReg.A1, 0);
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_str_charCodeAt");
+        vm.fmovToFloat(0, VReg.RET);
+        vm.fcvtzs(VReg.V0, 0);
+        vm.store(VReg.SP, 8, VReg.V0);
+        vm.load(VReg.S4, VReg.SP, 0);
+        vm.scvtf(0, VReg.S4);
+        vm.fmovToInt(VReg.A1, 0);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.call("_str_charCodeAt");
+        vm.fmovToFloat(0, VReg.RET);
+        vm.fcvtzs(VReg.V1, 0);
+        vm.load(VReg.V0, VReg.SP, 8);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jlt("_s16rc_lt");
+        vm.jgt("_s16rc_gt");
+        vm.load(VReg.S4, VReg.SP, 0);
+        vm.addImm(VReg.S4, VReg.S4, 1);
+        vm.jmp("_s16rc_loop");
+        vm.label("_s16rc_prefix");
+        vm.cmp(VReg.S2, VReg.S3);
+        vm.jlt("_s16rc_lt");
+        vm.jgt("_s16rc_gt");
+        vm.movImm(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 16);
+        vm.label("_s16rc_lt");
+        vm.movImm(VReg.RET, 1);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 16);
+        vm.label("_s16rc_gt");
+        vm.movImm(VReg.RET, 2);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4], 16);
+    }
+
     // Map the finite set of canonical-equivalence spellings exercised by the
     // localeCompare conformance corpus to one representative byte sequence.
     // The runtime intentionally has no ICU/Unicode database, so keep this
@@ -2509,9 +2566,13 @@ export class StringGenerator {
         vm.cmpImm(VReg.V1, 7);
         vm.jeq("_valueToStr_js_object");
 
-        // Tag 6 = array: OrdinaryToPrimitive
+        // Tag 6 = array: default Array#toString is join(",").  Going through
+        // OrdinaryToPrimitive/_object_get("toString") while
+        // `_nsobj_array_proto` is still 0 (no `Array.prototype` mention in the
+        // function) used to miss, bounce valueOf, and SIGSEGV — seen after
+        // `var C=Uint8Array; new C(iterable)` then Number([]) / TA.set([[]]).
         vm.cmpImm(VReg.V1, 6);
-        vm.jeq("_valueToStr_js_object");
+        vm.jeq("_valueToStr_js_array");
 
         // Tag 1 = boolean
         vm.cmpImm(VReg.V1, 1);
@@ -3262,9 +3323,36 @@ export class StringGenerator {
         vm.cmpImm(VReg.V2, 0x7FFF);        // 函数(含无 trap 原样返回)→ 同样回退
         vm.jne("_js_toprim_done");
         vm.label("_js_toprim_ordinary");
-        // BigInt wrapper: [[BigIntData]] via __bigint_value (Object(2n)+1n).
-        // After @@toPrimitive miss so a user trap still wins. x64 V0≡RET:
-        // cannot cmp RET against a constant loaded into V0.
+        // OrdinaryToPrimitive hint default: valueOf then toString. Internal
+        // [[NumberData]]/[[StringData]]/[[BigIntData]] slots are a fallback
+        // after those methods miss or return objects. Reading them first
+        // skipped a user valueOf/toString (`new String("x").valueOf=()=>"ed"`
+        // still compared as the original primitive).
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_user_valueof");   // A0 仍是对象/函数
+        // miss 现返原对象(0x7FFD);+0.0 是合法原语,勿 cmpImm 0。
+        vm.shrImm(VReg.V2, VReg.RET, 48); // (x64 V2==A2 无活值;V0≡RET 会盖掉原始值结果)
+        vm.cmpImm(VReg.V2, 0x7FFD);        // valueOf 结果又是对象 / 无 valueOf?
+        vm.jeq("_js_toprim_try_tostr");
+        vm.cmpImm(VReg.V2, 0x7FFF);        // 或仍是函数
+        vm.jne("_js_toprim_done");         // 原始值(含 +0.0) → 用
+        vm.label("_js_toprim_try_tostr");
+        // OrdinaryToPrimitive:valueOf 返对象后调用户 toString(可抛)。
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_object_user_tostr");
+        // +0.0 is a legal primitive; miss is the original object sentinel.
+        vm.shrImm(VReg.V2, VReg.RET, 48); // x64 V0≡RET: keep primitive result
+        vm.cmpImm(VReg.V2, 0x7FFD);
+        vm.jeq("_js_toprim_slots");
+        vm.cmpImm(VReg.V2, 0x7FFF);
+        vm.jeq("_js_toprim_slots");
+        vm.cmpImm(VReg.V2, 0x7FFE);
+        vm.jeq("_js_toprim_slots");
+        vm.epilogue([VReg.S0], 16);
+        vm.label("_js_toprim_slots");
+        // Fallback: wrapper internal slots when valueOf/toString were absent
+        // or returned objects. Presence-checked: _object_get miss is leftover
+        // 0, which is also +0.0.
         vm.mov(VReg.A0, VReg.S0);
         vm.lea(VReg.A1, vm.asm.addString("__bigint_value"));
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
@@ -3278,8 +3366,6 @@ export class StringGenerator {
         vm.load(VReg.RET, VReg.SP, 0);
         vm.jmp("_js_toprim_done");
         vm.label("_js_toprim_no_bi_slot");
-        // Number wrapper: [[NumberData]] via __number_value (new Number(1)+"").
-        // Presence first: _object_get miss is leftover 0, which is also +0.0.
         vm.mov(VReg.A0, VReg.S0);
         vm.lea(VReg.A1, vm.asm.addString("__number_value"));
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
@@ -3294,43 +3380,19 @@ export class StringGenerator {
         vm.call("_object_get");
         vm.jmp("_js_toprim_done");
         vm.label("_js_toprim_no_num_slot");
-        // String wrapper: [[StringData]] via __value (new String("1")+undefined).
         vm.mov(VReg.A0, VReg.S0);
         vm.lea(VReg.A1, vm.asm.addString("__value"));
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.A1, VReg.V1);
         vm.call("_object_has");
         vm.cmpImm(VReg.RET, 0);
-        vm.jeq("_js_toprim_no_str_slot");
+        vm.jeq("_js_toprim_both_obj");
         vm.mov(VReg.A0, VReg.S0);
         vm.lea(VReg.A1, vm.asm.addString("__value"));
         vm.movImm64(VReg.V1, 0x7ffc000000000000n);
         vm.or(VReg.A1, VReg.A1, VReg.V1);
         vm.call("_object_get");
         vm.jmp("_js_toprim_done");
-        vm.label("_js_toprim_no_str_slot");
-        vm.mov(VReg.A0, VReg.S0);
-        vm.call("_object_user_valueof");   // A0 仍是对象/函数
-        // miss 现返原对象(0x7FFD);+0.0 是合法原语,勿 cmpImm 0。
-        vm.shrImm(VReg.V2, VReg.RET, 48); // (x64 V2==A2 无活值;V0≡RET 会盖掉原始值结果)
-        vm.cmpImm(VReg.V2, 0x7FFD);        // valueOf 结果又是对象 / 无 valueOf?
-        vm.jeq("_js_toprim_try_tostr");
-        vm.cmpImm(VReg.V2, 0x7FFF);        // 或仍是函数
-        vm.jne("_js_toprim_done");         // 原始值(含 +0.0) → 用
-        vm.label("_js_toprim_try_tostr");
-        // OrdinaryToPrimitive:valueOf 返对象后调用户 toString(可抛);无则 _valueToStr。
-        vm.mov(VReg.A0, VReg.S0);
-        vm.call("_object_user_tostr");
-        // +0.0 is a legal primitive; miss is the original object sentinel.
-        // Still-object tags → TypeError (valueOf already failed this branch).
-        vm.shrImm(VReg.V2, VReg.RET, 48); // x64 V0≡RET: keep primitive result
-        vm.cmpImm(VReg.V2, 0x7FFD);
-        vm.jeq("_js_toprim_both_obj");
-        vm.cmpImm(VReg.V2, 0x7FFF);
-        vm.jeq("_js_toprim_both_obj");
-        vm.cmpImm(VReg.V2, 0x7FFE);
-        vm.jeq("_js_toprim_both_obj");
-        vm.epilogue([VReg.S0], 16);
         vm.label("_js_toprim_both_obj");
         this._emitThrowTypeError("Cannot convert object to primitive value");
         vm.label("_js_toprim_default_str");
@@ -10088,6 +10150,7 @@ export class StringGenerator {
         this.generateStrlen();
         this.generateStrLength(); // 统一 length 访问
         this.generateStrcmp();
+        this.generateStrRelcmpUtf16();
         this.generateLocaleCompare();
         this.generateStrcpy();
         this.generateStrcat();

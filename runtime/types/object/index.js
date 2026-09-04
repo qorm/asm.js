@@ -5897,6 +5897,16 @@ export class ObjectGenerator {
         vm.jeq("_object_set_array_px_bail");
         vm.jmp("_object_set_array_ok");
         vm.label("_object_set_array_px_bail");
+        // Strict PutValue on a non-extensible array (frozen tagged-template
+        // object / Object.freeze([])) must TypeError. Sloppy still returns.
+        vm.load(VReg.V0, VReg.SP, 24);
+        vm.cmpImm(VReg.V0, 2);
+        vm.jne("_object_set_array_px_bail_sloppy");
+        vm.lea(VReg.A0, this.vm.asm.addString("Cannot add property to a non-extensible object"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+        vm.label("_object_set_array_px_bail_sloppy");
         vm.mov(VReg.RET, VReg.S2);
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
         vm.label("_object_set_array_ok");
@@ -9443,6 +9453,7 @@ export class ObjectGenerator {
         vm.lea(VReg.V0, "_dynamic_gen_maker"); vm.store(VReg.V0, 0, VReg.A0);
         vm.lea(VReg.V0, "_dynamic_async_maker"); vm.store(VReg.V0, 0, VReg.A1);
         vm.lea(VReg.V0, "_dynamic_asyncgen_maker"); vm.store(VReg.V0, 0, VReg.A2);
+        vm.lea(VReg.V0, "_dynamic_function_maker"); vm.store(VReg.V0, 0, VReg.A0);
         vm.lea(VReg.RET, "_js_undefined"); vm.load(VReg.RET, VReg.RET, 0);
         vm.ret();
 
@@ -9484,7 +9495,8 @@ export class ObjectGenerator {
             vm.load(VReg.S1, VReg.S0, 8);
             // Maker ABI: (kind, argumentList, NewTarget), ordinary non-strict this.
             const kind = slot.indexOf("asyncgen") >= 0 ? 3 :
-                (slot.indexOf("async") >= 0 ? 2 : 1);
+                (slot.indexOf("async") >= 0 ? 2 :
+                (slot.indexOf("_gen_maker") >= 0 ? 1 : 0));
             vm.lea(VReg.V0, "_global_this"); vm.load(VReg.A0, VReg.V0, 0);
             vm.call("_box_obj_r"); vm.mov(VReg.A5, VReg.RET);
             vm.movImm(VReg.A0, kind); vm.scvtf(0, VReg.A0); vm.fmovToInt(VReg.A0, 0);
@@ -9502,6 +9514,7 @@ export class ObjectGenerator {
         emitDynamicCtorCall("_dynamic_gen_ctor_call", "_dynamic_gen_maker");
         emitDynamicCtorCall("_dynamic_async_ctor_call", "_dynamic_async_maker");
         emitDynamicCtorCall("_dynamic_asyncgen_ctor_call", "_dynamic_asyncgen_maker");
+        emitDynamicCtorCall("_dynamic_function_ctor_call", "_dynamic_function_maker");
 
         // Register one mmap-backed function in the host metadata universe.
         // Nodes deliberately start with the static table's 32-byte layout;
@@ -11762,6 +11775,9 @@ export class ObjectGenerator {
         vm.emitMaskLoad(VReg.V4);
         vm.andMaskReg(VReg.V0, VReg.A0, VReg.V4);
         vm.store(VReg.SP, 0, VReg.V0);   // src 指针
+        vm.loadByte(VReg.V1, VReg.V0, 0);
+        vm.cmpImm(VReg.V1, TYPE_PROXY);
+        vm.jeq("_object_rest_src_proxy");
         // [enum-order] 与 _object_keys 同规:枚举前把源对象自有属性归一到 ES 规范序
         // (整数键升序在前、字符串按插入序、Symbol 殿后),rest 的复制序才与
         // Object.keys/规范一致(obj-rest-order 族)。归一就地重排、幂等。
@@ -11871,6 +11887,91 @@ export class ObjectGenerator {
         vm.addImm(VReg.V0, VReg.V0, 1);
         vm.store(VReg.SP, 16, VReg.V0);
         vm.jmp("_object_rest_loop");
+
+        // Proxy source: CopyDataProperties uses [[OwnPropertyKeys]] then
+        // [[GetOwnProperty]] for every key (even undefined descriptors), in
+        // ownKeys trap order. Ordinary props_ptr walking misses type=8.
+        vm.label("_object_rest_src_proxy");
+        vm.call("_object_new");
+        vm.store(VReg.SP, 40, VReg.RET);
+        vm.load(VReg.V1, VReg.SP, 80);
+        vm.emitMaskLoad(VReg.V4);
+        vm.andMaskReg(VReg.V0, VReg.V1, VReg.V4);
+        vm.store(VReg.SP, 24, VReg.V0);
+        vm.load(VReg.V0, VReg.SP, 24);
+        vm.load(VReg.V1, VReg.V0, 8);
+        vm.store(VReg.SP, 32, VReg.V1);
+        vm.load(VReg.A0, VReg.SP, 72);
+        vm.call("_object_own_keys_all");
+        vm.store(VReg.SP, 56, VReg.RET);
+        vm.load(VReg.A0, VReg.SP, 56);
+        vm.call("_array_length");
+        vm.store(VReg.SP, 8, VReg.RET);
+        vm.movImm(VReg.V0, 0);
+        vm.store(VReg.SP, 16, VReg.V0);
+        vm.label("_object_rest_px_loop");
+        vm.load(VReg.V0, VReg.SP, 16);
+        vm.load(VReg.V1, VReg.SP, 8);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jge("_object_rest_done");
+        vm.load(VReg.A0, VReg.SP, 56);
+        vm.load(VReg.A1, VReg.SP, 16);
+        vm.call("_array_get");
+        vm.store(VReg.SP, 48, VReg.RET);
+        vm.movImm(VReg.V0, 0);
+        vm.store(VReg.SP, 64, VReg.V0);
+        vm.label("_object_rest_px_excl");
+        vm.load(VReg.V0, VReg.SP, 64);
+        vm.load(VReg.V1, VReg.SP, 32);
+        vm.cmp(VReg.V0, VReg.V1);
+        vm.jge("_object_rest_px_gopd");
+        vm.load(VReg.A0, VReg.SP, 80);
+        vm.load(VReg.A1, VReg.SP, 64);
+        vm.call("_array_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_js_prop_key");
+        vm.mov(VReg.A1, VReg.RET);
+        vm.load(VReg.A0, VReg.SP, 48);
+        vm.call("_object_key_eq");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_object_rest_px_next");
+        vm.load(VReg.V0, VReg.SP, 64);
+        vm.addImm(VReg.V0, VReg.V0, 1);
+        vm.store(VReg.SP, 64, VReg.V0);
+        vm.jmp("_object_rest_px_excl");
+        vm.label("_object_rest_px_gopd");
+        vm.load(VReg.A0, VReg.SP, 72);
+        vm.load(VReg.A1, VReg.SP, 48);
+        vm.call("_object_getOwnPropertyDescriptor");
+        vm.shrImm(VReg.V1, VReg.RET, 48);
+        vm.cmpImm(VReg.V1, 0x7FFB);
+        vm.jeq("_object_rest_px_next");
+        vm.cmpImm(VReg.V1, 0x7FFD);
+        vm.jne("_object_rest_px_next");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.lea(VReg.A1, vm.asm.addString("enumerable"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.call("_to_boolean");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jeq("_object_rest_px_next");
+        vm.load(VReg.A0, VReg.SP, 72);
+        vm.load(VReg.A1, VReg.SP, 48);
+        vm.call("_object_get");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.load(VReg.A1, VReg.SP, 72);
+        vm.call("_maybe_getter");
+        vm.mov(VReg.A2, VReg.RET);
+        vm.load(VReg.A0, VReg.SP, 40);
+        vm.load(VReg.A1, VReg.SP, 48);
+        vm.call("_object_set");
+        vm.label("_object_rest_px_next");
+        vm.load(VReg.V0, VReg.SP, 16);
+        vm.addImm(VReg.V0, VReg.V0, 1);
+        vm.store(VReg.SP, 16, VReg.V0);
+        vm.jmp("_object_rest_px_loop");
 
         vm.label("_object_rest_src_empty");
         vm.call("_object_new");

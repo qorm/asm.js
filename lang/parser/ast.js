@@ -549,7 +549,8 @@ export class AssignmentExpression extends Node {
         this.operator = operator;
         this.left = left;
         this.right = right;
-        if (left && left.type === "Identifier" && isStampableCallable(right) &&
+        if (left && left.type === "Identifier" && !left._parenthesized &&
+            isStampableCallable(right) &&
             (operator === "=" || operator === "??=" || operator === "&&=" || operator === "||=")) {
             stampFnHint(right, left.name);
         }

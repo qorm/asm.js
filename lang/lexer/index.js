@@ -192,7 +192,9 @@ export class Lexer {
                 if (k > 9) { return { cook: null, extra: 0 }; }
             }
             if (hex.length === 0) { return { cook: null, extra: 0 }; }
-            return { cook: this._cpToUtf8(parseInt(hex, 16)), extra: k };
+            const cp = parseInt(hex, 16);
+            if (cp !== cp || cp > 0x10FFFF) { return { cook: null, extra: 0 }; }
+            return { cook: this._cpToUtf8(cp), extra: k };
         }
         let d1 = this.peekCharN(1), d2 = this.peekCharN(2), d3 = this.peekCharN(3), d4 = this.peekCharN(4);
         if (!(this._isHex(d1) && this._isHex(d2) && this._isHex(d3) && this._isHex(d4))) {
@@ -583,69 +585,114 @@ export class Lexer {
         return result;
     }
 
+    // Template LineTerminatorSequence at this.ch. Source is UTF-8 bytes:
+    // LF / CR / CRLF → TRV LF; U+2028/U+2029 keep their 3-byte sequences.
+    // Returns { n, trv } or null. Does not consume.
+    _templateLineTerm() {
+        if (this.ch === "\n") return { n: 1, trv: "\n" };
+        if (this.ch === "\r") {
+            if (this.peekChar() === "\n") return { n: 2, trv: "\n" };
+            return { n: 1, trv: "\n" };
+        }
+        if (this.ch === WS_E2 && this.peekChar() === WS_80) {
+            const t = this.peekCharN(2);
+            if (t === WS_A8) return { n: 3, trv: WS_E2 + WS_80 + WS_A8 };
+            if (t === WS_A9) return { n: 3, trv: WS_E2 + WS_80 + WS_A9 };
+        }
+        return null;
+    }
+
+    _consumeTemplateLineTerm(lt) {
+        let k = 1;
+        while (k < lt.n) {
+            this.readChar();
+            k = k + 1;
+        }
+    }
+
     // 读取模板字符串内容（从当前位置读到 ` 或 ${）
-    // 返回 { value, isEnd } 其中 isEnd 为 true 表示遇到 `，false 表示遇到 ${
+    // 返回 { value, raw, isEnd, cookedInvalid }
     readTemplateContent() {
         let result = ""; // cooked（转义已 cook）
         let raw = "";    // raw（源文本原样,转义反斜杠保留;供 tagged template / String.raw）
+        let cookedInvalid = false;
+        const cook = (s) => { if (!cookedInvalid) result = result + s; };
 
         while (this.ch !== "`" && this.ch !== NUL_CHAR) {
             // 检查 ${
             if (this.ch === "$" && this.peekChar() === "{") {
                 this.readChar(); // 跳过 $
                 this.readChar(); // 跳过 {
-                return { value: result, raw: raw, isEnd: false };
+                return { value: result, raw: raw, isEnd: false, cookedInvalid: cookedInvalid };
             }
 
             if (this.ch === "\\") {
-                raw = raw + "\\"; // raw 保留反斜杠
+                raw = raw + "\\";
                 this.readChar();
-                raw = raw + this.ch; // raw 保留被转义字符原样
-                if (this.ch === "n") {
-                    result = result + "\n";
-                } else if (this.ch === "t") {
-                    result = result + "\t";
-                } else if (this.ch === "r") {
-                    result = result + "\r";
-                } else if (this.ch === "\\") {
-                    result = result + "\\";
-                } else if (this.ch === "`") {
-                    result = result + "`";
-                } else if (this.ch === "$") {
-                    result = result + "$";
-                } else if (this.ch === "0") {
-                    // \0：cooked 保留 NUL；raw 仍保留原始 \\0。
-                    result = result + this._cpToUtf8(0);
-                } else if (this.ch === "\n" || this.ch === "\u2028" || this.ch === "\u2029") {
-                    // 模板里的 LineContinuation:cooked 不产字符(raw 已原样保留)
-                    result = result + "";
-                } else if (this.ch === "\r") {
-                    if (this.peekChar() === "\n") { this.readChar(); raw = raw + this.ch; }
-                    result = result + "";
-                } else if (this.ch === "x" || this.ch === "u") {
-                    // \xNN / \uNNNN / \u{...} / 代理对 → cook 成 UTF-8 字节;raw 保留原样(String.raw/
-                    // tagged)。raw 已含 "\\x"/"\\u"(见上);合法时补消费的字符到 raw。_peekHexEscape
-                    // 前瞻校验,不合法(如 String.raw`C:\x`)→ 宽松字面,不越反引号边界。
-                    let _esc = this._peekHexEscape();
-                    if (_esc.cook !== null) {
-                        let _z = 0;
-                        while (_z < _esc.extra) { this.readChar(); raw = raw + this.ch; _z = _z + 1; }
-                        result = result + _esc.cook;
-                    } else {
-                        result = result + this.ch;
-                    }
+                const lt = this._templateLineTerm();
+                if (lt) {
+                    // LineContinuation: cooked empty; raw is `\` + TRV(LTS)
+                    // (CR / CRLF → LF). Do not keep the source CR bytes.
+                    raw = raw + lt.trv;
+                    this._consumeTemplateLineTerm(lt);
                 } else {
-                    result = result + this.ch;
+                    raw = raw + this.ch;
+                    if (this.ch === "n") {
+                        cook("\n");
+                    } else if (this.ch === "t") {
+                        cook("\t");
+                    } else if (this.ch === "r") {
+                        cook("\r");
+                    } else if (this.ch === "\\") {
+                        cook("\\");
+                    } else if (this.ch === "`") {
+                        cook("`");
+                    } else if (this.ch === "$") {
+                        cook("$");
+                    } else if (this.ch === "b") {
+                        cook(String.fromCharCode(8));
+                    } else if (this.ch === "f") {
+                        cook(String.fromCharCode(12));
+                    } else if (this.ch === "v") {
+                        cook(String.fromCharCode(11));
+                    } else if (this.ch === "0") {
+                        const nxt = this.peekChar();
+                        if (nxt >= "0" && nxt <= "9") {
+                            cookedInvalid = true;
+                        } else {
+                            cook(this._cpToUtf8(0));
+                        }
+                    } else if (this.ch >= "1" && this.ch <= "9") {
+                        cookedInvalid = true;
+                    } else if (this.ch === "x" || this.ch === "u") {
+                        let _esc = this._peekHexEscape();
+                        if (_esc.cook !== null) {
+                            let _z = 0;
+                            while (_z < _esc.extra) { this.readChar(); raw = raw + this.ch; _z = _z + 1; }
+                            cook(_esc.cook);
+                        } else {
+                            cookedInvalid = true;
+                        }
+                    } else {
+                        cook(this.ch);
+                    }
                 }
             } else {
-                raw = raw + this.ch;
-                result = result + this.ch;
+                const lt = this._templateLineTerm();
+                if (lt) {
+                    cook(lt.trv);
+                    raw = raw + lt.trv;
+                    this._consumeTemplateLineTerm(lt);
+                } else {
+                    raw = raw + this.ch;
+                    cook(this.ch);
+                }
             }
             this.readChar();
         }
 
         this.readChar(); // 跳过结束的反引号
-        return { value: result, raw: raw, isEnd: true };
+        return { value: result, raw: raw, isEnd: true, cookedInvalid: cookedInvalid };
     }
 
     // 读取模板字符串（从 ` 开始）
@@ -653,16 +700,16 @@ export class Lexer {
     // type: TEMPLATE_STRING (无插值) 或 TEMPLATE_HEAD (有插值)
     readTemplateString() {
         this.readChar(); // 跳过开始的反引号
-        let { value, raw, isEnd } = this.readTemplateContent();
+        let { value, raw, isEnd, cookedInvalid } = this.readTemplateContent();
 
         if (isEnd) {
-            return { type: TokenType.TEMPLATE_STRING, value, raw };
+            return { type: TokenType.TEMPLATE_STRING, value, raw, cookedInvalid };
         } else {
             this.templateDepth = this.templateDepth + 1;
             // 进入插值，记录当前的 braceDepth
             this.templateStack.push(this.braceDepth);
             this.braceDepth = 0; // 重置插值内部的深度
-            return { type: TokenType.TEMPLATE_HEAD, value, raw };
+            return { type: TokenType.TEMPLATE_HEAD, value, raw, cookedInvalid };
         }
     }
 
@@ -673,16 +720,16 @@ export class Lexer {
     // 返回 { type, value }
     // type: TEMPLATE_TAIL (遇到 `) 或 TEMPLATE_MIDDLE (遇到另一个 ${)
     readTemplateMiddle() {
-        let { value, raw, isEnd } = this.readTemplateContent();
+        let { value, raw, isEnd, cookedInvalid } = this.readTemplateContent();
 
         if (isEnd) {
             this.templateDepth = this.templateDepth - 1;
-            return { type: TokenType.TEMPLATE_TAIL, value, raw };
+            return { type: TokenType.TEMPLATE_TAIL, value, raw, cookedInvalid };
         } else {
             // 开始另一个插值
             this.templateStack.push(this.braceDepth);
             this.braceDepth = 0;
-            return { type: TokenType.TEMPLATE_MIDDLE, value, raw };
+            return { type: TokenType.TEMPLATE_MIDDLE, value, raw, cookedInvalid };
         }
     }
 
@@ -1042,11 +1089,12 @@ export class Lexer {
             // 检查是否在模板字符串插值结束处
             if (this.templateDepth > 0 && this.braceDepth === 0) {
                 this.readChar(); // 跳过 }
-                let { type, value, raw } = this.readTemplateMiddle();
+                let { type, value, raw, cookedInvalid } = this.readTemplateMiddle();
                 // 恢复进入插值前的深度
                 this.braceDepth = this.templateStack.pop() || 0;
                 let tmid = newToken(type, value, startLine, startColumn);
                 tmid.templateRaw = raw; // tagged template / String.raw 用的原始文本
+                tmid.cookedInvalid = !!cookedInvalid;
                 return tmid;
             }
             if (this.templateDepth > 0 && this.braceDepth > 0) {
@@ -1073,9 +1121,10 @@ export class Lexer {
             let str = this.readString(this.ch);
             return newToken(TokenType.STRING, str, startLine, startColumn);
         } else if (this.ch === "`") {
-            let { type, value, raw } = this.readTemplateString();
+            let { type, value, raw, cookedInvalid } = this.readTemplateString();
             let ttok = newToken(type, value, startLine, startColumn);
             ttok.templateRaw = raw; // tagged template / String.raw 用的原始文本
+            ttok.cookedInvalid = !!cookedInvalid;
             return ttok;
         } else if (this.ch === NUL_CHAR) {
             tok = newToken(TokenType.EOF, "", startLine, startColumn);

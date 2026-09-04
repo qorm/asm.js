@@ -1,0 +1,10 @@
+{
+  "description": "Sloppy direct eval var must not collide with a body let binding",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true",
+    "exitCode": 0
+  }
+}

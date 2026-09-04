@@ -786,7 +786,12 @@ export class JSValueGenerator {
         vm.call("_symbol_wellknown"); // RET = symbol 键
         vm.mov(VReg.A1, VReg.RET);
         vm.mov(VReg.A0, VReg.S0);     // 裸 right
-        vm.call("_object_get");       // RET = 方法或 undef/0
+        vm.call("_object_get");       // RET = 存储值 / TYPE_GETTER 标记
+        // GetMethod performs ordinary [[Get]]: invoke accessors so a throwing
+        // @@hasInstance getter surfaces as its own error, not TypeError.
+        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A1, VReg.S2);     // this = constructor
+        vm.call("_maybe_getter");
         vm.mov(VReg.S1, VReg.RET);
         vm.shrImm(VReg.V0, VReg.S1, 48);
         vm.cmpImm(VReg.V0, 0x7FFF);   // function tag
@@ -1080,8 +1085,28 @@ export class JSValueGenerator {
         vm.movImm(VReg.V4, 64);
         vm.jmp("_iof_user_loop");
         vm.label("_iof_arraybuffer_singleton");
+        vm.loadByte(VReg.V1, VReg.S0, 0);
+        vm.cmpImm(VReg.V1, 4); // TYPE_MAP
+        vm.jeq("_iof_map_singleton");
+        vm.cmpImm(VReg.V1, 5); // TYPE_SET
+        vm.jeq("_iof_set_singleton");
+        vm.cmpImm(VReg.V1, 14); // TYPE_DATA_VIEW
+        vm.jeq("_iof_dataview_singleton");
         vm.movImm(VReg.A0, 0x70); // ArrayBuffer pseudo type
         vm.call("_get_ctor_proto");
+        vm.jmp("_iof_coll_singleton_box");
+        vm.label("_iof_map_singleton");
+        vm.lea(VReg.V1, "_nsobj_map_proto");
+        vm.load(VReg.RET, VReg.V1, 0);
+        vm.jmp("_iof_coll_singleton_box");
+        vm.label("_iof_set_singleton");
+        vm.lea(VReg.V1, "_nsobj_set_proto");
+        vm.load(VReg.RET, VReg.V1, 0);
+        vm.jmp("_iof_coll_singleton_box");
+        vm.label("_iof_dataview_singleton");
+        vm.lea(VReg.V1, "_nsobj_dataview_proto");
+        vm.load(VReg.RET, VReg.V1, 0);
+        vm.label("_iof_coll_singleton_box");
         vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
         vm.and(VReg.V3, VReg.RET, VReg.V1);
         vm.load(VReg.V2, VReg.SP, 0);
@@ -1090,6 +1115,12 @@ export class JSValueGenerator {
 
         vm.label("_iof_proto_promise_check");
         vm.cmpImm(VReg.V1, 12); // TYPE_ARRAY_BUFFER: data_ptr@16, not proto
+        vm.jeq("_iof_arraybuffer_check");
+        vm.cmpImm(VReg.V1, 4); // TYPE_MAP: head@16
+        vm.jeq("_iof_arraybuffer_check");
+        vm.cmpImm(VReg.V1, 5); // TYPE_SET: head@16
+        vm.jeq("_iof_arraybuffer_check");
+        vm.cmpImm(VReg.V1, 14); // TYPE_DATA_VIEW: byteOffset@16
         vm.jeq("_iof_arraybuffer_check");
         vm.loadByte(VReg.V1, VReg.S0, 0);
         vm.cmpImm(VReg.V1, 11); // TYPE_PROMISE:proto@48,非 value@16

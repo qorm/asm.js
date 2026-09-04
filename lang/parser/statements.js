@@ -944,14 +944,13 @@ export const StatementParser = {
                 return new AST.ForOfStatement(init, right, body, isAwait);
             }
         } else if (!this.curTokenIs(TokenType.SEMICOLON)) {
-            // [for-of lookahead] The grammar excludes an unescaped `let` or
-            // `async` token immediately followed by the `of` keyword from the
-            // expression-form LHS.  They are otherwise parsed by the normal
-            // expression path (`let`/escaped keywords may be identifiers), so
-            // reject this exact pair before expression parsing.  Keep escaped
-            // spellings legal as IdentifierReferences, and do not alter the
-            // existing escaped-`of` diagnostic below.
-            if ((this.curTokenIs(TokenType.LET) || this.curTokenIs(TokenType.ASYNC)) &&
+            // [for-of lookahead] Unescaped `let of` is excluded from both
+            // for-of and for-await-of (`[lookahead ≠ let]`). Unescaped
+            // `async of` is only illegal in for-of; for-await-of may bind
+            // the identifier `async` (`for await (async of [7])`).
+            // Escaped spellings remain IdentifierReferences.
+            if ((this.curTokenIs(TokenType.LET) ||
+                 (!isAwait && this.curTokenIs(TokenType.ASYNC))) &&
                 !this.curToken.escaped && this.peekTokenIs(TokenType.OF) &&
                 !this.peekToken.escaped) {
                 this.errors.push("Invalid for-of left-hand side");
@@ -1172,7 +1171,9 @@ export const StatementParser = {
 
     parseBreakStatement() {
         let label = null;
-        if (this.peekTokenIs(TokenType.IDENT)) {
+        // [no LineTerminator here] break Identifier
+        if (this.peekTokenIs(TokenType.IDENT) &&
+            !this.peekToken.lineBreakBefore && this.peekToken.line === this.curToken.line) {
             this.nextToken();
             label = new AST.Identifier(this.curToken.literal);
             // [break-label] break L 的 L 必须标注外层迭代/switch(ES 13.8.1):普通语句
@@ -1201,7 +1202,9 @@ export const StatementParser = {
 
     parseContinueStatement() {
         let label = null;
-        if (this.peekTokenIs(TokenType.IDENT)) {
+        // [no LineTerminator here] continue Identifier
+        if (this.peekTokenIs(TokenType.IDENT) &&
+            !this.peekToken.lineBreakBefore && this.peekToken.line === this.curToken.line) {
             this.nextToken();
             label = new AST.Identifier(this.curToken.literal);
             // [test262 早期错误] 带标签的 continue 也必须在循环内部;

@@ -1,0 +1,10 @@
+{
+  "description": "Nested class method may access an outer class private field via a captured instance",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "42",
+    "exitCode": 0
+  }
+}

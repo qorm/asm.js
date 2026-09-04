@@ -1,0 +1,10 @@
+{
+  "description": "Named function expression BindingIdentifier is distinct from outer var and body let",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "outside\ninside",
+    "exitCode": 0
+  }
+}

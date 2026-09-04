@@ -2022,6 +2022,42 @@ export class SubscriptGenerator {
     generateJsLength() {
         const vm = this.vm;
 
+        // A0 = heap ptr -> RET 1 if it is a TypedArray user pointer.
+        // TypedArray blocks store type@0 in [0x40,0x61] and buffer@24 is 0
+        // (inline) or an ArrayBuffer.  String contents can start with a
+        // 0x40..0x61 byte, so the buffer slot is the discriminator.  Must
+        // run before the [ptr-16]==TYPE_STRING test: a TA allocated after
+        // a string has the string header (type 6) at ptr-16, which used to
+        // steal taFull.length in ToNumbers after RAB grow.
+        vm.label("_ta_user_ptr");
+        vm.prologue(0, [VReg.S0]);
+        vm.mov(VReg.S0, VReg.A0);
+        vm.cmpImm(VReg.S0, 0);
+        vm.jeq("_ta_user_ptr_no");
+        vm.loadByte(VReg.V0, VReg.S0, 0);
+        vm.andImm(VReg.V0, VReg.V0, 0xff);
+        vm.cmpImm(VReg.V0, 0x40);
+        vm.jlt("_ta_user_ptr_no");
+        vm.cmpImm(VReg.V0, 0x61);
+        vm.jgt("_ta_user_ptr_no");
+        vm.load(VReg.V1, VReg.S0, 24); // buffer@24
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_ta_user_ptr_yes"); // inline TA
+        vm.movImm64(VReg.V0, 0x0000ffffffffffffn);
+        vm.and(VReg.V1, VReg.V1, VReg.V0);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_ta_user_ptr_no");
+        vm.loadByte(VReg.V0, VReg.V1, 0);
+        vm.andImm(VReg.V0, VReg.V0, 0xff);
+        vm.cmpImm(VReg.V0, 12); // TYPE_ARRAY_BUFFER
+        vm.jne("_ta_user_ptr_no");
+        vm.label("_ta_user_ptr_yes");
+        vm.movImm(VReg.RET, 1);
+        vm.epilogue([VReg.S0], 0);
+        vm.label("_ta_user_ptr_no");
+        vm.movImm(VReg.RET, 0);
+        vm.epilogue([VReg.S0], 0);
+
         vm.label("_js_length");
         vm.prologue(16, [VReg.S0, VReg.S1]);
         vm.mov(VReg.S0, VReg.A0);
@@ -2055,6 +2091,14 @@ export class SubscriptGenerator {
         vm.load(VReg.V0, VReg.V0, 0);
         vm.cmp(VReg.S0, VReg.V0);
         vm.jge("_js_length_str");
+        // TypedArray user ptr first. A TA sitting after a string has
+        // [ptr-16]==TYPE_STRING (the previous block header); treating that
+        // as "this is a string" made ToNumbers(taFull) after RAB grow report
+        // length 3 instead of 6 (defineProperty typedarray-backed-by-resizable).
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_ta_user_ptr");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_js_length_ta");
         // 堆指针：先判是否堆字符串（block 头 [S0-16] 低字节 == 6 = TYPE_STRING）。
         // 字符串把 type 存 block+0（writeStringHeader RMW），数组/对象把 type 标记存 user+0；
         // _alloc 给非字符串块的 block+0 低字节是 (class<<6)&0xff ∈ {0,0x40,0x80,0xC0}，绝不为 6，
@@ -2078,6 +2122,7 @@ export class SubscriptGenerator {
         vm.jlt("_js_length_str");
         vm.cmpImm(VReg.V0, 0x70);
         vm.jgt("_js_length_str");
+        vm.label("_js_length_ta");
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_typed_array_length");
         vm.epilogue([VReg.S0, VReg.S1], 16);
@@ -2199,9 +2244,23 @@ export class SubscriptGenerator {
         vm.load(VReg.V0, VReg.V0, 0);
         vm.cmp(VReg.S0, VReg.V0);
         vm.jge("_js_length_dyn_public_fallback");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_ta_user_ptr");
+        vm.cmpImm(VReg.RET, 0);
+        vm.jne("_js_length_dyn_public_ta");
+        // Heap strings store TYPE_STRING at [ptr-16]. Do not fall through to
+        // _typed_array_length: a TA after a string used to steal length, but
+        // the inverse (string after any block) must still be a UTF-16 string.
         vm.loadByte(VReg.V0, VReg.S0, -16);
         vm.cmpImm(VReg.V0, 6);
-        vm.jne("_js_length_dyn_public_fallback");
+        vm.jeq("_js_length_dyn_public_str");
+        vm.jmp("_js_length_dyn_public_fallback");
+        vm.label("_js_length_dyn_public_ta");
+        vm.mov(VReg.A0, VReg.S0);
+        vm.call("_typed_array_length");
+        vm.scvtf(0, VReg.RET);
+        vm.fmovToInt(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1], 16);
         vm.label("_js_length_dyn_public_str");
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_str_utf16_length");

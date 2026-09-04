@@ -1,0 +1,10 @@
+{
+  "description": "Sloppy bare function calls bind this to globalThis; eval(()=>this) captures that binding",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true\ntrue",
+    "exitCode": 0
+  }
+}

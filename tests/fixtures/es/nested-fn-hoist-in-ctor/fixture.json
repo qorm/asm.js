@@ -1,0 +1,10 @@
+{
+  "description": "Nested function declarations in a constructor are hoisted and callable before their statement",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "id_string",
+    "exitCode": 0
+  }
+}

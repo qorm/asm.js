@@ -70,7 +70,7 @@ for (const _wk of ["iterator", "asyncIterator", "hasInstance", "isConcatSpreadab
 // (super 合法)、'n'=函数体内(new.target 合法)。由 compileCallExpression 在改派
 // __eval_direct 时按所在上下文写入,片段解析据此放行相应元属性(间接 eval 无此项)。
 function parseLayoutFlags(s) {
-    const out = { allowSuper: false, allowNewTarget: false, strict: false };
+    const out = { allowSuper: false, allowNewTarget: false, strict: false, inFieldInit: false, inClassMethod: false };
     if (!s || s.length === 0) return out;
     const parts = s.split(",");
     for (let i = 0; i < parts.length; i++) {
@@ -80,8 +80,58 @@ function parseLayoutFlags(s) {
         if (f.indexOf("s") >= 0) out.allowSuper = true;
         if (f.indexOf("n") >= 0) out.allowNewTarget = true;
         if (f.indexOf("t") >= 0) out.strict = true;
+        if (f.indexOf("i") >= 0) out.inFieldInit = true;
+        if (f.indexOf("m") >= 0) out.inClassMethod = true;
     }
     return out;
+}
+
+// Script Contains NewTarget (spec Contains): search arrows, skip nested
+// functions/classes. Indirect eval is never inside a function, so
+// `() => new.target` is an early SyntaxError.
+function scriptContainsNewTarget(node) {
+    if (!node || typeof node !== "object") return false;
+    if (Array.isArray(node)) {
+        for (let i = 0; i < node.length; i++) {
+            if (scriptContainsNewTarget(node[i])) return true;
+        }
+        return false;
+    }
+    const t = node.type;
+    if (t === "MetaProperty" && node.meta && node.meta.name === "new" &&
+        node.property && node.property.name === "target") return true;
+    if (t === "FunctionExpression" || t === "FunctionDeclaration" ||
+        t === "ClassExpression" || t === "ClassDeclaration") return false;
+    for (const k in node) {
+        if (k === "type" || k === "loc" || k === "range" || k === "start" || k === "end") continue;
+        if (scriptContainsNewTarget(node[k])) return true;
+    }
+    return false;
+}
+
+function parsePrivateScopes(s) {
+    const byClass = [];
+    const indexOf = {};
+    if (!s || s.length === 0) return byClass;
+    const parts = s.split(",");
+    for (let i = 0; i < parts.length; i++) {
+        const p = parts[i];
+        if (!p || p.slice(0, 6) !== "!priv:") continue;
+        const rest = p.slice(6);
+        const ci = rest.indexOf(":");
+        if (ci < 0) continue;
+        const name = rest.slice(0, ci);
+        const className = rest.slice(ci + 1);
+        if (!name || !className) continue;
+        let rec = indexOf[className];
+        if (rec === undefined) {
+            rec = byClass.length;
+            indexOf[className] = rec;
+            byClass.push({ className: className, names: new Set() });
+        }
+        byClass[rec].names.add(name);
+    }
+    return byClass;
 }
 
 function parseLexNames(s) {
@@ -187,9 +237,31 @@ export function compileFragment(source, target, captureLayout) {
     // 普通数组无此方法 → compileFragment 入口即 "emit32 is not a function"。
     const captures = parseCaptureLayout(captureLayout);
     const layoutFlags = parseLayoutFlags(captureLayout);
-    const ast = c.parse(source, layoutFlags);
+    const privScopes = parsePrivateScopes(captureLayout);
+    const parseOpts = {};
+    if (layoutFlags.allowSuper) parseOpts.allowSuper = true;
+    if (layoutFlags.allowNewTarget) parseOpts.fnDepth = 1;
+    if (layoutFlags.inFieldInit) parseOpts.inFieldInit = true;
+    if (layoutFlags.strict) parseOpts.strict = true;
+    parseOpts.scriptGoal = true;
+    if (privScopes.length > 0) {
+        parseOpts.classDepth = 1;
+        const names = [];
+        for (let i = 0; i < privScopes.length; i++) {
+            for (const n of privScopes[i].names) names.push(n);
+        }
+        parseOpts.privateNames = names;
+    } else if (layoutFlags.allowSuper) {
+        parseOpts.classDepth = 1;
+    }
+    const ast = c.parse(source, parseOpts);
     if (!ast.body || ast.body.length < 1) {
         throw new Error("engine: 空片段:" + source);
+    }
+    // Indirect eval / script-goal fragments: NewTarget is only valid inside
+    // functions. Direct eval in a function passes !ctx:n (allowNewTarget).
+    if (!layoutFlags.allowNewTarget && scriptContainsNewTarget(ast)) {
+        throw new SyntaxError("new.target is only valid inside a function");
     }
     // EvalDeclarationInstantiation:sloppy `var` 与中间词法绑定冲突 → SyntaxError
     if (captureLayout && captureLayout.indexOf("!lex:") >= 0) {
@@ -254,6 +326,13 @@ export function compileFragment(source, target, captureLayout) {
     const fragReturnLabel = "_frag_return";
     c.ctx.returnLabel = fragReturnLabel;
     if (layoutFlags.strict) c.ctx.inStrictFunction = true;
+    if (layoutFlags.allowSuper || privScopes.length > 0) c.ctx.inClass = true;
+    if (layoutFlags.inClassMethod) c.ctx.inClassMethod = true;
+    if (layoutFlags.inFieldInit) c.ctx.inFieldInit = true;
+    if (privScopes.length > 0) {
+        c._privateScopes = privScopes;
+        c.ctx.className = privScopes[privScopes.length - 1].className;
+    }
     if (captures.some(function (c) { return c.immutable; })) {
         c.ctx.immutableLocals = new Set();
         for (let _ii = 0; _ii < captures.length; _ii++) {

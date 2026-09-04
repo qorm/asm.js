@@ -1,0 +1,10 @@
+{
+  "description": "new Function class extends Uint8Array inherits BYTES_PER_ELEMENT and constructs views.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "function\n1\ntrue\n4\ntrue",
+    "exitCode": 0
+  }
+}

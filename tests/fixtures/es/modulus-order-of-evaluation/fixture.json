@@ -1,0 +1,10 @@
+{
+  "description": "Modulus Evaluate lhs then rhs before ToNumeric; GetValue(rhs) can throw first.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "MyError\n1\nMyError\n12",
+    "exitCode": 0
+  }
+}

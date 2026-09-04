@@ -1,0 +1,10 @@
+{
+  "description": "Inner class private getter can shadow outer static private field of the same name",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "outer class\ninner class\ntrue",
+    "exitCode": 0
+  }
+}

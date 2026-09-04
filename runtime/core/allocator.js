@@ -4576,6 +4576,8 @@ export class AllocatorGenerator {
         asm.addDataQword(0);
         asm.addDataLabel("_dynamic_asyncgen_maker");
         asm.addDataQword(0);
+        asm.addDataLabel("_dynamic_function_maker");
+        asm.addDataQword(0);
         asm.addDataLabel("_dynamic_func_meta_root");
         asm.addDataQword(0);
 

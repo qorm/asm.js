@@ -1,0 +1,10 @@
+{
+  "description": "Inner function in a class method can read/write private fields on a captured instance; ordinary objects throw TypeError",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "Test262\nok\ntrue",
+    "exitCode": 0
+  }
+}

@@ -12,6 +12,7 @@ const BOX_SIZE = 8;
 
 // getter 标记对象类型（与 runtime/core/allocator.js TYPE_GETTER 一致）
 const TYPE_GETTER = 60;
+const CLOSURE_MAGIC = 0xc105;
 
 // [批次D TDZ] 未初始化绑定哨兵值 —— 与 compiler/index.js 的
 // UNINITIALIZED_BINDING_SENTINEL 必须保持一致(emitUninitializedBindingGuard 比对它)
@@ -691,7 +692,13 @@ export const StatementCompiler = {
                 // hasParameterExpressions / static {} 的体 varEnv 与外层同名须隔离,
                 // 不得复用 mainCaptured 全局 box(paramsbody-var-open / static-init-scope-var-*)。
                 const globalLabel = this.ctx.getMainCapturedVar(name);
-                const useMainCapturedBox = globalLabel &&
+                // A function-local let/const/var/param/name binding must not
+                // reuse the module captured box for an outer same-named var
+                // (`function n(){ let n = 'inside' }` vs outer `var n`).
+                const localBinding = (this.ctx.ownBindingNames && this.ctx.ownBindingNames[name]) ||
+                    (this.ctx.lexLocalNames && this.ctx.lexLocalNames[name]) ||
+                    (this.ctx.paramBindingNames && this.ctx.paramBindingNames[name]);
+                const useMainCapturedBox = globalLabel && !localBinding &&
                     !this.ctx._paramSplitBodyVarEnv && !this.ctx._staticBlockVarEnv;
                 const skipScriptGlobalSync = this.ctx._paramSplitBodyVarEnv || this.ctx._staticBlockVarEnv;
 
@@ -2448,7 +2455,10 @@ export const StatementCompiler = {
                     this.emitThrowReferenceError(name + " is not defined");
                     return;
                 }
-                this.ctx.allocLocal(name);
+                // Sloppy assignment to an unresolvable name creates a global
+                // (for-await `{ unresolvable } of [{}]`). Do not invent a
+                // function-local slot that dies when the iteration frame ends.
+                if (strict) this.ctx.allocLocal(name);
             }
         }
         const tmpName = `__destrval_${this.nextLabelId()}`;
@@ -2954,6 +2964,25 @@ export const StatementCompiler = {
         return [];
     },
 
+    _emitForLetPerIterationRebox(stmt) {
+        if (!stmt.init || stmt.init.type !== "VariableDeclaration" ||
+            (stmt.init.kind !== "let" && stmt.init.kind !== "const")) return;
+        for (const loopDecl of stmt.init.declarations) {
+            if (!loopDecl.id || loopDecl.id.type !== "Identifier") continue;
+            const loopVarName = loopDecl.id.name;
+            if (!(this.ctx.boxedVars && this.ctx.boxedVars.has(loopVarName))) continue;
+            const loopVarOff = this.ctx.getLocal(loopVarName);
+            if (!loopVarOff) continue;
+            this.vm.load(VReg.RET, VReg.FP, loopVarOff);
+            this.vm.load(VReg.RET, VReg.RET, BOX_VALUE_OFFSET);
+            this.vm.push(VReg.RET);
+            this.vm.call("_box_alloc");
+            this.vm.store(VReg.FP, loopVarOff, VReg.RET);
+            this.vm.pop(VReg.V1);
+            this.vm.store(VReg.RET, BOX_VALUE_OFFSET, VReg.V1);
+        }
+    },
+
     compileForStatement(stmt) {
         const loopLabel = this.ctx.newLabel("for");
         const updateLabel = this.ctx.newLabel("for_update");
@@ -3016,6 +3045,11 @@ export const StatementCompiler = {
         this.vm.load(VReg.RET, VReg.V0, 0);
         this.vm.store(VReg.FP, cptnOff, VReg.RET);
 
+        // CreatePerIterationEnvironment before the first test/body so
+        // closures allocated in the initializer keep the init binding
+        // (`let x='outside'` vs later `x='inside'` in the test).
+        this._emitForLetPerIterationRebox(stmt);
+
         this.vm.label(loopLabel);
 
         if (stmt.test) {
@@ -3032,23 +3066,7 @@ export const StatementCompiler = {
         // update 前重建 box(拷贝当前值),update 作用于新 box —— 上一迭代创建的
         // 闭包持旧 box,其值不再被后续迭代改写(对齐 node:fs=[0,1,2] 而非 [3,3,3])。
         // 未捕获 / var 声明:零发射,codegen 不变。continue 跳到 updateLabel,天然覆盖。
-        if (stmt.init && stmt.init.type === "VariableDeclaration" &&
-            (stmt.init.kind === "let" || stmt.init.kind === "const")) {
-            for (const loopDecl of stmt.init.declarations) {
-                if (!loopDecl.id || loopDecl.id.type !== "Identifier") continue;
-                const loopVarName = loopDecl.id.name;
-                if (!(this.ctx.boxedVars && this.ctx.boxedVars.has(loopVarName))) continue;
-                const loopVarOff = this.ctx.getLocal(loopVarName);
-                if (!loopVarOff) continue;
-                this.vm.load(VReg.RET, VReg.FP, loopVarOff);       // 旧 box 指针
-                this.vm.load(VReg.RET, VReg.RET, BOX_VALUE_OFFSET); // 当前值
-                this.vm.push(VReg.RET);
-                this.vm.call("_box_alloc");                         // RET = 新 box(登记为 minor 根)
-                this.vm.store(VReg.FP, loopVarOff, VReg.RET);       // 槽 → 新 box
-                this.vm.pop(VReg.V1);
-                this.vm.store(VReg.RET, BOX_VALUE_OFFSET, VReg.V1); // 新 box.value = 旧值
-            }
-        }
+        this._emitForLetPerIterationRebox(stmt);
         if (stmt.update) {
             this.compileExpression(stmt.update);
         }
@@ -4917,11 +4935,22 @@ export const StatementCompiler = {
         this.vm.label(ok);
     },
 
+    _compileFieldInitializer(expr) {
+        const prev = this.ctx.inFieldInit;
+        this.ctx.inFieldInit = true;
+        this.compileExpression(expr);
+        this.ctx.inFieldInit = prev;
+    },
+
     // 实例字段 + 私有字段初始化(基类:构造体前;派生类:super() 后)。this 从 __this
     // 局部重载(字段初值可为破坏 A0/栈的复杂表达式),与原内联实现逐指令一致。
     // 计算键按下标从类定义期填好的 cfkeys 数组取,不再在构造器里求 field.key。
     // instanceFields 已按声明序含公有+私有(DefineField 交错)。
     emitCtorFieldInits(instanceFields, privateFields, className, thisOffset, cfkeysLabel, privateMethods, labelId) {
+        // Spec InitializeInstanceElements: PrivateMethodOrAccessorAdd first,
+        // then DefineField. Field initializers (and eval inside them) must
+        // already see private methods/getters on the instance.
+        this._emitInstallInstancePrivateMethods(privateMethods, className, thisOffset, labelId);
         let cfKeyIdx = 0;
         for (const field of instanceFields) {
             // Spec: instance [[Fields]] is document order (public + private).
@@ -4930,7 +4959,7 @@ export const StatementCompiler = {
                 const keyStr = "#" + className + privateName;
                 let valOff = null;
                 if (field.value) {
-                    this.compileExpression(field.value);
+                    this._compileFieldInitializer(field.value);
                     valOff = this.ctx.allocLocal(`__pfv_${this.nextLabelId()}`);
                     this.vm.store(VReg.FP, valOff, VReg.RET);
                 }
@@ -4957,7 +4986,7 @@ export const StatementCompiler = {
                 const kt = this.ctx.allocLocal(`__cfk_${this.nextLabelId()}`);
                 this.vm.store(VReg.FP, kt, VReg.RET);
                 if (field.value) {
-                    this.compileExpression(field.value);
+                    this._compileFieldInitializer(field.value);
                     this.vm.mov(VReg.V1, VReg.RET);
                 } else {
                     // 无初始化器的计算键字段(`[x]`)须建 own 属性 = undefined
@@ -4975,7 +5004,7 @@ export const StatementCompiler = {
             if (field.value) {
                 // 编译字段初始值（可能是 new Map() 等复杂表达式，会破坏 A0 和栈平衡，
                 // 故绝不能靠 push/pop A0 保 this——从 __this 局部重新加载，与私有字段一致）
-                this.compileExpression(field.value);
+                this._compileFieldInitializer(field.value);
                 this.vm.mov(VReg.V1, VReg.RET);
                 // 设置字段: this[fieldName] = value
                 this.vm.load(VReg.A0, VReg.FP, thisOffset);
@@ -4994,6 +5023,9 @@ export const StatementCompiler = {
             }
         }
 
+    },
+
+    _emitInstallInstancePrivateMethods(privateMethods, className, thisOffset, labelId) {
         // 实例私有方法/访问器:装到实例 own 属性,不放 prototype。
         // 规范 PrivateMethodOrAccessorAdd 在 InitializeInstanceElements(super 返回后)
         // 写实例品牌。方法挂原型时 return-override `{}` 没有 C.prototype → brand-miss。
@@ -5116,9 +5148,7 @@ export const StatementCompiler = {
             // make compileIdentifier dereference classinfo@0 as a box and feed a
             // malformed value to compileDynamicNew. Keep ordinary captures boxed,
             // but recognize local class declarations through the function table.
-            const capturedDecl = this.ctx.getFunction && this.ctx.getFunction(name);
-            const isCapturedClass = !!(capturedDecl && capturedDecl.type === "ClassDeclaration");
-            if (this.ctx.boxedVars && !isCapturedClass) this.ctx.boxedVars.add(name);
+            if (this.ctx.boxedVars) this.ctx.boxedVars.add(name);
         }
         this.vm.label(skip);
     },
@@ -5154,11 +5184,6 @@ export const StatementCompiler = {
             // sibling method captures it; that flag describes ordinary lexical
             // cells, not the class slot representation. Do not treat this slot
             // as a box pointer while materialising the method-capture array.
-            if (this.ctx.localDeclaredClasses && this.ctx.localDeclaredClasses[name] === true) {
-                vm.load(VReg.V1, VReg.FP, offset);
-                vm.store(VReg.S3, i * 8, VReg.V1);
-                continue;
-            }
             const isBoxed = this.ctx.boxedVars && this.ctx.boxedVars.has(name) && name !== "__this";
             if (isBoxed) {
                 vm.load(VReg.V1, VReg.FP, offset);
@@ -5356,6 +5381,9 @@ export const StatementCompiler = {
         const isClassExpr = asExpression === true || stmt.type === "ClassExpression";
         let classExprScope = null;
         let classExprSavedBoxed = false;
+        let classDeclScope = null;
+        let classDeclSavedBoxed = false;
+        let outerClassOffset = 0;
         if (isClassExpr) {
             classExprScope = this.ctx.enterScope();
             if (this.ctx.boxedVars && this.ctx.boxedVars.has(className)) {
@@ -5366,17 +5394,48 @@ export const StatementCompiler = {
             this.ctx.immutableLocals.add(className);
             if (!this.ctx.classNameBindings) this.ctx.classNameBindings = new Set();
             this.ctx.classNameBindings.add(className);
+        } else {
+            // ClassDeclaration: outer environment is a mutable binding; captured
+            // closures (probeBefore/setBefore) must share a box, not a copy of
+            // naked classinfo. Heritage/methods see an inner immutable binding.
+            outerClassOffset = this.ctx.getLocal(className) || 0;
+            if (!outerClassOffset) outerClassOffset = this.ctx.allocLocal(className);
+            if (!this.ctx.localDeclaredClasses) this.ctx.localDeclaredClasses = {};
+            this.ctx.localDeclaredClasses[className] = true;
+            const needsOuterBox = !!(this.ctx.boxedVars && this.ctx.boxedVars.has(className)) ||
+                !!(this.ctx.getMainCapturedVar && this.ctx.getMainCapturedVar(className));
+            if (needsOuterBox) {
+                if (!this.ctx.boxedVars) this.ctx.boxedVars = new Set();
+                this.ctx.boxedVars.add(className);
+                const gl = this.ctx.getMainCapturedVar && this.ctx.getMainCapturedVar(className);
+                const alreadyBoxed = !!(this.ctx.preboxedVars && this.ctx.preboxedVars.has(className));
+                if (gl && !alreadyBoxed) {
+                    this.vm.lea(VReg.V1, gl);
+                    this.vm.load(VReg.RET, VReg.V1, 0);
+                    this.vm.store(VReg.FP, outerClassOffset, VReg.RET);
+                    if (!this.ctx.preboxedVars) this.ctx.preboxedVars = new Set();
+                    this.ctx.preboxedVars.add(className);
+                } else if (!alreadyBoxed) {
+                    this.vm.call("_box_alloc");
+                    this.vm.movImm64(VReg.V1, TDZ_SENTINEL);
+                    this.vm.store(VReg.RET, 0, VReg.V1);
+                    this.vm.store(VReg.FP, outerClassOffset, VReg.RET);
+                    if (!this.ctx.preboxedVars) this.ctx.preboxedVars = new Set();
+                    this.ctx.preboxedVars.add(className);
+                }
+            }
+            classDeclScope = this.ctx.enterScope();
+            if (this.ctx.boxedVars && this.ctx.boxedVars.has(className)) {
+                classDeclSavedBoxed = true;
+                this.ctx.boxedVars.delete(className);
+            }
+            if (!this.ctx.immutableLocals) this.ctx.immutableLocals = new Set();
+            this.ctx.immutableLocals.add(className);
+            if (!this.ctx.classNameBindings) this.ctx.classNameBindings = new Set();
+            this.ctx.classNameBindings.add(className);
         }
         const classOffset = this.ctx.allocLocal(className);
         if (_traceClass) console.log("CC_SCOPE", className);
-        // 记本作用域**本地声明**的类名:其槽直存裸 classinfo(见下 classOffset 存储),
-        // 区别于顶层类被闭包捕获时槽存 box 指针。compileUserClassNew 据此决定 new 时
-        // 是否多解一层 box(见其注释:同名既本地声明又被 boxedVars 标记时 boxedVars 不可靠)。
-        // 表达式名只活在 enterScope 内,不标外层 C 为 classinfo。
-        if (!isClassExpr) {
-            if (!this.ctx.localDeclaredClasses) this.ctx.localDeclaredClasses = {};
-            this.ctx.localDeclaredClasses[className] = true;
-        }
 
         // [I8 类名 TDZ] extends 表达式里读本类名 → 绑定尚在 TDZ → ReferenceError
         // (class x extends x {} 族)。extends 求值前把类名槽置 TDZ 哨兵、读点标 _tdz
@@ -5645,6 +5704,7 @@ export const StatementCompiler = {
         this.ctx.localTemps = null;
         this.ctx.localOffset = 0;
         this.ctx.inClass = true;
+        this.ctx.inClassMethod = true;
         this.ctx.className = className;
         this.ctx.classInfoLabel = classInfoLabel; // super()→TA 绑 NewTarget.prototype 用
         // 构造器对外层 let/const 的捕获:合并方法自身共享局部 + 外层已分析的
@@ -6273,6 +6333,42 @@ export const StatementCompiler = {
                 this.vm.and(VReg.V2, VReg.V0, VReg.V1);
                 this.vm.store(VReg.S1, 16, VReg.V2);
                 _emitClassTrace(":heritage-direct-object");
+            } else if (this.engineNoIC && superClass && superClass.type === "Identifier" &&
+                       Object.prototype.hasOwnProperty.call(TA_SUPER_TAGS, superClass.name)) {
+                // eval/new Function fragments skip the generic heritage block
+                // (forward-branch locals are unsafe in route-B).  Without this
+                // narrow path, `class extends Uint8Array` has no [[Prototype]]
+                // and no BYTES_PER_ELEMENT, so test262's subClass()+ctors.concat
+                // feeds a non-constructor into `new ArrayBuffer(4 * BPE)`.
+                // V2 is the parent ctor raw from emitCtorClosureRef above.
+                this.vm.store(VReg.S0, 16, VReg.V2);
+                this.vm.push(VReg.S0);
+                this.vm.push(VReg.S1);
+                this.vm.push(VReg.S2);
+                this.vm.load(VReg.A0, VReg.V2, 16);
+                this.vm.call("_get_ctor_proto");
+                this.vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+                this.vm.and(VReg.V2, VReg.RET, VReg.V1);
+                this.vm.pop(VReg.S2);
+                this.vm.pop(VReg.S1);
+                this.vm.pop(VReg.S0);
+                this.vm.store(VReg.S1, 16, VReg.V2);
+                if (Object.prototype.hasOwnProperty.call(TA_SUPER_BPE, superClass.name)) {
+                    this.vm.push(VReg.S0);
+                    this.vm.push(VReg.S1);
+                    this.vm.push(VReg.S2);
+                    this.vm.mov(VReg.A0, VReg.S0);
+                    this.vm.lea(VReg.A1, this.addStringConstant("BYTES_PER_ELEMENT"));
+                    this.vm.call("_tag_str_a1");
+                    this.vm.movImm(VReg.A2, TA_SUPER_BPE[superClass.name]);
+                    this.vm.scvtf(0, VReg.A2);
+                    this.vm.fmovToInt(VReg.A2, 0);
+                    this.vm.call("_object_set");
+                    this.vm.pop(VReg.S2);
+                    this.vm.pop(VReg.S1);
+                    this.vm.pop(VReg.S0);
+                }
+                _emitClassTrace(":heritage-direct-ta");
             } else if (!this.engineNoIC || (process.env && process.env.ASMJS_HERITAGE_INLINE === "1")) {
             const skipProtoLink = this.ctx.newLabel("skip_proto_link");
             const classinfoLink = this.ctx.newLabel("super_proto_ci");
@@ -6743,7 +6839,7 @@ export const StatementCompiler = {
                             this.vm.store(VReg.FP, skt, VReg.RET);
                         }
                         if (field.value) {
-                            this.compileExpression(field.value);
+                            this._compileFieldInitializer(field.value);
                             this.vm.mov(VReg.V1, VReg.RET);
                         } else {
                             this.vm.movImm64(VReg.V1, 0x7ffb000000000000n);
@@ -6763,7 +6859,7 @@ export const StatementCompiler = {
                     if (field.key.type === "PrivateIdentifier") fieldName = "#" + className + fieldName;
                     if (field.value) {
                         this.vm.push(VReg.S0);
-                        this.compileExpression(field.value);
+                        this._compileFieldInitializer(field.value);
                         this.vm.mov(VReg.V1, VReg.RET);
                         this.vm.pop(VReg.S0);
                         this.vm.mov(VReg.A0, VReg.S0);
@@ -6858,6 +6954,12 @@ export const StatementCompiler = {
         // 使函数体内的 ClassName.staticMethod() 能拿到真实静态成员
         // ClassExpression 名不是外层绑定:禁止写穿 mainCapturedVars / export。
         if (!isClassExpr) {
+            if (classDeclSavedBoxed) {
+                this.vm.load(VReg.V1, VReg.FP, outerClassOffset);
+                this.vm.store(VReg.V1, 0, VReg.S0);
+            } else if (outerClassOffset) {
+                this.vm.store(VReg.FP, outerClassOffset, VReg.S0);
+            }
             const classGlobalLabel = this.ctx.getMainCapturedVar
                 ? this.ctx.getMainCapturedVar(className)
                 : null;
@@ -6867,6 +6969,12 @@ export const StatementCompiler = {
                 this.vm.store(VReg.V1, 0, VReg.S0); // box 值 = 类信息对象 (raw)
             }
             this.syncModuleExportBinding(className, VReg.S0);
+            if (classDeclScope) {
+                this.ctx.leaveScope(classDeclScope);
+                if (classDeclSavedBoxed && this.ctx.boxedVars) this.ctx.boxedVars.add(className);
+                if (this.ctx.immutableLocals) this.ctx.immutableLocals.delete(className);
+                if (this.ctx.classNameBindings) this.ctx.classNameBindings.delete(className);
+            }
         } else {
             // 表达式值 = 类对象。leaveScope 后外层 C 恢复,不能再 Identifier 读名。
             this.vm.load(VReg.RET, VReg.FP, classOffset);
@@ -6989,6 +7097,51 @@ export const StatementCompiler = {
         const runtimeKey = !!(method.computed && method.key &&
             method.key.type === "Identifier");
         return (runtimeKey ? "@c@" : "") + keyName;
+    },
+
+    _methodUsesPrivateName(method) {
+        const walk = (n) => {
+            if (!n || typeof n !== "object") return false;
+            if (Array.isArray(n)) {
+                for (let i = 0; i < n.length; i++) if (walk(n[i])) return true;
+                return false;
+            }
+            const t = n.type;
+            if (t === "PrivateIdentifier") return true;
+            if (t === "Identifier" && typeof n.name === "string" && n.name[0] === "#") return true;
+            // Nested functions/classes have their own private environment.
+            if (t === "FunctionExpression" || t === "FunctionDeclaration" ||
+                t === "ClassExpression" || t === "ClassDeclaration") return false;
+            if (t === "ArrowFunctionExpression") return walk(n.body) || walk(n.params);
+            for (const k in n) {
+                if (k === "type" || k === "loc" || k === "range" || k === "start" || k === "end") continue;
+                if (walk(n[k])) return true;
+            }
+            return false;
+        };
+        if (!method || !method.value) return false;
+        return walk(method.value.body) || walk(method.value.params);
+    },
+
+    // Wrap a static method as a closure capturing the class object so
+    // repeated class evaluations get distinct private brands.
+    _emitStaticMethodClosure(methodLabel, classReg, destReg) {
+        const clsOff = this.ctx.allocLocal(`__stcls_${this.nextLabelId()}`);
+        this.vm.store(VReg.FP, clsOff, classReg);
+        this.vm.movImm(VReg.A0, 24);
+        this.vm.call("_alloc");
+        const closOff = this.ctx.allocLocal(`__stclos_${this.nextLabelId()}`);
+        this.vm.store(VReg.FP, closOff, VReg.RET);
+        this.vm.movImm(VReg.V1, CLOSURE_MAGIC);
+        this.vm.store(VReg.RET, 0, VReg.V1);
+        this.vm.lea(VReg.V1, methodLabel);
+        this.vm.store(VReg.RET, 8, VReg.V1);
+        this.vm.call("_box_alloc");
+        this.vm.load(VReg.V1, VReg.FP, clsOff);
+        this.vm.store(VReg.RET, 0, VReg.V1);
+        this.vm.load(VReg.V2, VReg.FP, closOff);
+        this.vm.store(VReg.V2, 16, VReg.RET);
+        if (destReg !== VReg.V2) this.vm.mov(destReg, VReg.V2);
     },
 
     emitClassMethodTable(methods, className, labelId, isStatic, targetReg) {
@@ -7137,6 +7290,11 @@ export const StatementCompiler = {
                     this.vm.movImm(VReg.V1, 0);
                 }
                 this.vm.store(VReg.V2, 16, VReg.V1); // setter@value+16（无则 0）
+                // _tag_str_a1 / call clobber caller-saved V* (V2=X10). Stash the
+                // TYPE_GETTER marker like the private-accessor path so setter@16
+                // survives key tagging.
+                const accMkOff = this.ctx.allocLocal(`__cacc_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, accMkOff, VReg.V2);
                 if (isComputedAccessor) {
                     this.vm.pop(targetReg);                // 恢复被计算键求值覆盖的 S0/S1
                     this.vm.mov(VReg.A0, targetReg);
@@ -7147,7 +7305,7 @@ export const StatementCompiler = {
                     // [A3.5-fix] 键装箱(0x7FFC 驻留),同 constructor/方法键
                     this.vm.call("_tag_str_a1");
                 }
-                this.vm.mov(VReg.A2, VReg.V2);
+                this.vm.load(VReg.A2, VReg.FP, accMkOff);
                 this.vm.call("_object_define");
                 // Accessor on prototype/classinfo must be non-enumerable per ES spec.
                 this.vm.mov(VReg.A0, targetReg);
@@ -7209,10 +7367,18 @@ export const StatementCompiler = {
             this.vm.lea(VReg.A1, this.addStringConstant(defineKey));
             // [A3.5-fix] 键装箱(0x7FFC 驻留),同 constructor/访问器键
             this.vm.call("_tag_str_a1");
-            // 将函数地址标记为 JS 函数值（TAG_FUNCTION = 0x7FFF）
-            this.vm.lea(VReg.A2, methodLabel);
-            this.vm.movImm64(VReg.V0, 0x7fff000000000000n);
-            this.vm.or(VReg.A2, VReg.A2, VReg.V0);
+            if (isStatic && this._methodUsesPrivateName(method)) {
+                const keyOff = this.ctx.allocLocal(`__stmk_${this.nextLabelId()}`);
+                this.vm.store(VReg.FP, keyOff, VReg.A1);
+                this._emitStaticMethodClosure(methodLabel, targetReg, VReg.A2);
+                this.vm.mov(VReg.A0, targetReg);
+                this.vm.load(VReg.A1, VReg.FP, keyOff);
+            } else {
+                // 将函数地址标记为 JS 函数值（TAG_FUNCTION = 0x7FFF）
+                this.vm.lea(VReg.A2, methodLabel);
+                this.vm.movImm64(VReg.V0, 0x7fff000000000000n);
+                this.vm.or(VReg.A2, VReg.A2, VReg.V0);
+            }
             this.vm.call("_object_define");
             // Prototype/static methods must be non-enumerable per ES spec.
             this.vm.mov(VReg.A0, targetReg);
@@ -7302,7 +7468,9 @@ export const StatementCompiler = {
         const savedCtx = this.ctx;
         // [label collision] 掺入类声明唯一 labelId:两个模块同名类的同名方法
         // (`Server.who`)否则生成相同的方法体局部标签而互相覆盖(见 compileClassDeclaration)。
-        this.ctx = this.ctx.clone(`${className}.${methodName}.${labelId}`);
+        // get/set accessors share methodName; a shared clone prefix would
+        // overwrite assembler labels from the first accessor with the second.
+        this.ctx = this.ctx.clone(`${className}.${kindPrefix}${methodName}.${labelId}`);
         this.ctx._fnFrameSize = 8192;
         this.ctx.locals = new Map();
         this.ctx.localTemps = null;
@@ -7331,7 +7499,9 @@ export const StatementCompiler = {
         // emitArgumentsArray's array get unboxed → primitive (static-init-arguments-methods).
         this.ctx.boxedVars.delete("arguments");
         this.ctx.inClass = true;
+        this.ctx.inClassMethod = true;
         this.ctx.className = className;
+        this.ctx.classInfoLabel = this._classInfoLabelForDecl(className, labelId);
         this.ctx.inStaticMethod = !!isStatic; // super.m()/super.prop 在静态方法内走父类对象
         this.ctx.returnLabel = returnLabel;
         // [批次D] 生成器方法体:跑在协程栈上(inCoroBody → 体内无 try 的 throw/finally 重抛
@@ -7355,6 +7525,30 @@ export const StatementCompiler = {
         const thisOffset = this.ctx.allocLocal("__this");
         this.vm.mov(VReg.V0, VReg.A5); // 从 A5 获取 this
         this.vm.store(VReg.FP, thisOffset, VReg.V0);
+        if (isStatic && this._methodUsesPrivateName(method)) {
+            // Per-evaluation static private brand: these methods are installed
+            // as closures capturing the class object in slot 0.
+            const brandOff = this.ctx.allocLocal("__class_brand");
+            const notClos = this.ctx.newLabel("stbrand_raw");
+            const done = this.ctx.newLabel("stbrand_done");
+            // S0 is the closure only if it is an untagged heap pointer.
+            this.vm.shrImm(VReg.V1, VReg.S0, 48);
+            this.vm.cmpImm(VReg.V1, 0);
+            this.vm.jne(notClos);
+            this.vm.cmpImm(VReg.S0, 0);
+            this.vm.jeq(notClos);
+            this.vm.load(VReg.V1, VReg.S0, 0);
+            this.vm.cmpImm(VReg.V1, CLOSURE_MAGIC);
+            this.vm.jne(notClos);
+            this.vm.load(VReg.V1, VReg.S0, 16);
+            this.vm.load(VReg.V1, VReg.V1, 0);
+            this.vm.store(VReg.FP, brandOff, VReg.V1);
+            this.vm.jmp(done);
+            this.vm.label(notClos);
+            this.vm.movImm(VReg.V1, 0);
+            this.vm.store(VReg.FP, brandOff, VReg.V1);
+            this.vm.label(done);
+        }
         this.emitSnapshotNewTarget();
 
         // 处理参数

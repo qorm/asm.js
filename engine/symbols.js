@@ -247,6 +247,12 @@ export const SYM_NAMES = [
     "_pspc_is_ctor",
     // Object intrinsic singleton slots shared by dynamic fragments.
     "_nsobj_object", "_nsobj_object_proto", "_nsobj_object_ready",
+    // Public .length for eval/new Function (UTF-16 strings + TypedArray live length).
+    // Append-only ABI: fragments emit this helper after the TA user-ptr length fix.
+    "_js_length_dyn_public",
+    // CreateDynamicFunction for `new Function` inside eval fragments.
+    // Append-only ABI: fragment relocation ids remain stable.
+    "_dynamic_function_ctor_call",
 ];
 
 // 表中**不是代码标签**的名字:.data 段全局槽(数据段在 _engine_symaddr 生成之后才发射)

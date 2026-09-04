@@ -65,7 +65,7 @@ export class CoercionGenerator {
     generateRelCmp() {
         const vm = this.vm;
         vm.label("_js_relcmp");
-        vm.prologue(16, [VReg.S0, VReg.S1]);
+        vm.prologue(32, [VReg.S0, VReg.S1]);
         vm.mov(VReg.S0, VReg.A0);
         vm.mov(VReg.S1, VReg.A1);
         // Abstract Relational Comparison: ToPrimitive(x/y, hint Number) first.
@@ -108,15 +108,60 @@ export class CoercionGenerator {
         vm.shrImm(VReg.V0, VReg.S1, 48);
         vm.cmpImm(VReg.V0, 0x7FFC);
         vm.jne("_relcmp_num");
-        // 都是字符串:_strcmp(左内容, 右内容)→ 字节差
+        // 都是字符串:ASCII 走字节 _strcmp;含非 ASCII 走 UTF-16 码元序
+        // (_str_relcmp_utf16,独立 prologue,不改本帧)。
+        vm.store(VReg.SP, 0, VReg.S0);
+        vm.store(VReg.SP, 8, VReg.S1);
         vm.mov(VReg.A0, VReg.S0); vm.call("_getStrContent"); vm.mov(VReg.S0, VReg.RET);
-        vm.mov(VReg.A0, VReg.S1); vm.call("_getStrContent"); vm.mov(VReg.A1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S1); vm.call("_getStrContent"); vm.mov(VReg.S1, VReg.RET);
+        vm.mov(VReg.A0, VReg.S0); vm.call("_strlen");
+        vm.store(VReg.SP, 16, VReg.RET);
+        vm.label("_relcmp_scan_l");
+        vm.load(VReg.V1, VReg.SP, 16);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_relcmp_scan_r");
+        vm.loadByte(VReg.V0, VReg.S0, 0);
+        vm.andImm(VReg.V0, VReg.V0, 0xff);
+        vm.cmpImm(VReg.V0, 0x80);
+        vm.jge("_relcmp_utf16");
+        vm.addImm(VReg.S0, VReg.S0, 1);
+        vm.subImm(VReg.V1, VReg.V1, 1);
+        vm.store(VReg.SP, 16, VReg.V1);
+        vm.jmp("_relcmp_scan_l");
+        vm.label("_relcmp_scan_r");
+        vm.mov(VReg.A0, VReg.S1); vm.call("_strlen");
+        vm.store(VReg.SP, 16, VReg.RET);
+        vm.label("_relcmp_scan_r_loop");
+        vm.load(VReg.V1, VReg.SP, 16);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_relcmp_ascii");
+        vm.loadByte(VReg.V0, VReg.S1, 0);
+        vm.andImm(VReg.V0, VReg.V0, 0xff);
+        vm.cmpImm(VReg.V0, 0x80);
+        vm.jge("_relcmp_utf16");
+        vm.addImm(VReg.S1, VReg.S1, 1);
+        vm.subImm(VReg.V1, VReg.V1, 1);
+        vm.store(VReg.SP, 16, VReg.V1);
+        vm.jmp("_relcmp_scan_r_loop");
+        vm.label("_relcmp_utf16");
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.load(VReg.A1, VReg.SP, 8);
+        vm.call("_str_relcmp_utf16");
+        vm.cmpImm(VReg.RET, 1);
+        vm.jeq("_relcmp_lt");
+        vm.cmpImm(VReg.RET, 2);
+        vm.jeq("_relcmp_gt");
+        vm.movImm(VReg.RET, 0);
+        vm.epilogue([VReg.S0, VReg.S1], 32);
+        vm.label("_relcmp_ascii");
+        vm.load(VReg.A0, VReg.SP, 0); vm.call("_getStrContent"); vm.mov(VReg.S0, VReg.RET);
+        vm.load(VReg.A0, VReg.SP, 8); vm.call("_getStrContent"); vm.mov(VReg.A1, VReg.RET);
         vm.mov(VReg.A0, VReg.S0); vm.call("_strcmp"); // RET = 有符号字节差
         vm.cmpImm(VReg.RET, 0);
         vm.jlt("_relcmp_lt");
         vm.jgt("_relcmp_gt");
         vm.movImm(VReg.RET, 0); // 相等
-        vm.epilogue([VReg.S0, VReg.S1], 16);
+        vm.epilogue([VReg.S0, VReg.S1], 32);
         // 数值路径:各 ToNumber 后 fcmp
         vm.label("_relcmp_num");
         vm.mov(VReg.A0, VReg.S0); vm.call("_number_coerce"); vm.mov(VReg.S0, VReg.RET);
@@ -129,10 +174,10 @@ export class CoercionGenerator {
         vm.jflt("_relcmp_lt");
         vm.jfgt("_relcmp_gt");
         vm.movImm(VReg.RET, 0); // 相等
-        vm.epilogue([VReg.S0, VReg.S1], 16);
-        vm.label("_relcmp_lt"); vm.movImm(VReg.RET, 1); vm.epilogue([VReg.S0, VReg.S1], 16);
-        vm.label("_relcmp_gt"); vm.movImm(VReg.RET, 2); vm.epilogue([VReg.S0, VReg.S1], 16);
-        vm.label("_relcmp_unord"); vm.movImm(VReg.RET, 3); vm.epilogue([VReg.S0, VReg.S1], 16);
+        vm.epilogue([VReg.S0, VReg.S1], 32);
+        vm.label("_relcmp_lt"); vm.movImm(VReg.RET, 1); vm.epilogue([VReg.S0, VReg.S1], 32);
+        vm.label("_relcmp_gt"); vm.movImm(VReg.RET, 2); vm.epilogue([VReg.S0, VReg.S1], 32);
+        vm.label("_relcmp_unord"); vm.movImm(VReg.RET, 3); vm.epilogue([VReg.S0, VReg.S1], 32);
 
         // 4 个布尔 wrapper:call _js_relcmp,按编码返回 _js_true/_js_false。
         // lt:code==1;le:0 或 1;gt:2;ge:0 或 2。unordered(3)对全部为 false。

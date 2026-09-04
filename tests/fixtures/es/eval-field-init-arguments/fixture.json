@@ -1,0 +1,10 @@
+{
+  "description": "Direct eval inside a class field initializer (including nested arrows) is a SyntaxError if the eval source contains arguments",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true\nfalse",
+    "exitCode": 0
+  }
+}

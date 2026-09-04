@@ -1,0 +1,10 @@
+{
+  "description": "Template cooked TV of \\b/\\f/\\v and finite % Infinity remainder.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "8\n12\n11\n10\n9\n1\n1\n-1",
+    "exitCode": 0
+  }
+}

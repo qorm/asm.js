@@ -157,7 +157,7 @@ export const ClassParser = {
             const ref = refs[i];
             let found = false;
             for (let d = 1; d <= ref.depth; d++) {
-                const names = this._privateNamesByDepth[d];
+                const names = this._privateNamesByDepth && this._privateNamesByDepth[d];
                 if (names) {
                     for (let j = 0; j < names.length; j++) {
                         if (names[j].name === ref.name) { found = true; break; }

@@ -915,7 +915,8 @@ export const ExpressionCompiler = {
                 // 函数遮蔽时改派。末位实参为 body,其余为形参名(前 6 个绑定)。
                 const shadowed = (this.ctx.getLocal && this.ctx.getLocal("Function")) ||
                     (this.ctx.getFunction && this.ctx.getFunction("Function"));
-                if (!shadowed) {
+                if (!shadowed && !this.engineNoIC &&
+                    this.getFunctionLabel && this.getFunctionLabel("__makeFunction")) {
                     const bodyArg = args.length > 0 ? args[args.length - 1]
                         : { type: "Literal", value: "" };
                     const nameArgs = [];
@@ -928,6 +929,14 @@ export const ExpressionCompiler = {
                             bodyArg,
                         ],
                     });
+                    break;
+                }
+                if (!shadowed && this.engineNoIC) {
+                    // Eval fragments cannot import __makeFunction. The host
+                    // eval shim registers CreateDynamicFunction on
+                    // `_dynamic_function_maker`.
+                    this.compileCallArguments(args);
+                    this.vm.call("_dynamic_function_ctor_call");
                     break;
                 }
                 this.compileUserClassNew(typeName, args);
@@ -1048,9 +1057,22 @@ export const ExpressionCompiler = {
         this.vm.mov(VReg.A0, VReg.RET);
         this.emitBoxedStringKey("prototype", VReg.A1);
         this.vm.call("_closure_prop_get"); // RET = 装箱 proto / undefined
-        // 3. 脱壳 → 裸 prototype(undefined 脱壳得 0)
+        // 3. 仅对象可作为 [[Prototype]];否则 0,由 new 路径回落到 Object.prototype.
+        const protoObjL = this.ctx.newLabel("fnproto_isobj");
+        const protoDoneL = this.ctx.newLabel("fnproto_done");
+        this.vm.shrImm(VReg.V1, VReg.RET, 48);
+        this.vm.cmpImm(VReg.V1, 0x7FFD);
+        this.vm.jeq(protoObjL);
+        this.vm.cmpImm(VReg.V1, 0x7FFE);
+        this.vm.jeq(protoObjL);
+        this.vm.cmpImm(VReg.V1, 0x7FFF);
+        this.vm.jeq(protoObjL);
+        this.vm.movImm(VReg.RET, 0);
+        this.vm.jmp(protoDoneL);
+        this.vm.label(protoObjL);
         this.vm.emitMaskLoad(VReg.V1);
         this.vm.andMaskReg(VReg.RET, VReg.RET, VReg.V1);
+        this.vm.label(protoDoneL);
     },
 
     // [#69] 普通函数 new F(args):建对象→__proto__=F.prototype(惰性,经闭包属性侧表,
@@ -1082,6 +1104,13 @@ export const ExpressionCompiler = {
         //    且 `F.prototype.constructor` 由 _cpg_miss 落 → `(new F()).constructor===F`)。
         //    裸指针存储,__proto__ 链按裸指针解读(同 class props[1].val)。
         this.emitUserFuncProtoRef(funcName, symbol); // RET = 裸 F.prototype(S1 scratch)
+        const haveProtoL = this.ctx.newLabel("fnnew_have_proto");
+        this.vm.cmpImm(VReg.RET, 0);
+        this.vm.jne(haveProtoL);
+        this.vm.call("_object_proto_ensure");
+        this.vm.emitMaskLoad(VReg.V1);
+        this.vm.andMaskReg(VReg.RET, VReg.RET, VReg.V1);
+        this.vm.label(haveProtoL);
         this.vm.store(VReg.S0, 16, VReg.RET);
         this.vm.emitMaskLoad(VReg.V1);
         this.vm.andMaskReg(VReg.S0, VReg.S0, VReg.V1);
@@ -1280,8 +1309,7 @@ export const ExpressionCompiler = {
         // 漏这层 → 把 box 指针当裸 classinfo 解 props_ptr@32 → 段错误(闭包体内 new
         // 顶层类崩的根因)。
         const capturedBoxedClass = !!(offset &&
-            this.ctx.boxedVars && this.ctx.boxedVars.has(className) &&
-            !(this.ctx.localDeclaredClasses && this.ctx.localDeclaredClasses[className]));
+            this.ctx.boxedVars && this.ctx.boxedVars.has(className));
 
         if (offset || globalLabel) {
             if (offset) {
@@ -2596,6 +2624,34 @@ export const ExpressionCompiler = {
             this.vm.lea(VReg.V0, "_ta_ctor_tramp");
             this.vm.cmp(VReg.V1, VReg.V0);
             this.vm.jne(dnewNotTa);
+            {
+                const constructL = this.ctx.newLabel("dnew_ta_construct");
+                const typeSlot = this.ctx.allocLocal(`__dnew_ta_ty_${this.nextLabelId()}`);
+                // 1-arg TA: match static `new Uint8Array(x)` — evaluate the
+                // already-built args[0] then `_typed_array_from`. Keep type in
+                // an FP slot across `_array_get`.
+                this.vm.load(VReg.A0, VReg.FP, dnArgsSlot);
+                this.vm.call("_array_length");
+                this.vm.cmpImm(VReg.RET, 1);
+                this.vm.jne(constructL);
+                this.vm.load(VReg.V0, VReg.FP, dnFnValSlot);
+                this.vm.emitMaskLoad(VReg.V1);
+                this.vm.andMaskReg(VReg.V0, VReg.V0, VReg.V1);
+                this.vm.load(VReg.V1, VReg.V0, 16);
+                this.vm.cmpImm(VReg.V1, 0x70);
+                this.vm.jeq(constructL);
+                this.vm.store(VReg.FP, typeSlot, VReg.V1);
+                this.vm.load(VReg.A0, VReg.FP, dnArgsSlot);
+                this.vm.movImm(VReg.A1, 0);
+                this.vm.call("_array_get");
+                this.vm.mov(VReg.A1, VReg.RET);
+                this.vm.movImm(VReg.V0, 0);
+                this.vm.store(VReg.FP, dnArgsSlot, VReg.V0);
+                this.vm.load(VReg.A0, VReg.FP, typeSlot);
+                this.vm.call("_typed_array_from");
+                this.vm.jmp(dynNewProxyEndL);
+                this.vm.label(constructL);
+            }
             this.vm.load(VReg.RET, VReg.FP, dnArgsSlot);
             this.vm.mov(VReg.A1, VReg.RET);
             this.vm.load(VReg.A0, VReg.FP, dnFnValSlot);

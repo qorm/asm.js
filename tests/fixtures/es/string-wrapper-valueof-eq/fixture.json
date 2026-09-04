@@ -1,0 +1,10 @@
+{
+  "description": "String/Number wrapper ToPrimitive honors user valueOf/toString before [[StringData]]/[[NumberData]].",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true\ned\ned\n1undefined\ntrue\n1",
+    "exitCode": 0
+  }
+}

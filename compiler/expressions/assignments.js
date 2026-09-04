@@ -3,6 +3,7 @@
 
 import { VReg } from "../../vm/registers.js";
 import { Type, isIntType, isFloatType, inferType } from "../core/types.js";
+import { nodeEvalDeclaresVar } from "../../lang/analysis/closure.js";
 
 // 模块级算符表:热路径勿每次 new 短数组再 indexOf
 const FP_ARITH_OPS = { "+": 1, "-": 1, "*": 1, "/": 1, "%": 1 };
@@ -207,6 +208,11 @@ export const AssignmentCompiler = {
                         this.vm.call(setHelper);
                         this.vm.load(VReg.RET, VReg.FP, vSlot);
                     } else if (binOp) {
+                        // GetBindingValue / SetMutableBinding each do HasProperty
+                        // after HasBinding (Proxy has traps, with-proxy-env).
+                        const gbvHasL = this.ctx.newLabel("withcv_gbv_has");
+                        this._emitObjectEnvHasProperty(slot, name, gbvHasL);
+                        this.vm.label(gbvHasL);
                         this.vm.load(VReg.A0, VReg.FP, slot);
                         this.emitBoxedStringKey(name, VReg.A1);
                         this.vm.call("_object_get");
@@ -216,6 +222,9 @@ export const AssignmentCompiler = {
                         const leftSlot = this.ctx.allocLocal(`__withcv_l_${this.nextLabelId()}`);
                         this.vm.store(VReg.FP, leftSlot, VReg.RET);
                         if (strictSet) this._emitStrictObjectEnvPutGuard(slot, name);
+                        const smbHasL = this.ctx.newLabel("withcv_smb_has");
+                        this._emitObjectEnvHasProperty(slot, name, smbHasL);
+                        this.vm.label(smbHasL);
                         this._inWithResolve = true;
                         this.compileAssignmentExpression({
                             type: "AssignmentExpression",
@@ -325,11 +334,12 @@ export const AssignmentCompiler = {
 
             const op = expr.operator;
             let isBoxed = this.ctx.boxedVars && this.ctx.boxedVars.has(name);
-            // [S11.13.2] eval('var x') 与捕获同名:复合赋值 LHS Reference 仍指向
-            // 捕获 box(__cap_x),普通读/简单= 走 eval var 槽 x。
-            if (this.ctx.bodyEvalVarNames && this.ctx.bodyEvalVarNames.has(name) && op !== "=") {
+            // eval('var x') 与捕获同名:读走独立 eval var 槽。
+            // 复合赋值、以及 RHS 内含 eval('var x') 的简单赋值:LHS Reference 在
+            // eval 之前已解析,PutValue 仍写捕获 box(__cap_x)(S11.13.1_A6_T1)。
+            if (this.ctx.bodyEvalVarNames && this.ctx.bodyEvalVarNames.has(name)) {
                 const capOff = this.ctx.getLocal(`__cap_${name}`);
-                if (capOff) {
+                if (capOff && (op !== "=" || nodeEvalDeclaresVar(expr.right, name))) {
                     offset = capOff;
                     isBoxed = true;
                 }
@@ -1091,7 +1101,7 @@ export const AssignmentCompiler = {
             // 把品牌违规写成新增属性。
             if (this._isPrivateMemberKey(member.property)) {
                 this.vm.load(VReg.RET, VReg.FP, objOffset);
-                this.emitPrivateBrandCheck(propName, 1);
+                this.emitPrivateBrandCheck(propName, 1, !!(member.object && member.object.type === "ThisExpression"));
                 this.vm.load(VReg.RET, VReg.FP, pvalOff);
             }
 

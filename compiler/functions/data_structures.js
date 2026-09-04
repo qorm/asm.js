@@ -226,6 +226,18 @@ export const DataStructureCompiler = {
     },
 
     // 编译对象表达式 { a: 1, b: 2 }
+    _compileObjectPropValue(prop) {
+        const isMethod = !!(prop && (prop.method || prop.kind === "get" || prop.kind === "set"));
+        if (isMethod && prop.value &&
+            (prop.value.type === "FunctionExpression" || prop.value.type === "ArrowFunctionExpression")) {
+            prop.value._isObjectMethod = true;
+        }
+        const prev = this.ctx.inObjectMethod;
+        if (isMethod) this.ctx.inObjectMethod = true;
+        this.compileExpression(prop.value);
+        this.ctx.inObjectMethod = prev;
+    },
+
     compileObjectExpression(expr) {
         const props = expr.properties || [];
         const count = props.length;
@@ -466,7 +478,7 @@ export const DataStructureCompiler = {
                 if (isSymWK) {
                     // [Symbol.iterator] / [Symbol.asyncIterator]:静态存字符串键(读侧
                     // getMemberPropertyName 同名归一 → for-of / for-await 协议同键查得到)。
-                    this.compileExpression(prop.value);
+                    this._compileObjectPropValue(prop);
                     const vTmp2 = `__objv_si_${this.nextLabelId()}`;
                     const vOff2 = this.ctx.allocLocal(vTmp2);
                     this.vm.store(VReg.FP, vOff2, VReg.RET);
@@ -503,7 +515,7 @@ export const DataStructureCompiler = {
                 this.vm.call("_js_prop_key"); // 与下标路径一致的 symbol 键规范化
                 this.vm.label(keyDoneL);
                 this.vm.store(VReg.FP, kOff, VReg.RET); // 规范化后键回存槽
-                this.compileExpression(prop.value);
+                this._compileObjectPropValue(prop);
                 const vTmp = `__objv_${this.nextLabelId()}`;
                 const vOff = this.ctx.allocLocal(vTmp);
                 this.vm.store(VReg.FP, vOff, VReg.RET);
@@ -539,7 +551,7 @@ export const DataStructureCompiler = {
             // the proto, then store into boxed obj+16 (objOffset is 0x7FFD) SIGSEGV.
             // GetSuperBase tests use `{__proto__: proto, m(){ return super[key]; }}`.
             if (keyName === "__proto__" && !prop.method && !prop.shorthand) {
-                this.compileExpression(prop.value);
+                this._compileObjectPropValue(prop);
                 const protoValOff = this.ctx.allocLocal(`__objlit_proto_${this.nextLabelId()}`);
                 this.vm.store(VReg.FP, protoValOff, VReg.RET);
                 const protoNullL = this.ctx.newLabel("objlit_proto_null");
@@ -582,7 +594,7 @@ export const DataStructureCompiler = {
                 if (keyName.charCodeAt(ki) === 0) { keyHasNul = true; break; }
             }
             const keyLabel = keyHasNul ? null : this.asm.addString(keyName);
-            this.compileExpression(prop.value);
+            this._compileObjectPropValue(prop);
             let valueOffset = null;
             if (keyHasNul) {
                 valueOffset = this.ctx.allocLocal(`__objv_nulkey_${this.nextLabelId()}`);

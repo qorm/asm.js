@@ -921,7 +921,7 @@ const IDENT_BUILTIN_NAME_SET = _mkNameSet(IDENT_BUILTIN_NAMES);
 //  "number" 旧口径,要么实现要么除名,另案。)
 const IDENT_KNOWN_GLOBAL_NAMES = [
     "Math", "console", "Date", "RegExp", "Map", "Set", "WeakMap", "WeakSet",
-    "Promise", "Reflect", "Proxy", "BigInt", "DataView", "arguments", "eval",
+    "Promise", "Reflect", "Proxy", "BigInt", "DataView", "eval",
     "encodeURI", "decodeURI", "encodeURIComponent", "decodeURIComponent",
     "Buffer", "require", "module", "exports", "__dirname", "__filename",
     "setTimeout", "clearTimeout", "setInterval", "clearInterval",
@@ -957,9 +957,18 @@ export const MemberCompiler = {
             property.name[0] === "#";
     },
 
+    _privateMangledBelongsToCurrentClass(mangledName) {
+        const cls = this.ctx && this.ctx.className;
+        if (!cls || !mangledName) return false;
+        const prefix = "#" + cls;
+        if (mangledName.length <= prefix.length) return false;
+        if (mangledName.slice(0, prefix.length) !== prefix) return false;
+        return mangledName.charAt(prefix.length) === "#";
+    },
+
     // 私有成员品牌检查:接收者(装箱)在 RET,检查后 RET 原样保留。
     // mode 0=读(缺私有名/无 getter 抛),1=写(缺私有名/私有方法/无 setter 抛)。
-    emitPrivateBrandCheck(mangledName, mode) {
+    emitPrivateBrandCheck(mangledName, mode, receiverIsThis) {
         this.vm.push(VReg.RET);
         this.emitBoxedStringKey(mangledName, VReg.A1);
         this.vm.pop(VReg.A0);
@@ -974,10 +983,25 @@ export const MemberCompiler = {
         // class object as an instance-brand comparator would reject valid
         // accesses.  Static lexical-owner branding is a separate mechanism,
         // so keep static checks on the legacy own-key path for now.
-        const thisOff = (!this.ctx.inStaticMethod && this.ctx && this.ctx.getLocal)
-            ? this.ctx.getLocal("__this") : null;
-        if (thisOff !== null && thisOff !== undefined) {
-            this.vm.load(VReg.A3, VReg.FP, thisOff);
+        // A3 is the current class-method receiver used as a per-evaluation
+        // brand. Nested ordinary functions (and nested classes accessing an
+        // *outer* private name) must keep the legacy own-key path: their
+        // `__this` is the wrong object and would reject valid `self.#x`.
+        let brandOff = null;
+        if (this.ctx && this.ctx.inClassMethod &&
+            this._privateMangledBelongsToCurrentClass(mangledName) &&
+            this.ctx.getLocal) {
+            if (this.ctx.inStaticMethod) {
+                // Only `this.#x` in a static method uses the lexical class
+                // brand. `o.#x` may be an inner instance private of the same
+                // textual name (nested-class shadowing).
+                if (receiverIsThis) brandOff = this.ctx.getLocal("__class_brand");
+            } else {
+                brandOff = this.ctx.getLocal("__this");
+            }
+        }
+        if (brandOff !== null && brandOff !== undefined) {
+            this.vm.load(VReg.A3, VReg.FP, brandOff);
         } else {
             this.vm.movImm(VReg.A3, 0);
         }
@@ -4593,6 +4617,14 @@ export const MemberCompiler = {
             speciesTmpSlot: "_nsobj_weakmap_tmp",
         });
     },
+    emitDataViewCtorObject() {
+        this.emitCollectionCtorObject({
+            name: "DataView", length: 1, ctorFn: "_dataview_ctor_call",
+            ctorSlot: "_nsobj_dataview", protoSlot: "_nsobj_dataview_proto",
+            methods: [], sizeGetter: null, statics: [],
+            speciesTmpSlot: "_nsobj_dataview_tmp",
+        });
+    },
     emitPromiseCtorObject() {
         this.emitCollectionCtorObject({
             name: "Promise", length: 1, ctorFn: "_promise_ctor_call",
@@ -5730,6 +5762,10 @@ export const MemberCompiler = {
             this.emitProxyCtorObject();
             return;
         }
+        if (name === "DataView" && !this.collectionNameShadowed("DataView")) {
+            this.emitDataViewCtorObject();
+            return;
+        }
         // [Symbol 一等值] Symbol 构造函数 + well-known symbols
         if (name === "Symbol") {
             this.emitSymbolCtorObject();
@@ -6162,7 +6198,7 @@ export const MemberCompiler = {
             this.compileExpression(expr.object);
             const pobjSlot = this.ctx.allocLocal(`__pmr_obj_${this.nextLabelId()}`);
             this.vm.store(VReg.FP, pobjSlot, VReg.RET);
-            this.emitPrivateBrandCheck(mangled, 0);
+            this.emitPrivateBrandCheck(mangled, 0, !!(expr.object && expr.object.type === "ThisExpression"));
             this.vm.load(VReg.A0, VReg.FP, pobjSlot);
             this.emitBoxedStringKey(mangled, VReg.A1);
             this.vm.call("_object_get");
@@ -6610,7 +6646,31 @@ export const MemberCompiler = {
                 // runtime-error object that still needs brand reconstruction.
                 this.vm.movImm64(VReg.V1, 0x7ffb000000000000n);
                 this.vm.cmp(VReg.RET, VReg.V1);
+                const ctorArr = this.ctx.newLabel("ctor_arr");
+                const ctorAfterUndef = this.ctx.newLabel("ctor_after_undef");
+                this.vm.jeq(ctorArr);
+                this.vm.jmp(ctorAfterUndef);
+                this.vm.label(ctorArr);
+                // Array instances hide .constructor in _object_get_array (species
+                // fast path). Materialise the canonical Array so [].constructor === Array.
+                this.vm.load(VReg.V0, VReg.FP, ctorRecv);
+                this.vm.shrImm(VReg.V1, VReg.V0, 48);
+                this.vm.cmpImm(VReg.V1, 0x7FFE);
+                const ctorArrYes = this.ctx.newLabel("ctor_arr_yes");
+                this.vm.jeq(ctorArrYes);
+                this.vm.cmpImm(VReg.V1, 0);
+                this.vm.jne(ctorBrand);
+                this.vm.emitMaskLoad(VReg.V2);
+                this.vm.andMaskReg(VReg.V0, VReg.V0, VReg.V2);
+                this.vm.cmpImm(VReg.V0, 0);
                 this.vm.jeq(ctorBrand);
+                this.vm.loadByte(VReg.V1, VReg.V0, 0);
+                this.vm.cmpImm(VReg.V1, 1);
+                this.vm.jne(ctorBrand);
+                this.vm.label(ctorArrYes);
+                this.emitArrayCtorObject();
+                this.vm.jmp(ctorEnd);
+                this.vm.label(ctorAfterUndef);
                 this.vm.lea(VReg.V5, "_nsobj_object");
                 this.vm.load(VReg.V5, VReg.V5, 0);
                 this.vm.cmp(VReg.RET, VReg.V5);

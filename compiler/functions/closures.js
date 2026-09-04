@@ -436,6 +436,15 @@ export const ClosureCompiler = {
                 if (walk(node.callee)) return true;
                 const args = node.arguments;
                 if (args) for (let i = 0; i < args.length; i++) if (walk(args[i])) return true;
+                if (t === "CallExpression" && node.callee && node.callee.type === "Identifier" &&
+                    node.callee.name === "eval" && args && args[0] &&
+                    (args[0].type === "Literal" || args[0].type === "StringLiteral") &&
+                    typeof args[0].value === "string") {
+                    try {
+                        const prog = this.parse(args[0].value);
+                        if (walk(prog)) return true;
+                    } catch (_e) { /* invalid eval source: runtime */ }
+                }
                 return false;
             }
             if (t === "BinaryExpression" || t === "LogicalExpression" || t === "AssignmentExpression") {
@@ -1229,6 +1238,11 @@ export const ClosureCompiler = {
             superInfoLabel: this.ctx.superInfoLabel,
             classInfoLabel: this.ctx.classInfoLabel,
             inStaticMethod: this.ctx.inStaticMethod,
+            // Arrows inherit the enclosing class-method brand / field-init
+            // eval rules; ordinary nested functions do not.
+            inClassMethod: expr.type === "ArrowFunctionExpression" ? !!this.ctx.inClassMethod : false,
+            inFieldInit: expr.type === "ArrowFunctionExpression" ? !!this.ctx.inFieldInit : false,
+            inObjectMethod: !!(expr._isObjectMethod || (expr.type === "ArrowFunctionExpression" && this.ctx.inObjectMethod)),
             // 私有名作用域链快照(词法):嵌套类里的箭头体也须按声明者类名改写
             privateScopes: this._privateScopes ? this._privateScopes.slice() : null,
             // 外层具名函数表达式的不可变绑定,被本闭包捕获时须继续禁写。
@@ -1288,6 +1302,9 @@ export const ClosureCompiler = {
             const savedSuperInfoLabel = this.ctx.superInfoLabel;
             const savedClassInfoLabel = this.ctx.classInfoLabel;
             const savedInStaticMethod = this.ctx.inStaticMethod;
+            const savedInClassMethod = this.ctx.inClassMethod;
+            const savedInFieldInit = this.ctx.inFieldInit;
+            const savedInObjectMethod = this.ctx.inObjectMethod;
             if (func.moduleAst) this._currentModuleAst = func.moduleAst;
             if (func.mainCapturedVars) this.ctx.mainCapturedVars = func.mainCapturedVars;
             if (func.functionAliases) this.ctx.functionAliases = func.functionAliases;
@@ -1299,6 +1316,9 @@ export const ClosureCompiler = {
             this.ctx.superInfoLabel = func.superInfoLabel;
             this.ctx.classInfoLabel = func.classInfoLabel;
             this.ctx.inStaticMethod = func.inStaticMethod;
+            this.ctx.inClassMethod = !!func.inClassMethod;
+            this.ctx.inFieldInit = !!func.inFieldInit;
+            this.ctx.inObjectMethod = !!func.inObjectMethod;
             // [批次D] 生成器函数表达式：标签处先落 stub（建协程+生成器对象后即返回），
             // 真正函数体在 <label>_gbody，由 _coroutine_entry 首次 resume 时进入。
             let fdiList = null;
@@ -1334,6 +1354,9 @@ export const ClosureCompiler = {
             this.ctx.superInfoLabel = savedSuperInfoLabel;
             this.ctx.classInfoLabel = savedClassInfoLabel;
             this.ctx.inStaticMethod = savedInStaticMethod;
+            this.ctx.inClassMethod = savedInClassMethod;
+            this.ctx.inFieldInit = savedInFieldInit;
+            this.ctx.inObjectMethod = savedInObjectMethod;
             if (_traceClass) console.log("GPF_RESTORE", func.label);
         }
 

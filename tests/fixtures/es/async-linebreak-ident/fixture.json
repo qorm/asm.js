@@ -1,0 +1,10 @@
+{
+  "description": "Line terminator between async and identifier is ASI, not an async arrow",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "Direct eval of an undeclared private name in a class method is a SyntaxError before evaluation",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true\nfalse",
+    "exitCode": 0
+  }
+}
