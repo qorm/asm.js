@@ -6,6 +6,5 @@
     "run": true,
     "stdout": "function\ntrue false\n42\n7 7\n100\n1\n1 1",
     "exitCode": 0
-  },
-  "knownFailure": "Pre-existing failure - not in current task scope"
+  }
 }

@@ -2,6 +2,8 @@
 
 Version history. Newest first. Each entry is verified `gen2==gen3` byte-identical on the self-host gate.
 
+## v0.4.9 (**Object.getOwnPropertySymbols accepts classinfo (TYPE_FUNCTION=3) — gen2==gen3; fixtures 505 PASS / 17 XFAIL.** `_ogops_obj` only scanned `TYPE_OBJECT` (2) and returned `[]` for classinfo, which shares the same header/props layout. `Object.getOwnPropertyNames` already special-cased classinfo (`_object_gopn_classinfo_order`); symbols now do too. Unlocks `es/class-static-symbol-field` and `es/class-computed-key-subscript`.)
+
 ## v0.4.8 (**eval-direct-capture-writeback: fragment SYM_IDS for forEach/thisArg — gen2==gen3; fixtures 503 PASS / 19 XFAIL.** `eval("[1,2,3].forEach(v => { s = s + v })")` inside a caller that captures `s` needs `_array_forEach_rt_t` and `_coll_cb_this` in the append-only engine `SYM_NAMES` table. Unlocks `es/eval-direct-capture-writeback`.)
 
 ## v0.4.7 (**GeneratorValidate + ToPropertyDescriptor observation order — gen2==gen3; fixtures 502 PASS / 20 XFAIL.** **(1) Generator executing-state:** `next`/`return`/`throw` on an already-running generator now throw TypeError instead of re-entering the same stack (was SIGSEGV). Unlocks `es/generator-executing-state`. **(2) ToPropertyDescriptor:** dynamic `_object_define_property_dyn` observes fields in ES order (`enumerable → configurable → value → writable → get → set`) rather than source creation order. Unlocks `es/descriptor-explicit-undefined`.)

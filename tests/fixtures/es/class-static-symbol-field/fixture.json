@@ -6,6 +6,5 @@
     "run": true,
     "stdout": "Tag\n88\n5 9\n1 1",
     "exitCode": 0
-  },
-  "knownFailure": "Pre-existing failure - not in current task scope"
+  }
 }

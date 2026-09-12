@@ -10313,8 +10313,15 @@ export class ObjectGenerator {
         vm.jeq("_ogops_proxy");
         // Only TYPE_OBJECT has count/props_ptr at expected offsets.
         // Date/Map/Set/etc. have different layouts.
+        // classinfo (type@0==3 / TYPE_FUNCTION) shares the object header
+        // layout — Object.getOwnPropertyNames already special-cases it
+        // (_object_gopn_classinfo_order); symbols must too
+        // (es/class-static-symbol-field / class-computed-key-subscript).
         vm.cmpImm(VReg.V0, TYPE_OBJECT);
+        vm.jeq("_ogops_scan");
+        vm.cmpImm(VReg.V0, 3); // TYPE_FUNCTION / classinfo
         vm.jne("_ogops_empty");
+        vm.label("_ogops_scan");
         vm.load(VReg.S1, VReg.S0, 8); // count
         vm.movImm(VReg.A0, 0);
         vm.call("_array_new_with_size");

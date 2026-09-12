@@ -2,6 +2,8 @@
 
 版本历史,最新在前。每条均经自举门 `gen2==gen3` 逐字节一致验证。
 
+## v0.4.9(**Object.getOwnPropertySymbols 接受 classinfo(TYPE_FUNCTION=3) — gen2==gen3;fixtures 505 PASS / 17 XFAIL。** `_ogops_obj` 只扫 `TYPE_OBJECT`(2),对共用同一头/props 布局的 classinfo 返回 `[]`。`Object.getOwnPropertyNames` 早已特判 classinfo(`_object_gopn_classinfo_order`);symbols 现同。解锁 `es/class-static-symbol-field` 与 `es/class-computed-key-subscript`。)
+
 ## v0.4.8(**eval-direct-capture-writeback:为 forEach/thisArg 补片段 SYM_IDS — gen2==gen3;fixtures 503 PASS / 19 XFAIL。** `eval("[1,2,3].forEach(v => { s = s + v })")` 在捕获 `s` 的调用方内需要把 `_array_forEach_rt_t` 与 `_coll_cb_this` 追加进引擎 `SYM_NAMES`。解锁 `es/eval-direct-capture-writeback`。)
 
 ## v0.4.7(**GeneratorValidate + ToPropertyDescriptor 观察序 — gen2==gen3;fixtures 502 PASS / 20 XFAIL。** **(1) Generator executing-state:**对已在执行的生成器调用 `next`/`return`/`throw` 现抛 TypeError,不再重入同一栈(原 SIGSEGV)。解锁 `es/generator-executing-state`。**(2) ToPropertyDescriptor:**动态 `_object_define_property_dyn` 按 ES 顺序观察字段(`enumerable → configurable → value → writable → get → set`),不再跟源创建序。解锁 `es/descriptor-explicit-undefined`。)
