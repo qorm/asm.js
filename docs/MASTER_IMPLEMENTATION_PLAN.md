@@ -448,3 +448,15 @@ asm.js 的下一次跃迁，瓶颈不在“会不会写优化算法”，而在�
 **教训（自举）**：多行 `import { … }` 花括号列表 + 尾逗号会被 gen1 解析器拒
 （`expected }, got FROM`）。toolchain 内 import 须写成**单行、无尾逗号**，
 与仓库既有 import 风格一致。已记入 BOOTSTRAP 教训，建议后续加负向 fixture。
+
+### 2026-09-12 — P2.b `compiler/modules/cjs-named-exports.js` 落地
+
+纯移动，零语义：`isBareModuleName`/`isBareSubpath` + CJS 分类与具名导出键提取
+（~242 行）迁至 `compiler/modules/cjs-named-exports.js`。
+
+| 项 | 值 |
+|---|---|
+| 新模块 | `compiler/modules/cjs-named-exports.js`（9 个 export） |
+| index.js | 5264 → 5035 行（自起点 6365 累计 −1330） |
+| 定点 | `gen2 == gen3` 仍绿 |
+| 门禁 | toolchain_no_regex / ABI / source_gates / fixtures 426/5/7/5 不变 |
