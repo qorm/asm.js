@@ -1451,17 +1451,17 @@ export class JSValueGenerator {
         vm.store(VReg.S0, 16, VReg.V0); // target boxed
         vm.store(VReg.S0, 24, VReg.S2); // thisArg
         vm.store(VReg.S0, 32, VReg.S3); // nBound
-        vm.movImm(VReg.S1, 0);
-        vm.label("_fpb_copy");
-        vm.cmp(VReg.S1, VReg.S3);
-        vm.jge("_fpb_box");
-        vm.shlImm(VReg.V0, VReg.S1, 3);
-        vm.add(VReg.V1, VReg.SP, VReg.V0);
-        vm.load(VReg.V1, VReg.V1, 0);
-        vm.add(VReg.V0, VReg.S0, VReg.V0);
-        vm.store(VReg.V0, 40, VReg.V1);
-        vm.addImm(VReg.S1, VReg.S1, 1);
-        vm.jmp("_fpb_copy");
+        // 拷预绑定参:不得 add(reg, SP, reg)。ARM64 上 SP 的寄存器字段编码为 XZR,
+        // 会从地址 0 读 SIGSEGV(Function.prototype.bind.call(f,{}, "a") 根因)。
+        // nBound ≤ 4,按立即数偏移展开。
+        for (let bi = 0; bi < 4; bi++) {
+            const skip = `_fpb_copy_skip${bi}`;
+            vm.cmpImm(VReg.S3, bi + 1);
+            vm.jlt(skip);
+            vm.load(VReg.V1, VReg.SP, bi * 8);
+            vm.store(VReg.S0, 40 + bi * 8, VReg.V1);
+            vm.label(skip);
+        }
         vm.label("_fpb_box");
         vm.mov(VReg.A0, VReg.S0);
         vm.call("_js_box_function");
