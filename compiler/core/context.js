@@ -520,6 +520,9 @@ export class CompileContext {
         // initializer rules. Arrows share the parent ctx until their
         // pending-function record snapshots the flags.
         newCtx._fnFrameSize = this._fnFrameSize;
+        // TCO is skipped for toolchain sources (PrepareForTailCall still breaks
+        // self-host). Nested function clones inherit the flag.
+        newCtx.toolchainSource = this.toolchainSource;
         // [支柱②] 去虚拟化局部 new 跟踪(函数作用域):浅拷贝——方法见外层类型,
         // 方法内自有赋值不回写外层(语义按函数作用域隔离)。
         // 避免 `{...}` 展开(gen1 上更贵);空表不分配。

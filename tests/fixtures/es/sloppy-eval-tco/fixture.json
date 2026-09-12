@@ -6,6 +6,5 @@
     "run": true,
     "stdout": "ok",
     "exitCode": 0
-  },
-  "knownFailure": "NEW: TCO disabled; sloppy-eval-tco expects tail-call behavior"
+  }
 }

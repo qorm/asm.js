@@ -2,6 +2,8 @@
 
 Version history. Newest first. Each entry is verified `gen2==gen3` byte-identical on the self-host gate.
 
+## v0.4.11 (**Strict-mode TCO re-enabled for user programs — gen2==gen3; fixtures 509 PASS / 13 XFAIL.** PrepareForTailCall is back for non-toolchain strict functions. Toolchain sources (compiler/lang/asm/backend/vm/engine) and class field initializers stay non-TCO: the former still breaks self-host (gen2 "not a function"), the latter would rewrite `eval(...)` tail sites and lose the arguments-in-field-init SyntaxError. Unlocks `es/strict-tco-recursion` and `es/sloppy-eval-tco`.)
+
 ## v0.4.10 (**Async-generator yield thenable + throw-while-executing enqueue — gen2==gen3; fixtures 507 PASS / 15 XFAIL.** **(1) `yield {then:…}`** now Await-unwraps thenables (was yielding the raw object). **(2) `iter.throw(e)` while the async generator is executing** enqueues a mode=throw request on the next-queue (node: first `next()` still fulfills; the throw is delivered after the current yield). Unlocks `es/async-generator-yield-thenable` and `es/async-gen-throw-executing`.)
 
 ## v0.4.9 (**Object.getOwnPropertySymbols accepts classinfo (TYPE_FUNCTION=3) — gen2==gen3; fixtures 505 PASS / 17 XFAIL.** `_ogops_obj` only scanned `TYPE_OBJECT` (2) and returned `[]` for classinfo, which shares the same header/props layout. `Object.getOwnPropertyNames` already special-cased classinfo (`_object_gopn_classinfo_order`); symbols now do too. Unlocks `es/class-static-symbol-field` and `es/class-computed-key-subscript`.)

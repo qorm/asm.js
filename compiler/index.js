@@ -1748,6 +1748,9 @@ export class Compiler {
         // not run the expensive source-level eval/module scanners over its own
         // ~8MB graph. User/runtime files stay on the precise scanners below.
         const isToolchainSource = isToolchainSourcePath(filePath);
+        // TCO: skip PrepareForTailCall for toolchain sources (still breaks
+        // self-host). User programs get full TCO via _shouldTailCall().
+        this.ctx.toolchainSource = isToolchainSource;
         // Script 顶层 `var` 是 global object 的 own binding，即使测试源码没有
         // 直接写 `globalThis` 也必须可由回调的 `this` 观察到（例如
         // `var i = -1; Array.from(a, function () { ++this.i; })`）。此前按

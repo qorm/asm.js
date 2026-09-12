@@ -6,6 +6,5 @@
     "run": true,
     "stdout": "ok",
     "exitCode": 0
-  },
-  "knownFailure": "NEW: TCO disabled pending self-host fix; deep recursion fails"
+  }
 }

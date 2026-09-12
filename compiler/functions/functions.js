@@ -826,10 +826,19 @@ export const FunctionCompiler = {
 
     // Strict-mode TCO only, and only in a user function with a known frame.
     // Async/generator bodies keep a coro frame on the caller stack.
-    // Disabled: self-hosted gen1 previously threw "not a function" under TCO
-    // (PrepareForTailCall path). Re-enable only with a green gen2==gen3 gate.
+    // Toolchain sources (compiler/lang/asm/backend/vm/engine) stay non-TCO:
+    // PrepareForTailCall still breaks self-host (gen2 "not a function") even
+    // after the 32 KiB _main frame fix. User programs get full TCO.
     _shouldTailCall() {
-        return false;
+        if (!this.ctx) return false;
+        if (this.ctx.toolchainSource) return false;
+        // Class field initializers: TCO would rewrite `eval(...)` tail sites
+        // (arguments-in-field-init SyntaxError path; es/eval-field-init-arguments).
+        if (this.ctx.inFieldInit) return false;
+        if (!this.ctx.inStrictFunction) return false;
+        if (this.ctx.inCoroBody || this.ctx.inAsyncFunction || this.ctx.inAsyncGenerator) return false;
+        if (!this.ctx._fnFrameSize) return false;
+        return true;
     },
 
     _tcoNeedsCleanup() {

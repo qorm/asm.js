@@ -2,6 +2,8 @@
 
 版本历史,最新在前。每条均经自举门 `gen2==gen3` 逐字节一致验证。
 
+## v0.4.11(**用户程序严格模式 TCO 重开 — gen2==gen3;fixtures 509 PASS / 13 XFAIL。** PrepareForTailCall 对非 toolchain 的严格函数恢复。toolchain 源(compiler/lang/asm/backend/vm/engine)与类字段初始化器保持非 TCO:前者仍会弄挂自举(gen2 "not a function"),后者会改写 `eval(...)` 尾位、丢掉 field-init 里 arguments 的 SyntaxError。解锁 `es/strict-tco-recursion` 与 `es/sloppy-eval-tco`。)
+
 ## v0.4.10(**Async-generator yield thenable + throw-while-executing 入队 — gen2==gen3;fixtures 507 PASS / 15 XFAIL。** **(1) `yield {then:…}`** 现先 Await 解包 thenable(原先把原对象当值产出)。**(2) 协程执行中的 `iter.throw(e)`** 入队 mode=throw 请求,不再双 resume 活协程(node:首次 `next()` 仍 fulfill,throw 在当前 yield 之后投递)。解锁 `es/async-generator-yield-thenable` 与 `es/async-gen-throw-executing`。)
 
 ## v0.4.9(**Object.getOwnPropertySymbols 接受 classinfo(TYPE_FUNCTION=3) — gen2==gen3;fixtures 505 PASS / 17 XFAIL。** `_ogops_obj` 只扫 `TYPE_OBJECT`(2),对共用同一头/props 布局的 classinfo 返回 `[]`。`Object.getOwnPropertyNames` 早已特判 classinfo(`_object_gopn_classinfo_order`);symbols 现同。解锁 `es/class-static-symbol-field` 与 `es/class-computed-key-subscript`。)
