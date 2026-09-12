@@ -75,6 +75,8 @@ export function getSyscall(name) {
             if (name === "shutdown") return 48; // half-close (SHUT_WR) on socket.end()
             if (name === "sendmsg") return 46;   // dgram/UDP (linux-x64)
             if (name === "recvmsg") return 47;
+            if (name === "fstat") return 5;
+            if (name === "getdents64") return 217;
             return -1;
         }
         // linux-arm64 调用号
@@ -110,6 +112,8 @@ export function getSyscall(name) {
         if (name === "shutdown") return 210; // half-close (SHUT_WR) on socket.end()
         if (name === "sendmsg") return 211;  // dgram/UDP (linux-arm64)
         if (name === "recvmsg") return 212;
+        if (name === "fstat") return 80;
+        if (name === "getdents64") return 61;
         return -1;
     }
     // macos (arm64/x64): 0x2000000 | n
@@ -145,6 +149,12 @@ export function getSyscall(name) {
     if (name === "shutdown") return 33554566;    // 0x2000086 (shutdown = 134)
     if (name === "sendmsg") return 33554460;     // 0x200001C (sendmsg = 28, dgram/UDP)
     if (name === "recvmsg") return 33554459;     // 0x200001B (recvmsg = 27)
+    // fs stat/readdir
+    // macOS fstat=270 (new) / 189 (old struct); try 189 which matches
+    // mode@8/size@72/mtime@40 layout used by _rdLE in statSync.
+    if (name === "fstat") return 33554621;       // 0x20000BD (fstat = 189)
+    // getdirentries(196) works; getdirentries64(344) returned -3 on this host.
+    if (name === "getdirentries") return 33554596; // 0x20000C4 (getdirentries = 196)
     return -1;
 }
 // 注意：不可用返 -1 而非 0——linux-x64 的 read 调用号恰为 0，

@@ -4,6 +4,5 @@
     "parse": false,
     "compile": false,
     "run": false
-  },
-  "knownFailure": "NEW: \\u0023 private-reference escape not rejected at parse"
+  }
 }

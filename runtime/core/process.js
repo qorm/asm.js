@@ -878,6 +878,19 @@ export class ProcessGenerator {
         vm.lea(VReg.A1, this.vm.asm.addString("version"));
         vm.call("_object_set");
 
+        // pid: number (getpid)
+        {
+            let scPid = 33554452; // macOS getpid=20
+            if (this.os === "linux") scPid = (this.arch === "x64") ? 39 : 172;
+            vm.movImm(VReg.V0, scPid);
+            vm.syscallReg(VReg.V0);
+            vm.scvtf(0, VReg.RET);
+            vm.fmovToInt(VReg.A2, 0);
+            vm.load(VReg.A0, VReg.SP, 32);
+            vm.lea(VReg.A1, this.vm.asm.addString("pid"));
+            vm.call("_object_set");
+        }
+
         // versions: 对象，含 node/v8/modules/napi 版本字符串
         vm.movImm(VReg.A0, 128);
         vm.call("_object_new_sized"); // 裸对象指针

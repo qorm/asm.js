@@ -2,6 +2,8 @@
 
 版本历史,最新在前。每条均经自举门 `gen2==gen3` 逐字节一致验证。
 
+## v0.4.13(**Buffer.compare static、process.pid、私有名转义 parse 拒绝、fstat — gen2==gen3;fixtures 515 PASS / 7 XFAIL。** **(1)** `Buffer.compare(a,b)` 委托 `a.compare(b)`(内联循环在 LSRA 下返回 0)。**(2)** `process.pid` 经 getpid。**(3)** `.` 后转义 `#` 在 parse 期拒绝(ES 12.5.1.1)。**(4)** `fs.statSync` 真 fstat(macOS 189)+ 按 mode 的 isFile/isDirectory;`readdirSync` 仍返回 [](getdirentries EINVAL)。解锁 `node/builtin-buffer-methods` 与 `es/class-invalid-escaped-private-reference`。)
+
 ## v0.4.12(**unknown bare import、assert.match、crypto.randomBytes、net ready 序 — gen2==gen3;fixtures 513 PASS / 9 XFAIL。** **(1)** 未知裸包 specifier 现在编译期失败(`Cannot find package '…'`),不再绑定 undefined。**(2)** 对 unknown 接收者不再把 `assert.match`/`replace` 劫持成 String 方法——普通方法调用到达 assert 函数。**(3)** 去掉遗留的 `crypto.randomBytes START` 调试日志。**(4)** net socket 先发 `ready` 再发 `connect`,使 connect 处理器能观察到 `ready=true`。解锁 `es/unknown-bare-import`、`node/builtin-assert-match-code`、`node/builtin-crypto-random`、`node/builtin-net-connect-options`。)
 
 ## v0.4.11(**用户程序严格模式 TCO 重开 — gen2==gen3;fixtures 509 PASS / 13 XFAIL。** PrepareForTailCall 对非 toolchain 的严格函数恢复。toolchain 源(compiler/lang/asm/backend/vm/engine)与类字段初始化器保持非 TCO:前者仍会弄挂自举(gen2 "not a function"),后者会改写 `eval(...)` 尾位、丢掉 field-init 里 arguments 的 SyntaxError。解锁 `es/strict-tco-recursion` 与 `es/sloppy-eval-tco`。)

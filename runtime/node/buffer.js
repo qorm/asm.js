@@ -75,17 +75,12 @@ export class Buffer {
         return ["utf8", "ascii", "latin1", "base64", "hex", "ucs2", "utf16le"].includes(encoding);
     }
 
-    // Buffer.compare(a, b):字典序比较,返回 -1/0/1
+    // Buffer.compare(a, b):字典序比较,返回 -1/0/1。
+    // 委托实例 compare(a.compare(b) ≡ Buffer.compare(a,b);Node 文档)。
+    // 直接展开比较循环时在无调试调用的编译路径下会返回 0(LSRA/槽位);
+    // 实例路径已验证正确。
     static compare(a, b) {
-        const la = a.length, lb = b.length;
-        const n = la < lb ? la : lb;
-        for (let i = 0; i < n; i++) {
-            if (a.data[i] < b.data[i]) return -1;
-            if (a.data[i] > b.data[i]) return 1;
-        }
-        if (la < lb) return -1;
-        if (la > lb) return 1;
-        return 0;
+        return a.compare(b);
     }
 
     // Buffer.byteLength(value, encoding): 字节长度。asm.js 字节模型下字符串按

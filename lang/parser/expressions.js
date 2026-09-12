@@ -1776,6 +1776,19 @@ export const ExpressionParser = {
             return null;
         }
         // 支持私有字段访问 obj.#field（仅类体内合法，类外是语法错误）
+        // [test262] `this.\u0023field` — # token 不能用 Unicode 转义拼出
+        // (ES 12.5.1.1 PrivateIdentifier 不含转义)。
+        if (this.curToken.escaped &&
+            (this.curTokenIs(TokenType.HASH) ||
+             (this.curToken.literal && this.curToken.literal.startsWith("#")))) {
+            this.errors.push("Private names may not contain escaped characters");
+            return null;
+        }
+        if (this.curToken.identEscaped && this.curToken.literal &&
+            this.curToken.literal.startsWith("#")) {
+            this.errors.push("Private names may not contain escaped characters");
+            return null;
+        }
         if (this.curTokenIs(TokenType.HASH) || (this.curToken.literal && this.curToken.literal.startsWith("#"))) {
             let name = this.curToken.literal;
             if (!name.startsWith("#")) {

@@ -6,6 +6,5 @@
     "run": true,
     "stdout": "true\nfalse\n-1\n-1\n0\nAAAA\n4\nabcd\n258\n50595078\n-5",
     "exitCode": 0
-  },
-  "knownFailure": "NEW: Buffer methods residual mismatch"
+  }
 }

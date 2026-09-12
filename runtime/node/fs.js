@@ -31,14 +31,21 @@ function openFlags(flagStr) {
     }
 }
 
+function _rdLE(ptr, off, n) {
+    let v = 0, m = 1;
+    for (let i = 0; i < n; i++) { v += __getChar(ptr + off + i) * m; m *= 256; }
+    return v;
+}
+
 class Stats {
     constructor() {
         this.size = 0; this.mtime = new Date(); this.atime = new Date();
         this.ctime = new Date(); this.mode = 0; this.uid = 0;
         this.gid = 0; this.dev = 0; this.ino = 0; this.nlink = 0;
     }
-    isFile() { return false; }
-    isDirectory() { return false; }
+    // POSIX S_IFMT=0xF000
+    isFile() { return (this.mode & 0xF000) === 0x8000; }
+    isDirectory() { return (this.mode & 0xF000) === 0x4000; }
     isBlockDevice() { return false; }
     isCharacterDevice() { return false; }
     isFIFO() { return false; }
@@ -336,11 +343,89 @@ class fs {
             if (sc >= 0) __syscall(sc, pathBuf);
         }
     }
-    static readdirSync(p, options) { return []; }
+    static readdirSync(p, options) {
+        const names = [];
+        if (platform === "win32") return names;
+        const withTypes = options && options.withFileTypes === true;
+        const fd = fs.openSync(p, "r");
+        if (fd < 0) throw new Error("ENOENT: no such file or directory, scandir '" + p + "'");
+        const BUFSZ = 8192;
+        const buf = __alloc(BUFSZ);
+        if (platform === "linux") {
+            // getdents64: { u64 d_ino@0; s64 d_off@8; u16 d_reclen@16; u8 d_type@18; name@19 }
+            const sc = getSyscall("getdents64");
+            if (sc >= 0) {
+                while (true) {
+                    const n = __syscall(sc, fd, buf, BUFSZ, pos);
+                    if (n <= 0) break;
+                    let off = 0;
+                    while (off < n) {
+                        const reclen = _rdLE(buf, off + 16, 2);
+                        if (reclen <= 0) break;
+                        const dtype = __getChar(buf + off + 18);
+                        let name = "", i = 0;
+                        while (true) { const c = __getChar(buf + off + 19 + i); if (c === 0) break; name += String.fromCharCode(c); i++; }
+                        if (name !== "." && name !== "..") names.push(withTypes ? new Dirent(name, dtype === 4, dtype === 8) : name);
+                        off += reclen;
+                    }
+                }
+            }
+        } else {
+            // macOS getdirentries64(344): { u64 d_ino@0; u64 d_seekoff@8; u16 d_reclen@16;
+            // u16 d_namlen@18; u8 d_type@20; name@21 }
+            const sc = getSyscall("getdirentries");
+            const pos = __alloc(8);
+            for (let i = 0; i < 8; i++) __setChar(pos + i, 0);
+            if (sc >= 0) {
+                while (true) {
+                    const n = __syscall(sc, fd, buf, BUFSZ, pos);
+                    if (n <= 0) break;
+                    let off = 0;
+                    while (off < n) {
+                        const reclen = _rdLE(buf, off + 16, 2);
+                        if (reclen <= 0) break;
+                        const namlen = _rdLE(buf, off + 18, 2);
+                        const dtype = __getChar(buf + off + 20);
+                        let name = "";
+                        for (let i = 0; i < namlen; i++) name += String.fromCharCode(__getChar(buf + off + 21 + i));
+                        if (name !== "." && name !== "..") names.push(withTypes ? new Dirent(name, dtype === 4, dtype === 8) : name);
+                        off += reclen;
+                    }
+                }
+            }
+        }
+        fs.closeSync(fd);
+        return names;
+    }
 
     static statSync(p) {
         const s = new Stats();
-        s.isFile = () => true;
+        if (platform === "win32") { s.mode = 0x8000; return s; }
+        // by-path stat on macOS arm64 can return ENOENT; use open+fstat.
+        const fd = fs.openSync(p, "r");
+        if (fd < 0) throw new Error("ENOENT: no such file or directory, stat '" + p + "'");
+        const scFstat = getSyscall("fstat");
+        if (scFstat < 0) { fs.closeSync(fd); return s; }
+        const b = __alloc(160);
+        for (let i = 0; i < 160; i++) __setChar(b + i, 0);
+        const r = __syscall(scFstat, fd, b, 0);
+        fs.closeSync(fd);
+        if (r < 0) throw new Error("EIO: fstat failed, stat '" + p + "'");
+        if (platform === "linux" && arch === "arm64") {
+            s.mode = _rdLE(b, 16, 4);
+            s.size = _rdLE(b, 48, 6);
+            s.mtime = new Date(_rdLE(b, 88, 6) * 1000);
+        } else if (platform === "linux") {
+            s.mode = _rdLE(b, 24, 4);
+            s.size = _rdLE(b, 48, 6);
+            s.mtime = new Date(_rdLE(b, 88, 6) * 1000);
+        } else {
+            s.mode = _rdLE(b, 8, 2);
+            s.size = _rdLE(b, 72, 6);
+            s.mtime = new Date(_rdLE(b, 40, 6) * 1000);
+            s.atime = new Date(_rdLE(b, 24, 6) * 1000);
+            s.ctime = new Date(_rdLE(b, 56, 6) * 1000);
+        }
         return s;
     }
 
