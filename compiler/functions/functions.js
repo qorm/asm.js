@@ -13,7 +13,7 @@ import { DataStructureCompiler } from "./data_structures.js";
 import { ClosureCompiler } from "./closures.js";
 import { ASYNC_CLOSURE_MAGIC } from "../async/index.js";
 import { OperatorCompiler } from "../expressions/operators.js";
-import { collectDirectEvalSourceRefs } from "../../lang/analysis/closure.js";
+import { collectDirectEvalSourceRefs, collectVarDeclarations } from "../../lang/analysis/closure.js";
 import { parseStringNumericLiteral } from "../expressions/literals.js";
 
 // 闭包魔数 - 用于区分普通函数指针和闭包对象
@@ -1438,6 +1438,47 @@ export const FunctionCompiler = {
         }
     },
 
+    // Sloppy direct eval: `var` and annex-B FunctionDeclaration bindings must
+    // leak into the caller's VariableEnvironment. Seed caller locals (init
+    // undefined) for every such name the eval source declares so
+    // _directEvalLayoutStr includes them and the fragment copy-out writes
+    // back. Without this, `eval("function f(){}")` / `eval("var x=1")` left
+    // the caller's `f`/`x` undefined or missing.
+    _seedEvalWritebackLocals(nestedAst) {
+        if (!nestedAst || !nestedAst.body) return;
+        const names = {};
+        collectVarDeclarations({ type: "BlockStatement", body: nestedAst.body }, names);
+        const walk = (n) => {
+            if (!n || typeof n !== "object") return;
+            if (Array.isArray(n)) {
+                for (let i = 0; i < n.length; i++) walk(n[i]);
+                return;
+            }
+            const t = n.type;
+            if (t === "FunctionDeclaration") {
+                if (n.id && n.id.name) names[n.id.name] = true;
+                return; // body has its own VariableEnvironment
+            }
+            if (t === "FunctionExpression" || t === "ArrowFunctionExpression" ||
+                t === "ClassExpression" || t === "ClassDeclaration") return;
+            for (const k in n) {
+                if (k === "type" || k === "loc" || k === "range" || k === "start" || k === "end") continue;
+                walk(n[k]);
+            }
+        };
+        walk({ type: "BlockStatement", body: nestedAst.body });
+        for (const name in names) {
+            if (!Object.prototype.hasOwnProperty.call(names, name)) continue;
+            if (!name || name.charCodeAt(0) === 95) continue; // skip __*
+            if (name === "arguments" || name === "eval") continue;
+            if (this.ctx.getLocal && this.ctx.getLocal(name)) continue; // already in layout
+            const off = this.ctx.allocLocal(name);
+            this.vm.lea(VReg.RET, "_js_undefined");
+            this.vm.load(VReg.RET, VReg.RET, 0);
+            this.vm.store(VReg.FP, off, VReg.RET);
+        }
+    },
+
     _evalInitEarlyError(ast) {
         const walk = (n) => {
             if (!n || typeof n !== "object") return null;
@@ -1582,6 +1623,9 @@ export const FunctionCompiler = {
                 // Otherwise `eval("{function f(){}} assert.sameValue(...)")` loses
                 // `assert` ("assert is not defined") — annexB test262 cluster.
                 this._materializeOuterFnsForEval(firstArg);
+                // Seed caller slots for names the eval declares (var / block
+                // FunctionDeclaration) so they copy out after the fragment runs.
+                this._seedEvalWritebackLocals(nestedAst);
             }
         }
 

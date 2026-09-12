@@ -514,6 +514,25 @@ B.3.3 var-environment 泄漏（`typeof e3 === "undefined"`）。直写路径已�
 下一步应在 `engine/compile.js` / eval 片段声明实例化中补 annex B 函数绑定，
 配 fixture 后过定点。
 
+### 2026-09-12 续 — eval 写回：var / annex-B function 泄漏已修
+
+**更广根因**：片段 copy-out 只回写**调用方已有的** capture；eval 内**新建**的
+`var` / `function`（含块级 annex B）从未写回调用方 VariableEnvironment。
+
+| 用例 | 修复前 | 修复后 |
+|---|---|---|
+| `eval("function eTop(){}")` | `typeof` undefined | function |
+| `eval("var eVar = 2")` | ReferenceError | 2 |
+| `eval("{function e0(){}}")` | undefined | function |
+| `eval("if (true) {function e3(){}}")` | undefined | function |
+| `eval("switch (1){case 1: function e4(){}}")` | undefined | function |
+
+**修复**：`_seedEvalWritebackLocals` — 将 eval AST 中的 `var` 与
+FunctionDeclaration（含块级）名字在调用方 allocLocal（初始化 undefined），
+进入 capture layout，片段结束后 copy-out。
+
+**验证**：`gen2==gen3` 绿；fixtures 426/5/7/5；ABI / toolchain_no_regex 绿。
+
 ---
 
 ## 18. 分支状态（推送时）
