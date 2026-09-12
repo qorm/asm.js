@@ -460,3 +460,17 @@ asm.js 的下一次跃迁，瓶颈不在“会不会写优化算法”，而在�
 | index.js | 5264 → 5035 行（自起点 6365 累计 −1330） |
 | 定点 | `gen2 == gen3` 仍绿 |
 | 门禁 | toolchain_no_regex / ABI / source_gates / fixtures 426/5/7/5 不变 |
+
+### 2026-09-12 — P2.c `compiler/modules/module-graph.js` 落地
+
+纯移动，零语义：`normalizeNodeModuleName`、`runtimeNodeBase`、
+`resolveModulePath(Uncached)`、`normalizePathSegments`、package exports 解析
+（~268 行）迁至 `compiler/modules/module-graph.js`。
+
+| 项 | 值 |
+|---|---|
+| 新模块 | `compiler/modules/module-graph.js`（9 个 export） |
+| index.js | 5035 → 4779 行（自 6365 起累计 −1586） |
+| `_compilerRootDir` | `import.meta.url` 上溯深度 2→3（modules 子目录） |
+| 定点 | `gen2 == gen3` 仍绿 |
+| 门禁 | 同上，fixtures 口径不变 |
