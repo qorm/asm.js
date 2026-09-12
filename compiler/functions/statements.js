@@ -698,9 +698,11 @@ export const StatementCompiler = {
                 const localBinding = (this.ctx.ownBindingNames && this.ctx.ownBindingNames[name]) ||
                     (this.ctx.lexLocalNames && this.ctx.lexLocalNames[name]) ||
                     (this.ctx.paramBindingNames && this.ctx.paramBindingNames[name]);
-                const useMainCapturedBox = globalLabel && !localBinding &&
+                const isCatchParamBinding = !!(this.ctx._catchParamBindings && this.ctx._catchParamBindings[name] === true);
+                const useMainCapturedBox = globalLabel && !localBinding && !isCatchParamBinding &&
                     !this.ctx._paramSplitBodyVarEnv && !this.ctx._staticBlockVarEnv;
-                const skipScriptGlobalSync = this.ctx._paramSplitBodyVarEnv || this.ctx._staticBlockVarEnv;
+                const skipScriptGlobalSync = this.ctx._paramSplitBodyVarEnv || this.ctx._staticBlockVarEnv ||
+                    isCatchParamBinding;
 
                 const _initE = decl.init;
                 const isRecursiveInit = _initE &&
@@ -4716,12 +4718,29 @@ export const StatementCompiler = {
             // (try/dstr ary-ptrn-elem-ary-val-null 族 TIMEOUT 根因)。
             this.ctx.exceptionLabel = hasFinalizer ? finallyExcLabel : savedExceptionLabel;
 
+            let catchParamSaved = null;
+            let catchPrevOwnBindings = null;
             if (stmt.handler.param && stmt.handler.param.type === "Identifier") {
                 const name = stmt.handler.param.name;
-                let offset = this.ctx.getLocal(name);
-                if (!offset) {
-                    offset = this.ctx.allocLocal(name);
+                // B.3.5: catch parameter is a *fresh* lexical binding per entry.
+                // Always allocLocal (never reuse an outer same-named slot) and
+                // scope it to the catch body so `var name` inside aliases the
+                // parameter instead of a module/mainCaptured global box.
+                catchParamSaved = this.ctx.enterScope();
+                const offset = this.ctx.allocLocal(name);
+                catchPrevOwnBindings = this.ctx.ownBindingNames;
+                const _ownCopy = {};
+                if (catchPrevOwnBindings) {
+                    for (const _k in catchPrevOwnBindings) {
+                        if (Object.prototype.hasOwnProperty.call(catchPrevOwnBindings, _k)) {
+                            _ownCopy[_k] = catchPrevOwnBindings[_k];
+                        }
+                    }
                 }
+                _ownCopy[name] = true;
+                this.ctx.ownBindingNames = _ownCopy;
+                if (!this.ctx._catchParamBindings) this.ctx._catchParamBindings = {};
+                this.ctx._catchParamBindings[name] = true;
                 this.vm.lea(VReg.V0, "_exception_value");
                 this.vm.load(VReg.V1, VReg.V0, 0);
                 if (this.ctx.boxedVars && this.ctx.boxedVars.has(name)) {
@@ -4753,6 +4772,13 @@ export const StatementCompiler = {
             this.vm.lea(VReg.V0, "_js_undefined");
             this.vm.load(VReg.RET, VReg.V0, 0);
             this.compileStatement(stmt.handler.body);
+            if (catchParamSaved) {
+                this.ctx.ownBindingNames = catchPrevOwnBindings;
+                if (stmt.handler.param && stmt.handler.param.type === "Identifier" && this.ctx._catchParamBindings) {
+                    delete this.ctx._catchParamBindings[stmt.handler.param.name];
+                }
+                this.ctx.leaveScope(catchParamSaved);
+            }
 
             if (hasFinalizer) {
                 this.vm.store(VReg.FP, cptnSlot, VReg.RET);

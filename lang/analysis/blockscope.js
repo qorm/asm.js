@@ -322,7 +322,13 @@ function bsHandleVarDecl(node, st) {
         bsPatternIdents(d.id, ids);
         for (let j = 0; j < ids.length; j++) {
             const idn = ids[j];
-            if (!isLet) continue; // var/int:函数级,恒等(不改名)
+            if (!isLet) {
+                // B.3.5: `var F` inside catch assigns to the catch parameter
+                // (renamed), not a function-scoped binding of the same source name.
+                const crec = bsLookup(st, idn.name);
+                if (crec && crec.catch === 1 && crec.n) idn.name = crec.n;
+                continue;
+            }
             const rec = bsLookup(st, idn.name);
             if (rec) {
                 if (rec.n) idn.name = rec.n;
@@ -520,7 +526,9 @@ function bsWalkTry(node, st) {
                 const idn = ids[i];
                 if (bsRenameable(idn.name)) {
                     const nn = bsNewName(st, idn.name);
-                    frame.m[idn.name] = { bs: 1, n: nn, d: true, f: st.fnDepth, blk: null, t: 0 };
+                    // catch:1 marks B.3.5 — `var F` / `function F` inside the
+                    // catch body assign to this binding, not a function-scoped slot.
+                    frame.m[idn.name] = { bs: 1, n: nn, d: true, f: st.fnDepth, blk: null, t: 0, catch: 1 };
                     idn.name = nn;
                 } else {
                     bsRegIdentity(st, frame, idn.name);

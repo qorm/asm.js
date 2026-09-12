@@ -765,7 +765,26 @@ export function collectVarDeclarations(node, vars) {
         collectVarDeclarations(node.body, vars);
     } else if (t === "TryStatement") {
         collectVarDeclarations(node.block, vars);
-        if (node.handler) collectVarDeclarations(node.handler.body, vars);
+        if (node.handler) {
+            // B.3.5: `var F` inside catch does not create a function-scoped
+            // binding when F is the catch parameter — it assigns to that
+            // binding. Exclude those names from hoisting.
+            const catchSkip = {};
+            if (node.handler.param) {
+                if (node.handler.param.type === "Identifier") {
+                    catchSkip[node.handler.param.name] = true;
+                } else {
+                    collectPatternNames(node.handler.param, catchSkip);
+                }
+            }
+            const catchVars = {};
+            collectVarDeclarations(node.handler.body, catchVars);
+            for (const n in catchVars) {
+                if (Object.prototype.hasOwnProperty.call(catchVars, n) && catchSkip[n] !== true) {
+                    vars[n] = true;
+                }
+            }
+        }
         if (node.finalizer) collectVarDeclarations(node.finalizer, vars);
     } else if (t === "SwitchStatement") {
         const cases = node.cases || [];

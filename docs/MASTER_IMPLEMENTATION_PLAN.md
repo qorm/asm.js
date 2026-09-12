@@ -551,6 +551,22 @@ var 泄漏**不观察**当：
 `for(let ff;;){function ff(){}}` 后 `typeof ff` 为 undefined。
 **门禁**：`gen2==gen3`；fixtures 426/5/7/5；ABI；toolchain_no_regex。
 
+### 2026-09-12 — annexB B.3.5 catch 参数与 var 同名
+
+**规则**：`catch (foo) { var foo = … }` 的初始化赋给 **catch 参数**，
+不得写穿外层/全局同名绑定；`capturedFoo()` 仍见赋值前的值。
+
+**实现**：
+- catch Identifier：每次进入 **allocLocal 新槽** + enterScope；标记
+  `_catchParamBindings` / ownBindingNames，使 `var` 不走 mainCaptured /
+  `syncScriptGlobalVar`
+- `collectVarDeclarations` 跳过与 catch 参数同名的 catch 体内 var（B.3.5 提升）
+- `blockscope`：catch 参数记 `catch:1`；`bsHandleVarDecl` 对 var 查到 catch
+  绑定时把声明 id 改名为 catch 槽（rename 后源名已对不上）
+
+**对照 Node**：`capturedFoo()` → `prior to throw`；外层 `var x` 不被 catch 覆盖。
+**门禁**：`gen2==gen3`；fixtures 426/5/7/5。
+
 ---
 
 ## 18. 分支状态（推送时）
