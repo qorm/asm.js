@@ -266,6 +266,10 @@ export const SYM_NAMES = [
     // compileMethodCall) emit OrdinaryCallBindThis. Eval/new Function
     // fragments must relocate this host helper. Append-only ABI.
     "_ordinary_bind_this",
+    // eval("[1,2,3].forEach(v => { s = s + v })") — callback array method
+    // inside a direct-eval fragment. Append-only ABI.
+    "_array_forEach_rt_t",
+    "_coll_cb_this",
 ];
 
 // 表中**不是代码标签**的名字:.data 段全局槽(数据段在 _engine_symaddr 生成之后才发射)

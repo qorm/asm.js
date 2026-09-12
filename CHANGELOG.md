@@ -2,6 +2,8 @@
 
 Version history. Newest first. Each entry is verified `gen2==gen3` byte-identical on the self-host gate.
 
+## v0.4.8 (**eval-direct-capture-writeback: fragment SYM_IDS for forEach/thisArg — gen2==gen3; fixtures 503 PASS / 19 XFAIL.** `eval("[1,2,3].forEach(v => { s = s + v })")` inside a caller that captures `s` needs `_array_forEach_rt_t` and `_coll_cb_this` in the append-only engine `SYM_NAMES` table. Unlocks `es/eval-direct-capture-writeback`.)
+
 ## v0.4.7 (**GeneratorValidate + ToPropertyDescriptor observation order — gen2==gen3; fixtures 502 PASS / 20 XFAIL.** **(1) Generator executing-state:** `next`/`return`/`throw` on an already-running generator now throw TypeError instead of re-entering the same stack (was SIGSEGV). Unlocks `es/generator-executing-state`. **(2) ToPropertyDescriptor:** dynamic `_object_define_property_dyn` observes fields in ES order (`enumerable → configurable → value → writable → get → set`) rather than source creation order. Unlocks `es/descriptor-explicit-undefined`.)
 
 ## v0.4.6 (**_main frame 8 KiB → 32 KiB: locals beyond SP were smashed by callees — gen2==gen3; fixtures 500 PASS / 22 XFAIL.** `_main` emitted `prologue(8192)`. Date.UTC sites each `allocLocal` 7 slots (plus shim `__reprop_*`), pushing `stackOffset` past 8 KiB; a later `for (let i=…)` landed at `FP-8272`, **below SP**. Any callee prologue then clobbered `i` (printed as `32` / a denormal). Unlocked `date-utc-string` and `date-to-locale-string`. Frame now matches `compileFunction` (32768); dynamic high-water mark still future work.)
