@@ -474,3 +474,26 @@ asm.js 的下一次跃迁，瓶颈不在“会不会写优化算法”，而在�
 | `_compilerRootDir` | `import.meta.url` 上溯深度 2→3（modules 子目录） |
 | 定点 | `gen2 == gen3` 仍绿 |
 | 门禁 | 同上，fixtures 口径不变 |
+
+### 2026-09-12 — test262 切片：direct eval 外层函数绑定（annexB）
+
+**缺陷**：`eval("{function f(){}} assert.sameValue(...)")` 抛 `assert is not defined`。
+direct eval 含函数声明时走 `__eval_direct` 片段；capture layout 只含 FP 局部，
+**不含外层 function 声明** → 片段内自由名解析失败。
+
+**修复**（`compiler/functions/functions.js`）：
+
+1. `_materializeOuterFnsForEval`：字面量 eval 且将走片段路径时，把 eval 源码引用到的
+   外层 `function` 声明物化进调用方局部（先 `compileExpression` 再 `allocLocal`，
+   避免 local 遮蔽拿到未初始化槽）。
+2. direct eval 恒走 `__eval_direct`（空 layout 时不再误用间接 `__eval`）。
+
+**验证**：
+
+- 最小 repro：`eval9`/`eval10`/`eval11` 由 FAIL → PASS
+- annexB stride-20 样本：PASS 5→12，FAIL 47→40（assert 缺失簇关闭）
+- `language/expressions` stride-40：40/40 仍绿
+- `gen2==gen3` 定点绿；fixtures 426/5/7/5 不变
+
+**仍开放（annexB 剩余）**：块级 function 的 early-error skip、if/else/switch 作用域
+泄漏、catch var 捕获等 B.3 语义簇。

@@ -1404,6 +1404,40 @@ export const FunctionCompiler = {
         return walk(ast);
     },
 
+    // Materialize outer function declarations referenced by a direct-eval
+    // string into caller locals (boxed) so the eval fragment capture layout
+    // can see them. No-op when the name is already a local or not a function.
+    _materializeOuterFnsForEval(evalArg) {
+        if (!evalArg || evalArg.type !== "Literal" || typeof evalArg.value !== "string") return;
+        let refs = null;
+        try {
+            refs = collectDirectEvalSourceRefs({
+                type: "CallExpression",
+                callee: { type: "Identifier", name: "eval" },
+                arguments: [evalArg],
+            });
+        } catch (_e) {
+            return;
+        }
+        if (!refs || refs.length === 0) return;
+        for (let i = 0; i < refs.length; i++) {
+            const name = refs[i];
+            if (!name || name.charCodeAt(0) === 95) continue; // skip __*
+            if (this.ctx.getLocal && this.ctx.getLocal(name)) continue;
+            if (!(this.ctx.hasFunction && this.ctx.hasFunction(name))) continue;
+            // Materialize BEFORE allocLocal: compileIdentifier prefers locals,
+            // so allocating first would load an uninitialized slot instead of
+            // the function declaration.
+            this.compileExpression({ type: "Identifier", name });
+            this.vm.push(VReg.RET);
+            const off = this.ctx.allocLocal(name);
+            this.vm.pop(VReg.RET);
+            // Store the function value as a plain local (not a box pointer).
+            // Layout will be `name:off` so the fragment copy-in moves the value.
+            this.vm.store(VReg.FP, off, VReg.RET);
+        }
+    },
+
     _evalInitEarlyError(ast) {
         const walk = (n) => {
             if (!n || typeof n !== "object") return null;
@@ -1543,12 +1577,22 @@ export const FunctionCompiler = {
                     if (!any) this.vm.movImm64(VReg.RET, JS_UNDEF);
                     return true;
                 }
+                // Fragment path: materialize referenced outer function declarations
+                // into caller locals so _directEvalLayoutStr includes them.
+                // Otherwise `eval("{function f(){}} assert.sameValue(...)")` loses
+                // `assert` ("assert is not defined") — annexB test262 cluster.
+                this._materializeOuterFnsForEval(firstArg);
             }
         }
 
         const layoutStr = this._directEvalLayoutStr(hasSpread ? null : firstArg);
-        const useDirect = layoutStr.length > 0;
-        const calleeName = useDirect ? "__eval_direct" : "__eval";
+        // Direct eval must always take the __eval_direct path. An empty layout
+        // (no FP locals) still needs the direct-eval frame ABI so free names
+        // like outer function declarations (`assert` in test262) resolve.
+        // Using __eval here made annexB tests with `{ function f(){} }` lose
+        // outer bindings ("assert is not defined").
+        const useDirect = true;
+        const calleeName = "__eval_direct";
 
         if (hasSpread) {
             this.compileArrayExpressionWithSpread(evalArgs);
