@@ -432,3 +432,19 @@ asm.js 的下一次跃迁，瓶颈不在“会不会写优化算法”，而在�
 - **`gen2 == gen3` 字节定点恢复**
 - `vm_abi_contract` 全绿；`compiler_source_gates` 通过
 - fixtures 仍 426/5/7/5（FAIL 为 wasm/crypto 等预存项，与本修复无关）
+
+### 2026-09-12 — P2.a `compiler/modules/shim-triggers.js` 落地
+
+纯移动，零语义：`compiler/index.js` 中 `sourceHas*` / shim 触发扫描族
+（~1113 行）迁至 `compiler/modules/shim-triggers.js`，index.js 6365→5264 行。
+
+| 项 | 值 |
+|---|---|
+| 新模块 | `compiler/modules/shim-triggers.js`（15 个 export，纯函数） |
+| index.js | 6365 → 5264 行（−1101） |
+| 定点 | `gen2 == gen3` 仍绿 |
+| 门禁 | toolchain_no_regex / vm_abi / source_gates / fixtures 口径不变 |
+
+**教训（自举）**：多行 `import { … }` 花括号列表 + 尾逗号会被 gen1 解析器拒
+（`expected }, got FROM`）。toolchain 内 import 须写成**单行、无尾逗号**，
+与仓库既有 import 风格一致。已记入 BOOTSTRAP 教训，建议后续加负向 fixture。
