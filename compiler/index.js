@@ -2003,11 +2003,13 @@ export class Compiler {
         if (!this._scriptGlobalMirrorByFile) this._scriptGlobalMirrorByFile = {};
         // Every file in the toolchain tree has a real top-level ESM
         // declaration (source-tree invariant); avoid invoking the self-hosted
-        // RegExp engine on this hot path. Ordinary files retain the lexical
-        // check so script/global mirror semantics do not change.
+        // RegExp engine on this hot path. Ordinary files retain a hand-written
+        // line-leading import/export check (NO regex literal: toolchain sources
+        // skip __regexp_shim injection, so a real /re/.test here compiles to an
+        // unresolved __RE_test and self-hosted gen1 dies on every user file).
         const hasModuleSyntax = isToolchainSource
             ? true
-            : /(^|\n)\s*(?:import|export)\b/.test(src);
+            : sourceHasLineLeadingImportExport(src);
         this._scriptGlobalMirrorByFile[filePath] = !isCjs && !hasModuleSyntax;
         if (_absFilePath !== filePath) {
             this._scriptGlobalMirrorByFile[_absFilePath] = this._scriptGlobalMirrorByFile[filePath];
@@ -4988,6 +4990,49 @@ function sourceHasRegexLiteral(src) {
             continue;
         }
         if (c !== 32 && c !== 9 && c !== 13 && c !== 10) prevEnd = i;
+        i++;
+    }
+    return false;
+}
+
+// 行首 import/export 判定（等价 /(^|\n)\s*(?:import|export)\b/）。
+// 手写扫描：禁止在 toolchain 源里用正则字面量——自举时 toolchain 路径跳过
+// __regexp_shim 注入,真实 /re/.test 会改派到未绑定的 __RE_test,gen1 一跑就
+// ReferenceError（2026-09-12 P0.7 根因）。
+function sourceHasLineLeadingImportExport(src) {
+    const n = src.length;
+    let i = 0;
+    if (n >= 2 && src.charCodeAt(0) === 35 && src.charCodeAt(1) === 33) {
+        while (i < n && src.charCodeAt(i) !== 10) i++;
+    }
+    let atLineStart = true;
+    while (i < n) {
+        const c = src.charCodeAt(i);
+        if (c === 10) { atLineStart = true; i++; continue; }
+        if (c === 32 || c === 9 || c === 13) { i++; continue; }
+        if (atLineStart) {
+            // "import" / "export" 均为 6 字节
+            if (i + 6 <= n) {
+                const c0 = src.charCodeAt(i);
+                let hit = false;
+                if (c0 === 105) { // 'i'
+                    hit = src.charCodeAt(i + 1) === 109 && src.charCodeAt(i + 2) === 112 &&
+                        src.charCodeAt(i + 3) === 111 && src.charCodeAt(i + 4) === 114 &&
+                        src.charCodeAt(i + 5) === 116;
+                } else if (c0 === 101) { // 'e'
+                    hit = src.charCodeAt(i + 1) === 120 && src.charCodeAt(i + 2) === 112 &&
+                        src.charCodeAt(i + 3) === 111 && src.charCodeAt(i + 4) === 114 &&
+                        src.charCodeAt(i + 5) === 116;
+                }
+                if (hit) {
+                    const next = i + 6 < n ? src.charCodeAt(i + 6) : 0;
+                    const isIdent = (next >= 48 && next <= 57) || (next >= 65 && next <= 90) ||
+                        (next >= 97 && next <= 122) || next === 95 || next === 36;
+                    if (!isIdent) return true;
+                }
+            }
+            atLineStart = false;
+        }
         i++;
     }
     return false;

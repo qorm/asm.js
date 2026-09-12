@@ -3,6 +3,7 @@
 
 import { Backend } from "./base.js";
 import { VReg } from "../vm/registers.js";
+import { buildRegMap, getAbi } from "../vm/register-file.js";
 
 // x64 物理寄存器
 export const Reg = {
@@ -33,49 +34,11 @@ export class X64Backend extends Backend {
         const isWindows = platform === "windows";
 
         // x64 只有 5 个 callee-saved 寄存器，S5 需要使用栈槽位
-        this.s5StackOffset = -8; // S5 在栈上的偏移量（相对于 RBP）
-
-        // 虚拟寄存器 -> x64 物理寄存器映射
-        this.regMap = {
-            // 通用/临时寄存器
-            [VReg.V0]: Reg.RAX,
-            [VReg.V1]: Reg.RCX,
-            [VReg.V2]: Reg.RDX,
-            [VReg.V3]: Reg.R8,
-            [VReg.V4]: Reg.R9,
-            [VReg.V5]: Reg.R10,
-            [VReg.V6]: Reg.R11,
-            [VReg.V7]: Reg.RSI,
-
-            // Callee-saved 寄存器
-            [VReg.S0]: Reg.RBX,
-            [VReg.S1]: Reg.R12,
-            [VReg.S2]: Reg.R13,
-            [VReg.S3]: Reg.R14,
-            [VReg.S4]: Reg.R15,
-            // S5 使用栈槽位，不在 regMap 中
-
-            // 参数寄存器 - Windows 与 SysV 采用**完全相同**的内部约定。
-            // 原先 Windows 用 C ABI 的 RCX/RDX/R8/R9 作 A0-A3,导致 V1-V4(RCX/RDX/R8/R9)
-            // 与 A0-A3 别名:所有共享运行时里形如 shrImm(V1, A0, 48) 的首指令会把 A0 自己
-            // 算没(SysV 下 A0=RDI 不被任何 V 别名,故安全)——字符串索引/比较/大小写等
-            // 系统性错乱。改为内部一律 SysV(A0=RDI…A5=R9),让全部共享运行时寄存器关系
-            // 与已验证的 macos/linux-x64 逐指令一致;Win32 ABI 的 RCX/RDX/R8/R9 搬运只在
-            // 真正调 API 的三处胶水(callWindowsAPI/WriteConsole/ExitProcess + winfs)内做。
-            // 非 Windows 映射不变,四平台产物字节零影响。
-            [VReg.A0]: Reg.RDI,
-            [VReg.A1]: Reg.RSI,
-            [VReg.A2]: Reg.RDX,
-            [VReg.A3]: Reg.RCX,
-            [VReg.A4]: Reg.R8,
-            [VReg.A5]: Reg.R9,
-
-            // 特殊寄存器
-            [VReg.RET]: Reg.RAX,
-            [VReg.FP]: Reg.RBP,
-            [VReg.SP]: Reg.RSP,
-            [VReg.LR]: Reg.RAX, // x64 没有 LR，用 RAX 占位
-        };
+        // 映射与栈槽单源：vm/register-file.js（内部约定恒为 SysV 形；
+        // Win32 RCX/RDX/R8/R9 搬运只在 kernel32 胶水内做）。
+        this.abi = getAbi("x64");
+        this.s5StackOffset = this.abi.stackSlots[VReg.S5];
+        this.regMap = buildRegMap("x64");
 
         // 参数传递顺序
         this.callRegs = isWindows ? [Reg.RCX, Reg.RDX, Reg.R8, Reg.R9] : [Reg.RDI, Reg.RSI, Reg.RDX, Reg.RCX, Reg.R8, Reg.R9];

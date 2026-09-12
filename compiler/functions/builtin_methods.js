@@ -11,9 +11,13 @@ export const BuiltinMethodCompiler = {
     // compileCallExpression 的 REGEXP 分派已拦截,此处为 objType 分派的兜底,保持一致。
     compileRegExpMethod(obj, method, args) {
         if (method !== "test" && method !== "exec") return false;
+        // 未注入 shim 时不得改派到 __RE_*（自由标识符会 ReferenceError）。
+        // 退回 false → 走通用方法派发。
+        const helper = "__RE_" + method;
+        if (this.ctx && this.ctx.hasFunction && !this.ctx.hasFunction(helper)) return false;
         this.compileExpression({
             type: "CallExpression",
-            callee: { type: "Identifier", name: "__RE_" + method },
+            callee: { type: "Identifier", name: helper },
             arguments: [obj, args.length > 0 ? args[0]
                 : { type: "UnaryExpression", operator: "void", argument: { type: "Literal", value: 0 }, prefix: true }],
         });

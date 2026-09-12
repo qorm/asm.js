@@ -3,6 +3,7 @@
 
 import { Backend } from "./base.js";
 import { VReg } from "../vm/registers.js";
+import { buildRegMap, getAbi } from "../vm/register-file.js";
 
 // [M2 / G-M-P] per-M 槽重定向表(docs/PARALLEL_DESIGN.md §1.2 D 组)。对这些全局
 // 标签的 lea 在 arm64 改为 `add xd, x28, #OFF`(x28 = 当前 M 上下文,_start 绑定
@@ -67,56 +68,17 @@ export const Reg = {
 
 // Temporary/robustness diagnostic: mapReg is pure and its mapping is static;
 // keep a receiver-independent table so a malformed self-hosted member call can
-// still be diagnosed past register mapping.  Remove if not needed.
-const ARM64_REGMAP_STATIC = {
-    [VReg.V0]: Reg.X8, [VReg.V1]: Reg.X9, [VReg.V2]: Reg.X10, [VReg.V3]: Reg.X11,
-    [VReg.V4]: Reg.X12, [VReg.V5]: Reg.X13, [VReg.V6]: Reg.X14, [VReg.V7]: Reg.X15,
-    [VReg.S0]: Reg.X19, [VReg.S1]: Reg.X20, [VReg.S2]: Reg.X21, [VReg.S3]: Reg.X22,
-    [VReg.S4]: Reg.X23, [VReg.S5]: Reg.X24,
-    [VReg.A0]: Reg.X0, [VReg.A1]: Reg.X1, [VReg.A2]: Reg.X2, [VReg.A3]: Reg.X3,
-    [VReg.A4]: Reg.X4, [VReg.A5]: Reg.X5, [VReg.RET]: Reg.X0,
-    [VReg.FP]: Reg.FP, [VReg.SP]: Reg.SP, [VReg.LR]: Reg.LR,
-};
+// still be diagnosed past register mapping. Single-sourced from RegisterFile.
+const ARM64_REGMAP_STATIC = buildRegMap("arm64");
 
 export class ARM64Backend extends Backend {
     constructor(asm, platform) {
         super(asm);
         this.platform = platform || "linux"; // "linux" | "macos"
 
-        // 虚拟寄存器 -> ARM64 物理寄存器映射
-        this.regMap = {
-            // 通用/临时寄存器 (避开 X0 参数/返回值寄存器)
-            [VReg.V0]: Reg.X8,
-            [VReg.V1]: Reg.X9,
-            [VReg.V2]: Reg.X10,
-            [VReg.V3]: Reg.X11,
-            [VReg.V4]: Reg.X12,
-            [VReg.V5]: Reg.X13,
-            [VReg.V6]: Reg.X14,
-            [VReg.V7]: Reg.X15,
-
-            // Callee-saved 寄存器
-            [VReg.S0]: Reg.X19,
-            [VReg.S1]: Reg.X20,
-            [VReg.S2]: Reg.X21,
-            [VReg.S3]: Reg.X22,
-            [VReg.S4]: Reg.X23,
-            [VReg.S5]: Reg.X24,
-
-            // 参数寄存器
-            [VReg.A0]: Reg.X0,
-            [VReg.A1]: Reg.X1,
-            [VReg.A2]: Reg.X2,
-            [VReg.A3]: Reg.X3,
-            [VReg.A4]: Reg.X4,
-            [VReg.A5]: Reg.X5,
-
-            // 特殊寄存器
-            [VReg.RET]: Reg.X0,
-            [VReg.FP]: Reg.FP,
-            [VReg.SP]: Reg.SP,
-            [VReg.LR]: Reg.LR,
-        };
+        // 虚拟寄存器 -> ARM64 物理寄存器映射（单源：vm/register-file.js）
+        this.regMap = buildRegMap("arm64");
+        this.abi = getAbi("arm64");
     }
 
     get name() {

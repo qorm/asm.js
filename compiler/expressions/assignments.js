@@ -1561,7 +1561,14 @@ export const AssignmentCompiler = {
         // Restrict L4 to user/test modules; this still covers test262's
         // buildString hot path while avoiding gen1→gen2 drift in toolchain code.
         const srcPath = this.sourcePath || (this._currentModuleAst && this._currentModuleAst.filename) || "";
-        if (typeof srcPath === "string" && /\/(compiler|runtime|lang|vm|backend|asm)\//.test(srcPath)) return false;
+        // 禁正则字面量（自举：toolchain 不注入 __regexp_shim）。
+        if (typeof srcPath === "string") {
+            if (srcPath.indexOf("/compiler/") !== -1 || srcPath.indexOf("/runtime/") !== -1 ||
+                srcPath.indexOf("/lang/") !== -1 || srcPath.indexOf("/vm/") !== -1 ||
+                srcPath.indexOf("/backend/") !== -1 || srcPath.indexOf("/asm/") !== -1) {
+                return false;
+            }
+        }
         if (!root || (this.ctx._ipExportedNames && this.ctx._ipExportedNames.has(name))) return false;
         let index = this.ctx._ipIndex;
         if (!index) index = this.ctx._ipIndex = this._buildIpIndex(root);

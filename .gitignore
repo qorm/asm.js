@@ -58,6 +58,10 @@ compile_output*
 # === 临时 / 一次性脚本 ===
 .tmp*
 tmp-*
+tmp_*
+tmp_*.js
+tmp.out
+tmp.out.*
 test_*
 run
 run.sh
@@ -75,9 +79,24 @@ t-macos-arm64
 cli2
 cli_backup.js
 cli-macos-arm64
+cli.js.bak
+*.bak
 0
 burin/
 support/
+# one-off patch/fix probes (not product code)
+/patch*.js
+/fix.js
+/fix2.js
+/fix3.js
+/fix4.js
+/fix5.js
+# Node CPU profiles from compile profiling
+*.cpuprofile
+# stray self-compile leftovers with non-standard names
+gen2_from_node
+gen[123]_from_node
+tmp.out
 
 # === 会话杂物/本地脚本(勿入库)===
 /1

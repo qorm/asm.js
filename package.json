@@ -8,7 +8,9 @@
     "test:cache": "node tests/action_cache.mjs",
     "test:fixtures": "node scripts/run-fixtures.mjs",
     "gate": "bash scripts/bootstrap-gate.sh",
-    "platform:contract": "node tests/platform_contract.mjs"
+    "platform:contract": "node tests/platform_contract.mjs",
+    "test:abi": "node tests/vm_abi_contract.mjs",
+    "test:toolchain-regex": "node tests/toolchain_no_regex.mjs"
   },
   "devDependencies": {
     "espree": "^11.2.0"

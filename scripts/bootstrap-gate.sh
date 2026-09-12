@@ -29,9 +29,14 @@ trap 'rmdir "$LOCK"' EXIT
 
 echo "[gate] start HEAD=$(git rev-parse --short HEAD 2>/dev/null || echo nogit) target=host"
 
+# Cheap P0.7 preflight: toolchain must not contain real regex literals
+# (they compile to unresolved __RE_* under self-host and kill gen1).
+echo "[gate] 0/5 toolchain_no_regex"
+node tests/toolchain_no_regex.mjs
+
 rm -f gen1 gen2 gen3
 
-echo "[gate] 1/4 gen1 (node -> native)"
+echo "[gate] 1/5 gen1 (node -> native)"
 node cli.js cli.js -o gen1 --no-cache --no-daemon
 echo "[gate] 2/4 gen2 (gen1 -> native)"
 ./gen1 cli.js -o gen2 --no-cache --no-daemon

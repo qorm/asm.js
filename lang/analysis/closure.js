@@ -522,14 +522,56 @@ export function collectLexicalDeclarations(node, out) {
 
 function collectEvalVarNamesFromSource(src, out) {
     if (typeof src !== "string" || src.length === 0) return;
-    const re = /\bvar\s+([$A-Za-z_][$0-9A-Za-z_]*(?:\s*,\s*[$A-Za-z_][$0-9A-Za-z_]*)*)/g;
-    let m;
-    while ((m = re.exec(src)) !== null) {
-        const names = m[1].split(",");
-        for (let i = 0; i < names.length; i++) {
-            const n = names[i].trim();
-            if (n.length > 0) out[n] = true;
+    // 等价 /\bvar\s+(id(,id)*)/ 的手写扫描。禁止正则字面量：lang/ 属 toolchain，
+    // 自举跳过 __regexp_shim 注入，真实 /re/.exec 会改派到未绑定符号（P0.7）。
+    const n = src.length;
+    let i = 0;
+    const isIdStart = (c) => (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 36 || c === 95;
+    const isIdPart = (c) => isIdStart(c) || (c >= 48 && c <= 57);
+    while (i < n) {
+        // 找词边界上的 var
+        if (src.charCodeAt(i) === 118 && i + 3 <= n &&
+            src.charCodeAt(i + 1) === 97 && src.charCodeAt(i + 2) === 114) {
+            const before = i > 0 ? src.charCodeAt(i - 1) : 0;
+            const after = i + 3 < n ? src.charCodeAt(i + 3) : 0;
+            if (!isIdPart(before) && !isIdPart(after)) {
+                let j = i + 3;
+                // \s+
+                while (j < n) {
+                    const c = src.charCodeAt(j);
+                    if (c === 32 || c === 9 || c === 10 || c === 13) j++;
+                    else break;
+                }
+                // id(,id)*
+                while (j < n && isIdStart(src.charCodeAt(j))) {
+                    let k = j;
+                    while (k < n && isIdPart(src.charCodeAt(k))) k++;
+                    const name = src.slice(j, k);
+                    if (name.length > 0) out[name] = true;
+                    j = k;
+                    let s = j;
+                    while (j < n) {
+                        const c = src.charCodeAt(j);
+                        if (c === 32 || c === 9 || c === 10 || c === 13) j++;
+                        else break;
+                    }
+                    if (j < n && src.charCodeAt(j) === 44) { // ','
+                        j++;
+                        while (j < n) {
+                            const c = src.charCodeAt(j);
+                            if (c === 32 || c === 9 || c === 10 || c === 13) j++;
+                            else break;
+                        }
+                        continue;
+                    }
+                    void s;
+                    break;
+                }
+                i = j > i ? j : i + 3;
+                continue;
+            }
         }
+        i++;
     }
 }
 
