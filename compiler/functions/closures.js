@@ -2,7 +2,7 @@
 // 编译函数表达式、闭包、函数体
 
 import { VReg } from "../../vm/registers.js";
-import { analyzeCapturedVariables, analyzeSharedVariables, analyzeDirectEvalBoxedVars, collectLocalDeclarations, collectDirectFunctionDeclNames, collectVarDeclarations, collectLexicalDeclarations, collectParamEvalVarNames, collectBodyEvalVarNames, collectPatternNames, outerLocalsGet } from "../../lang/analysis/closure.js";
+import { analyzeCapturedVariables, analyzeSharedVariables, analyzeDirectEvalBoxedVars, collectLocalDeclarations, collectDirectFunctionDeclNames, collectVarDeclarations, collectLexicalDeclarations, collectLetConstClassNames, collectParamEvalVarNames, collectBodyEvalVarNames, collectPatternNames, outerLocalsGet } from "../../lang/analysis/closure.js";
 import { ASYNC_CLOSURE_MAGIC, isAsyncFunction, isGeneratorFunction } from "../async/index.js";
 
 // 闭包魔数 - 用于区分普通函数指针和闭包对象
@@ -1447,6 +1447,7 @@ export const ClosureCompiler = {
         const prevInFunctionBody = this.ctx._inFunctionBody;
         this.ctx._inFunctionBody = true;
         const prevLexLocalNames = this.ctx.lexLocalNames;
+        const prevLetConstClassNames = this.ctx.letConstClassNames;
         const prevParamBindingNames = this.ctx.paramBindingNames;
         const prevOwnBindingNames = this.ctx.ownBindingNames;
         const prevBodyEvalVarNames = this.ctx.bodyEvalVarNames;
@@ -1455,8 +1456,15 @@ export const ClosureCompiler = {
         // 曾对每次读空 cmp)。嵌套函数自有 Set,捕获读仍守卫。
         this.ctx._tdzClearedLocals = new Set();
         this.ctx.lexLocalNames = {};
+        this.ctx.letConstClassNames = {};
         if (!fnStrict && expr.body) {
             collectLexicalDeclarations(expr.body, this.ctx.lexLocalNames);
+        }
+        // Prefer pre-rename stamp from _stampAnnexBLexicalNames (source names).
+        if (expr._letConstClassNames) {
+            this.ctx.letConstClassNames = expr._letConstClassNames;
+        } else if (expr.body) {
+            collectLetConstClassNames(expr.body, this.ctx.letConstClassNames);
         }
         this.ctx.paramBindingNames = {};
         for (let _pi = 0; _pi < params.length; _pi++) {
@@ -1915,6 +1923,7 @@ export const ClosureCompiler = {
         this.ctx.outerWithScopes = prevOuterWithScopes;
         this.ctx._inFunctionBody = prevInFunctionBody;
         this.ctx.lexLocalNames = prevLexLocalNames;
+        this.ctx.letConstClassNames = prevLetConstClassNames;
         this.ctx.paramBindingNames = prevParamBindingNames;
         this.ctx.ownBindingNames = prevOwnBindingNames;
         this.ctx.bodyEvalVarNames = prevBodyEvalVarNames;

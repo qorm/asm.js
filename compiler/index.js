@@ -20,7 +20,7 @@ import { runtimeNodeBase, resolveModulePath } from "./modules/module-graph.js";
 
 // 语言前端
 import { Lexer, Parser } from "../lang/index.js";
-import { analyzeCapturedVariables, analyzeSharedVariables, analyzeTopLevelSharedVariables, analyzeDirectEvalBoxedVars, collectDirectEvalSourceRefs, collectLocalDeclarations, collectLexicalDeclarations, collectVarDeclarations, collectPatternNames } from "../lang/analysis/closure.js";
+import { analyzeCapturedVariables, analyzeSharedVariables, analyzeTopLevelSharedVariables, analyzeDirectEvalBoxedVars, collectDirectEvalSourceRefs, collectLocalDeclarations, collectLexicalDeclarations, collectLetConstClassNames, collectVarDeclarations, collectPatternNames } from "../lang/analysis/closure.js";
 import { renameBlockScopedBindings } from "../lang/analysis/blockscope.js";
 
 // 虚拟机和汇编器
@@ -2085,6 +2085,7 @@ export class Compiler {
             fnCtx._localsUndo = null;
             fnCtx.boxedVars = null;
             fnCtx.lexLocalNames = null;
+            fnCtx.letConstClassNames = null;
             fnCtx.paramBindingNames = null;
             fnCtx._tdzClearedLocals = null;
             fnCtx.immutableLocals = null;
@@ -2789,6 +2790,9 @@ export class Compiler {
                 // [L1 var hoist] 模块顶层 VariableEnvironment:var → undefined
                 this.emitHoistedVarInits({ type: "BlockStatement", body: moduleAst.body });
                 this.emitTdzBlockPrologue(moduleAst);
+                if (moduleAst._letConstClassNames) {
+                    this.ctx.letConstClassNames = moduleAst._letConstClassNames;
+                }
 
                 for (const stmt of moduleAst.body) {
                     if (stmt.type === "ImportDeclaration") {
@@ -3470,6 +3474,7 @@ export class Compiler {
         this._devirtPrepassModules([ast]);
         // [W-24] _fnHint 已在 parse 盖章;单文件路径同样免预扫
         // this._collectFnNameHints(ast);
+        this._stampAnnexBLexicalNames(ast);
         renameBlockScopedBindings(ast, !!ast._bsStrict);
         this.collectFunctions(ast);
         this.compileUserFunctions();
@@ -3635,6 +3640,7 @@ export class Compiler {
         this.ctx._ipExportedNames = null;
         this.ctx._ipIndex = null;
         this.ctx.lexLocalNames = {};
+        this.ctx.letConstClassNames = func._letConstClassNames || {};
         this.ctx.paramBindingNames = {};
         this.ctx._tdzClearedLocals = new Set();
         {
@@ -3676,6 +3682,7 @@ export class Compiler {
         this.ctx.currentFnName = name || (func.id && func.id.name) || null;
         if (!fnStrict && func.body) {
             collectLexicalDeclarations(func.body, this.ctx.lexLocalNames);
+            collectLetConstClassNames(func.body, this.ctx.letConstClassNames);
         }
         // [批次D] 顶层生成器声明:标签处先落 stub(建协程+生成器对象即返回),
         // 真正函数体在 <label>_gbody(由 _coroutine_entry 首次 resume 进入)。
@@ -4196,8 +4203,49 @@ export class Compiler {
     _renameModulesBlockScope() {
         for (let i = 0; i < this._moduleOrder.length; i++) {
             const moduleAst = this._moduleOrder[i];
+            // Stamp original let/const/class names on each function/script
+            // BEFORE renaming (annex-B B.3.3 skip uses source names).
+            this._stampAnnexBLexicalNames(moduleAst);
             renameBlockScopedBindings(moduleAst, !!moduleAst._bsStrict);
         }
+    }
+
+    // Attach `_letConstClassNames` to Program and every function node so
+    // compileNestedFunctionDeclaration can apply annex-B skip after rename.
+    _stampAnnexBLexicalNames(root) {
+        if (!root || typeof root !== "object") return;
+        const stampFn = (fnNode) => {
+            if (!fnNode || typeof fnNode !== "object") return;
+            const out = {};
+            if (fnNode.body) {
+                if (fnNode.body.type === "BlockStatement") {
+                    collectLetConstClassNames(fnNode.body, out);
+                } else {
+                    collectLetConstClassNames({ type: "BlockStatement", body: [fnNode.body] }, out);
+                }
+            }
+            fnNode._letConstClassNames = out;
+        };
+        const walk = (n) => {
+            if (!n || typeof n !== "object") return;
+            if (Array.isArray(n)) {
+                for (let i = 0; i < n.length; i++) walk(n[i]);
+                return;
+            }
+            const t = n.type;
+            if (t === "FunctionDeclaration" || t === "FunctionExpression" ||
+                t === "ArrowFunctionExpression") {
+                stampFn(n);
+            }
+            for (const k in n) {
+                if (k === "type" || k === "loc" || k === "range" || k === "start" || k === "end") continue;
+                walk(n[k]);
+            }
+        };
+        const progOut = {};
+        if (root.body) collectLetConstClassNames({ type: "BlockStatement", body: root.body }, progOut);
+        root._letConstClassNames = progOut;
+        walk(root);
     }
 
     _collectFnNameHints(ast) {

@@ -2598,6 +2598,30 @@ export const StatementCompiler = {
 
         const name = stmt.id.name;
 
+        // B.3.3.1 / B.3.3.2: annex-B "function in if/block" is not observed when
+        //   (1) F is a formal parameter of the enclosing function, or
+        //   (2) creating `var F` would be an Early Error — F is let/const/class
+        //       in this function's lexical environment (letConstClassNames).
+        // FunctionDeclaration names do NOT count (they are the annex-B binding).
+        // Still evaluate the FunctionExpression so default-param side effects
+        // run; leave any existing binding untouched.
+        const isParam = !!(this.ctx.paramBindingNames && this.ctx.paramBindingNames[name] === true);
+        const isLexicalConflict = !!(this.ctx.letConstClassNames && this.ctx.letConstClassNames[name] === true);
+        if (isParam || isLexicalConflict) {
+            const skipExpr = {
+                type: "FunctionExpression",
+                params: stmt.params,
+                body: stmt.body,
+                id: stmt.id,
+                async: !!(stmt.async || stmt.isAsync),
+                isAsync: !!(stmt.async || stmt.isAsync),
+                isGenerator: !!(stmt.isGenerator || stmt.generator),
+                generator: !!(stmt.isGenerator || stmt.generator),
+            };
+            this.compileFunctionExpression(skipExpr);
+            return;
+        }
+
         // 分配局部变量（如果还没有）。falsy 判定：合法偏移恒负，自举产物 getLocal(missing)=0。
         let offset = this.ctx.getLocal(name);
         if (!offset) {

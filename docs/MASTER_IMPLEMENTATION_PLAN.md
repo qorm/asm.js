@@ -533,6 +533,24 @@ FunctionDeclaration（含块级）名字在调用方 allocLocal（初始化 unde
 
 **验证**：`gen2==gen3` 绿；fixtures 426/5/7/5；ABI / toolchain_no_regex 绿。
 
+### 2026-09-12 — annexB B.3.3 skip（param / let 冲突）
+
+**规则**：`if (…) function F(){}` / 块内 FunctionDeclaration 在 sloppy 下的
+var 泄漏**不观察**当：
+1. F 是当前函数的形参；
+2. 创建 `var F` 会构成 Early Error（F 是同函数 let/const/class）。
+
+**实现**：
+- `collectLetConstClassNames`（仅 let/const/class，不含 FunctionDeclaration）
+- `_stampAnnexBLexicalNames`：**rename 前**把源名盖在 AST 上（rename 后
+  `let ff` → `ff$blk$1`，不能再按改名后集合判断）
+- `compileNestedFunctionDeclaration`：命中 skip 时仍求值 FunctionExpression，
+  但不创建/覆盖绑定
+
+**对照 Node**：形参 123 不被覆盖；`let lf=123; {function lf(){}}` 保持 123；
+`for(let ff;;){function ff(){}}` 后 `typeof ff` 为 undefined。
+**门禁**：`gen2==gen3`；fixtures 426/5/7/5；ABI；toolchain_no_regex。
+
 ---
 
 ## 18. 分支状态（推送时）

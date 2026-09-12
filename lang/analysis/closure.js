@@ -520,6 +520,61 @@ export function collectLexicalDeclarations(node, out) {
     }
 }
 
+// let/const/class names only (no FunctionDeclaration). Used for annex-B
+// B.3.3 skip: creating `var F` is an Early Error iff F is let/const/class.
+export function collectLetConstClassNames(node, out) {
+    if (!node) return;
+
+    const t = node.type;
+    if (t === "VariableDeclaration") {
+        if (node.kind !== "let" && node.kind !== "const") return;
+        const decls = node.declarations || [];
+        for (let i = 0; i < decls.length; i++) {
+            if (decls[i].id) collectPatternNames(decls[i].id, out);
+        }
+        return;
+    }
+    if (t === "ClassDeclaration") {
+        if (node.id && node.id.name) out[node.id.name] = true;
+        return;
+    }
+    if (t === "FunctionDeclaration" || t === "FunctionExpression" ||
+        t === "ArrowFunctionExpression" || t === "ClassExpression") {
+        return;
+    }
+    if (t === "BlockStatement") {
+        const body = node.body || [];
+        for (let i = 0; i < body.length; i++) collectLetConstClassNames(body[i], out);
+    } else if (t === "IfStatement") {
+        collectLetConstClassNames(node.consequent, out);
+        if (node.alternate) collectLetConstClassNames(node.alternate, out);
+    } else if (t === "WhileStatement" || t === "DoWhileStatement") {
+        collectLetConstClassNames(node.body, out);
+    } else if (t === "ForStatement") {
+        if (node.init) collectLetConstClassNames(node.init, out);
+        collectLetConstClassNames(node.body, out);
+    } else if (t === "ForInStatement" || t === "ForOfStatement") {
+        if (node.left && node.left.type === "VariableDeclaration") {
+            collectLetConstClassNames(node.left, out);
+        }
+        collectLetConstClassNames(node.body, out);
+    } else if (t === "TryStatement") {
+        collectLetConstClassNames(node.block, out);
+        if (node.handler) collectLetConstClassNames(node.handler.body, out);
+        if (node.finalizer) collectLetConstClassNames(node.finalizer, out);
+    } else if (t === "SwitchStatement") {
+        const cases = node.cases || [];
+        for (let i = 0; i < cases.length; i++) {
+            const c = cases[i];
+            for (let j = 0; j < c.consequent.length; j++) {
+                collectLetConstClassNames(c.consequent[j], out);
+            }
+        }
+    } else if (t === "WithStatement" || t === "LabeledStatement") {
+        collectLetConstClassNames(node.body, out);
+    }
+}
+
 function collectEvalVarNamesFromSource(src, out) {
     if (typeof src !== "string" || src.length === 0) return;
     // 等价 /\bvar\s+(id(,id)*)/ 的手写扫描。禁止正则字面量：lang/ 属 toolchain，
