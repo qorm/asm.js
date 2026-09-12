@@ -6,6 +6,5 @@
     "run": true,
     "stdout": "Test262\ntrue",
     "exitCode": 0
-  },
-  "knownFailure": "NEW: eval private method access incomplete"
+  }
 }

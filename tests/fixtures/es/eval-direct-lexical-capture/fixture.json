@@ -6,6 +6,5 @@
     "run": true,
     "stdout": "20\n8\n15:5\n109\n8\njohn\n5,2,3\n1\n42",
     "exitCode": 0
-  },
-  "knownFailure": "NEW: direct-eval lexical capture incomplete"
+  }
 }

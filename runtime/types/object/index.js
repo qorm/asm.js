@@ -3464,6 +3464,10 @@ export class ObjectGenerator {
         vm.movImm(VReg.V0, 0xc105);
         vm.cmp(VReg.V1, VReg.V0);
         vm.jeq("_pcc_fwd_closure");
+        // nested Proxy target: recurse (layout is type@0/target@8/handler@16,
+        // not classinfo props_ptr@32 — treating it as classinfo SIGSEGVs).
+        vm.cmpImm(VReg.V1, TYPE_PROXY);
+        vm.jeq("_pcc_fwd_proxy");
         vm.call("_object_new");
         vm.mov(VReg.S4, VReg.RET);    // S4 = 新实例(裸)
         vm.load(VReg.V1, VReg.S3, 32); // props_ptr
@@ -3511,6 +3515,13 @@ export class ObjectGenerator {
         vm.load(VReg.A1, VReg.SP, 0);
         vm.movImm(VReg.A2, 0);
         vm.call("_fn_construct_call");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
+
+        // [nested Proxy target] 递归进同一 construct 入口(带原实参数组)。
+        vm.label("_pcc_fwd_proxy");
+        vm.mov(VReg.A0, VReg.S3); // raw nested proxy
+        vm.load(VReg.A1, VReg.SP, 0);
+        vm.call("_proxy_construct_call");
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
 
         vm.label("_pcc_fwd_throw");

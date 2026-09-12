@@ -6,6 +6,5 @@
     "run": true,
     "stdout": "ok",
     "exitCode": 0
-  },
-  "knownFailure": "NEW: Proxy [[Call]] on non-callable crash"
+  }
 }

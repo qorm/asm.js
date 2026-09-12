@@ -300,6 +300,47 @@ export class JSValueGenerator {
         vm.load(VReg.S4, VReg.S0, 0);          // 块类型
         vm.cmpImm(VReg.S4, 8);                 // TYPE_PROXY
         vm.jne("_vc_throw");
+        // IsCallable(proxy):有 apply 陷阱或 IsCallable(target)。无陷阱且
+        // target 非函数(如 new Proxy({},{}))必须 TypeError,不得合成蹦床。
+        {
+            vm.load(VReg.S4, VReg.S0, 8);      // target
+            vm.subImm(VReg.SP, VReg.SP, 48);
+            vm.store(VReg.SP, 0, VReg.A0);
+            vm.store(VReg.SP, 8, VReg.A1);
+            vm.store(VReg.SP, 16, VReg.A2);
+            vm.store(VReg.SP, 24, VReg.A3);
+            vm.store(VReg.SP, 32, VReg.A4);
+            vm.store(VReg.SP, 40, VReg.A5);
+            vm.mov(VReg.A0, VReg.S4);
+            vm.call("_is_callable");
+            vm.cmpImm(VReg.RET, 0);
+            vm.jne("_vc_proxy_restored");
+            // target 不可调用:查 handler.apply(null 视为缺失)
+            vm.mov(VReg.A0, VReg.S0);
+            vm.lea(VReg.A1, vm.asm.addString("apply"));
+            vm.call("_proxy_trap_fn");
+            vm.cmpImm(VReg.RET, 0);
+            vm.jeq("_vc_proxy_notcallable");
+            vm.label("_vc_proxy_restored");
+            vm.load(VReg.A0, VReg.SP, 0);
+            vm.load(VReg.A1, VReg.SP, 8);
+            vm.load(VReg.A2, VReg.SP, 16);
+            vm.load(VReg.A3, VReg.SP, 24);
+            vm.load(VReg.A4, VReg.SP, 32);
+            vm.load(VReg.A5, VReg.SP, 40);
+            vm.addImm(VReg.SP, VReg.SP, 48);
+            vm.jmp("_vc_proxy_ok");
+            vm.label("_vc_proxy_notcallable");
+            vm.load(VReg.A0, VReg.SP, 0);
+            vm.load(VReg.A1, VReg.SP, 8);
+            vm.load(VReg.A2, VReg.SP, 16);
+            vm.load(VReg.A3, VReg.SP, 24);
+            vm.load(VReg.A4, VReg.SP, 32);
+            vm.load(VReg.A5, VReg.SP, 40);
+            vm.addImm(VReg.SP, VReg.SP, 48);
+            vm.jmp("_vc_throw");
+        }
+        vm.label("_vc_proxy_ok");
         vm.subImm(VReg.SP, VReg.SP, 48);       // A0-A5 落栈(16 对齐:48B)
         vm.store(VReg.SP, 0, VReg.A0);
         vm.store(VReg.SP, 8, VReg.A1);

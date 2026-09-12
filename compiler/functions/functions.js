@@ -2057,8 +2057,13 @@ export const FunctionCompiler = {
         // still %eval%.  Overwritten `eval` (global / with / dynamic var)
         // must be an ordinary (tail) call.  Do not bake DirectEval at a
         // tail site: the binding is resolved at runtime.
+        // When TCO is disabled (_shouldTailCall false), a marked `_tailCall`
+        // is not an actual PrepareForTailCall site — treat it as ordinary
+        // DirectEval so `return eval("42")` keeps the value (it used to take
+        // the globalThis.eval hop and yield {}).
+        const _evalTailReal = expr._tailCall && this._shouldTailCall();
         if (callee.type === "Identifier" && callee.name === "eval" &&
-            !expr._tailCall &&
+            !_evalTailReal &&
             !(this.ctx.getFunction && this.ctx.getFunction("eval"))) {
             // A bodyEvalVarNames slot for `eval("var eval = …")` is allocated
             // at function entry as undefined.  That must not hide DirectEval:
@@ -2075,7 +2080,7 @@ export const FunctionCompiler = {
         // and ordinary-call it. compileIdentifier("eval") still materialises
         // __eval, which would ignore that assignment.
         if (callee.type === "Identifier" && callee.name === "eval" &&
-            expr._tailCall &&
+            _evalTailReal &&
             !(this.ctx.getLocal && this.ctx.getLocal("eval")) &&
             !(this.ctx.getFunction && this.ctx.getFunction("eval")) &&
             !this._hasAnyWithScope()) {

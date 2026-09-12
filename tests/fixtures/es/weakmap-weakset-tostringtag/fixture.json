@@ -6,6 +6,5 @@
     "run": true,
     "stdout": "[object WeakMap]\n[object WeakSet]\n[object Map]\n[object Set]\n7 true\ntrue false\n[object Map] 1 1",
     "exitCode": 0
-  },
-  "knownFailure": "NEW: WeakMap/WeakSet @@toStringTag mismatch"
+  }
 }

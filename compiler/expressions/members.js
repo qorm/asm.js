@@ -4245,9 +4245,12 @@ export const MemberCompiler = {
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.RET, VReg.V0, 0);
         this._reSetProtoProp(protoSlot, "constructor", BUILTIN_PROP_ATTR);
-        // Map/Set/Promise.prototype[@@toStringTag]=name(attr 4)。Array 靠 IsArray
-        // builtinTag,规范不挂 @@toStringTag → 跳过。
-        if (cfg.name === "Map" || cfg.name === "Set" || cfg.name === "Promise") {
+        // Map/Set/WeakMap/WeakSet/Promise.prototype[@@toStringTag]=name(attr 4)。
+        // Array 靠 IsArray builtinTag,规范不挂 @@toStringTag → 跳过。
+        // Weak* 必须挂:物化原型后 Object.prototype.toString 会从 proto Get tag,
+        // miss 时按规范落 "Object" 而非 TYPE_MAP/SET 内建品牌。
+        if (cfg.name === "Map" || cfg.name === "Set" || cfg.name === "Promise" ||
+            cfg.name === "WeakMap" || cfg.name === "WeakSet") {
             this.emitWellKnownToStringTag(protoSlot, cfg.name);
         }
         // 静态方法作构造器闭包属性(attr 5)。值经 emitMemoizedBuiltinRef(与静态值读
