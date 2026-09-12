@@ -4,6 +4,5 @@
     "parse": true,
     "compile": false,
     "run": false
-  },
-  "knownFailure": "NEW: unknown bare import resolution incomplete"
+  }
 }

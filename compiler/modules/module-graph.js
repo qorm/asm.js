@@ -85,7 +85,10 @@ export function resolveModulePathUncached(importSource, sourcePath, nodeShimPath
         // 编译器自身裸导入全是内建(上面已解析),故此路径自举永不触发。
         const pkgResolved = resolvePackageSpecifier(importSource, sourcePath, pathMod, fsMod, forRequire === true);
         if (pkgResolved) return normalizePathSegments(pkgResolved);
-        return "";
+        // Unknown bare package: fail at compile time (Node ERR_MODULE_NOT_FOUND).
+        // Returning "" previously bound the import to undefined and the program
+        // compiled successfully (es/unknown-bare-import).
+        throw new Error("Cannot find package '" + importSource + "'");
     }
 
     const absSourcePath = pathMod.resolve(sourcePath || ".");

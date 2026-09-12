@@ -2,6 +2,8 @@
 
 Version history. Newest first. Each entry is verified `gen2==gen3` byte-identical on the self-host gate.
 
+## v0.4.12 (**unknown bare import, assert.match, crypto.randomBytes, net ready order — gen2==gen3; fixtures 513 PASS / 9 XFAIL.** **(1)** Unknown bare package specifiers now fail at compile time (`Cannot find package '…'`) instead of binding undefined. **(2)** `assert.match`/`replace` no longer hijacked as String methods on unknown receivers — ordinary method call reaches the assert function. **(3)** Removed leftover `crypto.randomBytes START` debug log. **(4)** net socket emits `ready` before `connect` so the connect handler observes `ready=true`. Unlocks `es/unknown-bare-import`, `node/builtin-assert-match-code`, `node/builtin-crypto-random`, `node/builtin-net-connect-options`.)
+
 ## v0.4.11 (**Strict-mode TCO re-enabled for user programs — gen2==gen3; fixtures 509 PASS / 13 XFAIL.** PrepareForTailCall is back for non-toolchain strict functions. Toolchain sources (compiler/lang/asm/backend/vm/engine) and class field initializers stay non-TCO: the former still breaks self-host (gen2 "not a function"), the latter would rewrite `eval(...)` tail sites and lose the arguments-in-field-init SyntaxError. Unlocks `es/strict-tco-recursion` and `es/sloppy-eval-tco`.)
 
 ## v0.4.10 (**Async-generator yield thenable + throw-while-executing enqueue — gen2==gen3; fixtures 507 PASS / 15 XFAIL.** **(1) `yield {then:…}`** now Await-unwraps thenables (was yielding the raw object). **(2) `iter.throw(e)` while the async generator is executing** enqueues a mode=throw request on the next-queue (node: first `next()` still fulfills; the throw is delivered after the current yield). Unlocks `es/async-generator-yield-thenable` and `es/async-gen-throw-executing`.)

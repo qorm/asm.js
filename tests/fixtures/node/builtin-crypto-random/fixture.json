@@ -6,6 +6,5 @@
     "run": true,
     "stdout": "16\ntrue\n36\n4\n----\ntrue\ntrue\n64",
     "exitCode": 0
-  },
-  "knownFailure": "NEW: crypto random residual mismatch"
+  }
 }

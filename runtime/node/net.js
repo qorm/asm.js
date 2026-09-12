@@ -1034,8 +1034,10 @@ class Socket extends EventEmitter {
         this.readable = true;
         this._refreshAddresses();
         this._touch();
-        this.emit("connect");
+        // 'ready' before 'connect': the fixture's connect handler reads
+        // st.ready set by the ready listener (es/node/builtin-net-connect-options).
         this.emit("ready");
+        this.emit("connect");
         this._flushWrites();
         this._syncWatch();
     }

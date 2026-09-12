@@ -5,5 +5,5 @@
     "compile": false,
     "run": false
   },
-  "knownFailure": "Pre-existing issue - not caused by current changes"
+  "knownFailure": "NEW: \\u0023 private-reference escape not rejected at parse"
 }

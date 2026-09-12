@@ -7,6 +7,5 @@
     "run": true,
     "stdout": "lookup true 127.0.0.1 4 localhost\nready true\nlookup-arg localhost:4\nopts",
     "exitCode": 0
-  },
-  "knownFailure": "NEW: net connect options residual mismatch"
+  }
 }

@@ -6797,10 +6797,16 @@ export const FunctionCompiler = {
                         return;
                     }
                 }
-                // [L3] match/replace 未入 HOISTED(避 assert.match 冲突),在此特判
+                // [L3] match/replace 未入 HOISTED(避 assert.match 冲突),在此特判。
+                // 只对静态已知为 String 的接收者走编译期字符串方法;否则
+                // compileStringMethod 会 _valueToStr 后当 String.match 调,
+                // 把 assert.match 变成 "[object Object]".match → 不抛
+                // (es/node/builtin-assert-match-code)。
                 if (prop.name === "match" || prop.name === "replace") {
-                    if (this.compileStringMethod(obj, prop.name, expr.arguments)) {
-                        return;
+                    if (objType === "String" || objType === "STRING") {
+                        if (this.compileStringMethod(obj, prop.name, expr.arguments)) {
+                            return;
+                        }
                     }
                 }
             }
@@ -7290,7 +7296,12 @@ export const FunctionCompiler = {
                 // 强行当字符串会把对象参数原样返回([object Object]),劫持掉真正的对象
                 // 方法。已知 String 接收者仍走上面的 String 分支;编译器自身不调 .normalize()。
                 const stringMethods = HOISTED_STRING_METHODS;
-                if (stringMethods.includes(prop.name) && prop.name !== "normalize" && !isBufferConcat) {
+                // match/replace: same name as assert.match / String.prototype.match.
+                // For unknown receivers fall through to ordinary method call so
+                // assert.match stays the assert function (es/…-assert-match-code).
+                // Known String receivers still take the String branch above.
+                if (stringMethods.includes(prop.name) && prop.name !== "normalize" &&
+                    prop.name !== "match" && prop.name !== "replace" && !isBufferConcat) {
                     if (this.compileStringMethod(obj, prop.name, expr.arguments)) {
                         return;
                     }

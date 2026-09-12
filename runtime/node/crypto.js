@@ -1038,7 +1038,7 @@ function _unbiasedBelow(range) {
 }
 
 export const crypto = {
-    randomBytes(size, callback) { console.log("crypto.randomBytes START");
+    randomBytes(size, callback) {
         const buf = Buffer.from(_entropyBytes(size));
         if (callback) { callback(null, buf); return; }
         return buf;
