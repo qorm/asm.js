@@ -497,3 +497,36 @@ direct eval 含函数声明时走 `__eval_direct` 片段；capture layout 只含
 
 **仍开放（annexB 剩余）**：块级 function 的 early-error skip、if/else/switch 作用域
 泄漏、catch var 捕获等 B.3 语义簇。
+
+### 2026-09-12 — annexB B.3.3 诊断（未合入修复）
+
+最小对照（`/tmp` 探针，非 fixture）：
+
+| 形态 | Node | asm.js 本分支 |
+|---|---|---|
+| `{ function f(){} }` 直写 | function | function |
+| `if (true) { function e1(){} }` 直写 | function | function |
+| `eval("if (true) { function e3(){} }")` | function | **undefined** |
+| `eval("{function f(){}} assert.x")` | ok | ok（上一 commit 已修） |
+
+**缺口**：direct eval 片段路径对 **if/switch 内嵌 FunctionDeclaration** 未做
+B.3.3 var-environment 泄漏（`typeof e3 === "undefined"`）。直写路径已正确。
+下一步应在 `engine/compile.js` / eval 片段声明实例化中补 annex B 函数绑定，
+配 fixture 后过定点。
+
+---
+
+## 18. 分支状态（推送时）
+
+分支 `docs/llvm-implementation-plan`，相对 `main@7485e46`：
+
+| Commit | 内容 |
+|---|---|
+| `c47219b22` | RegisterFile + ABI 契约 + P0.7 toolchain 正则自举修复 + 本规划 |
+| `104c374f3` | P2.a shim-triggers |
+| `4e8554bb3` | P2.b cjs-named-exports |
+| `33567ffb2` | P2.c module-graph |
+| `c053599df` | direct eval 外层函数绑定（annexB） |
+
+`compiler/index.js`：6365 → 4779 行。门禁：`gen2==gen3`、ABI、toolchain_no_regex、
+fixtures 426/5/7/5、官方 stride-5 抽样仍绿。

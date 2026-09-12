@@ -5,6 +5,10 @@
 
 > **2026-07-29 重定基线**:上行的 "v1.5.52" 是 2026-07-19 接管时点的**能力基线**(重新初始化前的代码状态),**不是当前版本号**。项目已于 2026-07-19 公开重新初始化并更名 asm.js,版本号自 v0.1 重新起算;当前为 **v0.3.x**(最新 tag v0.3.4,dev HEAD a678f85,cli.js VERSION=0.3.5 未提交)。fixtures 现状:manifest **385**(es 253 / modules 28 / node 104),门禁要求发现数**精确等于** `BASELINE_FIXTURES`(当前 **385**)且 FAIL==0、XPASS==0(见 §2 铁律1 与 `scripts/bootstrap-gate.sh`)。权威划分:fixture 基线的权威值是 `scripts/bootstrap-gate.sh` 的 `BASELINE_FIXTURES`;当前事实(版本号 / test262 数字 / 定点状态)的权威值是进度台账(`docs/progress/`)与 `tests/test262/last_report.md`;本文档是执行蓝图,不复述这些动态数字以免漂移。
 
+> **2026-09-12 架构蓝图**:中长期实施计划与逐日进度见
+> [docs/MASTER_IMPLEMENTATION_PLAN.md](./docs/MASTER_IMPLEMENTATION_PLAN.md)
+>（P0 卫生 / P1 RegisterFile / P2 去上帝类 / P3–P6 与 test262 路线）。
+
 ---
 
 ## 0. 接管交接状态(2026-07-19 已完成)
