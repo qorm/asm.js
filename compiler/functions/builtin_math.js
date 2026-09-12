@@ -91,13 +91,16 @@ export const BuiltinMathMethodCompiler = {
             } else {
                 this.compileExpression(args[0]); // RET = 累加器(首参)
                 this.emitNumberCoerceFast();
+                const accH = this._holdExpr(VReg.RET);
                 for (let k = 1; k < args.length; k++) {
-                    this.vm.push(VReg.RET);
                     this.compileExpression(args[k]);
                     this.emitNumberCoerceFast();
-                    this.vm.pop(VReg.V1); // V1 = acc, RET = 本参
+                    this._loadHeldExpr(accH, VReg.V1); // V1 = acc, RET = 本参
                     this.emitMinMaxStep(isMin); // RET = min/max(acc, 本参)，含 NaN 传播
+                    this._holdStore(accH, VReg.RET);
                 }
+                this._loadHeldExpr(accH, VReg.RET);
+                this._releaseHeldExpr();
             }
             return true;
         }
@@ -173,11 +176,12 @@ export const BuiltinMathMethodCompiler = {
             if (args.length >= 2) {
                 this.compileExpression(args[1]);   // x
                 this.emitNumberCoerceFast();
-                this.vm.push(VReg.RET);
+                const xH = this._holdExpr(VReg.RET);
                 this.compileExpression(args[0]);   // y
                 this.emitNumberCoerceFast();
                 this.vm.mov(VReg.A0, VReg.RET);    // A0 = y
-                this.vm.pop(VReg.A1);              // A1 = x
+                this._loadHeldExpr(xH, VReg.A1);   // A1 = x
+                this._releaseHeldExpr();
                 this.vm.call("_math_atan2");
                 this.emitMathNanNormalize(); // 硬件 NaN → 可打印
             } else {
@@ -191,12 +195,13 @@ export const BuiltinMathMethodCompiler = {
             if (args.length >= 2) {
                 this.compileExpression(args[1]);
                 this.emitNumberCoerceFast();
-                this.vm.push(VReg.RET); // exp
+                const expH = this._holdExpr(VReg.RET);
                 this.compileExpression(args[0]);
                 this.emitNumberCoerceFast(); // RET = base
                 // _math_pow 契约:A0=base 位、A1=exp 位(内部自 fmov;返回 RET=位)
                 this.vm.mov(VReg.A0, VReg.RET); // base
-                this.vm.pop(VReg.A1); // exp
+                this._loadHeldExpr(expH, VReg.A1);
+                this._releaseHeldExpr();
                 this.vm.call("_math_pow");
                 this.emitMathNanNormalize(); // 硬件 NaN → 可打印
             } else {
@@ -212,11 +217,12 @@ export const BuiltinMathMethodCompiler = {
                 this.compileExpression(args[0]);
                 if (this.vm.backend.name === "x64") this.vm.mov(VReg.A0, VReg.RET);
                 this.vm.call("_to_int32");          // RET = ToInt32(a)(符号扩展)
-                this.vm.push(VReg.RET);
+                const aH = this._holdExpr(VReg.RET);
                 this.compileExpression(args[1]);
                 if (this.vm.backend.name === "x64") this.vm.mov(VReg.A0, VReg.RET);
                 this.vm.call("_to_int32");          // RET = ToInt32(b)
-                this.vm.pop(VReg.V5);               // V5(R10)=a,避开 x64 A 参别名
+                this._loadHeldExpr(aH, VReg.V5);    // V5(R10)=a,避开 x64 A 参别名
+                this._releaseHeldExpr();
                 this.vm.mul(VReg.RET, VReg.RET, VReg.V5); // RET = a*b(64 位)
                 // 截为有符号 32 位(低 32 位符号扩展),再按规范 boxIntAsNumber → 裸 float64 位。
                 // (勿用 0x7FF8 int32-tag 装箱:负值经 &0xFFFFFFFF 掩码后是畸形位型,

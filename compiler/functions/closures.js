@@ -3,6 +3,7 @@
 
 import { VReg } from "../../vm/registers.js";
 import { analyzeCapturedVariables, analyzeSharedVariables, analyzeDirectEvalBoxedVars, collectLocalDeclarations, collectDirectFunctionDeclNames, collectVarDeclarations, collectLexicalDeclarations, collectLetConstClassNames, collectParamEvalVarNames, collectBodyEvalVarNames, collectPatternNames, outerLocalsGet } from "../../lang/analysis/closure.js";
+import { analyzeRawFloatVars } from "../../lang/analysis/rawfloat.js";
 import { ASYNC_CLOSURE_MAGIC, isAsyncFunction, isGeneratorFunction } from "../async/index.js";
 
 // 闭包魔数 - 用于区分普通函数指针和闭包对象
@@ -95,16 +96,17 @@ export const ClosureCompiler = {
             const off = this.ctx.allocLocal(name);
             vm.movImm(VReg.A0, 8);
             vm.call("_alloc");
+            vm.mov(VReg.A0, VReg.RET); // x64 V0≡RET: keep the box off V0
             const mcv = this.ctx.getMainCapturedVar && this.ctx.getMainCapturedVar(name);
             if (mcv) {
                 vm.lea(VReg.V1, mcv);
                 vm.load(VReg.V1, VReg.V1, 0);
-                vm.load(VReg.V0, VReg.V1, 0);
+                vm.load(VReg.V1, VReg.V1, 0);
             } else {
-                vm.movImm64(VReg.V0, undef);
+                vm.movImm64(VReg.V1, undef);
             }
-            vm.store(VReg.RET, 0, VReg.V0);
-            vm.store(VReg.FP, off, VReg.RET);
+            vm.store(VReg.A0, 0, VReg.V1);
+            vm.store(VReg.FP, off, VReg.A0);
             this.ctx.boxedVars.add(name);
         }
     },
@@ -124,18 +126,30 @@ export const ClosureCompiler = {
     // call-time SyntaxError at the default-expression branch itself. Dynamic
     // source retains the normal runtime eval path.
     emitParamEvalConflictSyntaxError(defaultExpr) {
-        if (!defaultExpr || !this.ctx.paramLexNames || this.ctx.paramLexNames.size === 0) return false;
+        if (!defaultExpr) return false;
         const fake = {
             type: "AssignmentPattern",
             left: { type: "Identifier", name: "__param_eval_probe" },
             right: defaultExpr,
         };
         const evalVars = collectParamEvalVarNames([fake]);
-        for (const name of this.ctx.paramLexNames) {
-            if (evalVars[name] === true) {
-                this.emitThrowSyntaxError("Identifier '" + name + "' has already been declared");
-                return true;
+        if (this.ctx.paramLexNames) {
+            for (const name of this.ctx.paramLexNames) {
+                if (evalVars[name] === true) {
+                    this.emitThrowSyntaxError("Identifier '" + name + "' has already been declared");
+                    return true;
+                }
             }
+        }
+        // EvalDeclarationInstantiation: sloppy direct eval in a default
+        // initializer walks lexEnv (parameter env, which holds the
+        // arguments object) toward varEnv. `var arguments` hits that
+        // binding → SyntaxError. Skipping it lets `var arguments = 'param'`
+        // overwrite the arguments object and SIGSEGV.
+        if (!this.ctx.inStrictFunction && !this.ctx._isArrowFunction &&
+            evalVars["arguments"] === true) {
+            this.emitThrowSyntaxError("Identifier 'arguments' has already been declared");
+            return true;
         }
         return false;
     },
@@ -152,8 +166,10 @@ export const ClosureCompiler = {
             const off = this.ctx.allocLocal(name);
             vm.movImm(VReg.A0, 8);
             vm.call("_alloc");
-            vm.movImm64(VReg.V0, undef);
-            vm.store(VReg.RET, 0, VReg.V0);
+            // x64 V0≡RET: movImm64(V0, undef) then store(RET,0,V0) writes
+            // to 0x7FFB (JS_UNDEFINED) and SIGSEGVs (eval('var x') body slots).
+            vm.movImm64(VReg.V1, undef);
+            vm.store(VReg.RET, 0, VReg.V1);
             vm.store(VReg.FP, off, VReg.RET);
             this.ctx.boxedVars.add(name);
         }
@@ -212,9 +228,13 @@ export const ClosureCompiler = {
             if (name === "__this" || name === "arguments") continue;
             let off = this.ctx.getLocal(name);
             const already = !!off;
-            // 参数/捕获已有槽:不覆盖(参数已绑定实参;捕获 box 已就位)
-            if (already) continue;
-            off = this.ctx.allocLocal(name);
+            // 参数/捕获已有槽:不覆盖(参数已绑定实参;捕获 box 已就位)。
+            // static {}:每块是独立 VariableEnvironment。外层同名 var 已有槽时
+            // compileClassDeclaration 先 allocLocal 遮蔽,本函数必须初始化新槽。
+            // 跳过的话 compileVariableDeclaration 见 preboxedVars(按名)把未初始化
+            // 槽当 box 指针 store → TEXT SIGBUS(static-init-scope-var-open/close)。
+            if (already && !this.ctx._staticBlockVarEnv) continue;
+            if (!already) off = this.ctx.allocLocal(name);
             const needsBox = this.ctx.boxedVars && this.ctx.boxedVars.has(name);
             if (needsBox) {
                 // [L1 box 统一] 模块顶层共享变量的全局 box 由 _main 序言预建(初值=TDZ
@@ -224,7 +244,9 @@ export const ClosureCompiler = {
                 // 全局 box → 双 box 分叉,闭包永远读陈旧值("var f=()=>x; var x=…"
                 // 族:closure 读 undefined / 计数不更新)。仅模块顶层(funcName 形如
                 // module_N)复用;函数体内同名局部遮蔽时无此语义,仍自建 box。
-                const gl = (this.ctx.shouldReuseMainCapturedBox && this.ctx.shouldReuseMainCapturedBox())
+                // static {} 遮蔽槽必须 _box_alloc,不得复用外层 mainCaptured box。
+                const gl = (!this.ctx._staticBlockVarEnv &&
+                    this.ctx.shouldReuseMainCapturedBox && this.ctx.shouldReuseMainCapturedBox())
                     ? this.ctx.getMainCapturedVar(name) : null;
                 if (gl) {
                     vm.lea(VReg.V1, gl);
@@ -243,23 +265,33 @@ export const ClosureCompiler = {
         }
     },
 
-    // 剩余参数 ...rest：A_pos..A4 + _argvSpill[5..] 中非 undefined 的实参收成数组。
-    // A5 为 this,不收。遇 undefined 停止(未提供实参已被调用方/快照填 JS_UNDEFINED)。
+    // 剩余参数 ...rest：A_pos..A4 + _argvSpill[5..] 收到 argc 为止。
+    // A5 为 this,不收。长度由实际 argc 决定,不得在 JS_UNDEFINED 处截断:
+    // 中间的空洞/`undefined` 是数据(`f(1, undefined, 2)` / `f.apply(null,[1,,2])`)。
     emitRestParam(restName, pos) {
         const vm = this.vm;
         const restOff = this.ctx.allocLocal(restName);
+        const argcOff = this.ctx.allocLocal(`__rest_argc_${pos}`);
+        vm.lea(VReg.V5, "_call_argc");
+        vm.load(VReg.V6, VReg.V5, 0);
+        vm.store(VReg.FP, argcOff, VReg.V6);
         const saved = [];
+        // Incoming A0–A4 may already have been smashed by
+        // emitArgvSpillSnapshot / eval-slot _alloc / earlier param
+        // binding. Same rule as emitArgToSlot: read the entry snapshot.
+        // V6 (x64 R11) is not an arg register.
         for (let k = pos; k <= 4; k++) {
             const so = this.ctx.allocLocal(`__rest_a_${pos}_${k}`);
-            vm.store(VReg.FP, so, vm.getArgReg(k));
-            saved.push(so);
+            this._loadIncomingArg(k, VReg.V6);
+            vm.store(VReg.FP, so, VReg.V6);
+            saved.push({ off: so, argIndex: k });
         }
         const spill = this.ctx._argvSpill;
         if (spill) {
             for (let k = 5; k < 16; k++) {
                 if (spill[k] === undefined) break;
                 if (k < pos) continue;
-                saved.push(spill[k]);
+                saved.push({ off: spill[k], argIndex: k });
             }
         }
         vm.movImm(VReg.A0, 0);
@@ -268,12 +300,12 @@ export const ClosureCompiler = {
         vm.store(VReg.FP, restOff, VReg.RET);
         const done = this.ctx.newLabel("rest_done");
         for (let k = 0; k < saved.length; k++) {
-            vm.load(VReg.V0, VReg.FP, saved[k]);
-            vm.movImm64(VReg.V1, 0x7ffb000000000000n); // JS_UNDEFINED
-            vm.cmp(VReg.V0, VReg.V1);
-            vm.jeq(done);
+            vm.load(VReg.V0, VReg.FP, argcOff);
+            vm.cmpImm(VReg.V0, saved[k].argIndex);
+            vm.jle(done);
+            vm.load(VReg.V5, VReg.FP, saved[k].off);
             vm.load(VReg.A0, VReg.FP, restOff);
-            vm.mov(VReg.A1, VReg.V0);
+            vm.mov(VReg.A1, VReg.V5);
             vm.call("_array_push");
             vm.store(VReg.FP, restOff, VReg.RET);
         }
@@ -295,9 +327,11 @@ export const ClosureCompiler = {
         vm.store(VReg.FP, argcOff, VReg.V0);
         const saved = [];
         // 形参 i 对应实参寄存器 A(i+1);最多收到 A5。
+        // Snapshot, not live A-regs: same class as emitRestParam.
         for (let k = pos + 1; k <= 5; k++) {
             const so = this.ctx.allocLocal(`__ctor_rest_a_${pos}_${k}`);
-            vm.store(VReg.FP, so, vm.getArgReg(k));
+            this._loadIncomingArg(k, VReg.V6);
+            vm.store(VReg.FP, so, VReg.V6);
             saved.push({ off: so, argIndex: k - 1 });
         }
         const spill = this.ctx._argvSpill;
@@ -342,7 +376,10 @@ export const ClosureCompiler = {
         const saved = [];
         for (let k = 1; k <= 5; k++) {
             const so = this.ctx.allocLocal(`__ctor_args_a_${k}`);
-            vm.store(VReg.FP, so, vm.getArgReg(k));
+            // Rest / _array_push already smashed live A1-A5. Same rule as
+            // emitCtorRestParam: read the entry snapshot.
+            this._loadIncomingArg(k, VReg.V6);
+            vm.store(VReg.FP, so, VReg.V6);
             saved.push(so);
         }
         const spill = this.ctx._argvSpill;
@@ -685,20 +722,37 @@ export const ClosureCompiler = {
         // 最先读 _call_argc 入 FP 槽(体内 _array_* 等 runtime helper 不改写它,
         // 但一切 JS 调用点都会——必须在任何用户代码执行前落栈)。
         const argcOff = this.ctx.allocLocal("__argc_saved");
+        if (!this.ctx._pinnedFpOffs) this.ctx._pinnedFpOffs = [];
+        this.ctx._pinnedFpOffs.push(argcOff);
         vm.lea(VReg.V0, "_call_argc");
         vm.load(VReg.V0, VReg.V0, 0);
         vm.store(VReg.FP, argcOff, VReg.V0);
         const saved = [];
+        const spillRegs = this.ctx._argRegSpill;
         for (let k = 0; k <= 4; k++) {
+            // Prefer the entry snapshot (__argreg_*, already pinned). A second
+            // copy of live A-regs can be lifted onto x64 V7≡A1 and then smashed
+            // by _array_new/_array_push (arguments[1] became 1e-323).
+            if (spillRegs && typeof spillRegs[k] === "number") {
+                saved.push(spillRegs[k]);
+                continue;
+            }
             const so = this.ctx.allocLocal(`__args_a_${k}`);
+            this.ctx._pinnedFpOffs.push(so);
             vm.store(VReg.FP, so, vm.getArgReg(k));
             saved.push(so);
         }
         // A5=this: helper 调用(_array_new/_array_push)会毁掉 A5。此前只恢复 A0..A4,
         // 序言稍后 __this=A5 写成垃圾 → this+arguments 同函数 SIGSEGV(x64; arm64
         // 同样会被 call 毁掉 A5,只是偶发未爆)。
-        const thisSave = this.ctx.allocLocal("__args_a5_this");
-        vm.store(VReg.FP, thisSave, VReg.A5);
+        let thisSave;
+        if (spillRegs && typeof spillRegs[5] === "number") {
+            thisSave = spillRegs[5];
+        } else {
+            thisSave = this.ctx.allocLocal("__args_a5_this");
+            this.ctx._pinnedFpOffs.push(thisSave);
+            vm.store(VReg.FP, thisSave, VReg.A5);
+        }
         // [argv 溢出] 实参 5..15 在 _call_argv:快照槽已由 emitArgvSpillSnapshot 备好
         // (未备则本函数只见前 5 个,同旧行为)。argc 守卫在下方收集循环里统一做。
         const spill = this.ctx._argvSpill;
@@ -818,6 +872,34 @@ export const ClosureCompiler = {
     // 覆盖该全局。argc <= i 的槽填真 JS_UNDEFINED —— 全局槽残留的是上一次调用的值,
     // 不守卫会把陈旧实参当本次实参。n = 需要覆盖的实参上界(形参个数;体内用
     // `arguments` 时取满 16)。返回 {索引: 帧内偏移} 并挂 ctx._argvSpill。
+    // 进入用户函数立刻把 A0-A5 落到 FP。任何后续 helper(含 _alloc /
+    // emitInstallAsyncExcFrame / `new`)都会毁掉 A-reg;形参绑定与 `this`
+    // 必须从这些槽读。`__argreg_*` 是合成名,allocLocal 不绑 T*。
+    emitArgRegSnapshot() {
+        const vm = this.vm;
+        const sp = [];
+        if (!this.ctx._pinnedFpOffs) this.ctx._pinnedFpOffs = [];
+        for (let i = 0; i < 6; i++) {
+            const off = this.ctx.allocLocal(`__argreg_${i}`);
+            vm.store(VReg.FP, off, vm.getArgReg(i));
+            sp.push(off);
+            // 钉 FP:x64 上 LSRA 若把本槽升到 V1≡A3,第一条 store 变成
+            // `mov A3,A0`,A3 还没快照就被冲掉(class ctor / 多形参方法)。
+            this.ctx._pinnedFpOffs.push(off);
+        }
+        this.ctx._argRegSpill = sp;
+        return sp;
+    },
+
+    _loadIncomingArg(i, dest) {
+        const sp = this.ctx._argRegSpill;
+        if (sp && typeof sp[i] === "number") {
+            this.vm.load(dest, VReg.FP, sp[i]);
+            return;
+        }
+        this.vm.mov(dest, this.vm.getArgReg(i));
+    },
+
     emitArgvSpillSnapshot(n) {
         this.ctx._argvSpill = null;
         if (!n || n <= 5) return null;
@@ -865,12 +947,19 @@ export const ClosureCompiler = {
         const vm = this.vm;
         const base = argBase || 0;
         if (i < 5) {
-            vm.store(VReg.FP, off, vm.getArgReg(i + base));
+            const idx = i + base;
+            const sp = this.ctx._argRegSpill;
+            if (sp && typeof sp[idx] === "number") {
+                vm.load(VReg.V6, VReg.FP, sp[idx]);
+                vm.store(VReg.FP, off, VReg.V6);
+                return;
+            }
+            vm.store(VReg.FP, off, vm.getArgReg(idx));
             return;
         }
-        const sp = this.ctx._argvSpill;
-        if (sp && sp[i] !== undefined) {
-            vm.load(VReg.V0, VReg.FP, sp[i]);
+        const spill = this.ctx._argvSpill;
+        if (spill && spill[i] !== undefined) {
+            vm.load(VReg.V0, VReg.FP, spill[i]);
             vm.store(VReg.FP, off, VReg.V0);
             return;
         }
@@ -879,13 +968,34 @@ export const ClosureCompiler = {
     },
 
 
-    // P1 录制税:仅对含 for/while 的函数录制(for-in/of 排除)。
-    // 体量不再用顶层语句数卡死——声明/方法/表达式已统一走此门,
-    // 过大由 REC_CAP 白冲兜底。显式 AST 遍历保证定点。
+    // P1 录制:LLVM virtreg — 非空用户函数一律 T* + endRecord 线性扫描。
+    // 旧门只录 for/while,无循环的局部全走 FP,热路径会慢一个数量级。
+    // 过大由 REC_CAP 白冲。Toolchain 仍 skip:compiler/engine/vm 进 eval
+    // 产物会超官方 30s compile。runtime/node 用户热循环仍录。
+    _p1SkipCurrent() {
+        const p = this.sourcePath;
+        if (typeof p !== "string") return false;
+        if (p.indexOf("__regexp_shim") !== -1) return true;
+        return p.indexOf("compiler/") !== -1 ||
+            p.indexOf("lang/") !== -1 ||
+            p.indexOf("asm/") !== -1 ||
+            p.indexOf("backend/") !== -1 ||
+            p.indexOf("/vm/") !== -1 ||
+            p.indexOf("engine/") !== -1 ||
+            // Runtime generators are imported by the compiler graph and AOT'd
+            // into eval/`new Function` binaries. Their for-loops are huge;
+            // recording them pushes 4-way windows-x64 compile past 30s.
+            // runtime/node/ (user-facing builtins) still records.
+            p.indexOf("runtime/core/") !== -1 ||
+            p.indexOf("runtime/types/") !== -1 ||
+            p.indexOf("runtime/async/") !== -1;
+    },
+
     _fnNeedsP1Record(expr) {
         const body = expr && expr.body;
         if (!body) return false;
-        return this._nodeHasLoop(body);
+        if (body.type === "BlockStatement" && (!body.body || body.body.length === 0)) return false;
+        return true;
     },
 
     _nodeHasLoop(n) {
@@ -1064,7 +1174,7 @@ export const ClosureCompiler = {
 
         this.vm.movImm(VReg.A0, closureSize);
         this.vm.call("_alloc");
-        this.vm.push(VReg.RET);
+        const cloH = this._holdExpr(VReg.RET);
 
         // 写入 magic 标记（区分普通函数和 async 函数；async generator 走普通 magic）
         this.vm.movImm(VReg.V1, isAsyncClosureMagic ? ASYNC_CLOSURE_MAGIC : CLOSURE_MAGIC);
@@ -1092,8 +1202,7 @@ export const ClosureCompiler = {
             // [#32] 纵深防御:outerLocals 是裸字典,合法偏移恒为负数;typeof 守卫挡
             // 一切沿原型链命中的污染值(closure.js 修复后 captured 必为自有局部)。
             if (typeof offset === "number" && offset) {
-                // 闭包指针在栈顶，弹出保存到 V3（因为 _alloc 会 clobber V1, V2）
-                this.vm.pop(VReg.V3);  // V3 = closure pointer
+                this._loadHeldExpr(cloH, VReg.V3);
 
                 // [#63] 外部变量已经装箱：该 box 就是绑定的唯一真身(可能同时被
                 // 顶层函数经 _main_captured_ 全局 box、以及先前创建的其它闭包共享)。
@@ -1106,69 +1215,47 @@ export const ClosureCompiler = {
                 if (outerBoxedVars.has(varName) && varName !== "__this" && varName !== "__new_target") {
                     this.vm.load(VReg.V1, VReg.FP, offset);        // V1 = 既有 box 指针
                     this.vm.store(VReg.V3, 16 + i * 8, VReg.V1);   // 闭包槽 = 共享既有 box
-                    this.vm.push(VReg.V3);                         // 闭包指针压回,供下轮/后续
                     continue;
                 }
 
                 // 到此仅剩两类：__this(外层直接存值,非 box)、以及尚未装箱的外层变量
                 // (首次装箱)。二者都取外层槽的原始值,下面新建 box 包裹。
                 this.vm.load(VReg.V1, VReg.FP, offset);  // V1 = 原始值
-
-                // 保存值和闭包指针到栈上（_alloc 会 clobber V0, V1, V2）
-                this.vm.push(VReg.V1);  // 保存值
-                this.vm.push(VReg.V3);  // 保存闭包指针
-
-                // 创建新 box
+                const capValH = this._holdExpr(VReg.V1);
                 this.vm.call("_box_alloc");  // RET = new box pointer(分配+登记,分代 minor 根)
-
-                // 恢复闭包指针和值（逆序弹出）
-                this.vm.pop(VReg.V2);  // V2 = 闭包指针
-                this.vm.pop(VReg.V1);  // V1 = 值
-
-                // 将值存入新 box (V1 = value, RET = box pointer)
+                this._loadHeldExpr(capValH, VReg.V1);
+                this._loadHeldExpr(cloH, VReg.V2);
+                this._releaseHeldExpr();
                 this.vm.store(VReg.RET, 0, VReg.V1);  // [RET] = value
-
-                // 将 box 指针存入闭包 (V2 = closure, RET = box)
                 this.vm.store(VReg.V2, 16 + i * 8, VReg.RET);  // [V2 + offset] = box
-
-                // 将闭包指针重新压栈（供下次迭代或后续使用）
-                this.vm.push(VReg.V2);
             } else if (varName === "__new_target") {
                 // 顶层箭头:无外层 NewTarget → undefined
-                this.vm.pop(VReg.V3);
-                this.vm.push(VReg.V3);
                 this.vm.movImm64(VReg.V1, 0x7ffb000000000000n);
-                this.vm.pop(VReg.V3);
-                this.vm.push(VReg.V1);
-                this.vm.push(VReg.V3);
+                const ntValH = this._holdExpr(VReg.V1);
                 this.vm.call("_box_alloc");
-                this.vm.pop(VReg.V2);
-                this.vm.pop(VReg.V1);
+                this._loadHeldExpr(ntValH, VReg.V1);
+                this._loadHeldExpr(cloH, VReg.V2);
+                this._releaseHeldExpr();
                 this.vm.store(VReg.RET, 0, VReg.V1);
                 this.vm.store(VReg.V2, 16 + i * 8, VReg.RET);
-                this.vm.push(VReg.V2);
             } else if (varName === "__this") {
                 // 顶层箭头:无外层 __this 槽,词法 this = globalThis。
-                this.vm.pop(VReg.V3);
-                this.vm.push(VReg.V3);
                 this.vm.lea(VReg.V0, "_global_this");
                 this.vm.load(VReg.RET, VReg.V0, 0);
                 this.vm.call("_box_obj_r");
-                this.vm.mov(VReg.V1, VReg.RET);
-                this.vm.pop(VReg.V3);
-                this.vm.push(VReg.V1);
-                this.vm.push(VReg.V3);
+                const thisValH = this._holdExpr(VReg.RET);
                 this.vm.call("_box_alloc");
-                this.vm.pop(VReg.V2);
-                this.vm.pop(VReg.V1);
+                this._loadHeldExpr(thisValH, VReg.V1);
+                this._loadHeldExpr(cloH, VReg.V2);
+                this._releaseHeldExpr();
                 this.vm.store(VReg.RET, 0, VReg.V1);
                 this.vm.store(VReg.V2, 16 + i * 8, VReg.RET);
-                this.vm.push(VReg.V2);
             }
         }
         this._pendingWithCapSlots = null;
 
-        this.vm.pop(VReg.RET);
+        this._loadHeldExpr(cloH, VReg.RET);
+        this._releaseHeldExpr();
 
         // 将原始指针装箱为 JSValue 函数
         // JSValue = (ptr & 0x0000ffffffffffff) | 0x7fff000000000000
@@ -1182,17 +1269,18 @@ export const ClosureCompiler = {
         // _cpg_miss 惰性建,须在造值时落下,否则 function*(){} 无该自有属性。
         if (isGeneratorFunction(expr)) this.emitFnOwnPrototype(isAsyncFunction(expr));
 
-        // Runtime-compiled specialised functions live in mmap pages, outside
-        // the host executable's immutable func_meta table.  Register their
-        // code pointer/kind/name/arity at creation time so constructor,
-        // toStringTag, getPrototypeOf, instanceof and IsConstructor all see
-        // the same semantics as AOT functions.  Ordinary fragment functions
-        // keep the existing explicit new-Function shim path.
-        if (this.engineNoIC && (isGeneratorFunction(expr) || isAsyncFunction(expr))) {
-            let dynKind = isGeneratorFunction(expr)
-                ? (isAsyncFunction(expr) ? 3 : 1) : 2;
+        // Runtime-compiled functions live in mmap pages, outside the host
+        // executable's immutable func_meta table.  Register their code
+        // pointer/kind/name/arity at creation time so OrdinaryCallBindThis,
+        // constructor, toStringTag, instanceof and IsConstructor see the
+        // same semantics as AOT functions.  Generators/async lack
+        // [[Construct]] (kind bit 9).
+        if (this.engineNoIC) {
+            let dynKind = 0;
+            if (isGeneratorFunction(expr)) dynKind = isAsyncFunction(expr) ? 3 : 1;
+            else if (isAsyncFunction(expr)) dynKind = 2;
             if (this._computeFunctionStrict(expr)) dynKind |= 0x100;
-            dynKind |= 0x200; // specialised functions lack [[Construct]]
+            if (isGeneratorFunction(expr) || isAsyncFunction(expr)) dynKind |= 0x200;
             let dynArity = 0;
             const dynParams = expr.params || [];
             for (let dpi = 0; dpi < dynParams.length; dpi++) {
@@ -1385,7 +1473,8 @@ export const ClosureCompiler = {
         // prologue 的 savedRegs 数组写入 _recB[](初值为 0 的稠密数字数组)会在 asm.js
         // 自托管编译器上触发「Cannot assign to read only property」(类型槽拒写)。
         // 顶层 Uint8Array 不经 beginRecord,故不受影响;new Function/eval 嵌套函数体才踩中。
-        const doP1 = !isAsync && !isGenerator && !this.engineNoIC && this._fnNeedsP1Record(expr);
+        const doP1 = !isAsync && !isGenerator && !this.engineNoIC &&
+            !this._p1SkipCurrent() && this._fnNeedsP1Record(expr);
         if (doP1) vm.beginRecord();
         const savedRegs = [VReg.S0, VReg.S1, VReg.S2, VReg.S3];
         // Large compiler methods (notably compileClassDeclaration) allocate
@@ -1403,10 +1492,12 @@ export const ClosureCompiler = {
         const prevStackOffset = this.ctx.stackOffset;
         const prevReturnLabel = this.ctx.returnLabel;
         const prevBoxedVars = this.ctx.boxedVars;
+        const prevRawFloatVars = this.ctx.rawFloatVars;
         const prevInAsyncFunction = this.ctx.inAsyncFunction;
         const prevInAsyncGenerator = this.ctx.inAsyncGenerator;
         const prevInCoroBody = this.ctx.inCoroBody;
         const prevInStrictFunction = this.ctx.inStrictFunction;
+        const prevIsArrowFunction = this.ctx._isArrowFunction;
         const prevPreboundFnDecls = this.ctx._preboundFnDecls;
         const prevImmutableLocals = this.ctx.immutableLocals;
         const prevClassNameBindings = this.ctx.classNameBindings;
@@ -1414,6 +1505,15 @@ export const ClosureCompiler = {
         const prevSuperCalledOff = this.ctx.superCalledOff;
         const prevWithScopes = this.ctx.withScopes;
         const prevOuterWithScopes = this.ctx.outerWithScopes;
+        const prevArgRegSpill = this.ctx._argRegSpill;
+        const prevPinnedFpOffs = this.ctx._pinnedFpOffs;
+        const prevEsPool = this.ctx._esPool;
+        const prevEsDepth = this.ctx._esDepth;
+        const prevLocalTemps = this.ctx.localTemps;
+        const prevObjTmpSlots = this.ctx._objTmpSlots;
+        const prevObjTmpDepth = this.ctx._objTmpDepth;
+        const prevArrTmpSlots = this.ctx._arrTmpSlots;
+        const prevArrTmpDepth = this.ctx._arrTmpDepth;
 
         this.ctx.locals = new Map();
         if (prevEngineLocalNames && prevEngineLocalOffsets) {
@@ -1423,6 +1523,14 @@ export const ClosureCompiler = {
         this.ctx.withScopes = [];
         this.ctx.outerWithScopes = [];
         this.ctx.localTemps = null;
+        this.ctx._argRegSpill = null;
+        this.ctx._pinnedFpOffs = [];
+        this.ctx._esPool = null;
+        this.ctx._esDepth = 0;
+        this.ctx._objTmpSlots = null;
+        this.ctx._objTmpDepth = 0;
+        this.ctx._arrTmpSlots = null;
+        this.ctx._arrTmpDepth = 0;
         this.ctx._localsUndo = [];
         this.ctx._preboundFnDecls = new Set();
         this.ctx.stackOffset = 0;
@@ -1433,6 +1541,7 @@ export const ClosureCompiler = {
         const fnStrict = this._computeFunctionStrict(expr);
         expr._fnStrict = fnStrict;
         this.ctx.inStrictFunction = fnStrict;
+        this.ctx._isArrowFunction = expr.type === "ArrowFunctionExpression";
         const prevCurrentFnName = this.ctx.currentFnName;
         this.ctx.currentFnName = (expr.id && expr.id.name) ? expr.id.name : null;
 
@@ -1440,6 +1549,7 @@ export const ClosureCompiler = {
         const innerBoxedVars = analyzeSharedVariables(expr);
         this._addDirectEvalBoxedVars(expr, innerBoxedVars);
         this.ctx.boxedVars = innerBoxedVars;
+        this.ctx.rawFloatVars = analyzeRawFloatVars(expr, innerBoxedVars);
         this.ctx.immutableLocals = new Set(this.ctx._pendingImmutableFromParent || []);
         this.ctx.classNameBindings = new Set(this.ctx._pendingClassNameFromParent || []);
         this.ctx.fnExprNameSlot = 0;
@@ -1492,6 +1602,10 @@ export const ClosureCompiler = {
         const prevAsyncCoroOff = this.ctx._asyncCoroOff;
         const prevAsyncPromiseOff = this.ctx._asyncPromiseOff;
         let asyncRejectLabel = null;
+        // A0-A5 must be on the frame before emitInstallAsyncExcFrame / any
+        // helper: x64 V2≡A2, so loading coro.promise into V2 otherwise
+        // replaces the 3rd actual (`SameValue([object Promise], NaN)`).
+        this.emitArgRegSnapshot();
         // async generator 体走协程/生成器返回流(非 Promise resolve),不设 async_reject 落点。
         if (isAsync && !isGenerator) {
             asyncRejectLabel = this.ctx.newLabel("async_reject");
@@ -1527,19 +1641,8 @@ export const ClosureCompiler = {
             this.emitArgumentsArray();
         }
         if (expr.type === "FunctionExpression" && expr.id && expr.id.name) {
-            vm.push(VReg.A0);
-            vm.push(VReg.A1);
-            vm.push(VReg.A2);
-            vm.push(VReg.A3);
-            vm.push(VReg.A4);
-            vm.push(VReg.A5);
             this.emitNamedFunctionExprBinding(expr);
-            vm.pop(VReg.A5);
-            vm.pop(VReg.A4);
-            vm.pop(VReg.A3);
-            vm.pop(VReg.A2);
-            vm.pop(VReg.A1);
-            vm.pop(VReg.A0);
+            for (let ai = 0; ai < 6; ai++) this._loadIncomingArg(ai, vm.getArgReg(ai));
         }
         if (this._paramsHaveExpressions(params)) this.emitSeedMainCapturedVars();
         this._pendingParamEvalParams = params;
@@ -1750,13 +1853,11 @@ export const ClosureCompiler = {
             if (innerBoxedVars.has(param.name)) {
                 // 从栈中加载参数值
                 vm.load(VReg.V1, VReg.FP, param.offset);
-                vm.push(VReg.V1); // 保存参数值
-
-                // 创建 box
+                const pbH = this._holdExpr(VReg.V1);
                 vm.call("_box_alloc"); // 分配+登记(分代 minor 根)
                 vm.store(VReg.FP, param.offset, VReg.RET); // 存储 box 指针
-
-                vm.pop(VReg.V1); // 恢复参数值
+                this._loadHeldExpr(pbH, VReg.V1);
+                this._releaseHeldExpr();
                 vm.store(VReg.RET, 0, VReg.V1); // 存入 box
             }
         }
@@ -1778,10 +1879,11 @@ export const ClosureCompiler = {
                 const param = paramOffsets[i];
                 if (innerBoxedVars.has(param.name)) continue;
                 vm.load(VReg.V1, VReg.FP, param.offset);
-                vm.push(VReg.V1);
+                const mapBoxH = this._holdExpr(VReg.V1);
                 vm.call("_box_alloc");
                 vm.store(VReg.FP, param.offset, VReg.RET);
-                vm.pop(VReg.V1);
+                this._loadHeldExpr(mapBoxH, VReg.V1);
+                this._releaseHeldExpr();
                 vm.store(VReg.RET, 0, VReg.V1);
                 innerBoxedVars.add(param.name);
                 this.ctx.boxedVars.add(param.name);
@@ -1874,7 +1976,8 @@ export const ClosureCompiler = {
                 this.compileStatement(stmt);
             }
         } else {
-            // 箭头函数表达式体 - 隐式返回
+            // 箭头函数表达式体 - 隐式返回（concise body 是尾位置）
+            this._markTailCalls(expr.body);
             this.compileExpression(expr.body);
             hasImplicitReturn = true;
         }
@@ -1898,8 +2001,8 @@ export const ClosureCompiler = {
             // 普通函数 / 生成器 / async generator:epilogue 返回。
             // (生成器/async-gen 体经 _coroutine_entry 捕获返回 → _coroutine_return 置 COMPLETED。)
             vm.epilogue(savedRegs, 16384);
-        vm.endRecord(); // [P1]
         }
+        vm.endRecord(this.ctx._pinnedFpOffs);
         if (_traceClass) console.log("CFB_EPILOGUE_DONE", expr && expr.type);
 
         this.ctx.locals = prevLocals;
@@ -1910,10 +2013,12 @@ export const ClosureCompiler = {
         this.ctx.stackOffset = prevStackOffset;
         this.ctx.returnLabel = prevReturnLabel;
         this.ctx.boxedVars = prevBoxedVars;
+        this.ctx.rawFloatVars = prevRawFloatVars;
         this.ctx.inAsyncFunction = prevInAsyncFunction;
         this.ctx.inAsyncGenerator = prevInAsyncGenerator;
         this.ctx.inCoroBody = prevInCoroBody;
         this.ctx.inStrictFunction = prevInStrictFunction;
+        this.ctx._isArrowFunction = prevIsArrowFunction;
         this.ctx.currentFnName = prevCurrentFnName;
         this.ctx.immutableLocals = prevImmutableLocals;
         this.ctx.classNameBindings = prevClassNameBindings;
@@ -1933,6 +2038,15 @@ export const ClosureCompiler = {
         this.ctx._asyncCoroOff = prevAsyncCoroOff;
         this.ctx._asyncPromiseOff = prevAsyncPromiseOff;
         this.ctx._preboundFnDecls = prevPreboundFnDecls;
+        this.ctx._argRegSpill = prevArgRegSpill;
+        this.ctx._pinnedFpOffs = prevPinnedFpOffs;
+        this.ctx._esPool = prevEsPool;
+        this.ctx._esDepth = prevEsDepth;
+        this.ctx._objTmpSlots = prevObjTmpSlots;
+        this.ctx._objTmpDepth = prevObjTmpDepth;
+        this.ctx._arrTmpSlots = prevArrTmpSlots;
+        this.ctx._arrTmpDepth = prevArrTmpDepth;
+        this.ctx.localTemps = prevLocalTemps;
     },
 
     // 具名函数表达式 BindingIdentifier:CreateImmutableBinding,初值=本闭包(S0)。
@@ -1947,9 +2061,10 @@ export const ClosureCompiler = {
         const boxIt = forceBox || (this.ctx.boxedVars && this.ctx.boxedVars.has(nm));
         if (boxIt) {
             if (this.ctx.boxedVars) this.ctx.boxedVars.add(nm);
-            this.vm.push(VReg.RET);
+            const nfeH = this._holdExpr(VReg.RET);
             this.vm.call("_box_alloc");
-            this.vm.pop(VReg.V1);
+            this._loadHeldExpr(nfeH, VReg.V1);
+            this._releaseHeldExpr();
             this.vm.store(VReg.RET, 0, VReg.V1);
             this.vm.store(VReg.FP, offset, VReg.RET);
         } else {

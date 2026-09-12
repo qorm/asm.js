@@ -1,0 +1,10 @@
+{
+  "description": "new Date(1978, 3) year ToInteger must not shrImm V0,RET on x64 (V0≡RET wipes 1978 to 0, 2-digit offset → 1900).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ok",
+    "exitCode": 0
+  }
+}

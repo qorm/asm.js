@@ -1,0 +1,10 @@
+{
+  "description": "Runtime tag-dispatch and generic method this use expr-scratch T* instead of parking the receiver on SP.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "U\nP3\n12\nok\n3\n1-2-3\n9",
+    "exitCode": 0
+  }
+}

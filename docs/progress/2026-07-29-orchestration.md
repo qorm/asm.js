@@ -55,7 +55,7 @@
 - `docs/ROADMAP.md:6/:26` 称“五目标 gen2==gen3 定点”，与 x64 回退口径直接冲突；
   `:217` 门禁引用死命令 `npm run test:fixtures`（package.json 无 scripts）。
 - `tests/README.md:119` 称“362 个用例”（真实 385 manifest / 380 门禁）。
-- `CHANGELOG.md` 停在 v0.3.0（无 v0.3.1–v0.3.4 条目），标题仍 `# jsbin — Changelog`。
+- `CHANGELOG.md` 停在 v0.3.0（无 v0.3.1–v0.3.4 条目），标题尚未改为 `# asm.js — Changelog`。
 - `package.json` 无 name/version/type/scripts；每次运行报 MODULE_TYPELESS_PACKAGE_JSON 警告。
 - README 内部矛盾：`:172-173` 称“五目标每次变更后复核 gen2==gen3” vs `:13/17/94` 称 x64 回退。
 

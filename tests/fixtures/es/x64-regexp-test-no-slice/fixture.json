@@ -1,0 +1,10 @@
+{
+  "description": "RegExp.prototype.test must not __re_uniSlice the whole match (four \\P{Script=Latin} aliases over a long non-Latin string; exec still materialises m[0]).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true\ntrue\ntrue\ntrue\nfalse",
+    "exitCode": 0
+  }
+}

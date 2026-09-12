@@ -1,9 +1,7 @@
 > **[归档 2026-07-16]** 本文件是 2026-01 → 2026-07-12(≈v1.4.x)期间的开发进展日志,此后不再更新;
 > v1.5.13 起的版本级记录见 [CHANGELOG.md](../../CHANGELOG.md)。保留仅供回溯。
 
-# JSBin JavaScript 编译器
-
-> 命名说明:"jsbin/JSBin" 是暂定的内部代号,非最终产品名;对外发布前会另定正式名称,文中所有 "jsbin" 均按此理解。
+# asm.js JavaScript 编译器
 
 ## 里程碑 v1.1.0 —— 五目标自举（2026-07-09)
 
@@ -11,7 +9,7 @@
 
 ### 里程碑 v1.0.0 —— 循环自举达成（2026-07-08）
 
-JSBin 实现**循环自举**：编译器把自身源码编译成原生二进制，该二进制再编译整个编译器，产物与上一代**逐字节一致**——稳定的自我复现定点。无三方依赖、运行时不调外部解释器。
+asm.js 实现**循环自举**：编译器把自身源码编译成原生二进制，该二进制再编译整个编译器，产物与上一代**逐字节一致**——稳定的自我复现定点。无三方依赖、运行时不调外部解释器。
 - 本轮攻克：内存墙 28GB(OOM)→4.3GB（实现保守式 mark-sweep GC）、全部运行期崩溃清零、9 处跨代 codegen 分歧修复。
 
 ### v1.4.4 完整 ES 核验(含 ES2025,2026-07-12)
@@ -70,7 +68,7 @@ JSBin 实现**循环自举**：编译器把自身源码编译成原生二进制�
 
 **[已修] `Array.prototype.unshift`(2026-07-12,v1.4.9 后,数组变异簇专项第二刀)**:
 - **现象**:`a.unshift(x)` 返 `[object Object]`、数组不变(应前插并返新长度)。同 shift 的双层死代码根因。
-- **修**:`runtime/types/array/index.js` 加 live `_array_unshift`(`_array_ensure_cap` 原地扩容——头指针稳定、data_ptr@24 更新、**无需 caller 写回**;元素从尾到头右移一位;`data[0]=value`;length++ @8;返回新长度**裸 int→double 装箱** `scvtf(0,len); fmovToInt(RET,0)`——jsbin 数字是裸 IEEE double)+ 接 generate();活跃 `compileArrayMethod` switch 加 `case "unshift"`(编 value→A1、arr→A0、call;结果=新长度)。
+- **修**:`runtime/types/array/index.js` 加 live `_array_unshift`(`_array_ensure_cap` 原地扩容——头指针稳定、data_ptr@24 更新、**无需 caller 写回**;元素从尾到头右移一位;`data[0]=value`;length++ @8;返回新长度**裸 int→double 装箱** `scvtf(0,len); fmovToInt(RET,0)`——asm.js 数字是裸 IEEE double)+ 接 generate();活跃 `compileArrayMethod` switch 加 `case "unshift"`(编 value→A1、arr→A0、call;结果=新长度)。
 - **门禁**:`unshift` 返新长度/连续前插/空数组/触发扩容(6 次 unshift)与 node 一致;fixture `array-unshift`;**自举定点 gen2==gen3 逐字节 17,727,504**;fixtures 90/40 零回归。偏差:多参 `unshift(a,b)` 退化只插首个(记偏差);`splice` 仍待(变长)。
 
 **[已修] `Array.prototype.shift`(2026-07-12,v1.4.9 后,数组变异簇专项第一刀)**:
@@ -140,8 +138,8 @@ JSBin 实现**循环自举**：编译器把自身源码编译成原生二进制�
 - **门禁**:行为 `s1 s2 s3 t1 t2 t3`(链式 `.then().then()`)逐字节匹配 node;**定点 gen2==gen3 逐字节一致 17,301,520**,gen2 `__text`=16,794,280(**过 16MB 悬崖 +17,064 字节**——修复前必挂,现干净达定点,悬崖实战验证);fixtures **PASS=79/FAIL=45** 与 base 失败集**逐项一致(零回归)**。偏差:setImmediate/process.nextTick/setTimeout 事件循环部分未落地(import-local-nexttick-* 仍失败,非本波 scope)。
 
 **[已修] #36 Error 对象字符串化(2026-07-12)**:
-- **现象**:Error 族对象(普通对象 tag 0x7FFD + `__jsbin_err` 品牌)此前 `err.toString()` 落通用方法路径找不到 toString 而崩,`String(err)`/`""+err`/模板/`console.log(err)` 出 "[object Object]"。node 期望 "name: message"(空 message → "name")。
-- **实现**:新增共享运行时 `_is_jsbin_err`(tag 0x7FFD 且 `_object_has "__jsbin_err"`)与 `_error_to_str`(读 name/message,空 message 返 name,否则 `name + ": " + message`,委托既有 `_object_get`/`_strconcat`,仅用 S0-S2 避开 `_strconcat` 冲 S5)。三处 chokepoint 前插判别:print.js `_print_value_object_ptr`(console.log)、string `_valueToStr` 装箱/裸对象双分支(String/拼接/模板,裸指针分支先回装箱 0x7FFD)、functions.js `.toString()` tag 分派。另在 Error 构造显式落 `cause=undefined`(否则缺失属性访问返 int 0,`err.cause === undefined` 为 false)。
+- **现象**:Error 族对象(普通对象 tag 0x7FFD + `__asmjs_err` 品牌)此前 `err.toString()` 落通用方法路径找不到 toString 而崩,`String(err)`/`""+err`/模板/`console.log(err)` 出 "[object Object]"。node 期望 "name: message"(空 message → "name")。
+- **实现**:新增共享运行时 `_is_asmjs_err`(tag 0x7FFD 且 `_object_has "__asmjs_err"`)与 `_error_to_str`(读 name/message,空 message 返 name,否则 `name + ": " + message`,委托既有 `_object_get`/`_strconcat`,仅用 S0-S2 避开 `_strconcat` 冲 S5)。三处 chokepoint 前插判别:print.js `_print_value_object_ptr`(console.log)、string `_valueToStr` 装箱/裸对象双分支(String/拼接/模板,裸指针分支先回装箱 0x7FFD)、functions.js `.toString()` tag 分派。另在 Error 构造显式落 `cause=undefined`(否则缺失属性访问返 int 0,`err.cause === undefined` 为 false)。
 - **门禁**:node 差分逐字节(toString/String/拼接/模板/console.log、Error/TypeError/RangeError、空 message、catch 到的 error)全绿;fixtures **PASS=85/127**(error-basic/error-subtypes FAIL→PASS,零回归);自举定点 **gen2==gen3 逐字节一致(17,629,200)**,gen2 编译含 throw/catch 的 error 程序输出正确。关键:错误处理是编译器自身可能用到的路径,定点仍逐字节一致确认改动未扰自举。
 
 **[已修] #71 + #73a/#73b/#73c(内建分派群,2026-07-12)**:
@@ -221,12 +219,12 @@ JSBin 实现**循环自举**：编译器把自身源码编译成原生二进制�
 - **性能**:自编译 240s → ~11.9s;性能主线 P0/P1/P2 均已落地(见 [docs/PERF_PLAN.md](./docs/PERF_PLAN.md)):P0 驻留键指针扫(prop −19%)、P1 vm 录制层热槽晋升 S4(num −9%,簿记税经三代形态收敛到 +4.4% 后被 P2 抵消)、P2 属性 get/set 站点缓存(自验证键下标 IC,融合 getter/写屏障;prop 微基准对 Node 24 从 ~32× 收窄到 ~22×,Map 持平或略快)。下一杠杆:P3 每函数完整 IR + 线性扫描(#12 收官)。
 - **内存/GC**:**分代 GC 已转正为缺省**(v1.2.0):sticky mark-bit minor(256MB nursery)+ GOGC 式 full 步调(live×2)+ RS 容器级去重;自编译峰值 RSS −30%(2005→1414MB)、耗时 ~+5%、产物与旧缺省字节一致。编译期可退:GC_FULLONLY(旧 full-only/4GB)、GC_DISABLE。"布局运气毁堆"根因(f32.buffer 别名违规,#19)已根除;判别工具 GC_POISON/GC_SHADOW/GC_DIAG 保留。
 - **stdlib**:批次 1/2 完成;**批次 3 完成**(2026-07-10):JSON.stringify/parse 以编译器注入的纯 JS shim 落地(内建 shim 机制首铺,fixtures 61→65),连带根修负浮点 typeof/print、instanceof(空桩)、Array.isArray、_valueToStr 共享缓冲、_floatToString 写头/精度(6 位截断→15 位舍入+去尾零)。已知偏差:第 16 位有效数字边角、JSON 无 replacer/space/toJSON。
-- **工具链**:`jsbin run <file>`(编译→执行→末行计时)已加。
+- **工具链**:编译后直接执行(编译→执行→末行计时)已加。
 - **规划**:四方向路线图(引擎库化/完整 ES/Node+包管理/README 完整化)见 [docs/ROADMAP.md](./docs/ROADMAP.md)。
 
 ## 项目概述
 
-JSBin 是一个将 JavaScript 编译为原生机器码的 AOT (Ahead-of-Time) 编译器，支持多平台输出。**已在五目标循环自举。**
+asm.js 是一个将 JavaScript 编译为原生机器码的 AOT (Ahead-of-Time) 编译器，支持多平台输出。**已在五目标循环自举。**
 
 | 类别 | 完成度 | 说明 |
 |------|--------|------|
@@ -242,7 +240,7 @@ JSBin 是一个将 JavaScript 编译为原生机器码的 AOT (Ahead-of-Time) �
 ## 项目架构
 
 ```
-jsbin/
+asm.js/
 ├── lang/                       # 语言前端
 │   ├── lexer/                  # 词法分析 (80+ Token 类型)
 │   ├── parser/                 # Pratt Parser (50+ AST 节点)
@@ -557,7 +555,7 @@ node cli.js input.js -o libout.a --static
 - **性能 6.8×**:自编译 72.3s→10.6s(strconcat 免扫描、_strlen O(1) 头契约、对象属性首字节预滤、模块解析 memoize 3 处 O(n²)、_alloc_large 扫描上限)。
 - **GC**:分配统计/阈值/禁用 env 门控;sweep 零 call 化(位图内联+class 查表);分代 GC 基建(box 登记、8 写屏障、minor、影子对照模式)+ Map/Set 全链扫描;**内部指针毁堆根因定位**(GC_DIAG 抓到栈上内部指针→容器未标→sweep 误回收;修复进行中,任务 #19)。
 - **stdlib 批次 1/2**:str.at/repeat/toUpperCase/toLowerCase 栈失衡与 dispatch、array lastIndexOf/sort/reverse、fromCharCode、tofixed 等(平台测试驱动,五目标)。
-- **工具链**:`jsbin run`(编译→执行→计时)、LABEL_MAP 符号化、GC_DIAG/ALLOC_DBG 诊断、Release CI(tag 触发 5 目标交叉编译发布)。
+- **工具链**:编译后直接执行(编译→执行→计时)、LABEL_MAP 符号化、GC_DIAG/ALLOC_DBG 诊断、Release CI(tag 触发 5 目标交叉编译发布)。
 - **文档**:README 优劣势章节 + 中文版 README.zh-CN.md + docs/ROADMAP.md(四方向规划)。
 - **寄存器注**:虚拟寄存器现为 V0-V7 / S0-S5 / A0-A5(旧文档 S0-S3 已过时);x64 别名陷阱(V0=RAX=RET、V1=RCX=A3、V2=RDX=A2)见 BOOTSTRAP_RULES。
 

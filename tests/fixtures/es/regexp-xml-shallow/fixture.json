@@ -1,0 +1,10 @@
+{
+  "description": "XML-shallow-parse nested quantified groups must trampoline the regexp CPS matcher; native recursion per repeat with 16-32 KiB frames SIGSEGV (S15.10.2_A1_T1).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ok",
+    "exitCode": 0
+  }
+}

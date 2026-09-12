@@ -65,6 +65,28 @@ export class X64Backend extends Backend {
         return vreg === VReg.S5;
     }
 
+    // 内部 scratch:优先 R11,其次 R10,最后才 RAX。
+    // 禁止默认借 RET:store/load S5 经 RAX 中转是 SetRecord SIGSEGV /
+    // Map empty 墓碑那一类的根因。avoid 可以是 VReg 或物理编号。
+    scratchReg(...regs) {
+        const avoid = [];
+        for (let i = 0; i < regs.length; i++) {
+            const reg = regs[i];
+            if (reg == null || this.isS5(reg)) continue;
+            avoid.push(typeof reg === "number" ? reg : this.mapReg(reg));
+        }
+        const candidates = [Reg.R11, Reg.R10, Reg.RAX];
+        for (let i = 0; i < candidates.length; i++) {
+            const c = candidates[i];
+            let hit = false;
+            for (let j = 0; j < avoid.length; j++) {
+                if (avoid[j] === c) { hit = true; break; }
+            }
+            if (!hit) return c;
+        }
+        return Reg.R11;
+    }
+
     // ========== 数据移动 ==========
 
     mov(dest, src) {
@@ -83,7 +105,7 @@ export class X64Backend extends Backend {
             this.asm.movLoadOffset(this.mapReg(dest), Reg.RBP, this.s5StackOffset);
             return;
         }
-        // 同物理寄存器自消除(RET==V0==RAX、A1==V7==RSI 等别名下 self-mov 密度高,纯废指令)
+        // 同物理寄存器自消除(RET==V0==RAX、A1==V7==RSI 等别名下 self-mov 是废指令)
         const d = this.mapReg(dest);
         const s = this.mapReg(src);
         if (d === s) return;
@@ -92,13 +114,13 @@ export class X64Backend extends Backend {
 
     movImm(dest, imm) {
         if (this.isS5(dest)) {
-            // movImm S5, imm -> 需要临时寄存器
+            const tmp = this.scratchReg();
             if (imm === 0) {
-                this.asm.xorReg(Reg.RAX, Reg.RAX);
+                this.asm.xorReg(tmp, tmp);
             } else {
-                this.asm.movImm(Reg.RAX, imm);
+                this.asm.movImm(tmp, imm);
             }
-            this.asm.movStoreOffset(Reg.RBP, this.s5StackOffset, Reg.RAX);
+            this.asm.movStoreOffset(Reg.RBP, this.s5StackOffset, tmp);
             return;
         }
         if (imm === 0) {
@@ -109,58 +131,60 @@ export class X64Backend extends Backend {
     }
 
     movImm64(dest, imm) {
-        // 64位立即数，对于 x64 直接使用 asm.movImm64
         if (this.isS5(dest)) {
-            this.asm.movImm64(Reg.RAX, imm);
-            this.asm.movStoreOffset(Reg.RBP, this.s5StackOffset, Reg.RAX);
+            const tmp = this.scratchReg();
+            this.asm.movImm64(tmp, imm);
+            this.asm.movStoreOffset(Reg.RBP, this.s5StackOffset, tmp);
             return;
         }
         this.asm.movImm64(this.mapReg(dest), imm);
     }
 
     load(dest, base, offset) {
-        // 处理 S5 作为 dest 或 base
         if (this.isS5(base)) {
-            // load dest, [S5 + offset] -> 先加载 S5 到临时寄存器
-            this.asm.movLoadOffset(Reg.RAX, Reg.RBP, this.s5StackOffset);
+            const tmp = this.scratchReg(dest);
+            this.asm.movLoadOffset(tmp, Reg.RBP, this.s5StackOffset);
             if (this.isS5(dest)) {
-                // load S5, [S5 + offset]
-                this.asm.movLoadOffset(Reg.RAX, Reg.RAX, offset);
-                this.asm.movStoreOffset(Reg.RBP, this.s5StackOffset, Reg.RAX);
+                this.asm.movLoadOffset(tmp, tmp, offset);
+                this.asm.movStoreOffset(Reg.RBP, this.s5StackOffset, tmp);
             } else {
-                this.asm.movLoadOffset(this.mapReg(dest), Reg.RAX, offset);
+                this.asm.movLoadOffset(this.mapReg(dest), tmp, offset);
             }
             return;
         }
         if (this.isS5(dest)) {
-            // load S5, [base + offset]
-            this.asm.movLoadOffset(Reg.RAX, this.mapReg(base), offset);
-            this.asm.movStoreOffset(Reg.RBP, this.s5StackOffset, Reg.RAX);
+            const tmp = this.scratchReg(base);
+            this.asm.movLoadOffset(tmp, this.mapReg(base), offset);
+            this.asm.movStoreOffset(Reg.RBP, this.s5StackOffset, tmp);
             return;
         }
         this.asm.movLoadOffset(this.mapReg(dest), this.mapReg(base), offset);
     }
 
     store(base, offset, src) {
-        // 处理 S5 作为 base 或 src
+        // S5 指针中转用 scratchReg,避开另一操作数(含 RET)。旧实现固定 RAX:
+        // store(S5,n,V0/RET) 写成 [node]=node; store(RET,n,S5) 毁掉刚 alloc 的指针。
         if (this.isS5(base)) {
-            // store [S5 + offset], src
-            this.asm.movLoadOffset(Reg.RAX, Reg.RBP, this.s5StackOffset);
             if (this.isS5(src)) {
-                // store [S5 + offset], S5 -> 需要两个临时寄存器
-                this.asm.push(Reg.RCX);
-                this.asm.movLoadOffset(Reg.RCX, Reg.RBP, this.s5StackOffset);
-                this.asm.movStoreOffset(Reg.RAX, offset, Reg.RCX);
-                this.asm.pop(Reg.RCX);
-            } else {
-                this.asm.movStoreOffset(Reg.RAX, offset, this.mapReg(src));
+                const tmp = this.scratchReg();
+                this.asm.push(Reg.R10);
+                this.asm.movLoadOffset(tmp, Reg.RBP, this.s5StackOffset);
+                this.asm.movLoadOffset(Reg.R10, Reg.RBP, this.s5StackOffset);
+                this.asm.movStoreOffset(tmp, offset, Reg.R10);
+                this.asm.pop(Reg.R10);
+                return;
             }
+            const srcPhys = this.mapReg(src);
+            const tmp = this.scratchReg(src);
+            this.asm.movLoadOffset(tmp, Reg.RBP, this.s5StackOffset);
+            this.asm.movStoreOffset(tmp, offset, srcPhys);
             return;
         }
         if (this.isS5(src)) {
-            // store [base + offset], S5
-            this.asm.movLoadOffset(Reg.RAX, Reg.RBP, this.s5StackOffset);
-            this.asm.movStoreOffset(this.mapReg(base), offset, Reg.RAX);
+            const basePhys = this.mapReg(base);
+            const tmp = this.scratchReg(base);
+            this.asm.movLoadOffset(tmp, Reg.RBP, this.s5StackOffset);
+            this.asm.movStoreOffset(basePhys, offset, tmp);
             return;
         }
         this.asm.movStoreOffset(this.mapReg(base), offset, this.mapReg(src));
@@ -168,37 +192,35 @@ export class X64Backend extends Backend {
 
     // 存储字节 (8位)
     storeByte(base, offset, src) {
-        const rb = this._getReg(base, Reg.R10);
-        const rs = this._getReg(src, Reg.R11);
+        const rb = this._getReg(base, this.scratchReg(src));
+        const rs = this._getReg(src, this.scratchReg(base, rb));
         this.asm.movStoreOffset8(rb, offset, rs);
     }
 
     // 加载字节 (零扩展到64位)
     loadByte(dest, base, offset) {
-        const tempReg = Reg.R10;
-        const rb = this._getReg(base, tempReg);
-
+        const rb = this._getReg(base, this.scratchReg(dest));
         if (this.isS5(dest)) {
-            // 需要另一个临时寄存器来存结果
-            const tempResult = Reg.R11;
-            this.asm.movLoadOffset8(tempResult, rb, offset);
-            this.asm.movStoreOffset(Reg.RBP, this.s5StackOffset, tempResult);
+            const tmp = this.scratchReg(base, rb);
+            this.asm.movLoadOffset8(tmp, rb, offset);
+            this.asm.movStoreOffset(Reg.RBP, this.s5StackOffset, tmp);
         } else {
             this.asm.movLoadOffset8(this.mapReg(dest), rb, offset);
         }
     }
 
     store32(base, offset, src) {
-        const rb = this._getReg(base, Reg.R10);
-        const rs = this._getReg(src, Reg.R11);
+        const rb = this._getReg(base, this.scratchReg(src));
+        const rs = this._getReg(src, this.scratchReg(base, rb));
         this.asm.movStoreOffset32(rb, offset, rs);
     }
 
     load32(dest, base, offset) {
-        const rb = this._getReg(base, Reg.R10);
+        const rb = this._getReg(base, this.scratchReg(dest));
         if (this.isS5(dest)) {
-            this.asm.movLoadOffset32(Reg.R11, rb, offset);
-            this.asm.movStoreOffset(Reg.RBP, this.s5StackOffset, Reg.R11);
+            const tmp = this.scratchReg(base, rb);
+            this.asm.movLoadOffset32(tmp, rb, offset);
+            this.asm.movStoreOffset(Reg.RBP, this.s5StackOffset, tmp);
         } else {
             this.asm.movLoadOffset32(this.mapReg(dest), rb, offset);
         }
@@ -206,15 +228,16 @@ export class X64Backend extends Backend {
 
     lea(dest, label) {
         if (this.isS5(dest)) {
-            this.asm.leaRipRel(Reg.RAX, label);
-            this.asm.movStoreOffset(Reg.RBP, this.s5StackOffset, Reg.RAX);
+            const tmp = this.scratchReg();
+            this.asm.leaRipRel(tmp, label);
+            this.asm.movStoreOffset(Reg.RBP, this.s5StackOffset, tmp);
             return;
         }
         this.asm.leaRipRel(this.mapReg(dest), label);
     }
 
     // 辅助：获取寄存器值（处理 S5）
-    _getReg(vreg, tempReg = Reg.RAX) {
+    _getReg(vreg, tempReg = Reg.R11) {
         if (this.isS5(vreg)) {
             this.asm.movLoadOffset(tempReg, Reg.RBP, this.s5StackOffset);
             return tempReg;
@@ -1029,7 +1052,7 @@ export class X64Backend extends Backend {
         }
     }
 
-    epilogue(savedRegs, stackSize) {
+    epilogue(savedRegs, stackSize, keep) {
         // 过滤 S5（它使用栈槽位，不是 push/pop）
         const regsWithoutS5 = savedRegs.filter((r) => !this.isS5(r));
         const hasS5 = savedRegs.some((r) => this.isS5(r));
@@ -1051,9 +1074,10 @@ export class X64Backend extends Backend {
             this.asm.pop(this.mapReg(regsWithoutS5[i]));
         }
 
-        // 恢复 RBP 并返回
+        // 恢复 RBP。keep=1 leaves the original return address on the stack
+        // for the tail callee's ret (jmpIndirect does not push a new one).
         this.asm.pop(Reg.RBP);
-        this.asm.ret();
+        if (!keep) this.asm.ret();
     }
 
     call(label) {
@@ -1136,7 +1160,7 @@ export class X64Backend extends Backend {
     }
 
     // 动态系统调用号：从寄存器读取调用号（__syscall 内建用）。
-    // lowering 使用 V0(=RAX) 传号，避免覆盖 A3(=RCX)；A3 在 syscall 前
+    // lowering 用独立寄存器传号(现 V0=R10),再搬进 RAX;A3 在 syscall 前
     // 搬到内核 ABI 要求的 R10，因此 getsockopt/setsockopt 等 5 参数调用可用。
     syscallReg(reg) {
         const rs = this._getReg(reg, Reg.RAX);

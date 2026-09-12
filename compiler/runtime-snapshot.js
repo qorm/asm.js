@@ -22,7 +22,7 @@ import { SYM_NAMES } from "../engine/symbols.js";
 // engine executes stale lowering code and bootstrap failures become
 // non-reproducible.  Bump the format and include the whole compiler tree in
 // the manifest below.
-const SNAPSHOT_VERSION = 51;
+const SNAPSHOT_VERSION = 52;
 const snapshots = new Map();
 const TOOLCHAIN_DIRS = ["runtime", "asm", "backend", "vm", "engine", "compiler"];
 const TOOLCHAIN_FILES = ["compiler/index.js", "compiler/runtime-snapshot.js"];

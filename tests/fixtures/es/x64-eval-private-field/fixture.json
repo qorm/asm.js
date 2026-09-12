@@ -1,0 +1,10 @@
+{
+  "description": "new Function returning a class with a private field must not call the ARM64-only _str_re_scan_unicode leaf on x64 (missing label SIGSEGV at eval-binary startup).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "1",
+    "exitCode": 0
+  }
+}

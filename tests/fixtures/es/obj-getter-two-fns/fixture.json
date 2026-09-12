@@ -1,0 +1,10 @@
+{
+  "description": "Object-literal getter temps are per-function; the second function must not reuse the first function's FP slot (flags/rethrow SIGSEGV).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ok",
+    "exitCode": 0
+  }
+}

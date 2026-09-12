@@ -14,6 +14,7 @@ export const TYPE_SET = 5; // Set
 export const TYPE_STRING = 6; // 字符串
 export const TYPE_DATE = 7; // Date
 export const TYPE_REGEXP = 8; // RegExp
+export const TYPE_PROXY = 8; // Proxy（历史 type 字节=8，与 TYPE_REGEXP 同值）
 export const TYPE_GENERATOR = 9; // Generator
 export const TYPE_COROUTINE = 10; // Coroutine
 export const TYPE_PROMISE = 11; // Promise

@@ -1,0 +1,10 @@
+var empty = Function();
+if (typeof empty !== "function") throw new Error("empty typeof");
+if (empty() !== undefined) throw new Error("empty call");
+var f = Function("return 1");
+if (typeof f !== "function") throw new Error("ret1 typeof");
+if (f() !== 1) throw new Error("ret1 call");
+var g = Function("return this");
+if (g.call() !== globalThis) throw new Error("call this");
+if (g.call(null) !== globalThis) throw new Error("call null");
+console.log("ok");

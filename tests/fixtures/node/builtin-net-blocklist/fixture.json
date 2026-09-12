@@ -1,0 +1,10 @@
+{
+  "description": "node:net BlockList addAddress/addRange/addSubnet and check for IPv4 plus IPv6 address rules",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true\nfalse\ntrue\ntrue\nfalse\ntrue\nfalse\ntrue\ntrue\nfalse\nfalse",
+    "exitCode": 0
+  }
+}

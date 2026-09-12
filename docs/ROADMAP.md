@@ -14,7 +14,7 @@
 > - 下方正文保留 2026-07-10 制定时点的表述,阶段表中已完成项以上述为准。
 
 > **并发(方向五 C2)推进到 G-M-P N>2**:共享堆 G-M-P 路线(见 §4.5 补注)已从设计研究执行到真多核——双 M 工作窃取调度(GOMAXPROCS=2)→ per-P 无锁分配(M4)+ STW 安全点(M5)→ 真多 M stop-the-world GC 周期 → 泛化到 N>2(**GOMAXPROCS=3 真 3 线程窃取 + N 路 STW GC**,linux-arm64 Docker 验证)。`GOMAXPROCS=1` 保持字节一致自举定点;跨 M channel 唤醒、非 M0 协调者、x64 段寄存器 TLS 为已知余项。
-> - **E4 test262 落地首个基线**:真实 conformance harness(`tests/test262/run.mjs`,含 frontmatter/includes/negative 机制)已上线;首个基线 **20.55%**(2026-07-19 时点历史值,当前 **43.67%**,2822/6462;stride-5 抽样运行 6462 例 / 当时 PASS 1328,TypedArray 区经 v0.2 构造器全局值自 0% 救起)。距 M4 的 ≥80% 目标尚远,作为 M4 进行中的量化锚点。
+> - **E4 test262**:真实 conformance harness(`tests/test262/run.mjs`)已上线。官方 stride-5 样本现为 **6276/6276 = 100%**(macos-arm64,2026-09-08;口径见 [FACTS.md](./FACTS.md))。20.55%(2026-07-19)/43.67%(2026-07-27,2822/6462)为历史值。
 > - **Node crypto 已到 AES-GCM/SHA-512/HKDF**(密文与派生密钥对 Node 逐字节一致);同期 N3 深度推进还有真实 zlib、async net/HTTP/UDP、streams/child_process 等。
 > - **性能(v0.2 新进展)**:静态可解析方法调用的编译期去虚拟化(自编译 −7.5%),对象 shape/隐藏类 IC 专项进行中(docs/SHAPE_IC_DESIGN.md)。
 > - 下方正文与 §5 里程碑表仍保留 2026-07-10 制定时点表述;各里程碑实际状态见 §5 表新增「实际状态」列。
@@ -118,7 +118,7 @@ asmjs_free(ctx);
 | **E3 内建完备** | 缺失/半残的内建对象 | `JSON.stringify/parse` **主体已落地**(2026-07-10,编译器注入纯 JS shim —— 内建 shim 机制首铺,后续内建复用;余 replacer/reviver/缩进/toJSON)、**自研 RegExp 引擎**(回溯式,先 BMP 后 Unicode)、`Date` 完整、`Number` 打印精度(15 位舍入已落地,余 shortest round-trip 第 16 位边角)、`Proxy/Reflect`(靠后)、`Intl` **非目标** |
 | **E4 度量体系** | 从"fixture 绿"升级到行业标尺 | 引入 **test262 子集**跑分(先挑 language/ + built-ins/ 中已实现面),CI 输出通过率仪表盘,README 公布数字 |
 
-> 注(2026-07-19 补):E1 行"`with` 明确列为非目标"为制定时点立场,与 [ES_SUPPORT.md](./ES_SUPPORT.md) 已标 ✅ 矛盾——`with` 实际已落地(读/赋值/更新/方法解析,字节门控使非 `with` 代码产物不变),以 ES_SUPPORT.md 为准,此处保留原文备查。E4 已按此行设想落地:test262 harness 已上线,首个基线 20.55%(2026-07-19 时点历史值,当前 43.67%,见 `tests/test262/last_run_summary.json`)。
+> 注(2026-07-19 补):E1 行"`with` 明确列为非目标"为制定时点立场,与 [ES_SUPPORT.md](./ES_SUPPORT.md) 已标 ✅ 矛盾——`with` 实际已落地(读/赋值/更新/方法解析,字节门控使非 `with` 代码产物不变),以 ES_SUPPORT.md 为准,此处保留原文备查。E4 已按此行设想落地:test262 harness 已上线;当前官方样本数字见 [FACTS.md](./FACTS.md) 与 `tests/test262/last_report.md`(勿用过期的 `last_run_summary.json` 当头条)。
 
 ### 2.2 工程原则
 
@@ -207,12 +207,12 @@ C3/C4 严格在 C2 之后。风险:线程 × 保守 GC = 每线程栈根扫描 +
 | 里程碑 | 内容 | 验收 | 实际状态(2026-07-20,v0.2) |
 |--------|------|------|------|
 | **M0**(✅ 2026-07-10) | 分代 GC 收尾 + 寄存器分配器阶段2 | 已达成:影子自编译 0 MISS;分代转正缺省(RSS −30%);span 页模型 S1;阶段2 实验定论(阶段3 = 每函数 IR 线性扫描) | ✅ 已达成(维持原判) |
-| **M1** | E1 语法扫尾 + E4 test262 接入 | 零静默退化;test262 仪表盘上线 | **大部分达成**:test262 harness 已上线(基线 20.55% 为 2026-07-19 时点历史值,当前 43.67%);E1 语法大体扫尾,但基线仍暴露 COMPILE_FAIL 存量(parser 缺口),"零静默退化"未经全量证实 |
+| **M1** | E1 语法扫尾 + E4 test262 接入 | 零静默退化;test262 仪表盘上线 | **已达成(官方样本)**:test262 harness 已上线;官方 stride-5 6276/6276=100%(macos-arm64,见 FACTS.md)。E1 语法大体扫尾;全量 eligible 变体仍有 notRun |
 | **M2** | N1 解析器 + N2 CJS 语义 | 解析测试向量全绿 | **已达成**:N1/N2 已落地;环形 `require()`(N2 循环依赖语义)已补齐,fixtures 首次全绿 |
 | **M3** | L1a 静态库(与 M2 并行) | C 宿主 demo 跑通 | **未启动**:CHANGELOG 无 L1a 对应条目(路线被 L2 route B 与 G-M-P 并发线挤占) |
-| **M4** | E2 语义 + E3 JSON/Number;N3 fs/path/buffer/events | test262 子集 ≥ 80% | **进行中**:test262 20.55%(2026-07-19 时点历史值,当前 43.67%)≪ 80% 目标;E2/E3 持续收口(描述符/枚举序/JSON 全参/Dragon4),N3 推进至 streams/child_process/net/crypto 深度 |
-| **M5** | RegExp 引擎;N4 包验证集(首批 10 包);L1b/L1c | 10 包全绿;dylib demo | **部分达成**:自研 RegExp 引擎已落地(回溯式,大面完整,余 `\p{}`/`v` 标志等,见 ES_SUPPORT.md);**N4 包验证集与 L1b/L1c 未启动** |
-| **M6** | N5 `asm.js build`;E3 收尾;N4 二批 10 包;L2a 预研 | 真实 CLI 包单二进制;test262 ≥ 90% | **大部分未启动**:仅 L2a 预研被 route B 超前覆盖(全局 eval/`new Function` 已打通,直接 eval 词法捕获已完成);**N5、N4(含二批)未启动**,E3 收尾(Date 完整等)仍在进行 |
+| **M4** | E2 语义 + E3 JSON/Number;N3 fs/path/buffer/events | test262 子集 ≥ 80% | **已达成(官方样本)**:官方 stride-5 6276/6276=100%(macos-arm64,2026-09-08;口径见 FACTS.md)。E2/E3 主体已收口;N3 已推进至 streams/child_process/net/crypto 深度 |
+| **M5** | RegExp 引擎;N4 包验证集(首批 10 包);L1b/L1c | 10 包全绿;dylib demo | **部分达成**:自研 RegExp 引擎已落地(回溯式,大面完整,含 `\p{...}`;余 `v` 标志等,见 ES_SUPPORT.md);**N4 包验证集与 L1b/L1c 未启动** |
+| **M6** | N5 `asm.js build`;E3 收尾;N4 二批 10 包;L2a 预研 | 真实 CLI 包单二进制;test262 ≥ 90% | **test262 ≥90% 已达成(官方样本 100%)**;N5/N4 未启动;L2a 被 route B 超前覆盖(全局 eval/`new Function` 与直接 eval 词法捕获已完成) |
 
 每个里程碑的固定门禁:`node scripts/run-fixtures.mjs` 全绿 + ARM64 双目标 `gen2 == gen3` 回放 + 性能不回退(自编译耗时 ±5% 内)。
 

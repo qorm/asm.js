@@ -1,0 +1,10 @@
+{
+  "description": "Function() constructs a callable; sloppy .call() with missing/null thisArg is globalThis (OrdinaryCallBindThis).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ok",
+    "exitCode": 0
+  }
+}

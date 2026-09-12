@@ -4380,6 +4380,20 @@ export class AllocatorGenerator {
         asm.addDataLabel("_call_new_target");
         asm.addDataQword(JS_UNDEFINED);
 
+        // [TCO] PrepareForTailCall 暂存：epilogue 会恢复 caller S0-S3，故先把
+        // env/fn/argc/regs 摞进数据段，再 epilogueKeep 后 reload 并 jmpIndirect。
+        // 普通数据 qword，与 _call_argc 同一 lea 约定（x64/arm64 共享）。
+        asm.addDataLabel("_tco_env");
+        asm.addDataQword(0);
+        asm.addDataLabel("_tco_fn");
+        asm.addDataQword(0);
+        asm.addDataLabel("_tco_argc");
+        asm.addDataQword(0);
+        asm.addDataLabel("_tco_regs");
+        for (let i = 0; i < 6; i = i + 1) asm.addDataQword(0);
+        asm.addDataLabel("_tco_argv");
+        for (let i = 0; i < 16; i = i + 1) asm.addDataQword(0);
+
         // [gen.return] 生成器 return(v) 注入通道:_generator_return 对挂起协程置
         // pending=1、value=v 后 resume;yield 恢复点(emitYieldValue)见 pending 即清零、
         // 取 value 作返回值、内联跑挂起点与函数出口间的 finalizer 后跳 returnLabel。

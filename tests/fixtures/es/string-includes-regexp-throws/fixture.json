@@ -1,0 +1,10 @@
+{
+  "description": "String includes/startsWith/endsWith IsRegExp: naked TYPE_REGEXP literals and boxed RegExp both throw TypeError.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "includes=TypeError\nstartsWith=TypeError\nendsWith=TypeError\nboxed=TypeError",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "1024 sibling {} literals must reuse object-build temps so _main's 8 KiB frame is not overrun (Array.sort 2048-element stability SIGBUS).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ok",
+    "exitCode": 0
+  }
+}

@@ -31,6 +31,9 @@ export class CompileContext {
         // float64 位/0x7FF8),读写走整数路径免 _to_int32/fmov;仅在安全 for 循环
         // 体内有效,循环出口物化回 float64。见 unboxing-int-residency-design 记忆。
         this.rawIntVars = {}; // 变量名 -> true
+        // [P3.1] 函数级证明恒持 raw float64 的非参数非装箱局部。Identifier 作
+        // 算术操作数时跳过恒等 coerce。与 boxedVars 同位分析,见 lang/analysis/rawfloat.js。
+        this.rawFloatVars = {}; // 变量名 -> true
         // [解箱① P4.1] 循环内浮点累加器驻留 caller-saved FP 寄存器(d2+)的变量:
         // 仅在 call-free 循环体内有效(caller-saved FP 跨迭代存活、body 无 call 不被腐蚀);
         // 名 -> FP 寄存器号;`s=s<op>E` 直发 f<op> d_reg,d_reg,d_tmp,免 slot 往返/coerce
@@ -93,6 +96,16 @@ export class CompileContext {
         // 用户函数 LSRA:局部名 → T*(与 spill home 同槽)。raVm 在 beginRecord 期间挂上。
         this.raVm = null;
         this.localTemps = null;
+        // 表达式左值暂存栈:嵌套 `a+(b+c)` 按深度复用,不每算子 allocLocal。
+        this._esPool = null;
+        this._esDepth = 0;
+        // Per-function object/array literal FP temps. Offsets are frame-local;
+        // leaking them across compileFunction / compileFunctionBody reuses the
+        // previous function's slot (second `{ get x(){} }` SIGSEGV).
+        this._objTmpSlots = null;
+        this._objTmpDepth = 0;
+        this._arrTmpSlots = null;
+        this._arrTmpDepth = 0;
         // Engine fragments run inside the self-hosted x64 compiler. Its compact
         // Map can lose equal string keys, so fragments opt into a tiny
         // content-based side table for local bindings. Normal AOT contexts keep
@@ -183,7 +196,8 @@ export class CompileContext {
         }
         this.varTypes[name] = type;
         // 录制中 / 在线 RA 为普通局部绑 T*(跳过 __ 合成名);装箱/裸 int 读路径仍走 FP,忽略 T*。
-        // 关:RA_NO_TEMP=1
+        // 形参同样绑 T*:LSRA 用 mention∪CFG 活区间,跨 call 着 callee-saved S,
+        // call-free 着 caller-saved V(与 LLVM virtreg 一致)。关:RA_NO_TEMP=1
         if (!(typeof process !== "undefined" && process.env && process.env.RA_NO_TEMP) &&
             this.raVm && (this.raVm._raOnline || this.raVm._recN >= 0) && name &&
             !(name.length >= 2 && name.charCodeAt(0) === 95 && name.charCodeAt(1) === 95)) {
@@ -194,6 +208,44 @@ export class CompileContext {
             }
         }
         return off;
+    }
+
+    // 匿名表达式暂存:录制期绑 T*(只经 mov,flush 走 _emitTempMov,不漏进 backend)。
+    // 与局部同 spill home;LSRA 跨 call 着 S,call-free 着 V。
+    allocScratchSlot() {
+        this.stackOffset = this.stackOffset + 8;
+        const off = -CALLEE_SAVED_AREA - this.stackOffset;
+        let tmp = null;
+        if (!(typeof process !== "undefined" && process.env && process.env.RA_NO_TEMP) &&
+            this.raVm && (this.raVm._raOnline || this.raVm._recN >= 0)) {
+            tmp = this.raVm.newTemp(off) || null;
+        }
+        return { off: off, tmp: tmp };
+    }
+
+    pushExprScratch() {
+        if (!this._esPool) this._esPool = [];
+        const i = this._esDepth;
+        this._esDepth = i + 1;
+        if (i >= this._esPool.length) {
+            this._esPool.push(this.allocScratchSlot());
+            return this._esPool[i];
+        }
+        const s = this._esPool[i];
+        // Pool objects outlive beginRecord/endRecord. A leftover T* has no
+        // home after the previous recording and must not reach the backend.
+        if (this.raVm && this.raVm._recN >= 0) {
+            if (!s.tmp || !this.raVm._tempHomes || this.raVm._tempHomes[s.tmp] === undefined) {
+                s.tmp = this.raVm.newTemp(s.off) || null;
+            }
+        } else {
+            s.tmp = null;
+        }
+        return s;
+    }
+
+    popExprScratch() {
+        if (this._esDepth > 0) this._esDepth = this._esDepth - 1;
     }
 
     // 获取局部变量偏移
@@ -248,6 +300,12 @@ export class CompileContext {
         return this.rawIntVars[name] === true;
     }
 
+    // [P3.1] 槽内恒为 raw float64 位(合法 JS number 形态)。守卫:恒为布尔标记。
+    isRawFloatVar(name) {
+        const t = this.rawFloatVars;
+        return !!(t && t[name] === true);
+    }
+
     // [解箱① P4.1] 返回浮点累加器的 FP 寄存器号(未驻留返 0)。守卫:恒为正整数。
     getFpAccum(name) {
         const r = this.fpAccumVars[name];
@@ -287,6 +345,27 @@ export class CompileContext {
             }
         }
         this.stackOffset = saved.stackOffset;
+        // Scratch / object-literal / array-literal homes are FP slots.
+        // Rolling stackOffset back without dropping those pools lets the
+        // next push reuse a home that allocLocal just handed to a new
+        // binding. `_esPool` used to clobber class-expr method tables;
+        // `_objTmpSlots` did the same to shape_ptr@48 (boxed 0x7FFD stored
+        // as a raw pointer → Function()/compileFragment SIGSEGV).
+        const water = -CALLEE_SAVED_AREA - saved.stackOffset;
+        if (this._esDepth === 0) {
+            this._esPool = null;
+        } else if (this._esPool) {
+            let n = 0;
+            for (let i = 0; i < this._esPool.length; i = i + 1) {
+                const s = this._esPool[i];
+                if (s && s.off >= water) {
+                    this._esPool[n] = s;
+                    n = n + 1;
+                }
+            }
+            this._esPool.length = n;
+        }
+        this._dropStaleLiteralTemps(water);
         this.scopeDepth = saved.scopeDepth;
         this.breakLabel = saved.breakLabel;
         this.continueLabel = saved.continueLabel;
@@ -305,6 +384,44 @@ export class CompileContext {
     setLoopLabels(breakLabel, continueLabel) {
         this.breakLabel = breakLabel;
         this.continueLabel = continueLabel;
+    }
+
+    // Drop object/array literal FP temps that sit below the live frame.
+    // `off >= water` is still in-frame (same rule as `_esPool`).
+    _dropStaleLiteralTemps(water) {
+        if (this._objTmpDepth === 0) {
+            this._objTmpSlots = null;
+        } else if (this._objTmpSlots) {
+            let n = 0;
+            for (let i = 0; i < this._objTmpSlots.length; i = i + 1) {
+                const off = this._objTmpSlots[i];
+                if (typeof off === "number" && off >= water) {
+                    this._objTmpSlots[n] = off;
+                    n = n + 1;
+                }
+            }
+            this._objTmpSlots.length = n;
+            if (this._objTmpDepth > n) this._objTmpDepth = n;
+        }
+        if (this._arrTmpDepth === 0) {
+            this._arrTmpSlots = null;
+        } else if (this._arrTmpSlots) {
+            let n = 0;
+            for (let i = 0; i < this._arrTmpSlots.length; i = i + 1) {
+                const off = this._arrTmpSlots[i];
+                if (typeof off === "number" && off >= water) {
+                    this._arrTmpSlots[n] = off;
+                    n = n + 1;
+                }
+            }
+            this._arrTmpSlots.length = n;
+            if (this._arrTmpDepth > n) this._arrTmpDepth = n;
+        }
+    }
+
+    fpOffLive(off) {
+        if (typeof off !== "number") return false;
+        return off >= (-CALLEE_SAVED_AREA - this.stackOffset);
     }
 
     // 注册函数声明

@@ -1,0 +1,10 @@
+{
+  "description": "Rest parameter length follows argc, including middle undefined / apply holes.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ok",
+    "exitCode": 0
+  }
+}

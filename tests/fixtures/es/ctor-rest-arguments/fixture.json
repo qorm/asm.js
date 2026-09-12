@@ -1,0 +1,10 @@
+{
+  "description": "Class constructor rest must not smash arguments: arguments[0] is the first actual, not leftover 1.5e-323.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ok",
+    "exitCode": 0
+  }
+}

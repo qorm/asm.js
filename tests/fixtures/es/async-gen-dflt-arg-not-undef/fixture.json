@@ -1,0 +1,10 @@
+{
+  "description": "Async-generator identifier defaults: provided args 1-5 stay in FDI transfer; 4th actual is 0 not a leftover object.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "1 0 0 0 0 0 0",
+    "exitCode": 0
+  }
+}

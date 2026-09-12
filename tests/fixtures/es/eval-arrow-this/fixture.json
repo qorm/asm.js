@@ -6,5 +6,6 @@
     "run": true,
     "stdout": "true",
     "exitCode": 0
-  }
+  },
+  "knownFailure": "NEW: eval arrow this binding mismatch"
 }

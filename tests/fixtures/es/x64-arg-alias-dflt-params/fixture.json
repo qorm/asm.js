@@ -1,0 +1,10 @@
+{
+  "description": "x64 incoming A0-A5 snapshot before V1/V2/async-exc clobber: 4th arg stays 0. Object rest from a string does not SIGSEGV. TypedArray.slice copies instead of skipping (V0!==RET cmp).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "0\nfalse\n1\na\nb\n40\n41",
+    "exitCode": 0
+  }
+}

@@ -1,9 +1,11 @@
 # asm.js 接管规划 (plan.md)
 
+> 口径与版本/门禁/test262 数字以 [docs/FACTS.md](./docs/FACTS.md) 为准。本文档是执行蓝图,不复述动态数字。
+>
 > 接管日期: 2026-07-19 · 接管时点能力基线: dev @ v1.5.52 (fixtures 362/362 全绿, gen1==gen2==gen3 字节级定点)
 > 本文档是接管后的总执行蓝图,取代 ROADMAP 中已滞后的里程碑表,作为进度跟踪的执行蓝图(非唯一事实源,见下注)。
 
-> **2026-07-29 重定基线**:上行的 "v1.5.52" 是 2026-07-19 接管时点的**能力基线**(重新初始化前的代码状态),**不是当前版本号**。项目已于 2026-07-19 公开重新初始化并更名 asm.js,版本号自 v0.1 重新起算;当前为 **v0.3.x**(最新 tag v0.3.4,dev HEAD a678f85,cli.js VERSION=0.3.5 未提交)。fixtures 现状:manifest **385**(es 253 / modules 28 / node 104),门禁要求发现数**精确等于** `BASELINE_FIXTURES`(当前 **385**)且 FAIL==0、XPASS==0(见 §2 铁律1 与 `scripts/bootstrap-gate.sh`)。权威划分:fixture 基线的权威值是 `scripts/bootstrap-gate.sh` 的 `BASELINE_FIXTURES`;当前事实(版本号 / test262 数字 / 定点状态)的权威值是进度台账(`docs/progress/`)与 `tests/test262/last_report.md`;本文档是执行蓝图,不复述这些动态数字以免漂移。
+> **2026-07-29 重定基线**:上行的 "v1.5.52" 是 2026-07-19 接管时点的**能力基线**(重新初始化前的代码状态),**不是当前版本号**。项目已于 2026-07-19 公开重新初始化并更名 asm.js,版本号自 v0.1 重新起算。当前版本、fixtures 发现数、test262 口径与五目标矩阵以 [docs/FACTS.md](./docs/FACTS.md) 为准;fixture 门禁下限是 `scripts/bootstrap-gate.sh` 的 `BASELINE_FIXTURES`。本文档是执行蓝图,不复述这些动态数字以免漂移。
 
 > **2026-09-12 架构蓝图**:中长期实施计划与逐日进度见
 > [docs/MASTER_IMPLEMENTATION_PLAN.md](./docs/MASTER_IMPLEMENTATION_PLAN.md)
@@ -16,7 +18,7 @@
 | 事项 | 结果 |
 |---|---|
 | 前代 AI 助手痕迹清理 | ✅ `.claude/`(1.5GB, 60 worktree)已删;953 个提交的 `Co-Authored-By` 尾注已从全部历史剥离;100 个 `worktree-agent-*`/`worktree-wf_*` 分支已删;5 个 tag(v1.4.1–v1.4.5)附注重打;test262 摘要残留路径已修正 |
-| 回滚保险 | `jsbin-backup-2026-07-19.bundle`(清理前全量引用快照) |
+| 回滚保险 | 清理前全量引用快照（离线 bundle） |
 | 保留分支 | `dev`(主开发)、`main`(与 dev 同点)、`work`/`work2`/`tmp_fsrepro`(各有 1–3 个未合并提交,待甄别后并入或删除) |
 | 验证 | 改写仅动提交信息,tree 逐字节不变;fixtures 362/362 通过 |
 | 待办(已决议) | ~~远程 force-push 同步~~ → 改为**重新初始化**:仓库更名 `qorm/asm.js`(产品正式定名 asm.js,主页 https://asm.js.cn),历史重置为单提交 v0.1 重新编号(非回退),仅 `main`/`dev` 双分支,旧 v1.x tags/releases 全部退役;releases 说明文字已备份至 `.agent-work/releases-backup/` |
@@ -25,11 +27,11 @@
 
 零依赖、自举的 JavaScript→原生 AOT 编译器:JS 源码 →(lang 前端)→(compiler 上帝类直接 codegen)→(vm 虚拟指令 + 寄存器提升)→(backend 物理翻译)→(asm 编码/重定位)→(binary 五格式打包);运行时由 `runtime/*Generator` 在编译期现生成机器码;值表示为 NaN-boxing;分代 GC 默认开启;G-M-P 并行调度已到 N>2(仅 linux-arm64 真体)。
 
-**当前阶段定位**(接管时点): v1.5.x 修复季尾声 + G-M-P 一期收官的交汇点。ES/Node 从"补能力"转入"度量驱动收口"(test262 20.4% 是接管时点的北极星**历史值**,当前 43.67%);L2 引擎库(route B)已超前交付,L1 未启动;文档系统性滞后代码 10+ 个版本。
+**当前阶段定位**(接管时点): v1.5.x 修复季尾声 + G-M-P 一期收官的交汇点。ES/Node 从"补能力"转入"度量驱动收口"(test262 20.4% 是接管时点的北极星**历史值**;当前官方样本数字见 [docs/FACTS.md](./docs/FACTS.md));L2 引擎库(route B)已超前交付。
 
 ## 2. 治理铁律(每次改动必须遵守,源自 BOOTSTRAP_RULES §2/§3)
 
-1. **fixtures 真值**: `node scripts/run-fixtures.mjs` 发现的 manifest 数须精确等于 `scripts/bootstrap-gate.sh` 的 `BASELINE_FIXTURES`(当前 385),且 FAIL==0、XPASS==0、PASS+XFAIL==发现数;新增 fixture 时同步上调 BASELINE_FIXTURES,绝不降低。
+1. **fixtures 真值**: `node scripts/run-fixtures.mjs` 发现的 manifest 数须精确等于 `scripts/bootstrap-gate.sh` 的 `BASELINE_FIXTURES`(当前值见 [docs/FACTS.md](./docs/FACTS.md)),且 FAIL==0、XPASS==0、PASS+XFAIL==发现数;新增 fixture 时同步上调 BASELINE_FIXTURES,绝不降低。
 2. **自举定点不破**: 任何改动后 macos-arm64 全链 `gen1==gen2==gen3` 字节一致;探针字节不变不构成安全证据。
 3. **gen0 最小复现**: 每个修复配 repro,与 Node 行为对拍。
 4. **内存布局原子性**: 对象头/数组头变更必须单次提交同步所有遍历站点。

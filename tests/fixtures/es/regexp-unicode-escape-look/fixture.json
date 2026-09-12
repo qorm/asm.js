@@ -1,0 +1,10 @@
+{
+  "description": "parseAtom must not object-literal a look node or utf8Str atom (new RegExp('(?=a)' / '\\\\u00FF') _object_set NULL / SIGSEGV).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ok",
+    "exitCode": 0
+  }
+}

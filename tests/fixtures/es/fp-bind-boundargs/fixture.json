@@ -1,0 +1,11 @@
+{
+  "description": "Function.prototype.bind.call with bound args must not add(reg, SP, reg) on ARM64 (SP encodes as XZR → load [0] SIGSEGV).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ok",
+    "exitCode": 0
+  },
+  "knownFailure": "NEW: Function.bind prebound args crash"
+}

@@ -216,10 +216,11 @@ export const OperatorCompiler = {
             if (ARITH_OPS_AS_INT[op]) {
                 // 左→右求值序(规范 GetValue 顺序;抛错测例依赖)
                 this.compileExpressionAsInt(expr.left);
-                this.vm.push(VReg.RET);
+                const leftH = this._holdExpr(VReg.RET);
                 this.compileExpressionAsInt(expr.right);
                 this.vm.mov(VReg.V1, VReg.RET); // V1 = right
-                this.vm.pop(VReg.RET);          // RET = left
+                this._loadHeldExpr(leftH, VReg.RET);
+                this._releaseHeldExpr();
 
                 switch (op) {
                     case "+":
@@ -402,11 +403,11 @@ export const OperatorCompiler = {
                 leftType === Type.DATE || rightType === Type.DATE) {
                 // [fix-stack-corrupt] 使用 FP 槽保存左值,避免 push/pop 异常路径栈失衡
                 this.compileExpression(expr.left);
-                const tmpSlot = this.ctx.allocLocal("__tmp_add_left");
-                this.vm.store(VReg.FP, tmpSlot, VReg.RET);
+                const addL = this._holdExpr(VReg.RET);
                 this.compileExpression(expr.right);
                 this.vm.mov(VReg.A1, VReg.RET);
-                this.vm.load(VReg.A0, VReg.FP, tmpSlot);
+                this._loadHeldExpr(addL, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_js_add");
                 return;
             }
@@ -419,10 +420,11 @@ export const OperatorCompiler = {
             "<<": "_js_bshl", ">>": "_js_bshr", ">>>": "_js_bushr" };
         if (bitwiseFns[op]) {
             this.compileExpression(expr.left);
-            this.vm.push(VReg.RET);
+            const bitL = this._holdExpr(VReg.RET);
             this.compileExpression(expr.right);
-            this.vm.mov(VReg.A1, VReg.RET); // right
-            this.vm.pop(VReg.A0);           // left
+            this.vm.mov(VReg.A1, VReg.RET);
+            this._loadHeldExpr(bitL, VReg.A0);
+            this._releaseHeldExpr();
             this.vm.call(bitwiseFns[op]);
             return;
         }
@@ -435,10 +437,11 @@ export const OperatorCompiler = {
             "<": "lt", "<=": "le", ">": "gt", ">=": "ge" };
         if (cmpBig[op] && (isBigOperand(expr.left) || isBigOperand(expr.right))) {
             this.compileExpression(expr.left);
-            this.vm.push(VReg.RET);
+            const bigL = this._holdExpr(VReg.RET);
             this.compileExpression(expr.right);
             this.vm.mov(VReg.A1, VReg.RET);
-            this.vm.pop(VReg.A0);
+            this._loadHeldExpr(bigL, VReg.A0);
+            this._releaseHeldExpr();
             const kind = cmpBig[op];
             const setTrue = () => { this.vm.movImm64(VReg.RET, 0x7ff9000000000001n); };
             const setFalse = () => { this.vm.movImm64(VReg.RET, 0x7ff9000000000000n); };
@@ -483,10 +486,11 @@ export const OperatorCompiler = {
         const arithBig = { "-": "_js_bsub", "*": "_js_bmul", "/": "_js_bdiv", "%": "_js_bmod", "**": "_js_bpow" };
         if (arithBig[op] && (isBigOperand(expr.left) || isBigOperand(expr.right))) {
             this.compileExpression(expr.left);
-            this.vm.push(VReg.RET);
+            const barL = this._holdExpr(VReg.RET);
             this.compileExpression(expr.right);
-            this.vm.mov(VReg.A1, VReg.RET); // right
-            this.vm.pop(VReg.A0);           // left
+            this.vm.mov(VReg.A1, VReg.RET);
+            this._loadHeldExpr(barL, VReg.A0);
+            this._releaseHeldExpr();
             this.vm.call(arithBig[op]);
             return;
         }
@@ -508,10 +512,11 @@ export const OperatorCompiler = {
         };
         if (relHelper[op] && !(staticNumeric(expr.left) && staticNumeric(expr.right))) {
             this.compileExpression(expr.left);
-            this.vm.push(VReg.RET);
+            const relL = this._holdExpr(VReg.RET);
             this.compileExpression(expr.right);
-            this.vm.mov(VReg.A1, VReg.RET); // right
-            this.vm.pop(VReg.A0);           // left
+            this.vm.mov(VReg.A1, VReg.RET);
+            this._loadHeldExpr(relL, VReg.A0);
+            this._releaseHeldExpr();
             this.vm.call(relHelper[op]);
             return;
         }
@@ -540,10 +545,11 @@ export const OperatorCompiler = {
         if (isIntOp && !needsFloatDiv) {
             // int 类型：使用整数运算(左→右求值)
             this.compileExpressionAsInt(expr.left);
-            this.vm.push(VReg.RET);
+            const intL = this._holdExpr(VReg.RET);
             this.compileExpressionAsInt(expr.right);
             this.vm.mov(VReg.V1, VReg.RET); // V1 = right
-            this.vm.pop(VReg.RET);          // RET = left
+            this._loadHeldExpr(intL, VReg.RET);
+            this._releaseHeldExpr();
 
             // 注:compileBinaryExpression 是**装箱值**入口(int 上下文另走
             // compileExpressionAsInt 的独立递归,line 206)。故 +/-/* 的裸 int 结果必须
@@ -679,8 +685,13 @@ export const OperatorCompiler = {
                         return;
                     }
                 }
+                // [P3.1] 已证槽内恒 raw float64:load 即操作数,跳过恒等 coerce。
+                if (this.ctx.isRawFloatVar(operand.name)) {
+                    this.compileExpression(operand);
+                    return;
+                }
                 this.compileExpression(operand);
-                this.emitNumberCoerceFast(); // [P3.1] 内联快路守卫
+                this.emitNumberCoerceFast();
                 return;
             }
 
@@ -824,10 +835,11 @@ export const OperatorCompiler = {
         if (op === "==" || op === "!=") {
             // 左→右求值序
             compileOperandAsJSValue(expr.left);
-            this.vm.push(VReg.RET);
+            const eqL = this._holdExpr(VReg.RET);
             compileOperandAsJSValue(expr.right);
             this.vm.mov(VReg.A1, VReg.RET);
-            this.vm.pop(VReg.A0);
+            this._loadHeldExpr(eqL, VReg.A0);
+            this._releaseHeldExpr();
             this.vm.call("_abstract_eq");
             // `!=` 是 `==` 的取反。此前对 `!=` 直接返回 _abstract_eq 结果**未取反**——
             // `x != null` 等恒返 `x == null`(倒置),破坏 `arr.filter(x=>x!=null)` 等常见
@@ -1140,17 +1152,13 @@ export const OperatorCompiler = {
                 this.vm.mov(VReg.A0, VReg.RET);
                 this.vm.call("_js_unbox");
                 this.vm.store(VReg.FP, inObjOff, VReg.RET);
-                // symbol 键:按身份判存在,走 _object_has(装箱键 + _object_key_eq,与 hasOwn
-                // 一致)。此前 _getStrContent(symbol)+_prop_in 逐字节比 → `sym in o` 恒 false。
-                // (own-only:继承的 symbol 键极罕见,记偏差)
                 this.vm.load(VReg.A0, VReg.FP, inKeyOff);
                 this.vm.call("_is_symbol");
                 this.vm.cmpImm(VReg.RET, 0);
                 const inSymKey = this.ctx.newLabel("in_symkey");
                 this.vm.jne(inSymKey);
-                // 非 symbol:原字符串内容路径(数值键规范化 + 原型链感知 _prop_in)
                 this.vm.load(VReg.A0, VReg.FP, inKeyOff);
-                this.vm.call("_js_prop_key"); // [#39] 数值键规范化(1 in o ≡ "1" in o)
+                this.vm.call("_js_prop_key");
                 this.vm.mov(VReg.A0, VReg.RET);
                 this.vm.call("_getStrContent");
                 this.vm.mov(VReg.A1, VReg.RET);
@@ -1159,7 +1167,7 @@ export const OperatorCompiler = {
                 this.vm.jmp(inResultReady);
                 this.vm.label(inSymKey);
                 this.vm.load(VReg.A0, VReg.FP, inObjOff);
-                this.vm.load(VReg.A1, VReg.FP, inKeyOff); // 装箱 symbol 键
+                this.vm.load(VReg.A1, VReg.FP, inKeyOff);
                 this.vm.call("_object_has");
             }
             this.vm.label(inResultReady);
@@ -1182,10 +1190,11 @@ export const OperatorCompiler = {
         // `if (f() === x)` 调 f 两次(副作用重放,长期潜伏)。
         if (op === "==" || op === "===" || op === "!=" || op === "!==") {
             compileOperandAsJSValue(expr.left);
-            this.vm.push(VReg.RET);
+            const eqL = this._holdExpr(VReg.RET);
             compileOperandAsJSValue(expr.right);
             this.vm.mov(VReg.A1, VReg.RET);
-            this.vm.pop(VReg.A0);
+            this._loadHeldExpr(eqL, VReg.A0);
+            this._releaseHeldExpr();
             this.vm.call(op === "==" || op === "!=" ? "_abstract_eq" : "_strict_eq");
             if (op === "==" || op === "===") return;
             // != / !==:对相等结果取反。
@@ -1221,18 +1230,16 @@ export const OperatorCompiler = {
         // Integer fast-path above already returned. `+` stays on the concat/add path.
         if (op === "-" || op === "*" || op === "/" || op === "%") {
             this.compileExpression(expr.left);
-            const arL = this.ctx.allocLocal(`__ar_l_${this.nextLabelId()}`);
-            this.vm.store(VReg.FP, arL, VReg.RET);
+            const arL = this._holdExpr(VReg.RET);
             this.compileExpression(expr.right);
-            const arR = this.ctx.allocLocal(`__ar_r_${this.nextLabelId()}`);
-            this.vm.store(VReg.FP, arR, VReg.RET);
-            this.vm.load(VReg.RET, VReg.FP, arL);
+            const arR = this._holdExpr(VReg.RET);
+            this._loadHeldExpr(arL, VReg.RET);
             this.emitNumberCoerceFast();
-            this.vm.store(VReg.FP, arL, VReg.RET);
-            this.vm.load(VReg.RET, VReg.FP, arR);
+            this._holdStore(arL, VReg.RET);
+            this._loadHeldExpr(arR, VReg.RET);
             this.emitNumberCoerceFast();
             this.vm.mov(VReg.V1, VReg.RET);
-            this.vm.load(VReg.RET, VReg.FP, arL);
+            this._loadHeldExpr(arL, VReg.RET);
             this.vm.fmovToFloat(0, VReg.RET);
             this.vm.fmovToFloat(1, VReg.V1);
             if (op === "-") this.vm.fsub(0, 0, 1);
@@ -1241,6 +1248,8 @@ export const OperatorCompiler = {
             else this.vm.fmod(0, 0, 1);
             this.vm.fmovToInt(VReg.RET, 0);
             if (mightBeNaN) this.emitNaNCanon();
+            this._releaseHeldExpr();
+            this._releaseHeldExpr();
             return;
         }
 
@@ -1249,33 +1258,32 @@ export const OperatorCompiler = {
         // (exponentiation/order-of-evaluation)。数值热路径(+-*/)不走此分支。
         if (op === "**") {
             this.compileExpression(expr.left);
-            const powL = this.ctx.allocLocal(`__pow_l_${this.nextLabelId()}`);
-            this.vm.store(VReg.FP, powL, VReg.RET);
+            const powL = this._holdExpr(VReg.RET);
             this.compileExpression(expr.right);
-            const powR = this.ctx.allocLocal(`__pow_r_${this.nextLabelId()}`);
-            this.vm.store(VReg.FP, powR, VReg.RET);
-            this.vm.load(VReg.RET, VReg.FP, powL);
+            const powR = this._holdExpr(VReg.RET);
+            this._loadHeldExpr(powL, VReg.RET);
             this.emitNumberCoerceFast();
-            this.vm.store(VReg.FP, powL, VReg.RET);
-            this.vm.load(VReg.RET, VReg.FP, powR);
+            this._holdStore(powL, VReg.RET);
+            this._loadHeldExpr(powR, VReg.RET);
             this.emitNumberCoerceFast();
             this.vm.mov(VReg.A1, VReg.RET);
-            this.vm.load(VReg.A0, VReg.FP, powL);
+            this._loadHeldExpr(powL, VReg.A0);
+            this._releaseHeldExpr();
+            this._releaseHeldExpr();
             this.vm.call("_math_pow");
             if (mightBeNaN) this.emitNaNCanon();
             return;
         }
 
-        // [fix-stack-corrupt] 使用 FP 槽保存左值,避免 push/pop 异常路径栈失衡
-        // 左→右求值序(规范;抛错测例依赖)
+        // 左→右求值序。录制期 T* 着色,直发期 FP 槽(避免 push/pop 异常路径失衡)。
         compileOperandAsFloat(expr.left);
-        const floatTmpSlot = this.ctx.allocLocal("__tmp_float_left");
-        this.vm.store(VReg.FP, floatTmpSlot, VReg.RET);
+        const floatHeld = this._holdExpr(VReg.RET);
 
         // 计算右操作数
         compileOperandAsFloat(expr.right);
         this.vm.mov(VReg.V1, VReg.RET); // V1 = right
-        this.vm.load(VReg.RET, VReg.FP, floatTmpSlot); // RET = left
+        this._loadHeldExpr(floatHeld, VReg.RET);
+        this._releaseHeldExpr();
 
         // 对于算术运算，使用浮点指令
         if (isArithOp) {
@@ -1496,7 +1504,7 @@ export const OperatorCompiler = {
         vm.lea(VReg.V1, "_heap_base");
         vm.load(VReg.V1, VReg.V1, 0);
         vm.cmp(VReg.RET, VReg.V1);
-        vm.jlt(doneL); // < heap_base → raw double
+        vm.jlt(doneL); // < heap_base → raw double (incl. denormals / MIN_VALUE)
         vm.lea(VReg.V1, "_heap_ptr");
         vm.load(VReg.V1, VReg.V1, 0);
         vm.cmp(VReg.RET, VReg.V1);
@@ -1574,20 +1582,22 @@ export const OperatorCompiler = {
         if (expr.operator === "&&") {
             // x && y：x 为假值 → 返回 x（短路），否则返回 y。
             // 用完整 ToBoolean（undefined/null/0/""/false/NaN 都为假）
-            this.vm.push(VReg.RET);         // 保留左值
+            const held = this._holdExpr(VReg.RET);
             this.vm.mov(VReg.A0, VReg.RET);
             this.vm.call("_to_boolean");    // RET = 0/1
             this.vm.cmpImm(VReg.RET, 0);
-            this.vm.pop(VReg.RET);          // 恢复左值
+            this._loadHeldExpr(held, VReg.RET);
+            this._releaseHeldExpr();
             this.vm.jeq(endLabel);          // 假 → 返回左值
             this.compileExpression(expr.right);
         } else if (expr.operator === "||") {
             // x || y：x 为真值 → 返回 x（短路），否则返回 y
-            this.vm.push(VReg.RET);
+            const held = this._holdExpr(VReg.RET);
             this.vm.mov(VReg.A0, VReg.RET);
             this.vm.call("_to_boolean");
             this.vm.cmpImm(VReg.RET, 0);
-            this.vm.pop(VReg.RET);
+            this._loadHeldExpr(held, VReg.RET);
+            this._releaseHeldExpr();
             this.vm.jne(endLabel);          // 真 → 返回左值
             this.compileExpression(expr.right);
         } else if (expr.operator === "??") {
@@ -1698,8 +1708,13 @@ export const OperatorCompiler = {
                 const wkDeleteName = darg.computed && darg.property &&
                     darg.property.type === "MemberExpression"
                     ? this.getMemberPropertyName(darg.property) : null;
-                if (wkDeleteName === "Symbol.iterator" ||
-                    wkDeleteName === "Symbol.asyncIterator") {
+                // Same well-known list as getMemberPropertyName / assignment SET.
+                // Deleting only the "Symbol.xxx" string alias leaves @@toStringTag
+                // (and @@isConcatSpreadable, @@match, …) on the prototype, so
+                // `delete Set.prototype[Symbol.toStringTag]` still toString's as
+                // [object Set].
+                if (wkDeleteName && wkDeleteName.length > 7 &&
+                    wkDeleteName.slice(0, 7) === "Symbol.") {
                     const recvOff = this.ctx.allocLocal(`__delwk_recv_${this.nextLabelId()}`);
                     const done = this.ctx.newLabel("delwk_done");
                     this.compileExpression(darg.object);
@@ -1742,10 +1757,11 @@ export const OperatorCompiler = {
                 }
                 // 动态键:_object_key_eq 内容比较兜底
                 this.compileExpression(darg.property);
-                this.vm.push(VReg.RET);
+                const delKeyH = this._holdExpr(VReg.RET);
                 this.compileExpression(darg.object);
                 this.vm.mov(VReg.A0, VReg.RET);
-                this.vm.pop(VReg.A1);
+                this._loadHeldExpr(delKeyH, VReg.A1);
+                this._releaseHeldExpr();
                 this.vm.call("_object_delete");
                 this._emitStrictDeleteCheck();
                 return;
@@ -1793,11 +1809,9 @@ export const OperatorCompiler = {
                     // 未解析的标识符(隐式全局/未知):ES sloppy 语义
                     // HasProperty(globalThis, name) ? [[Delete]] : true。
                     const missL = this.ctx.newLabel("del_g_miss");
-                    this.vm.lea(VReg.V0, "_global_this");
-                    this.vm.load(VReg.A0, VReg.V0, 0);
-                    this.vm.call("_box_obj_r");             // A0 = boxed globalThis
-                    const gOff = this.ctx.allocLocal(`__delg_${this.nextLabelId()}`);
-                    this.vm.store(VReg.FP, gOff, VReg.RET);
+                    // _box_obj_r 是 RET-in:load A0 在 x64 会把 leftover RAX 装箱
+                    // (eval shim 链入后 leftover 是毒指针 → _object_has SIGSEGV)。
+                    const gOff = this._emitLoadBoxedGlobalThis();
                     this.emitBoxedStringKey(darg.name, VReg.A1);
                     this.vm.load(VReg.A0, VReg.FP, gOff);
                     this.vm.call("_object_has");
@@ -1868,13 +1882,8 @@ export const OperatorCompiler = {
         if (expr.operator === "typeof" && expr.argument.type === "Identifier" &&
             this.isUnresolvableIdentifier && this.isUnresolvableIdentifier(expr.argument)) {
             const nameLabel = this.asm.addString(expr.argument.name);
-            // 1. globalThis 装箱
-            this.vm.lea(VReg.V0, "_global_this");
-            this.vm.load(VReg.V0, VReg.V0, 0);
-            this.vm.mov(VReg.A0, VReg.V0);
-            this.vm.call("_box_obj_r");          // RET = boxed globalThis
-            const tgOff = this.ctx.allocLocal(`__typeofg_${this.nextLabelId()}`);
-            this.vm.store(VReg.FP, tgOff, VReg.RET);
+            // 1. globalThis 装箱(_box_obj_r 是 RET-in;勿 load A0/V0 再 box)
+            const tgOff = this._emitLoadBoxedGlobalThis();
             // 2. key = boxed name string
             this.vm.lea(VReg.A0, nameLabel);
             this.vm.movImm64(VReg.V2, 0x7ffc000000000000n);
@@ -1937,6 +1946,9 @@ export const OperatorCompiler = {
                     this.vm.fmovToFloat(0, VReg.RET);
                     this.vm.fneg(0, 0);
                     this.vm.fmovToInt(VReg.RET, 0);
+                    // x64 fneg of a canonical NaN can quiet to 0x7ff8 (INT 0).
+                    // Same rule as binary `/` `%` unary-minus in FACTS.
+                    this.emitNaNCanon();
                 }
                 break;
             case "!": {
@@ -2023,15 +2035,12 @@ export const OperatorCompiler = {
         // 弹栈时右在栈顶。_strconcat 契约不变（A0=left, A1=right）。
         // 编译左侧，转换为字符串
         this.compileExpressionToString(expr.left);
-        this.vm.push(VReg.RET);
+        const catL = this._holdExpr(VReg.RET);
 
-        // 编译右侧，转换为字符串
         this.compileExpressionToString(expr.right);
-        this.vm.push(VReg.RET);
-
-        // 弹出右侧到 A1（栈顶），左侧到 A0 (_strconcat expects A0=left, A1=right)
-        this.vm.pop(VReg.A1);
-        this.vm.pop(VReg.A0);
+        this.vm.mov(VReg.A1, VReg.RET);
+        this._loadHeldExpr(catL, VReg.A0);
+        this._releaseHeldExpr();
         // [L4.2 字符串原地拼接] 逃逸门控命中且本拼接即门控的 `s + E`(左侧为同名简单变量):
         // 发 _str_concat_ip(旧串为堆串且容量足 → 就地追加返同指针;守卫不满足则尾委托
         // _strconcat,逐字节等价)。名字守卫防嵌套拼接误命中(s + (a + b) 的内层 left=a)。

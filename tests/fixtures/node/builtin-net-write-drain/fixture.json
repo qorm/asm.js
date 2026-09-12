@@ -1,0 +1,12 @@
+{
+  "description": "node:net write queue and drain: paused peer plus a large payload exercises partial/EAGAIN writes; callbacks fire and received bytes match sent",
+  "timeoutMs": 8000,
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "bytes 131072\nsent 131072\ncallbacks 8\nmatch true",
+    "exitCode": 0
+  },
+  "knownFailure": "NEW: net write drain timeout"
+}

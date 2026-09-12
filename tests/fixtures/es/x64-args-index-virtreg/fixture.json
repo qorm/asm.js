@@ -1,0 +1,10 @@
+{
+  "description": "Array.from/every callback arguments[1] is the index, not an x64 V7≡A1 leftover (1e-323).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "0 1 2",
+    "exitCode": 0
+  }
+}

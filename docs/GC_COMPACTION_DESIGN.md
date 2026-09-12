@@ -9,7 +9,7 @@
 
 ## 1. 摘要与动机
 
-jsbin 运行时是保守式三色 mark-sweep GC(非移动、非压实)+ 分代(sticky mark-bit
+asm.js 运行时是保守式三色 mark-sweep GC(非移动、非压实)+ 分代(sticky mark-bit
 minor + GOGC 风格 full 步调,nursery 触发缺省 256MB)。非移动的直接后果是
 **存活对象散布钉住内存页、sweep 必须线性扫过整个堆高水位**,RSS 远高于真实存活量。
 

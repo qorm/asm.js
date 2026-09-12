@@ -1,0 +1,11 @@
+{
+  "description": "Calling a Proxy whose target is not callable must TypeError, not synthesize [[Call]] and SIGBUS.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ok",
+    "exitCode": 0
+  },
+  "knownFailure": "NEW: Proxy [[Call]] on non-callable crash"
+}

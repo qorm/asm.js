@@ -1,0 +1,10 @@
+{
+  "description": "Direct eval in a default parameter cannot var-declare arguments (EvalDeclarationInstantiation SyntaxError; assignment must not SIGSEGV).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ok",
+    "exitCode": 0
+  }
+}

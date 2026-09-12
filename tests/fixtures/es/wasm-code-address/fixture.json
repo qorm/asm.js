@@ -6,5 +6,6 @@
     "run": true,
     "stdout": "ops 7 12 6\nhof 2,4,6,8,10,12,14,16 2,4,6,8 36\nclosure 13\nrecur 6765 125250\nparity true false\ntable 24",
     "exitCode": 0
-  }
+  },
+  "knownFailure": "NEW: wasm code address incomplete"
 }

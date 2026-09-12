@@ -1,17 +1,18 @@
 // asm.js 虚拟机 - 核心抽象层
 // 提供统一的指令接口，由后端翻译为目标平台代码
 
-import { VReg } from "./registers.js";
+import { VReg, isTemp, makeTempName } from "./registers.js";
 import { OpCode, Instruction } from "./instructions.js";
 import { ARM64Backend } from "../backend/arm64.js";
 import { X64Backend } from "../backend/x64.js";
 import { WasmBackend } from "../backend/wasm32.js";
+import { runUserFuncRegAlloc } from "./regalloc.js";
 
 // [#22 P1] 录制 opcode(整数——gen1 里字符串比较/每 op 数组分配付不起簿记税,
 // 首版字符串形态实测自编译 +30%;编号 = 重放链频率序,热 op 先命中)
-// 录制上限:超过 REC_CAP 个 op 的函数当场原样冲出并放弃晋升——大函数贡献绝大多数
-// op 量(录制/分析/重放税 ~20%),却几乎不受益于单槽晋升;设限后税只落在小函数上。
-const REC_CAP = 256;
+// 录制上限。超过则白冲(录了不分析),所以 _fnNeedsP1Record 按 AST 体量
+// 预先跳过大函数,避免编译税打水漂。2048 覆盖中等循环体。
+const REC_CAP = 2048;
 const RC_STORE = 1;
 const RC_LOAD = 2;
 const RC_MOV = 3;
@@ -150,16 +151,42 @@ export class VirtualMachine {
             }
         }
         this._recN = 0;
-        // 新录制段:T* 序号从 0 起。newTemp 未接线时返回 null,allocLocal 走 FP 槽。
         this._tempSeq = 0;
         this._tempHomes = null;
     }
 
-    // 用户函数 LSRA 临时:与 spill home(FP 槽)绑定。runUserFuncRegAlloc 尚未
-    // 接到 endRecord,故返回 null —— allocLocal 不绑 T*,读路径走 FP load。
-    // 与 macos-arm64 97.29% 基线同一条局部路径;有方法即可让含函数的 test262 编过。
+    // 用户函数虚寄存器:与 spill home(FP 槽)同区间。LLVM 式无限 T*,endRecord
+    // 线性扫描着色到 S/V 或降回 home。未在录制时返回 null,allocLocal 走 FP。
     newTemp(homeOff) {
-        return null;
+        if (this._recN < 0) return null;
+        if (!this._tempHomes) this._tempHomes = Object.create(null);
+        const name = makeTempName(this._tempSeq);
+        this._tempSeq = this._tempSeq + 1;
+        this._tempHomes[name] = homeOff;
+        return name;
+    }
+
+    // RA 未改写的 T* 在重放/超限冲出时降到 spill home。mov T0,T1 经 RET 中转,
+    // 与未晋升局部 `a=b` 的 load RET/store 同形。
+    _emitTempMov(dest, src) {
+        const homes = this._tempHomes;
+        const hd = (homes && isTemp(dest)) ? homes[dest] : undefined;
+        const hs = (homes && isTemp(src)) ? homes[src] : undefined;
+        if (typeof hd === "number" && typeof hs === "number") {
+            if (hd === hs) return;
+            this.load(VReg.RET, VReg.FP, hs);
+            this.store(VReg.FP, hd, VReg.RET);
+            return;
+        }
+        if (typeof hd === "number") {
+            this.store(VReg.FP, hd, src);
+            return;
+        }
+        if (typeof hs === "number") {
+            this.load(dest, VReg.FP, hs);
+            return;
+        }
+        this.backend.mov(dest, src);
     }
 
     _flushRecordVerbatim() {
@@ -172,7 +199,7 @@ export class VirtualMachine {
         for (let i = 0; i < cnt; i++) this._replayOp(ops[i], ra[i], rb[i], rc[i]);
     }
 
-    endRecord() {
+    endRecord(pinnedOffs) {
         if (this._recN < 0) return; // 未在录制(未开录/已被嵌套冲出/超限冲出)
         const cnt = this._recN;
         this._recN = -1;
@@ -181,238 +208,19 @@ export class VirtualMachine {
         const rb = this._recB;
         const rc = this._recC;
 
-        // ---- 分析 v3(#29 线性扫描):FP 槽活跃区间 + S 占用 + 回边/调用位置 ----
-        // SP 引用/参数区偏移/FP 取址 → 整体放弃(与 P1 同,保守正确)。
-        let bail = false;
-        const offs = [];
-        const cnts = [];
-        const firsts = []; // 槽首次访问 op 下标
-        const lasts = [];  // 槽末次访问 op 下标
-        const usedS = [false, false, false, false, false, false];
-        let hasCall = false;
-        let hasIndirectJmp = false; // jmpIndirect:控制流不可知 → 区间退化全函数
-        const labNames = []; // 已见标签(名字实例通常与跳转同引用;=== 内容等价兜底)
-        const labPos = [];
-        const backT = []; // 回边 [标签位, 跳转位]
-        const backJ = [];
-        const markS = (x) => {
-            if (x === VReg.S0) usedS[0] = true;
-            else if (x === VReg.S1) usedS[1] = true;
-            else if (x === VReg.S2) usedS[2] = true;
-            else if (x === VReg.S3) usedS[3] = true;
-            else if (x === VReg.S4) usedS[4] = true;
-            else if (x === VReg.S5) usedS[5] = true;
-        };
-        const isJumpOp = (n) =>
-            n === RC_JMP || n === RC_JEQ || n === RC_JNE ||
-            n === RC_JLT || n === RC_JLE || n === RC_JGT || n === RC_JGE ||
-            n === RC_JB || n === RC_JBE || n === RC_JA || n === RC_JAE ||
-            n === RC_JFLT || n === RC_JFLE || n === RC_JFGT || n === RC_JFGE ||
-            n === RC_JNAN;
-        for (let i = 0; i < cnt; i++) {
-            const n = ops[i];
-            if (n === RC_LOAD || n === RC_STORE) {
-                const base = (n === RC_LOAD) ? rb[i] : ra[i];
-                const off = (n === RC_LOAD) ? rc[i] : rb[i];
-                if (base === VReg.FP) {
-                    if (off > -48) { bail = true; break; } // 非常规局部区(参数区/别名风险)
-                    let found = -1;
-                    for (let k = 0; k < offs.length; k++) { if (offs[k] === off) { found = k; break; } }
-                    if (found === -1) { offs.push(off); cnts.push(1); firsts.push(i); lasts.push(i); }
-                    else { cnts[found] = cnts[found] + 1; lasts[found] = i; }
-                } else if (base === VReg.SP) {
-                    bail = true; break; // SP 派生访问,保守放弃
-                }
-                // dest/src/base 若为 S 寄存器(方法体用 S0-S2 跨 call 保活等)→ 占用
-                markS(ra[i]); markS(rb[i]); markS(rc[i]);
-            } else if (n === RC_LABEL) {
-                labNames.push(ra[i]);
-                labPos.push(i);
-            } else if (n !== RC_PROLOGUE && n !== RC_EPILOGUE) {
-                // 任何操作数引用 SP/FP(取址/搬运)→ 放弃(空槽为 0,不会误判)
-                const a = ra[i];
-                const b = rb[i];
-                const c = rc[i];
-                if (a === VReg.SP || a === VReg.FP || b === VReg.SP || b === VReg.FP || c === VReg.SP || c === VReg.FP) {
-                    bail = true; break;
-                }
-                markS(a); markS(b); markS(c);
-                if (n === RC_CALL || n === RC_CALLINDIRECT ||
-                    n === RC_CALLIAT || n === RC_CALLWINDOWSAPI ||
-                    n === RC_CALLWINDOWSWRITECONSOLE || n === RC_CALLWINDOWSEXITPROCESS ||
-                    n === RC_CALLWINDOWSGETCOMMANDLINE) {
-                    hasCall = true;
-                } else if (n === RC_JMPINDIRECT) {
-                    hasIndirectJmp = true;
-                } else if (isJumpOp(n)) {
-                    // 目标标签已见 → 回边(循环);前向跳不构环,忽略
-                    for (let k = labNames.length - 1; k >= 0; k--) {
-                        if (labNames[k] === a) { backT.push(labPos[k]); backJ.push(i); break; }
-                    }
-                }
-            }
-        }
-
-        // ---- 回边扩展到不动点:区间与循环 [t,j] 相交 → 并入整个循环 ----
-        // (跨回边存活的值不得被区间复用者踩;jmpIndirect 时退化为全函数区间)
-        if (!bail && offs.length > 0) {
-            if (hasIndirectJmp) {
-                for (let k = 0; k < offs.length; k++) { firsts[k] = 0; lasts[k] = cnt - 1; }
-            } else if (backT.length > 0) {
-                let changed = true;
-                while (changed) {
-                    changed = false;
-                    for (let k = 0; k < offs.length; k++) {
-                        for (let e = 0; e < backT.length; e++) {
-                            const t = backT[e];
-                            const j = backJ[e];
-                            if (firsts[k] <= j && lasts[k] >= t) {
-                                if (firsts[k] > t) { firsts[k] = t; changed = true; }
-                                if (lasts[k] < j) { lasts[k] = j; changed = true; }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // ---- 分配(#29 线性扫描):槽活跃区间 → callee-saved 寄存器,区间复用 ----
-        // 寄存器池:体内未占用的 S0-S3(零成本:prologue 本就保存,全调用链
-        //   callee-saved 契约成立含运行时;偏好 S3→S0——运行时 helper 从 S0/S1
-        //   保存起,晋升那里会形成 call 后恢复-装载依赖链,实测 num ±40%);
-        //   S4 计费扩展(整函数任一分配即扩展 prologue);S5 仅 arm64 叶子
-        //   (_strconcat 冲 S5 且传递不可知;x64 S5 是栈槽)。
-        // 线性扫描:区间按起点排序,active 过期即归还寄存器 → 不相交区间共享。
-        // 落选即"不晋升"(维持内存槽),永远 sound,无溢出代码。
-        // 异常无碍:throw 是函数内 jmp exceptionLabel,无跨函数 unwind。
-        const promOffs = [];
-        const promRegs = [];
-        const extList = []; // 实际启用的扩展寄存器(须入 prologue/epilogue,整函数一次)
-        if (!bail && offs.length > 0) {
-            const pool = [];      // 寄存器池(顺序即偏好)
-            const poolExt = [];   // 对应位是否计费(S4/S5)
-            if (!usedS[3]) { pool.push(VReg.S3); poolExt.push(false); }
-            if (!usedS[2]) { pool.push(VReg.S2); poolExt.push(false); }
-            if (!usedS[1]) { pool.push(VReg.S1); poolExt.push(false); }
-            if (!usedS[0]) { pool.push(VReg.S0); poolExt.push(false); }
-            if (!usedS[4]) { pool.push(VReg.S4); poolExt.push(true); }
-            if (!usedS[5] && !hasCall && this._arch === "arm64") { pool.push(VReg.S5); poolExt.push(true); }
-
-            if (pool.length > 0) {
-                // 候选槽按区间起点升序(选择排序;REC_CAP 约束下规模小)
-                const order = [];
-                for (let k = 0; k < offs.length; k++) order.push(k);
-                for (let x = 0; x < order.length; x++) {
-                    let m = x;
-                    for (let y = x + 1; y < order.length; y++) {
-                        if (firsts[order[y]] < firsts[order[m]]) m = y;
-                    }
-                    const tmp = order[x]; order[x] = order[m]; order[m] = tmp;
-                }
-                const poolBusyUntil = []; // 每寄存器的占用截止 op 下标(-1 空闲)
-                for (let p = 0; p < pool.length; p++) poolBusyUntil.push(-1);
-                for (let x = 0; x < order.length; x++) {
-                    const k = order[x];
-                    // 门槛:免费位 ≥2 次,计费位 ≥4 次
-                    for (let p = 0; p < pool.length; p++) {
-                        if (poolBusyUntil[p] >= firsts[k]) continue; // 区间重叠,占用中
-                        const minUse = poolExt[p] ? 4 : 2;
-                        if (cnts[k] < minUse) continue;
-                        poolBusyUntil[p] = lasts[k];
-                        promOffs.push(offs[k]);
-                        promRegs.push(pool[p]);
-                        if (poolExt[p]) {
-                            let seen = false;
-                            for (let t = 0; t < extList.length; t++) { if (extList[t] === pool[p]) { seen = true; break; } }
-                            if (!seen) extList.push(pool[p]);
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-        const promote = promOffs.length > 0;
-
-        // ---- push/pop 对虚拟化(#29 二期"无限虚寄存器"第一刀)----
-        // 表达式操作数暂存的栈往返(push src … pop dst)改写为空闲寄存器 mov。
-        // 保守约束(保证 sound):区域内无标签/跳转/间接跳/嵌套 prologue/epilogue/ret
-        // (单入单出直线区);V 寄存器仅 arm64 且区域无 call(后端 scratchReg 恒选
-        // X16/X17,V5-V7=X13-X15 从不被下沉当临时;x64 下沉仍用 R10/R11=V5/V6,
-        // V7=RSI=A1 别名,故 x64 只用 S);S 须全函数未占用且与槽分配/已改写对
-        // 区间不重叠;配对不平衡(录制截断等)整体放弃。紧邻对留给后端窥孔。
-        const prIdx = [];
-        const prReg = [];
-        if (!bail && cnt > 0 && !hasIndirectJmp) {
-            // 槽分配的寄存器占用区间(避让用)
-            const busyReg = [];
-            const busyS = [];
-            const busyE = [];
-            for (let k = 0; k < promOffs.length; k++) {
-                for (let q = 0; q < offs.length; q++) {
-                    if (offs[q] === promOffs[k]) {
-                        busyReg.push(promRegs[k]);
-                        busyS.push(firsts[q]);
-                        busyE.push(lasts[q]);
-                        break;
-                    }
-                }
-            }
-            const isCallOp = (m) =>
-                m === RC_CALL || m === RC_CALLINDIRECT || m === RC_CALLIAT ||
-                m === RC_CALLWINDOWSAPI || m === RC_CALLWINDOWSWRITECONSOLE ||
-                m === RC_CALLWINDOWSEXITPROCESS || m === RC_CALLWINDOWSGETCOMMANDLINE ||
-                m === RC_SYSCALL || m === RC_SYSCALLREG || m === RC_PREPARECALL; // 保守:V 池一律避开
-            let pairOk = true;
-            const stk = [];
-            for (let i = 0; i < cnt && pairOk; i++) {
-                const n = ops[i];
-                if (n === RC_PUSH) {
-                    stk.push(i);
-                } else if (n === RC_POP) {
-                    if (stk.length === 0) { pairOk = false; break; }
-                    const p = stk.pop();
-                    if (i <= p + 1) continue; // 紧邻对:后端窥孔做字节级撤销,更优
-                    let ok = true;
-                    let regionCall = false;
-                    for (let q = p + 1; q < i; q++) {
-                        const m = ops[q];
-                        if (m === RC_LABEL || m === RC_PROLOGUE || m === RC_EPILOGUE ||
-                            m === RC_RET || m === RC_JMPINDIRECT || isJumpOp(m)) { ok = false; break; }
-                        if (isCallOp(m)) regionCall = true;
-                    }
-                    if (!ok) continue;
-                    const cands = [];
-                    if (this._arch === "arm64" && !regionCall) {
-                        cands.push(VReg.V7); cands.push(VReg.V6); cands.push(VReg.V5);
-                    }
-                    if (!usedS[3]) cands.push(VReg.S3);
-                    if (!usedS[2]) cands.push(VReg.S2);
-                    if (!usedS[1]) cands.push(VReg.S1);
-                    if (!usedS[0]) cands.push(VReg.S0);
-                    for (let t = 0; t < extList.length; t++) cands.push(extList[t]); // 已计费的 S4/S5 顺带可用
-                    for (let ci = 0; ci < cands.length; ci++) {
-                        const R = cands[ci];
-                        let free = true;
-                        for (let q = p + 1; q < i; q++) {
-                            if (ra[q] === R || rb[q] === R || rc[q] === R) { free = false; break; }
-                        }
-                        if (!free) continue;
-                        for (let t = 0; t < busyReg.length; t++) {
-                            if (busyReg[t] === R && busyS[t] <= i && busyE[t] >= p) { free = false; break; }
-                        }
-                        if (!free) continue;
-                        prIdx.push(p); prReg.push(R);
-                        prIdx.push(i); prReg.push(R);
-                        busyReg.push(R); busyS.push(p); busyE.push(i); // 供后续对避让
-                        break;
-                    }
-                }
-            }
-            if (!pairOk || stk.length !== 0) {
-                // 不平衡:放弃全部改写(标记数组用哨兵重建,避免 length 截断)
-                while (prIdx.length > 0) { prIdx.pop(); prReg.pop(); }
-            }
-        }
+        // 单一 LSRA(vm/regalloc.js)。失败则原样重放,T* 由 _emitTempMov 降 home。
+        const raOut = runUserFuncRegAlloc({
+            ops, ra, rb, rc, cnt,
+            arch: this._arch,
+            tempHomes: this._tempHomes,
+            pinnedOffs: pinnedOffs || [],
+        });
+        const promOffs = raOut.promOffs;
+        const promRegs = raOut.promRegs;
+        const extList = raOut.extList;
+        const prIdx = raOut.prIdx;
+        const prReg = raOut.prReg;
+        const promote = !raOut.bail && promOffs.length > 0;
 
         // ---- 重放(晋升槽 load/store → 寄存器 mov;push/pop 对 → mov;
         //      prologue/epilogue 按需扩展) ----
@@ -463,7 +271,7 @@ export class VirtualMachine {
                     const ext = ra[i].slice();
                     for (let k = 0; k < extList.length; k++) ext.push(extList[k]);
                     if ((ext.length & 1) === 1) ext.push(padReg);
-                    this.epilogue(ext, rb[i]);
+                    this.epilogue(ext, rb[i], rc[i]);
                     continue;
                 }
             }
@@ -523,7 +331,7 @@ export class VirtualMachine {
         if (n === RC_TEST) { this.test(a, b); return; }
         if (n === RC_TESTIMM) { this.testImm(a, b); return; }
         if (n === RC_PROLOGUE) { this.prologue(a, b); return; }
-        if (n === RC_EPILOGUE) { this.epilogue(a, b); return; }
+        if (n === RC_EPILOGUE) { this.epilogue(a, b, c); return; }
         if (n === RC_RET) { this.ret(); return; }
         if (n === RC_CALLINDIRECT) { this.callIndirect(a); return; }
         if (n === RC_JMPINDIRECT) { this.jmpIndirect(a); return; }
@@ -598,6 +406,8 @@ export class VirtualMachine {
     //   ELF(linux)=0x400000, Mach-O(macos)=0x100000000, PE(windows)=0x140000000。
     // 注意：macos/windows 保持历史 0x100000000（windows 指针 >=0x140000000 仍通过），
     // 只有 linux 需要下调，否则数据段字符串常量(0x40xxxx)全被误判为损坏 → 返回空串。
+    // Windows eval 片段的 VirtualAlloc 可能低于此 floor; `_getStrContent`
+    // 对登记过的 `_engine_data_ranges` 放行,不在这里下调 floor。
     get ptrFloor() {
         // wasi:线性内存地址小,取与 linux 相同的 2^22(代码序号空间/数据段/堆均 >= 4MB,
         // 影子栈在其下——栈地址本就不该被当装箱指针)。
@@ -610,6 +420,10 @@ export class VirtualMachine {
     // 寄存器到寄存器
     mov(dest, src) {
         if (this._recN >= 0) { const k = this._recN; if (k < REC_CAP) { this._recOp[k] = RC_MOV; this._recA[k] = dest; this._recB[k] = src; this._recC[k] = 0; this._recN = k + 1; return; } this._flushRecordVerbatim(); }
+        if (isTemp(dest) || isTemp(src)) {
+            this._emitTempMov(dest, src);
+            return;
+        }
         const b = this.backend;
         if (!b) throw new Error("VMBACKENDNULL_mov");
         b.mov(dest, src);
@@ -1002,10 +816,10 @@ export class VirtualMachine {
         this.backend.prologue(stackSize, savedRegs || []);
     }
 
-    // 函数尾声
-    epilogue(savedRegs, stackSize) {
-        if (this._recN >= 0) { const k = this._recN; if (k < REC_CAP) { this._recOp[k] = RC_EPILOGUE; this._recA[k] = savedRegs; this._recB[k] = stackSize; this._recC[k] = 0; this._recN = k + 1; return; } this._flushRecordVerbatim(); }
-        this.backend.epilogue(savedRegs || [], stackSize || 0);
+    // 函数尾声。keep 非 0：弹出帧但不 ret（尾调用 PrepareForTailCall）。
+    epilogue(savedRegs, stackSize, keep) {
+        if (this._recN >= 0) { const k = this._recN; if (k < REC_CAP) { this._recOp[k] = RC_EPILOGUE; this._recA[k] = savedRegs; this._recB[k] = stackSize; this._recC[k] = keep ? 1 : 0; this._recN = k + 1; return; } this._flushRecordVerbatim(); }
+        this.backend.epilogue(savedRegs || [], stackSize || 0, keep);
     }
 
     // 调用函数

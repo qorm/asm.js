@@ -1,0 +1,10 @@
+{
+  "description": "delete obj[Symbol.xxx] must remove the real well-known symbol and the string alias (delete Set.prototype[Symbol.toStringTag] → [object Object]).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "[object Object]",
+    "exitCode": 0
+  }
+}

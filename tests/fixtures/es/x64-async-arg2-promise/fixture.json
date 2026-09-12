@@ -1,0 +1,10 @@
+{
+  "description": "x64 V2≡A2: async function entry must snapshot A0-A5 before emitInstallAsyncExcFrame loads coro.promise into V2 (3rd arg must stay NaN, not the Promise).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "number\nNaN\nNaN",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "nested function with a for-loop copies ArrayBuffer via Uint8Array views; second param must survive the first constructor call",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "10,20,30,40",
+    "exitCode": 0
+  }
+}

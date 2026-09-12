@@ -1,0 +1,9 @@
+{
+  "description": "unknown bare package specifier must fail at compile time, not bind 0",
+  "expect": {
+    "parse": true,
+    "compile": false,
+    "run": false
+  },
+  "knownFailure": "NEW: unknown bare import resolution incomplete"
+}

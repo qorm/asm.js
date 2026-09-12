@@ -1,0 +1,12 @@
+{
+  "description": "node:net Server.maxConnections emits drop and closes the extra accepted socket without a connection event",
+  "timeoutMs": 8000,
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "IPv4\ntrue\nn 1\ndrops 1",
+    "exitCode": 0
+  },
+  "knownFailure": "NEW: net drop timeout"
+}

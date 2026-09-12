@@ -1,0 +1,10 @@
+{
+  "description": "String.fromCodePoint.apply must use the array helper for an array retrieved from an object property, not only for statically typed array literals (property-escapes buildString).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ªºⁱⁿℲⅎ",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "Zero-arg toString/valueOf/toFixed tag dispatch parks the receiver in expr-scratch T* instead of SP.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "3.5\nab\n[object Object]\n1,2\n10\n7\n1\ntrue\ntrue",
+    "exitCode": 0
+  }
+}

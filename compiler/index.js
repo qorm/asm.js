@@ -21,6 +21,7 @@ import { runtimeNodeBase, resolveModulePath } from "./modules/module-graph.js";
 // 语言前端
 import { Lexer, Parser } from "../lang/index.js";
 import { analyzeCapturedVariables, analyzeSharedVariables, analyzeTopLevelSharedVariables, analyzeDirectEvalBoxedVars, collectDirectEvalSourceRefs, collectLocalDeclarations, collectLexicalDeclarations, collectLetConstClassNames, collectVarDeclarations, collectPatternNames } from "../lang/analysis/closure.js";
+import { analyzeRawFloatVars } from "../lang/analysis/rawfloat.js";
 import { renameBlockScopedBindings } from "../lang/analysis/blockscope.js";
 
 // 虚拟机和汇编器
@@ -337,6 +338,7 @@ export class Compiler {
             }
         }
         meta.boxedVars = boxedVars;
+        meta.rawFloatVars = analyzeRawFloatVars(moduleBodyFunc, boxedVars);
     }
 
     getFunctionSymbolForModule(moduleMeta, localName) {
@@ -565,6 +567,7 @@ export class Compiler {
         moduleCtx.varTypes = {};
         moduleCtx.varInitExprs = {};
         moduleCtx.rawIntVars = {};
+        moduleCtx.rawFloatVars = moduleMeta.rawFloatVars || {};
         moduleCtx.fpAccumVars = {};
         moduleCtx.stackOffset = 0;
         moduleCtx.scopeDepth = 0;
@@ -1323,8 +1326,9 @@ export class Compiler {
         const vm = this.vm;
         vm.push(valueReg);
         vm.lea(VReg.V0, "_global_this");
-        vm.load(VReg.A0, VReg.V0, 0);
+        vm.load(VReg.RET, VReg.V0, 0);
         vm.call("_box_obj_r");
+        vm.mov(VReg.A0, VReg.RET);
         this.emitBoxedStringKey(localName, VReg.A1);
         vm.load(VReg.A2, VReg.SP, 0);
         // CreateGlobalVarBinding:DefineOwnProperty,不受原型不可写数据挡住
@@ -2064,6 +2068,7 @@ export class Compiler {
             fnCtx.varTypes = {};
             fnCtx.varInitExprs = {};
             fnCtx.rawIntVars = {};
+            fnCtx.rawFloatVars = {};
             fnCtx.fpAccumVars = {};
             fnCtx.stackOffset = 0;
             fnCtx.scopeDepth = 0;
@@ -2105,12 +2110,19 @@ export class Compiler {
             fnCtx.className = savedCtx.className;
             fnCtx.superClass = savedCtx.superClass;
             fnCtx.inStrictFunction = savedCtx.inStrictFunction;
+            fnCtx._isArrowFunction = false;
             fnCtx.superClassExpr = savedCtx.superClassExpr;
             fnCtx.superInfoLabel = savedCtx.superInfoLabel;
             fnCtx.inStaticMethod = savedCtx.inStaticMethod;
             fnCtx.inClassMethod = false;
             fnCtx.inFieldInit = false;
             fnCtx.inObjectMethod = false;
+            fnCtx._esPool = null;
+            fnCtx._esDepth = 0;
+            fnCtx._objTmpSlots = null;
+            fnCtx._objTmpDepth = 0;
+            fnCtx._arrTmpSlots = null;
+            fnCtx._arrTmpDepth = 0;
             if (ownerMeta) {
                 fnCtx.functionAliases = ownerMeta.functionAliases;
                 fnCtx.mainCapturedVars = ownerMeta.mainCapturedVars;
@@ -3634,6 +3646,7 @@ export class Compiler {
         const boxedVars = analyzeSharedVariables(func);
         this._addDirectEvalBoxedVars(func, boxedVars);
         this.ctx.boxedVars = boxedVars;
+        this.ctx.rawFloatVars = analyzeRawFloatVars(func, boxedVars);
         // [L4.2] 普通函数启用保守字符串累加逃逸扫描；async/generator 经过
         // 协程栈与跨帧生命周期，本阶段暂不启用原地 append。
         this.ctx._ipScanRoot = (isAsync || _isGenFuncDecl(func)) ? null : func;
@@ -3708,9 +3721,8 @@ export class Compiler {
             this.emitAsyncMethodStub(funcLabel + "_abody", false);
         }
         // [P1] async 禁录(S4 跨协程共享,见 closures.js 注);生成器体同理禁录;
-        // 与闭包路径同用 _fnNeedsP1Record(中等 for/while 窗口)。
-        const p1Skip = typeof this.sourcePath === "string" &&
-            this.sourcePath.indexOf("__regexp_shim") !== -1;
+        // 与闭包路径同用 _fnNeedsP1Record(非空体一律 T*/LSRA)。
+        const p1Skip = this._p1SkipCurrent();
         if (!isAsync && !isGenerator && !p1Skip && this._fnNeedsP1Record(func)) {
             vm.beginRecord();
         }
@@ -3722,6 +3734,9 @@ export class Compiler {
         // frame above.
         vm.prologue(32768, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
         this.ctx._fnFrameSize = 32768;
+        this.ctx._argRegSpill = null;
+        this.ctx._pinnedFpOffs = [];
+        this.emitArgRegSnapshot();
 
         const params = func.params || [];
         const _isCoroBody = isGenerator || isAsyncGen;
@@ -4035,11 +4050,11 @@ export class Compiler {
             // 经跳转到达)。与 closures.js 闭包路径同构。
             vm.label(asyncDeclRejectLabel);
             this.emitAsyncRejectFromException();
-            vm.endRecord(); // [P1] async 未开录,安全 no-op
+            vm.endRecord(this.ctx._pinnedFpOffs); // [P1] async 未开录,安全 no-op
         } else {
             // 普通/生成器/async-gen:epilogue(协程体经 _coroutine_entry → _coroutine_return)
             vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32768);
-        vm.endRecord(); // [P1]
+            vm.endRecord(this.ctx._pinnedFpOffs);
         }
         this.ctx.exceptionLabel = prevDeclExcLabel;
         this.ctx._asyncExcFrameOff = prevDeclAsyncExcFrameOff;
@@ -4596,29 +4611,25 @@ export class Compiler {
     // ========== C 调用约定参数编译 ==========
 
     compileCallArgumentsForCConvention(args) {
-        const vm = this.vm;
         const paramCount = Math.min(args.length, 8);
-        const tempOffsets = [];
-
+        const hs = [];
         for (let i = 0; i < paramCount; i++) {
             this.compileExpression(args[i]);
-            const tempName = `__temp_arg_${i}_${this.nextLabelId()}`;
-            const offset = this.ctx.allocLocal(tempName);
-            tempOffsets.push(offset);
-            vm.store(VReg.FP, offset, VReg.RET);
+            hs.push(this._holdExpr(VReg.RET));
         }
 
         if (this.arch === "arm64") {
             for (let i = 0; i < paramCount; i++) {
-                vm.load(VReg.RET, VReg.FP, tempOffsets[i]);
+                this._loadHeldExpr(hs[i], VReg.RET);
                 this.asm.fmovToFloat(i, 0);
             }
         } else {
             for (let i = 0; i < paramCount; i++) {
-                vm.load(VReg.RET, VReg.FP, tempOffsets[i]);
+                this._loadHeldExpr(hs[i], VReg.RET);
                 this.asm.movqToXmm(i, 0);
             }
         }
+        this._releaseHeldN(paramCount);
     }
 
     // 兼容旧 API

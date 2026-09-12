@@ -1,0 +1,10 @@
+{
+  "description": "with HasBinding Get @@unscopables: x64 must not shrImm(V0,RET,48) then use RET as the object; use _subscript_get for the well-known symbol.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "2",
+    "exitCode": 0
+  }
+}

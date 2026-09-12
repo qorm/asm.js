@@ -1,0 +1,11 @@
+{
+  "description": "new WeakMap(iterable) must Get(wm,'set') on WeakMap.prototype and IteratorClose if set throws (infinite iterator must not hang).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ok",
+    "exitCode": 0
+  },
+  "knownFailure": "NEW: WeakMap iterator close on set failure timeout"
+}

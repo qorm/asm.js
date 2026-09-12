@@ -1,0 +1,11 @@
+{
+  "description": "node:net Unix domain sockets: server.listen(path) + connect({path}) echo, address() returns the path string, remoteFamily is unix",
+  "timeoutMs": 8000,
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true\ntrue\nunix\nrecv unix\nend\nclient ack:unix",
+    "exitCode": 0
+  }
+}

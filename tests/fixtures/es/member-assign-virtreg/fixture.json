@@ -1,0 +1,10 @@
+{
+  "description": "Member-assign obj/key/val and template accumulators use expr-scratch T* instead of __ allocLocal.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "3\n7\n7\n3\n9|4|4\n3\n2\n9",
+    "exitCode": 0
+  }
+}

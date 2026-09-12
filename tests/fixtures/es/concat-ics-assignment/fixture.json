@@ -1,0 +1,10 @@
+{
+  "description": "obj[Symbol.isConcatSpreadable]=true must store the well-known symbol so Array.concat Get(@@isConcatSpreadable) sees it (spread empty; poisoned length throws).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "0\n1",
+    "exitCode": 0
+  }
+}

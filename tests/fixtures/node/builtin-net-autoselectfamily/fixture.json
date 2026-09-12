@@ -1,0 +1,10 @@
+{
+  "description": "node:net get/setDefaultAutoSelectFamily and AttemptTimeout (IPv6 Happy Eyeballs knobs; wire family remains IPv4)",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "false\ntrue\ntrue\nfalse\nfalse\n250\n500\n500\n500\n500",
+    "exitCode": 0
+  }
+}

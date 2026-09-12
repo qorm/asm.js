@@ -1,0 +1,10 @@
+{
+  "description": "CreateDynamicFunction argument list must survive x64 A0≢RET: GeneratorFunction/Function instance length is the parameter count, including subclass Construct.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "2\n2\n2\n2",
+    "exitCode": 0
+  }
+}

@@ -12,15 +12,63 @@ const FP_ASSIGN_ARITH_OPS = { "+=": 1, "-=": 1, "*=": 1, "/=": 1, "%=": 1 };
 // 赋值编译方法混入
 export const AssignmentCompiler = {
     // 非装箱局部:优先 T*(与 members 标识符读/简单赋值写同契约);否则 FP。
+    // T* 只在仍在录制时有效:嵌套 beginRecord 会白冲外层并清空 _tempHomes,
+    // 冲后继续用 localTemps 会把 T* 送进 backend(Unknown virtual register)。
+    _liveLocalTemp(name) {
+        if (this.ctx.isRawIntVar(name)) return null;
+        const vm = this.ctx.raVm;
+        if (!vm || vm._recN < 0) return null;
+        const lt = this.ctx.localTemps ? this.ctx.localTemps.get(name) : null;
+        if (!lt) return null;
+        // Nested beginRecord resets _tempHomes for the inner function.
+        // Outer localTemps can still name a T* that no longer has a home.
+        if (!vm._tempHomes || vm._tempHomes[lt] === undefined) return null;
+        return lt;
+    },
     _loadLocalTemp(name, offset, dest) {
-        const lt = this.ctx.localTemps && this.ctx.localTemps.get(name);
-        if (lt && !this.ctx.isRawIntVar(name)) this.vm.mov(dest, lt);
+        const lt = this._liveLocalTemp(name);
+        if (lt) this.vm.mov(dest, lt);
         else this.vm.load(dest, VReg.FP, offset);
     },
     _storeLocalTemp(name, offset, src) {
-        const lt = this.ctx.localTemps && this.ctx.localTemps.get(name);
-        if (lt && !this.ctx.isRawIntVar(name)) this.vm.mov(lt, src);
+        const lt = this._liveLocalTemp(name);
+        if (lt) this.vm.mov(lt, src);
         else this.vm.store(VReg.FP, offset, src);
+    },
+
+    _holdExpr(src) {
+        const s = this.ctx.pushExprScratch();
+        if (s.tmp) this.vm.mov(s.tmp, src);
+        else this.vm.store(VReg.FP, s.off, src);
+        return s;
+    },
+    _loadHeldExpr(s, dest) {
+        if (s.tmp) this.vm.mov(dest, s.tmp);
+        else this.vm.load(dest, VReg.FP, s.off);
+    },
+    _holdStore(s, src) {
+        if (s.tmp) this.vm.mov(s.tmp, src);
+        else this.vm.store(VReg.FP, s.off, src);
+    },
+    _releaseHeldExpr() {
+        this.ctx.popExprScratch();
+    },
+    _releaseHeldN(n) {
+        for (let i = 0; i < n; i = i + 1) this._releaseHeldExpr();
+    },
+    // S0-S2 live across a helper that clobbers callee-saved. Hardware push/pop:
+    // LSRA must see RC_PUSH/RC_POP so pairs that span nested prologue/labels
+    // stay real stack saves. FP/T* snapshots get colored onto S0 and elide.
+    _holdCalleeSaved3() {
+        this.vm.push(VReg.S0);
+        this.vm.push(VReg.S1);
+        this.vm.push(VReg.S2);
+        return true;
+    },
+    _restoreCalleeSaved3(_h) {
+        this.vm.pop(VReg.S2);
+        this.vm.pop(VReg.S1);
+        this.vm.pop(VReg.S0);
     },
 
     // Object Environment SetMutableBinding:strict 且 !HasProperty(bindings, N) → ReferenceError。
@@ -66,11 +114,9 @@ export const AssignmentCompiler = {
     _emitGlobalObjectEnvCompoundAssign(name, binOp, right, strictSet) {
         const gOff = this._emitLoadBoxedGlobalThis();
         this._emitGlobalObjectEnvGet(gOff, name);
-        const leftSlot = this.ctx.allocLocal(`__genv_l_${this.nextLabelId()}`);
-        this.vm.store(VReg.FP, leftSlot, VReg.RET);
+        const leftH = this._holdExpr(VReg.RET);
         this.compileExpression(right);
-        const vSlot = this.ctx.allocLocal(`__genv_r_${this.nextLabelId()}`);
-        this.vm.store(VReg.FP, vSlot, VReg.RET);
+        const vH = this._holdExpr(VReg.RET);
         if (strictSet) this._emitStrictObjectEnvPutGuard(gOff, name);
         this._inWithResolve = true;
         this.compileAssignmentExpression({
@@ -85,11 +131,13 @@ export const AssignmentCompiler = {
             right: {
                 type: "BinaryExpression",
                 operator: binOp,
-                left: { type: "__WithPrecomputed", slot: leftSlot },
-                right: { type: "__WithPrecomputed", slot: vSlot },
+                left: { type: "__WithPrecomputed", hold: leftH },
+                right: { type: "__WithPrecomputed", hold: vH },
             },
         });
         this._inWithResolve = false;
+        this._releaseHeldExpr();
+        this._releaseHeldExpr();
     },
 
     // 编译赋值表达式
@@ -100,6 +148,10 @@ export const AssignmentCompiler = {
         if (isIntType(inferType(expr, this.ctx))) {
             this.compileExpressionAsInt(expr);
             this.intToFloat64Bits(VReg.RET);
+            return;
+        }
+        if (expr && expr.type === "Identifier" && this.ctx.isRawFloatVar(expr.name)) {
+            this.compileExpression(expr);
             return;
         }
         this.compileExpression(expr);
@@ -289,16 +341,16 @@ export const AssignmentCompiler = {
                     // FP 槽保 RHS:不可用 push/pop——嵌套在二元运算等已 push 左值的
                     // 上下文里会掏错槽,且 arm64 stp 填充字使 SP+0 读值不可靠叠加。
                     this.compileExpression(expr.right);      // RET = RHS
-                    const rhsOff = this.ctx.allocLocal(`__gassign_${this.nextLabelId()}`);
-                    this.vm.store(VReg.FP, rhsOff, VReg.RET);
+                    const rhsH = this._holdExpr(VReg.RET);
                     this.vm.lea(VReg.V0, "_global_this");
                     this.vm.load(VReg.RET, VReg.V0, 0);
                     this.vm.call("_box_obj_r");              // RET = boxed globalThis (x64 A0≢RET)
                     this.vm.mov(VReg.A0, VReg.RET);          // _object_set this
                     this.emitBoxedStringKey(name, VReg.A1);  // _tag_key_a1 clobber V1
-                    this.vm.load(VReg.A2, VReg.FP, rhsOff);  // A2 = RHS
+                    this._loadHeldExpr(rhsH, VReg.A2);
                     this.vm.call("_object_set");
-                    this.vm.load(VReg.RET, VReg.FP, rhsOff); // 赋值表达式之值 = RHS
+                    this._loadHeldExpr(rhsH, VReg.RET);
+                    this._releaseHeldExpr();
                     return;
                 }
                 // 严格简单 `=` 对编译期未解析名:先求 RHS,再全局对象环境 SetMutableBinding
@@ -308,15 +360,15 @@ export const AssignmentCompiler = {
                     this.isUnresolvableIdentifier &&
                     this.isUnresolvableIdentifier({ type: "Identifier", name: name })) {
                     this.compileExpression(expr.right);
-                    const rhsOff = this.ctx.allocLocal(`__gassign_${this.nextLabelId()}`);
-                    this.vm.store(VReg.FP, rhsOff, VReg.RET);
+                    const rhsH = this._holdExpr(VReg.RET);
                     const gOff = this._emitLoadBoxedGlobalThis();
                     this._emitStrictObjectEnvPutGuard(gOff, name);
                     this.vm.load(VReg.A0, VReg.FP, gOff);
                     this.emitBoxedStringKey(name, VReg.A1);
-                    this.vm.load(VReg.A2, VReg.FP, rhsOff);
+                    this._loadHeldExpr(rhsH, VReg.A2);
                     this.vm.call("_object_set_strict");
-                    this.vm.load(VReg.RET, VReg.FP, rhsOff);
+                    this._loadHeldExpr(rhsH, VReg.RET);
+                    this._releaseHeldExpr();
                     return;
                 }
                 if (this.isUnresolvableIdentifier &&
@@ -489,19 +541,21 @@ export const AssignmentCompiler = {
                 if (op === "&&=") {
                     // x &&= y:x 为假不赋值。[#33] 原为 raw-0 判定——tagged false
                     // (0x7FF9..02)/""/NaN 全被当真 → 改完整 ToBoolean(同 && 运算符)
-                    this.vm.push(VReg.RET);
+                    const held = this._holdExpr(VReg.RET);
                     this.vm.mov(VReg.A0, VReg.RET);
                     this.vm.call("_to_boolean");
                     this.vm.cmpImm(VReg.RET, 0);
-                    this.vm.pop(VReg.RET);
+                    this._loadHeldExpr(held, VReg.RET);
+                    this._releaseHeldExpr();
                     this.vm.jeq(endLabel);
                 } else if (op === "||=") {
                     // x ||= y:x 为真不赋值(同上改完整 ToBoolean)
-                    this.vm.push(VReg.RET);
+                    const held = this._holdExpr(VReg.RET);
                     this.vm.mov(VReg.A0, VReg.RET);
                     this.vm.call("_to_boolean");
                     this.vm.cmpImm(VReg.RET, 0);
-                    this.vm.pop(VReg.RET);
+                    this._loadHeldExpr(held, VReg.RET);
+                    this._releaseHeldExpr();
                     this.vm.jne(endLabel);
                 } else {
                     // x ??= y:仅 tagged null(0x7FFA)/undefined(0x7FFB)才赋值。
@@ -547,16 +601,17 @@ export const AssignmentCompiler = {
             const isArithOp = (op === "+=" || op === "-=" || op === "*=" || op === "/=");
             const isUnboxedArith = !isBoxed && !globalLabel && isArithOp;
 
+            let boxH = null;
             if (globalLabel && !offset) {
                 // 主程序被捕获变量
                 this.vm.lea(VReg.V3, globalLabel);
                 this.vm.load(VReg.V3, VReg.V3, 0); // 加载 box 指针
-                this.vm.push(VReg.V3); // 保存 box 指针
+                boxH = this._holdExpr(VReg.V3);
                 this.vm.load(VReg.RET, VReg.V3, 0); // 当前值
                 this.emitUninitializedBindingGuard(name, VReg.RET);
             } else if (isBoxed) {
                 this.vm.load(VReg.V3, VReg.FP, offset); // box 指针
-                this.vm.push(VReg.V3); // 保存 box 指针
+                boxH = this._holdExpr(VReg.V3);
                 this.vm.load(VReg.RET, VReg.V3, 0); // 当前值
                 this.emitUninitializedBindingGuard(name, VReg.RET);
             } else if (isUnboxedArith) {
@@ -573,16 +628,18 @@ export const AssignmentCompiler = {
                     !isBoxed && !globalLabel &&
                     !(this.ctx.withScopes && this.ctx.withScopes.length > 0) &&
                     this._canIpStringAccum && this._canIpStringAccum(name);
-                this.vm.push(VReg.V1);
+                const leftH = this._holdExpr(VReg.V1);
                 if (_ipPlus) {
                     this.compileExpressionToString(expr.right);
                     this.vm.mov(VReg.A1, VReg.RET);
-                    this.vm.pop(VReg.A0);
+                    this._loadHeldExpr(leftH, VReg.A0);
+                    this._releaseHeldExpr();
                     this.vm.call("_str_concat_ip");
                 } else {
                     this.compileExpression(expr.right);
                     this.vm.mov(VReg.A1, VReg.RET);
-                    this.vm.pop(VReg.A0);
+                    this._loadHeldExpr(leftH, VReg.A0);
+                    this._releaseHeldExpr();
                     this.vm.call("_js_add");
                 }
                 this._storeLocalTemp(name, offset, VReg.RET);
@@ -591,17 +648,18 @@ export const AssignmentCompiler = {
                 // 0x7FF9.. tag、x=null 存为 0x7FFA.. tag)，直接 fmovToFloat 会误解
                 // 位模式为 float64 → NaN/垃圾。先 ToNumber 两侧再浮点运算。
                 // V1=左槽值。compileExpression 可能物化原型并占用 S0(如 new Number →
-                // emitNumberProtoObject),故左值必须落栈而非 S0——否则 `true /= new Number(1)`
+                // emitNumberProtoObject),故左值必须落 hold 而非 S0——否则 `true /= new Number(1)`
                 // 左操作数被冲掉 → NaN。
-                this.vm.push(VReg.V1);                   // 栈: 左 JSValue
+                const leftH = this._holdExpr(VReg.V1);
                 this.compileExpression(expr.right);      // RET = 右 JSValue
                 this.vm.mov(VReg.A0, VReg.RET);          // A0 = 右 JSValue
                 this.vm.call("_number_coerce");          // RET = 右 float64
-                this.vm.pop(VReg.V1);                    // V1 = 左 JSValue
-                this.vm.push(VReg.RET);                  // 栈: 右 float
-                this.vm.mov(VReg.A0, VReg.V1);           // A0 = 左 JSValue
+                const rightH = this._holdExpr(VReg.RET);
+                this._loadHeldExpr(leftH, VReg.A0);       // A0 = 左 JSValue
                 this.vm.call("_number_coerce");          // RET = 左 float64
-                this.vm.pop(VReg.V1);                    // V1 = 右 float
+                this._loadHeldExpr(rightH, VReg.V1);      // V1 = 右 float
+                this._releaseHeldExpr();
+                this._releaseHeldExpr();
 
                 // 现在: RET = 左 float, V1 = 右 float. 装 FP regs.
                 this.vm.fmovToFloat(0, VReg.RET);        // FP0 = 左
@@ -627,9 +685,9 @@ export const AssignmentCompiler = {
                 // 存储回 slot
                 this._storeLocalTemp(name, offset, VReg.RET);
             } else {
-                this.vm.push(VReg.RET);
+                const oldH = this._holdExpr(VReg.RET);
                 this.compileExpression(expr.right);
-                this.vm.pop(VReg.V1);
+                this._loadHeldExpr(oldH, VReg.V1);
                 // 此处 V1 = 旧值, RET = 右值。
 
                 // [#59] 算术复合赋值 (-=/*=//=/%=) 对 box/global 捕获变量及本路径经过的
@@ -637,22 +695,21 @@ export const AssignmentCompiler = {
                 // 原码用裸整数 sub/mul/div/mod 直接算位模式 → 垃圾（v*=3 得 0、m%=3 得 0.）。
                 // 只有 += 走 _js_add(正确) 而其余非 += 算术分支错。改为把左右都 ToNumber
                 // 归一到 float64 位再做浮点运算，与非装箱局部的浮点快路径同语义。
-                // 跨 _number_coerce 调用用栈/GP 保值（FP 亦 caller-saved，故先全部落到
-                // GP/栈再装 FP）。位运算/** 仍走各自运行时分派（下方 switch 不变）。
+                // 跨 _number_coerce 调用用 hold 保值（FP 亦 caller-saved）。位运算/**
+                // 仍走各自运行时分派（下方 switch 不变）。
                 if (op === "-=" || op === "*=" || op === "/=" || op === "%=") {
                     // 关键：(1) _number_coerce 破坏 caller-saved（含 V1、A*）；
-                    // (2) arm64 上 A0 与 RET 同为 X0。故每次覆写 X0 前，需要的值必须已在栈
-                    // 或保存寄存器里。原码 pop(A0) 冲掉了 RET 里的右 float → 两操作数坍缩成
-                    // 旧值（*= 因交换律侥幸对，-=/=/% 露馅）。此序两次 call 间全程走栈/V1。
-                    this.vm.push(VReg.RET);              // [.., 右值 raw]
-                    this.vm.mov(VReg.A0, VReg.V1);       // A0 = 旧值 raw（V1 尚未被 call 破坏）
+                    // (2) arm64 上 A0 与 RET 同为 X0。故每次覆写 X0 前，需要的值必须已 hold。
+                    const rightH = this._holdExpr(VReg.RET);
+                    this.vm.mov(VReg.A0, VReg.V1);       // A0 = 旧值 raw
                     this.vm.call("_number_coerce");      // RET = 旧值 float
-                    this.vm.pop(VReg.V1);                // V1 = 右值 raw
-                    this.vm.push(VReg.RET);              // [.., 旧值 float]
-                    this.vm.mov(VReg.A0, VReg.V1);       // A0 = 右值 raw
+                    this._holdStore(oldH, VReg.RET);
+                    this._loadHeldExpr(rightH, VReg.A0); // A0 = 右值 raw
                     this.vm.call("_number_coerce");      // RET = 右值 float
                     this.vm.mov(VReg.V1, VReg.RET);      // V1 = 右值 float
-                    this.vm.pop(VReg.RET);               // RET = 旧值 float
+                    this._loadHeldExpr(oldH, VReg.RET);  // RET = 旧值 float
+                    this._releaseHeldExpr();             // rightH
+                    this._releaseHeldExpr();             // oldH
                     this.vm.fmovToFloat(0, VReg.RET);    // FP0 = 旧
                     this.vm.fmovToFloat(1, VReg.V1);     // FP1 = 右
                     if (op === "-=") { this.vm.fsub(0, 0, 1); }
@@ -662,7 +719,8 @@ export const AssignmentCompiler = {
                     this.vm.fmovToInt(VReg.RET, 0);
                     // [#nan-int0] 同上:fmul/fsub/fdiv/fmod 结果可能为别名 NaN → 规范化
                     this.emitNaNCanon();
-                } else
+                } else {
+                this._releaseHeldExpr(); // oldH; V1=旧, RET=右
                 switch (op) {
                     case "+=":
                         // 完整 JS 加法语义（字符串拼接/数值）
@@ -699,16 +757,15 @@ export const AssignmentCompiler = {
                         this.vm.mov(VReg.A1, VReg.RET); this.vm.mov(VReg.A0, VReg.V1); this.vm.call("_math_pow");
                         break;
                     default:
+                        if (boxH) this._releaseHeldExpr();
                         console.warn("Unhandled assignment operator:", op);
                         return;
                 }
+                }
 
-                if (globalLabel && !offset) {
-                    // 主程序被捕获变量
-                    this.vm.pop(VReg.V2); // 恢复 box 指针
-                    this.vm.store(VReg.V2, 0, VReg.RET);
-                } else if (isBoxed) {
-                    this.vm.pop(VReg.V2); // 恢复 box 指针
+                if (boxH) {
+                    this._loadHeldExpr(boxH, VReg.V2);
+                    this._releaseHeldExpr();
                     this.vm.store(VReg.V2, 0, VReg.RET);
                 } else {
                     this._storeLocalTemp(name, offset, VReg.RET);
@@ -743,23 +800,21 @@ export const AssignmentCompiler = {
                 // 不调 setter(与 node 的访问器可观测性一致)。此前脱糖成 `member = (member OP rhs)`
                 // 恒写回 → 即便短路也触发 setter(es-compat t850/t853/t856)。对象/键各求值一次
                 // (存帧槽 + `__WithPrecomputed` 复用),读写共用同一预求值对象,免副作用重复。
-                const id = this.nextLabelId();
                 const endLabel = this.ctx.newLabel("mla_end");
                 // (1) 对象求值一次
                 this.compileExpression(member.object);
-                const objSlot = this.ctx.allocLocal(`__mla_obj_${id}`);
-                this.vm.store(VReg.FP, objSlot, VReg.RET);
+                const objH = this._holdExpr(VReg.RET);
                 // (2) 计算键求值一次
                 let propNode = member.property;
+                let keyH = null;
                 if (member.computed) {
                     this.compileExpression(member.property);
-                    const keySlot = this.ctx.allocLocal(`__mla_key_${id}`);
-                    this.vm.store(VReg.FP, keySlot, VReg.RET);
-                    propNode = { type: "__WithPrecomputed", slot: keySlot };
+                    keyH = this._holdExpr(VReg.RET);
+                    propNode = { type: "__WithPrecomputed", hold: keyH };
                 }
                 const preMember = {
                     type: "MemberExpression",
-                    object: { type: "__WithPrecomputed", slot: objSlot },
+                    object: { type: "__WithPrecomputed", hold: objH },
                     property: propNode,
                     computed: member.computed,
                 };
@@ -767,11 +822,12 @@ export const AssignmentCompiler = {
                 this.compileExpression(preMember);
                 // (4) 短路判定:满足则跳 end(RET 已是读值,即赋值表达式之值)
                 if (binOp === "||" || binOp === "&&") {
-                    this.vm.push(VReg.RET);
+                    const held = this._holdExpr(VReg.RET);
                     this.vm.mov(VReg.A0, VReg.RET);
                     this.vm.call("_to_boolean");
                     this.vm.cmpImm(VReg.RET, 0);
-                    this.vm.pop(VReg.RET);
+                    this._loadHeldExpr(held, VReg.RET);
+                    this._releaseHeldExpr();
                     if (binOp === "||") this.vm.jne(endLabel); // 真 → 不赋值
                     else this.vm.jeq(endLabel);                // &&:假 → 不赋值
                 } else {
@@ -793,6 +849,8 @@ export const AssignmentCompiler = {
                     right: expr.right,
                 });
                 this.vm.label(endLabel);
+                if (keyH) this._releaseHeldExpr();
+                this._releaseHeldExpr();
                 return;
             }
             // 算术/位复合赋值 member OP= rhs 脱糖成 member = (member OP rhs)，复用成员读 + 简单赋值。
@@ -813,42 +871,50 @@ export const AssignmentCompiler = {
             if (member.object && member.object.type === "SuperExpression") {
                 dsMember = member;
             } else if (!this.isPureExpr(member.object) || member.computed) {
-                const did = this.nextLabelId();
                 this.compileExpression(member.object);
-                const dsObjSlot = this.ctx.allocLocal(`__cma_obj_${did}`);
-                this.vm.store(VReg.FP, dsObjSlot, VReg.RET);
+                const objH = this._holdExpr(VReg.RET);
                 let dsProp = member.property;
+                let keyH = null;
                 if (member.computed) {
                     this.compileExpression(member.property);
-                    // [求值序] `base[prop] op= rhs`,base 为 null/undefined:键**表达式**要求值
-                    // (其抛出可观测),但 ToPropertyKey 不做 —— GetValue 先 ToObject(base) 抛
-                    // TypeError。此前先 _js_prop_key,键对象的 toString 被调 → 抛出的是它的错
-                    // (S11.13.2_A7.x 族期待 TypeError)。
                     const coercibleOk = this.ctx.newLabel("cma_base_ok");
                     const coercibleBad = this.ctx.newLabel("cma_base_nullish");
-                    this.vm.push(VReg.RET); // 保住键值
-                    this.vm.load(VReg.V0, VReg.FP, dsObjSlot);
+                    keyH = this._holdExpr(VReg.RET);
+                    this._loadHeldExpr(objH, VReg.V0);
                     this.vm.shrImm(VReg.V1, VReg.V0, 48);
-                    this.vm.cmpImm(VReg.V1, 0x7FFA); // null
+                    this.vm.cmpImm(VReg.V1, 0x7FFA);
                     this.vm.jeq(coercibleBad);
-                    this.vm.cmpImm(VReg.V1, 0x7FFB); // undefined
+                    this.vm.cmpImm(VReg.V1, 0x7FFB);
                     this.vm.jne(coercibleOk);
                     this.vm.label(coercibleBad);
                     this.emitThrowTypeError("Cannot read properties of null or undefined");
                     this.vm.label(coercibleOk);
-                    this.vm.pop(VReg.RET);
-                    this.vm.mov(VReg.A0, VReg.RET);
-                    this.vm.call("_js_prop_key"); // ToPropertyKey 单次(对象键 toString 可观测)
-                    const dsKeySlot = this.ctx.allocLocal(`__cma_key_${did}`);
-                    this.vm.store(VReg.FP, dsKeySlot, VReg.RET);
-                    dsProp = { type: "__WithPrecomputed", slot: dsKeySlot };
+                    this._loadHeldExpr(keyH, VReg.A0);
+                    this.vm.call("_js_prop_key");
+                    this._holdStore(keyH, VReg.RET);
+                    dsProp = { type: "__WithPrecomputed", hold: keyH };
                 }
                 dsMember = {
                     type: "MemberExpression",
-                    object: { type: "__WithPrecomputed", slot: dsObjSlot },
+                    object: { type: "__WithPrecomputed", hold: objH },
                     property: dsProp,
                     computed: member.computed,
                 };
+                const desugaredHeld = {
+                    type: "AssignmentExpression",
+                    operator: "=",
+                    left: dsMember,
+                    right: {
+                        type: "BinaryExpression",
+                        operator: binOp,
+                        left: dsMember,
+                        right: expr.right,
+                    },
+                };
+                this.compileAssignmentExpression(desugaredHeld);
+                if (keyH) this._releaseHeldExpr();
+                this._releaseHeldExpr();
+                return;
             }
             const desugared = {
                 type: "AssignmentExpression",
@@ -892,18 +958,18 @@ export const AssignmentCompiler = {
             (member.computed && member.property.type === "Literal" && member.property.value === "length");
         if (isLengthWrite) {
             this.compileExpression(member.object);
-            const slenObjOff = this.ctx.allocLocal(`__slen_obj_${this.nextLabelId()}`);
-            this.vm.store(VReg.FP, slenObjOff, VReg.RET); // 保存对象(boxed JSValue)
+            const objH = this._holdExpr(VReg.RET);
             this.compileExpression(expr.right);
-            const slenValOff = this.ctx.allocLocal(`__slen_val_${this.nextLabelId()}`);
-            this.vm.store(VReg.FP, slenValOff, VReg.RET);  // 保存原始 RHS(作表达式值)
+            const valH = this._holdExpr(VReg.RET);
             this.vm.mov(VReg.A1, VReg.RET);                // A1 = boxed value(保留 Inf/负数)
-            this.vm.load(VReg.A0, VReg.FP, slenObjOff);    // A0 = 对象
+            this._loadHeldExpr(objH, VReg.A0);
             const slenStrict = (this.ctx && this.ctx.inStrictFunction) ||
                 (this._currentModuleAst && this._currentModuleAst._bsStrict);
             this.vm.movImm(VReg.A2, slenStrict ? 1 : 0);
             this.vm.call("_js_set_length");
-            this.vm.load(VReg.RET, VReg.FP, slenValOff);   // 赋值表达式求值为原始 RHS 值
+            this._loadHeldExpr(valH, VReg.RET);
+            this._releaseHeldExpr();
+            this._releaseHeldExpr();
             return;
         }
 
@@ -916,18 +982,18 @@ export const AssignmentCompiler = {
         if (_cpsFnr && (_cpsFnr.node.type === "FunctionDeclaration" ||
             _cpsFnr.node.type === "FunctionExpression" || _cpsFnr.node.type === "ArrowFunctionExpression")) {
             this.compileExpression(member.object);
-            const cpsObjOff = this.ctx.allocLocal(`__cps_fn_${this.nextLabelId()}`);
-            this.vm.store(VReg.FP, cpsObjOff, VReg.RET);
+            const objH = this._holdExpr(VReg.RET);
             this.compileExpression(expr.right);
-            const cpsValOff = this.ctx.allocLocal(`__cps_val_${this.nextLabelId()}`);
-            this.vm.store(VReg.FP, cpsValOff, VReg.RET);
-            this.vm.mov(VReg.A2, VReg.RET);
-            this.vm.load(VReg.A0, VReg.FP, cpsObjOff);
+            const valH = this._holdExpr(VReg.RET);
+            this._loadHeldExpr(objH, VReg.A0);
             this.emitBoxedStringKey(member.property.name, VReg.A1);
+            this._loadHeldExpr(valH, VReg.A2);
             const _cpsStrict = (this.ctx && this.ctx.inStrictFunction) ||
                 (this._currentModuleAst && this._currentModuleAst._bsStrict);
             this.vm.call(_cpsStrict ? "_closure_prop_set_strict" : "_closure_prop_set");
-            this.vm.load(VReg.RET, VReg.FP, cpsValOff);
+            this._loadHeldExpr(valH, VReg.RET);
+            this._releaseHeldExpr();
+            this._releaseHeldExpr();
             return;
         }
 
@@ -941,32 +1007,28 @@ export const AssignmentCompiler = {
                 : (this.getMemberPropertyName ? this.getMemberPropertyName(member.property) : null);
             if (computedPropName !== null) {
                 this.compileExpression(member.object);
-                const objTempName = `__obj_assign_${this.nextLabelId()}`;
-                const objOffset = this.ctx.allocLocal(objTempName);
-                this.vm.store(VReg.FP, objOffset, VReg.RET);
+                const objH = this._holdExpr(VReg.RET);
 
                 this.compileExpression(expr.right);
-                const cvalOff = this.ctx.allocLocal(`__cval_assign_${this.nextLabelId()}`);
-                this.vm.store(VReg.FP, cvalOff, VReg.RET); // 保存被赋值(call 后作表达式值)
-                this.vm.mov(VReg.A2, VReg.RET);
-                this.vm.load(VReg.A0, VReg.FP, objOffset);
-                if (computedPropName === "Symbol.iterator" ||
-                    computedPropName === "Symbol.asyncIterator" ||
-                    computedPropName === "Symbol.species") {
-                    // 规范键是 well-known Symbol;勿落字符串别名(读侧 @@iterator 走符号键)。
-                    const wkSlot = computedPropName === "Symbol.iterator"
-                        ? "_symwk_iterator"
-                        : (computedPropName === "Symbol.asyncIterator"
-                            ? "_symwk_asyncIterator"
-                            : "_symwk_species");
-                    this.vm.lea(VReg.A0, wkSlot);
+                const valH = this._holdExpr(VReg.RET);
+                // getMemberPropertyName folds Symbol.xxx to the string
+                // "Symbol.xxx". Runtime helpers (IsConcatSpreadable, match,
+                // toStringTag, …) Get the well-known symbol, not that alias.
+                // iterator/asyncIterator/species already took this path;
+                // the other well-known names must too, or
+                // `obj[Symbol.isConcatSpreadable]=true` is invisible to concat.
+                if (computedPropName.length > 7 &&
+                    computedPropName.charCodeAt(0) === 83 &&
+                    computedPropName.slice(0, 7) === "Symbol.") {
+                    this.vm.lea(VReg.A0, "_symwk_" + computedPropName.slice(7));
                     this.vm.lea(VReg.A1, this.asm.addString(computedPropName));
                     this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
                     this.vm.or(VReg.A1, VReg.A1, VReg.V1);
                     this.vm.call("_symbol_wellknown");
                     this.vm.mov(VReg.A1, VReg.RET);
-                    this.vm.load(VReg.A0, VReg.FP, objOffset);
+                    this._loadHeldExpr(objH, VReg.A0);
                 } else {
+                    this._loadHeldExpr(objH, VReg.A0);
                     this.emitBoxedStringKey(computedPropName, VReg.A1);
                 }
                 // Resolving a well-known Symbol calls _symbol_wellknown, which is
@@ -974,13 +1036,15 @@ export const AssignmentCompiler = {
                 // after the key is ready; otherwise `obj[Symbol.iterator] = fn`
                 // stores an A2 scratch value on x64 and GetMethod later sees a
                 // non-callable number instead of fn.
-                this.vm.load(VReg.A2, VReg.FP, cvalOff);
+                this._loadHeldExpr(valH, VReg.A2);
                 {
                     const strictSet = (this.ctx && this.ctx.inStrictFunction) ||
                         (this._currentModuleAst && this._currentModuleAst._bsStrict);
                     this.vm.call(strictSet ? "_object_set_strict" : "_object_set");
                 }
-                this.vm.load(VReg.RET, VReg.FP, cvalOff); // 赋值表达式求值为被赋的值
+                this._loadHeldExpr(valH, VReg.RET);
+                this._releaseHeldExpr();
+                this._releaseHeldExpr();
                 return;
             }
 
@@ -991,72 +1055,63 @@ export const AssignmentCompiler = {
                 // 静态索引：arr[0] = value（仅整数字面量,非整数走动态路径 [#39],同 members.js）
                 const idx = Math.trunc(member.property.value);
 
-                // 先编译数组对象
                 this.compileExpression(member.object);
-                const arrTempName = `__arr_assign_${this.nextLabelId()}`;
-                const arrOffset = this.ctx.allocLocal(arrTempName);
-                this.vm.store(VReg.FP, arrOffset, VReg.RET);
+                const arrH = this._holdExpr(VReg.RET);
 
-                // 编译要赋的值
                 this.compileExpression(expr.right);
-                // 注意：RET = A0 = X0，所以要先保存 value 再加载 arr
-                const valTempName = `__val_assign_${this.nextLabelId()}`;
-                const valOffset = this.ctx.allocLocal(valTempName);
-                this.vm.store(VReg.FP, valOffset, VReg.RET);
+                const valH = this._holdExpr(VReg.RET);
 
-                // 调用 _subscript_set(arr, idx, value)
-                this.vm.load(VReg.A0, VReg.FP, arrOffset); // arr
-                this.vm.movImm(VReg.A1, idx); // index
-                this.vm.load(VReg.A2, VReg.FP, valOffset); // value
-                // Strict getter-only / nonwritable array index must TypeError
-                // (4-243-2). Object props already pick _object_set_strict.
+                this._loadHeldExpr(arrH, VReg.A0);
+                this.vm.movImm(VReg.A1, idx);
+                this._loadHeldExpr(valH, VReg.A2);
                 {
                     const strictSet = (this.ctx && this.ctx.inStrictFunction) ||
                         (this._currentModuleAst && this._currentModuleAst._bsStrict);
                     this.vm.call(strictSet ? "_subscript_set_strict" : "_subscript_set");
                 }
-                // 赋值表达式求值为**被赋的值**(a[i]=v 返 v),非 _subscript_set 的返回残留。
-                this.vm.load(VReg.RET, VReg.FP, valOffset);
+                this._loadHeldExpr(valH, VReg.RET);
+                this._releaseHeldExpr();
+                this._releaseHeldExpr();
             } else {
                 // 动态下标：arr[i] = value / obj[key] = value
                 // 键保持原始 JSValue，交给 _subscript_set 运行时分派。
                 // [求值序] ES 规范:对象 → 键 → 值 严格左到右。任一操作数**非纯**(可能有
                 // 副作用/受副作用影响)时按规范序发;两者皆纯(标识符/this/字面量,编译器
                 // 自身全此类)保持原键先序 → 字节不变(纯操作数下顺序不可观测)。
-                const idxTempName = `__idx_assign_${this.nextLabelId()}`;
-                const idxOffset = this.ctx.allocLocal(idxTempName);
-                const arrTempName = `__arr_assign_${this.nextLabelId()}`;
-                const arrOffset = this.ctx.allocLocal(arrTempName);
-                if (this.isPureExpr(member.object) && this.isPureExpr(member.property)) {
+                const pure = this.isPureExpr(member.object) && this.isPureExpr(member.property);
+                let idxH, arrH;
+                if (pure) {
                     this.compileExpression(member.property);
-                    this.vm.store(VReg.FP, idxOffset, VReg.RET);
+                    idxH = this._holdExpr(VReg.RET);
                     this.compileExpression(member.object);
-                    this.vm.store(VReg.FP, arrOffset, VReg.RET);
+                    arrH = this._holdExpr(VReg.RET);
                 } else {
                     this.compileExpression(member.object);
-                    this.vm.store(VReg.FP, arrOffset, VReg.RET);
+                    arrH = this._holdExpr(VReg.RET);
                     this.compileExpression(member.property);
-                    this.vm.store(VReg.FP, idxOffset, VReg.RET);
+                    idxH = this._holdExpr(VReg.RET);
                 }
 
-                // 编译要赋的值
                 this.compileExpression(expr.right);
-                // 注意：RET = A0 = X0，所以要先保存 value 再加载 arr
-                const valTempName = `__val_assign_${this.nextLabelId()}`;
-                const valOffset = this.ctx.allocLocal(valTempName);
-                this.vm.store(VReg.FP, valOffset, VReg.RET);
+                const valH = this._holdExpr(VReg.RET);
 
-                // 调用 _subscript_set(arr, idx, value)
-                this.vm.load(VReg.A0, VReg.FP, arrOffset); // arr
-                this.vm.load(VReg.A1, VReg.FP, idxOffset); // index
-                this.vm.load(VReg.A2, VReg.FP, valOffset); // value
+                this._loadHeldExpr(arrH, VReg.A0);
+                this._loadHeldExpr(idxH, VReg.A1);
+                this._loadHeldExpr(valH, VReg.A2);
                 {
                     const strictSet = (this.ctx && this.ctx.inStrictFunction) ||
                         (this._currentModuleAst && this._currentModuleAst._bsStrict);
                     this.vm.call(strictSet ? "_subscript_set_strict" : "_subscript_set");
                 }
-                // 赋值表达式求值为**被赋的值**(arr[i]=v / obj[k]=v 返 v)。
-                this.vm.load(VReg.RET, VReg.FP, valOffset);
+                this._loadHeldExpr(valH, VReg.RET);
+                this._releaseHeldExpr(); // valH
+                if (pure) {
+                    this._releaseHeldExpr(); // arrH
+                    this._releaseHeldExpr(); // idxH
+                } else {
+                    this._releaseHeldExpr(); // idxH
+                    this._releaseHeldExpr(); // arrH
+                }
             }
         } else {
             // 对象属性赋值：obj.prop = value
@@ -1066,16 +1121,11 @@ export const AssignmentCompiler = {
                 : (member.property.name || member.property.value);
             const propLabel = this.asm.addString(propName);
 
-            // 先编译对象
             this.compileExpression(member.object);
-            const objTempName = `__obj_assign_${this.nextLabelId()}`;
-            const objOffset = this.ctx.allocLocal(objTempName);
-            this.vm.store(VReg.FP, objOffset, VReg.RET);
+            const objH = this._holdExpr(VReg.RET);
 
-            // 编译要赋的值
             this.compileExpression(expr.right);
-            const pvalOff = this.ctx.allocLocal(`__pval_assign_${this.nextLabelId()}`);
-            this.vm.store(VReg.FP, pvalOff, VReg.RET); // 保存被赋值(IC call 后作表达式值)
+            const valH = this._holdExpr(VReg.RET);
 
             // PutValue ToObject(base) after RHS. _object_set on null/undefined is
             // a silent no-op ("illegal type, skip"); spec TypeError.
@@ -1084,7 +1134,7 @@ export const AssignmentCompiler = {
             {
                 const idBaseOk = this.ctx.newLabel("cma_id_base_ok");
                 const idBaseBad = this.ctx.newLabel("cma_id_base_nullish");
-                this.vm.load(VReg.V1, VReg.FP, objOffset);
+                this._loadHeldExpr(objH, VReg.V1);
                 this.vm.shrImm(VReg.V2, VReg.V1, 48); // V2 tag; x64 V0≡RET
                 this.vm.cmpImm(VReg.V2, 0x7FFA);
                 this.vm.jeq(idBaseBad);
@@ -1093,26 +1143,27 @@ export const AssignmentCompiler = {
                 this.vm.label(idBaseBad);
                 this.emitThrowTypeError("Cannot convert undefined or null to object");
                 this.vm.label(idBaseOk);
-                this.vm.load(VReg.RET, VReg.FP, pvalOff);
+                this._loadHeldExpr(valH, VReg.RET);
             }
 
             // [私有品牌] `o.#x = v`:接收者无该私有名 → TypeError;私有方法、无 setter 的
             // 私有访问器一律不可写(规范 PrivateSet)。此前静默当普通属性写(键 "#C#x"),
             // 把品牌违规写成新增属性。
             if (this._isPrivateMemberKey(member.property)) {
-                this.vm.load(VReg.RET, VReg.FP, objOffset);
+                this._loadHeldExpr(objH, VReg.RET);
                 this.emitPrivateBrandCheck(propName, 1, !!(member.object && member.object.type === "ThisExpression"));
-                this.vm.load(VReg.RET, VReg.FP, pvalOff);
+                this._loadHeldExpr(valH, VReg.RET);
             }
 
             // 调用 _object_set_ic(obj, key, value, site)
             // 注意：RET 和 A0 都是 X0，所以要先 mov A2 再 load A0
-            this.vm.mov(VReg.A2, VReg.RET); // value (先移动，因为 load A0 会覆盖 X0)
-            this.vm.load(VReg.A0, VReg.FP, objOffset); // obj
-            this.emitObjectSetIC(propName); // [P2] 站点缓存(key→A1/site→A3/call)
+            this.vm.mov(VReg.A2, VReg.RET);
+            this._loadHeldExpr(objH, VReg.A0);
+            this.emitObjectSetIC(propName);
 
-            // 赋值表达式求值为**被赋的值**(obj.prop=v 返 v),非 IC 调用返回残留。
-            this.vm.load(VReg.RET, VReg.FP, pvalOff);
+            this._loadHeldExpr(valH, VReg.RET);
+            this._releaseHeldExpr();
+            this._releaseHeldExpr();
         }
     },
 
@@ -1144,10 +1195,8 @@ export const AssignmentCompiler = {
                 this.vm.mov(VReg.A0, VReg.RET);
                 this.vm.load(VReg.A1, VReg.FP, slot);
                 this.vm.call("_maybe_getter");
-                const oldSlot = this.ctx.allocLocal(`__withupd_${this.nextLabelId()}`);
-                this.vm.store(VReg.FP, oldSlot, VReg.RET);
-                // new = old ± 1
-                this.vm.load(VReg.RET, VReg.FP, oldSlot);
+                const oldH = this._holdExpr(VReg.RET);
+                this._loadHeldExpr(oldH, VReg.RET);
                 this.emitNumberCoerceFast();
                 this.vm.fmovToFloat(0, VReg.RET);
                 this.vm.movImm(VReg.V1, 0x3ff00000);
@@ -1156,16 +1205,16 @@ export const AssignmentCompiler = {
                 if (expr.operator === "++") this.vm.fadd(0, 0, 1);
                 else this.vm.fsub(0, 0, 1);
                 this.vm.fmovToInt(VReg.A2, 0);
-                const newOff = this.ctx.allocLocal(`__withupd_new_${this.nextLabelId()}`);
-                this.vm.store(VReg.FP, newOff, VReg.A2);
-                // PutValue 恒写本 binding(不再 HasBinding)
+                const newH = this._holdExpr(VReg.A2);
                 if (strictSet) this._emitStrictObjectEnvPutGuard(slot, name);
-                this.vm.load(VReg.A2, VReg.FP, newOff);
+                this._loadHeldExpr(newH, VReg.A2);
                 this.vm.load(VReg.A0, VReg.FP, slot);
                 this.emitBoxedStringKey(name, VReg.A1);
                 this.vm.call(setHelper);
-                if (expr.prefix) this.vm.fmovToInt(VReg.RET, 0);
-                else this.vm.load(VReg.RET, VReg.FP, oldSlot);
+                if (expr.prefix) this._loadHeldExpr(newH, VReg.RET);
+                else this._loadHeldExpr(oldH, VReg.RET);
+                this._releaseHeldExpr();
+                this._releaseHeldExpr();
                 this.vm.jmp(doneL);
                 this.vm.label(missL);
             }
@@ -1233,7 +1282,7 @@ export const AssignmentCompiler = {
                         } else {
                             // Boxed slots may contain raw float bits, int32 JSValues, or heap Numbers.
                             // Normalize through ToNumber before applying ++/--.
-                            this.vm.push(VReg.V2);
+                            const boxH = this._holdExpr(VReg.V2);
                             this.vm.mov(VReg.A0, VReg.RET);
                             this.vm.call("_number_coerce");
                             this.vm.movImm(VReg.V1, 0x3ff00000);
@@ -1246,7 +1295,8 @@ export const AssignmentCompiler = {
                                 this.vm.fsub(0, 0, 1);
                             }
                             this.vm.fmovToInt(VReg.RET, 0);
-                            this.vm.pop(VReg.V2);
+                            this._loadHeldExpr(boxH, VReg.V2);
+                            this._releaseHeldExpr();
                         }
                         this.vm.store(VReg.V2, 0, VReg.RET);
                         this.syncModuleExportBinding(name, VReg.RET);
@@ -1262,10 +1312,10 @@ export const AssignmentCompiler = {
                             // 后置表达式值 = ToNumber(old),不是原对象/函数。
                             // 此前 push 未 coerce 的旧值:`y=fn--` 在 isNaN(y) 走
                             // 第二次 ToNumber 时又撞 0x7FF8/int0 别名。
-                            this.vm.push(VReg.V2); // box pointer
+                            const boxH = this._holdExpr(VReg.V2);
                             this.vm.mov(VReg.A0, VReg.RET);
                             this.vm.call("_number_coerce");
-                            this.vm.push(VReg.RET); // ToNumber(old)=postfix ret
+                            const oldH = this._holdExpr(VReg.RET); // ToNumber(old)=postfix ret
                             this.vm.fmovToFloat(0, VReg.RET);
                             this.vm.movImm(VReg.V1, 0x3ff00000);
                             this.vm.shl(VReg.V1, VReg.V1, 32);
@@ -1278,8 +1328,10 @@ export const AssignmentCompiler = {
                             this.vm.fmovToInt(VReg.RET, 0);
                             this.emitNaNCanon();
                             this.vm.mov(VReg.V1, VReg.RET); // new
-                            this.vm.pop(VReg.RET);          // postfix = ToNumber(old)
-                            this.vm.pop(VReg.V2);           // box pointer
+                            this._loadHeldExpr(oldH, VReg.RET); // postfix = ToNumber(old)
+                            this._loadHeldExpr(boxH, VReg.V2);
+                            this._releaseHeldExpr(); // oldH
+                            this._releaseHeldExpr(); // boxH
                         }
                         this.vm.store(VReg.V2, 0, VReg.V1);
                         this.syncModuleExportBinding(name, VReg.V1);
@@ -1328,7 +1380,7 @@ export const AssignmentCompiler = {
                         } else {
                             this.vm.mov(VReg.A0, VReg.V1);
                             this.vm.call("_number_coerce");   // RET = float64(old) = postfix ret
-                            this.vm.push(VReg.RET);          // 保护 postfix ret;SP-=16
+                            const oldH = this._holdExpr(VReg.RET);
                             this.vm.fmovToFloat(0, VReg.RET);
                             this.vm.movImm(VReg.V2, 0x3ff00000);
                             this.vm.shl(VReg.V2, VReg.V2, 32);
@@ -1342,7 +1394,8 @@ export const AssignmentCompiler = {
                             this.vm.mov(VReg.RET, VReg.V1);  // RET = 结果(canon)
                             this.emitNaNCanon();             // [#nan-int0]
                             this.vm.mov(VReg.V1, VReg.RET);  // V1 = 规范化结果
-                            this.vm.pop(VReg.RET);           // RET = postfix ret;SP+=16
+                            this._loadHeldExpr(oldH, VReg.RET);
+                            this._releaseHeldExpr();
                         }
                         this._storeLocalTemp(name, offset, VReg.V1);
                         this.syncModuleExportBinding(name, VReg.V1);
@@ -1358,12 +1411,8 @@ export const AssignmentCompiler = {
                 const setHelper = strictSet ? "_object_set_strict" : "_object_set";
                 const gOff = this._emitLoadBoxedGlobalThis();
                 this._emitGlobalObjectEnvGet(gOff, name);
-                const oldSlot = this.ctx.allocLocal(`__gupd_${this.nextLabelId()}`);
-                this.vm.store(VReg.FP, oldSlot, VReg.RET);
-                this.vm.load(VReg.RET, VReg.FP, oldSlot);
                 this.emitNumberCoerceFast();
-                const oldNumOff = this.ctx.allocLocal(`__gupd_oldn_${this.nextLabelId()}`);
-                this.vm.store(VReg.FP, oldNumOff, VReg.RET);
+                const oldNumH = this._holdExpr(VReg.RET);
                 this.vm.fmovToFloat(0, VReg.RET);
                 this.vm.movImm(VReg.V1, 0x3ff00000);
                 this.vm.shl(VReg.V1, VReg.V1, 32);
@@ -1371,15 +1420,16 @@ export const AssignmentCompiler = {
                 if (expr.operator === "++") this.vm.fadd(0, 0, 1);
                 else this.vm.fsub(0, 0, 1);
                 this.vm.fmovToInt(VReg.A2, 0);
-                const newOff = this.ctx.allocLocal(`__gupd_new_${this.nextLabelId()}`);
-                this.vm.store(VReg.FP, newOff, VReg.A2);
+                const newH = this._holdExpr(VReg.A2);
                 if (strictSet) this._emitStrictObjectEnvPutGuard(gOff, name);
-                this.vm.load(VReg.A2, VReg.FP, newOff);
+                this._loadHeldExpr(newH, VReg.A2);
                 this.vm.load(VReg.A0, VReg.FP, gOff);
                 this.emitBoxedStringKey(name, VReg.A1);
                 this.vm.call(setHelper);
-                if (expr.prefix) this.vm.load(VReg.RET, VReg.FP, newOff);
-                else this.vm.load(VReg.RET, VReg.FP, oldNumOff);
+                if (expr.prefix) this._loadHeldExpr(newH, VReg.RET);
+                else this._loadHeldExpr(oldNumH, VReg.RET);
+                this._releaseHeldExpr();
+                this._releaseHeldExpr();
             }
         } else if (expr.argument.type === "MemberExpression" &&
             expr.argument.object && expr.argument.object.type === "SuperExpression") {
@@ -1397,28 +1447,27 @@ export const AssignmentCompiler = {
                 return;
             }
             this.compileExpression(expr.argument);
-            const oldOff = this.ctx.allocLocal(`__supupd_old_${this.nextLabelId()}`);
-            this.vm.store(VReg.FP, oldOff, VReg.RET);
+            const oldH = this._holdExpr(VReg.RET);
             this.compileMemberAssignment({
                 type: "AssignmentExpression",
                 operator: expr.operator === "++" ? "+=" : "-=",
                 left: expr.argument,
                 right: one,
             });
-            this.vm.load(VReg.RET, VReg.FP, oldOff);
+            this._loadHeldExpr(oldH, VReg.RET);
+            this._releaseHeldExpr();
             return;
         } else if (expr.argument.type === "MemberExpression") {
             // 成员自增/自减：obj.prop++ / obj[k]-- / arr[i]++ （原先未处理 → 静默 no-op，
             // 致 this.labelCounter++ 等失效 → 标签重复/野跳，是自举后期堆损坏/野跳的又一根因）。
             const member = expr.argument;
             const isInc = expr.operator === "++";
-            // 全程用栈保存 obj/key/old/new（自包含、push/pop 平衡），避免 allocLocal 帧槽在
-            // 模板字面量/拼接等外层表达式已 push 累加器的上下文里交互出错（原 allocLocal 版
-            // 在 `${this.n++}` 里会野写 _object_set(NULL)）。
-            // 1. 求值 object → 压栈
+            // obj/key/old/new 走 _holdExpr 池(录制期 T*,直发期 FP)。原 SP 相对存取
+            // 依赖后端槽宽(arm64 16 / x64 8),且外层若再 push 会错位;
+            // `${this.n++}` 已改 FP 累加器,本路径不再碰 SP。
             this.compileExpression(member.object);
-            this.vm.push(VReg.RET); // 栈: [obj]
-            let dynKey = false, staticKey = null;
+            const objH = this._holdExpr(VReg.RET);
+            let dynKey = false, staticKey = null, keyH = null;
             if (member.computed) {
                 const kn = (member.property.type === "Identifier")
                     ? null
@@ -1427,7 +1476,7 @@ export const AssignmentCompiler = {
                     staticKey = kn;
                 } else {
                     this.compileExpression(member.property);
-                    this.vm.push(VReg.RET); // 栈: [obj, key]
+                    keyH = this._holdExpr(VReg.RET);
                     dynKey = true;
                 }
             } else {
@@ -1445,10 +1494,6 @@ export const AssignmentCompiler = {
                     updFnProp = true;
                 }
             }
-            // 2. 读旧值 obj[key]。push 槽宽因后端而异：arm64 stp reg,xzr,[sp,#-16]! 每格
-            // 16 字节；x64 pushq 每格 8 字节。偏移按 slot 递增（原硬编码 16 在 x64 上
-            // 读错槽 → _object_set(NULL) FATAL，是 this.labelCounter++ 自举崩溃根因）。
-            const updSlot = this.vm.backend.name === "x64" ? 8 : 16;
             if (dynKey) {
                 // EvaluatePropertyAccessWithExpressionKey:RequireObjectCoercible(base)
                 // 先于 ToPropertyKey。_subscript_get_nullish 为拼 message 会
@@ -1457,7 +1502,7 @@ export const AssignmentCompiler = {
                 // (S11.4.5_A6_T3)。热路径 this.n++ 非计算键,不受影响。
                 const okL = this.ctx.newLabel("upd_base_ok");
                 const badL = this.ctx.newLabel("upd_base_nullish");
-                this.vm.load(VReg.V0, VReg.SP, updSlot);
+                this._loadHeldExpr(objH, VReg.V0);
                 this.vm.shrImm(VReg.V1, VReg.V0, 48);
                 this.vm.cmpImm(VReg.V1, 0x7FFA);
                 this.vm.jeq(badL);
@@ -1466,62 +1511,56 @@ export const AssignmentCompiler = {
                 this.vm.label(badL);
                 this.emitThrowTypeError("Cannot read properties of null or undefined");
                 this.vm.label(okL);
-                this.vm.load(VReg.A0, VReg.SP, 0);
+                this._loadHeldExpr(keyH, VReg.A0);
                 this.vm.call("_js_prop_key");
-                this.vm.store(VReg.SP, 0, VReg.RET);
-                this.vm.load(VReg.A1, VReg.SP, 0);
-                this.vm.load(VReg.A0, VReg.SP, updSlot);
+                this._holdStore(keyH, VReg.RET);
+                this._loadHeldExpr(keyH, VReg.A1);
+                this._loadHeldExpr(objH, VReg.A0);
                 this.vm.call("_subscript_get");
             } else if (updFnProp) {
-                this.vm.load(VReg.A0, VReg.SP, 0);   // obj(函数值)
+                this._loadHeldExpr(objH, VReg.A0);
                 this.emitBoxedStringKey(staticKey, VReg.A1);
                 this.vm.call("_closure_prop_get");
             } else {
-                this.vm.load(VReg.RET, VReg.SP, 0);  // obj
-                this.emitObjectGetIC(staticKey);     // [P2] 站点缓存(getter 已融合)
+                this._loadHeldExpr(objH, VReg.RET);
+                this.emitObjectGetIC(staticKey);
             }
-            // 3. ToNumber(old) → 压栈
             this.vm.mov(VReg.A0, VReg.RET);
             this.vm.call("_number_coerce");
-            this.vm.push(VReg.RET); // 栈: [obj,(key,)old]
-            // 4. new = old ± 1.0 → 压栈
+            const oldH = this._holdExpr(VReg.RET);
             this.vm.movImm(VReg.V1, 0x3ff00000);
             this.vm.shl(VReg.V1, VReg.V1, 32);
             this.vm.fmovToFloat(0, VReg.RET);
             this.vm.fmovToFloat(1, VReg.V1);
             if (isInc) { this.vm.fadd(0, 0, 1); } else { this.vm.fsub(0, 0, 1); }
             this.vm.fmovToInt(VReg.RET, 0);
-            this.vm.push(VReg.RET); // 栈顶→底(每格 slot): new@0,old@slot,(key@2slot,)obj@(dynKey?3slot:2slot)
-            // 5. 写回 obj[key] = new
+            const newH = this._holdExpr(VReg.RET);
             if (dynKey) {
-                this.vm.load(VReg.A2, VReg.SP, 0);   // new
-                this.vm.load(VReg.A1, VReg.SP, 2 * updSlot);  // key
-                this.vm.load(VReg.A0, VReg.SP, 3 * updSlot);  // obj
+                this._loadHeldExpr(newH, VReg.A2);
+                this._loadHeldExpr(keyH, VReg.A1);
+                this._loadHeldExpr(objH, VReg.A0);
                 {
                     const strictSet = (this.ctx && this.ctx.inStrictFunction) ||
                         (this._currentModuleAst && this._currentModuleAst._bsStrict);
                     this.vm.call(strictSet ? "_subscript_set_strict" : "_subscript_set");
                 }
             } else if (updFnProp) {
-                this.vm.load(VReg.A2, VReg.SP, 0);   // new
-                this.vm.load(VReg.A0, VReg.SP, 2 * updSlot);  // obj(函数值)
+                this._loadHeldExpr(newH, VReg.A2);
+                this._loadHeldExpr(objH, VReg.A0);
                 this.emitBoxedStringKey(staticKey, VReg.A1);
                 const _updFnStrict = (this.ctx && this.ctx.inStrictFunction) ||
                     (this._currentModuleAst && this._currentModuleAst._bsStrict);
                 this.vm.call(_updFnStrict ? "_closure_prop_set_strict" : "_closure_prop_set");
             } else {
-                this.vm.load(VReg.A0, VReg.SP, 2 * updSlot);  // obj
-                this.vm.load(VReg.A2, VReg.SP, 0);   // new
-                this.emitObjectSetIC(staticKey); // [P2] 站点缓存(key→A1/site→A3/call)
+                this._loadHeldExpr(objH, VReg.A0);
+                this._loadHeldExpr(newH, VReg.A2);
+                this.emitObjectSetIC(staticKey);
             }
-            // 6. 结果：prefix→new(SP+0)，postfix→old(SP+slot)
-            this.vm.load(VReg.RET, VReg.SP, expr.prefix ? 0 : updSlot);
-            // 7. 清栈（pop 到废寄存器，RET 不受影响；x64 上 V0==RET==RAX，改用 V1）
-            const updScrap = this.vm.backend.name === "x64" ? VReg.V1 : VReg.V0;
-            this.vm.pop(updScrap); // new
-            this.vm.pop(updScrap); // old
-            if (dynKey) { this.vm.pop(updScrap); } // key
-            this.vm.pop(updScrap); // obj
+            this._loadHeldExpr(expr.prefix ? newH : oldH, VReg.RET);
+            this._releaseHeldExpr(); // newH
+            this._releaseHeldExpr(); // oldH
+            if (dynKey) this._releaseHeldExpr(); // keyH
+            this._releaseHeldExpr(); // objH
         }
     },
 

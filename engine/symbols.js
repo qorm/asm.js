@@ -253,6 +253,19 @@ export const SYM_NAMES = [
     // CreateDynamicFunction for `new Function` inside eval fragments.
     // Append-only ABI: fragment relocation ids remain stable.
     "_dynamic_function_ctor_call",
+    // x64 eval/new Function DATA fixups (append-only).
+    "_scheduler_current",
+    "_gen_last_coro",
+    // Date.prototype.toJSON / @@toPrimitive (append-only).
+    "_date_toJSON", "_date_toPrimitive",
+    "_date_timeclip",
+    "_date_norm_ym", "_date_compose_ms", "_date_civil_to_days",
+    "_date_toTimeString",
+    "_date_set_instance_proto", "_date_get_instance_proto",
+    // Method calls with nullish thisArg (Function.prototype.call/apply and
+    // compileMethodCall) emit OrdinaryCallBindThis. Eval/new Function
+    // fragments must relocate this host helper. Append-only ABI.
+    "_ordinary_bind_this",
 ];
 
 // 表中**不是代码标签**的名字:.data 段全局槽(数据段在 _engine_symaddr 生成之后才发射)
@@ -273,6 +286,8 @@ export const SYM_LATE_LABELS = new Set([
     "_dynamic_fn_maker_set", "_dynamic_fn_meta_add",
     "_nsobj_promise",
     "_nsobj_object", "_nsobj_object_proto", "_nsobj_object_ready",
+    "_scheduler_current",
+    "_gen_last_coro",
     // `_pspc_is_ctor` is a runtime code label (not a data slot); it is listed
     // here only when a platform build emits the promise generator lazily.
 ]);

@@ -1,0 +1,10 @@
+{
+  "description": "Whole-string Unicode property scan leaf: x64 must keep the table index off V1 (aliases A3) while walking encoded table bytes. Anchored one-or-more Letter property matches letters and rejects digits.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true\nfalse",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "Member reads and builtin LTR temps use expr-scratch T* instead of hardware push/pop.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "20\n30\n7\n1\ntrue\ntrue\n16\nAB\n2\ntrue\ntrue",
+    "exitCode": 0
+  }
+}

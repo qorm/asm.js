@@ -1,0 +1,10 @@
+{
+  "description": "x64 A3≡V1 and store(RET,S5) via RAX: TA find thisArg stays undefined, empty reduce throws, Set-like GetSetRecord does not SIGSEGV.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true\nthrew\nfalse",
+    "exitCode": 0
+  }
+}

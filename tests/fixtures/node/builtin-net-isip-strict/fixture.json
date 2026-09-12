@@ -1,0 +1,10 @@
+{
+  "description": "node:net isIP/isIPv4/isIPv6 reject malformed IPv4/IPv6 and accept compressed plus IPv4-mapped IPv6 text",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "4\n6\n6\n6\n6\n6\n0\n0\n0\n0\n0\n0\ntrue\nfalse\ntrue\nfalse",
+    "exitCode": 0
+  }
+}

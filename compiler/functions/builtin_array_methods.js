@@ -3,6 +3,7 @@
 
 import { VReg } from "../../vm/registers.js";
 import { argsHasSpread } from "../expressions/expressions.js";
+import { TYPE_PROXY } from "../../runtime/core/types.js";
 
 export const BuiltinArrayMethodCompiler = {
     // [半支持修补] Array.prototype.flat(depth):接收者已在 RET。逐层调用 _array_flat
@@ -124,15 +125,16 @@ export const BuiltinArrayMethodCompiler = {
                     // 非 spread 快路径不分配 FP-local(编译器自身热用 push,避免帧膨胀踩
                     // layout-position 定点雷)。
                     this.compileExpression(arrayExpr);
-                    this.vm.push(VReg.RET);                  // 栈顶 = 当前数组指针
+                    const pushH = this._holdExpr(VReg.RET);
                     for (let ai = 0; ai < args.length; ai++) {
                         this.compileExpression(args[ai]);
-                        this.vm.mov(VReg.A1, VReg.RET);      // A1 = 元素
-                        this.vm.pop(VReg.A0);                // A0 = 当前数组
-                        this.vm.call("_array_push");         // RET = 扩容后新数组指针
-                        this.vm.push(VReg.RET);              // 更新栈顶 = 新数组
+                        this.vm.mov(VReg.A1, VReg.RET);
+                        this._loadHeldExpr(pushH, VReg.A0);
+                        this.vm.call("_array_push");
+                        this._holdStore(pushH, VReg.RET);
                     }
-                    this.vm.pop(VReg.RET);                   // RET = 最终数组指针
+                    this._loadHeldExpr(pushH, VReg.RET);
+                    this._releaseHeldExpr();
                 } else {
                     // spread 慢路径:arr.push(...src) 逐元素展开。FP-local 槽滚动当前数组,
                     // spread 源用 _array_length + _array_get + _array_push 运行时循环
@@ -212,14 +214,14 @@ export const BuiltinArrayMethodCompiler = {
                     const wbKey = arrayExpr.property.type === "PrivateIdentifier"
                         ? this.manglePrivateName(arrayExpr.property.name)
                         : arrayExpr.property.name;
-                    this.vm.push(VReg.RET);                       // 栈: [新数组]
+                    const newArrH = this._holdExpr(VReg.RET);      // 新数组(扩容指针)
                     this.compileExpression(arrayExpr.object);     // RET = obj
                     this.vm.mov(VReg.A0, VReg.RET);               // A0 = obj
                     this.emitBoxedStringKey(wbKey, VReg.A1);      // A1 = key
-                    this.vm.pop(VReg.A2);                         // A2 = 新数组
-                    this.vm.push(VReg.A2);                        // 再存一份供后续算长度
+                    this._loadHeldExpr(newArrH, VReg.A2);         // A2 = 新数组
                     this.vm.call("_object_set");                  // obj[key] = 新数组
-                    this.vm.pop(VReg.RET);                        // 恢复 RET = 新数组
+                    this._loadHeldExpr(newArrH, VReg.RET);        // 恢复 RET = 新数组
+                    this._releaseHeldExpr();
                 }
 
                 // _array_push 返回了更新后的数组指针 (boxed JSValue)
@@ -286,10 +288,11 @@ export const BuiltinArrayMethodCompiler = {
                 // args==0 used to leave leftover RET (the receiver array)
                 // so [1,2,3].at() was leftover array. 1-arg emit unchanged.
                 if (args.length > 0) {
-                    this.vm.push(VReg.RET); // 保存数组 JSValue
+                    const recvH = this._holdExpr(VReg.RET); // 保存数组 JSValue
                     this.compileExpressionAsInt(args[0]);
                     this.vm.mov(VReg.A1, VReg.RET); // index (int)
-                    this.vm.pop(VReg.A0); // arr JSValue
+                    this._loadHeldExpr(recvH, VReg.A0); // arr JSValue
+                    this._releaseHeldExpr();
                     // `_array_at` accepts the boxed array directly and masks
                     // its 0x7FFE tag itself.  Do not call `_js_unbox` here:
                     // that helper is a normal call and may clobber A1 on x64,
@@ -341,17 +344,19 @@ export const BuiltinArrayMethodCompiler = {
                 // leftover 0. Missing searchElement is 0x7FFB. 1-arg / 2-arg
                 // emit unchanged.
                 if (args.length > 0) {
-                    this.vm.push(VReg.RET); // 数组(装箱)
+                    const recvH = this._holdExpr(VReg.RET); // 数组(装箱)
                     this.compileExpression(args[0]);
-                    this.vm.push(VReg.RET); // value
+                    const valH = this._holdExpr(VReg.RET); // value
                     if (args.length > 1) {
                         this.compileExpression(args[1]); // boxed from(勿提前 _to_int32)
                     } else {
                         this.vm.movImm64(VReg.RET, 0x7ffb000000000000n); // undefined
                     }
                     this.vm.mov(VReg.A2, VReg.RET);
-                    this.vm.pop(VReg.A1); // value
-                    this.vm.pop(VReg.A0); // array
+                    this._loadHeldExpr(valH, VReg.A1); // value
+                    this._loadHeldExpr(recvH, VReg.A0); // array
+                    this._releaseHeldExpr();
+                    this._releaseHeldExpr();
                 } else {
                     this.vm.mov(VReg.A0, VReg.RET);
                     this.vm.movImm64(VReg.A1, 0x7ffb000000000000n);
@@ -366,17 +371,19 @@ export const BuiltinArrayMethodCompiler = {
                 // timing and SameValueZero; the old direct helper truncated
                 // fromIndex with _to_int32 and compared raw float bit patterns.
                 if (args.length > 0) {
-                    this.vm.push(VReg.RET);
+                    const recvH = this._holdExpr(VReg.RET);
                     this.compileExpression(args[0]);
-                    this.vm.push(VReg.RET);
+                    const valH = this._holdExpr(VReg.RET);
                     if (args.length > 1) {
                         this.compileExpression(args[1]);
                     } else {
                         this.vm.movImm64(VReg.RET, 0x7ffb000000000000n);
                     }
                     this.vm.mov(VReg.A2, VReg.RET); // boxed fromIndex
-                    this.vm.pop(VReg.A1);           // searchElement
-                    this.vm.pop(VReg.A0);           // receiver
+                    this._loadHeldExpr(valH, VReg.A1); // searchElement
+                    this._loadHeldExpr(recvH, VReg.A0); // receiver
+                    this._releaseHeldExpr();
+                    this._releaseHeldExpr();
                 } else {
                     this.vm.mov(VReg.A0, VReg.RET);
                     this.vm.movImm64(VReg.A1, 0x7ffb000000000000n);
@@ -536,15 +543,18 @@ export const BuiltinArrayMethodCompiler = {
             case "join":
                 // 接收者已在行首(line 148)求值到 RET；勿再 compileExpression(arrayExpr)，
                 // 否则 arr.reverse().join() 会二次求值把原地反转再跑一遍 → 得原序。
-                this.vm.push(VReg.RET);
+                {
+                const recvH = this._holdExpr(VReg.RET);
                 if (args.length > 0) {
                     this.compileExpression(args[0]);
                     this.vm.mov(VReg.A1, VReg.RET);
                 } else {
                     this.vm.lea(VReg.A1, "_str_comma_only");
                 }
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_array_join");
+                }
                 break;
             case "reverse":
                 // 接收者已在 RET;须走活读(_agen_reverse):defineProperty accessor
@@ -595,11 +605,15 @@ export const BuiltinArrayMethodCompiler = {
             case "lastIndexOf":
                 // Preserve boxed fromIndex so the runtime can check length==0
                 // before coercion and retain ±Infinity/full 64-bit values.
-                this.vm.push(VReg.RET);
+                {
+                const recvH = this._holdExpr(VReg.RET);
                 if (args.length >= 2) {
-                    this.compileExpression(args[0]); this.vm.push(VReg.RET);
-                    this.compileExpression(args[1]); this.vm.mov(VReg.A2, VReg.RET);
-                    this.vm.pop(VReg.A1);
+                    this.compileExpression(args[0]);
+                    const searchH = this._holdExpr(VReg.RET);
+                    this.compileExpression(args[1]);
+                    this.vm.mov(VReg.A2, VReg.RET);
+                    this._loadHeldExpr(searchH, VReg.A1);
+                    this._releaseHeldExpr();
                 } else if (args.length === 1) {
                     this.compileExpression(args[0]); this.vm.mov(VReg.A1, VReg.RET);
                     this.vm.movImm64(VReg.A2, 0x7ff0000000000000n); // omitted → +Infinity
@@ -607,8 +621,10 @@ export const BuiltinArrayMethodCompiler = {
                     this.vm.movImm64(VReg.A1, 0x7ffb000000000000n);
                     this.vm.movImm64(VReg.A2, 0x7ff0000000000000n); // omitted → +Infinity
                 }
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_aref_arr_lastIndexOf");
+                }
                 break;
             case "sort":
                 // arr.sort(comparator) - 原地排序，调用用户比较器。
@@ -1395,7 +1411,7 @@ export const BuiltinArrayMethodCompiler = {
             // [Proxy 回调] 可调用 Proxy(type@0==8)→ _validate_callable 合成闭包块
             // {0xc105, tramp, proxyRaw}(in/out=S0,A0-A5/S1/S2 保持)→ 按闭包分派。
             const rawFnLabel = this.ctx.newLabel("cb_raw_fn");
-            vm.movImm(VReg.S2, 8); // TYPE_PROXY
+            vm.movImm(VReg.S2, TYPE_PROXY);
             vm.cmp(VReg.S1, VReg.S2);
             vm.jne(rawFnLabel);
             // _validate_callable 的 proxy 判别要求**装箱 0x7FFD 形态**(裸指针落 raw 路
@@ -1609,18 +1625,12 @@ export const BuiltinArrayMethodCompiler = {
         // 保存当前元素
         this.vm.store(VReg.FP, elemOffset, VReg.RET);
 
-        // 准备闭包调用
-        this.vm.load(VReg.V6, VReg.FP, cbOffset);
-        this.vm.push(VReg.V6);
-
-        // 设置参数
+        // 回调已在 FP 槽;装参会冲掉 caller-saved,从槽装 S0,勿再 push/pop。
         this.vm.load(VReg.A0, VReg.FP, elemOffset); // element
         this.vm.load(VReg.A1, VReg.FP, idxOffset); // index (raw)
         this.vm.scvtf(0, VReg.A1); this.vm.fmovToInt(VReg.A1, 0); // index → 装箱 JS number
         this.vm.load(VReg.A2, VReg.FP, arrOffset); // array
-
-        // 弹出闭包并调用
-        this.vm.pop(VReg.S0);
+        this.vm.load(VReg.S0, VReg.FP, cbOffset);
         this.emitClosureCallAfterSetup();
 
         // 检查返回值是否为 truthy（回调可能返回 JS bool / 任意值，

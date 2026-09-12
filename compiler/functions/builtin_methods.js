@@ -44,14 +44,15 @@ export const BuiltinMethodCompiler = {
             (_sp0.indexOf("__regexp_shim.js") !== -1 || _mf0.indexOf("__regexp_shim.js") !== -1);
         if (_regexpShimCharCode) {
             this.compileExpression(obj);
-            this.vm.push(VReg.RET); // preserve receiver while compiling index
+            const shimH = this._holdExpr(VReg.RET);
             if (args.length > 0) {
                 this.compileExpression(args[0]);
                 this.vm.mov(VReg.A1, VReg.RET);
             } else {
                 this.vm.movImm(VReg.A1, 0);
             }
-            this.vm.pop(VReg.A0);
+            this._loadHeldExpr(shimH, VReg.A0);
+            this._releaseHeldExpr();
             this.vm.call("_str_byteAt_fast");
             return true;
         }
@@ -60,20 +61,22 @@ export const BuiltinMethodCompiler = {
         this.compileExpression(obj);
         this.vm.mov(VReg.A0, VReg.RET);
         this.vm.call("_valueToStr"); // RET = boxed string (handles 0x7FFD wrappers)
-        this.vm.push(VReg.RET); // 保存归一化后的字符串
+        const recvH = this._holdExpr(VReg.RET);
 
         switch (method) {
             case "toLocaleUpperCase":
                 // str.toLocaleUpperCase() - asm.js no locale support, alias to toUpperCase
             case "toUpperCase":
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_str_toUpperCase");
                 return true;
 
             case "toLocaleLowerCase":
                 // str.toLocaleLowerCase() - asm.js no locale support, alias to toLowerCase
             case "toLowerCase":
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_str_toLowerCase");
                 return true;
 
@@ -88,7 +91,8 @@ export const BuiltinMethodCompiler = {
                 } else {
                     this.vm.movImm(VReg.A1, 0); // 0-arg leftover: ToInteger(undefined)=0
                 }
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_str_charAt");
                 return true;
 
@@ -100,7 +104,8 @@ export const BuiltinMethodCompiler = {
                 } else {
                     this.vm.movImm64(VReg.A1, 0x7FF8000000000000n); // 0 (boxed)
                 }
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_str_at");
                 return true;
 
@@ -116,7 +121,8 @@ export const BuiltinMethodCompiler = {
                 } else {
                     this.vm.movImm64(VReg.A1, 0x7ffb000000000000n); // undefined → ToInteger → 0
                 }
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_str_proto_codePointAt_utf16");
                 return true;
 
@@ -132,7 +138,8 @@ export const BuiltinMethodCompiler = {
                 } else {
                     this.vm.movImm(VReg.A1, 0); // 0-arg leftover: ToInteger(undefined)=0
                 }
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 // The compiler/parser and the UTF-8 regexp shim intentionally
                 // inspect raw bytes.  All ordinary user code follows the
                 // ECMAScript UTF-16 code-unit contract.  Keep the distinction
@@ -174,7 +181,8 @@ export const BuiltinMethodCompiler = {
 
             case "trim":
                 // str.trim() - 去除首尾空白
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_getStrContent");
                 this.vm.mov(VReg.A0, VReg.RET);
                 this.vm.call("_str_trim");
@@ -183,33 +191,29 @@ export const BuiltinMethodCompiler = {
             case "slice":
                 // str.slice(start, end) —— slice 语义(负→从末尾、start>end→空)。
                 // substring 语义不同(负→0、swap),见下方独立 case。
-                // 先获取字符串内容指针
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_getStrContent");
-                this.vm.push(VReg.RET); // 保存内容指针
+                const sliceStrH = this._holdExpr(VReg.RET);
 
-                // start 不预 _to_int32:保留 Infinity/NaN 原值(同 substring),
-                // _str_slice 内部 ToIntegerOrInfinity。预转 +Inf→0 会把
-                // slice(Infinity, Infinity) 错成 slice(0, +Inf)→全串。
                 if (args.length > 0) {
                     this.compileExpression(args[0]);
-                    this.vm.push(VReg.RET); // start(raw JSValue: NaN/Inf 保留原 float bits)
                 } else {
-                    this.vm.movImm64(VReg.V1, 0x7FF8000000000000n); // 0 (boxed)
-                    this.vm.push(VReg.V1);
+                    this.vm.movImm64(VReg.RET, 0x7FF8000000000000n);
                 }
+                const sliceStartH = this._holdExpr(VReg.RET);
 
-                // 编译 end 参数。禁止预 _to_int32：undefined 必须原样传入，
-                // 由 _str_slice 判 end===undefined → len（预转会变成 0 → 空串）。
                 if (args.length > 1) {
                     this.compileExpression(args[1]);
                     this.vm.mov(VReg.A2, VReg.RET);
                 } else {
-                    this.vm.movImm64(VReg.A2, 0x7ffb000000000000n); // JS_UNDEFINED
+                    this.vm.movImm64(VReg.A2, 0x7ffb000000000000n);
                 }
 
-                this.vm.pop(VReg.A1); // start
-                this.vm.pop(VReg.A0); // str content
+                this._loadHeldExpr(sliceStartH, VReg.A1);
+                this._loadHeldExpr(sliceStrH, VReg.A0);
+                this._releaseHeldExpr();
+                this._releaseHeldExpr();
                 this.vm.call("_str_slice");
                 return true;
 
@@ -222,19 +226,20 @@ export const BuiltinMethodCompiler = {
                 // _str_substring 内部用 _number_coerce + ToIntegerOrInfinity 语义处理。
                 if (args.length > 0) {
                     this.compileExpression(args[0]);
-                    this.vm.push(VReg.RET); // start(raw JSValue: NaN/Inf 保留原 float bits)
                 } else {
-                    this.vm.movImm64(VReg.V1, 0x7FF8000000000000n); // 0(boxed)
-                    this.vm.push(VReg.V1);
+                    this.vm.movImm64(VReg.RET, 0x7FF8000000000000n);
                 }
+                const subStartH = this._holdExpr(VReg.RET);
                 if (args.length > 1) {
                     this.compileExpression(args[1]);
-                    this.vm.mov(VReg.A2, VReg.RET); // end(raw JSValue)
+                    this.vm.mov(VReg.A2, VReg.RET);
                 } else {
-                    this.vm.movImm64(VReg.A2, 0x7ffb000000000000n); // JS_UNDEFINED
+                    this.vm.movImm64(VReg.A2, 0x7ffb000000000000n);
                 }
-                this.vm.pop(VReg.A1); // start(raw JSValue)
-                this.vm.pop(VReg.A0); // 接收者(装箱串,未 getStrContent)
+                this._loadHeldExpr(subStartH, VReg.A1);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
+                this._releaseHeldExpr();
                 this.vm.call("_str_substring");
                 return true;
 
@@ -250,11 +255,10 @@ export const BuiltinMethodCompiler = {
                     this.vm.and(VReg.RET, VReg.RET, VReg.V1);
                     this.vm.movImm64(VReg.V1, 0x7FF8000000000000n);
                     this.vm.or(VReg.RET, VReg.RET, VReg.V1);
-                    this.vm.push(VReg.RET); // start (boxed)
                 } else {
-                    this.vm.movImm64(VReg.V1, 0x7FF8000000000000n); // 0 (boxed)
-                    this.vm.push(VReg.V1);
+                    this.vm.movImm64(VReg.RET, 0x7FF8000000000000n);
                 }
+                const substrStartH = this._holdExpr(VReg.RET);
 
                 if (args.length > 1) {
                     this.compileExpression(args[1]);
@@ -266,11 +270,13 @@ export const BuiltinMethodCompiler = {
                     this.vm.or(VReg.RET, VReg.RET, VReg.V1);
                     this.vm.mov(VReg.A2, VReg.RET);
                 } else {
-                    this.vm.movImm64(VReg.A2, 0x7ffb000000000000n); // JS_UNDEFINED
+                    this.vm.movImm64(VReg.A2, 0x7ffb000000000000n);
                 }
 
-                this.vm.pop(VReg.A1); // start
-                this.vm.pop(VReg.A0); // str content
+                this._loadHeldExpr(substrStartH, VReg.A1);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
+                this._releaseHeldExpr();
                 this.vm.call("_str_substr");
                 return true;
 
@@ -286,7 +292,8 @@ export const BuiltinMethodCompiler = {
                     const id = this.nextLabelId();
                     const recvName = `__rpl_recv_${id}`;
                     const recvOff = this.ctx.allocLocal(recvName);
-                    this.vm.pop(VReg.RET);
+                    this._loadHeldExpr(recvH, VReg.RET);
+                    this._releaseHeldExpr();
                     this.vm.store(VReg.FP, recvOff, VReg.RET);
                     this.compileExpression({
                         type: "CallExpression",
@@ -303,19 +310,22 @@ export const BuiltinMethodCompiler = {
                 if (args.length >= 2) {
                     const replIsFn = args[1].type === "FunctionExpression" || args[1].type === "ArrowFunctionExpression";
                     this.compileExpression(args[0]);
-                    this.vm.push(VReg.RET);          // search
+                    const searchH = this._holdExpr(VReg.RET);
                     this.compileExpression(args[1]);
-                    this.vm.mov(VReg.A2, VReg.RET);  // repl(串或函数闭包)
-                    this.vm.pop(VReg.A1);            // search
-                    this.vm.pop(VReg.A0);            // str
+                    this.vm.mov(VReg.A2, VReg.RET);
+                    this._loadHeldExpr(searchH, VReg.A1);
+                    this._loadHeldExpr(recvH, VReg.A0);
+                    this._releaseHeldExpr();
+                    this._releaseHeldExpr();
                     if (replIsFn) {
                         this.vm.call(method === "replaceAll" ? "_str_replaceAll_fn" : "_str_replace_fn");
                     } else {
                         this.vm.call(method === "replaceAll" ? "_str_replaceAll" : "_str_replace");
                     }
                 } else {
-                    this.vm.pop(VReg.A0);
-                    this.vm.mov(VReg.RET, VReg.A0);  // 原串
+                    this._loadHeldExpr(recvH, VReg.A0);
+                    this._releaseHeldExpr();
+                    this.vm.mov(VReg.RET, VReg.A0);
                 }
                 return true;
             }
@@ -326,23 +336,23 @@ export const BuiltinMethodCompiler = {
                 // (缺参=undefined→"undefined";勿预 _getStrContent/勿塞空串)。
                 if (args.length > 0) {
                     this.compileExpression(args[0]);
-                    this.vm.mov(VReg.A1, VReg.RET);
+                    const idxSearchH = this._holdExpr(VReg.RET);
                     if (args.length > 1) {
-                        this.vm.push(VReg.A1);
                         this.compileExpression(args[1]);
-                        // ToInteger(+Inf 哨兵),勿 _to_int32(Infinity→0 错成命中)
                         this.vm.mov(VReg.A0, VReg.RET);
                         this.vm.call("_aref_fromindex");
                         this.vm.mov(VReg.A2, VReg.RET);
-                        this.vm.pop(VReg.A1);
                     } else {
                         this.vm.movImm(VReg.A2, 0);
                     }
+                    this._loadHeldExpr(idxSearchH, VReg.A1);
+                    this._releaseHeldExpr();
                 } else {
-                    this.vm.movImm64(VReg.A1, 0x7ffb000000000000n); // undefined
+                    this.vm.movImm64(VReg.A1, 0x7ffb000000000000n);
                     this.vm.movImm(VReg.A2, 0);
                 }
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_str_indexOf");
                 // 装箱返回值为 Number 对象
                 this.boxIntAsNumber(VReg.RET);
@@ -352,41 +362,42 @@ export const BuiltinMethodCompiler = {
                 // str.lastIndexOf(search, fromIndex?) — A1 装箱 JSValue(同 indexOf)。
                 if (args.length > 0) {
                     this.compileExpression(args[0]);
-                    this.vm.mov(VReg.A1, VReg.RET);
+                    const lioSearchH = this._holdExpr(VReg.RET);
                     if (args.length > 1) {
-                        this.vm.push(VReg.A1);
                         this.compileExpression(args[1]);
-                        // fromIndex 保持装箱,运行时 _number_coerce(规范 ToInteger)
                         this.vm.mov(VReg.A2, VReg.RET);
-                        this.vm.pop(VReg.A1);
                     } else {
-                        this.vm.movImm(VReg.A2, 0x7FFFFFFF); // 哨兵:不钳(搜到末尾)
+                        this.vm.movImm(VReg.A2, 0x7FFFFFFF);
                     }
+                    this._loadHeldExpr(lioSearchH, VReg.A1);
+                    this._releaseHeldExpr();
                 } else {
-                    this.vm.movImm64(VReg.A1, 0x7ffb000000000000n); // undefined → "undefined"
+                    this.vm.movImm64(VReg.A1, 0x7ffb000000000000n);
                     this.vm.movImm(VReg.A2, 0x7FFFFFFF);
                 }
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_str_lastIndexOf");
                 this.boxIntAsNumber(VReg.RET);
                 return true;
 
             case "concat":
-                // str.concat(a, b, c, ...) - 逐参串接(此前只用 args[0],丢弃其余 → "a".concat("b","c")="ab")
-                this.vm.pop(VReg.A0); // A0 = 接收者(装箱串)
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 if (args.length === 0) {
-                    this.vm.mov(VReg.RET, VReg.A0); // 无参:返回原串
+                    this.vm.mov(VReg.RET, VReg.A0);
                     return true;
                 }
+                const catH = this._holdExpr(VReg.A0);
                 for (let ci = 0; ci < args.length; ci++) {
-                    this.vm.push(VReg.A0);             // 保存累加器(compileExpression 会破坏 A 寄存器)
-                    this.compileExpression(args[ci]);  // RET = 本参(装箱串)
+                    this.compileExpression(args[ci]);
                     this.vm.mov(VReg.A1, VReg.RET);
-                    this.vm.pop(VReg.A0);              // 恢复累加器
-                    this.vm.call("_strconcat");        // RET = A0 + A1
-                    this.vm.mov(VReg.A0, VReg.RET);   // 累加器 = 结果
+                    this._loadHeldExpr(catH, VReg.A0);
+                    this.vm.call("_strconcat");
+                    this._holdStore(catH, VReg.RET);
                 }
-                this.vm.mov(VReg.RET, VReg.A0);
+                this._loadHeldExpr(catH, VReg.RET);
+                this._releaseHeldExpr();
                 return true;
 
             case "includes":
@@ -399,7 +410,8 @@ export const BuiltinMethodCompiler = {
                     this.vm.store(VReg.FP, incSearch, VReg.RET);
                     this.compileExpression(args[1]);          // pos
                     this.vm.mov(VReg.A1, VReg.RET);
-                    this.vm.pop(VReg.A0);                      // receiver
+                    this._loadHeldExpr(recvH, VReg.A0);
+                    this._releaseHeldExpr();                      // receiver
                     this.vm.movImm64(VReg.A2, 0x7ffb000000000000n); // undefined → 到尾
                     this.vm.call("_str_substring");           // RET = 尾串
                     this.vm.mov(VReg.A0, VReg.RET);
@@ -413,7 +425,8 @@ export const BuiltinMethodCompiler = {
                 } else {
                     this.vm.lea(VReg.A1, "_str_empty");
                 }
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_str_includes");
                 return true;
 
@@ -428,7 +441,8 @@ export const BuiltinMethodCompiler = {
                     this.vm.store(VReg.FP, swSearch, VReg.RET);
                     this.compileExpression(args[1]);          // pos(boxed number)
                     this.vm.mov(VReg.A1, VReg.RET);
-                    this.vm.pop(VReg.A0);                      // receiver(boxed str)
+                    this._loadHeldExpr(recvH, VReg.A0);
+                    this._releaseHeldExpr();                      // receiver(boxed str)
                     this.vm.movImm64(VReg.A2, 0x7ffb000000000000n); // undefined → 到尾
                     this.vm.call("_str_substring");           // RET = tail
                     this.vm.mov(VReg.A0, VReg.RET);           // A0 = tail
@@ -442,7 +456,8 @@ export const BuiltinMethodCompiler = {
                 } else {
                     this.vm.lea(VReg.A1, "_str_empty");
                 }
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_str_startsWith");
                 return true;
 
@@ -456,7 +471,8 @@ export const BuiltinMethodCompiler = {
                     this.vm.store(VReg.FP, ewSearch, VReg.RET);
                     this.compileExpression(args[1]);          // endPos
                     this.vm.mov(VReg.A2, VReg.RET);           // end = endPos
-                    this.vm.pop(VReg.A0);                      // receiver
+                    this._loadHeldExpr(recvH, VReg.A0);
+                    this._releaseHeldExpr();                      // receiver
                     this.vm.movImm64(VReg.A1, 0x7FF8000000000000n); // start = 0(boxed)
                     this.vm.call("_str_substring");           // RET = 前缀 [0,endPos)
                     this.vm.mov(VReg.A0, VReg.RET);
@@ -470,7 +486,8 @@ export const BuiltinMethodCompiler = {
                 } else {
                     this.vm.lea(VReg.A1, "_str_empty");
                 }
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_str_endsWith");
                 return true;
 
@@ -513,7 +530,8 @@ export const BuiltinMethodCompiler = {
                 } else {
                     this.vm.movImm(VReg.A1, 0);
                 }
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_str_repeat");
                 return true;
 
@@ -521,16 +539,15 @@ export const BuiltinMethodCompiler = {
                 // str.padStart(targetLen, padString)
                 if (args.length >= 2) {
                     this.compileExpression(args[0]);
-                    // targetLen -> int32 via _to_int32 (handles strings, numbers,
-                    // undefined, null, objects correctly — fcvtzs misinterprets
-                    // non-float64 bits and fails for string/"5" etc.)
                     if (this.vm.backend.name === "x64") this.vm.mov(VReg.A0, VReg.RET);
                     this.vm.call("_to_int32");
-                    this.vm.push(VReg.RET);
+                    const padLenH = this._holdExpr(VReg.RET);
                     this.compileExpression(args[1]);
                     this.vm.mov(VReg.A2, VReg.RET);
-                    this.vm.pop(VReg.A1);
-                    this.vm.pop(VReg.A0);
+                    this._loadHeldExpr(padLenH, VReg.A1);
+                    this._loadHeldExpr(recvH, VReg.A0);
+                    this._releaseHeldExpr();
+                    this._releaseHeldExpr();
                     this.vm.call("_str_padStart");
                 } else if (args.length === 1) {
                     this.compileExpression(args[0]);
@@ -543,10 +560,12 @@ export const BuiltinMethodCompiler = {
                     this.vm.lea(VReg.A2, this.asm.addString(" "));
                     this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
                     this.vm.or(VReg.A2, VReg.A2, VReg.V1);
-                    this.vm.pop(VReg.A0);
+                    this._loadHeldExpr(recvH, VReg.A0);
+                    this._releaseHeldExpr();
                     this.vm.call("_str_padStart");
                 } else {
-                    this.vm.pop(VReg.RET);
+                    this._loadHeldExpr(recvH, VReg.RET);
+                    this._releaseHeldExpr();
                 }
                 return true;
 
@@ -554,14 +573,15 @@ export const BuiltinMethodCompiler = {
                 // str.padEnd(targetLen, padString)
                 if (args.length >= 2) {
                     this.compileExpression(args[0]);
-                    // targetLen -> int32 via _to_int32 (same as padStart)
                     if (this.vm.backend.name === "x64") this.vm.mov(VReg.A0, VReg.RET);
                     this.vm.call("_to_int32");
-                    this.vm.push(VReg.RET);
+                    const padLenH = this._holdExpr(VReg.RET);
                     this.compileExpression(args[1]);
                     this.vm.mov(VReg.A2, VReg.RET);
-                    this.vm.pop(VReg.A1);
-                    this.vm.pop(VReg.A0);
+                    this._loadHeldExpr(padLenH, VReg.A1);
+                    this._loadHeldExpr(recvH, VReg.A0);
+                    this._releaseHeldExpr();
+                    this._releaseHeldExpr();
                     this.vm.call("_str_padEnd");
                 } else if (args.length === 1) {
                     this.compileExpression(args[0]);
@@ -574,10 +594,12 @@ export const BuiltinMethodCompiler = {
                     this.vm.lea(VReg.A2, this.asm.addString(" "));
                     this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
                     this.vm.or(VReg.A2, VReg.A2, VReg.V1);
-                    this.vm.pop(VReg.A0);
+                    this._loadHeldExpr(recvH, VReg.A0);
+                    this._releaseHeldExpr();
                     this.vm.call("_str_padEnd");
                 } else {
-                    this.vm.pop(VReg.RET);
+                    this._loadHeldExpr(recvH, VReg.RET);
+                    this._releaseHeldExpr();
                 }
                 return true;
 
@@ -587,7 +609,8 @@ export const BuiltinMethodCompiler = {
                     const id = this.nextLabelId();
                     const recvName = `__mtch_recv_${id}`;
                     const recvOff = this.ctx.allocLocal(recvName);
-                    this.vm.pop(VReg.RET);
+                    this._loadHeldExpr(recvH, VReg.RET);
+                    this._releaseHeldExpr();
                     this.vm.store(VReg.FP, recvOff, VReg.RET);
                     const argNode = args.length > 0
                         ? args[0]
@@ -608,7 +631,8 @@ export const BuiltinMethodCompiler = {
                 } else {
                     this.vm.lea(VReg.A1, "_str_empty");
                 }
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_str_match");
                 return true;
 
@@ -618,7 +642,8 @@ export const BuiltinMethodCompiler = {
                     const id = this.nextLabelId();
                     const recvName = `__mtcha_recv_${id}`;
                     const recvOff = this.ctx.allocLocal(recvName);
-                    this.vm.pop(VReg.RET);
+                    this._loadHeldExpr(recvH, VReg.RET);
+                    this._releaseHeldExpr();
                     this.vm.store(VReg.FP, recvOff, VReg.RET);
                     const argNode = args.length > 0
                         ? args[0]
@@ -640,7 +665,8 @@ export const BuiltinMethodCompiler = {
                 } else {
                     this.vm.lea(VReg.A1, "_str_empty");
                 }
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_str_matchAll");
                 return true;
 
@@ -651,7 +677,8 @@ export const BuiltinMethodCompiler = {
                     const id = this.nextLabelId();
                     const recvName = `__srch_recv_${id}`;
                     const recvOff = this.ctx.allocLocal(recvName);
-                    this.vm.pop(VReg.RET);
+                    this._loadHeldExpr(recvH, VReg.RET);
+                    this._releaseHeldExpr();
                     this.vm.store(VReg.FP, recvOff, VReg.RET);
                     const argNode = args.length > 0
                         ? args[0]
@@ -680,7 +707,8 @@ export const BuiltinMethodCompiler = {
                 } else {
                     this.vm.lea(VReg.A1, "_str_empty");
                 }
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_str_search");
                 this.boxIntAsNumber(VReg.RET);
                 return true;
@@ -693,7 +721,8 @@ export const BuiltinMethodCompiler = {
                     const s0str = this.ctx.allocLocal(`__split0_str_${s0id}`);
                     const s0arr = this.ctx.allocLocal(`__split0_arr_${s0id}`);
                     const s0boxed = this.ctx.allocLocal(`__split0_boxed_${s0id}`);
-                    this.vm.pop(VReg.RET);                 // 接收者(装箱串)
+                    this._loadHeldExpr(recvH, VReg.RET);
+                    this._releaseHeldExpr();                 // 接收者(装箱串)
                     this.vm.store(VReg.FP, s0str, VReg.RET);
                     this.vm.movImm(VReg.A0, 1);
                     this.vm.call("_array_new_with_size");  // RET = 裸数组头(len=1)
@@ -742,7 +771,8 @@ export const BuiltinMethodCompiler = {
                 }
                 this.emitArrayCtorObject();
                 this.vm.load(VReg.A1, VReg.FP, _ss);
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 if (splitLimRawSlot !== null) {
                     this.vm.load(VReg.A2, VReg.FP, splitLimRawSlot);
                 } else {
@@ -754,14 +784,16 @@ export const BuiltinMethodCompiler = {
             case "trimStart":
             case "trimLeft":
                 // str.trimStart()
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_str_trimStart");
                 return true;
 
             case "trimEnd":
             case "trimRight":
                 // str.trimEnd()
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_str_trimEnd");
                 return true;
 
@@ -783,7 +815,8 @@ export const BuiltinMethodCompiler = {
                 } else {
                     this.vm.movImm64(VReg.A1, 0x7ffb000000000000n); // undefined → NFC
                 }
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_str_normalize");
                 return true;
 
@@ -796,23 +829,26 @@ export const BuiltinMethodCompiler = {
                 } else {
                     this.vm.movImm64(VReg.A1, 0x7ffb000000000000n); // undefined
                 }
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_str_localeCompare");
                 return true;
 
             case "isWellFormed":
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_str_isWellFormed");
                 return true;
 
             case "toWellFormed":
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_str_toWellFormed");
                 return true;
         }
 
         // 未处理的方法，弹出栈
-        this.vm.pop(VReg.V0);
+        this._releaseHeldExpr();
         return false;
     },
 };

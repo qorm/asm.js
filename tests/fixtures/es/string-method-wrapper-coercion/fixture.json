@@ -1,0 +1,10 @@
+{
+  "description": "String prototype methods coerce Boolean and Number wrapper receivers on the x64 backend.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "fal\nfalseAtrue2\n123",
+    "exitCode": 0
+  }
+}

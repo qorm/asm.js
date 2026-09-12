@@ -1,0 +1,10 @@
+{
+  "description": "Map/Set/Date/Math method temps use expr-scratch T* instead of hardware push/pop.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "1\ntrue\n1\n2\n2\na:1,b:2\ntrue\n2\ntrue\n3\n3\n2020\n0\n2\n2021\n0\n3\n1\n8\n0\n8",
+    "exitCode": 0
+  }
+}

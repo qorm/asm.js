@@ -2,6 +2,7 @@
 import { fork } from "child_process";
 import { dirname, join, resolve } from "path";
 import { fileURLToPath } from "url";
+import os from "os";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_WORKER = join(__dirname, "compile-worker.mjs");
@@ -130,6 +131,10 @@ export class CompilePool {
         env: this.env,
         stdio: ["ignore", "pipe", "pipe", "ipc"],
       });
+      // Wine/qemu PE/ELF runs share this host with 4 compile workers.
+      // At nice 0 the workers sit at 100%+ and a 2s wine test wall-clocks
+      // past the 60s emulator run floor (findIndex/length-as-symbol).
+      try { os.setPriority(child.pid, 10); } catch {}
       const w = { child, dead: false, replaced: false, job: null, ready: false };
       const startupTimer = setTimeout(() => {
         if (w.ready) return;

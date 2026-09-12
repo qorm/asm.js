@@ -11,7 +11,7 @@
 
 ## 1. 摘要与价值定位(诚实框架)
 
-**必须先说清本设计不能解决什么。** prop.js(`o.a=o.b+o.c; s=s+o.a`,20M)实测 **jsbin 0.31s / node 0.03s = 10.3×**。定向采样(3513 叶样本)分解:
+**必须先说清本设计不能解决什么。** prop.js(`o.a=o.b+o.c; s=s+o.a`,20M)实测 **asm.js 0.31s / node 0.03s = 10.3×**。定向采样(3513 叶样本)分解:
 
 | 站点 | 叶采样 | 归属 | 本设计层级 |
 |---|---|---|---|
@@ -297,7 +297,7 @@ statements.js 声明处临时填充休眠钩子 `ctx.varInitTypes[name]={propert
 - 命中路径内联 POC(~40% 读路径内联):零提速 + 产物 +144%;
 - **本次(算术分派 + nan_canon 消除):零墙钟差。**
 
-arm64 分支预测 + 零 prologue helper 使 bl/ret 与标签判别廉价;叶采样在 call/branch 落点聚集,**高占比 ≠ 高墙钟**。prop.js 的 10.3× 差距**不来自任何单一可分派 helper**,而是结构性的:每操作指令数(jsbin 发 load+coerce 守卫+fmov×2+fadd+fmov vs V8 内联单 insn)、GP↔FP fmov 往返、I-cache 压力。
+arm64 分支预测 + 零 prologue helper 使 bl/ret 与标签判别廉价;叶采样在 call/branch 落点聚集,**高占比 ≠ 高墙钟**。prop.js 的 10.3× 差距**不来自任何单一可分派 helper**,而是结构性的:每操作指令数(asm.js 发 load+coerce 守卫+fmov×2+fadd+fmov vs V8 内联单 insn)、GP↔FP fmov 往返、I-cache 压力。
 
 ### 12.4 战略修订
 

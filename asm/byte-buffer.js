@@ -127,6 +127,29 @@ export class ByteBuffer {
         return out;
     }
 
+    // Dump into a number[] sink (ELF/PE writers). Indexing `buf[i]` on a
+    // ByteBuffer is undefined, which previously wrote a zero-filled linux-arm64
+    // ELF (SIGILL at e_entry).
+    appendToArray(array) {
+        const CHUNK_BITS = 20;
+        const CHUNK_MASK = 1048575;
+        let src = 0;
+        const n = this.length;
+        while (src < n) {
+            const within = src & CHUNK_MASK;
+            const word = this.chunks[src >> CHUNK_BITS][within >> 2];
+            const rem = n - src;
+            if (rem >= 4 && (within & 3) === 0) {
+                array.push(word & 255, (word >>> 8) & 255, (word >>> 16) & 255, (word >>> 24) & 255);
+                src += 4;
+            } else {
+                array.push((word >>> ((within & 3) << 3)) & 255);
+                src += 1;
+            }
+        }
+        return array;
+    }
+
     static fromBytes(bytes) {
         const out = new ByteBuffer();
         const n = bytes ? bytes.length : 0;

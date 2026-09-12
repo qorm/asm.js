@@ -1,0 +1,10 @@
+{
+  "description": "Binary/equality operands use expr-scratch T* (LLVM virtreg) instead of per-op FP slots or push/pop.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "48\ntrue\ntrue\n8\n3",
+    "exitCode": 0
+  }
+}

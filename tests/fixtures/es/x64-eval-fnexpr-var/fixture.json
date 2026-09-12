@@ -1,0 +1,10 @@
+{
+  "description": "Direct eval var slots in function expressions: x64 must not fill the box via V0 after _alloc (V0 aliases RET and clobbers the pointer). Also sloppy eval var x in an IIFE must not alias the captured outer x.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "3\n4\nundefined\n1",
+    "exitCode": 0
+  }
+}

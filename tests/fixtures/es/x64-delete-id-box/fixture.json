@@ -1,0 +1,10 @@
+{
+  "description": "identifier-delete of an unresolvable name boxes globalThis via RET-in _box_obj_r (x64 leftover RAX after eval-shim is a poison pointer).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ok",
+    "exitCode": 0
+  }
+}

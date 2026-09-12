@@ -1,7 +1,7 @@
 # test262 完整支持路线图 — 从 22.25% 到完整一致
 
-> 日期:2026-07-23(制定) · 状态:**执行中** · **当前:43.67%**(2822/6462,stride-5 子集;CRASH 177、COMPILE_FAIL 40,更新于 2026-07-27 / v0.3.4)
-> 轨迹:20.55%(v0.2.1)→ 22.25%(v0.2.2)→ 28.51%(v0.2.3)→ 30.63%(v0.2.4)→ 31.96%(v0.2.5)→ 33.63%(v0.2.6)→ 35.52%(v0.2.7)→ 36.04%(v0.2.8)→ 36.99%(v0.2.9)→ 39.74%(v0.3.0)→ 41.64%(v0.3.1)→ 43.49%(v0.3.2)→ 43.67%(v0.3.3)→ **43.67%(v0.3.4)**
+> 日期:2026-07-23(制定) · 状态:**官方 stride-5 样本五目标均 100%**(6276/6276，virtreg 后 `--gate`；windows-x64 2026-09-09，其余 2026-09-08；FAIL=COMPILE_FAIL=CRASH=0)。全集 `language`+`built-ins`+`annexB` 未达成，不得称 ES 全部支持。口径与五目标矩阵以 [FACTS.md](./FACTS.md) 为准。
+> 轨迹:20.55%(v0.2.1)→ … → 43.67%(v0.3.4)→ 70.19%(v0.3.65)→ 97.29%(v0.3.66)→ **100%(v0.4.1,官方样本 6276/6276)**。下方 43.67%/6462 与分类表为 2026-07-27 历史快照,勿当头条。
 > 参考:[Yuku](https://github.com/yuku-toolchain/yuku)(zig 规范一致 parser/工具链)、[Kiesel](https://codeberg.org/kiesel-js/kiesel)(zig 引擎,[20→25% devlog](https://linus.dev/posts/kiesel-devlog-1/))、[LibJS test262 仪表盘](https://serenityos.github.io/libjs-website/test262/)、[test262.fyi](https://test262.fyi/)
 > 关联:plan.md S1/S4、docs/SHAPE_IC_DESIGN.md、记忆 test262-s1-progress
 
@@ -11,9 +11,9 @@
 
 **目标**:在 test262 可运行子集上达到**完整一致**(对标成熟引擎 90%+)。
 
-**范围界定**(诚实):我们的 test262 数字基于**选定子集**——`language/{expressions,statements}` + 13 个核心 `built-ins/`(Array/Object/String/Number/Math/JSON/Map/Set/TypedArray/RegExp/Promise/Boolean/Symbol),stride=5 抽样 6462 项。**排除**:intl402(国际化,小引擎通常不做)、staging(提案)、dynamic-import/SharedArrayBuffer/decorators 等特性门(1383 项)。"完整支持" = 在此 in-scope 子集上 90%+,而非全量 ~48000 项。
+**范围界定**(诚实):官方口径见 [FACTS.md](./FACTS.md)——选定 `language/` + 核心 `built-ins/`、stride=5、每测试一种变体(现 6276 项)。**排除**:Intl/staging、以及 harness 标为 unsupported 的 feature。100% 指已跑官方样本 FAIL=COMPILE_FAIL=CRASH=0,不是全部 eligible 变体。
 
-**当前分类**(5024 失败 / 6462):
+**历史分类**(2026-07-27 快照,5024 失败 / 6462;当时样本宽度与现口径不同):
 | 状态 | 数 | 性质 |
 |---|---|---|
 | FAIL | 4435 | 能编译运行但断言失败(语义缺口) |

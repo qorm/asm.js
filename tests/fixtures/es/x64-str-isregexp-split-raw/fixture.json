@@ -1,0 +1,10 @@
+{
+  "description": "x64 V0≡RET must not load undefined over a live GetMethod/IsRegExp result; emitRestParam must read _argRegSpill so String.raw substitutions are the real arguments.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "includes=TypeError\nsplit=via-split\nraw=aXb\nraw-sub=TOSTR",
+    "exitCode": 0
+  }
+}

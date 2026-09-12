@@ -1,0 +1,11 @@
+{
+  "description": "node:net cork/uncork holds writes, write(..., 'hex') decodes, destroySoon half-closes after the queue drains",
+  "timeoutMs": 8000,
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "0\n2\n1\n0\npingpong\ntrue",
+    "exitCode": 0
+  }
+}

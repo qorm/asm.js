@@ -1,0 +1,10 @@
+{
+  "description": "String protocol dispatch preserves GetMethod results for custom and missing well-known symbol methods.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "custom:true::limit\ninsearchValue",
+    "exitCode": 0
+  }
+}

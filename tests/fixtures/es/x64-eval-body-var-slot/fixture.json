@@ -1,0 +1,10 @@
+{
+  "description": "x64 V0≡RET: emitBodyEvalVarSlots/emitParamEvalVarSlots must not movImm64(V0, undef) then store(RET,0,V0) (writes JS_UNDEFINED 0x7FFB). Direct eval var/let conflict throws SyntaxError; comma-eval var binding stays undefined.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "1\ndup=SyntaxError\narrow=SyntaxError\nundefined\n1",
+    "exitCode": 0
+  }
+}

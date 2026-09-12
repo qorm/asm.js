@@ -1,0 +1,11 @@
+{
+  "description": "node:net getConnections, maxConnections=1 serializes accept, setNoDelay/setKeepAlive succeed, readyState is open",
+  "timeoutMs": 8000,
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true\nIPv4\nack1\nack2\nn 2\ncounts 1,1\nfinal 0\nopen true",
+    "exitCode": 0
+  }
+}

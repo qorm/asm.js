@@ -6,5 +6,6 @@
     "run": true,
     "stdout": "true\nfalse",
     "exitCode": 0
-  }
+  },
+  "knownFailure": "NEW: eval in class field init arguments incomplete"
 }

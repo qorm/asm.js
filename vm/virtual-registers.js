@@ -46,7 +46,7 @@ const CONTRACTS = {
         callerSaved: ["V0", "V1", "V2", "V3", "V4", "V5", "V6", "V7", "A0", "A1", "A2", "A3", "A4", "A5", "RET"],
         allocatable: ["S0", "S1", "S2", "S3", "S4"],
         scratchPhysical: [10, 11],
-        // RSP/RBP and the two backend scratch registers are never allocator
+        // RSP/RBP and R10/R11 (backend scratchReg) are never allocator
         // candidates.  Caller-saved argument/result registers remain available
         // when `allowCallerSaved` is explicitly requested for call-free code.
         reservedPhysical: [4, 5, 10, 11],
@@ -266,15 +266,29 @@ export function getRegisterAliases(arch, name) {
 }
 
 /**
+ * True when two VReg names share a physical register on `arch`.
+ * Stack homes (x64 S5) never alias a GPR.
+ */
+export function registersAlias(arch, a, b) {
+    if (a === b) return true;
+    const contract = contractFor(arch);
+    if (!isRegisterName(contract, a) || !isRegisterName(contract, b)) return false;
+    const pa = contract.map[a];
+    const pb = contract.map[b];
+    if (pa == null || pb == null) return false;
+    return pa === pb;
+}
+
+/**
  * A deliberately conservative linear-scan manager.
  *
  * It is useful in two places:
  *   1. standalone IR tests (`allocate([{uses, defs, call}])`), and
  *   2. the VM recorder (`allocateRecorded({ops, a, b, c, cnt, tempHomes})`).
  *
- * The default pool is callee-saved only. This is slower than using every GPR,
- * but it makes a mapping sound across helper calls while the call-clobber table
- * is still being migrated out of hand-written compiler sites.
+ * Default pool is callee-saved. Production user-function coloring lives in
+ * `vm/regalloc.js` (phys-id linear scan, caller-saved for call-free ranges).
+ * This manager remains the contract/audit API.
  */
 export class VirtualRegisterManager {
     constructor(arch, options) {

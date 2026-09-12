@@ -1,0 +1,10 @@
+{
+  "description": "Hundreds of sibling [a,b] literals must reuse array-build temps so _main's 8 KiB frame is not overrun.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ok",
+    "exitCode": 0
+  }
+}

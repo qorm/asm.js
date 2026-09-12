@@ -1,0 +1,10 @@
+{
+  "description": "Call/new/method arguments use expr-scratch T* instead of push/pop into A0-A5.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "6\n10\n1,2,3,4,5,6\n13\n7\n8\ntrue\n123",
+    "exitCode": 0
+  }
+}

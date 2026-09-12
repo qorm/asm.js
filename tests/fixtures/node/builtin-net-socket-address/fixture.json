@@ -1,0 +1,11 @@
+{
+  "description": "node:net SocketAddress construct/parse/isSocketAddress and connect(SocketAddress) over loopback",
+  "timeoutMs": 8000,
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "127.0.0.1\n80\nipv4\ntrue\nfalse\n10.0.0.1\n443\nipv4\n::1\n22\nipv6\ntrue\ntrue\ntrue\nipv6\nvia-sa",
+    "exitCode": 0
+  }
+}

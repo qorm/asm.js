@@ -1,0 +1,10 @@
+{
+  "description": "Bitwise/logical/concat/compound-member temps use expr-scratch T* instead of push/pop or __ allocLocal.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "2\n0\n5\nabc\ntrue\n3\n5\n6",
+    "exitCode": 0
+  }
+}

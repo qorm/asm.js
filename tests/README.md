@@ -1,6 +1,6 @@
 # asm.js Fixture Tests
 
-这套目录最早是 `docs/ENGINEERING_PLAN.md`（该文件已删除）里 `Phase 0` 的第一步，用来把当时零散的手工样例收束成统一回归面；现行阶段规划见仓库根的 `plan.md`。
+这套目录最早是 `docs/ENGINEERING_PLAN.md`（该文件已删除）里 `Phase 0` 的第一步，用来把当时零散的手工样例收束成统一回归面；现行阶段规划见仓库根的 `plan.md`;门禁发现数见 `docs/FACTS.md` 与 `scripts/bootstrap-gate.sh` 的 `BASELINE_FIXTURES`。
 
 ## 目录结构
 
@@ -74,7 +74,7 @@ node scripts/run-fixtures.mjs
 
 门禁 `scripts/bootstrap-gate.sh` 消费的也是权威 runner 的输出，其 fixture 断言为：
 
-- 发现的 manifest 数 == `BASELINE_FIXTURES`（当前 385，只随版本上移）
+- 发现的 manifest 数 == `BASELINE_FIXTURES`（只随版本上移；当前值见 [docs/FACTS.md](../docs/FACTS.md)）
 - `FAIL == 0`
 - `XPASS == 0`
 - `PASS + XFAIL == 发现数`
@@ -136,4 +136,33 @@ node --no-warnings scripts/run-fixtures.mjs --verbose
 - `ptest/`：大量本地试编译产物（平台后缀二进制）及配套驱动脚本，未跟踪；`.gitignore` 已按“会话杂物/本地脚本（勿入库）”忽略。
 - `support/`：仅余本地探针 `test_nodejs_init.js`，未跟踪；`.gitignore` 已按“临时 / 一次性脚本”忽略。
 
-处置决定：两者保留为本地 scratch，不入库、不计入 fixtures 基线。回归基线的唯一入口是 `tests/fixtures/`（当前 385 个 fixture manifest；门禁下限 `BASELINE_FIXTURES` 随版本只升不降），由唯一权威 runner `node scripts/run-fixtures.mjs` 驱动（`tests/run_fixtures.mjs` 仅透传转发）。
+处置决定：两者保留为本地 scratch，不入库、不计入 fixtures 基线。回归基线的唯一入口是 `tests/fixtures/`（发现数与门禁下限见 [docs/FACTS.md](../docs/FACTS.md) 与 `scripts/bootstrap-gate.sh` 的 `BASELINE_FIXTURES`，随版本只升不降），由唯一权威 runner `node scripts/run-fixtures.mjs` 驱动（`tests/run_fixtures.mjs` 仅透传转发）。
+
+## test262
+
+口径与跨平台矩阵以 [docs/FACTS.md](../docs/FACTS.md) 为准。官方样本是选定 `language/` + 核心 `built-ins/` 的 stride-5 子集（6276 项），不是全量 eligible 变体。
+
+```bash
+# 本机能力
+node tests/test262/exec-target.mjs
+node tests/test262/runner_contract.mjs
+
+# 单目标官方样本（按 --target 直跑 / Rosetta / Docker / Wine）
+node tests/test262/run.mjs --stride 5 --jobs 8 --target macos-arm64 --gate
+node tests/test262/run.mjs --stride 5 --jobs 8 --target macos-x64 --gate
+
+# 五发布目标矩阵：可跑的必须 100%，不可跑的 SKIP
+node tests/test262/matrix.mjs --dry-run
+bash scripts/test262-gate.sh
+
+# ECMA-262 全集（language+built-ins+annexB, stride=1）。不写 last_report.md。
+# 未 0/0/0 前不得称 ES 全部支持。见 docs/FACTS.md。
+bash scripts/test262-corpus.sh
+# 先收一块: --dirs built-ins/Date
+node tests/test262/run.mjs --dirs built-ins/Date --stride 1 --jobs 8 --no-report --gate
+
+# 单测
+node tests/test262/one.mjs --target linux-x64 built-ins/Object/is/same-value-x-y-empty.js
+```
+
+官方 stride-5 写入 `tests/test262/last_report-<target>.md`；macos-arm64 额外写入头条 `last_report.md`。过滤/非 stride-5 运行不覆盖头条（加 `--no-report`）。

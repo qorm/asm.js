@@ -1,0 +1,11 @@
+{
+  "description": "Strict-mode return-position tail calls reuse the caller frame (100k test262 TCO would SIGSEGV without jmpIndirect).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ok",
+    "exitCode": 0
+  },
+  "knownFailure": "NEW: TCO disabled pending self-host fix; deep recursion fails"
+}

@@ -1,6 +1,6 @@
 {
   "name": "asm.js",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "scripts": {
     "bench:compile": "node scripts/bench-compile.mjs",
     "gate:compile-perf": "node scripts/compile-perf-gate.mjs",
@@ -8,9 +8,11 @@
     "test:cache": "node tests/action_cache.mjs",
     "test:fixtures": "node scripts/run-fixtures.mjs",
     "gate": "bash scripts/bootstrap-gate.sh",
-    "platform:contract": "node tests/platform_contract.mjs",
+    "gate:test262": "bash scripts/test262-gate.sh",
+    "platform:contract": "node tests/platform_contract.mjs && node tests/elf_arm64_bytebuffer.mjs",
     "test:abi": "node tests/vm_abi_contract.mjs",
-    "test:toolchain-regex": "node tests/toolchain_no_regex.mjs"
+    "test:toolchain-regex": "node tests/toolchain_no_regex.mjs",
+    "test:test262-runner": "node tests/test262/runner_contract.mjs"
   },
   "devDependencies": {
     "espree": "^11.2.0"

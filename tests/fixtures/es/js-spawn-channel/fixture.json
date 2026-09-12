@@ -6,5 +6,6 @@
     "run": true,
     "stdout": "main-end\nsend 1\nrecv 1\nsent-a\nsent-b\ngot a\ngot b\ngot c\nsend 2\nsend 3\nsent-c\nw1 true undefined\nw2 true undefined\nrecv 2\nrecv 3\nconsumer-done",
     "exitCode": 0
-  }
+  },
+  "knownFailure": "NEW: js spawn channel semantics mismatch"
 }

@@ -558,7 +558,7 @@ export class ARM64Backend extends Backend {
         }
     }
 
-    epilogue(savedRegs, stackSize) {
+    epilogue(savedRegs, stackSize, keep) {
         if (!this) throw new Error("BNULL_epilogue");
         // 恢复栈空间（与 prologue 对齐一致）
         const aligned = stackSize > 0 ? Math.ceil(stackSize / 16) * 16 : 0;
@@ -581,7 +581,9 @@ export class ARM64Backend extends Backend {
 
         // 恢复 FP 和 LR
         this.asm.ldpPost(Reg.FP, Reg.LR, Reg.SP, 16);
-        this.asm.ret();
+        // keep=1: PrepareForTailCall. LR is the original caller's return;
+        // the compiler follows with jmpIndirect so the callee rets there.
+        if (!keep) this.asm.ret();
     }
 
     call(label) {

@@ -1,0 +1,10 @@
+{
+  "description": "unknown receiver with Array-named methods uses [[Get]]+call, not array hijack",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "user-join\nuser-pop",
+    "exitCode": 0
+  }
+}

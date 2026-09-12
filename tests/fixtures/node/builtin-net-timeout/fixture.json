@@ -1,0 +1,11 @@
+{
+  "description": "node:net Socket.setTimeout emits timeout on idle without auto-destroying the socket",
+  "timeoutMs": 8000,
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "timeout\nopen",
+    "exitCode": 0
+  }
+}

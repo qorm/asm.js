@@ -7,11 +7,12 @@
 //   --no-run only compile
 //   --strict prepend "use strict";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from "fs";
-import { spawn } from "child_process";
 import { join, resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 import { tmpdir } from "os";
 import { CompilePool } from "./compile-pool.mjs";
+import { resolveTarget } from "../../compiler/core/platform.js";
+import { TargetExecutor, describeRunner } from "./exec-target.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(__dirname, "..", "..");
@@ -29,6 +30,13 @@ for (let i = 0; i < args.length; i++) {
   else if (a === "--raw-src") rawSrc = args[++i];
   else rel = a;
 }
+target = resolveTarget(target);
+const runner = describeRunner(target);
+if (!noRun && !runner.runnable) {
+  console.error("target " + target + " is not runnable on this host: " + runner.reason);
+  process.exit(2);
+}
+console.error("== target:", target, "runner:", runner.mode, "(" + runner.reason + ")");
 
 function extractFrontmatter(src) {
   const start = src.indexOf("/*---");
@@ -124,28 +132,7 @@ const srcPath = join(dir, "t.js");
 const binPath = join(dir, "t");
 writeFileSync(srcPath, source);
 
-function run(cmd, args, timeoutMs) {
-  return new Promise((resolvePromise) => {
-    let stdout = "", stderr = "", done = false;
-    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
-    const timer = setTimeout(() => {
-      if (done) return;
-      done = true;
-      try { child.kill("SIGKILL"); } catch {}
-      resolvePromise({ code: null, signal: "SIGKILL", stdout, stderr: stderr + "\n[TIMEOUT]", timedOut: true });
-    }, timeoutMs);
-    child.stdout.on("data", (d) => { stdout += d; });
-    child.stderr.on("data", (d) => { stderr += d; });
-    child.on("error", (err) => {
-      if (done) return; done = true; clearTimeout(timer);
-      resolvePromise({ code: null, signal: null, stdout, stderr: stderr + String(err), timedOut: false });
-    });
-    child.on("close", (code, signal) => {
-      if (done) return; done = true; clearTimeout(timer);
-      resolvePromise({ code, signal, stdout, stderr, timedOut: false });
-    });
-  });
-}
+const executor = new TargetExecutor(target);
 
 const compilePool = new CompilePool({ size: 1, repo: REPO });
 let comp;
@@ -173,11 +160,16 @@ if (noRun) {
   console.error("--no-run: keeping " + dir);
   process.exit(0);
 }
-const tRun = Date.now();
-const r = await run(binPath, [], 15000);
-const runMs = Date.now() - tRun;
-console.error("== run: exit=" + r.code + " signal=" + r.signal + " timedOut=" + r.timedOut + " runMs=" + runMs);
-console.error("== stdout:\n" + r.stdout);
-console.error("== stderr:\n" + r.stderr);
-if (!keep) rmSync(dir, { recursive: true, force: true });
-else console.error("kept at " + dir);
+try {
+  await executor.start(dir);
+  const tRun = Date.now();
+  const r = await executor.run(binPath, 15000);
+  const runMs = Date.now() - tRun;
+  console.error("== run: exit=" + r.code + " signal=" + r.signal + " timedOut=" + r.timedOut + " runMs=" + runMs);
+  console.error("== stdout:\n" + r.stdout);
+  console.error("== stderr:\n" + r.stderr);
+} finally {
+  await executor.close();
+  if (!keep) rmSync(dir, { recursive: true, force: true });
+  else console.error("kept at " + dir);
+}

@@ -1,0 +1,10 @@
+{
+  "description": "class static block var bindings are a fresh VariableEnvironment; shadowing an outer captured var must not store through an uninitialized box pointer.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ok",
+    "exitCode": 0
+  }
+}

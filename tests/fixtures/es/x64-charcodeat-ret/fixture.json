@@ -1,0 +1,10 @@
+{
+  "description": "x64 V0≡RET: charCodeAt must not shrImm the one-unit string in RET (toPrecision rounding uses charCodeAt).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "49\n55\n2e+1",
+    "exitCode": 0
+  }
+}

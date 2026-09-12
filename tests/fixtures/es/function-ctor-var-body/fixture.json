@@ -1,0 +1,10 @@
+{
+  "description": "Function() / eval fragment with a local binding: raw-float analysis must not use nested closures (self-hosted compileFragment).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ok",
+    "exitCode": 0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "x64 V0≡RET: String wrapper _emitThisToString must not shrImm the extracted __value (new String('hello').split/charAt/substring).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "h\nhe\nhe\nhe",
+    "exitCode": 0
+  }
+}

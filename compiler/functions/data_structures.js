@@ -9,6 +9,57 @@ const TYPE_GETTER = 60;
 
 // 数据结构编译方法混入
 export const DataStructureCompiler = {
+    // Nested array literals only need one live temp per nesting depth.
+    // Unique allocLocal per literal blew _main's 8 KiB frame (test262
+    // property-escapes `ranges: [[a,b], …]` × hundreds → FP-0x2028 past
+    // SP, slot smashed, _array_set treated a code pointer as an array).
+    _arrTempPush() {
+        const ctx = this.ctx;
+        if (!ctx._arrTmpSlots) {
+            ctx._arrTmpSlots = [];
+            ctx._arrTmpDepth = 0;
+        }
+        let off;
+        if (ctx._arrTmpDepth < ctx._arrTmpSlots.length) {
+            off = ctx._arrTmpSlots[ctx._arrTmpDepth];
+            if (typeof ctx.fpOffLive === "function" && !ctx.fpOffLive(off)) {
+                off = ctx.allocLocal("__arr_temp_d" + ctx._arrTmpDepth);
+                ctx._arrTmpSlots[ctx._arrTmpDepth] = off;
+            }
+        } else {
+            off = ctx.allocLocal("__arr_temp_d" + ctx._arrTmpDepth);
+            ctx._arrTmpSlots.push(off);
+        }
+        ctx._arrTmpDepth++;
+        return off;
+    },
+    _arrTempPop() {
+        this.ctx._arrTmpDepth--;
+    },
+    _objTempPush() {
+        const ctx = this.ctx;
+        if (!ctx._objTmpSlots) {
+            ctx._objTmpSlots = [];
+            ctx._objTmpDepth = 0;
+        }
+        let off;
+        if (ctx._objTmpDepth < ctx._objTmpSlots.length) {
+            off = ctx._objTmpSlots[ctx._objTmpDepth];
+            if (typeof ctx.fpOffLive === "function" && !ctx.fpOffLive(off)) {
+                off = ctx.allocLocal("__obj_temp_d" + ctx._objTmpDepth);
+                ctx._objTmpSlots[ctx._objTmpDepth] = off;
+            }
+        } else {
+            off = ctx.allocLocal("__obj_temp_d" + ctx._objTmpDepth);
+            ctx._objTmpSlots.push(off);
+        }
+        ctx._objTmpDepth++;
+        return off;
+    },
+    _objTempPop() {
+        this.ctx._objTmpDepth--;
+    },
+
     // 编译数组表达式 [a, b, c]
     compileArrayExpression(expr) {
         const elements = expr.elements || [];
@@ -26,9 +77,7 @@ export const DataStructureCompiler = {
         this.vm.movImm(VReg.A0, count);
         this.vm.call("_array_new_with_size");
 
-        // 将数组指针保存到局部变量槽位，避免被 compileExpression 破坏
-        const arrTempName = `__arr_temp_${this.nextLabelId()}`;
-        const arrOffset = this.ctx.allocLocal(arrTempName);
+        const arrOffset = this._arrTempPush();
         this.vm.store(VReg.FP, arrOffset, VReg.RET);
 
         // 填充元素：_array_set(arr, index, value)
@@ -52,6 +101,7 @@ export const DataStructureCompiler = {
         this.vm.andMaskReg(VReg.V2, VReg.V2, VReg.V1);  // V2 = V2 & V1 = ptr & MASK
         this.vm.movImm64(VReg.V1, 0x7ffe000000000000n);  // V1 = TAG (array)
         this.vm.or(VReg.RET, VReg.V2, VReg.V1);  // RET = (ptr & MASK) | TAG
+        this._arrTempPop();
     },
 
     // 编译含扩展元素的数组 [a, ...b, c]
@@ -277,9 +327,7 @@ export const DataStructureCompiler = {
         this.vm.movImm(VReg.A0, 24 + 16 * nonSpread + 128);
         this.vm.call("_object_new_sized");
 
-        // 将对象指针保存到局部变量槽位，避免被 compileExpression 破坏
-        const objTempName = `__obj_temp_${this.nextLabelId()}`;
-        const objOffset = this.ctx.allocLocal(objTempName);
+        const objOffset = this._objTempPush();
         this.vm.store(VReg.FP, objOffset, VReg.RET);
 
         // 访问器归组：同名 get/set 必须合并进同一个 24B 标记对象
@@ -627,7 +675,12 @@ export const DataStructureCompiler = {
             const shapeLabel = this.ctx.newLabel("shape_lit");
             this.asm.addDataLabel(shapeLabel);
             this.asm.addDataQword(literalShapeKeyCount);
+            // objOffset may hold a boxed 0x7FFD (leaveScope reused the FP
+            // slot for a later local / _holdExpr). shape_ptr@48 is a raw
+            // field; the __proto__ path already unboxes for the same reason.
             this.vm.load(VReg.V0, VReg.FP, objOffset);
+            this.vm.emitMaskLoad(VReg.V1);
+            this.vm.andMaskReg(VReg.V0, VReg.V0, VReg.V1);
             this.vm.lea(VReg.V1, shapeLabel);
             this.vm.store(VReg.V0, 48, VReg.V1);
         }
@@ -639,6 +692,7 @@ export const DataStructureCompiler = {
         this.vm.andMaskReg(VReg.V2, VReg.V2, VReg.V1);  // V2 = V2 & V1 = ptr & MASK
         this.vm.movImm64(VReg.V1, 0x7ffd000000000000n);  // V1 = TAG (object)
         this.vm.or(VReg.RET, VReg.V2, VReg.V1);  // RET = (ptr & MASK) | TAG
+        this._objTempPop();
     },
 
     // 对象字面量属性的静态键名（Identifier/字符串/数字字面量；取不到返回 null）

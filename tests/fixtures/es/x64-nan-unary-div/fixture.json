@@ -1,0 +1,10 @@
+{
+  "description": "0/0 and unary-minus of 0/0 must canon to printable NaN (0x7ff0000000000001), not hardware qNaN 0x7ff8 which aliases boxed int 0.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true\ntrue\ntrue",
+    "exitCode": 0
+  }
+}

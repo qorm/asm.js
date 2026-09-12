@@ -1,0 +1,10 @@
+{
+  "description": "node:net nonblocking connect: write-before-connect is queued, connect is async, local/remote address and readyState/pending are populated, unref client still completes while the server remains refed",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "open\npending-false\nlocal-ok\n127.0.0.1\nhello",
+    "exitCode": 0
+  }
+}

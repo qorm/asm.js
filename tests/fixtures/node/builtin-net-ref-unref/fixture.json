@@ -1,0 +1,10 @@
+{
+  "description": "node:net Server.unref lets the process exit while a listening fd remains; hasRef reports the ref state",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true\nfalse\nunref-ok",
+    "exitCode": 0
+  }
+}

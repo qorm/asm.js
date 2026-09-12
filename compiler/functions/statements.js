@@ -4,6 +4,8 @@
 import { VReg } from "../../vm/registers.js";
 import { Type, inferType, isCompatible, typeName } from "../core/types.js";
 import { analyzeSharedVariables, analyzeDirectEvalBoxedVars, collectPatternNames, analyzeCapturedVariables, collectLocalDeclarations, collectDirectFunctionDeclNames, collectVarDeclarations, collectDirectEvalSourceRefs } from "../../lang/analysis/closure.js";
+import { analyzeRawFloatVars } from "../../lang/analysis/rawfloat.js";
+import { TYPE_PROXY } from "../../runtime/core/types.js";
 
 // Box 对象布局：存储被捕获变量的包装对象
 // +0: 实际值
@@ -93,7 +95,9 @@ export const StatementCompiler = {
 
     emitUnhandledExceptionExit() {
         this.vm.movImm(VReg.A0, 1);
-        if (this.os === "wasi") {
+        if (this.os === "windows") {
+            this.vm.jmp("_exit");
+        } else if (this.os === "wasi") {
             this.vm.syscall(60); // wasi 号名空间 = linux-x64
         } else if (this.arch === "arm64") {
             this.vm.syscall(this.os === "linux" ? 93 : 1);
@@ -103,9 +107,10 @@ export const StatementCompiler = {
     },
 
     emitThrowValue(valueReg = VReg.RET) {
-        this.vm.push(valueReg);
+        const throwValH = this._holdExpr(valueReg);
         this.vm.lea(VReg.V0, "_exception_value");
-        this.vm.pop(VReg.V1);
+        this._loadHeldExpr(throwValH, VReg.V1);
+        this._releaseHeldExpr();
         this.vm.store(VReg.V0, 0, VReg.V1);
 
         this.vm.lea(VReg.V0, "_exception_pending");
@@ -775,24 +780,26 @@ export const StatementCompiler = {
 
                     if (decl.init) {
                         // 编译初始值
-                        this.vm.push(VReg.RET); // 保存 box 指针
+                        const boxPtrH = this._holdExpr(VReg.RET);
                         this.compileExpressionWithType(decl.init, varType);
-                        this.vm.pop(VReg.V1); // 恢复 box 指针
+                        this._loadHeldExpr(boxPtrH, VReg.V1);
+                        this._releaseHeldExpr();
 
                         // 如果是 builtin，立即将堆对象指针存入全局 _builtin_<name>
                         if (isBuiltinInit) {
                             // RET 已经是 boxed value（ptr | TAG），我们需要原始指针
                             // boxed value 格式：(ptr & 0x0000ffffffffffff) | TAG
                             // 提取原始指针: RET = RET & ~TAG
-                            this.vm.push(VReg.V1);  // 保存 box 指针
-                            this.vm.push(VReg.RET);  // 保存 boxed value
+                            const builtinBoxH = this._holdExpr(VReg.V1);
+                            const builtinValH = this._holdExpr(VReg.RET);
                             this.vm.emitMaskLoad(VReg.V1);
                             this.vm.andMaskReg(VReg.V1, VReg.RET, VReg.V1);  // V1 = 原始指针
-                            this.vm.pop(VReg.RET);   // 恢复 boxed value
+                            this._loadHeldExpr(builtinValH, VReg.RET);
                             // 存入全局
                             this.vm.lea(VReg.V2, builtinLabel);
                             this.vm.store(VReg.V2, 0, VReg.V1);  // *label = raw_ptr
-                            this.vm.pop(VReg.V1);  // 恢复 box 指针
+                            this._loadHeldExpr(builtinBoxH, VReg.V1);
+                            this._releaseHeldN(2);
                         }
 
                         // var 在 with 内:PutValue 命中 binding object 则不写 varEnv box
@@ -821,12 +828,13 @@ export const StatementCompiler = {
                         // 如果是 builtin，立即将堆对象指针存入全局 _builtin_<name>
                         if (isBuiltinInit) {
                             // 提取原始指针
-                            this.vm.push(VReg.RET);
+                            const rawH = this._holdExpr(VReg.RET);
                             this.vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
                             this.vm.and(VReg.V1, VReg.RET, VReg.V1);  // V1 = 原始指针
                             this.vm.lea(VReg.V2, builtinLabel);
                             this.vm.store(VReg.V2, 0, VReg.V1);  // *label = raw_ptr
-                            this.vm.pop(VReg.RET);
+                            this._loadHeldExpr(rawH, VReg.RET);
+                            this._releaseHeldExpr();
                         }
 
                         const withDone = (kind === "var") ? this._emitVarInitWithPut(name) : null;
@@ -2781,9 +2789,36 @@ export const StatementCompiler = {
         return walk(node);
     },
 
+    // Strict-mode HasCallInTailPosition for a ReturnStatement argument
+    // (and arrow concise bodies). Only CallExpression / desugared tagged
+    // templates become tail calls; wrap through ?: / && / || / ?? / comma.
+    _markTailCalls(node) {
+        if (!node || typeof node !== "object") return;
+        const t = node.type;
+        if (t === "CallExpression") {
+            node._tailCall = true;
+            if (node.arguments) node.arguments._tco = 1;
+            return;
+        }
+        if (t === "ConditionalExpression") {
+            this._markTailCalls(node.consequent);
+            this._markTailCalls(node.alternate);
+            return;
+        }
+        if (t === "LogicalExpression") {
+            this._markTailCalls(node.right);
+            return;
+        }
+        if (t === "SequenceExpression") {
+            const xs = node.expressions;
+            if (xs && xs.length > 0) this._markTailCalls(xs[xs.length - 1]);
+        }
+    },
+
     // 编译返回语句
     compileReturnStatement(stmt) {
         if (stmt.argument) {
+            this._markTailCalls(stmt.argument);
             this.compileExpression(stmt.argument);
         } else {
             // 裸 `return;` 产出真正的 undefined(tagged 0x7FFB),而非裸 int 0——
@@ -3001,10 +3036,11 @@ export const StatementCompiler = {
             if (!loopVarOff) continue;
             this.vm.load(VReg.RET, VReg.FP, loopVarOff);
             this.vm.load(VReg.RET, VReg.RET, BOX_VALUE_OFFSET);
-            this.vm.push(VReg.RET);
+            const reboxH = this._holdExpr(VReg.RET);
             this.vm.call("_box_alloc");
             this.vm.store(VReg.FP, loopVarOff, VReg.RET);
-            this.vm.pop(VReg.V1);
+            this._loadHeldExpr(reboxH, VReg.V1);
+            this._releaseHeldExpr();
             this.vm.store(VReg.RET, BOX_VALUE_OFFSET, VReg.V1);
         }
     },
@@ -3140,10 +3176,11 @@ export const StatementCompiler = {
         if (varOffset === null || varOffset === undefined) return;
         const needsBox = varName && this.ctx.boxedVars && this.ctx.boxedVars.has(varName);
         if (needsBox) {
-            this.vm.push(VReg.RET);              // 保存元素值
+            const elemH = this._holdExpr(VReg.RET);
             this.vm.call("_box_alloc");              // RET = 新 box 指针
             this.vm.store(VReg.FP, varOffset, VReg.RET); // 槽 = box 指针
-            this.vm.pop(VReg.V1);                // V1 = 元素值
+            this._loadHeldExpr(elemH, VReg.V1);
+            this._releaseHeldExpr();
             this.vm.store(VReg.RET, BOX_VALUE_OFFSET, VReg.V1); // box.value = 值
         } else {
             this.vm.store(VReg.FP, varOffset, VReg.RET);
@@ -3295,6 +3332,15 @@ export const StatementCompiler = {
         this.vm.movImm(VReg.V0, 0);
         this.vm.store(VReg.FP, iterCloseOffset, VReg.V0);
         let iterClosePushed = false;
+        // [cptn] V=undefined must be stored before the first runtime branch.
+        // Array-fast-path init used to sit after `jne iteratorStartLabel`, so
+        // eval('for (a of [0]) { break; }') on x64 (iterator path) read an
+        // uninitialized slot and returned a leftover pointer.
+        const cptnOff = this.ctx.allocLocal(`__forof_cptn_${this.nextLabelId()}`);
+        const endNormalLabel = this.ctx.newLabel("endforof_normal");
+        this.vm.lea(VReg.V0, "_js_undefined");
+        this.vm.load(VReg.RET, VReg.V0, 0);
+        this.vm.store(VReg.FP, cptnOff, VReg.RET);
 
         // 计算 iterable，当前快路支持 NaN-boxed Array。
         // TypedArray 不再快照成普通数组:for-of 须见循环体内的元素写入与
@@ -3391,13 +3437,6 @@ export const StatementCompiler = {
         const loopPatternSrcSlot = loopPattern
             ? this.ctx.allocLocal(`__forof_destr_${this.nextLabelId()}`)
             : null;
-        // [cptn] ForIn/OfBodyEvaluation V=undefined; empty iteration / break must not
-        // leak element-binding leftover in RET.
-        const cptnOff = this.ctx.allocLocal(`__forof_cptn_${this.nextLabelId()}`);
-        const endNormalLabel = this.ctx.newLabel("endforof_normal");
-        this.vm.lea(VReg.V0, "_js_undefined");
-        this.vm.load(VReg.RET, VReg.V0, 0);
-        this.vm.store(VReg.FP, cptnOff, VReg.RET);
 
         this.vm.label(loopLabel);
 
@@ -3665,8 +3704,11 @@ export const StatementCompiler = {
             this.vm.call("_tam_throw_if_detached");
             this.vm.load(VReg.A0, VReg.FP, arrTempOffset);
             this.vm.call("_typed_array_length");
-            this.vm.load(VReg.V0, VReg.FP, idxTempOffset);
-            this.vm.cmp(VReg.V0, VReg.RET);
+            // x64 V0≡RET: loading the index into V0 would clobber length so
+            // cmp(V0, RET) is always equal and for-of of a TypedArray exits
+            // with zero iterations (int8array.js).
+            this.vm.load(VReg.V1, VReg.FP, idxTempOffset);
+            this.vm.cmp(VReg.V1, VReg.RET);
             this.vm.jge(endNormalLabel);
             this.vm.load(VReg.A0, VReg.FP, arrTempOffset);
             this.vm.load(VReg.A1, VReg.FP, idxTempOffset);
@@ -3808,6 +3850,9 @@ export const StatementCompiler = {
         this.vm.mov(VReg.A0, VReg.RET);
         this.vm.load(VReg.A1, VReg.FP, resultTempOffset);
         this.vm.call("_maybe_getter");
+        // x64 V0≡RET:下方 lea V0,_exc_ctx_top 会冲掉 IteratorValue。
+        // 复用 result 槽暂存元素值(此后不再读 result 对象)。
+        this.vm.store(VReg.FP, resultTempOffset, VReg.RET);
 
         // IteratorValue 成功后,ForIn/OfBodyEvaluation 中的绑定与循环体
         // 任何 abrupt throw 都必须先 IteratorClose。用一个真异常帧包住
@@ -3843,6 +3888,7 @@ export const StatementCompiler = {
         this.vm.store(VReg.V0, 0, VReg.V1);
         this.ctx.exceptionLabel = closeRethrowLabel;
 
+        this.vm.load(VReg.RET, VReg.FP, resultTempOffset);
         this.storeLoopBinding(varName, varOffset, loopPattern, loopPatternMode, loopPatternSrcSlot, leftMember);
 
         this.ctx.continueLabel = iteratorContinueLabel;
@@ -3880,11 +3926,15 @@ export const StatementCompiler = {
         // 正常 done 完成直接 jmp endLabel(不经此)→ 不 close 已耗尽迭代器。非协议迭代器
         // (array/string/Set/Map)槽=0 → 直通 endLabel。单一 runtime helper(不内联方法调用)。
         this.vm.label(iterCloseLabel);
-        this.vm.load(VReg.V0, VReg.FP, iterCloseOffset);
-        this.vm.cmpImm(VReg.V0, 0);
+        // x64 V0≡RET: 不可用 V0 读 iterCloseOffset,否则冲掉循环完成值
+        // (eval('for (a of [0]) { 3; break; }') 须为 3;空 body break 须为 undefined)。
+        this.vm.load(VReg.V1, VReg.FP, iterCloseOffset);
+        this.vm.cmpImm(VReg.V1, 0);
         this.vm.jeq(endLabel);
+        this.vm.store(VReg.FP, cptnOff, VReg.RET);
         this.vm.load(VReg.A0, VReg.FP, iterCloseOffset);
         this.vm.call("_iterator_close");
+        this.vm.load(VReg.RET, VReg.FP, cptnOff);
         this.vm.jmp(endLabel); // 跳过下方的 notIterableLabel(TypeError 路径)
 
         // [iterator-protocol] 不可迭代值(TypeError):上面的 Symbol.iterator 检查不通过→跳此。
@@ -4087,13 +4137,13 @@ export const StatementCompiler = {
         this.vm.emitMaskLoad(VReg.V1);
         this.vm.andMaskReg(VReg.V0, VReg.RET, VReg.V1);
         this.vm.store(VReg.FP, ptrOffset, VReg.V0);
-        // Proxy(type 字节 8):for-in 无 ownKeys 陷阱切片 → 迭代 target 的键(target@8 装箱,
-        // 脱壳后替换 ptrOffset;数组/普通对象 type≠8 不受影响)。
+        // Proxy:for-in 无 ownKeys 陷阱切片 → 迭代 target 的键(target@8 装箱,
+        // 脱壳后替换 ptrOffset;数组/普通对象 type≠TYPE_PROXY 不受影响)。
         {
             const forinNotProxy = this.ctx.newLabel("forin_notproxy");
             this.vm.loadByte(VReg.V1, VReg.V0, 0);
             this.vm.andImm(VReg.V1, VReg.V1, 0xff);
-            this.vm.cmpImm(VReg.V1, 8);
+            this.vm.cmpImm(VReg.V1, TYPE_PROXY);
             this.vm.jne(forinNotProxy);
             this.vm.load(VReg.V0, VReg.V0, 8); // target(装箱)
             this.vm.emitMaskLoad(VReg.V1);
@@ -4478,7 +4528,7 @@ export const StatementCompiler = {
         if (stmt.label) {
             const entry = this.ctx.labelMap ? this.ctx.labelMap.get(stmt.label.name) : undefined;
             if (entry && entry.breakLabel) {
-                this.emitPendingIteratorCloses(entry.breakIterCloseLen || 0, false);
+                this.emitPendingIteratorCloses(entry.breakIterCloseLen || 0, true);
                 this.emitPendingFinalizers(entry.breakTryLen, false);
                 if (this.ctx.tryFrames && this.ctx.tryFrames.length > entry.breakTryLen) {
                     this.emitExcCtxRestore(this.ctx.tryFrames[entry.breakTryLen]);
@@ -4488,7 +4538,7 @@ export const StatementCompiler = {
             return;
         }
         if (this.ctx.breakLabel) {
-            this.emitPendingIteratorCloses(this.ctx.breakIterCloseLen || 0, false);
+            this.emitPendingIteratorCloses(this.ctx.breakIterCloseLen || 0, true);
             // [#54] break 跨越边界内含 finally 的 try:从内到外先跑各 finalizer
             this.emitPendingFinalizers(this.ctx.breakTryLen, false);
             // [#38] break 跨出 try:恢复链头为循环/switch 边界处深度的 try 的 link
@@ -4505,7 +4555,7 @@ export const StatementCompiler = {
         if (stmt.label) {
             const entry = this.ctx.labelMap ? this.ctx.labelMap.get(stmt.label.name) : undefined;
             if (entry && entry.continueLabel) {
-                this.emitPendingIteratorCloses(entry.continueIterCloseLen || 0, false);
+                this.emitPendingIteratorCloses(entry.continueIterCloseLen || 0, true);
                 this.emitPendingFinalizers(entry.continueTryLen, false);
                 if (this.ctx.tryFrames && this.ctx.tryFrames.length > entry.continueTryLen) {
                     this.emitExcCtxRestore(this.ctx.tryFrames[entry.continueTryLen]);
@@ -4515,7 +4565,7 @@ export const StatementCompiler = {
             return;
         }
         if (this.ctx.continueLabel) {
-            this.emitPendingIteratorCloses(this.ctx.continueIterCloseLen || 0, false);
+            this.emitPendingIteratorCloses(this.ctx.continueIterCloseLen || 0, true);
             // [#54] continue 跨越边界内含 finally 的 try:从内到外先跑各 finalizer
             this.emitPendingFinalizers(this.ctx.continueTryLen, false);
             // [#38] continue 跨出 try:同 break,边界为所属循环入口
@@ -4749,10 +4799,11 @@ export const StatementCompiler = {
                     // locals. Storing the exception value directly made the
                     // nested closure treat a tagged string/number as a box
                     // pointer and dereference it after the catch had closed.
-                    this.vm.push(VReg.V1);
+                    const catchBoxH = this._holdExpr(VReg.V1);
                     this.vm.call("_box_alloc");
                     this.vm.store(VReg.FP, offset, VReg.RET);
-                    this.vm.pop(VReg.V1);
+                    this._loadHeldExpr(catchBoxH, VReg.V1);
+                    this._releaseHeldExpr();
                     this.vm.store(VReg.RET, BOX_VALUE_OFFSET, VReg.V1);
                 } else {
                     this.vm.store(VReg.FP, offset, VReg.V1);
@@ -4924,7 +4975,7 @@ export const StatementCompiler = {
             else nInst++;
         }
         if (nInst === 0 && nStat === 0) return staticSlots;
-        this.vm.push(VReg.S0);
+        const cfS0H = this._holdExpr(VReg.S0);
         let arrSlot = null;
         if (nInst > 0 && cfkeysLabel) {
             this.vm.movImm(VReg.A0, nInst);
@@ -4957,7 +5008,8 @@ export const StatementCompiler = {
             this.vm.lea(VReg.V1, cfkeysLabel);
             this.vm.store(VReg.V1, 0, VReg.V0);
         }
-        this.vm.pop(VReg.S0);
+        this._loadHeldExpr(cfS0H, VReg.S0);
+        this._releaseHeldExpr();
         return staticSlots;
     },
 
@@ -5208,9 +5260,7 @@ export const StatementCompiler = {
     emitStoreClassCtorCaptures(captured, capsLabel) {
         if (!captured || captured.length === 0) return;
         const vm = this.vm;
-        vm.push(VReg.S0);
-        vm.push(VReg.S1);
-        vm.push(VReg.S2);
+        const capSH = this._holdCalleeSaved3();
         vm.movImm(VReg.A0, captured.length * 8);
         vm.call("_alloc");
         vm.mov(VReg.S3, VReg.RET);
@@ -5240,11 +5290,12 @@ export const StatementCompiler = {
                 vm.store(VReg.S3, i * 8, VReg.V1);
             } else {
                 vm.load(VReg.V1, VReg.FP, offset);
-                vm.push(VReg.V1);
-                vm.push(VReg.S3);
+                const capV1H = this._holdExpr(VReg.V1);
+                const capS3H = this._holdExpr(VReg.S3);
                 vm.call("_box_alloc");
-                vm.pop(VReg.S3);
-                vm.pop(VReg.V1);
+                this._loadHeldExpr(capS3H, VReg.S3);
+                this._loadHeldExpr(capV1H, VReg.V1);
+                this._releaseHeldN(2);
                 vm.store(VReg.RET, 0, VReg.V1);
                 vm.store(VReg.S3, i * 8, VReg.RET);
                 vm.store(VReg.FP, offset, VReg.RET);
@@ -5252,9 +5303,7 @@ export const StatementCompiler = {
                 this.ctx.boxedVars.add(name);
             }
         }
-        vm.pop(VReg.S2);
-        vm.pop(VReg.S1);
-        vm.pop(VReg.S0);
+        this._restoreCalleeSaved3(capSH);
         vm.store(VReg.S0, 48, VReg.S3);
         // Dedicated slot for methods: classinfo@48 is also shape_ptr and is
         // overwritten by setPrototypeOf / _object_set (null-proto Super SET).
@@ -5354,6 +5403,10 @@ export const StatementCompiler = {
     compileClassDeclaration(stmt, asExpression) {
         const className = stmt.id.name;
         const superClass = stmt.superClass;
+        // Nested ctor/method beginRecord inlines a second prologue into the
+        // enclosing recording; LSRA then miscolors S0-S2 heritage saves.
+        // Flush the outer function so class lowering matches _main (unrecorded).
+        if (this.vm && this.vm._recN >= 0) this.vm._flushRecordVerbatim();
         const _traceClass = typeof process !== "undefined" && process.env && process.env.ASMJS_TRACE_CLASS === "1";
         if (_traceClass) console.log("CC_ENTER", className, asExpression ? 1 : 0, superClass ? superClass.type : "none");
         // Optional runtime breadcrumbs for route-B class fragments. Keep the
@@ -5374,12 +5427,13 @@ export const StatementCompiler = {
             // caller-saved helper and may overwrite both (V2 is A2 on x64),
             // so bracket the probe with the same stack discipline as any
             // ordinary call boundary.
-            this.vm.push(VReg.RET);
-            this.vm.push(VReg.V2);
+            const trH = this._holdExpr(VReg.RET);
+            const tv2H = this._holdExpr(VReg.V2);
             this.vm.lea(VReg.A0, _lbl);
             this.vm.call("_print_str");
-            this.vm.pop(VReg.V2);
-            this.vm.pop(VReg.RET);
+            this._loadHeldExpr(tv2H, VReg.V2);
+            this._loadHeldExpr(trH, VReg.RET);
+            this._releaseHeldN(2);
         };
         // [Cluster 11] extends builtin: builtin constructors don't have classinfo
         // objects.  emitLoadClassInfo returns 0 for known builtins; callers guard
@@ -5737,8 +5791,9 @@ export const StatementCompiler = {
         this.registerFuncMeta(constructorLabel,
             hasDeclaredCtor ? constructor.value : { type: "FunctionExpression", params: [] },
             ctorMetaName);
-        // [P1] 与闭包路径同用 _fnNeedsP1Record;无声明构造器体为空,不录。
-        if (hasDeclaredCtor && constructor.value && this._fnNeedsP1Record(constructor.value)) {
+        // [P1] 与闭包路径同用 _fnNeedsP1Record(非空体 T*/LSRA);无声明构造器体为空,不录。
+        if (hasDeclaredCtor && constructor.value && !this._p1SkipCurrent() &&
+            this._fnNeedsP1Record(constructor.value)) {
             this.vm.beginRecord();
         }
         this.vm.prologue(8192, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
@@ -5750,7 +5805,10 @@ export const StatementCompiler = {
         // 唯一的 labelId 掺入 ctx 名使 labelPrefix 唯一(仅改标签名、不改机器码,无冲突时
         // 逐字节等价;函数体走 compileFunction 已用模块符号名故本就唯一)。
         this.ctx = this.ctx.clone(className + "." + labelId);
+        this.ctx._fnFrameSize = 8192;
         this.ctx.locals = new Map();
+        this.ctx._argRegSpill = null;
+        this.ctx._pinnedFpOffs = [];
         this.ctx.localTemps = null;
         this.ctx.localOffset = 0;
         this.ctx.inClass = true;
@@ -5782,6 +5840,9 @@ export const StatementCompiler = {
             }
         }
         this.ctx.boxedVars = ctorBoxedVars;
+        this.ctx.rawFloatVars = (constructor && constructor.value)
+            ? analyzeRawFloatVars(constructor.value, ctorBoxedVars)
+            : {};
         // 标识符父类:superClass=父名(名字快路径)。表达式父类:无名字,置本类名(仅使
         // super.prop 的真值守卫通过);实际父类经 superClassExpr/superInfoLabel 从全局解析。
         this.ctx.superClass = superClass ? (superIsExpr ? className : superClass.name) : null;
@@ -5828,6 +5889,10 @@ export const StatementCompiler = {
         const thisOffset = this.ctx.allocLocal("__this");
         this.vm.store(VReg.FP, thisOffset, VReg.A0);
         this.emitSnapshotNewTarget();
+        // leftover-arg: save A0-A5 BEFORE rest / arguments / name binding.
+        // emitCtorRestParam calls _array_push and smashes A1; arguments built
+        // from live A-regs then sees 1.5e-323 (constructor(...a) + arguments).
+        this.emitArgRegSnapshot();
         // leftover-arg: save A1-A5 BEFORE name binding / captures.
         // x64 V1≡A3: emitInstallClassNameBinding lea V1 smashed the 3rd ctor
         // arg → empty-constructor-heritage args[2] denormal (typeof function).
@@ -5917,9 +5982,10 @@ export const StatementCompiler = {
         // `(_ => super())()` 写同一 box,构造器 return 检查才能看见。
         if (superClass && superCalledOff != null && ctorFn && this.functionBodyUsesLexicalSuper(ctorFn)) {
             this.vm.load(VReg.V1, VReg.FP, superCalledOff);
-            this.vm.push(VReg.V1);
+            const scBoxH = this._holdExpr(VReg.V1);
             this.vm.call("_box_alloc");
-            this.vm.pop(VReg.V1);
+            this._loadHeldExpr(scBoxH, VReg.V1);
+            this._releaseHeldExpr();
             this.vm.store(VReg.RET, 0, VReg.V1);
             this.vm.store(VReg.FP, superCalledOff, VReg.RET);
             if (!this.ctx.boxedVars) this.ctx.boxedVars = new Set();
@@ -6084,7 +6150,7 @@ export const StatementCompiler = {
             this.vm.label(keepRet);
         }
         this.vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 8192);
-        this.vm.endRecord(); // [P1]
+        this.vm.endRecord(this.ctx._pinnedFpOffs);
 
 
         // ========== 生成实例方法 ==========
@@ -6159,37 +6225,15 @@ export const StatementCompiler = {
         this.vm.movImm(VReg.V0, 0);
         this.vm.store(VReg.S0, 16, VReg.V0);
         if (!superClass) {
-            // The route-B fast path calls the lazy runtime helper directly and
-            // does not push S0/S1/S2.  Keep the save/restore pair structurally
-            // balanced: the old diagnostic `INLINE` switch popped here even
+            // emitFunctionProtoObject clobbers S0-S2. Hold the live class
+            // registers; the old diagnostic `INLINE` switch popped here even
             // though no matching pushes had been emitted, corrupting the
             // fragment stack (plain dynamic classes consequently SIGBUS).
-            let functionProtoSaved = false;
-            if (this.engineNoIC) {
-                // The runtime lazy helper is ABI-safe, but its side-table
-                // initialisation is not yet guaranteed to be present in every
-                // relocated fragment.  Use the ordinary emitter here as the
-                // canonical fallback; it is fully self-contained and the
-                // balanced save/restore also protects the live class regs.
-                this.vm.push(VReg.S0);
-                this.vm.push(VReg.S1);
-                this.vm.push(VReg.S2);
-                functionProtoSaved = true;
-                this.emitFunctionProtoObject(); // RET = boxed Function.prototype
-            } else {
-                this.vm.push(VReg.S0);
-                this.vm.push(VReg.S1);
-                this.vm.push(VReg.S2);
-                functionProtoSaved = true;
-                this.emitFunctionProtoObject(); // RET = boxed Function.prototype
-            }
+            const fnProtoH = this._holdCalleeSaved3();
+            this.emitFunctionProtoObject(); // RET = boxed Function.prototype
             this.vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
             this.vm.and(VReg.V0, VReg.RET, VReg.V1);
-            if (functionProtoSaved) {
-                this.vm.pop(VReg.S2);
-                this.vm.pop(VReg.S1);
-                this.vm.pop(VReg.S0);
-            }
+            this._restoreCalleeSaved3(fnProtoH);
             this.vm.store(VReg.S0, 16, VReg.V0);
             if (_traceClass) console.log("CC_PARENT_SET", className);
         }
@@ -6259,9 +6303,7 @@ export const StatementCompiler = {
                 // `extends null`:规范允许 heritage=null(proto 链断),但 super() 时
                 // GetSuperConstructor → %FunctionPrototype% 非构造器 → TypeError。
                 // 存哨兵 1(非合法堆指针)与「无 classinfo 的 0」区分。
-                this.vm.push(VReg.S0);
-                this.vm.push(VReg.S1);
-                this.vm.push(VReg.S2);
+                const exprHeritH = this._holdCalleeSaved3();
                 this.compileExpression(superClass); // RET = 装箱父类信息/构造器
                 {
                     const notNullL = this.ctx.newLabel("super_herit_notnull");
@@ -6291,33 +6333,33 @@ export const StatementCompiler = {
                 }
                 this.vm.lea(VReg.V1, superInfoLabel);
                 this.vm.store(VReg.V1, 0, VReg.V2); // 全局槽 = 父(classinfo/闭包/哨兵)
-                this.vm.pop(VReg.S2);
-                this.vm.pop(VReg.S1);
-                this.vm.pop(VReg.S0);
+                this._restoreCalleeSaved3(exprHeritH);
             } else {
                 // emitLoadClassInfo 对部分内建会 compileExpression(物化闭包)→ 冲 S0/S2;
                 // 此处 S0=classinfo、S2=props,须全护。
                 _emitClassTrace(":heritage-load-begin");
-                this.vm.push(VReg.S0);
-                this.vm.push(VReg.S1);
-                this.vm.push(VReg.S2);
+                const loadHeritH = this._holdCalleeSaved3();
                 this.emitLoadClassInfo(superClass.name, VReg.V2); // V2 = 父类信息对象(raw)
                 _emitClassTrace(":heritage-load-done");
-                this.vm.pop(VReg.S2);
-                this.vm.pop(VReg.S1);
-                this.vm.pop(VReg.S0);
+                this._restoreCalleeSaved3(loadHeritH);
                 // 内建:emitLoadClassInfo 返 0;物化构造器闭包以便链上 __proto__/prototype。
                 // TA 走 emitCtorClosureRef(稳定 type@16);其余(Boolean/Promise/…)经
                 // 标识符求值触发 emitXxxCtorObject(与全局 Boolean===Boolean 同身份)。
                 if (superClass.type === "Identifier" && BUILTIN_HERITAGE_NAMES[superClass.name]) {
                     const gotBuiltin = this.ctx.newLabel("super_proto_got_builtin");
-                    this.vm.cmpImm(VReg.V2, 0);
-                    this.vm.jne(gotBuiltin);
-                    this.vm.push(VReg.S0);
-                    this.vm.push(VReg.S1);
-                    this.vm.push(VReg.S2);
+                    const isTaBuiltin = TA_SUPER_TAGS[superClass.name] != null;
+                    // TA builtins must always materialize the ctor closure.
+                    // x64 emitLoadClassInfo can leave a leftover non-zero in
+                    // V2≡A2, which used to jne gotBuiltin and skip
+                    // emitCtorClosureRef → class extends Uint8Array had
+                    // [[Prototype]] 0 and instances failed ValidateTypedArray.
+                    if (!isTaBuiltin) {
+                        this.vm.cmpImm(VReg.V2, 0);
+                        this.vm.jne(gotBuiltin);
+                    }
+                    const builtinHeritH = this._holdCalleeSaved3();
                     _emitClassTrace(":heritage-builtin-begin");
-                    if (TA_SUPER_TAGS[superClass.name] != null) {
+                    if (isTaBuiltin) {
                         this.emitCtorClosureRef(superClass.name, TA_SUPER_TAGS[superClass.name]);
                     } else if (superClass.name === "Object" && this.emitObjectCtorObject) {
                         // In a route-B fragment the global object may still
@@ -6339,9 +6381,7 @@ export const StatementCompiler = {
                         this.vm.lea(VReg.V1, superInfoLabel);
                         this.vm.store(VReg.V1, 0, VReg.V2);
                     }
-                    this.vm.pop(VReg.S2);
-                    this.vm.pop(VReg.S1);
-                    this.vm.pop(VReg.S0);
+                    this._restoreCalleeSaved3(builtinHeritH);
                     this.vm.label(gotBuiltin);
                 }
             }
@@ -6390,23 +6430,33 @@ export const StatementCompiler = {
                 // narrow path, `class extends Uint8Array` has no [[Prototype]]
                 // and no BYTES_PER_ELEMENT, so test262's subClass()+ctors.concat
                 // feeds a non-constructor into `new ArrayBuffer(4 * BPE)`.
-                // V2 is the parent ctor raw from emitCtorClosureRef above.
+                // Re-materialize the parent ctor here.  Reloading V2 from
+                // superInfoLabel is not enough: x64 V2≡A2 dies across the
+                // earlier heritage pops, and a fragment-local superinfo slot
+                // can miss the host singleton.  emitCtorClosureRef (route-B)
+                // goes through _ta_dynamic_ctor_ref.
+                const taCtorH = this._holdCalleeSaved3();
+                this.emitCtorClosureRef(superClass.name, TA_SUPER_TAGS[superClass.name]);
+                this.vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+                this.vm.and(VReg.V2, VReg.RET, VReg.V1);
+                if (superInfoLabel) {
+                    this.vm.lea(VReg.V1, superInfoLabel);
+                    this.vm.store(VReg.V1, 0, VReg.V2);
+                }
+                this._restoreCalleeSaved3(taCtorH);
                 this.vm.store(VReg.S0, 16, VReg.V2);
-                this.vm.push(VReg.S0);
-                this.vm.push(VReg.S1);
-                this.vm.push(VReg.S2);
+                const taProtoH = this._holdCalleeSaved3();
+                // Reload parent from classinfo.[[Prototype]] (just stored).
+                // Do not keep V2 live across the hold: x64 V2≡A2.
+                this.vm.load(VReg.V2, VReg.S0, 16);
                 this.vm.load(VReg.A0, VReg.V2, 16);
                 this.vm.call("_get_ctor_proto");
                 this.vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
                 this.vm.and(VReg.V2, VReg.RET, VReg.V1);
-                this.vm.pop(VReg.S2);
-                this.vm.pop(VReg.S1);
-                this.vm.pop(VReg.S0);
+                this._restoreCalleeSaved3(taProtoH);
                 this.vm.store(VReg.S1, 16, VReg.V2);
                 if (Object.prototype.hasOwnProperty.call(TA_SUPER_BPE, superClass.name)) {
-                    this.vm.push(VReg.S0);
-                    this.vm.push(VReg.S1);
-                    this.vm.push(VReg.S2);
+                    const taBpeH = this._holdCalleeSaved3();
                     this.vm.mov(VReg.A0, VReg.S0);
                     this.vm.lea(VReg.A1, this.addStringConstant("BYTES_PER_ELEMENT"));
                     this.vm.call("_tag_str_a1");
@@ -6414,9 +6464,7 @@ export const StatementCompiler = {
                     this.vm.scvtf(0, VReg.A2);
                     this.vm.fmovToInt(VReg.A2, 0);
                     this.vm.call("_object_set");
-                    this.vm.pop(VReg.S2);
-                    this.vm.pop(VReg.S1);
-                    this.vm.pop(VReg.S0);
+                    this._restoreCalleeSaved3(taBpeH);
                 }
                 _emitClassTrace(":heritage-direct-ta");
             } else if (!this.engineNoIC || (process.env && process.env.ASMJS_HERITAGE_INLINE === "1")) {
@@ -6446,15 +6494,11 @@ export const StatementCompiler = {
                 this.vm.label(nullHeritage);
                 this.vm.movImm(VReg.V0, 0);
                 this.vm.store(VReg.S1, 16, VReg.V0); // Sub.prototype.__proto__ = null
-                this.vm.push(VReg.S0);
-                this.vm.push(VReg.S1);
-                this.vm.push(VReg.S2);
+                const nullHeritH = this._holdCalleeSaved3();
                 this.emitFunctionProtoObject(); // RET = boxed Function.prototype
                 this.vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
                 this.vm.and(VReg.V0, VReg.RET, VReg.V1);
-                this.vm.pop(VReg.S2);
-                this.vm.pop(VReg.S1);
-                this.vm.pop(VReg.S0);
+                this._restoreCalleeSaved3(nullHeritH);
                 this.vm.store(VReg.S0, 16, VReg.V0); // C.[[Prototype]] = %FunctionPrototype%
                 this.vm.jmp(skipProtoLink);
                 this.vm.label(notNullHeritage);
@@ -6484,14 +6528,10 @@ export const StatementCompiler = {
                 // `_is_nonctor_fn` is a normal caller-saved helper and may
                 // overwrite V2 (the raw superclass pointer).  Preserve that
                 // value on every route; the old route-B diagnostic skipped
-                // this push and subsequently linked against a clobbered
+                // this hold and subsequently linked against a clobbered
                 // pointer, producing an undefined prototype or a SIGSEGV.
-                this.vm.push(VReg.V2);
-                if (!this.engineNoIC) {
-                    this.vm.push(VReg.S0);
-                    this.vm.push(VReg.S1);
-                    this.vm.push(VReg.S2);
-                }
+                const nonctorV2H = this._holdExpr(VReg.V2);
+                const nonctorSH = this.engineNoIC ? null : this._holdCalleeSaved3();
                 _emitClassTrace(":heritage-nonctor-begin");
                 this.vm.mov(VReg.A0, VReg.V2);
                 this.vm.call("_is_nonctor_fn");
@@ -6507,12 +6547,9 @@ export const StatementCompiler = {
                 this.vm.or(VReg.A0, VReg.A0, VReg.V1);
                 this.vm.call("_throw_type_error");
                 this.vm.label(heritageOk);
-                if (!this.engineNoIC) {
-                    this.vm.pop(VReg.S2);
-                    this.vm.pop(VReg.S1);
-                    this.vm.pop(VReg.S0);
-                }
-                this.vm.pop(VReg.V2);
+                if (nonctorSH) this._restoreCalleeSaved3(nonctorSH);
+                this._loadHeldExpr(nonctorV2H, VReg.V2);
+                this._releaseHeldExpr();
             } else {
                 _emitClassTrace(":heritage-probe-skipped");
             }
@@ -6526,9 +6563,7 @@ export const StatementCompiler = {
             _emitClassTrace(":heritage-closure");
             const parentCloSlot = this.ctx.allocLocal(`__herit_clo_${this.nextLabelId()}`);
             this.vm.store(VReg.FP, parentCloSlot, VReg.V2);
-            this.vm.push(VReg.S0);
-            this.vm.push(VReg.S1);
-            this.vm.push(VReg.S2);
+            const protoSaved = this._holdCalleeSaved3();
             // TA/AB 蹦床:fnptr@8==_ta_ctor_tramp → type@16 走 _get_ctor_proto。
             // 其它内建(Boolean/Promise/Map…):.prototype 在闭包属性侧表。
             const taProtoL = this.ctx.newLabel("super_proto_ta");
@@ -6561,11 +6596,12 @@ export const StatementCompiler = {
                 }
                 _emitClassTrace(":heritage-proto-get-done");
                 if (_traceClass && className === "X") {
-                    this.vm.push(VReg.RET);
+                    const prH = this._holdExpr(VReg.RET);
                     this.vm.mov(VReg.A0, VReg.RET);
                     this.vm.call("_print_int");
                     this.vm.call("_print_nl");
-                    this.vm.pop(VReg.RET);
+                    this._loadHeldExpr(prH, VReg.RET);
+                    this._releaseHeldExpr();
                 }
                 _emitClassTrace(":heritage-before-proto-jmp");
                 if (_traceClass && className === "X") console.log("CC_BEFORE_SKIP", skipProtoLink, this.asm.code && this.asm.code.length);
@@ -6582,9 +6618,7 @@ export const StatementCompiler = {
                     // pair balanced before taking the common continuation.
                     this.vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
                     this.vm.and(VReg.V2, VReg.RET, VReg.V1);
-                    this.vm.pop(VReg.S2);
-                    this.vm.pop(VReg.S1);
-                    this.vm.pop(VReg.S0);
+                    this._restoreCalleeSaved3(protoSaved);
                     this.vm.store(VReg.S1, 16, VReg.V2);
                     this.vm.jmp(skipProtoLink);
                 } else {
@@ -6609,9 +6643,7 @@ export const StatementCompiler = {
                 this.emitValidateHeritageProtoParent();
             }
             _emitClassTrace(":heritage-validate-done");
-            this.vm.pop(VReg.S2);
-            this.vm.pop(VReg.S1);
-            this.vm.pop(VReg.S0);
+            this._restoreCalleeSaved3(protoSaved);
             this.vm.store(VReg.S1, 16, VReg.V2); // Sub.prototype.__proto__ = Parent.prototype
             this.vm.jmp(skipProtoLink);
             this.vm.label(classinfoLink);
@@ -6636,9 +6668,7 @@ export const StatementCompiler = {
             // their closure-side property table is not yet writable.
             if (!this.engineNoIC && superClass && superClass.type === "Identifier" &&
                 Object.prototype.hasOwnProperty.call(TA_SUPER_BPE, superClass.name)) {
-                this.vm.push(VReg.S0);
-                this.vm.push(VReg.S1);
-                this.vm.push(VReg.S2);
+                const bpeH = this._holdCalleeSaved3();
                 this.vm.mov(VReg.A0, VReg.S0);
                 this.vm.lea(VReg.A1, this.addStringConstant("BYTES_PER_ELEMENT"));
                 this.vm.call("_tag_str_a1");
@@ -6646,9 +6676,7 @@ export const StatementCompiler = {
                 this.vm.scvtf(0, VReg.A2);
                 this.vm.fmovToInt(VReg.A2, 0);
                 this.vm.call("_object_set");
-                this.vm.pop(VReg.S2);
-                this.vm.pop(VReg.S1);
-                this.vm.pop(VReg.S0);
+                this._restoreCalleeSaved3(bpeH);
             }
         }
 
@@ -6881,7 +6909,7 @@ export const StatementCompiler = {
                                 break;
                             }
                         }
-                        this.vm.push(VReg.S0);
+                        const sfKeyH = this._holdExpr(VReg.S0);
                         if (skt == null) {
                             this.compileExpression(field.key);
                             this.emitToPropertyKey();
@@ -6894,7 +6922,8 @@ export const StatementCompiler = {
                         } else {
                             this.vm.movImm64(VReg.V1, 0x7ffb000000000000n);
                         }
-                        this.vm.pop(VReg.S0);
+                        this._loadHeldExpr(sfKeyH, VReg.S0);
+                        this._releaseHeldExpr();
                         this.vm.mov(VReg.A0, VReg.S0);
                         this.vm.load(VReg.A1, VReg.FP, skt);
                         this.vm.mov(VReg.A2, VReg.V1);
@@ -6908,10 +6937,11 @@ export const StatementCompiler = {
                     if (fieldName == null) continue;
                     if (field.key.type === "PrivateIdentifier") fieldName = "#" + className + fieldName;
                     if (field.value) {
-                        this.vm.push(VReg.S0);
+                        const sfValH = this._holdExpr(VReg.S0);
                         this._compileFieldInitializer(field.value);
                         this.vm.mov(VReg.V1, VReg.RET);
-                        this.vm.pop(VReg.S0);
+                        this._loadHeldExpr(sfValH, VReg.S0);
+                        this._releaseHeldExpr();
                         this.vm.mov(VReg.A0, VReg.S0);
                         this.vm.lea(VReg.A1, this.addStringConstant(fieldName));
                         this.vm.call("_tag_str_a1");
@@ -6958,7 +6988,7 @@ export const StatementCompiler = {
             if (hasStaticInit) {
                 if (this.ctx.funcName === "main") {
                     this.vm.lea(VReg.V0, "_global_this");
-                    this.vm.load(VReg.V0, VReg.V0, 0);
+                    this.vm.load(VReg.RET, VReg.V0, 0);
                     this.vm.call("_box_obj_r");
                     this.vm.store(VReg.FP, thisOff, VReg.RET);
                 } else if (savedThisTmpOff !== null) {
@@ -6966,7 +6996,7 @@ export const StatementCompiler = {
                     this.vm.store(VReg.FP, thisOff, VReg.V0);
                 } else if (!savedThisOff) {
                     this.vm.lea(VReg.V0, "_global_this");
-                    this.vm.load(VReg.V0, VReg.V0, 0);
+                    this.vm.load(VReg.RET, VReg.V0, 0);
                     this.vm.call("_box_obj_r");
                     this.vm.store(VReg.FP, thisOff, VReg.RET);
                 }
@@ -7082,7 +7112,7 @@ export const StatementCompiler = {
         const kindPrefix = method.kind === "get" ? "get_" : (method.kind === "set" ? "set_" : "");
         const memberLabel = `_class_${className}_${prefix}${kindPrefix}${methodName}_${labelId}`;
 
-        this.vm.push(targetReg);
+        const ckTgtH = this._holdExpr(targetReg);
         this.compileExpression(method.key);
         this.vm.mov(VReg.A0, VReg.RET);
         this.vm.call("_js_prop_key"); // ToPropertyKey:数字→字符串键,Symbol 原样
@@ -7107,9 +7137,9 @@ export const StatementCompiler = {
                 this.vm.store(VReg.V2, 8, VReg.V1);
             }
             // 计算键求值/惰性物化 Symbol 构造器可覆盖承载 classinfo/prototype 的
-            // S0/S1。只弹到 A0 虽能完成本次 define，却会让后续属性位设置及最终类
+            // S0/S1。只装回 A0 虽能完成本次 define，却会让后续属性位设置及最终类
             // 绑定使用坏掉的 targetReg（static [Symbol.species] 后 new C 即崩）。
-            this.vm.pop(targetReg);
+            this._loadHeldExpr(ckTgtH, targetReg);
             this.vm.mov(VReg.A0, targetReg);
             this.vm.load(VReg.A1, VReg.FP, kSlot);
             this.vm.mov(VReg.A2, VReg.V2);
@@ -7120,13 +7150,14 @@ export const StatementCompiler = {
             this.vm.or(VReg.A2, VReg.A2, VReg.V0);
             const fnSlot = this.ctx.allocLocal(`__ckfn_${this.nextLabelId()}`);
             this.vm.store(VReg.FP, fnSlot, VReg.A2);
-            this.vm.pop(targetReg);
+            this._loadHeldExpr(ckTgtH, targetReg);
             this.vm.mov(VReg.A0, targetReg);
             this.vm.load(VReg.A1, VReg.FP, kSlot);
             this.vm.load(VReg.A2, VReg.FP, fnSlot);
             this.vm.call("_object_define");
             this._emitSetFunctionName(fnSlot, kSlot);
         }
+        this._releaseHeldExpr();
         // 方法/访问器按规范不可枚举(实例落 prototype;静态落 classinfo)。
         // classinfo flags 已可安全 materialize(name/length 同路径),静态成员亦须落 attr,
         // 否则去掉 gOPD 强制清 enumerable 后静态方法会误报可枚举。
@@ -7258,7 +7289,7 @@ export const StatementCompiler = {
                 // 保持 _js_prop_key 存储不变。
                 const symProp = method.key.property.name;
                 const useStringKey = (symProp === "iterator" || symProp === "asyncIterator");
-                this.vm.push(targetReg);
+                const wkTgtH = this._holdExpr(targetReg);
                 if (useStringKey) {
                     this.emitBoxedStringKey("Symbol." + symProp, VReg.RET);
                 } else {
@@ -7268,7 +7299,8 @@ export const StatementCompiler = {
                 }
                 const wkt = this.ctx.allocLocal(`__cwk_${this.nextLabelId()}`);
                 this.vm.store(VReg.FP, wkt, VReg.RET);
-                this.vm.pop(targetReg);             // 恢复被 Symbol.X 求值覆盖的 S0/S1
+                this._loadHeldExpr(wkTgtH, targetReg);
+                this._releaseHeldExpr();
                 this.vm.mov(VReg.A0, targetReg);
                 this.vm.load(VReg.A1, VReg.FP, wkt); // 键(字符串 or symbol)
                 this.vm.lea(VReg.A2, wkLabel);
@@ -7314,8 +7346,9 @@ export const StatementCompiler = {
                 // 计算键访问器 `get [k]()`:先求键值→ToPropertyKey,暂存 FP 槽(marker 构造在
                 // _alloc/store 间无调用,V2 存活;pop/load 不毁 V2)。非计算键走静态字符串键。
                 let ckSlot = null;
+                let accTgtH = null;
                 if (isComputedAccessor) {
-                    this.vm.push(targetReg);
+                    accTgtH = this._holdExpr(targetReg);
                     this.compileExpression(method.key);
                     this.vm.mov(VReg.A0, VReg.RET);
                     this.vm.call("_js_prop_key");
@@ -7346,7 +7379,8 @@ export const StatementCompiler = {
                 const accMkOff = this.ctx.allocLocal(`__cacc_${this.nextLabelId()}`);
                 this.vm.store(VReg.FP, accMkOff, VReg.V2);
                 if (isComputedAccessor) {
-                    this.vm.pop(targetReg);                // 恢复被计算键求值覆盖的 S0/S1
+                    this._loadHeldExpr(accTgtH, targetReg);
+                    this._releaseHeldExpr();
                     this.vm.mov(VReg.A0, targetReg);
                     this.vm.load(VReg.A1, VReg.FP, ckSlot); // 运行时键字符串
                 } else {
@@ -7387,7 +7421,7 @@ export const StatementCompiler = {
             const isIdentComputedKey = method.computed && method.key &&
                 method.key.type === "Identifier";
             if (isIdentComputedKey) {
-                this.vm.push(targetReg);
+                const idTgtH = this._holdExpr(targetReg);
                 this.compileExpression(method.key);      // 求变量 k 的值
                 this.vm.mov(VReg.A0, VReg.RET);
                 // ToPropertyKey:`class E { [s](){} }`(s 为 Symbol)此前经 _valueToStr
@@ -7400,7 +7434,8 @@ export const StatementCompiler = {
                 this.vm.or(VReg.A2, VReg.A2, VReg.V0);
                 const fnSlot = this.ctx.allocLocal(`__cmfn_${this.nextLabelId()}`);
                 this.vm.store(VReg.FP, fnSlot, VReg.A2);
-                this.vm.pop(targetReg);                   // 恢复被计算键求值覆盖的 S0/S1
+                this._loadHeldExpr(idTgtH, targetReg);
+                this._releaseHeldExpr();
                 this.vm.mov(VReg.A0, targetReg);
                 this.vm.load(VReg.A1, VReg.FP, kt);       // 运行时键
                 this.vm.load(VReg.A2, VReg.FP, fnSlot);
@@ -7508,9 +7543,10 @@ export const StatementCompiler = {
         } finally {
             this._genStubParamsOverride = _prevGenParamsOverride;
         }
-        // [P1] async/生成器禁录;其余与闭包路径同用 _fnNeedsP1Record。
+        // [P1] async/生成器禁录;其余与闭包路径同用 _fnNeedsP1Record(非空体 T*/LSRA)。
         if (!(method.value && method.value.isAsync) && !isGenMethod &&
-            method.value && this._fnNeedsP1Record(method.value)) {
+            method.value && !this._p1SkipCurrent() &&
+            this._fnNeedsP1Record(method.value)) {
             this.vm.beginRecord();
         }
         this.vm.prologue(8192, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
@@ -7523,6 +7559,8 @@ export const StatementCompiler = {
         this.ctx = this.ctx.clone(`${className}.${kindPrefix}${methodName}.${labelId}`);
         this.ctx._fnFrameSize = 8192;
         this.ctx.locals = new Map();
+        this.ctx._argRegSpill = null;
+        this.ctx._pinnedFpOffs = [];
         this.ctx.localTemps = null;
         this.ctx.localOffset = 0;
         // 方法体自己的 box-on-capture 分析:被嵌套闭包捕获(且写)的 `let`/`const`
@@ -7544,6 +7582,9 @@ export const StatementCompiler = {
             if (_decl && _decl.type === "ClassDeclaration") methodBoxedVars.delete(_n);
         }
         this.ctx.boxedVars = methodBoxedVars;
+        this.ctx.rawFloatVars = method.value
+            ? analyzeRawFloatVars(method.value, methodBoxedVars)
+            : {};
         // arguments is per-function, never a lexical capture. Outer boxedVars
         // (static block / sibling methods that mention arguments) would make
         // emitArgumentsArray's array get unboxed → primitive (static-init-arguments-methods).
@@ -7560,6 +7601,8 @@ export const StatementCompiler = {
         // 专属 clone,方法末尾整体还原 savedCtx,无需逐字段恢复。
         this.ctx.inCoroBody = isGenMethod;
         this.ctx.inAsyncGenerator = isAsyncGenMethod;
+        // A0-A5 onto the frame before emitInstallAsyncExcFrame (x64 V2≡A2).
+        this.emitArgRegSnapshot();
         // async 方法体:未捕获异常 reject 关联 Promise(而非退出),同 async 函数。
         let asyncMethodRejectLabel = null;
         if (isAsyncMethod) {
@@ -7573,7 +7616,7 @@ export const StatementCompiler = {
         // 注意：JS 方法调用约定中，this 通过 A5 传递（而不是 A0）
         // 这是 asm.js 的特殊约定，用于区分方法调用和普通函数调用
         const thisOffset = this.ctx.allocLocal("__this");
-        this.vm.mov(VReg.V0, VReg.A5); // 从 A5 获取 this
+        this.vm.mov(VReg.V0, VReg.A5);
         this.vm.store(VReg.FP, thisOffset, VReg.V0);
         if (isStatic && this._methodUsesPrivateName(method)) {
             // Per-evaluation static private brand: these methods are installed
@@ -7710,10 +7753,11 @@ export const StatementCompiler = {
             const p = methodParamOffsets[i];
             if (methodBoxedVars.has(p.name)) {
                 this.vm.load(VReg.V1, VReg.FP, p.offset);
-                this.vm.push(VReg.V1);
+                const mpBoxH = this._holdExpr(VReg.V1);
                 this.vm.call("_box_alloc");
                 this.vm.store(VReg.FP, p.offset, VReg.RET);
-                this.vm.pop(VReg.V1);
+                this._loadHeldExpr(mpBoxH, VReg.V1);
+                this._releaseHeldExpr();
                 this.vm.store(VReg.RET, 0, VReg.V1);
             }
         }
@@ -7746,7 +7790,7 @@ export const StatementCompiler = {
             this.emitAsyncRejectFromException();
         } else {
             this.vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 8192);
-            this.vm.endRecord(); // [P1]
+            this.vm.endRecord(this.ctx._pinnedFpOffs);
         }
 
         this.ctx = savedCtx;

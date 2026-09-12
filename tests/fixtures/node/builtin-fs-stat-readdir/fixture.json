@@ -1,0 +1,11 @@
+{
+  "description": "fs.statSync/readdirSync real syscall (isFile/isDirectory, names, missing throws)",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "true\ntrue\nfalse\ntrue\nok",
+    "exitCode": 0
+  },
+  "knownFailure": "NEW: fs stat/readdir residual mismatch"
+}

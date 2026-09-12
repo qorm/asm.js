@@ -1,0 +1,11 @@
+{
+  "description": "Sloppy overwritten eval (global assign and eval('var eval = g')) is a tail call, not DirectEval.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ok",
+    "exitCode": 0
+  },
+  "knownFailure": "NEW: TCO disabled; sloppy-eval-tco expects tail-call behavior"
+}

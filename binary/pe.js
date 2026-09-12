@@ -414,8 +414,12 @@ export class PE64Generator {
         this.write32(0);
         this.write16(IMAGE_SUBSYSTEM_CONSOLE);
         this.write16(0);
-        this.write64(1048576); // 0x100000
-        this.write64(4096);
+        // SizeOfStackReserve / SizeOfStackCommit. Unix defaults are 8MiB;
+        // 1MiB + 4KiB commit was overflowing Wine guard pages on nested
+        // RegExp lookaround / quantifier tests (timeout or exit 1). Commit
+        // the full reserve so Wine does not have to grow via guard faults.
+        this.write64(8 * 1024 * 1024);
+        this.write64(8 * 1024 * 1024);
         this.write64(1048576);
         this.write64(4096);
         this.write32(0);

@@ -1,0 +1,11 @@
+{
+  "description": "new Proxy(nestedProxy, {construct:null}) must forward [[Construct]] instead of reading classinfo props_ptr@32 (SIGSEGV).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ok",
+    "exitCode": 0
+  },
+  "knownFailure": "NEW: Proxy construct null trap crash"
+}

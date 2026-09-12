@@ -1,0 +1,10 @@
+{
+  "description": "P3.1 raw-float64 locals skip identity ToNumber; object write still coerces via valueOf.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "-1\n6\n9\n2.5",
+    "exitCode": 0
+  }
+}

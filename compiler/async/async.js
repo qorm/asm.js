@@ -37,10 +37,11 @@ export const AsyncCompiler = {
         const awaitDone = this.ctx.newLabel("await_done");
         if (!agenAwait) {
         vm.mov(VReg.A0, VReg.RET);
-        vm.push(VReg.RET);
+        const thenH = this._holdExpr(VReg.RET);
         vm.call("_is_promise_or_thenable");
         vm.cmpImm(VReg.RET, 0);
-        vm.pop(VReg.RET);
+        this._loadHeldExpr(thenH, VReg.RET);
+        this._releaseHeldExpr();
         vm.jeq(awaitDone);
         }
 
@@ -54,26 +55,21 @@ export const AsyncCompiler = {
 
         // 检查 await 期间是否产生异常（promise 被 reject）
         const contLabel = this.ctx.newLabel("await_no_exc");
-        vm.push(VReg.RET); // 暂存结果值，保证两条路径栈平衡
+        const awaitResH = this._holdExpr(VReg.RET);
         vm.lea(VReg.V0, "_exception_pending");
         vm.load(VReg.V1, VReg.V0, 0);
         vm.cmpImm(VReg.V1, 0);
         vm.jeq(contLabel);
-        // 异常挂起：拒因已在 _exception_value，跳到当前 try 的 catch（或未处理退出）
-        vm.pop(VReg.RET);
         if (this.ctx.exceptionLabel) {
             vm.jmp(this.ctx.exceptionLabel);
         } else if (this.ctx.inCoroBody && this.ctx.returnLabel) {
-            // [gen/async-gen unwind] 协程体内 await 到 reject 且无本地 try:完成协程
-            // (pending 保留),由 _generator_next/_async_generator_next 在调用方栈上传播
-            // (生成器 → reject 该次 next() Promise;async generator → reject)。与
-            // emitYieldValue / emitAsyncYieldValue 的裸 throw 同构。
             vm.jmp(this.ctx.returnLabel);
         } else {
             this.emitUnhandledExceptionExit();
         }
         vm.label(contLabel);
-        vm.pop(VReg.RET);
+        this._loadHeldExpr(awaitResH, VReg.RET);
+        this._releaseHeldExpr();
         vm.label(awaitDone);
     },
 
@@ -106,20 +102,20 @@ export const AsyncCompiler = {
             // reject 本次 next() 的 Promise。
             const yieldDone = this.ctx.newLabel("ayieldval_done");
             vm.mov(VReg.A0, VReg.RET);
-            vm.push(VReg.RET);
+            const yvH = this._holdExpr(VReg.RET);
             vm.call("_is_promise");     // RET = 1 若为 Promise
             vm.cmpImm(VReg.RET, 0);
-            vm.pop(VReg.RET);           // RET = yield 值(还原)
+            this._loadHeldExpr(yvH, VReg.RET);
+            this._releaseHeldExpr();
             vm.jeq(yieldDone);          // 非 Promise → 值即产出值
             vm.mov(VReg.A0, VReg.RET);
             vm.call("_promise_await_job");
             const yieldExcLabel = this.ctx.newLabel("ayieldval_no_exc");
-            vm.push(VReg.RET);
+            const yexcH = this._holdExpr(VReg.RET);
             vm.lea(VReg.V0, "_exception_pending");
             vm.load(VReg.V1, VReg.V0, 0);
             vm.cmpImm(VReg.V1, 0);
             vm.jeq(yieldExcLabel);
-            vm.pop(VReg.RET);
             if (this.ctx.exceptionLabel) {
                 vm.jmp(this.ctx.exceptionLabel);
             } else if (this.ctx.inCoroBody && this.ctx.returnLabel) {
@@ -128,7 +124,8 @@ export const AsyncCompiler = {
                 this.emitUnhandledExceptionExit();
             }
             vm.label(yieldExcLabel);
-            vm.pop(VReg.RET);
+            this._loadHeldExpr(yexcH, VReg.RET);
+            this._releaseHeldExpr();
             vm.label(yieldDone);
             }
             this.emitAsyncYieldValue();
@@ -149,11 +146,12 @@ export const AsyncCompiler = {
         // coro = _scheduler_current；resolve coro+88 = P
         vm.lea(VReg.V1, "_scheduler_current");
         vm.load(VReg.V1, VReg.V1, 0); // V1 = coro
-        vm.push(VReg.V1); // 跨 _promise_resolve 保 coro
+        const coroH = this._holdExpr(VReg.V1);
         vm.mov(VReg.A1, VReg.RET); // result
         vm.load(VReg.A0, VReg.V1, 88); // A0 = P(boxed)
         vm.call("_promise_resolve");
-        vm.pop(VReg.V1); // coro
+        this._loadHeldExpr(coroH, VReg.V1);
+        this._releaseHeldExpr();
         vm.movImm(VReg.V0, 0);
         vm.store(VReg.V1, 88, VReg.V0); // 清 +88
         const nextQSkip = this.ctx.newLabel("ayield_nextq_skip");
@@ -165,7 +163,20 @@ export const AsyncCompiler = {
         vm.store(VReg.V1, 264, VReg.V0);
         vm.load(VReg.V0, VReg.V2, 8);
         vm.store(VReg.V1, 88, VReg.V0);
+        vm.load(VReg.V6, VReg.V2, 24);
         vm.load(VReg.RET, VReg.V2, 16);
+        const nextQThrow = this.ctx.newLabel("ayield_nextq_throw");
+        vm.cmpImm(VReg.V6, 1);
+        vm.jeq(nextQThrow);
+        vm.jmp(afterYieldL);
+        vm.label(nextQThrow);
+        vm.mov(VReg.V6, VReg.RET);
+        vm.lea(VReg.V0, "_exception_value");
+        vm.store(VReg.V0, 0, VReg.V6);
+        vm.lea(VReg.V0, "_exception_pending");
+        vm.movImm(VReg.V2, 1);
+        vm.store(VReg.V0, 0, VReg.V2);
+        vm.mov(VReg.RET, VReg.V6);
         vm.jmp(afterYieldL);
         vm.label(nextQSkip);
         // return() while this next() was still in Await (+88≠0) only queued.
@@ -209,12 +220,11 @@ export const AsyncCompiler = {
         vm.label(afterYieldL);
         // [agen.throw] 恢复后异常注入检查(与 emitYieldValue 同构)
         const contLabel = this.ctx.newLabel("ayield_no_exc");
-        vm.push(VReg.RET);
+        const ayH = this._holdExpr(VReg.RET);
         vm.lea(VReg.V0, "_exception_pending");
         vm.load(VReg.V1, VReg.V0, 0);
         vm.cmpImm(VReg.V1, 0);
         vm.jeq(contLabel);
-        vm.pop(VReg.RET);
         if (this.ctx.exceptionLabel) {
             vm.jmp(this.ctx.exceptionLabel);
         } else if (this.ctx.returnLabel) {
@@ -232,7 +242,6 @@ export const AsyncCompiler = {
         vm.load(VReg.V2, VReg.V1, 0);
         vm.cmpImm(VReg.V2, 0);
         vm.jeq(retFall);
-        vm.pop(VReg.RET);
         vm.movImm(VReg.V2, 0);
         vm.store(VReg.V1, 0, VReg.V2);
         vm.lea(VReg.V1, "_gen_return_value");
@@ -250,7 +259,8 @@ export const AsyncCompiler = {
             this.emitUnhandledExceptionExit();
         }
         vm.label(retFall);
-        vm.pop(VReg.RET);
+        this._loadHeldExpr(ayH, VReg.RET);
+        this._releaseHeldExpr();
         vm.label(starDone);
         vm.label(starDoneEarly);
     },
@@ -269,16 +279,14 @@ export const AsyncCompiler = {
 
         const contLabel = this.ctx.newLabel("yield_no_exc");
         const retChkLabel = this.ctx.newLabel("yield_retchk");
-        vm.push(VReg.RET); // 暂存 resume 值,保证各路径栈平衡
+        const yresumeH = this._holdExpr(VReg.RET);
         vm.lea(VReg.V0, "_exception_pending");
         vm.load(VReg.V1, VReg.V0, 0);
         vm.cmpImm(VReg.V1, 0);
         vm.jeq(retChkLabel);
-        vm.pop(VReg.RET);
         if (this.ctx.exceptionLabel) {
             vm.jmp(this.ctx.exceptionLabel);
         } else if (this.ctx.returnLabel) {
-            // 体内无 try:完成协程,pending 保留 → 回 _generator_throw 传播给调用者
             vm.jmp(this.ctx.returnLabel);
         } else {
             this.emitUnhandledExceptionExit();
@@ -294,7 +302,6 @@ export const AsyncCompiler = {
         vm.load(VReg.V2, VReg.V1, 0);
         vm.cmpImm(VReg.V2, 0);
         vm.jeq(contLabel);
-        vm.pop(VReg.RET); // 弃 resume 值(V0 被冲,V1 仍是地址)
         vm.movImm(VReg.V2, 0);
         vm.store(VReg.V1, 0, VReg.V2); // 清 pending(消费一次)
         vm.lea(VReg.V1, "_gen_return_value");
@@ -311,7 +318,8 @@ export const AsyncCompiler = {
             this.emitUnhandledExceptionExit();
         }
         vm.label(contLabel);
-        vm.pop(VReg.RET);
+        this._loadHeldExpr(yresumeH, VReg.RET);
+        this._releaseHeldExpr();
     },
 
     // [收尾] yield* 委托:对可迭代对象取迭代器,逐值 yield 直到 done,表达式值 = 被委托者
@@ -1089,6 +1097,13 @@ export const AsyncCompiler = {
         // 分配临时槽;无解构参数的生成器探针零发射,多余栈空间仅浪费不入栈 —— 指令/字节
         // 只在含探针的生成器上变化。S3 仍用于跨 _generator_new 保住 A5=this。
         vm.prologue(8192, [VReg.S3]);
+        // Stub FP is this prologue. Enclosing _esPool homes are the outer
+        // frame's offsets; reusing them here stores into __fdiarg_* /
+        // __stubarg_* (async-gen dflt-params a0 became the caller's leftover).
+        const stubEsPool = this.ctx._esPool;
+        const stubEsDepth = this.ctx._esDepth;
+        this.ctx._esPool = null;
+        this.ctx._esDepth = 0;
         // [FDI eager] 含 pattern 形参时在调用期完成**完整**形参绑定(FunctionDeclaration-
         // Instantiation:求默认值、读属性/触发 getter、GetIterator/消费迭代器),与体内
         // 绑定同一发射器(emitParamDestructure),异常类型/消息/时机全对齐规范。守卫与
@@ -1126,7 +1141,8 @@ export const AsyncCompiler = {
             this.emitGenStubIterGuard(bodyLabel);
         }
         vm.mov(VReg.S3, VReg.A5);  // S3 = this(A5);callee-saved,survives _generator_new
-        // 先把 2-5 号实参压栈(4 个=32B,16 对齐),随后覆盖 A0/A1/A2 供 _generator_new
+        // Stub FP is this prologue, but _holdExpr allocates against enclosing
+        // ctx.stackOffset. SP push/pop is the save that matches this frame.
         vm.push(VReg.A1);
         vm.push(VReg.A2);
         vm.push(VReg.A3);
@@ -1196,6 +1212,8 @@ export const AsyncCompiler = {
         vm.call("_generator_set_instance_proto");
         // 栈尺寸须与 prologue(8192) 配对(epilogue 用 stackSize 恢复 SP;0 会令 SP 停在
         // 帧中段 → ret 从错误地址取返回地址 → 调用生成器函数即崩)。
+        this.ctx._esPool = stubEsPool;
+        this.ctx._esDepth = stubEsDepth;
         vm.epilogue([VReg.S3], 8192); // ret：返回 genobj；恢复 S3
         vm.label(bodyLabel);
         return fdi ? fdi.list : null;
@@ -1246,6 +1264,7 @@ export const AsyncCompiler = {
         const savedStackOffset = this.ctx.stackOffset;
         const savedLocals = this.ctx.locals;
         const savedBoxed = this.ctx.boxedVars;
+        const savedRawFloatVars = this.ctx.rawFloatVars;
         const savedVarTypes = this.ctx.varTypes;
         const savedCtx = this.ctx;
 
@@ -1266,6 +1285,7 @@ export const AsyncCompiler = {
         rec.localTemps = null;
         rec.stackOffset = 0;
         rec.varTypes = {};
+        rec.rawFloatVars = {};
         // [标签隔离] rec 继承外层 labelPrefix/labelCounter,newLabel 的 ++ 落在 rec 自有
         // counter 上(外层 counter 不前进)→ 与之后发射的同前缀标签(体内 destructure、
         // 外层代码的 destructure)同号相撞:汇编器把早发跳转解析到后发的重名标签落点
@@ -1289,6 +1309,19 @@ export const AsyncCompiler = {
             for (let i = 0; i < capturedNames.length; i++) rec.boxedVars.add(capturedNames[i]);
         }
         this.ctx = rec;
+        // rec inherits the enclosing script/function ctx via Object.create.
+        // That ctx already has _argRegSpill from its own prologue. Loading
+        // those offsets in the stub frame builds arguments[] from the
+        // outer leftover (params-dflt-ref-arguments: arguments[2] was
+        // undefined instead of the third actual). Snapshot THIS entry.
+        rec._argRegSpill = null;
+        rec._argvSpill = null;
+        rec._pinnedFpOffs = [];
+        // Object.create would inherit the outer _esPool. Those homes are the
+        // enclosing frame; hold-expr in this stub then overwrites __fdiarg_*.
+        rec._esPool = null;
+        rec._esDepth = 0;
+        this.emitArgRegSnapshot();
 
         const pevObj = collectParamEvalVarNames(params);
         const pevList = [];
@@ -1307,18 +1340,21 @@ export const AsyncCompiler = {
             rec.paramBindingNames = bindingNames;
         }
         const thisOff = rec.allocLocal("__this");
-        vm.store(VReg.FP, thisOff, VReg.A5);
+        this._loadIncomingArg(5, VReg.V5);
+        vm.store(VReg.FP, thisOff, VReg.V5);
         // leftover-arg: save A0-A4 (not just n formals) BEFORE captures / V1.
         // x64 V1≡A3: capture lea smashed arguments[3]; restoring only n=3 left
         // A3 leftover in coro+128 → body arguments[3] denormal.
         const slots = [];
         for (let i = 0; i < 5; i++) {
             const off = rec.allocLocal(`__fdiarg_${i}`);
-            vm.store(VReg.FP, off, vm.getArgReg(i));
+            this._loadIncomingArg(i, VReg.V5);
+            vm.store(VReg.FP, off, VReg.V5);
             slots.push(off);
         }
         const thisSlot = rec.allocLocal(`__fdithis`);
-        vm.store(VReg.FP, thisSlot, VReg.A5);
+        this._loadIncomingArg(5, VReg.V5);
+        vm.store(VReg.FP, thisSlot, VReg.V5);
         // [params-dflt-ref-arguments] 默认值求值可引用 arguments;须在绑定前于探针帧建
         // arguments 对象(与 compileFunctionBody 顺序同)。类生成器方法此前既无 override
         // 形参表、stub 也不建 arguments → 默认值读垃圾崩。
@@ -1367,21 +1403,23 @@ export const AsyncCompiler = {
                 rec.boxedVars.add(nm);
                 vm.movImm(VReg.A0, 8);
                 vm.call("_alloc");
+                // x64 V0≡RET: filling via V0 clobbers the box pointer.
+                vm.mov(VReg.V5, VReg.RET);
                 const mcv = rec.getMainCapturedVar && rec.getMainCapturedVar(nm);
                 if (mcv) {
                     vm.lea(VReg.V1, mcv);
                     vm.load(VReg.V1, VReg.V1, 0);
-                    vm.load(VReg.V0, VReg.V1, 0);
+                    vm.load(VReg.V6, VReg.V1, 0);
                 } else {
-                    vm.movImm64(VReg.V0, undef);
+                    vm.movImm64(VReg.V6, undef);
                 }
-                vm.store(VReg.RET, 0, VReg.V0);
-                vm.store(VReg.FP, pevOff, VReg.RET);
+                vm.store(VReg.V5, 0, VReg.V6);
+                vm.store(VReg.FP, pevOff, VReg.V5);
             }
         }
         // [NFE FDI] 具名生成器表达式 BindingIdentifier 须在形参默认值求值前可见
-        // (`function* g(_=(…g…))` 读 inner g,非外层同名 var)。须在 vm.push(S0) 前
-        // 完成(_alloc 等 helper 会踩 S0;push 后 S0 栈上保存)。gbody 仍
+        // (`function* g(_=(…g…))` 读 inner g,非外层同名 var)。须在 hold S0 前
+        // 完成(_alloc 等 helper 会踩 S0;随后 S0 在 hold 池)。gbody 仍
         // emitNamedFunctionExprBinding,此处只服务 stub/FDI 阶段的 param env。
         {
             const fnExpr = this._genStubFnExpr;
@@ -1397,9 +1435,10 @@ export const AsyncCompiler = {
                     const boxIt = rec.boxedVars && rec.boxedVars.has(nm);
                     if (boxIt) {
                         rec.boxedVars.add(nm);
-                        vm.push(VReg.RET);
+                        const nfeH = this._holdExpr(VReg.RET);
                         vm.call("_box_alloc");
-                        vm.pop(VReg.V1);
+                        this._loadHeldExpr(nfeH, VReg.V1);
+                        this._releaseHeldExpr();
                         vm.store(VReg.RET, 0, VReg.V1);
                         vm.store(VReg.FP, nameOff, VReg.RET);
                     } else {
@@ -1413,7 +1452,9 @@ export const AsyncCompiler = {
         // (emitCollectionCtorObject 的闭包构造码 mov S0,RET)——生成器 stub 的 S0 = 闭包
         // 对象(hasClosure 路径),必须跨绑定保住,否则 _generator_new(A2=S0) 拿垃圾闭包
         // 指针 → 体内捕获变量载入解引用崩(与 emitGenStubIterGuard 同法;抛路径不返回
-        // 无需弹)。
+        // 无需弹)。Hardware push: _holdExpr(S0) is an FP home in this probe
+        // frame and overlaps __fdiarg_*; LSRA also colors a T* snapshot of S0
+        // back onto S0 and elides the save (same class as _holdCalleeSaved3).
         vm.push(VReg.S0);
         // [FDI ident] 无默认值的 Identifier 形参须先于默认值求值入探针帧
         // (`async function*(x, y=x)` / `function*(a,b,c,d,e,f=…)` 的 y=x 等)。
@@ -1491,6 +1532,7 @@ export const AsyncCompiler = {
         this.ctx.stackOffset = savedStackOffset;
         this.ctx.locals = savedLocals;
         this.ctx.boxedVars = savedBoxed;
+        this.ctx.rawFloatVars = savedRawFloatVars;
         this.ctx.varTypes = savedVarTypes;
         for (let i = 0; i < 5; i++) {
             vm.load(vm.getArgReg(i), VReg.FP, slots[i]);
@@ -1513,13 +1555,20 @@ export const AsyncCompiler = {
         const savedLocals = this.ctx.locals;
         const savedLocalsUndo = this.ctx._localsUndo;
         const savedBoxed = this.ctx.boxedVars;
+        const savedRawFloatVars = this.ctx.rawFloatVars;
         const savedVarTypes = this.ctx.varTypes;
+        const savedLocalTemps = this.ctx.localTemps;
+        const savedEsPool = this.ctx._esPool;
+        const savedEsDepth = this.ctx._esDepth;
         const savedCtx = this.ctx;
         this.ctx.stackOffset = 0;
         this.ctx.locals = new Map();
         this.ctx.localTemps = null;
+        this.ctx._esPool = null;
+        this.ctx._esDepth = 0;
         this.ctx._localsUndo = [];
         this.ctx.boxedVars = new Set();
+        this.ctx.rawFloatVars = {};
         this.ctx.varTypes = {};
         const vm = this.vm;
         const n = Math.min(params.length, 5);
@@ -1595,7 +1644,11 @@ export const AsyncCompiler = {
         this.ctx.locals = savedLocals;
         this.ctx._localsUndo = savedLocalsUndo;
         this.ctx.boxedVars = savedBoxed;
+        this.ctx.rawFloatVars = savedRawFloatVars;
         this.ctx.varTypes = savedVarTypes;
+        this.ctx.localTemps = savedLocalTemps;
+        this.ctx._esPool = savedEsPool;
+        this.ctx._esDepth = savedEsDepth;
         return slots;
     },
 
@@ -1881,10 +1934,15 @@ export const AsyncCompiler = {
         const savedStackOffset = this.ctx.stackOffset;
         const savedLocals = this.ctx.locals;
         const savedLocalsUndo = this.ctx._localsUndo;
+        const savedLocalTemps = this.ctx.localTemps;
+        const savedEsPool = this.ctx._esPool;
+        const savedEsDepth = this.ctx._esDepth;
         const savedCtx = this.ctx;
         this.ctx.stackOffset = 0;
         this.ctx.locals = new Map();
         this.ctx.localTemps = null;
+        this.ctx._esPool = null;
+        this.ctx._esDepth = 0;
         this.ctx._localsUndo = [];
         const n = pats.length < 5 ? pats.length : 5;
         const slots = [];
@@ -1919,7 +1977,7 @@ export const AsyncCompiler = {
             // emitArrayProtoObject 内联体使用 S0(emitCollectionCtorObject 的闭包
             // 构造码 mov S0,RET):生成器 stub 的 S0 = 闭包对象(hasClosure 路径),
             // 必须跨物化保住——否则 _generator_new(A2=S0) 拿垃圾闭包指针 → 解引用崩
-            // (named async-gen dstr CRASH 根因)。push/pop 平衡;抛路径不返回无需弹。
+            // (named async-gen dstr CRASH 根因)。hold 平衡;抛路径不返回无需弹。
             vm.push(VReg.S0);
             if (this.emitArrayProtoObject) this.emitArrayProtoObject();
             vm.load(VReg.A0, VReg.FP, slots[pats[i].index]);
@@ -1945,6 +2003,9 @@ export const AsyncCompiler = {
         this.ctx.stackOffset = savedStackOffset;
         this.ctx.locals = savedLocals;
         this.ctx._localsUndo = savedLocalsUndo;
+        this.ctx.localTemps = savedLocalTemps;
+        this.ctx._esPool = savedEsPool;
+        this.ctx._esDepth = savedEsDepth;
         this.ctx = savedCtx;
     },
 
@@ -2099,6 +2160,8 @@ export const AsyncCompiler = {
         const vm = this.vm;
         vm.prologue(0, [VReg.S1, VReg.S2, VReg.S3]);
         vm.mov(VReg.S3, VReg.A5); // S3 = this(A5),callee-saved
+        // prologue(0): no FP locals. Hold-expr uses enclosing ctx.stackOffset
+        // against this stub FP and smashes saved S1-S3 / the caller.
         vm.push(VReg.A1);
         vm.push(VReg.A2);
         vm.push(VReg.A3);
@@ -2337,8 +2400,10 @@ export const AsyncCompiler = {
         vm.lea(VReg.V1, "_scheduler_current");
         vm.load(VReg.V1, VReg.V1, 0);
         vm.store(VReg.FP, coroOff, VReg.V1);
-        vm.load(VReg.V2, VReg.V1, 88);
-        vm.store(VReg.FP, promiseOff, VReg.V2);
+        // x64 V2≡A2: loading coro.promise into V2 clobbers the 3rd argument
+        // (`async f(a,b,c)` sees c as the Promise). V5 is R10, not an A-reg.
+        vm.load(VReg.V5, VReg.V1, 88);
+        vm.store(VReg.FP, promiseOff, VReg.V5);
     },
 
     _emitAsyncPopExcChain() {
@@ -2424,7 +2489,7 @@ export const AsyncCompiler = {
         // Old order lea(_exception_pending) into V0 smashed RET, so
         // `async () => p` / `return 9` settled leftover bits (denormal
         // number) and throwsAsync saw fulfillment instead of adopt.
-        vm.push(VReg.RET);
+        const asyncRetH = this._holdExpr(VReg.RET);
 
         this._emitAsyncPopExcChain();
 
@@ -2441,15 +2506,14 @@ export const AsyncCompiler = {
         const noPromiseLabel = this.ctx.newLabel("async_ret_no_promise");
         vm.jeq(noPromiseLabel);
 
-        vm.pop(VReg.A1); // 返回值
-        vm.push(VReg.A1); // 保留一份
+        this._loadHeldExpr(asyncRetH, VReg.A1);
         vm.mov(VReg.A0, VReg.V2);
         vm.call("_promise_resolve");
         this._emitAsyncClearCoroPromise();
 
         vm.label(noPromiseLabel);
-        // 恢复返回值，然后正常 epilogue
-        vm.pop(VReg.RET);
+        this._loadHeldExpr(asyncRetH, VReg.RET);
+        this._releaseHeldExpr();
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], this.ctx._fnFrameSize || 16384);
     },
 

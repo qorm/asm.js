@@ -1,0 +1,11 @@
+{
+  "description": "AsyncGenerator.prototype.throw while executing enqueues instead of resuming the live coro (no SIGSEGV).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ok",
+    "exitCode": 0
+  },
+  "knownFailure": "NEW: async-gen throw-while-executing not yet matching node (crash/exit null)"
+}

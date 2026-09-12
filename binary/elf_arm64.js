@@ -30,6 +30,10 @@ export class ELF64ARM64Generator {
     }
 
     writeBytes(bytes) {
+        if (bytes && bytes._asmjsByteBuffer) {
+            bytes.appendToArray(this.buffer);
+            return;
+        }
         for (let i = 0; i < bytes.length; i = i + 1) {
             this.write(bytes[i]);
         }

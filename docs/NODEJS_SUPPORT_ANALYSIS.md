@@ -1,6 +1,8 @@
 # asm.js Node.js 兼容性现状清单
 
-> 更新时间: 2026-07-19 事实清偿(对照 CHANGELOG v1.5.16–v1.5.52 与代码现状逐项核实;审计主体仍为 2026-07-11 快照,上次全面审计 2026-04-01)。文中 v1.5.xx 标注均为重编号前的开发档案版本号(对应 CHANGELOG v1.x 条目),当前发布口径为 v0.2(2026-07-20)
+> 版本/门禁/test262 口径以 [FACTS.md](./FACTS.md) 为准。本文件是 Node shim 审计;与 `runtime/node/` 冲突时以代码为准。
+>
+> 更新时间: 2026-07-19 事实清偿(对照 CHANGELOG v1.5.16–v1.5.52 与代码现状逐项核实;审计主体仍为 2026-07-11 快照,上次全面审计 2026-04-01)。文中 v1.5.xx 标注均为重编号前的开发档案版本号(对应 CHANGELOG v1.x 条目),当前发布口径见 FACTS.md。
 > 审计范围: `runtime/node/`、`compiler/index.js`、`tests/fixtures/node/`、`tests/run_fixtures.mjs`
 > 审计方法: 源码盘点 + fixture 全量运行 + 编译产物小测试(与 node 输出对照)
 > 结论先行: asm.js 提供的是一组 Node 风格内建模块 shim;CJS/`node_modules` 的 **AOT 子集已落地(见下方状态更新)**,npm 真实包消费尚未验证。规划见 [ROADMAP.md](./ROADMAP.md) 方向三(N1–N5)。
@@ -67,7 +69,7 @@
 | 全局 `setTimeout`(不 import) | ✅ 已修(v1.5.34):编译器内建识别全局 `setTimeout`/`setImmediate`/`clearTimeout`/`clearImmediate`(fixture `global-timers`) |
 | `process.nextTick`(不 import process) | ✅ 已修(v1.5.16):原生全局 `process` 对象启动时注入(`runtime/core/process.js`,含 `nextTick`/`version`/`versions`/`env`),裸用可用;经 `node:process` 导入亦绿(fixture `builtin-node-scheme-process`) |
 | `const fs = require("fs")` | ✅ 已修(v1.5.16 CJS AOT 子集;v1.5.35 修编译产物内 `require(builtin)` 导出形态误判):内建返回可用形态(fixture `cjs/require-builtin-fs`) |
-| `import x from "leftpad"`(未知 bare 包) | ❌ 仍真实(2026-07-19 核):`resolveModulePath` 对未命中 node_modules 解析的 bare specifier 返回空串,导入被静默跳过,绑定仍退化为 `0`(E2 收口范围) |
+| `import x from "leftpad"`(未知 bare 包) | ✅ 未命中 node_modules 时编译期抛 `Cannot find package`（不再静默绑定 0） |
 
 ## 3. 内建模块 shim 逐 API 状态
 

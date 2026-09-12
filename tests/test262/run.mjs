@@ -17,6 +17,9 @@
 // Options (all optional):
 //   --corpus <dir>   Path to test262 checkout   (default: <repo>/.test262-corpus)
 //   --target <t>     asm.js target               (default: macos-arm64)
+//                    Execution honors this target (direct / Rosetta / Docker /
+//                    Wine). A linux/windows binary is never spawned as if it
+//                    were a host executable.
 //   --stride <n>     Keep every n-th eligible test (default: 1 = all selected)
 //   --max <n>        Hard cap on tests actually run (default: none)
 //   --jobs <n>       Parallel workers           (default: 8)
@@ -26,6 +29,12 @@
 //   --run-timeout <ms>      default 10000
 //   --quiet          Suppress per-test progress
 //   --no-report      Print totals only; do not write last_report.md / JSON
+//   --gate           Exit 1 unless FAIL=COMPILE_FAIL=CRASH=0
+//   --keep-features  Do not drop tests tagged in UNSUPPORTED_FEATURES.
+//                    Official stride-5 sample stays excluded; ECMA-262 corpus
+//                    (language+built-ins+annexB) uses this so BigInt / regexp-v
+//                    / dynamic-import / Array.fromAsync stay in the denominator.
+//                    intl402/ and staging/ dirs are still skipped.
 //   --canonical      Acceptance mode: fixed corpus/scope, no sampling knobs,
 //                    and both strict/sloppy variants for default tests.
 //   --full           Alias for --canonical over the complete corpus/test tree.
@@ -34,17 +43,21 @@
 // each worker loads the compiler module graph once, then `new Compiler` +
 // `compileFile` per test. Native binaries are still spawned independently.
 //
-// Output:
-//   tests/test262/last_report.md    human report (committed)
-//   tests/test262/last_run.json     machine-readable results (committed if small)
+// Output (official stride-5 default-dir sample only):
+//   tests/test262/last_report-<target>.md
+//   tests/test262/last_report.md            macos-arm64 headline copy
+//   tests/test262/last_run_summary-<target>.json
+//   tests/test262/last_run-<target>.json    per-test (gitignored)
 
 import { readFileSync, writeFileSync, existsSync, readdirSync, rmSync,
   mkdtempSync, realpathSync, statSync } from "fs";
-import { spawn, execFileSync } from "child_process";
+import { execFileSync } from "child_process";
 import { join, dirname, resolve, relative, isAbsolute } from "path";
 import { fileURLToPath } from "url";
 import { tmpdir } from "os";
 import { CompilePool, aggregateTiming, formatTiming } from "./compile-pool.mjs";
+import { resolveTarget } from "../../compiler/core/platform.js";
+import { TargetExecutor, describeRunner } from "./exec-target.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -147,9 +160,12 @@ function parseArgs(argv) {
     dirs: null,
     compileTimeout: 30000,
     runTimeout: 10000,
+    runTimeoutSet: false,
     quiet: false,
     filters: null,
     noReport: false,
+    gate: false,
+    keepFeatures: false,
     canonical: false,
     full: false,
   };
@@ -164,10 +180,15 @@ function parseArgs(argv) {
       case "--jobs": o.jobs = Math.max(1, parseIntOption(next(), "--jobs")); break;
       case "--dirs": o.dirs = next().split(",").map((s) => s.trim()).filter(Boolean); break;
       case "--compile-timeout": o.compileTimeout = parseIntOption(next(), "--compile-timeout"); break;
-      case "--run-timeout": o.runTimeout = parseIntOption(next(), "--run-timeout"); break;
+      case "--run-timeout":
+        o.runTimeout = parseIntOption(next(), "--run-timeout");
+        o.runTimeoutSet = true;
+        break;
       case "--quiet": o.quiet = true; break;
       case "--filter": o.filters = (o.filters || []).concat(next().split(",").map((s) => s.trim()).filter(Boolean)); break;
       case "--no-report": o.noReport = true; break;
+      case "--gate": o.gate = true; break;
+      case "--keep-features": o.keepFeatures = true; break;
       case "--canonical": o.canonical = true; break;
       case "--full": o.canonical = true; o.full = true; break;
       case "-h": case "--help":
@@ -190,6 +211,7 @@ function parseArgs(argv) {
       throw new Error("canonical mode rejects sampling/custom-scope options: " + violations.join(", "));
     }
   }
+  o.target = resolveTarget(o.target);
   return o;
 }
 
@@ -326,29 +348,12 @@ function assembleSource(corpus, body, meta, strict, hcache) {
   return out;
 }
 
-// ---------------------------------------------------------------------------
-// Child process helpers (with timeout, since macOS lacks `timeout`)
-// ---------------------------------------------------------------------------
-function run(cmd, args, timeoutMs) {
-  return new Promise((resolvePromise) => {
-    let stdout = "", stderr = "", done = false, timedOut = false;
-    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
-    const timer = setTimeout(() => {
-      if (done) return;
-      timedOut = true;
-      try { child.kill("SIGKILL"); } catch {}
-    }, timeoutMs);
-    child.stdout.on("data", (d) => { if (stdout.length < 65536) stdout += d; });
-    child.stderr.on("data", (d) => { if (stderr.length < 65536) stderr += d; });
-    child.on("error", (err) => {
-      if (done) return; done = true; clearTimeout(timer);
-      resolvePromise({ code: null, signal: null, stdout, stderr: stderr + String(err), timedOut, spawnError: true });
-    });
-    child.on("close", (code, signal) => {
-      if (done) return; done = true; clearTimeout(timer);
-      resolvePromise({ code, signal, stdout, stderr, timedOut, spawnError: false });
-    });
-  });
+function isOfficialBoundedSample(opt) {
+  if (opt.canonical || opt.full) return false;
+  if (opt.filters && opt.filters.length) return false;
+  if (opt.max !== 0 || opt.stride !== 5) return false;
+  if (opt.dirs && opt.dirs.join("\0") !== SELECTED_DIRS.join("\0")) return false;
+  return true;
 }
 
 // Best-effort identity of this runner's checkout (the asm.js repo HEAD),
@@ -374,7 +379,7 @@ function gitRunnerSha() {
 //   CRASH        segfault / signal / timeout at compile or run
 // For negative tests the expected outcome is inverted (see below).
 
-async function runOneTest(t, opt, workdir, pool) {
+async function runOneTest(t, opt, workdir, pool, executor) {
   const srcPath = join(workdir, "t" + t.id + ".js");
   const binPath = join(workdir, "t" + t.id);
   // Never let a previous/PID-reused artifact satisfy `existsSync` below.
@@ -416,7 +421,7 @@ async function runOneTest(t, opt, workdir, pool) {
       return cls("COMPILE_FAIL", "runtime-negative failed to compile: " + firstLine(comp.stderr), compileMs, 0, cacheHit);
     }
     const tRun = Date.now();
-    const r = await run(binPath, [], opt.runTimeout);
+    const r = await executor.run(binPath, opt.runTimeout);
     const runMs = Date.now() - tRun;
     cleanup(srcPath, binPath);
     if (r.timedOut) return cls("CRASH", "run timeout", compileMs, runMs, cacheHit);
@@ -434,7 +439,7 @@ async function runOneTest(t, opt, workdir, pool) {
     return cls("COMPILE_FAIL", firstLine(comp.stderr) || "compile exit " + comp.code, compileMs, 0, cacheHit);
   }
   const tRun = Date.now();
-  const r = await run(binPath, [], opt.runTimeout);
+  const r = await executor.run(binPath, opt.runTimeout);
   const runMs = Date.now() - tRun;
   cleanup(srcPath, binPath);
   if (r.timedOut) return cls("CRASH", "run timeout", compileMs, runMs, cacheHit);
@@ -680,11 +685,13 @@ async function main() {
     if (EXCLUDED_DIR_PREFIXES.some((p) => rel.startsWith(p))) { excluded.dir++; continue; }
     const meta = parseFrontmatter(extractFrontmatter(src));
     if (meta.flags.includes("module")) { excluded.module++; continue; }
-    const badFeat = meta.features.find((ft) => UNSUPPORTED_FEATURES.has(ft));
-    if (badFeat) {
-      excluded.feature++;
-      excludedFeatureCounts[badFeat] = (excludedFeatureCounts[badFeat] || 0) + 1;
-      continue;
+    if (!opt.keepFeatures) {
+      const badFeat = meta.features.find((ft) => UNSUPPORTED_FEATURES.has(ft));
+      if (badFeat) {
+        excluded.feature++;
+        excludedFeatureCounts[badFeat] = (excludedFeatureCounts[badFeat] || 0) + 1;
+        continue;
+      }
     }
     eligible.push({ file: f, rel, src, meta });
   }
@@ -727,8 +734,31 @@ async function main() {
   console.error(`selected dirs : ${opt.full ? "<all test/>" : dirs.join(", ")}`);
   console.error(`discovered    : ${files.length} files`);
   if (duplicateFiles) console.error(`deduplicated  : ${duplicateFiles} duplicate file aliases`);
-  console.error(`excluded      : module=${excluded.module} feature=${excluded.feature} dir=${excluded.dir}`);
+  console.error(`excluded      : module=${excluded.module} feature=${excluded.feature} dir=${excluded.dir}` +
+    (opt.keepFeatures ? " (keep-features: UNSUPPORTED_FEATURES not dropped)" : ""));
   console.error(`eligible      : ${eligible.length} files / ${eligibleVariants} variants  selected=${selectedVariants}  stride=${opt.stride}  running=${tests.length}  jobs=${opt.jobs}`);
+  const runner = describeRunner(opt.target);
+  console.error(`target        : ${opt.target}  runner=${runner.mode} (${runner.reason})`);
+  if (!runner.runnable) {
+    throw new Error("target " + opt.target + " is not runnable on this host: " + runner.reason);
+  }
+  // Docker linux/amd64 on an arm64 host is QEMU. Isolated Bidi_Mirrored
+  // finishes in ~1.6s on Rosetta and ~13s in qemu; the 10s native budget
+  // SIGKILLs every generated property-escape (88 CRASH, FAIL=0). Wine on
+  // the same host is in the same class (x64 PE under an emulator). Rosetta
+  // is faster than qemu but virtreg + jobs=4 still pushes generated \p{}
+  // over 10s (General_Category_-_Mark run timeout). Canonical mode keeps
+  // 10s. An explicit --run-timeout wins.
+  if (!opt.canonical && (runner.mode === "docker" || runner.mode === "wine" ||
+      runner.mode === "rosetta") && !opt.runTimeoutSet) {
+    // Cross-arch docker is QEMU: virtreg generated \p{} Mark scans ~120s
+    // (isolated run-sum=120.2s). 60s and 120s floors SIGKILL. Same-arch
+    // docker (linux-arm64 on arm64) and Rosetta keep the 60s floor.
+    const floor = (runner.mode === "docker" && runner.qemu) ? 180000 : 60000;
+    opt.runTimeout = Math.max(opt.runTimeout, floor);
+    console.error(`run timeout   : ${opt.runTimeout}ms (${runner.mode}` +
+      (runner.qemu ? " qemu" : "") + " emulator floor; native stays 10s)");
+  }
   console.error("");
 
   const workdir = mkdtempSync(join(tmpdir(), "asm.js-t262-"));
@@ -746,6 +776,7 @@ async function main() {
     compileEnv.ASMJS_RUNTIME_SNAPSHOT = "0";
   }
   const compilePool = new CompilePool({ size: opt.jobs, repo: REPO, env: compileEnv });
+  const executor = new TargetExecutor(opt.target);
   const results = new Array(tests.length);
   let next = 0, completed = 0;
   const t0 = Date.now();
@@ -755,13 +786,16 @@ async function main() {
       if (i >= tests.length) return;
       const t = tests[i];
       let res;
-      try { res = await runOneTest(t, opt, workdir, compilePool); }
+      try { res = await runOneTest(t, opt, workdir, compilePool, executor); }
       catch (e) { res = cls("CRASH", "harness error: " + e.message, 0, 0, null); }
       results[i] = { rel: t.rel, strict: t.strict, status: res.status, detail: res.detail,
                      flags: t.meta.flags, negative: t.meta.negative,
                      features: t.meta.features, includes: t.meta.includes,
                      compileMs: res.compileMs, runMs: res.runMs, cacheHit: res.cacheHit };
       completed++;
+      if (!opt.quiet && res.status !== "PASS") {
+        process.stderr.write(`\n${res.status} ${t.rel}  ${res.detail}\n`);
+      }
       if (!opt.quiet && completed % 50 === 0) {
         const rate = completed / ((Date.now() - t0) / 1000);
         process.stderr.write(`\r  ${completed}/${tests.length}  (${rate.toFixed(1)}/s)   `);
@@ -769,10 +803,11 @@ async function main() {
     }
   }
   try {
-    await compilePool.start();
+    await Promise.all([compilePool.start(), executor.start(workdir, { jobs: opt.jobs })]);
     await Promise.all(Array.from({ length: opt.jobs }, worker));
   } finally {
     await compilePool.close();
+    await executor.close();
     try { rmSync(workdir, { recursive: true, force: true }); } catch {}
   }
   if (!opt.quiet) process.stderr.write("\n");
@@ -805,8 +840,26 @@ async function main() {
     duplicateFiles, excluded, excludedFeatureCounts,
     eligible: eligible.length, eligibleVariants, selectedVariants, variants, executed: runCount,
     notRun, run: runCount, totals, pct, pctExpected, byArea, failPatterns, failByFeature,
-    elapsed, timing,
+    elapsed, timing, runner,
   });
+  const applyGate = () => {
+    if (opt.gate) {
+      const bad = totals.FAIL + totals.COMPILE_FAIL + totals.CRASH;
+      if (bad) {
+        console.error("GATE FAIL: " + opt.target + " FAIL=" + totals.FAIL +
+          " COMPILE_FAIL=" + totals.COMPILE_FAIL + " CRASH=" + totals.CRASH +
+          " (need 0/0/0 for 100%)");
+        process.exitCode = 1;
+      } else {
+        console.error("GATE PASS: " + opt.target + " " + totals.PASS + "/" + runCount +
+          " executed, FAIL=0 COMPILE_FAIL=0 CRASH=0");
+      }
+    }
+    if (opt.canonical) {
+      const omitted = notRun + excluded.module + excluded.feature + excluded.dir;
+      if (omitted || totals.FAIL || totals.COMPILE_FAIL || totals.CRASH) process.exitCode = 1;
+    }
+  };
   // 部分/过滤运行(--no-report)不落地委托报告:否则 headline 被局部样本覆盖。
   if (opt.noReport) {
     const bad = results.filter((r) => r.status !== "PASS");
@@ -818,14 +871,15 @@ async function main() {
       `COMPILE_FAIL=${totals.COMPILE_FAIL} CRASH=${totals.CRASH} ` +
       `(pass=${pctExpected(totals.PASS)}% expected, ${pct(totals.PASS)}% executed; ${elapsed}s)`);
     console.error(formatTiming(timing, wallMs));
+    applyGate();
     return;
   }
-  writeFileSync(join(__dirname, "last_report.md"), report);
   const summary = {
     generated: new Date().toISOString(),
     // Reproducibility identity: exact runner checkout + exact corpus snapshot.
     runnerSha: gitRunnerSha(),
     corpusPin: TEST262_PIN,
+    runner: { mode: runner.mode, reason: runner.reason },
     // Portable corpus identifier: path relative to the repo root (default
     // ".test262-corpus"); never a machine-specific absolute path.
     config: { corpus: relative(REPO, opt.corpus), target: opt.target, dirs, stride: opt.stride, max: opt.max, jobs: opt.jobs,
@@ -841,27 +895,46 @@ async function main() {
     byArea,
     topFailPatterns: topN(failPatterns, 30),
   };
-  // Compact, committed summary (no per-test array); full per-test JSON is gitignored.
-  writeFileSync(join(__dirname, "last_run_summary.json"), JSON.stringify(summary, null, 2));
-  writeFileSync(join(__dirname, "last_run.json"), JSON.stringify({
+  const perTest = {
     ...summary,
     results: results.map((r) => ({
       test: r.rel, strict: r.strict, status: r.status, detail: r.detail,
       compileMs: r.compileMs, runMs: r.runMs, cacheHit: r.cacheHit,
     })),
-  }, null, 2));
+  };
+  const official = isOfficialBoundedSample(opt);
+  const written = [];
+  if (official) {
+    const perTargetMd = join(__dirname, "last_report-" + opt.target + ".md");
+    writeFileSync(perTargetMd, report);
+    written.push("last_report-" + opt.target + ".md");
+    if (opt.target === "macos-arm64") {
+      writeFileSync(join(__dirname, "last_report.md"), report);
+      written.push("last_report.md");
+    }
+    writeFileSync(join(__dirname, "last_run_summary-" + opt.target + ".json"), JSON.stringify(summary, null, 2));
+    written.push("last_run_summary-" + opt.target + ".json");
+    if (opt.target === "macos-arm64") {
+      writeFileSync(join(__dirname, "last_run_summary.json"), JSON.stringify(summary, null, 2));
+      written.push("last_run_summary.json");
+    }
+    writeFileSync(join(__dirname, "last_run-" + opt.target + ".json"), JSON.stringify(perTest, null, 2));
+    if (opt.target === "macos-arm64") {
+      writeFileSync(join(__dirname, "last_run.json"), JSON.stringify(perTest, null, 2));
+    }
+  } else {
+    writeFileSync(join(__dirname, "last_run.json"), JSON.stringify(perTest, null, 2));
+    console.error("note: not the official stride-5 default-dir sample; last_report.md not updated");
+  }
 
   console.error(report.split("\n").slice(0, 42).join("\n"));
   console.error(formatTiming(timing, wallMs));
-  console.error(`\nWrote tests/test262/last_report.md and last_run.json  (${elapsed}s)`);
-
-  // Acceptance mode is a gate, not just a differently worded percentage.
-  // Unsupported/module/dir exclusions and any omitted variants keep the exit
-  // status non-zero even when every executed test passed.
-  if (opt.canonical) {
-    const omitted = notRun + excluded.module + excluded.feature + excluded.dir;
-    if (omitted || totals.FAIL || totals.COMPILE_FAIL || totals.CRASH) process.exitCode = 1;
+  if (written.length) {
+    console.error("\nWrote tests/test262/{" + written.join(", ") + "}  (" + elapsed + "s)");
+  } else {
+    console.error("\nWrote tests/test262/last_run.json  (" + elapsed + "s)");
   }
+  applyGate();
 }
 
 function areaOf(rel) {
@@ -899,7 +972,10 @@ function buildReport(d) {
   const P = (s) => L.push(s);
   P("# asm.js test262 conformance report");
   P("");
-  P(`_Generated ${new Date().toISOString()} — target ${d.opt.target}_`);
+  const runnerLine = d.runner
+    ? ` (runner ${d.runner.mode}: ${d.runner.reason})`
+    : "";
+  P(`_Generated ${new Date().toISOString()} — target ${d.opt.target}${runnerLine}_`);
   P("");
   const passPctExecuted = d.pct(d.totals.PASS);
   const passPctExpected = (d.pctExpected || d.pct)(d.totals.PASS);
@@ -909,8 +985,13 @@ function buildReport(d) {
   const scope = d.opt.full ? "full test/ tree" : "selected language/ + core built-ins/ dirs";
   P("## Headline");
   P("");
-  P(`**asm.js passes ${d.totals.PASS} / ${variants} expected variants = ${passPctExpected}%**`);
-  P(`Executed-rate (PASS / executed): ${passPctExecuted}% (${executed} executed, ${notRun} notRun).`);
+  if (isOfficialBoundedSample(d.opt)) {
+    P(`**asm.js passes ${d.totals.PASS} / ${executed} = ${passPctExecuted}% of the executed official stride-5 sample**`);
+    P(`Expected-variant rate (PASS / ${variants}): ${passPctExpected}%. notRun=${notRun}. Official stride-5 sample, not every eligible variant.`);
+  } else {
+    P(`**asm.js passes ${d.totals.PASS} / ${variants} expected variants = ${passPctExpected}%**`);
+    P(`Executed-rate (PASS / executed): ${passPctExecuted}% (${executed} executed, ${notRun} notRun).`);
+  }
   P(`Scope: ${scope}. ${d.opt.canonical ? "Canonical acceptance gate enabled." : "Bounded subset mode (not a full-corpus claim)."}`);
   P("");
   P(`Of ${d.files} unique discovered test files${d.discoveredRaw !== undefined ? ` (${d.discoveredRaw} raw paths` : ""}${d.discoveredRaw !== undefined ? ")" : ""}, `
@@ -989,7 +1070,9 @@ function buildReport(d) {
   P("- Each assembled test is AOT-compiled by a resident Node compile worker " +
     "(`new Compiler` + `compileFile` per test; compiler modules loaded once per `--jobs` worker; " +
     d.opt.jobs + " workers, target `" + d.opt.target + "`, " +
-    d.opt.compileTimeout / 1000 + "s timeout) then executed (" + d.opt.runTimeout / 1000 + "s timeout).");
+    d.opt.compileTimeout / 1000 + "s timeout) then executed (" + d.opt.runTimeout / 1000 + "s timeout) " +
+    "via `tests/test262/exec-target.mjs` (direct / Rosetta / Docker / Wine according to `--target`; " +
+    "filename-less `t123` binaries never infer the host platform).");
   P("- Classification: PASS = positive test exits 0 (async: `Test262:AsyncTestComplete` on stdout);");
   P("  FAIL = compiled+ran but assertion threw / wrong exit; COMPILE_FAIL = asm.js could not compile;");
   P("  CRASH = signal/timeout. NEGATIVE tests invert: parse/resolution ⇒ PASS iff compile fails;");

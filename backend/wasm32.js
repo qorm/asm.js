@@ -523,7 +523,7 @@ export class WasmBackend extends Backend {
         }
     }
 
-    epilogue(savedRegs, stackSize) {
+    epilogue(savedRegs, stackSize, keep) {
         if (stackSize > 0) {
             this.addImm(VReg.SP, VReg.SP, stackSize);
         }
@@ -541,7 +541,7 @@ export class WasmBackend extends Backend {
         this.load(VReg.FP, VReg.SP, 0);
         this.load(VReg.LR, VReg.SP, 8);
         this.addImm(VReg.SP, VReg.SP, 16);
-        this.ret();
+        if (!keep) this.ret();
     }
 
     call(label) {

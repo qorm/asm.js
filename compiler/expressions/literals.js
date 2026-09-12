@@ -185,28 +185,24 @@ export const LiteralCompiler = {
         }
 
         // 交替连接表达式和后续的 quasi。
-        // 累加器存 FP 局部而非 push——这样插值表达式在「干净的栈」上编译，
-        // 避免像成员自增 `${this.n++}`（内部用 SP 相对存取）在已 push 累加器的
-        // 栈上运行时错位野写 _object_set(NULL)。
+        // 累加器走 _holdExpr 池(录制期 T*,直发期 FP),插值在干净 SP 上编译。
         for (let i = 0; i < expressions.length; i++) {
-            const accSlot = this.ctx.allocLocal(`__tmpl_acc_${this.nextLabelId()}`);
-            this.vm.store(VReg.FP, accSlot, VReg.RET);
+            const accH = this._holdExpr(VReg.RET);
 
-            // 编译表达式并转换为字符串（栈干净）
             this.compileExpressionToString(expressions[i]);
             this.vm.mov(VReg.A1, VReg.RET);
-            this.vm.load(VReg.A0, VReg.FP, accSlot);
+            this._loadHeldExpr(accH, VReg.A0);
+            this._releaseHeldExpr();
             this.vm.call("_strconcat");
 
-            // 如果有下一个 quasi 且不为空，继续连接
             if (i + 1 < quasis.length) {
                 const nextQuasi = quasis[i + 1].value.cooked || quasis[i + 1].value.raw;
                 if (nextQuasi.length > 0) {
-                    const accSlot2 = this.ctx.allocLocal(`__tmpl_acc2_${this.nextLabelId()}`);
-                    this.vm.store(VReg.FP, accSlot2, VReg.RET);
+                    const accH2 = this._holdExpr(VReg.RET);
                     this.compileStringValue(nextQuasi);
                     this.vm.mov(VReg.A1, VReg.RET);
-                    this.vm.load(VReg.A0, VReg.FP, accSlot2);
+                    this._loadHeldExpr(accH2, VReg.A0);
+                    this._releaseHeldExpr();
                     this.vm.call("_strconcat");
                 }
             }

@@ -25,20 +25,21 @@ export const BuiltinCollectionMethodCompiler = {
     // 编译 Map 方法调用
     // obj.set(key, value), obj.get(key), obj.has(key), obj.delete(key), obj.size
     compileMapMethod(obj, method, args) {
-        // 先编译 Map 对象
         this.compileExpression(obj);
-        this.vm.push(VReg.RET); // 保存 Map 指针
+        const recvH = this._holdExpr(VReg.RET);
 
         switch (method) {
             case "set":
                 // map.set(key, value)
                 if (args.length >= 2) {
                     this.compileExpression(args[1]);
-                    this.vm.push(VReg.RET); // 保存 value
+                    const valH = this._holdExpr(VReg.RET);
                     this.compileExpression(args[0]);
                     this.vm.mov(VReg.A1, VReg.RET); // key
-                    this.vm.pop(VReg.A2); // value
-                    this.vm.pop(VReg.A0); // map
+                    this._loadHeldExpr(valH, VReg.A2);
+                    this._loadHeldExpr(recvH, VReg.A0);
+                    this._releaseHeldExpr();
+                    this._releaseHeldExpr();
                     this.vm.call("_map_set");
                     return true;
                 }
@@ -52,99 +53,102 @@ export const BuiltinCollectionMethodCompiler = {
                 for (let i = 0; i < args.length; i++) {
                     if (args[i].type === "SpreadElement") spread = true;
                 }
-                if (spread) break; // 交通用路径(栈由 switch 尾统一恢复)
+                if (spread) break; // 交通用路径(recv 由 switch 尾统一释放)
                 if (args.length >= 1) this.compileExpression(args[0]);
                 else this.vm.movImm64(VReg.RET, 0x7ffb000000000000n);
-                this.vm.push(VReg.RET); // key
+                const keyH = this._holdExpr(VReg.RET);
                 if (args.length >= 2) this.compileExpression(args[1]);
                 else this.vm.movImm64(VReg.RET, 0x7ffb000000000000n);
                 this.vm.mov(VReg.A2, VReg.RET); // value / callbackfn
-                this.vm.pop(VReg.A1);           // key
-                this.vm.pop(VReg.A0);           // map
+                this._loadHeldExpr(keyH, VReg.A1);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
+                this._releaseHeldExpr();
                 this.vm.call(method === "getOrInsert" ? "_map_getOrInsert" : "_map_getOrInsertComputed");
                 return true;
             }
 
             case "get":
-                // map.get(key)
                 if (args.length >= 1) {
                     this.compileExpression(args[0]);
                     this.vm.mov(VReg.A1, VReg.RET); // key
-                    this.vm.pop(VReg.A0); // map
+                    this._loadHeldExpr(recvH, VReg.A0);
+                    this._releaseHeldExpr();
                     this.vm.call("_map_get");
                     return true;
                 }
                 break;
 
             case "has":
-                // map.has(key)
                 if (args.length >= 1) {
                     this.compileExpression(args[0]);
                     this.vm.mov(VReg.A1, VReg.RET); // key
-                    this.vm.pop(VReg.A0); // map
+                    this._loadHeldExpr(recvH, VReg.A0);
+                    this._releaseHeldExpr();
                     this.vm.call("_map_has");
                     return true;
                 }
                 break;
 
             case "delete":
-                // map.delete(key)
                 if (args.length >= 1) {
                     this.compileExpression(args[0]);
                     this.vm.mov(VReg.A1, VReg.RET); // key
-                    this.vm.pop(VReg.A0); // map
+                    this._loadHeldExpr(recvH, VReg.A0);
+                    this._releaseHeldExpr();
                     this.vm.call("_map_delete");
                     return true;
                 }
                 break;
 
             case "size":
-                // map.size - 直接从头部读取 length 字段 (统一头部结构 +8)
-                this.vm.pop(VReg.RET);
+                this._loadHeldExpr(recvH, VReg.RET);
+                this._releaseHeldExpr();
                 this.vm.load(VReg.RET, VReg.RET, 8);
                 return true;
 
             case "clear":
-                // map.clear() - 走运行时（需同时重置 head/tail 并清零哈希桶数组）
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_map_clear");
                 this.vm.movImm64(VReg.RET, 0x7ffb000000000000n); // JS_UNDEFINED (spec: return undefined)
                 return true;
 
             case "forEach":
-                // map.forEach(cb(value, key, map)) - 编译期回调循环遍历插入序链表
                 if (args.length >= 1) {
-                    this.compileMapForEach(args[0], args[1]); // map(boxed)已在栈顶
+                    this._loadHeldExpr(recvH, VReg.RET);
+                    this._releaseHeldExpr();
+                    this.compileMapForEach(args[0], args[1]);
                     return true;
                 }
                 break;
 
             case "keys":
-                // map.keys() -> 键数组(迭代器实现为真数组,可 for-of/展开/Array.from)
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_map_keys");
                 return true;
 
             case "values":
-                // map.values() -> 值数组
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_map_values");
                 return true;
 
             case "entries":
-                // map.entries() -> [[k,v]...] 数组
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_map_entries");
                 return true;
         }
 
-        this.vm.pop(VReg.RET); // 恢复栈
+        this._releaseHeldExpr();
         return false;
     },
 
     // Map.forEach:遍历插入序链表(head@16 → node.next@16,以裸 0 结尾),
     // 对每个节点以 (value@8, key@0, map) 调用回调。只读遍历(不改桶/不 rehash),
-    // 循环状态存 FP 槽,每轮在调用后重载(调用毁 caller-saved)。进入时 map(boxed)在栈顶。
+    // 循环状态存 FP 槽,每轮在调用后重载(调用毁 caller-saved)。进入时 map(boxed)在 RET。
     compileMapForEach(callbackExpr, thisArgExpr = null) {
         const vm = this.vm;
         const id = this.nextLabelId();
@@ -152,8 +156,6 @@ export const BuiltinCollectionMethodCompiler = {
         const curOffset = this.ctx.allocLocal(`__mapfe_cur_${id}`); // 当前裸节点指针
         const cbOffset = this.ctx.allocLocal(`__mapfe_cb_${id}`);
 
-        // map(boxed)在栈顶(compileMapMethod 序言 push)
-        vm.pop(VReg.RET);
         vm.store(VReg.FP, mapOffset, VReg.RET);
         // 回调
         this.compileExpression(callbackExpr);
@@ -177,17 +179,14 @@ export const BuiltinCollectionMethodCompiler = {
         vm.cmpImm(VReg.V1, 0);
         vm.jne(skipL);
 
-        // 加载闭包并 push(与 array.forEach 同序)
-        vm.load(VReg.V6, VReg.FP, cbOffset);
-        vm.push(VReg.V6);
+        // 回调已在 FP 槽;装参会冲掉 caller-saved,从槽装 S0。
         // A0 = value(@8),A1 = key(@0),A2 = map(boxed)。arm64 上 V0≡A0≡RET,不能用
-        // V0 当节点指针暂存(会覆盖 A0);用 S1(callee 保存,本段本就随 emitClosureCall
-        // 一起被视作 scratch),且 A0 最后加载。
+        // V0 当节点指针暂存(会覆盖 A0);用 S1,且 A0 最后加载。
         vm.load(VReg.S1, VReg.FP, curOffset); // S1 = 节点裸指针
         vm.load(VReg.A1, VReg.S1, 0);         // key
         vm.load(VReg.A2, VReg.FP, mapOffset); // map(boxed)
         vm.load(VReg.A0, VReg.S1, 8);         // value(A0 最后加载)
-        vm.pop(VReg.S0); // 闭包
+        vm.load(VReg.S0, VReg.FP, cbOffset);
         this.emitClosureCallAfterSetup();
 
         // cur = node.next(@16)——调用毁寄存器,从 FP 槽重载节点指针
@@ -210,8 +209,6 @@ export const BuiltinCollectionMethodCompiler = {
         const curOffset = this.ctx.allocLocal(`__setfe_cur_${id}`); // 当前裸节点指针
         const cbOffset = this.ctx.allocLocal(`__setfe_cb_${id}`);
 
-        // set(boxed)在栈顶(compileSetMethod 序言 push)
-        vm.pop(VReg.RET);
         vm.store(VReg.FP, setOffset, VReg.RET);
         // 回调
         this.compileExpression(callbackExpr);
@@ -231,16 +228,14 @@ export const BuiltinCollectionMethodCompiler = {
         vm.cmpImm(VReg.V0, 0);
         vm.jeq(endL);
 
-        // 加载闭包并 push(与 array/map.forEach 同序)
-        vm.load(VReg.V6, VReg.FP, cbOffset);
-        vm.push(VReg.V6);
+        // 回调已在 FP 槽;装参会冲掉 caller-saved,从槽装 S0。
         // A0 = value(@0),A1 = value(同,Set 语义),A2 = set(boxed)。A0≡V0≡RET,故用
         // S1 暂存节点指针、A0 最后加载(同 compileMapForEach 的别名规避)。
         vm.load(VReg.S1, VReg.FP, curOffset); // S1 = 节点裸指针
         vm.load(VReg.A1, VReg.S1, 0);         // value(第二实参)
         vm.load(VReg.A2, VReg.FP, setOffset); // set(boxed)
         vm.load(VReg.A0, VReg.S1, 0);         // value(第一实参,A0 最后加载)
-        vm.pop(VReg.S0); // 闭包
+        vm.load(VReg.S0, VReg.FP, cbOffset);
         this.emitClosureCallAfterSetup();
 
         // cur = node.next(@8)——调用毁寄存器,从 FP 槽重载节点指针
@@ -255,53 +250,52 @@ export const BuiltinCollectionMethodCompiler = {
     // 编译 Set 方法调用
     // obj.add(value), obj.has(value), obj.delete(value), obj.size
     compileSetMethod(obj, method, args) {
-        // 先编译 Set 对象
         this.compileExpression(obj);
-        this.vm.push(VReg.RET); // 保存 Set 指针
+        const recvH = this._holdExpr(VReg.RET);
 
         switch (method) {
             case "add":
-                // set.add(value)
                 if (args.length >= 1) {
                     this.compileExpression(args[0]);
                     this.vm.mov(VReg.A1, VReg.RET); // value
-                    this.vm.pop(VReg.A0); // set
+                    this._loadHeldExpr(recvH, VReg.A0);
+                    this._releaseHeldExpr();
                     this.vm.call("_set_add");
                     return true;
                 }
                 break;
 
             case "has":
-                // set.has(value)
                 if (args.length >= 1) {
                     this.compileExpression(args[0]);
                     this.vm.mov(VReg.A1, VReg.RET); // value
-                    this.vm.pop(VReg.A0); // set
+                    this._loadHeldExpr(recvH, VReg.A0);
+                    this._releaseHeldExpr();
                     this.vm.call("_set_has");
                     return true;
                 }
                 break;
 
             case "delete":
-                // set.delete(value)
                 if (args.length >= 1) {
                     this.compileExpression(args[0]);
                     this.vm.mov(VReg.A1, VReg.RET); // value
-                    this.vm.pop(VReg.A0); // set
+                    this._loadHeldExpr(recvH, VReg.A0);
+                    this._releaseHeldExpr();
                     this.vm.call("_set_delete");
                     return true;
                 }
                 break;
 
             case "size":
-                // set.size - 直接从头部读取 length 字段 (统一头部结构 +8)
-                this.vm.pop(VReg.RET);
+                this._loadHeldExpr(recvH, VReg.RET);
+                this._releaseHeldExpr();
                 this.vm.load(VReg.RET, VReg.RET, 8);
                 return true;
 
             case "clear":
-                // set.clear()
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_set_clear");
                 this.vm.movImm64(VReg.RET, 0x7ffb000000000000n); // JS_UNDEFINED (spec: return undefined)
                 return true;
@@ -310,21 +304,23 @@ export const BuiltinCollectionMethodCompiler = {
                 // set.forEach(cb(value, value, set)) - 此前无 case → 落通用派发查
                 // "forEach" miss → 崩(基础 `set.forEach(v=>...)` 段错误根因)。
                 if (args.length >= 1) {
-                    this.compileSetForEach(args[0], args[1]); // set(boxed)已在栈顶
+                    this._loadHeldExpr(recvH, VReg.RET);
+                    this._releaseHeldExpr();
+                    this.compileSetForEach(args[0], args[1]);
                     return true;
                 }
                 break;
 
             case "keys":
             case "values":
-                // set.keys()/.values() -> 值数组（语义相同）
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_set_values");
                 return true;
 
             case "entries":
-                // set.entries() -> [[v,v]...] 数组
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(recvH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_set_entries");
                 return true;
 
@@ -349,17 +345,16 @@ export const BuiltinCollectionMethodCompiler = {
                         isSupersetOf: "_set_issuperset",
                         isDisjointFrom: "_set_isdisjoint",
                     }[method];
-                    // 1) 编译 b,用 _set_coerce_arg 转裸 Set
                     this.compileExpression(args[0]);
                     this.vm.mov(VReg.A0, VReg.RET);   // A0 = b(候选值)
                     this.vm.call("_set_coerce_arg");    // RET = 裸 Set b
-                    this.vm.mov(VReg.A1, VReg.RET);    // A1 = 裸 Set b
-                    // 2) 取 a(boxed),用 _set_coerce_arg 转裸 Set;先 push A1 防被 call 毁
-                    this.vm.pop(VReg.A0);              // A0 = a(boxed,接收者)
-                    this.vm.push(VReg.A1);             // [sp] = 裸 Set b(save across call)
+                    const bH = this._holdExpr(VReg.RET);
+                    this._loadHeldExpr(recvH, VReg.A0); // A0 = a(boxed,接收者)
                     this.vm.call("_set_coerce_arg");    // RET = 裸 Set a
                     this.vm.mov(VReg.A0, VReg.RET);    // A0 = 裸 Set a
-                    this.vm.pop(VReg.A1);              // A1 = 裸 Set b(restore)
+                    this._loadHeldExpr(bH, VReg.A1);   // A1 = 裸 Set b
+                    this._releaseHeldExpr();            // b
+                    this._releaseHeldExpr();            // recv
                     this.vm.call(setCombinatorLabel);
                     return true;
                 }
@@ -367,7 +362,7 @@ export const BuiltinCollectionMethodCompiler = {
             }
         }
 
-        this.vm.pop(VReg.RET); // 恢复栈
+        this._releaseHeldExpr();
         return false;
     },
 
@@ -451,7 +446,7 @@ export const BuiltinCollectionMethodCompiler = {
                     this.vm.store(VReg.FP, invOff, VReg.V1); // invalidBefore = 1
                     this.vm.label(freshLbl);
                 }
-                this.vm.push(VReg.RET); // 保存 date 值
+                const dateH = this._holdExpr(VReg.RET);
                 this.compileExpression(args[0]);
                 this.emitNumberCoerceFast(); // RET = 裸 float 位
                 // [Date 加固] NaN/±Inf(指数全 1)判别:此前直接 fcvtzs,NaN→0 静默当 0 写、
@@ -479,12 +474,12 @@ export const BuiltinCollectionMethodCompiler = {
                     this.vm.cmpImm(VReg.V0, 0);
                     this.vm.jne(invLbl);
                 }
-                this.vm.pop(VReg.A0); // date 值
+                this._loadHeldExpr(dateH, VReg.A0);
                 this.vm.movImm(VReg.A1, part);
                 this.vm.call("_date_set_part"); // RET = 新 ms(裸 float number)
                 this.vm.jmp(okLbl);
                 this.vm.label(nanLbl);
-                this.vm.pop(VReg.A0); // date 值
+                this._loadHeldExpr(dateH, VReg.A0);
                 this.vm.emitMaskLoad(VReg.V1);
                 this.vm.andMaskReg(VReg.A0, VReg.A0, VReg.V1); // 裸 date 指针
                 this.vm.movImm64(VReg.V1, 0x7ff0000000000001n); // canonical NaN(同 _dp_invalid)
@@ -493,10 +488,10 @@ export const BuiltinCollectionMethodCompiler = {
                 this.vm.jmp(okLbl);
                 if (part !== 0) {
                     this.vm.label(invLbl);
-                    this.vm.pop(VReg.V0); // 平衡栈(date 废弃;不写回)
                     this.vm.movImm64(VReg.RET, 0x7ff0000000000001n); // RET = NaN
                 }
                 this.vm.label(okLbl);
+                this._releaseHeldExpr();
                 return true;
             }
             // 多字段时间族(part 3..5:setHours/setMinutes/setSeconds 及 UTC 变体):
@@ -525,7 +520,7 @@ export const BuiltinCollectionMethodCompiler = {
                     this.vm.store(VReg.FP, invOff, VReg.V1); // invalidBefore = 1
                     this.vm.label(freshLbl);
                 }
-                this.vm.push(VReg.RET); // 保存 date(boxed)
+                const dateH = this._holdExpr(VReg.RET);
                 const bufOffs = [];
                 for (let i = 0; i < count; i++) {
                     bufOffs.push(this.ctx.allocLocal(`__dset_buf${i}_${id}`));
@@ -543,15 +538,15 @@ export const BuiltinCollectionMethodCompiler = {
                 // A3 = valuesPtr = FP + bufOffs[count-1](最低槽);用寄存器减法避免大立即数
                 this.vm.movImm(VReg.A3, -bufOffs[count - 1]);
                 this.vm.sub(VReg.A3, VReg.FP, VReg.A3);
-                this.vm.pop(VReg.A0); // date(boxed)
+                this._loadHeldExpr(dateH, VReg.A0);
                 this.vm.movImm(VReg.A1, part);   // startPart
                 this.vm.movImm(VReg.A2, count);  // count
                 this.vm.call("_date_set_time_f64"); // RET = 新 ms(number)
                 this.vm.jmp(okLbl);
                 this.vm.label(invLbl);
-                this.vm.pop(VReg.V0); // 平衡栈(date 废弃;不写回)
                 this.vm.movImm64(VReg.RET, 0x7ff0000000000001n); // RET = NaN
                 this.vm.label(okLbl);
+                this._releaseHeldExpr();
                 return true;
             }
             // 多字段日历族(part 0..1:setFullYear/setMonth 及 UTC 变体):原子写。
@@ -584,7 +579,7 @@ export const BuiltinCollectionMethodCompiler = {
                 this.vm.store(VReg.FP, minvOff, VReg.V1); // invalidBefore = 1
                 this.vm.label(mFreshLbl);
             }
-            this.vm.push(VReg.RET); // 保存 date(boxed)
+            const dateH = this._holdExpr(VReg.RET);
             const bufOffs = [];
             for (let i = 0; i < count; i++) {
                 bufOffs.push(this.ctx.allocLocal(`__dset_buf${i}_${id}`));
@@ -635,13 +630,13 @@ export const BuiltinCollectionMethodCompiler = {
             // A3 = valuesPtr = FP + bufOffs[count-1](最低槽);用寄存器减法避免大立即数
             this.vm.movImm(VReg.A3, -bufOffs[count - 1]);
             this.vm.sub(VReg.A3, VReg.FP, VReg.A3);
-            this.vm.pop(VReg.A0); // date(boxed)
+            this._loadHeldExpr(dateH, VReg.A0);
             this.vm.movImm(VReg.A1, part);   // startPart
             this.vm.movImm(VReg.A2, count);  // count
             this.vm.call("_date_set_parts"); // RET = 新 ms(裸 float number)
             this.vm.jmp(mOkLbl);
             this.vm.label(mNanLbl);
-            this.vm.pop(VReg.A0); // date(boxed)
+            this._loadHeldExpr(dateH, VReg.A0);
             this.vm.emitMaskLoad(VReg.V1);
             this.vm.andMaskReg(VReg.A0, VReg.A0, VReg.V1); // 裸 date 指针
             this.vm.movImm64(VReg.V1, 0x7ff0000000000001n); // canonical NaN(同 _dp_invalid)
@@ -650,22 +645,22 @@ export const BuiltinCollectionMethodCompiler = {
             this.vm.jmp(mOkLbl);
             if (part !== 0) {
                 this.vm.label(mInvLbl);
-                this.vm.pop(VReg.V0); // 平衡栈(date 废弃;不写回)
                 this.vm.movImm64(VReg.RET, 0x7ff0000000000001n); // RET = NaN
             }
             this.vm.label(mOkLbl);
+            this._releaseHeldExpr();
             return true;
         }
         // setTime(ms):ToNumber + TimeClip(镜像 aref 路 _aref_date_setTime):
         // NaN/±Inf(指数全 1)或 |v| > 8.64e15(fcmp 比较,守 §1.2 不用整数比 float 位)
         // → 写 canonical NaN 返 NaN;否则向零截断(-0→+0)写回并返回新 ms。
-        // 注意 RET==A0==V0==X0 别名:coerce 后的值须先存 A2(=X2),再 pop A0 取 date,
-        // 否则 pop 会覆盖 X0 里的新 timestamp,反把 date 指针写进去。
+        // 注意 RET==A0==V0==X0 别名:coerce 后的值须先存 A2(=X2),再 load date,
+        // 否则会覆盖 X0 里的新 timestamp,反把 date 指针写进去。
         if (method === "setTime" && args.length >= 1) {
             const stNanLbl = this.ctx.newLabel("stime_nan");
             const stOkLbl = this.ctx.newLabel("stime_ok");
             this.compileExpression(obj);
-            this.vm.push(VReg.RET);
+            const dateH = this._holdExpr(VReg.RET);
             this.compileExpression(args[0]);
             this.emitNumberCoerceFast(); // RET = 裸 float 位(= 新 timestamp)
             this.vm.shrImm(VReg.V1, VReg.RET, 52);
@@ -687,7 +682,8 @@ export const BuiltinCollectionMethodCompiler = {
             this.vm.label(stNanLbl);
             this.vm.movImm64(VReg.A2, 0x7ff0000000000001n); // canonical NaN(同 _dp_invalid)
             this.vm.label(stOkLbl);
-            this.vm.pop(VReg.A0); // date 值
+            this._loadHeldExpr(dateH, VReg.A0);
+            this._releaseHeldExpr();
             this.vm.emitMaskLoad(VReg.V1);
             this.vm.andMaskReg(VReg.A0, VReg.A0, VReg.V1); // 裸 date 指针
             this.vm.store(VReg.A0, 8, VReg.A2); // 写回 timestamp

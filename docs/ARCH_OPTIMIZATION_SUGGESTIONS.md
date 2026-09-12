@@ -11,7 +11,7 @@
 ## 1. 编译流体系优化：从“VM 录制重放”演进为“静态 SSA IR”
 
 ### 现状评估
-当前项目在 [vm/index.js](file:///Users/dmy/work/jsbin/vm/index.js#L128) 中巧妙地实现了一套“函数内指令录制与重放（beginRecord / endRecord）”机制。它在录制期截获 AST 发射的虚拟指令，并在重放期对 FP 栈槽进行活跃区间分析，通过**线性扫描（Linear Scan）**和**栈往返虚拟化（push/pop virtualization）**将热槽提升为 callee-saved 寄存器（`S0-S5`）。
+当前项目在 [vm/index.js](vm/index.js#L128) 中巧妙地实现了一套“函数内指令录制与重放（beginRecord / endRecord）”机制。它在录制期截获 AST 发射的虚拟指令，并在重放期对 FP 栈槽进行活跃区间分析，通过**线性扫描（Linear Scan）**和**栈往返虚拟化（push/pop virtualization）**将热槽提升为 callee-saved 寄存器（`S0-S5`）。
 *   **局限性**：由于没有真正的控制流图（CFG）与数据流依赖链，这种机制很难进行跨基本块的更深层次优化（如公共子表达式消除 CSE、循环不变代码外提 LICM、死代码删除 DCE 等）。同时，`VirtualMachine` 类承担了过多的优化职责，导致模块耦合度较高。
 
 ### 优化建议
@@ -25,7 +25,7 @@
 ## 2. 类型系统与计算特化：全局类型推断与彻底解箱（Unboxing）
 
 ### 现状评估
-JS 作为动态类型语言，其运算值默认采用 **NaN-boxing (NaN 装箱)** 表示。在目前的实现中，所有的算术和比较操作均需经历运行时 tag 类型检查及 `_number_coerce` 强制类型转换（详见 [PERF_PLAN.md](file:///Users/dmy/work/jsbin/docs/PERF_PLAN.md#L91)）。这导致 AOT 编译出的原生机器码中充斥着大量的 runtime call，无法发挥 CPU 原生指令的威力。
+JS 作为动态类型语言，其运算值默认采用 **NaN-boxing (NaN 装箱)** 表示。在目前的实现中，所有的算术和比较操作均需经历运行时 tag 类型检查及 `_number_coerce` 强制类型转换（详见 [PERF_PLAN.md](docs/PERF_PLAN.md#L91)）。这导致 AOT 编译出的原生机器码中充斥着大量的 runtime call，无法发挥 CPU 原生指令的威力。
 
 ### 优化建议
 1.  **全程序静态类型流分析（Whole-Program Type Inference）**：
@@ -42,7 +42,7 @@ JS 作为动态类型语言，其运算值默认采用 **NaN-boxing (NaN 装箱)
 ## 3. 对象模型升级：静态 Shape 偏置与属性去虚拟化（Static Shape & Offset Access）
 
 ### 现状评估
-属性访问密集型负载是目前最大的性能差距所在（落后 V8 约 16 倍）。虽然通过 `_object_get_ic` 引入了单态站点缓存（IC）（详见 [members.js](file:///Users/dmy/work/jsbin/compiler/expressions/members.js#L38)），但在多态或方法密集调用时仍有显著开销，且 IC 每次仍需进行运行时的自验证指针 cmp。
+属性访问密集型负载是目前最大的性能差距所在（落后 V8 约 16 倍）。虽然通过 `_object_get_ic` 引入了单态站点缓存（IC）（详见 [members.js](compiler/expressions/members.js#L38)），但在多态或方法密集调用时仍有显著开销，且 IC 每次仍需进行运行时的自验证指针 cmp。
 
 ### 优化建议
 1.  **编译期 Shape 静态拓扑分配**：
@@ -57,7 +57,7 @@ JS 作为动态类型语言，其运算值默认采用 **NaN-boxing (NaN 装箱)
 ## 4. 内存管理：精确化栈图与分配路径内联（Stack Map & Inlined Allocation）
 
 ### 现状评估
-asm.js 的垃圾回收器是一套基于分代式（sticky mark-bit minor + Go 式 full 步调，见 [allocator.js](file:///Users/dmy/work/jsbin/runtime/core/allocator.js)）的**保守式、非移动 GC**。由于栈扫描是保守的，它必须把栈帧和寄存器里任何形似指针的 64 位值都作为 Root，这会导致一定程度的“指针泄漏（Pointer Leak）”和不必要的内存保留。此外，Nursery 的内存分配仍需通过 `call _alloc` 的运行时边界。
+asm.js 的垃圾回收器是一套基于分代式（sticky mark-bit minor + Go 式 full 步调，见 [allocator.js](runtime/core/allocator.js)）的**保守式、非移动 GC**。由于栈扫描是保守的，它必须把栈帧和寄存器里任何形似指针的 64 位值都作为 Root，这会导致一定程度的“指针泄漏（Pointer Leak）”和不必要的内存保留。此外，Nursery 的内存分配仍需通过 `call _alloc` 的运行时边界。
 
 ### 优化建议
 1.  **引入精确栈图（Stack Maps / Reference Maps）**：
@@ -82,7 +82,7 @@ asm.js 的垃圾回收器是一套基于分代式（sticky mark-bit minor + Go �
 ## 5. 字符串与 Shim 运行时重构：Rope 树与栈上分配
 
 ### 现状评估
-字符串构建性能落后 Node 约 3 倍。目前 `_strconcat` 每次都会触发全内存拷贝和新堆空间分配（详见 [string/index.js](file:///Users/dmy/work/jsbin/runtime/types/string/index.js#L313)），这在循环拼接或大模板字符串渲染中会产生大量垃圾对象，频繁触发 GC。
+字符串构建性能落后 Node 约 3 倍。目前 `_strconcat` 每次都会触发全内存拷贝和新堆空间分配（详见 [string/index.js](runtime/types/string/index.js#L313)），这在循环拼接或大模板字符串渲染中会产生大量垃圾对象，频繁触发 GC。
 
 ### 优化建议
 1.  **引入 Rope 树（绳索字符串）或 String Slice 视图**：

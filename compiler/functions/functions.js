@@ -15,6 +15,7 @@ import { ASYNC_CLOSURE_MAGIC } from "../async/index.js";
 import { OperatorCompiler } from "../expressions/operators.js";
 import { collectDirectEvalSourceRefs, collectVarDeclarations } from "../../lang/analysis/closure.js";
 import { parseStringNumericLiteral } from "../expressions/literals.js";
+import { TYPE_PROXY } from "../../runtime/core/types.js";
 
 // 闭包魔数 - 用于区分普通函数指针和闭包对象
 const CLOSURE_MAGIC = 0xc105;
@@ -80,21 +81,23 @@ export const FunctionCompiler = {
         if (name === "lastIndexOf" && args.length >= 1) {
             const vm = this.vm;
             this.compileExpression(obj);
-            vm.push(VReg.RET);
+            const taH = this._holdExpr(VReg.RET);
             vm.mov(VReg.A0, VReg.RET);
             vm.call("_tam_validate");
             vm.mov(VReg.A0, VReg.RET);
             vm.call("_tam_throw_if_detached");
             this.compileExpression(args[0]);
-            vm.push(VReg.RET);
+            const searchH = this._holdExpr(VReg.RET);
             if (args.length >= 2) {
                 this.compileExpression(args[1]);
                 vm.mov(VReg.A2, VReg.RET);
             } else {
                 vm.movImm64(VReg.A2, 0x7ff800007fffffffn); // 缺省 from=INT_MAX(装箱 int32)
             }
-            vm.pop(VReg.A1);
-            vm.pop(VReg.A0);
+            this._loadHeldExpr(searchH, VReg.A1);
+            this._loadHeldExpr(taH, VReg.A0);
+            this._releaseHeldExpr();
+            this._releaseHeldExpr();
             vm.call("_ta_lastindexof"); // 裸下标/-1
             this.boxIntAsNumber(VReg.RET);
             return true;
@@ -166,8 +169,8 @@ export const FunctionCompiler = {
         return false;
     },
 
-    // 编译函数参数 - 先全部压栈，再统一弹出到参数寄存器
-    // 这是因为 VReg.RET 和 VReg.A0 都映射到同一个物理寄存器 (X0/RAX)
+    // 编译函数参数 - 先全部 _holdExpr，再装入参数寄存器
+    // VReg.RET 和 VReg.A0 同物理寄存器 (X0/RAX),不能边求值边写 A0。
     compileCallArguments(args, isMethodCall, options) {
         // A0-A4 = 前 5 个实参;A5 在 invoke 时为 this(见 _fn_invoke_tail / compileClosureCall)。
         // 第 6 个及以后 → _call_argv(被调方 emitArgvSpillSnapshot 快照)。
@@ -192,15 +195,15 @@ export const FunctionCompiler = {
         }
 
         const argCount = args.length;
-
+        const holds = [];
         for (let i = 0; i < argCount; i++) {
             this.compileExpression(args[i]);
-            this.vm.push(VReg.RET);
+            holds.push(this._holdExpr(VReg.RET));
         }
-
-        for (let i = argCount - 1; i >= 0; i--) {
-            this.vm.pop(this.vm.getArgReg(i));
+        for (let i = 0; i < argCount; i++) {
+            this._loadHeldExpr(holds[i], this.vm.getArgReg(i));
         }
+        this._releaseHeldN(argCount);
         for (let i = argCount; i < regLimit; i++) {
             this.vm.lea(this.vm.getArgReg(i), "_js_undefined");
             this.vm.load(this.vm.getArgReg(i), this.vm.getArgReg(i), 0);
@@ -215,19 +218,21 @@ export const FunctionCompiler = {
     compileCallArgumentsWithOverflow(args, regLimit, maxArgCount, extendedArgc) {
         const cap = maxArgCount === undefined ? 16 : maxArgCount;
         const argCount = Math.min(args.length, cap);
+        const holds = [];
         for (let i = 0; i < argCount; i++) {
             this.compileExpression(args[i]);
-            this.vm.push(VReg.RET);
+            holds.push(this._holdExpr(VReg.RET));
         }
-        for (let i = argCount - 1; i >= 0; i--) {
+        for (let i = 0; i < argCount; i++) {
             if (i < regLimit) {
-                this.vm.pop(this.vm.getArgReg(i));
+                this._loadHeldExpr(holds[i], this.vm.getArgReg(i));
             } else {
-                this.vm.pop(VReg.V6);
+                this._loadHeldExpr(holds[i], VReg.V6);
                 this.vm.lea(VReg.V5, "_call_argv");
                 this.vm.store(VReg.V5, i * 8, VReg.V6);
             }
         }
+        this._releaseHeldN(argCount);
         for (let i = argCount; i < regLimit; i++) {
             this.vm.lea(this.vm.getArgReg(i), "_js_undefined");
             this.vm.load(this.vm.getArgReg(i), this.vm.getArgReg(i), 0);
@@ -315,27 +320,27 @@ export const FunctionCompiler = {
         this.vm.load(VReg.A0, VReg.FP, argsArrOff);
         this.vm.call("_call_argv_fill");
 
-        // 逆序算出 arg[argLimit-1..0] 压栈；每个 = (i < len) ? arr[i] : 未定义
-        for (let i = argLimit - 1; i >= 0; i--) {
+        const holds = [];
+        for (let i = 0; i < argLimit; i++) {
             const id = this.nextLabelId();
             const undefL = `_callsp_undef_${id}`;
             const doneL = `_callsp_done_${id}`;
             this.vm.load(VReg.V0, VReg.FP, lenOff);
             this.vm.cmpImm(VReg.V0, i);
-            this.vm.jle(undefL);                  // 长度 <= i → 无此实参
+            this.vm.jle(undefL);
             this.vm.load(VReg.A0, VReg.FP, argsArrOff);
             this.vm.movImm(VReg.A1, i);
-            this.vm.call("_array_get");                // RET = arr[i]
+            this.vm.call("_array_get");
             this.vm.jmp(doneL);
             this.vm.label(undefL);
-            this.vm.movImm64(VReg.RET, 0x7ffb000000000000n); // lea+load _js undef
+            this.vm.movImm64(VReg.RET, 0x7ffb000000000000n);
             this.vm.label(doneL);
-            this.vm.push(VReg.RET);
+            holds.push(this._holdExpr(VReg.RET));
         }
-        // 依次弹出到 A0..A(argLimit-1) (栈顶是 arg0)
         for (let i = 0; i < argLimit; i++) {
-            this.vm.pop(this.vm.getArgReg(i));
+            this._loadHeldExpr(holds[i], this.vm.getArgReg(i));
         }
+        this._releaseHeldN(argLimit);
         // [argc ABI] spread 路径:实参个数为运行时数组长度(裸整数,消费方自行按寄存器上限截断)
         this.vm.load(VReg.V6, VReg.FP, lenOff);
         this.emitSetCallArgc(0, VReg.V6);
@@ -444,6 +449,30 @@ export const FunctionCompiler = {
     // 唯一区别:不调用 _date_new_ts 装箱成 Date,而是把毫秒作为裸 float64 数值留在 RET。
     // 缺省(ECMAScript):month=0、day=1、其余=0。year 缺省→NaN(0-arg leftover-arg)。
     // 结果留在 RET(V0):裸 float64 位模式,即本运行时的 number 表示(同 getTime/new Date ms)。
+    // dOffs[0..6] = year, month0, day, h, mi, s, ms as int64 on the FP.
+    // 2-digit year (0..99 → +1900) must already have been applied.
+    // MakeDay month overflow + IEEE MakeTime/MakeDate + TimeClip.
+    emitDateMakeClipFromLocals(dOffs) {
+        const vm = this.vm;
+        vm.load(VReg.A0, VReg.FP, dOffs[0]);
+        vm.load(VReg.A1, VReg.FP, dOffs[1]);
+        vm.mov(VReg.A2, VReg.FP);
+        vm.addImm(VReg.A2, VReg.A2, dOffs[0]);
+        vm.mov(VReg.A3, VReg.FP);
+        vm.addImm(VReg.A3, VReg.A3, dOffs[1]);
+        vm.call("_date_norm_ym");
+        vm.load(VReg.A0, VReg.FP, dOffs[0]);
+        vm.load(VReg.A1, VReg.FP, dOffs[1]);
+        vm.load(VReg.A2, VReg.FP, dOffs[2]);
+        vm.call("_date_civil_to_days");
+        vm.mov(VReg.A0, VReg.RET);
+        vm.load(VReg.A1, VReg.FP, dOffs[3]);
+        vm.load(VReg.A2, VReg.FP, dOffs[4]);
+        vm.load(VReg.A3, VReg.FP, dOffs[5]);
+        vm.load(VReg.A4, VReg.FP, dOffs[6]);
+        vm.call("_date_compose_ms");
+    },
+
     emitDateUTCms(args) {
         // leftover-arg: Date.UTC() ≡ ToNumber(undefined) → NaN → TimeClip(NaN).
         // args==0 used to invent year=0/month=0/day=1 (year 0 epoch). Missing
@@ -468,89 +497,30 @@ export const FunctionCompiler = {
                 this.vm.andImm(VReg.V5, VReg.V5, 0x7ff);
                 this.vm.cmpImm(VReg.V5, 0x7ff);
                 this.vm.jeq(nanL);
-                this.vm.fmovToFloat(0, VReg.RET);
-                this.vm.fcvtzs(VReg.RET, 0);
+                if (di2 < 3) {
+                    this.vm.fmovToFloat(0, VReg.RET);
+                    this.vm.fcvtzs(VReg.RET, 0);
+                }
+                // h/mi/s/milli stay IEEE bits: MakeTime is f64 * / +, and
+                // milli can exceed int64 (UTC/fp-evaluation-order).
             } else {
                 this.vm.movImm(VReg.RET, di2 === 2 ? 1 : 0); // 缺省日=1,余 0
             }
             this.vm.store(VReg.FP, dOffs[di2], VReg.RET);
         }
-        // m = mo+1; if (m<=2) y--
-        this.vm.load(VReg.V0, VReg.FP, dOffs[1]);
-        this.vm.addImm(VReg.V0, VReg.V0, 1); // m
-        this.vm.load(VReg.V1, VReg.FP, dOffs[0]); // y
-        const dL1 = this.ctx.newLabel("dutc_mgt2");
-        this.vm.cmpImm(VReg.V0, 2);
-        this.vm.jgt(dL1);
-        this.vm.subImm(VReg.V1, VReg.V1, 1);
-        this.vm.label(dL1);
-        // era = (y>=0 ? y : y-399)/400
-        this.vm.mov(VReg.V2, VReg.V1);
-        const dL2 = this.ctx.newLabel("dutc_ypos");
-        this.vm.cmpImm(VReg.V2, 0);
-        this.vm.jge(dL2);
-        this.vm.subImm(VReg.V2, VReg.V2, 399);
-        this.vm.label(dL2);
-        this.vm.movImm(VReg.V3, 400);
-        this.vm.div(VReg.V4, VReg.V2, VReg.V3); // era
-        // yoe = y - era*400
-        this.vm.movImm(VReg.V3, 400);
-        this.vm.mul(VReg.V2, VReg.V4, VReg.V3);
-        this.vm.sub(VReg.V1, VReg.V1, VReg.V2); // yoe
-        // mp = m + (m>2 ? -3 : 9)
-        const dL3 = this.ctx.newLabel("dutc_mp");
-        const dL4 = this.ctx.newLabel("dutc_mpd");
-        this.vm.cmpImm(VReg.V0, 2);
-        this.vm.jgt(dL3);
-        this.vm.addImm(VReg.V0, VReg.V0, 9);
-        this.vm.jmp(dL4);
-        this.vm.label(dL3);
-        this.vm.subImm(VReg.V0, VReg.V0, 3);
-        this.vm.label(dL4);
-        // doy = (153*mp+2)/5 + d - 1
-        this.vm.movImm(VReg.V3, 153);
-        this.vm.mul(VReg.V0, VReg.V0, VReg.V3);
-        this.vm.addImm(VReg.V0, VReg.V0, 2);
-        this.vm.movImm(VReg.V3, 5);
-        this.vm.div(VReg.V0, VReg.V0, VReg.V3);
-        this.vm.load(VReg.V3, VReg.FP, dOffs[2]);
-        this.vm.add(VReg.V0, VReg.V0, VReg.V3);
-        this.vm.subImm(VReg.V0, VReg.V0, 1); // doy
-        // doe = yoe*365 + yoe/4 - yoe/100 + doy
-        this.vm.movImm(VReg.V3, 365);
-        this.vm.mul(VReg.V2, VReg.V1, VReg.V3);
-        this.vm.movImm(VReg.V3, 4);
-        this.vm.div(VReg.V3, VReg.V1, VReg.V3);
-        this.vm.add(VReg.V2, VReg.V2, VReg.V3);
-        this.vm.movImm(VReg.V3, 100);
-        this.vm.div(VReg.V3, VReg.V1, VReg.V3);
-        this.vm.sub(VReg.V2, VReg.V2, VReg.V3);
-        this.vm.add(VReg.V2, VReg.V2, VReg.V0); // doe
-        // days = era*146097 + doe - 719468
-        this.vm.movImm(VReg.V3, 146097);
-        this.vm.mul(VReg.V4, VReg.V4, VReg.V3);
-        this.vm.add(VReg.V2, VReg.V2, VReg.V4);
-        this.vm.movImm(VReg.V3, 719468);
-        this.vm.sub(VReg.V2, VReg.V2, VReg.V3); // days
-        // ms = ((days*24 + h)*60 + mi)*60000 + s*1000 + msArg
-        this.vm.movImm(VReg.V3, 24);
-        this.vm.mul(VReg.V2, VReg.V2, VReg.V3);
-        this.vm.load(VReg.V3, VReg.FP, dOffs[3]);
-        this.vm.add(VReg.V2, VReg.V2, VReg.V3);
-        this.vm.movImm(VReg.V3, 60);
-        this.vm.mul(VReg.V2, VReg.V2, VReg.V3);
-        this.vm.load(VReg.V3, VReg.FP, dOffs[4]);
-        this.vm.add(VReg.V2, VReg.V2, VReg.V3);
-        this.vm.movImm(VReg.V3, 60000);
-        this.vm.mul(VReg.V2, VReg.V2, VReg.V3);
-        this.vm.load(VReg.V3, VReg.FP, dOffs[5]);
-        this.vm.movImm(VReg.V4, 1000);
-        this.vm.mul(VReg.V3, VReg.V3, VReg.V4);
-        this.vm.add(VReg.V2, VReg.V2, VReg.V3);
-        this.vm.load(VReg.V3, VReg.FP, dOffs[6]);
-        this.vm.add(VReg.V2, VReg.V2, VReg.V3); // ms(整数)
-        this.vm.scvtf(0, VReg.V2);
-        this.vm.fmovToInt(VReg.RET, 0); // RET = 裸 float64 毫秒数值(number)
+        // 0≤y≤99 → y+1900(Date.UTC(0,0) 是 1900 不是 year 0)
+        {
+            const dy2 = this.ctx.newLabel("dutc_2digit_year_skip");
+            this.vm.load(VReg.V0, VReg.FP, dOffs[0]);
+            this.vm.cmpImm(VReg.V0, 0);
+            this.vm.jlt(dy2);
+            this.vm.cmpImm(VReg.V0, 99);
+            this.vm.jgt(dy2);
+            this.vm.addImm(VReg.V0, VReg.V0, 1900);
+            this.vm.store(VReg.FP, dOffs[0], VReg.V0);
+            this.vm.label(dy2);
+        }
+        this.emitDateMakeClipFromLocals(dOffs);
         this.vm.jmp(doneL);
         this.vm.label(nanL);
         this.vm.movImm64(VReg.RET, 0x7ff0000000000001n); // canonical NaN(number)
@@ -586,9 +556,10 @@ export const FunctionCompiler = {
         // 保护 A2/A3，doneLabel 处恢复；非法路径直接抛异常不返回，无需平衡。
         // arm64 上 V1/V2(X9/X10) 与 A 寄存器独立，不加指令，输出逐字节不变。
         const guardX64Args = vm.backend.name === "x64";
+        let x64A2H = null, x64A3H = null;
         if (guardX64Args) {
-            vm.push(VReg.A2);
-            vm.push(VReg.A3);
+            x64A2H = this._holdExpr(VReg.A2);
+            x64A3H = this._holdExpr(VReg.A3);
         }
 
         vm.cmpImm(VReg.S0, 0);
@@ -625,8 +596,10 @@ export const FunctionCompiler = {
 
         vm.label(doneLabel);
         if (guardX64Args) {
-            vm.pop(VReg.A3);
-            vm.pop(VReg.A2);
+            this._loadHeldExpr(x64A3H, VReg.A3);
+            this._loadHeldExpr(x64A2H, VReg.A2);
+            this._releaseHeldExpr();
+            this._releaseHeldExpr();
         }
     },
 
@@ -696,14 +669,13 @@ export const FunctionCompiler = {
     compileClosureCall(funcReg, args) {
         const vm = this.vm;
 
-        // 保存函数指针/闭包对象到栈
-        vm.push(funcReg);
+        const fnH = this._holdExpr(funcReg);
 
         // 编译参数(A5 随后由 OrdinaryCallBindThis 覆盖;第 6 实参与 this 同槽,既有上限)
         this.compileCallArguments(args);
 
-        // 恢复函数指针/闭包对象到 S0 (callee-saved)
-        vm.pop(VReg.S0);
+        this._loadHeldExpr(fnH, VReg.S0);
+        this._releaseHeldExpr();
 
         this.emitValidateCallableInS0("not a function");
 
@@ -763,7 +735,11 @@ export const FunctionCompiler = {
             this.emitOrdinaryCallBindThis(VReg.S1);
         }
         // 通过 S1 间接调用（不能用 V6 因为它映射到 X6 = A5+1）
-        vm.callIndirect(VReg.S1);
+        if ((args && args._tco) && this._shouldTailCall()) {
+            this.emitTailCallJump();
+        } else {
+            vm.callIndirect(VReg.S1);
+        }
 
         vm.label(asyncDoneLabel);
     },
@@ -774,16 +750,16 @@ export const FunctionCompiler = {
     compileMethodCall(funcReg, thisReg, args, options) {
         const vm = this.vm;
 
-        // 保存 this 和函数指针到栈
-        vm.push(thisReg);
-        vm.push(funcReg);
+        const thisH = this._holdExpr(thisReg);
+        const fnH = this._holdExpr(funcReg);
 
         // 编译参数(A5 预留为 receiver,实参上限 5)
         this.compileCallArguments(args, true, options);
 
-        // 恢复函数指针和 this
-        vm.pop(VReg.S0); // 函数指针/闭包
-        vm.pop(VReg.S3); // this 对象
+        this._loadHeldExpr(fnH, VReg.S0);
+        this._loadHeldExpr(thisH, VReg.S3);
+        this._releaseHeldExpr();
+        this._releaseHeldExpr();
 
         this.emitValidateCallableInS0("not a function");
 
@@ -810,7 +786,127 @@ export const FunctionCompiler = {
         vm.movImm(VReg.S0, 0);
 
         vm.label(callLabel);
-        vm.callIndirect(VReg.S1);
+        // Function.prototype.call/apply with a missing or nullish thisArg:
+        // sloppy callees get globalThis (OrdinaryCallBindThis).  Strict
+        // callees keep null/undefined.  Direct obj.m() receivers are not
+        // nullish here (Get on null/undefined already threw).
+        const mBind = this.ctx.newLabel("mcall_bindthis");
+        const mDone = this.ctx.newLabel("mcall_thisdone");
+        vm.shrImm(VReg.V5, VReg.A5, 48);
+        vm.cmpImm(VReg.V5, 0x7ffb);
+        vm.jeq(mBind);
+        vm.cmpImm(VReg.V5, 0x7ffa);
+        vm.jne(mDone);
+        vm.label(mBind);
+        vm.subImm(VReg.SP, VReg.SP, 48);
+        vm.store(VReg.SP, 0, VReg.A0);
+        vm.store(VReg.SP, 8, VReg.A1);
+        vm.store(VReg.SP, 16, VReg.A2);
+        vm.store(VReg.SP, 24, VReg.A3);
+        vm.store(VReg.SP, 32, VReg.A4);
+        vm.store(VReg.SP, 40, VReg.S1);
+        vm.mov(VReg.A0, VReg.S1);
+        vm.mov(VReg.A1, VReg.A5);
+        vm.call("_ordinary_bind_this");
+        vm.mov(VReg.A5, VReg.RET);
+        vm.load(VReg.A0, VReg.SP, 0);
+        vm.load(VReg.A1, VReg.SP, 8);
+        vm.load(VReg.A2, VReg.SP, 16);
+        vm.load(VReg.A3, VReg.SP, 24);
+        vm.load(VReg.A4, VReg.SP, 32);
+        vm.load(VReg.S1, VReg.SP, 40);
+        vm.addImm(VReg.SP, VReg.SP, 48);
+        vm.label(mDone);
+        if ((args && args._tco) && this._shouldTailCall()) {
+            this.emitTailCallJump();
+        } else {
+            vm.callIndirect(VReg.S1);
+        }
+    },
+
+    // Strict-mode TCO only, and only in a user function with a known frame.
+    // Async/generator bodies keep a coro frame on the caller stack.
+    // Disabled: self-hosted gen1 previously threw "not a function" under TCO
+    // (PrepareForTailCall path). Re-enable only with a green gen2==gen3 gate.
+    _shouldTailCall() {
+        return false;
+    },
+
+    _tcoNeedsCleanup() {
+        const ic = this.ctx.iterCloseStack;
+        if (ic && ic.length > 0) return true;
+        const fs = this.ctx.finallyStack;
+        if (fs && fs.length > 0) return true;
+        const tf = this.ctx.tryFrames;
+        if (tf && tf.length > 0) return true;
+        return false;
+    },
+
+    _tcoSnapshotArgs() {
+        const vm = this.vm;
+        vm.lea(VReg.V6, "_call_argc");
+        vm.load(VReg.V5, VReg.V6, 0);
+        vm.lea(VReg.V6, "_tco_argc");
+        vm.store(VReg.V6, 0, VReg.V5);
+        vm.lea(VReg.V6, "_tco_regs");
+        vm.store(VReg.V6, 0, VReg.A0);
+        vm.store(VReg.V6, 8, VReg.A1);
+        vm.store(VReg.V6, 16, VReg.A2);
+        vm.store(VReg.V6, 24, VReg.A3);
+        vm.store(VReg.V6, 32, VReg.A4);
+        vm.store(VReg.V6, 40, VReg.A5);
+        for (let i = 0; i < 16; i++) {
+            vm.lea(VReg.V6, "_call_argv");
+            vm.load(VReg.V5, VReg.V6, i * 8);
+            vm.lea(VReg.V6, "_tco_argv");
+            vm.store(VReg.V6, i * 8, VReg.V5);
+        }
+    },
+
+    _tcoRestoreArgs() {
+        const vm = this.vm;
+        vm.lea(VReg.V6, "_tco_argc");
+        vm.load(VReg.V5, VReg.V6, 0);
+        vm.lea(VReg.V6, "_call_argc");
+        vm.store(VReg.V6, 0, VReg.V5);
+        vm.lea(VReg.V6, "_tco_regs");
+        vm.load(VReg.A0, VReg.V6, 0);
+        vm.load(VReg.A1, VReg.V6, 8);
+        vm.load(VReg.A2, VReg.V6, 16);
+        vm.load(VReg.A3, VReg.V6, 24);
+        vm.load(VReg.A4, VReg.V6, 32);
+        vm.load(VReg.A5, VReg.V6, 40);
+        for (let i = 0; i < 16; i++) {
+            vm.lea(VReg.V6, "_tco_argv");
+            vm.load(VReg.V5, VReg.V6, i * 8);
+            vm.lea(VReg.V6, "_call_argv");
+            vm.store(VReg.V6, i * 8, VReg.V5);
+        }
+    },
+
+    // PrepareForTailCall then jmpIndirect(S1). S0=env, S1=code, A0-A5/argc live.
+    // Epilogue restores caller S0-S3, so stash env/fn in data first.
+    emitTailCallJump() {
+        const vm = this.vm;
+        vm.lea(VReg.V6, "_tco_env");
+        vm.store(VReg.V6, 0, VReg.S0);
+        vm.lea(VReg.V6, "_tco_fn");
+        vm.store(VReg.V6, 0, VReg.S1);
+        if (this._tcoNeedsCleanup()) {
+            this._tcoSnapshotArgs();
+            this.emitPendingIteratorCloses(0, false);
+            this.emitPendingFinalizers(0, false);
+            if (this.ctx.tryFrames && this.ctx.tryFrames.length > 0) {
+                this.emitExcCtxRestore(this.ctx.tryFrames[0]);
+            }
+            this._tcoRestoreArgs();
+        }
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], this.ctx._fnFrameSize, 1);
+        vm.lea(VReg.V6, "_tco_env");
+        vm.load(VReg.S0, VReg.V6, 0);
+        vm.lea(VReg.V6, "_tco_fn");
+        vm.load(VReg.S1, VReg.V6, 0);
+        vm.jmpIndirect(VReg.S1);
     },
 
     // [支柱②] 去虚拟化:推断接收者类名(this→当前类;成员链逐段查字段类型表;
@@ -1146,7 +1242,7 @@ export const FunctionCompiler = {
         this.vm.cmpImm(VReg.V2, 0);
         this.vm.jeq(normalLabel);
         this.vm.loadByte(VReg.V1, VReg.V2, 0);
-        this.vm.cmpImm(VReg.V1, 8); // TYPE_PROXY
+        this.vm.cmpImm(VReg.V1, TYPE_PROXY);
         this.vm.jne(normalLabel);
         this.vm.load(VReg.A0, VReg.FP, oOff);
         this.vm.load(VReg.A1, VReg.FP, kOff);
@@ -1234,7 +1330,7 @@ export const FunctionCompiler = {
         const eLbl = this.ctx.newLabel("tagd_end");
         const bLbls = builtins.map((_, i) => this.ctx.newLabel("tagd_b" + i));
         this.compileExpression(obj);
-        this.vm.push(VReg.RET);            // 存 obj（用户方法路径要用）
+        const objH = this._holdExpr(VReg.RET);
         this.vm.movImm64(VReg.V1, 0x0000FFFFFFFFFFFFn);
         this.vm.and(VReg.V0, VReg.RET, VReg.V1);  // 脱壳成裸指针
         this.vm.loadByte(VReg.V0, VReg.V0, 0);    // 头部类型字节
@@ -1245,7 +1341,7 @@ export const FunctionCompiler = {
                 // 但**字符串(0x7FFC)的内容首字节('A'=0x41 等)会冒充 TA 类型字节**——
                 // 先验 tag,字符串不匹配 TA 分支(落后续分支/用户路径)。
                 const notTaL = this.ctx.newLabel("tagd_nota" + i);
-                this.vm.load(VReg.V1, VReg.SP, 0);
+                this._loadHeldExpr(objH, VReg.V1);
                 this.vm.shrImm(VReg.V1, VReg.V1, 48);
                 this.vm.cmpImm(VReg.V1, 0x7FFC);
                 this.vm.jeq(notTaL);
@@ -1257,19 +1353,17 @@ export const FunctionCompiler = {
                 this.vm.jeq(bLbls[i]);
             }
         }
-        // 非内建 → 用户方法(obj 在 RET 且栈顶)
-        // [A3.5] 用户方法查找走 24B 形状 IC(自有/直接原型双模,getter 已融合);
-        // RET 恢复为 obj(x64 上 RET 已被上方类型判别毁掉,统一从栈顶重载)。
+        // 非内建 → 用户方法。x64 上 RET 已被类型判别毁掉,从 hold 重载。
         const pn = this.getMemberPropertyName ? this.getMemberPropertyName(prop) : (prop.name || prop.value);
-        this.vm.load(VReg.RET, VReg.SP, 0);
+        this._loadHeldExpr(objH, VReg.RET);
         this.emitObjectGetIC(pn);
         this.vm.mov(VReg.V6, VReg.RET);
-        this.vm.pop(VReg.V5);
+        this._loadHeldExpr(objH, VReg.V5);
+        this._releaseHeldExpr();
         this.compileMethodCall(VReg.V6, VReg.V5, args);
         this.vm.jmp(eLbl);
         for (let i = 0; i < builtins.length; i++) {
             this.vm.label(bLbls[i]);
-            this.vm.pop(VReg.V0); // 丢弃存的 obj（compile 会重新求值 obj）
             builtins[i].compile();
             this.vm.jmp(eLbl);
         }
@@ -1331,9 +1425,10 @@ export const FunctionCompiler = {
 
         // 正常返回:弹帧后包 resolved
         this.ctx.exceptionLabel = savedExceptionLabel;
-        vm.push(VReg.RET);
+        const tryRetH = this._holdExpr(VReg.RET);
         this.emitExcCtxRestore(excFrameOff);
-        vm.pop(VReg.RET);
+        this._loadHeldExpr(tryRetH, VReg.RET);
+        this._releaseHeldExpr();
         vm.mov(VReg.A0, VReg.RET);
         vm.lea(VReg.A5, "_nsobj_promise");
         vm.load(VReg.A5, VReg.A5, 0);
@@ -1538,6 +1633,13 @@ export const FunctionCompiler = {
         if (this.ctx._evalInParamInit && this.ctx.paramLexNames) {
             for (const pn of this.ctx.paramLexNames) parts.push("!lex:" + pn);
         }
+        // Parameter env of a non-arrow holds `arguments`. Fragment
+        // EvalDeclarationInstantiation must SyntaxError on `var arguments`
+        // (same walk as emitParamEvalConflictSyntaxError).
+        if (this.ctx._evalInParamInit && !this.ctx.inStrictFunction &&
+            !this.ctx._isArrowFunction) {
+            parts.push("!lex:arguments");
+        }
         // Sloppy direct eval: var names must not collide with body let/const.
         if (!this.ctx.inStrictFunction && this.ctx.lexLocalNames) {
             for (const n in this.ctx.lexLocalNames) {
@@ -1716,13 +1818,15 @@ export const FunctionCompiler = {
             // use.  No _call_argc marker is needed: the runtime intrinsic has a
             // fixed A0/A1/A2 ABI and does not inspect the generic argument window.
             this.compileExpression(expr.arguments[0]);
-            this.vm.push(VReg.RET);
+            const cp0 = this._holdExpr(VReg.RET);
             this.compileExpression(expr.arguments[1]);
-            this.vm.push(VReg.RET);
+            const cp1 = this._holdExpr(VReg.RET);
             this.compileExpression(expr.arguments[2]);
             this.vm.mov(VReg.A2, VReg.RET);
-            this.vm.pop(VReg.A1);
-            this.vm.pop(VReg.A0);
+            this._loadHeldExpr(cp1, VReg.A1);
+            this._loadHeldExpr(cp0, VReg.A0);
+            this._releaseHeldExpr();
+            this._releaseHeldExpr();
             this.vm.call("_str_cpAt_fast");
             return;
         }
@@ -1730,8 +1834,8 @@ export const FunctionCompiler = {
         // The regexp shim's unbounded one-or-more \d/\s/\w class loops can
         // consume hundreds of thousands of UTF-8 bytes.  On ARM64 only, lower
         // the exact five-argument scanner call to the leaf runtime primitive;
-        // x64/wasm retain the JavaScript fallback so no label/ABI is assumed on
-        // targets that do not emit this private entry point.
+        // x64/wasm retain the JavaScript class-scan fallback (that leaf is
+        // ARM64-only).
         const _scanSrcPath = _cpSrcPath;
         const _scanModulePath = _cpModulePath;
         if (this.vm.backend && this.vm.backend.name === "arm64" &&
@@ -1741,15 +1845,17 @@ export const FunctionCompiler = {
              _scanModulePath.indexOf("__regexp_shim.js") !== -1)) {
             // Preserve left-to-right evaluation and protect each value from
             // subsequent expression code, matching the cpAt intrinsic ABI.
+            const scH = [];
             for (let _si = 0; _si < 5; _si++) {
                 this.compileExpression(expr.arguments[_si]);
-                this.vm.push(VReg.RET);
+                scH.push(this._holdExpr(VReg.RET));
             }
-            this.vm.pop(VReg.A4);
-            this.vm.pop(VReg.A3);
-            this.vm.pop(VReg.A2);
-            this.vm.pop(VReg.A1);
-            this.vm.pop(VReg.A0);
+            this._loadHeldExpr(scH[4], VReg.A4);
+            this._loadHeldExpr(scH[3], VReg.A3);
+            this._loadHeldExpr(scH[2], VReg.A2);
+            this._loadHeldExpr(scH[1], VReg.A1);
+            this._loadHeldExpr(scH[0], VReg.A0);
+            this._releaseHeldN(5);
             this.vm.call("_str_re_scan_class");
             return;
         }
@@ -1761,20 +1867,26 @@ export const FunctionCompiler = {
         // function call if it happens to define a similarly named binding.
         // A0 = UTF-8 string, A1 = byte length, A2 = encoded table string,
         // A3 = table index, A4 = negated-property bit.
+        // ARM64 only: generateReScanUnicode() does not emit
+        // `_str_re_scan_unicode` on x64/wasm. Calling a missing label there
+        // relocates to garbage (eval-enabled x64 binaries SIGSEGV at startup,
+        // RIP in the stack). Same rule as `_str_re_scan_class`.
         if (this.vm.backend && this.vm.backend.name === "arm64" &&
             callee.type === "Identifier" && callee.name === "__re_scanUnicode" &&
             expr.arguments && expr.arguments.length === 5 &&
             (_scanSrcPath.indexOf("__regexp_shim.js") !== -1 ||
              _scanModulePath.indexOf("__regexp_shim.js") !== -1)) {
+            const unH = [];
             for (let _ui = 0; _ui < 5; _ui++) {
                 this.compileExpression(expr.arguments[_ui]);
-                this.vm.push(VReg.RET);
+                unH.push(this._holdExpr(VReg.RET));
             }
-            this.vm.pop(VReg.A4);
-            this.vm.pop(VReg.A3);
-            this.vm.pop(VReg.A2);
-            this.vm.pop(VReg.A1);
-            this.vm.pop(VReg.A0);
+            this._loadHeldExpr(unH[4], VReg.A4);
+            this._loadHeldExpr(unH[3], VReg.A3);
+            this._loadHeldExpr(unH[2], VReg.A2);
+            this._loadHeldExpr(unH[1], VReg.A1);
+            this._loadHeldExpr(unH[0], VReg.A0);
+            this._releaseHeldN(5);
             this.vm.call("_str_re_scan_unicode");
             return;
         }
@@ -1941,10 +2053,46 @@ export const FunctionCompiler = {
 
         // eval(x) → route B 引擎。空参数列表返回 undefined;字面量表达式直编进
         // 当前词法环境(含私有名/super);spread/非字面量走 __eval / __eval_direct。
+        // Tail-position `eval(...)` is only DirectEval when the binding is
+        // still %eval%.  Overwritten `eval` (global / with / dynamic var)
+        // must be an ordinary (tail) call.  Do not bake DirectEval at a
+        // tail site: the binding is resolved at runtime.
         if (callee.type === "Identifier" && callee.name === "eval" &&
-            !(this.ctx.getLocal && this.ctx.getLocal("eval")) &&
+            !expr._tailCall &&
             !(this.ctx.getFunction && this.ctx.getFunction("eval"))) {
-            if (this._compileDirectEvalCall(expr)) return;
+            // A bodyEvalVarNames slot for `eval("var eval = …")` is allocated
+            // at function entry as undefined.  That must not hide DirectEval:
+            // the call that *creates* the var is still %eval%.
+            const evalLoc = this.ctx.getLocal && this.ctx.getLocal("eval");
+            const evalVarOnly = evalLoc && this.ctx.bodyEvalVarNames &&
+                this.ctx.bodyEvalVarNames.has("eval");
+            if (!evalLoc || evalVarOnly) {
+                if (this._compileDirectEvalCall(expr)) return;
+            }
+        }
+        // Tail `eval(...)` whose binding is not a local/with hit: Get the
+        // writable global `eval` (sloppy `eval = f` writes globalThis.eval)
+        // and ordinary-call it. compileIdentifier("eval") still materialises
+        // __eval, which would ignore that assignment.
+        if (callee.type === "Identifier" && callee.name === "eval" &&
+            expr._tailCall &&
+            !(this.ctx.getLocal && this.ctx.getLocal("eval")) &&
+            !(this.ctx.getFunction && this.ctx.getFunction("eval")) &&
+            !this._hasAnyWithScope()) {
+            this.vm.lea(VReg.V0, "_global_this");
+            this.vm.load(VReg.RET, VReg.V0, 0);
+            this.vm.call("_box_obj_r");
+            const gEvalH = this._holdExpr(VReg.RET);
+            this.emitBoxedStringKey("eval", VReg.A1);
+            this._loadHeldExpr(gEvalH, VReg.A0);
+            this.vm.call("_object_get");
+            this.vm.mov(VReg.A0, VReg.RET);
+            this._loadHeldExpr(gEvalH, VReg.A1);
+            this._releaseHeldExpr();
+            this.vm.call("_maybe_getter");
+            this.vm.mov(VReg.V6, VReg.RET);
+            this.compileClosureCall(VReg.V6, expr.arguments);
+            return;
         }
 
 
@@ -2064,10 +2212,11 @@ export const FunctionCompiler = {
             const innerProp = inner.property && (inner.property.name || inner.property.value);
             if (innerProp === "hasOwnProperty" && expr.arguments.length >= 2) {
                 this.compileExpression(expr.arguments[0]); // obj
-                this.vm.push(VReg.RET);
+                const hopH = this._holdExpr(VReg.RET);
                 this.compileExpression(expr.arguments[1]); // key
                 this.vm.mov(VReg.A1, VReg.RET);
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(hopH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_object_has");
                 // _object_has 返回 0/1,转规范 JS bool(lea _js_true/_js_false + load,
                 // 同字面量)。此前用立即数 0x7FF9…01/02 是非规范布尔:if/&& 的 ToBoolean
@@ -2111,10 +2260,11 @@ export const FunctionCompiler = {
         if (callee.type === "MemberExpression" && !callee.computed && callee.property &&
             callee.property.name === "hasOwnProperty" && expr.arguments.length >= 1) {
             this.compileExpression(callee.object); // obj
-            this.vm.push(VReg.RET);
+            const hop2H = this._holdExpr(VReg.RET);
             this.compileExpression(expr.arguments[0]); // key
             this.vm.mov(VReg.A1, VReg.RET);
-            this.vm.pop(VReg.A0);
+            this._loadHeldExpr(hop2H, VReg.A0);
+            this._releaseHeldExpr();
             this.vm.call("_object_has");
             // 规范布尔:lea _js_true/_js_false + load(与字面量同码)。此前用立即数
             // 0x7FF9…01/02 是**非规范**布尔值,typeof 判 boolean 但 !/===/ToNumber 全不认
@@ -2138,10 +2288,11 @@ export const FunctionCompiler = {
             expr.arguments.length >= 1) {
             const rmName = callee.property.name;
             this.compileExpression(callee.object); // 接收者(propIsEnum:obj;isProtoOf:proto)
-            this.vm.push(VReg.RET);
+            const pieH = this._holdExpr(VReg.RET);
             this.compileExpression(expr.arguments[0]); // 参(key / x)
             this.vm.mov(VReg.A1, VReg.RET);
-            this.vm.pop(VReg.A0);
+            this._loadHeldExpr(pieH, VReg.A0);
+            this._releaseHeldExpr();
             this.vm.call(rmName === "isPrototypeOf" ? "_is_prototype_of" : "_object_propertyIsEnumerable");
             return;
         }
@@ -2761,13 +2912,15 @@ export const FunctionCompiler = {
             } else {
                 const ctorArgRegs = [VReg.A1, VReg.A2, VReg.A3, VReg.A4, VReg.A5];
                 const n = Math.min(expr.arguments.length, ctorArgRegs.length);
-                this.vm.push(VReg.S2);
+                const superS2H = this._holdExpr(VReg.S2);
+                const superArgH = [];
                 for (let i = 0; i < n; i++) {
                     this.compileExpression(expr.arguments[i]);
-                    this.vm.push(VReg.RET);
+                    superArgH.push(this._holdExpr(VReg.RET));
                 }
-                for (let i = n - 1; i >= 0; i--) this.vm.pop(ctorArgRegs[i]);
-                this.vm.pop(VReg.S2);
+                for (let i = 0; i < n; i++) this._loadHeldExpr(superArgH[i], ctorArgRegs[i]);
+                this._loadHeldExpr(superS2H, VReg.S2);
+                this._releaseHeldN(n + 1);
                 // 隐式派生 ctor 合成 super(f0..f4):寄存器里仍转发最多 5 个,
                 // 但 _call_argc 必须是 new 的真实个数,否则 parent arguments.length
                 // 恒为 5(new Derived → 5, new Derived(0,1,2) → 5)。
@@ -2817,7 +2970,7 @@ export const FunctionCompiler = {
                 this.vm.label(superBindChkHeap);
                 this.vm.cmpImm(VReg.V2, 2);
                 this.vm.jeq(keepL);
-                this.vm.cmpImm(VReg.V2, 8);
+                this.vm.cmpImm(VReg.V2, TYPE_PROXY);
                 this.vm.jeq(keepL);
                 this.vm.cmpImm(VReg.V2, 4);
                 this.vm.jeq(keepL);
@@ -3190,15 +3343,15 @@ export const FunctionCompiler = {
                     // resolved Promise(namespace)
                     this.vm.movImm(VReg.A0, 0);
                     this.vm.call("_promise_new");   // RET = pending promise
-                    this.vm.push(VReg.RET);
-                    this.vm.push(VReg.RET);          // 存两份(一份出参、一份 A0)
+                    const impH = this._holdExpr(VReg.RET);
                     this.vm.movImm(VReg.A0, modIdx);
                     this.vm.lea(VReg.A1, this.asm.addString("*"));
                     this.vm.call("_get_module_export"); // RET = namespace 对象
                     this.vm.mov(VReg.A1, VReg.RET);
-                    this.vm.pop(VReg.A0);            // A0 = promise
+                    this._loadHeldExpr(impH, VReg.A0);
                     this.vm.call("_promise_resolve");
-                    this.vm.pop(VReg.RET);           // RET = promise
+                    this._loadHeldExpr(impH, VReg.RET);
+                    this._releaseHeldExpr();
                 } else {
                     // rejected Promise。reason:模块不存在 → specifier 字符串(对齐 node
                     // fixture 简化预期);运行时 specifier(L2 引擎库)→ TypeError 说明。
@@ -3207,14 +3360,14 @@ export const FunctionCompiler = {
                         : "TypeError: dynamic import specifier must be statically resolvable (runtime specifier is L2 engine-lib)";
                     this.vm.movImm(VReg.A0, 0);
                     this.vm.call("_promise_new");
-                    this.vm.push(VReg.RET);
-                    this.vm.push(VReg.RET);
+                    const impH = this._holdExpr(VReg.RET);
                     this.vm.lea(VReg.A1, this.asm.addString(rejMsg));
                     this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
                     this.vm.or(VReg.A1, VReg.A1, VReg.V1); // 装箱字符串
-                    this.vm.pop(VReg.A0);
+                    this._loadHeldExpr(impH, VReg.A0);
                     this.vm.call("_promise_reject");
-                    this.vm.pop(VReg.RET);
+                    this._loadHeldExpr(impH, VReg.RET);
+                    this._releaseHeldExpr();
                 }
                 return;
             }
@@ -3282,27 +3435,34 @@ export const FunctionCompiler = {
             // mmap-backed functions without adding user-visible globals.
             if (callee.name === "__engine_set_dynamic_fn_maker" &&
                 expr.arguments.length >= 3) {
-                this.compileExpression(expr.arguments[0]); this.vm.push(VReg.RET);
-                this.compileExpression(expr.arguments[1]); this.vm.push(VReg.RET);
-                this.compileExpression(expr.arguments[2]); this.vm.push(VReg.RET);
-                this.vm.pop(VReg.A2); this.vm.pop(VReg.A1); this.vm.pop(VReg.A0);
+                this.compileExpression(expr.arguments[0]); const df0 = this._holdExpr(VReg.RET);
+                this.compileExpression(expr.arguments[1]); const df1 = this._holdExpr(VReg.RET);
+                this.compileExpression(expr.arguments[2]); this.vm.mov(VReg.A2, VReg.RET);
+                this._loadHeldExpr(df1, VReg.A1);
+                this._loadHeldExpr(df0, VReg.A0);
+                this._releaseHeldExpr();
+                this._releaseHeldExpr();
                 this.vm.call("_dynamic_fn_maker_set");
                 return;
             }
             if (callee.name === "__engine_register_dynamic_function" &&
                 expr.arguments.length >= 3) {
-                this.compileExpression(expr.arguments[0]); this.vm.push(VReg.RET);
-                this.compileExpressionAsInt(expr.arguments[1]); this.vm.push(VReg.RET);
-                this.compileExpressionAsInt(expr.arguments[2]); this.vm.push(VReg.RET);
-                this.vm.pop(VReg.A2); this.vm.pop(VReg.A1); this.vm.pop(VReg.A0);
+                this.compileExpression(expr.arguments[0]); const dm0 = this._holdExpr(VReg.RET);
+                this.compileExpressionAsInt(expr.arguments[1]); const dm1 = this._holdExpr(VReg.RET);
+                this.compileExpressionAsInt(expr.arguments[2]); this.vm.mov(VReg.A2, VReg.RET);
+                this._loadHeldExpr(dm1, VReg.A1);
+                this._loadHeldExpr(dm0, VReg.A0);
+                this._releaseHeldExpr();
+                this._releaseHeldExpr();
                 this.vm.call("_dynamic_fn_meta_add");
                 return;
             }
             if (callee.name === "__engine_set_dynamic_function_proto" &&
                 expr.arguments.length >= 2) {
-                this.compileExpression(expr.arguments[0]); this.vm.push(VReg.RET);
-                this.compileExpression(expr.arguments[1]); this.vm.push(VReg.RET);
-                this.vm.pop(VReg.A1); this.vm.pop(VReg.A0);
+                this.compileExpression(expr.arguments[0]); const dp0 = this._holdExpr(VReg.RET);
+                this.compileExpression(expr.arguments[1]); this.vm.mov(VReg.A1, VReg.RET);
+                this._loadHeldExpr(dp0, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_dynamic_fn_meta_set_proto");
                 return;
             }
@@ -3343,14 +3503,17 @@ export const FunctionCompiler = {
                 this.vm.and(VReg.V0, VReg.RET, VReg.V1);
                 this.vm.load(VReg.A1, VReg.V0, 8);       // A1 = fragLen
                 this.vm.load(VReg.A0, VReg.V0, 16);      // A0 = fragPtr(deref data_ptr@16;见 __engine_exec 注)
-                this.vm.push(VReg.A0); this.vm.push(VReg.A1);
+                const fragPtrH = this._holdExpr(VReg.A0);
+                const fragLenH = this._holdExpr(VReg.A1);
                 this.compileExpression(expr.arguments[1]); // relocArr
                 this.vm.movImm64(VReg.V1, MASK);
                 this.vm.and(VReg.V0, VReg.RET, VReg.V1);
                 this.vm.load(VReg.A3, VReg.V0, 8);       // A3 = relocByteLen
                 this.vm.load(VReg.A2, VReg.V0, 16);      // A2 = relocPtr(deref data_ptr@16)
-                this.vm.pop(VReg.A1);                     // A1 = fragLen
-                this.vm.pop(VReg.A0);                     // A0 = fragPtr
+                this._loadHeldExpr(fragLenH, VReg.A1);
+                this._loadHeldExpr(fragPtrH, VReg.A0);
+                this._releaseHeldExpr();
+                this._releaseHeldExpr();
                 this.vm.call("_engine_reloc_exec");
                 return;
             }
@@ -3363,21 +3526,25 @@ export const FunctionCompiler = {
             if (callee.name === "__engine_exec_reloc_fp" && expr.arguments.length >= 3) {
                 const MASK = 0x0000ffffffffffffn;
                 this.compileExpression(expr.arguments[2]); // fp(原始指针,不装箱)
-                this.vm.push(VReg.RET);                     // 保活 fp
+                const fpH = this._holdExpr(VReg.RET);
                 this.compileExpression(expr.arguments[0]); // fragArr
                 this.vm.movImm64(VReg.V1, MASK);
                 this.vm.and(VReg.V0, VReg.RET, VReg.V1);
                 this.vm.load(VReg.A1, VReg.V0, 8);       // A1 = fragLen
                 this.vm.load(VReg.A0, VReg.V0, 16);      // A0 = fragPtr(deref data_ptr@16;见 __engine_exec 注)
-                this.vm.push(VReg.A0); this.vm.push(VReg.A1);
+                const fragPtrH = this._holdExpr(VReg.A0);
+                const fragLenH = this._holdExpr(VReg.A1);
                 this.compileExpression(expr.arguments[1]); // relocArr
                 this.vm.movImm64(VReg.V1, MASK);
                 this.vm.and(VReg.V0, VReg.RET, VReg.V1);
                 this.vm.load(VReg.A3, VReg.V0, 8);       // A3 = relocByteLen
                 this.vm.load(VReg.A2, VReg.V0, 16);      // A2 = relocPtr(deref data_ptr@16)
-                this.vm.pop(VReg.A1);                     // A1 = fragLen
-                this.vm.pop(VReg.A0);                     // A0 = fragPtr
-                this.vm.pop(VReg.A4);                     // A4 = fp(callerFP)
+                this._loadHeldExpr(fragLenH, VReg.A1);
+                this._loadHeldExpr(fragPtrH, VReg.A0);
+                this._loadHeldExpr(fpH, VReg.A4);
+                this._releaseHeldExpr();
+                this._releaseHeldExpr();
+                this._releaseHeldExpr();
                 this.vm.call("_engine_reloc_exec_fp");
                 return;
             }
@@ -3535,19 +3702,21 @@ export const FunctionCompiler = {
                 // 每个值先经 _syscall_arg 归一化（float位->int、字符串->指针），
                 // 全部压栈后逆序弹出，避免参数间相互覆盖。
                 const n = Math.min(args.length, 6);
+                const sysH = [];
                 for (let i = 0; i < n; i++) {
                     this.compileExpression(args[i]);
                     this.vm.mov(VReg.A0, VReg.RET);
                     this.vm.call("_syscall_arg");
-                    this.vm.push(VReg.RET);
+                    sysH.push(this._holdExpr(VReg.RET));
                 }
-                for (let i = n - 1; i >= 1; i--) {
-                    this.vm.pop(this.vm.getArgReg(i - 1));
+                for (let i = 1; i < n; i++) {
+                    this._loadHeldExpr(sysH[i], this.vm.getArgReg(i - 1));
                 }
                 if (n > 0) {
                     // 动态号放 V0：x64 上 V1 与第 4 参数 A3 同为 RCX，若把号放
                     // V1 会覆盖 getsockopt/setsockopt/ppoll 的第 4 参数。
-                    this.vm.pop(VReg.V0);
+                    this._loadHeldExpr(sysH[0], VReg.V0);
+                    this._releaseHeldN(n);
                     this.vm.syscallReg(VReg.V0);
                 }
                 // 返回值转标准 JS number（float64 位），供 fd < 0 等比较使用
@@ -3685,15 +3854,17 @@ export const FunctionCompiler = {
                     __winfs_close: "_win_close",
                 }[callee.name];
                 const wn = Math.min(expr.arguments.length, 3);
+                const winH = [];
                 for (let i = 0; i < wn; i++) {
                     this.compileExpression(expr.arguments[i]);
                     this.vm.mov(VReg.A0, VReg.RET);
                     this.vm.call("_syscall_arg");
-                    this.vm.push(VReg.RET);
+                    winH.push(this._holdExpr(VReg.RET));
                 }
-                for (let i = wn - 1; i >= 0; i--) {
-                    this.vm.pop(this.vm.getArgReg(i));
+                for (let i = 0; i < wn; i++) {
+                    this._loadHeldExpr(winH[i], this.vm.getArgReg(i));
                 }
+                this._releaseHeldN(wn);
                 this.vm.call(winfsLabel);
                 this.vm.scvtf(0, VReg.RET);
                 this.vm.fmovToInt(VReg.RET, 0);
@@ -3751,11 +3922,12 @@ export const FunctionCompiler = {
                     this.compileExpression(expr.arguments[0]);
                     this.vm.mov(VReg.A0, VReg.RET);
                     this.vm.call("_syscall_ptr"); // ptr 归一化：不做装箱 Number 解引用
-                    this.vm.push(VReg.RET);
+                    const scH = this._holdExpr(VReg.RET);
                     this.compileExpression(expr.arguments[1]);
                     this.vm.mov(VReg.A0, VReg.RET);
                     this.vm.call("_syscall_arg");
-                    this.vm.pop(VReg.V1);
+                    this._loadHeldExpr(scH, VReg.V1);
+                    this._releaseHeldExpr();
                     this.vm.storeByte(VReg.V1, 0, VReg.RET);
                 }
                 this.vm.movImm(VReg.RET, 0);
@@ -3770,11 +3942,12 @@ export const FunctionCompiler = {
                     this.compileExpression(expr.arguments[0]);
                     this.vm.mov(VReg.A0, VReg.RET);
                     this.vm.call("_syscall_ptr");
-                    this.vm.push(VReg.RET);
+                    const spH = this._holdExpr(VReg.RET);
                     this.compileExpression(expr.arguments[1]);
                     this.vm.mov(VReg.A0, VReg.RET);
                     this.vm.call("_syscall_ptr");
-                    this.vm.pop(VReg.V1);
+                    this._loadHeldExpr(spH, VReg.V1);
+                    this._releaseHeldExpr();
                     this.vm.store(VReg.V1, 0, VReg.RET);
                 }
                 this.vm.movImm(VReg.RET, 0);
@@ -3924,14 +4097,15 @@ export const FunctionCompiler = {
                     return;
                 }
                 this.compileExpression(expr.arguments[0]);
-                this.vm.push(VReg.RET);
+                const piH = this._holdExpr(VReg.RET);
                 if (expr.arguments.length > 1) {
                     this.compileExpression(expr.arguments[1]);
                     this.vm.mov(VReg.A1, VReg.RET);
                 } else {
                     this.vm.movImm(VReg.A1, 0); // radix=0 → 运行时默认 10 / 0x 自动 16
                 }
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(piH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_js_parseInt");
                 return;
             }
@@ -4142,8 +4316,8 @@ export const FunctionCompiler = {
                     // Object(Symbol()) 必须包装成对象,typeof 才返回 "object"
                     this.vm.cmpImm(VReg.RET, 0);
                     this.vm.jeq(notBareLabel);               // null/0 → 包装
-                    this.vm.movImm64(VReg.V0, 0x100000000n);  // ptrFloor
-                    this.vm.cmp(VReg.RET, VReg.V0);
+                    this.vm.movImm64(VReg.V5, 0x100000000n);  // ptrFloor; x64 V0≡RET
+                    this.vm.cmp(VReg.RET, VReg.V5);
                     this.vm.jlt(notBareLabel);               // 地址低于 floor → 非指针
                     this.vm.loadByte(VReg.V0, VReg.RET, 0);
                     this.vm.cmpImm(VReg.V0, 61);              // TYPE_SYMBOL
@@ -4350,7 +4524,12 @@ export const FunctionCompiler = {
                 // a sloppy function saw a garbage this.
                 this.vm.lea(VReg.S1, funcLabel);
                 this.emitOrdinaryCallBindThis(VReg.S1);
-                this.vm.call(funcLabel);
+                if (expr._tailCall && this._shouldTailCall()) {
+                    this.vm.movImm(VReg.S0, 0);
+                    this.emitTailCallJump();
+                } else {
+                    this.vm.call(funcLabel);
+                }
                 return;
             }
 
@@ -4446,7 +4625,6 @@ export const FunctionCompiler = {
                 obj.property && obj.property.type === "Identifier" &&
                 (obj.property.name === "fromCodePoint" || obj.property.name === "fromCharCode") &&
                 expr.arguments.length === 2 &&
-                inferType(expr.arguments[1], this.ctx) === Type.ARRAY &&
                 !(this.ctx.getLocal && this.ctx.getLocal("String")) &&
                 !(this.ctx.getFunction && this.ctx.getFunction("String"))) {
                 // Function#apply evaluates thisArg before argsArray even though
@@ -4725,15 +4903,18 @@ export const FunctionCompiler = {
                     this.vm.mov(VReg.A0, VReg.RET);
                     this.vm.call(cpHelper);
                     // 其余每个 code → helper 后 _strconcat 累加（多参之前只取首个 → "HI" 得 "H"）
+                    const cpAccH = this._holdExpr(VReg.RET);
                     for (let ci = 1; ci < expr.arguments.length; ci++) {
-                        this.vm.push(VReg.RET);                 // 存 acc
                         this.compileExpression(expr.arguments[ci]);
                         this.vm.mov(VReg.A0, VReg.RET);
                         this.vm.call(cpHelper);
                         this.vm.mov(VReg.A1, VReg.RET);         // A1 = 本字符
-                        this.vm.pop(VReg.A0);                   // A0 = acc
+                        this._loadHeldExpr(cpAccH, VReg.A0);
                         this.vm.call("_strconcat");             // RET = acc + 本字符
+                        this._holdStore(cpAccH, VReg.RET);
                     }
+                    this._loadHeldExpr(cpAccH, VReg.RET);
+                    this._releaseHeldExpr();
                     return;
                 }
             }
@@ -4776,7 +4957,7 @@ export const FunctionCompiler = {
                 // 同族 isNaN 已 false(指数非全 1)。_is_symbol 毁 RET; linux-x64 V0=RET。
                 // scratch V5; 不碰已占用 V0/V1/V2/V4。+0.0 bits=0 免 call。
                 const nsymL = this.ctx.newLabel("numis_nsym");
-                this.vm.push(VReg.RET);
+                const numisH = this._holdExpr(VReg.RET);
                 this.vm.shrImm(VReg.V5, VReg.RET, 48);
                 this.vm.cmpImm(VReg.V5, 0);
                 this.vm.jne(nsymL);
@@ -4786,10 +4967,9 @@ export const FunctionCompiler = {
                 this.vm.call("_is_symbol");
                 this.vm.cmpImm(VReg.RET, 0);
                 this.vm.jeq(nsymL);
-                this.vm.pop(VReg.V5); // discard saved value
                 this.vm.jmp(fL); // Symbol → Type not Number → false
                 this.vm.label(nsymL);
-                this.vm.pop(VReg.RET);
+                this._loadHeldExpr(numisH, VReg.RET);
                 this.vm.shrImm(VReg.V1, VReg.RET, 48); // V1 = 高16
                 // 装箱 int32:isNaN → false,其余 → true
                 this.vm.cmpImm(VReg.V1, 0x7FF8);
@@ -4832,7 +5012,10 @@ export const FunctionCompiler = {
                         this.vm.movImm64(VReg.RET, 0x433fffffffffffffn); // (double)(2^53-1)
                         this.vm.fmovToFloat(2, VReg.RET);
                         this.vm.fcmp(0, 2);
-                        this.vm.jle(tL);            // |v| <= 2^53-1 → safe
+                        // Float compare: x64 ucomisd only sets CF/ZF/PF, so
+                        // signed jle (SF/OF) misses |v| < 2^53-1 (isSafeInteger(1)
+                        // was false). jfle is jbe/bls after fcmp on both backends.
+                        this.vm.jfle(tL);           // |v| <= 2^53-1 → safe
                         this.vm.jmp(fL);
                     } else {
                         this.vm.jeq(tL);
@@ -4845,6 +5028,7 @@ export const FunctionCompiler = {
                 this.vm.label(fL);
                 this.vm.movImm64(VReg.RET, 0x7ff9000000000000n); // was lea+load _js const
                 this.vm.label(eL);
+                this._releaseHeldExpr();
                 return;
             }
 
@@ -4857,14 +5041,15 @@ export const FunctionCompiler = {
                         this.vm.movImm64(VReg.RET, 0x7ff0000000000001n);
                     } else {
                         this.compileExpression(expr.arguments[0]);
-                        this.vm.push(VReg.RET);
+                        const npiH = this._holdExpr(VReg.RET);
                         if (expr.arguments.length > 1) {
                             this.compileExpression(expr.arguments[1]);
                             this.vm.mov(VReg.A1, VReg.RET);
                         } else {
                             this.vm.movImm(VReg.A1, 0);
                         }
-                        this.vm.pop(VReg.A0);
+                        this._loadHeldExpr(npiH, VReg.A0);
+                        this._releaseHeldExpr();
                         this.vm.call("_js_parseInt");
                     }
                 } else {
@@ -5375,10 +5560,11 @@ export const FunctionCompiler = {
                 if (prop.name === "groupBy") {
                     if (expr.arguments.length >= 2) {
                         this.compileExpression(expr.arguments[0]); // items
-                        this.vm.push(VReg.RET);
+                        const gbH = this._holdExpr(VReg.RET);
                         this.compileExpression(expr.arguments[1]); // cb
                         this.vm.mov(VReg.A1, VReg.RET);
-                        this.vm.pop(VReg.A0);
+                        this._loadHeldExpr(gbH, VReg.A0);
+                        this._releaseHeldExpr();
                         this.vm.call("_object_groupBy");
                     } else {
                         // 缺参:空对象(装箱)
@@ -5452,10 +5638,11 @@ export const FunctionCompiler = {
                     // 2-arg emit unchanged (same helper).
                     if (expr.arguments.length >= 2) {
                         this.compileExpression(expr.arguments[0]);
-                        this.vm.push(VReg.RET);
+                        const hoH = this._holdExpr(VReg.RET);
                         this.compileExpression(expr.arguments[1]);
                         this.vm.mov(VReg.A1, VReg.RET);
-                        this.vm.pop(VReg.A0);
+                        this._loadHeldExpr(hoH, VReg.A0);
+                        this._releaseHeldExpr();
                     } else if (expr.arguments.length === 1) {
                         this.compileExpression(expr.arguments[0]);
                         this.vm.mov(VReg.A0, VReg.RET);
@@ -5671,13 +5858,16 @@ export const FunctionCompiler = {
                     }
                     if (expr.arguments.length >= 2) {
                         this.compileExpression(expr.arguments[0]);
+                        const asgH = this._holdExpr(VReg.RET);
                         for (let ai = 1; ai < expr.arguments.length; ai++) {
-                            this.vm.push(VReg.RET); // 当前 target
                             this.compileExpression(expr.arguments[ai]);
                             this.vm.mov(VReg.A1, VReg.RET); // source
-                            this.vm.pop(VReg.A0);
+                            this._loadHeldExpr(asgH, VReg.A0);
                             this.vm.call("_object_assign");
+                            this._holdStore(asgH, VReg.RET);
                         }
+                        this._loadHeldExpr(asgH, VReg.RET);
+                        this._releaseHeldExpr();
                     } else if (expr.arguments.length === 1) {
                         // ES: ToObject(target); 单参无 source → 返 to。经 _object_assign(tgt, undefined)。
                         this.compileExpression(expr.arguments[0]);
@@ -5731,10 +5921,11 @@ export const FunctionCompiler = {
                     // Object.hasOwn(obj, key):ToObject 先于 ToPropertyKey(见上注)
                     if (expr.arguments.length >= 2) {
                         this.compileExpression(expr.arguments[0]);
-                        this.vm.push(VReg.RET);
+                        const hasOwnH = this._holdExpr(VReg.RET);
                         this.compileExpression(expr.arguments[1]);
                         this.vm.mov(VReg.A1, VReg.RET);
-                        this.vm.pop(VReg.A0);
+                        this._loadHeldExpr(hasOwnH, VReg.A0);
+                        this._releaseHeldExpr();
                         this.vm.call("_aref_obj_hasOwn");
                     } else {
                         this.vm.movImm(VReg.RET, 0);
@@ -5767,9 +5958,10 @@ export const FunctionCompiler = {
                     // (TypeError); missing obj is undefined (RequireObjectCoercible).
                     if (expr.arguments.length >= 2) {
                         this.compileExpression(expr.arguments[1]);
-                        this.vm.push(VReg.RET);
+                        const protoH = this._holdExpr(VReg.RET);
                         this.compileExpression(expr.arguments[0]);
-                        this.vm.pop(VReg.A1);
+                        this._loadHeldExpr(protoH, VReg.A1);
+                        this._releaseHeldExpr();
                         this.vm.mov(VReg.A0, VReg.RET);
                     } else if (expr.arguments.length >= 1) {
                         this.compileExpression(expr.arguments[0]);
@@ -5829,7 +6021,7 @@ export const FunctionCompiler = {
                     this.vm.cmpImm(VReg.V2, 0);
                     this.vm.jeq(dpNormalLabel);
                     this.vm.loadByte(VReg.V1, VReg.V2, 0);
-                    this.vm.cmpImm(VReg.V1, 8); // TYPE_PROXY
+                    this.vm.cmpImm(VReg.V1, TYPE_PROXY);
                     this.vm.jne(dpNormalLabel);
                     // proxy 分支:求值整份描述符对象 → 陷阱
                     if (desc) this.compileExpression(desc);
@@ -5918,11 +6110,12 @@ export const FunctionCompiler = {
                 if (prop.name === "defineProperties") {
                     if (expr.arguments.length >= 1) this.compileExpression(expr.arguments[0]);
                     else this.vm.movImm64(VReg.RET, 0x7ffb000000000000n);
-                    this.vm.push(VReg.RET);
+                    const dpsH = this._holdExpr(VReg.RET);
                     if (expr.arguments.length >= 2) this.compileExpression(expr.arguments[1]);
                     else this.vm.movImm64(VReg.RET, 0x7ffb000000000000n);
                     this.vm.mov(VReg.A1, VReg.RET);
-                    this.vm.pop(VReg.A0);
+                    this._loadHeldExpr(dpsH, VReg.A0);
+                    this._releaseHeldExpr();
                     this.vm.call("_object_define_properties_dyn");
                     return;
                 }
@@ -5939,14 +6132,15 @@ export const FunctionCompiler = {
                     // are 0x7FFB. 2-arg emit unchanged (same helper).
                     if (expr.arguments.length >= 1) {
                         this.compileExpression(expr.arguments[0]);
-                        this.vm.push(VReg.RET);
+                        const gopdH = this._holdExpr(VReg.RET);
                         if (expr.arguments.length >= 2) {
                             this.compileExpression(expr.arguments[1]);
                         } else {
                             this.vm.movImm64(VReg.RET, 0x7ffb000000000000n);
                         }
                         this.vm.mov(VReg.A1, VReg.RET);
-                        this.vm.pop(VReg.A0);
+                        this._loadHeldExpr(gopdH, VReg.A0);
+                        this._releaseHeldExpr();
                     } else {
                         this.vm.movImm64(VReg.A0, 0x7ffb000000000000n);
                         this.vm.movImm64(VReg.A1, 0x7ffb000000000000n);
@@ -5994,10 +6188,11 @@ export const FunctionCompiler = {
                 if (prop.name === "groupBy") {
                     if (expr.arguments.length >= 2) {
                         this.compileExpression(expr.arguments[0]); // items
-                        this.vm.push(VReg.RET);
+                        const mgbH = this._holdExpr(VReg.RET);
                         this.compileExpression(expr.arguments[1]); // cb
                         this.vm.mov(VReg.A1, VReg.RET);
-                        this.vm.pop(VReg.A0);
+                        this._loadHeldExpr(mgbH, VReg.A0);
+                        this._releaseHeldExpr();
                         this.vm.call("_map_groupBy"); // 返回裸 Map 指针
                     } else {
                         this.vm.call("_map_new");
@@ -6142,10 +6337,11 @@ export const FunctionCompiler = {
             if (prop && prop.type === "Identifier" && prop.name === "finally" &&
                 expr.arguments.length > 0) {
                 this.compileExpression(obj);
-                this.vm.push(VReg.RET);
+                const finH = this._holdExpr(VReg.RET);
                 this.compileExpression(expr.arguments[0]);
                 this.vm.mov(VReg.A1, VReg.RET);
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(finH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_promise_finally");
                 return;
             }
@@ -6156,28 +6352,26 @@ export const FunctionCompiler = {
                 // then(onF, onR):双回调,onF 挂 fulfill 链、onR 挂 reject 链、共享 next。
                 if (prop.name === "then" && expr.arguments.length >= 2) {
                     this.compileExpression(obj);
-                    this.vm.push(VReg.RET);                  // promise
+                    const pH = this._holdExpr(VReg.RET);
                     this.compileExpression(expr.arguments[0]);
-                    this.vm.push(VReg.RET);                  // onF
+                    const onFH = this._holdExpr(VReg.RET);
                     this.compileExpression(expr.arguments[1]);
                     this.vm.mov(VReg.A2, VReg.RET);          // onR
-                    this.vm.pop(VReg.A1);                    // onF
-                    this.vm.pop(VReg.A0);                    // promise
+                    this._loadHeldExpr(onFH, VReg.A1);
+                    this._loadHeldExpr(pH, VReg.A0);
+                    this._releaseHeldExpr();
+                    this._releaseHeldExpr();
                     this.vm.call("_promise_then_dispatch");
                     return;
                 }
                 // 只支持单个回调参数
                 if (expr.arguments.length > 0) {
-                    // 先编译 promise 对象
                     this.compileExpression(obj);
-                    this.vm.push(VReg.RET);
-
-                    // 再编译回调（闭包对象或函数指针）
+                    const pH = this._holdExpr(VReg.RET);
                     this.compileExpression(expr.arguments[0]);
                     this.vm.mov(VReg.A1, VReg.RET);
-
-                    // 调用运行时
-                    this.vm.pop(VReg.A0);
+                    this._loadHeldExpr(pH, VReg.A0);
+                    this._releaseHeldExpr();
                     if (prop.name === "then") {
                         this.vm.movImm64(VReg.A2, 0x7ffb000000000000n);
                         this.vm.call("_promise_then_dispatch");
@@ -6237,7 +6431,7 @@ export const FunctionCompiler = {
                 this.vm.shrImm(VReg.V2, VReg.RET, 48);
                 this.vm.cmpImm(VReg.V2, 0x7FFD);
                 this.vm.jne(voEndLbl); // 非对象 → RET 已是接收者,原样返回
-                this.vm.push(VReg.RET); // 存对象(x64 V0==RET)
+                const voH = this._holdExpr(VReg.RET);
                 this.vm.emitMaskLoad(VReg.V1);
                 this.vm.andMaskReg(VReg.V0, VReg.RET, VReg.V1);
                 this.vm.loadByte(VReg.V0, VReg.V0, 0); // 头类型字节
@@ -6247,21 +6441,21 @@ export const FunctionCompiler = {
                 // An own override may be Number.prototype.valueOf, whose brand
                 // guard must observe the Date receiver and throw TypeError.
                 const voDateDefault = this.ctx.newLabel("valof_date_default");
-                this.vm.load(VReg.A0, VReg.SP, 0);
+                this._loadHeldExpr(voH, VReg.A0);
                 this.emitBoxedStringKey("valueOf", VReg.A1);
                 this.vm.call("_object_get");
                 this.vm.mov(VReg.A0, VReg.RET);
-                this.vm.load(VReg.A1, VReg.SP, 0);
+                this._loadHeldExpr(voH, VReg.A1);
                 this.vm.call("_maybe_getter");
                 this.vm.mov(VReg.V6, VReg.RET);
                 this.vm.shrImm(VReg.V2, VReg.V6, 48);
                 this.vm.cmpImm(VReg.V2, 0x7FFF);
                 this.vm.jne(voDateDefault);
-                this.vm.pop(VReg.V5);
+                this._loadHeldExpr(voH, VReg.V5);
                 this.compileMethodCall(VReg.V6, VReg.V5, expr.arguments);
                 this.vm.jmp(voEndLbl);
                 this.vm.label(voDateDefault);
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(voH, VReg.A0);
                 this.vm.call("_date_getTime"); // missing intrinsic method → timestamp
                 this.vm.jmp(voEndLbl);
                 this.vm.label(voIdLbl);
@@ -6269,24 +6463,25 @@ export const FunctionCompiler = {
                 // to invoke the actual valueOf method on the prototype chain
                 {
                     const voLbl = this.asm.addString("valueOf");
-                    this.vm.load(VReg.A0, VReg.SP, 0);
+                    this._loadHeldExpr(voH, VReg.A0);
                     this.vm.lea(VReg.A1, voLbl);
                     this.vm.call("_tag_str_a1"); // key box
                     this.vm.call("_object_get");
                     this.vm.mov(VReg.A0, VReg.RET);
-                    this.vm.load(VReg.A1, VReg.SP, 0);
+                    this._loadHeldExpr(voH, VReg.A1);
                     this.vm.call("_maybe_getter");
                     this.vm.mov(VReg.V6, VReg.RET);
                     this.vm.shrImm(VReg.V0, VReg.V6, 48);
                     this.vm.cmpImm(VReg.V0, 0x7FFF);
                     this.vm.jne(voIdLbl2); // not a function → identity fallback
-                    this.vm.pop(VReg.V5);
+                    this._loadHeldExpr(voH, VReg.V5);
                     this.compileMethodCall(VReg.V6, VReg.V5, expr.arguments);
                     this.vm.jmp(voEndLbl);
                     this.vm.label(voIdLbl2);
-                    this.vm.pop(VReg.RET); // identity fallback
+                    this._loadHeldExpr(voH, VReg.RET); // identity fallback
                 }
                 this.vm.label(voEndLbl);
+                this._releaseHeldExpr();
                 return;
             }
 
@@ -6301,7 +6496,7 @@ export const FunctionCompiler = {
                 const tsBiLbl = this.ctx.newLabel("tostr_bigint");
                 const tsEndLbl = this.ctx.newLabel("tostr_end");
                 this.compileExpression(obj);
-                this.vm.push(VReg.RET); // 存 obj(通用/字符串路径复用;x64 V0==RET)
+                const tsH = this._holdExpr(VReg.RET);
                 this.vm.shrImm(VReg.V2, VReg.RET, 48);
                 // Symbol 接收者(裸堆指针 high16==0):运行时 _is_symbol 判别后走
                 // _symbol_to_string("Symbol(desc)")。此前 high16==0 落数字路径把
@@ -6329,15 +6524,15 @@ export const FunctionCompiler = {
                 // [Date] 先查对象头类型字节(7)→ _date_toString,先于 _is_asmjs_err:
                 // 省一次对 16B Date 块的无谓 Error 品牌遍历,正确性不依赖 _object_has
                 // 黑名单兜底(非零 ts 的 Date 会被当 [count,props_ptr] 野扫)。
-                this.vm.load(VReg.V0, VReg.SP, 0);
+                this._loadHeldExpr(tsH, VReg.V0);
                 this.vm.emitMaskLoad(VReg.V1);
                 this.vm.andMaskReg(VReg.V0, VReg.V0, VReg.V1);
                 this.vm.loadByte(VReg.V0, VReg.V0, 0);
                 this.vm.cmpImm(VReg.V0, 7);
                 this.vm.jeq(tsDateLbl);
                 // [#36] Error 族对象.toString() → "name: message"(否则落通用路径找不到
-                // toString 方法而崩)。obj 仍在栈顶,装箱 0x7FFD。
-                this.vm.load(VReg.A0, VReg.SP, 0);
+                // toString 方法而崩)。obj 仍 hold,装箱 0x7FFD。
+                this._loadHeldExpr(tsH, VReg.A0);
                 this.vm.call("_is_asmjs_err");
                 this.vm.cmpImm(VReg.RET, 0);
                 this.vm.jne(tsErrLbl);
@@ -6345,12 +6540,12 @@ export const FunctionCompiler = {
                 // 通用:用户对象方法;若无用户 toString(数组/plain 对象)则回退默认转换。
                 {
                     const tsLbl = this.asm.addString("toString");
-                    this.vm.load(VReg.A0, VReg.SP, 0);
+                    this._loadHeldExpr(tsH, VReg.A0);
                     this.vm.lea(VReg.A1, tsLbl);
                     this.vm.call("_tag_str_a1"); // key box->helper
                     this.vm.call("_object_get");
                     this.vm.mov(VReg.A0, VReg.RET);
-                    this.vm.load(VReg.A1, VReg.SP, 0);
+                    this._loadHeldExpr(tsH, VReg.A1);
                     this.vm.call("_maybe_getter");
                     this.vm.mov(VReg.V6, VReg.RET);
                     // 仅真正的 miss(undefined)可进入表示层 fallback。其它非 callable 值
@@ -6362,19 +6557,18 @@ export const FunctionCompiler = {
                     this.vm.movImm64(VReg.V0, 0x7ffb000000000000n);
                     this.vm.cmp(VReg.V6, VReg.V0);
                     this.vm.jne(tsUserL);
-                    this.vm.load(VReg.A0, VReg.SP, 0);
+                    this._loadHeldExpr(tsH, VReg.A0);
                     this.vm.call("_is_array_value");
                     this.vm.cmpImm(VReg.RET, 0);
                     this.vm.jeq(tsMissingNonArrayL);
-                    this.vm.pop(VReg.A0); // array / Proxy-array receiver
+                    this._loadHeldExpr(tsH, VReg.A0); // array / Proxy-array receiver
                     this.vm.call("_agen_toString");
                     this.vm.jmp(tsEndLbl);
                     this.vm.label(tsMissingNonArrayL);
-                    this.vm.pop(VReg.V0); // 平衡 obj；Get 返回 undefined 后 Call 必须抛
                     this.vm.call("_throw_not_a_function");
                     this.vm.jmp(tsEndLbl);
                     this.vm.label(tsUserL);
-                    this.vm.pop(VReg.V5);
+                    this._loadHeldExpr(tsH, VReg.V5);
                     this.compileMethodCall(VReg.V6, VReg.V5, expr.arguments);
                 }
                 this.vm.jmp(tsEndLbl);
@@ -6384,37 +6578,37 @@ export const FunctionCompiler = {
                 // 非函数时才保留表示层默认格式化兜底。
                 {
                     const tsDateDefault = this.ctx.newLabel("tostr_date_default");
-                    this.vm.load(VReg.A0, VReg.SP, 0);
+                    this._loadHeldExpr(tsH, VReg.A0);
                     this.emitBoxedStringKey("toString", VReg.A1);
                     this.vm.call("_object_get");
                     this.vm.mov(VReg.A0, VReg.RET);
-                    this.vm.load(VReg.A1, VReg.SP, 0);
+                    this._loadHeldExpr(tsH, VReg.A1);
                     this.vm.call("_maybe_getter");
                     this.vm.mov(VReg.V6, VReg.RET);
                     this.vm.shrImm(VReg.V2, VReg.V6, 48);
                     this.vm.cmpImm(VReg.V2, 0x7fff);
                     this.vm.jne(tsDateDefault);
-                    this.vm.pop(VReg.V5);
+                    this._loadHeldExpr(tsH, VReg.V5);
                     this.compileMethodCall(VReg.V6, VReg.V5, expr.arguments);
                     this.vm.jmp(tsEndLbl);
                     this.vm.label(tsDateDefault);
-                    this.vm.pop(VReg.A0); // 平衡栈(obj)
+                    this._loadHeldExpr(tsH, VReg.A0);
                     this.vm.emitMaskLoad(VReg.V1);
                     this.vm.andMaskReg(VReg.A0, VReg.A0, VReg.V1);
                     this.vm.call("_date_toString");
                 }
                 this.vm.jmp(tsEndLbl);
                 this.vm.label(tsErrLbl); // [#36] Error 对象 → "name: message"
-                this.vm.pop(VReg.A0); // 平衡栈(obj,装箱 0x7FFD)
+                this._loadHeldExpr(tsH, VReg.A0);
                 this.vm.call("_error_to_str");
                 this.vm.jmp(tsEndLbl);
                 this.vm.label(tsStrLbl); // 字符串:toString 恒等返回
-                this.vm.pop(VReg.RET);
+                this._loadHeldExpr(tsH, VReg.RET);
                 this.vm.jmp(tsEndLbl);
                 this.vm.label(tsNumLbl);
                 // 零参用通用数字格式器(int/float 都对,3.5→"3.5");
                 // _num_toString 是整数进制格式器,只给带 radix 形态用
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(tsH, VReg.A0);
                 this.vm.call("_numberToString");
                 this.vm.jmp(tsEndLbl);
                 this.vm.label(tsSymLbl); // high16==0:可能是 Symbol/BigInt,运行时确认
@@ -6422,23 +6616,23 @@ export const FunctionCompiler = {
                 // 此前落数字路径把 bigint 指针当 double 格式化 → "0."。先判 _is_bigint
                 // (内部带堆界守卫,非 bigint 返 0),命中则取 64 位值 → _intToStr 十进制串
                 // (有符号,负 bigint 亦正确)。再判 symbol,末尾才回落数字路径。
-                this.vm.load(VReg.A0, VReg.SP, 0); // obj(仍在栈顶)
+                this._loadHeldExpr(tsH, VReg.A0);
                 this.vm.call("_is_bigint");
                 this.vm.cmpImm(VReg.RET, 0);
                 this.vm.jne(tsBiLbl);
-                this.vm.load(VReg.A0, VReg.SP, 0); // obj
+                this._loadHeldExpr(tsH, VReg.A0);
                 this.vm.call("_is_symbol");
                 this.vm.cmpImm(VReg.RET, 0);
                 const tsTaLbl = this.ctx.newLabel("tostr_ta");
                 this.vm.jeq(tsTaLbl); // 非 symbol/bigint 的 high16==0 值:先探 TypedArray
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(tsH, VReg.A0);
                 this.vm.call("_symbol_to_string");
                 this.vm.jmp(tsEndLbl);
                 // [#4] TypedArray.toString()(裸堆指针,类型字节 0x40-0x61)→ 逗号连接串
                 // (对齐 node "1,2,3")。此前落数字路径把 ta 头指针当 double → 垃圾浮点。
                 // 堆界守卫后读类型字节;非 typed 的微小 double 回落数字路径。
                 this.vm.label(tsTaLbl);
-                this.vm.load(VReg.V0, VReg.SP, 0);
+                this._loadHeldExpr(tsH, VReg.V0);
                 this.vm.lea(VReg.V1, "_heap_base"); this.vm.load(VReg.V1, VReg.V1, 0);
                 this.vm.cmp(VReg.V0, VReg.V1); this.vm.jlt(tsNumLbl);
                 this.vm.lea(VReg.V1, "_heap_ptr"); this.vm.load(VReg.V1, VReg.V1, 0);
@@ -6446,17 +6640,18 @@ export const FunctionCompiler = {
                 this.vm.loadByte(VReg.V0, VReg.V0, 0);
                 this.vm.cmpImm(VReg.V0, 0x40); this.vm.jlt(tsNumLbl);
                 this.vm.cmpImm(VReg.V0, 0x61); this.vm.jgt(tsNumLbl);
-                this.vm.pop(VReg.A0); // ta 裸指针
+                this._loadHeldExpr(tsH, VReg.A0);
                 this.vm.lea(VReg.A1, this.asm.addString(","));
                 this.vm.movImm64(VReg.V0, 0x7ffc000000000000n);
                 this.vm.or(VReg.A1, VReg.A1, VReg.V0); // 装箱 "," 数据串
                 this.vm.call("_ta_join");
                 this.vm.jmp(tsEndLbl);
                 this.vm.label(tsBiLbl);
-                this.vm.pop(VReg.A0);      // bigint ptr(high16 已 0,无需 unbox)
+                this._loadHeldExpr(tsH, VReg.A0);
                 this.vm.load(VReg.A0, VReg.A0, 0); // 64 位值
                 this.vm.call("_intToStr");
                 this.vm.label(tsEndLbl);
+                this._releaseHeldExpr();
                 return;
             }
 
@@ -6478,7 +6673,7 @@ export const FunctionCompiler = {
                 const tlsBiLbl = this.ctx.newLabel("toloc_bigint");
                 const tlsEndLbl = this.ctx.newLabel("toloc_end");
                 this.compileExpression(obj);
-                this.vm.push(VReg.RET);
+                const tlsH = this._holdExpr(VReg.RET);
                 this.vm.shrImm(VReg.V2, VReg.RET, 48);
                 this.vm.cmpImm(VReg.V2, 0);
                 this.vm.jeq(tlsSymLbl);
@@ -6499,48 +6694,48 @@ export const FunctionCompiler = {
                 this.vm.label(tlsGenLbl);
                 {
                     const tlsLbl = this.asm.addString("toLocaleString");
-                    this.vm.load(VReg.A0, VReg.SP, 0);
+                    this._loadHeldExpr(tlsH, VReg.A0);
                     this.vm.lea(VReg.A1, tlsLbl);
                     this.vm.call("_tag_str_a1");
                     this.vm.call("_object_get");
                     this.vm.mov(VReg.A0, VReg.RET);
-                    this.vm.load(VReg.A1, VReg.SP, 0);
+                    this._loadHeldExpr(tlsH, VReg.A1);
                     this.vm.call("_maybe_getter");
                     this.vm.mov(VReg.V6, VReg.RET);
                     const tlsUserL = this.ctx.newLabel("toloc_user");
                     this.vm.shrImm(VReg.V0, VReg.V6, 48);
                     this.vm.cmpImm(VReg.V0, 0x7FFF);
                     this.vm.jeq(tlsUserL);
-                    this.vm.pop(VReg.A0);
+                    this._loadHeldExpr(tlsH, VReg.A0);
                     this.vm.call("_object_proto_toLocaleString");
                     this.vm.jmp(tlsEndLbl);
                     this.vm.label(tlsUserL);
-                    this.vm.pop(VReg.V5);
+                    this._loadHeldExpr(tlsH, VReg.V5);
                     this.compileMethodCall(VReg.V6, VReg.V5, expr.arguments);
                 }
                 this.vm.jmp(tlsEndLbl);
                 this.vm.label(tlsStrLbl);
-                this.vm.pop(VReg.RET);
+                this._loadHeldExpr(tlsH, VReg.RET);
                 this.vm.jmp(tlsEndLbl);
                 this.vm.label(tlsNumLbl);
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(tlsH, VReg.A0);
                 this.vm.call("_numberToString");
                 this.vm.jmp(tlsEndLbl);
                 this.vm.label(tlsSymLbl);
-                this.vm.load(VReg.A0, VReg.SP, 0);
+                this._loadHeldExpr(tlsH, VReg.A0);
                 this.vm.call("_is_bigint");
                 this.vm.cmpImm(VReg.RET, 0);
                 this.vm.jne(tlsBiLbl);
-                this.vm.load(VReg.A0, VReg.SP, 0);
+                this._loadHeldExpr(tlsH, VReg.A0);
                 this.vm.call("_is_symbol");
                 this.vm.cmpImm(VReg.RET, 0);
                 const tlsTaLbl = this.ctx.newLabel("toloc_ta");
                 this.vm.jeq(tlsTaLbl);
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(tlsH, VReg.A0);
                 this.vm.call("_symbol_to_string");
                 this.vm.jmp(tlsEndLbl);
                 this.vm.label(tlsTaLbl);
-                this.vm.load(VReg.V0, VReg.SP, 0);
+                this._loadHeldExpr(tlsH, VReg.V0);
                 this.vm.lea(VReg.V1, "_heap_base"); this.vm.load(VReg.V1, VReg.V1, 0);
                 this.vm.cmp(VReg.V0, VReg.V1); this.vm.jlt(tlsNumLbl);
                 this.vm.lea(VReg.V1, "_heap_ptr"); this.vm.load(VReg.V1, VReg.V1, 0);
@@ -6548,14 +6743,15 @@ export const FunctionCompiler = {
                 this.vm.loadByte(VReg.V0, VReg.V0, 0);
                 this.vm.cmpImm(VReg.V0, 0x40); this.vm.jlt(tlsNumLbl);
                 this.vm.cmpImm(VReg.V0, 0x61); this.vm.jgt(tlsNumLbl);
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(tlsH, VReg.A0);
                 this.vm.call("_ta_toLocaleString");
                 this.vm.jmp(tlsEndLbl);
                 this.vm.label(tlsBiLbl);
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(tlsH, VReg.A0);
                 this.vm.load(VReg.A0, VReg.A0, 0);
                 this.vm.call("_intToStr");
                 this.vm.label(tlsEndLbl);
+                this._releaseHeldExpr();
                 return;
             }
 
@@ -6606,16 +6802,18 @@ export const FunctionCompiler = {
                 else this.vm.movImm(VReg.A1, 0);
                 // end:缺省 = byteLength
                 if (expr.arguments.length >= 2) {
-                    this.vm.push(VReg.A1);
+                    const abStartH = this._holdExpr(VReg.A1);
                     this.compileExpressionAsInt(expr.arguments[1]);
                     this.vm.mov(VReg.A2, VReg.RET);
-                    this.vm.pop(VReg.A1);
+                    this._loadHeldExpr(abStartH, VReg.A1);
+                    this._releaseHeldExpr();
                 } else {
                     this.vm.load(VReg.A0, VReg.FP, abOff);
-                    this.vm.push(VReg.A1);
+                    const abStartH = this._holdExpr(VReg.A1);
                     this.vm.call("_arraybuffer_bytelength");
                     this.vm.mov(VReg.A2, VReg.RET);
-                    this.vm.pop(VReg.A1);
+                    this._loadHeldExpr(abStartH, VReg.A1);
+                    this._releaseHeldExpr();
                 }
                 this.vm.load(VReg.A0, VReg.FP, abOff);
                 this.vm.call("_arraybuffer_slice");
@@ -6748,28 +6946,30 @@ export const FunctionCompiler = {
                     this.vm.label(ts1RadixL);
                     const biRxLbl = this.ctx.newLabel("ts_radix_nobi");
                     this.vm.load(VReg.RET, VReg.FP, ts1RecvOff);
-                    this.vm.push(VReg.RET); // 接收者值(SP+8)
+                    const tsRxH = this._holdExpr(VReg.RET);
                     this.compileExpression(expr.arguments[0]);
                     if (this.vm.backend.name === "x64") this.vm.mov(VReg.A0, VReg.RET);
                     this.vm.call("_to_int32");
-                    this.vm.push(VReg.RET); // radix 裸 int(SP+0;_is_bigint 会冲寄存器)
+                    const radixH = this._holdExpr(VReg.RET);
                     // [#71] BigInt.toString(radix):接收者是裸 user_ptr → 取 64 位值,
                     // 截低 32 位重打 int32 tag(0x7FF8),供 _num_toString 内部 _to_int32
                     // 正确取回(值域限 32 位,超范围 bigint 的非十进制 radix 截断,记偏差)。
-                    this.vm.load(VReg.A0, VReg.SP, 8); // 接收者
+                    this._loadHeldExpr(tsRxH, VReg.A0);
                     this.vm.call("_is_bigint");
                     this.vm.cmpImm(VReg.RET, 0);
                     this.vm.jeq(biRxLbl);
-                    this.vm.load(VReg.A0, VReg.SP, 8); // bigint ptr
+                    this._loadHeldExpr(tsRxH, VReg.A0);
                     this.vm.load(VReg.A0, VReg.A0, 0); // 64 位值
                     this.vm.movImm64(VReg.V1, 0xFFFFFFFFn);
                     this.vm.and(VReg.A0, VReg.A0, VReg.V1);
                     this.vm.movImm64(VReg.V1, 0x7FF8000000000000n);
                     this.vm.or(VReg.A0, VReg.A0, VReg.V1);
-                    this.vm.store(VReg.SP, 8, VReg.A0); // 覆盖接收者槽为装箱 int32
+                    this._holdStore(tsRxH, VReg.A0); // 覆盖接收者为装箱 int32
                     this.vm.label(biRxLbl);
-                    this.vm.pop(VReg.A1); // radix
-                    this.vm.pop(VReg.A0); // 接收者(bigint 时已装箱 int32)
+                    this._loadHeldExpr(radixH, VReg.A1);
+                    this._loadHeldExpr(tsRxH, VReg.A0);
+                    this._releaseHeldExpr();
+                    this._releaseHeldExpr();
                     this.vm.call("_num_toString");
                     this.vm.label(ts1EndL);
                     return;
@@ -6778,10 +6978,11 @@ export const FunctionCompiler = {
                 if (prop.name === "toFixed" && !callee.computed && expr.arguments.length <= 1) {
                     this.compileExpression(obj);
                     if (expr.arguments.length === 1) {
-                        this.vm.push(VReg.RET);
+                        const fxH = this._holdExpr(VReg.RET);
                         this.compileExpression(expr.arguments[0]);
                         this.vm.mov(VReg.A1, VReg.RET); // digits(boxed JSValue; _aref_num_toFixed argIntOr 处理)
-                        this.vm.pop(VReg.A0);
+                        this._loadHeldExpr(fxH, VReg.A0);
+                        this._releaseHeldExpr();
                     } else {
                         this.vm.mov(VReg.A0, VReg.RET);
                         this.vm.movImm64(VReg.A1, 0x7ffb000000000000n); // JS_UNDEFINED → argIntOr default 0
@@ -6832,32 +7033,26 @@ export const FunctionCompiler = {
                     const arrLbl = this.ctx.newLabel("push_arr");
                     const endLbl = this.ctx.newLabel("push_end");
                     this.compileExpression(obj);
-                    this.vm.push(VReg.RET);            // 存 obj（用户方法路径要用）
+                    const pushObjH = this._holdExpr(VReg.RET);
                     this.vm.shrImm(VReg.V0, VReg.RET, 48);
                     this.vm.cmpImm(VReg.V0, 0x7FFE);
                     this.vm.jeq(arrLbl);
-                    // 非数组 → 用户方法（obj 在 RET 且栈顶）
-                    // x64: V0==RET==RAX，上面 shrImm 已把 RET 毁成 tag 值，
-                    // 从栈顶重载 obj（自举编译器 asm.push 发射指令被判 not a function 根因）
+                    // 非数组 → 用户方法。x64 V0==RET,shrImm 毁 RET,从 hold 重载。
                     const pn = this.getMemberPropertyName ? this.getMemberPropertyName(prop) : (prop.name || prop.value);
                     const pLbl = this.asm.addString(pn);
-                    if (this.vm.backend.name === "x64") {
-                        this.vm.load(VReg.A0, VReg.SP, 0);
-                    } else {
-                        this.vm.mov(VReg.A0, VReg.RET);
-                    }
+                    this._loadHeldExpr(pushObjH, VReg.A0);
                     this.vm.lea(VReg.A1, pLbl);
                     this.vm.call("_tag_str_a1"); // key box->helper
                     this.vm.call("_object_get");
                     this.vm.mov(VReg.A0, VReg.RET);
-                    this.vm.load(VReg.A1, VReg.SP, 0);
+                    this._loadHeldExpr(pushObjH, VReg.A1);
                     this.vm.call("_maybe_getter");
                     this.vm.mov(VReg.V6, VReg.RET);
-                    this.vm.pop(VReg.V5);
+                    this._loadHeldExpr(pushObjH, VReg.V5);
+                    this._releaseHeldExpr();
                     this.compileMethodCall(VReg.V6, VReg.V5, expr.arguments);
                     this.vm.jmp(endLbl);
                     this.vm.label(arrLbl);
-                    this.vm.pop(VReg.V0); // 丢弃存的 obj（compileArrayMethod 会重新求值 obj）
                     this.compileArrayMethod(obj, "push", expr.arguments);
                     this.vm.label(endLbl);
                     return;
@@ -6879,13 +7074,13 @@ export const FunctionCompiler = {
                     const jEndLbl = this.ctx.newLabel("join_end");
                     const objOnce = this._evalOnceToIdent(obj); // 接收者单次求值
                     this.compileExpression(objOnce);
-                    this.vm.push(VReg.RET);            // 存 obj(用户方法路径要用)
+                    const joinObjH = this._holdExpr(VReg.RET);
                     this.vm.shrImm(VReg.V0, VReg.RET, 48);
                     this.vm.cmpImm(VReg.V0, 0x7FFE);
                     this.vm.jeq(jArrLbl);
                     // TypedArray(**裸指针** high16==0 才判头字节 0x40-0x61;0x7FFC 字符串的
                     // 内容首字节('A'=0x41 等)会冒充 TA 类型字节,必须先验 tag)→ _ta_join
-                    this.vm.load(VReg.V0, VReg.SP, 0);
+                    this._loadHeldExpr(joinObjH, VReg.V0);
                     this.vm.shrImm(VReg.V1, VReg.V0, 48);
                     this.vm.cmpImm(VReg.V1, 0);
                     this.vm.jne(jUserLbl);
@@ -6895,29 +7090,23 @@ export const FunctionCompiler = {
                     this.vm.cmpImm(VReg.V0, 0x40);
                     this.vm.jge(jTaLbl);
                     this.vm.label(jUserLbl);
-                    // 非数组：用户方法(x64: V0==RET 已毁,从栈顶重载;同 push 派发器)
                     const jLbl = this.asm.addString("join");
-                    if (this.vm.backend.name === "x64") {
-                        this.vm.load(VReg.A0, VReg.SP, 0);
-                    } else {
-                        this.vm.mov(VReg.A0, VReg.RET);
-                    }
+                    this._loadHeldExpr(joinObjH, VReg.A0);
                     this.vm.lea(VReg.A1, jLbl);
                     this.vm.call("_tag_str_a1"); // key box->helper
                     this.vm.call("_object_get");
                     this.vm.mov(VReg.A0, VReg.RET);
-                    this.vm.load(VReg.A1, VReg.SP, 0);
+                    this._loadHeldExpr(joinObjH, VReg.A1);
                     this.vm.call("_maybe_getter");
                     this.vm.mov(VReg.V6, VReg.RET);
-                    this.vm.pop(VReg.V5);
+                    this._loadHeldExpr(joinObjH, VReg.V5);
+                    this._releaseHeldExpr();
                     this.compileMethodCall(VReg.V6, VReg.V5, expr.arguments);
                     this.vm.jmp(jEndLbl);
                     this.vm.label(jTaLbl);
-                    this.vm.pop(VReg.V0); // 丢弃(compileTypedArrayMethod 重新求值 obj)
                     this.compileTypedArrayMethod(objOnce, "join", expr.arguments);
                     this.vm.jmp(jEndLbl);
                     this.vm.label(jArrLbl);
-                    this.vm.pop(VReg.V0); // 丢弃(compileArrayMethod 重新求值 obj)
                     this.compileArrayMethod(objOnce, "join", expr.arguments);
                     this.vm.label(jEndLbl);
                     return;
@@ -6934,26 +7123,17 @@ export const FunctionCompiler = {
                     // `mk().pop()`/`s.push(x)`(s 为函数返回的对象,unknown 型)把对象当数组
                     // 操作 → 段错误。镜像上方 join 的 tag 派发,非 computed 才拦(computed
                     // obj["pop"] 保持)。
-                    if (!callee.computed) {
-                        // 运行时按对象头类型字节分派:数组(TYPE_ARRAY=1)与 TypedArray(0x40-0x61)
-                        // → 数组方法实现(map/filter/reduce/... 内部 _subscript_get/_array_length
-                        // 运行时处理 typed 布局);否则(同名用户对象方法)→ 通用方法查找。
-                        // 此前仅判装箱 tag 0x7FFE(纯数组),闭包内捕获的 typed array 落用户方法
-                        // 路径查 miss → 崩(nested-closure typed forEach/map/filter 段错误根因)。
-                        const objOnce = this._evalOnceToIdent(obj); // 接收者单次求值
-                        this.emitTagDispatchMethod(objOnce, prop, expr.arguments, [
-                            { type: 1, compile: () => this.compileArrayMethod(objOnce, prop.name, expr.arguments) },
-                            // TypedArray:先试 TA 专用实现(_ta_fill/slice/join/...),
-                            // 未覆盖者(map/filter/reduce 等)回退 typed-aware 数组实现。
-                            { typedArray: true, compile: () => {
-                                if (!this.compileTaMethodExt(objOnce, prop.name, expr.arguments)) {
-                                    this.compileArrayMethod(objOnce, prop.name, expr.arguments);
-                                }
-                            } },
-                        ]);
-                        return;
-                    }
-                    this.compileArrayMethod(obj, prop.name, expr.arguments);
+                    // computed 与非 computed 同一条:先按数组/TA tag 分派,否则 [[Get]]+调用。
+                    // 此前 computed obj["pop"] 无条件当数组,用户 {pop(){}} 会段错误。
+                    const objOnce = this._evalOnceToIdent(obj);
+                    this.emitTagDispatchMethod(objOnce, prop, expr.arguments, [
+                        { type: 1, compile: () => this.compileArrayMethod(objOnce, prop.name, expr.arguments) },
+                        { typedArray: true, compile: () => {
+                            if (!this.compileTaMethodExt(objOnce, prop.name, expr.arguments)) {
+                                this.compileArrayMethod(objOnce, prop.name, expr.arguments);
+                            }
+                        } },
+                    ]);
                     return;
                 }
 
@@ -6993,7 +7173,7 @@ export const FunctionCompiler = {
                     // 未覆盖者(lastIndexOf/concat)回退 typed-aware 数组实现;否则维持字符串路由。
                     const taChkLbl = this.ctx.newLabel("ambig_tachk");
                     this.compileExpression(objOnce);
-                    this.vm.push(VReg.RET);
+                    const ambigH = this._holdExpr(VReg.RET);
                     this.vm.shrImm(VReg.V1, VReg.RET, 48);
                     this.vm.cmpImm(VReg.V1, 0);
                     this.vm.jeq(taChkLbl);
@@ -7006,14 +7186,13 @@ export const FunctionCompiler = {
                     this.vm.cmpImm(VReg.V0, 0x40);
                     this.vm.jge(taLbl);
                     this.vm.label(taStrLbl);
-                    this.vm.pop(VReg.V0);
+                    this._releaseHeldExpr();
                     // 非数组：按字符串方法处理
                     if (!this.compileStringMethod(objOnce, prop.name, expr.arguments)) {
                         this.compileArrayMethod(objOnce, prop.name, expr.arguments);
                     }
                     this.vm.jmp(endLbl);
                     this.vm.label(taLbl);
-                    this.vm.pop(VReg.V0);
                     if (!this.compileTaMethodExt(objOnce, prop.name, expr.arguments)) {
                         this.compileArrayMethod(objOnce, prop.name, expr.arguments);
                     }
@@ -7027,16 +7206,17 @@ export const FunctionCompiler = {
                         const pn = this.getMemberPropertyName ? this.getMemberPropertyName(prop) : (prop.name || prop.value);
                         const pLbl = this.asm.addString(pn);
                         this.compileExpression(objOnce);
-                        this.vm.push(VReg.RET);            // this
-                        this.vm.load(VReg.A0, VReg.SP, 0);
+                        const ambigObjH = this._holdExpr(VReg.RET);
+                        this._loadHeldExpr(ambigObjH, VReg.A0);
                         this.vm.lea(VReg.A1, pLbl);
                         this.vm.call("_tag_str_a1"); // key box->helper
                         this.vm.call("_object_get");
                         this.vm.mov(VReg.A0, VReg.RET);
-                        this.vm.load(VReg.A1, VReg.SP, 0);
+                        this._loadHeldExpr(ambigObjH, VReg.A1);
                         this.vm.call("_maybe_getter");
                         this.vm.mov(VReg.V6, VReg.RET);
-                        this.vm.pop(VReg.V5);
+                        this._loadHeldExpr(ambigObjH, VReg.V5);
+                        this._releaseHeldExpr();
                         this.compileMethodCall(VReg.V6, VReg.V5, expr.arguments);
                     }
                     this.vm.label(endLbl);
@@ -7187,10 +7367,11 @@ export const FunctionCompiler = {
             if (prop && prop.type === "Identifier" && !callee.computed &&
                 prop.name === "propertyIsEnumerable" && expr.arguments.length >= 1) {
                 this.compileExpression(obj);
-                this.vm.push(VReg.RET);
+                const pieH = this._holdExpr(VReg.RET);
                 this.compileExpression(expr.arguments[0]);
                 this.vm.mov(VReg.A1, VReg.RET);
-                this.vm.pop(VReg.A0);
+                this._loadHeldExpr(pieH, VReg.A0);
+                this._releaseHeldExpr();
                 this.vm.call("_object_propertyIsEnumerable");
                 return;
             }
@@ -7198,7 +7379,7 @@ export const FunctionCompiler = {
             // 通用对象方法调用 - obj.method(args)
             // 获取方法（闭包或函数指针）并传递 this
             this.compileExpression(obj); // obj -> RET
-            this.vm.push(VReg.RET); // 保存 obj 作为 this
+            const thisH = this._holdExpr(VReg.RET);
 
             // `call`/`apply`/`bind` are also ordinary method names on the
             // compiler's own classes (notably VirtualMachine.call and the
@@ -7233,7 +7414,8 @@ export const FunctionCompiler = {
                 // 勿重求值(双副作用)、勿早退留悬栈(此前每个 .call 编译点泄 16B
                 // 栈 → _main 尾声读错帧,退出段错误的根因)
                 const cabFn = this.ctx.allocLocal(`__cab_fn_${this.nextLabelId()}`);
-                this.vm.pop(VReg.V1);
+                this._loadHeldExpr(thisH, VReg.V1);
+                this._releaseHeldExpr();
                 this.vm.store(VReg.FP, cabFn, VReg.V1);
                 this.vm.mov(VReg.RET, VReg.V1);
                 const cabGen = this.ctx.newLabel("cab_generic");
@@ -7352,19 +7534,19 @@ export const FunctionCompiler = {
 
             // this.#m() / C.#g(): PrivateBrandCheck on the receiver before Get.
             // Generic emitObjectGetIC walks proto, so D.f() → this.#g() found C.#g.
-            // obj is already pushed as this (compileExpression + push above).
             if (!callee.computed && this._isPrivateMemberKey && this._isPrivateMemberKey(prop)) {
                 const mangled = this.manglePrivateName(prop.name);
-                this.vm.load(VReg.RET, VReg.SP, 0);
+                this._loadHeldExpr(thisH, VReg.RET);
                 this.emitPrivateBrandCheck(mangled, 0, !!(obj && obj.type === "ThisExpression"));
-                this.vm.load(VReg.A0, VReg.SP, 0);
+                this._loadHeldExpr(thisH, VReg.A0);
                 this.emitBoxedStringKey(mangled, VReg.A1);
                 this.vm.call("_object_get");
                 this.vm.mov(VReg.A0, VReg.RET);
-                this.vm.load(VReg.A1, VReg.SP, 0);
+                this._loadHeldExpr(thisH, VReg.A1);
                 this.vm.call("_maybe_getter");
                 this.vm.mov(VReg.V6, VReg.RET);
-                this.vm.pop(VReg.V5);
+                this._loadHeldExpr(thisH, VReg.V5);
+                this._releaseHeldExpr();
                 this.compileMethodCall(VReg.V6, VReg.V5, expr.arguments);
                 return;
             }
@@ -7379,13 +7561,14 @@ export const FunctionCompiler = {
                 // computed 键（obj[expr]()）：运行时求键，_subscript_get 分派
                 this.compileExpression(prop);
                 this.vm.mov(VReg.A1, VReg.RET); // 键
-                this.vm.load(VReg.A0, VReg.SP, 0); // obj (this)
+                this._loadHeldExpr(thisH, VReg.A0);
                 this.vm.call("_subscript_get"); // 取方法值 -> RET
                 this.vm.mov(VReg.A0, VReg.RET);
-                this.vm.load(VReg.A1, VReg.SP, 0);
+                this._loadHeldExpr(thisH, VReg.A1);
                 this.vm.call("_maybe_getter");
                 this.vm.mov(VReg.V6, VReg.RET);
-                this.vm.pop(VReg.V5);
+                this._loadHeldExpr(thisH, VReg.V5);
+                this._releaseHeldExpr();
                 this.compileMethodCall(VReg.V6, VReg.V5, expr.arguments);
                 return;
             }
@@ -7401,23 +7584,32 @@ export const FunctionCompiler = {
             if (propName && this.emitArrayProtoObject &&
                 (propName.startsWith("Symbol.") || propName === "reduce" ||
                  propName === "reduceRight")) {
-                this.vm.push(VReg.RET);
                 if (objType === "String" && propName.startsWith("Symbol.") &&
                     this.emitStringProtoObject) {
                     this.emitStringProtoObject();
                 } else {
                     this.emitArrayProtoObject();
                 }
-                this.vm.pop(VReg.RET);
+                this._loadHeldExpr(thisH, VReg.RET);
             }
-            if (propName === "Symbol.iterator" || propName === "Symbol.asyncIterator") {
-                this.vm.lea(VReg.A0, propName === "Symbol.iterator" ? "_symwk_iterator" : "_symwk_asyncIterator");
+            const wkCallName = (propName && propName.startsWith("Symbol."))
+                ? propName.slice(7) : null;
+            const wkCallNames = ["iterator", "asyncIterator", "hasInstance", "isConcatSpreadable",
+                "match", "matchAll", "replace", "search", "species", "split", "toPrimitive",
+                "toStringTag", "unscopables"];
+            // GET of obj[Symbol.match] already well-known-retries (members.js).
+            // CALL of obj[Symbol.match](...) used to emitObjectGetIC("Symbol.match")
+            // as a string key → undefined → "not a function" (test262
+            // builtin-failure-y-set-lastindex / match-failure). Same dual-key
+            // retry as iterator/asyncIterator.
+            if (wkCallName && wkCallNames.indexOf(wkCallName) >= 0) {
+                this.vm.lea(VReg.A0, "_symwk_" + wkCallName);
                 this.vm.lea(VReg.A1, this.asm.addString(propName));
                 this.vm.movImm64(VReg.V1, 0x7ffc000000000000n);
                 this.vm.or(VReg.A1, VReg.A1, VReg.V1);
                 this.vm.call("_symbol_wellknown");
                 this.vm.mov(VReg.A1, VReg.RET);
-                this.vm.load(VReg.A0, VReg.SP, 0); // recv 仍在栈上(5931 push)
+                this._loadHeldExpr(thisH, VReg.A0);
                 this.vm.call("_subscript_get");
                 const wkCallDone = this.ctx.newLabel("symwk_call_done");
                 const wkCallStr = this.ctx.newLabel("symwk_call_str");
@@ -7427,15 +7619,17 @@ export const FunctionCompiler = {
                 this.vm.mov(VReg.V6, VReg.RET);
                 this.vm.jmp(wkCallDone);
                 this.vm.label(wkCallStr);
-                this.vm.load(VReg.RET, VReg.SP, 0);
+                this._loadHeldExpr(thisH, VReg.RET);
                 this.emitObjectGetIC(propName);
                 this.vm.mov(VReg.V6, VReg.RET);
                 this.vm.label(wkCallDone);
             } else {
+                this._loadHeldExpr(thisH, VReg.RET);
                 this.emitObjectGetIC(propName);
                 this.vm.mov(VReg.V6, VReg.RET); // 方法指针/闭包
             }
-            this.vm.pop(VReg.V5); // 恢复 obj (this)
+            this._loadHeldExpr(thisH, VReg.V5);
+            this._releaseHeldExpr();
 
             // 使用带 this 的闭包调用。String.prototype.concat is a
             // variadic built-in and the generic method-value path is the one
@@ -7467,11 +7661,12 @@ export const FunctionCompiler = {
                     this._emitObjectEnvHasBinding(cur[wi], callee.name, missL);
                     // x64 V0≡RET: HasBinding 后从帧槽重载 (V5=this, V6=func)
                     this.vm.load(VReg.A0, VReg.FP, cur[wi]);
-                    this.vm.push(VReg.A0);
+                    const withH = this._holdExpr(VReg.A0);
                     this.emitBoxedStringKey(callee.name, VReg.A1);
                     this.vm.call("_object_get");
                     this.vm.mov(VReg.A0, VReg.RET);
-                    this.vm.pop(VReg.A1);
+                    this._loadHeldExpr(withH, VReg.A1);
+                    this._releaseHeldExpr();
                     this.vm.call("_maybe_getter");
                     this.vm.mov(VReg.V6, VReg.RET);
                     this.vm.load(VReg.V5, VReg.FP, cur[wi]);
@@ -7492,11 +7687,12 @@ export const FunctionCompiler = {
                         const missL = this.ctx.newLabel("with_call_omiss");
                         this._emitObjectEnvHasBinding(outer[wi], callee.name, missL);
                         this.vm.load(VReg.A0, VReg.FP, outer[wi]);
-                        this.vm.push(VReg.A0);
+                        const withOH = this._holdExpr(VReg.A0);
                         this.emitBoxedStringKey(callee.name, VReg.A1);
                         this.vm.call("_object_get");
                         this.vm.mov(VReg.A0, VReg.RET);
-                        this.vm.pop(VReg.A1);
+                        this._loadHeldExpr(withOH, VReg.A1);
+                        this._releaseHeldExpr();
                         this.vm.call("_maybe_getter");
                         this.vm.mov(VReg.V6, VReg.RET);
                         this.vm.load(VReg.V5, VReg.FP, outer[wi]);
@@ -7528,7 +7724,12 @@ export const FunctionCompiler = {
                     this.compileCallArguments(expr.arguments);
                     this.vm.lea(VReg.S1, funcLabel);
                     this.emitOrdinaryCallBindThis(VReg.S1);
-                    this.vm.call(funcLabel);
+                    if (expr._tailCall && this._shouldTailCall()) {
+                        this.vm.movImm(VReg.S0, 0);
+                        this.emitTailCallJump();
+                    } else {
+                        this.vm.call(funcLabel);
+                    }
                     return;
                 }
             }
@@ -7537,7 +7738,12 @@ export const FunctionCompiler = {
                 this.compileCallArguments(expr.arguments);
                 this.vm.lea(VReg.S1, shimLabel);
                 this.emitOrdinaryCallBindThis(VReg.S1);
-                this.vm.call(shimLabel);
+                if (expr._tailCall && this._shouldTailCall()) {
+                    this.vm.movImm(VReg.S0, 0);
+                    this.emitTailCallJump();
+                } else {
+                    this.vm.call(shimLabel);
+                }
                 return;
             }
             // Unresolvable / global identifier call: GetValue(ref) then Call.

@@ -86,6 +86,10 @@ export class ELFObjectGenerator {
     }
 
     writeBytes(bytes) {
+        if (bytes && bytes._asmjsByteBuffer) {
+            bytes.appendToArray(this.buffer);
+            return;
+        }
         for (let i = 0; i < bytes.length; i++) {
             this.write(bytes[i]);
         }

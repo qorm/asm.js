@@ -1,8 +1,8 @@
 # asm.js ES 标准支持列表
 
-> 状态基线: **v0.3.0**(2026-07-26;编译器全确定性 `gen1==gen2==gen3`,fixtures 380/380)。
-> 本文件是**当前支持面清单**,不含修复过程——历史修复日志与旧版逐条注记已归档至 [archive/ES_SUPPORT_HISTORY.md](./archive/ES_SUPPORT_HISTORY.md),版本级变更以 [CHANGELOG.md](../CHANGELOG.md) 为准。
-> 核对方法: `node tests/run_fixtures.mjs` 全量 + 逐特性最小程序与 `node` 输出逐字节对照 + es-compat 差分计分卡(`tests/es-compat/`,诚实覆盖率 ~42%) + test262 差分(`tests/test262/run.mjs`,当前基线 2,568/6,462 = 39.74%,stride-5 子集;CRASH 181、COMPILE_FAIL 40)。
+> 状态基线数字以 [FACTS.md](./FACTS.md) 与 [CHANGELOG.md](../CHANGELOG.md) 为准(本文件头部曾冻结在 v0.3.0 / test262 39.74%,已过期)。
+> 本文件是**语言面清单**,不含修复过程——历史修复日志与旧版逐条注记已归档至 [archive/ES_SUPPORT_HISTORY.md](./archive/ES_SUPPORT_HISTORY.md)。
+> 核对方法: `node scripts/run-fixtures.mjs` 全量 + 与 node 输出对照 + `tests/test262/run.mjs`(口径见 FACTS.md)。
 > 图例: ✅ 支持(与 node 对拍一致)/ ⚠️ 部分支持(注明偏差)/ ❌ 未支持 / 🔷 引擎库(L2)形态专属,AOT 非目标
 
 ## 1. ES5 及更早
@@ -140,7 +140,8 @@
 | `Object.groupBy` / `Map.groupBy` | ✅ | 非数组可迭代输入未支持 |
 | `Promise.withResolvers`(2024)/ `Promise.try`(2025) | ✅ | |
 | RegExp 内联修饰组 `(?i:...)`(2024) | ✅ | |
-| RegExp `v` 标志 / `\p{...}` Unicode 属性转义 | ❌ | 需 Unicode DB,大项 |
+| RegExp `\p{...}` Unicode 属性转义 | ✅ | 官方 stride-5 含 generated property-escapes;macos-arm64 全绿 |
+| RegExp `v` 标志 | ❌ | 未做 |
 | resizable ArrayBuffer / `Array.fromAsync` | ❌ | |
 | ES2025 Set 组合子(union/intersection/difference/symmetricDifference/isSubsetOf/isSupersetOf/isDisjointFrom) | ✅ | |
 | `RegExp.escape`(2025) | ✅ | |
@@ -162,7 +163,7 @@
 | 对象/能力 | 状态 | 备注 |
 |------|------|------|
 | JSON | ✅ | stringify/parse 全参(replacer/space/reviver/toJSON、Date→ISO);循环引用不抛 |
-| RegExp 引擎(自研回溯 shim) | ⚠️ 大面完整 | 字面量/`new RegExp`、flags `gimsyd`、命名组+`\k`+`$<n>`、lookaround、反向引用、matchAll、`replace(re, fn)`(含命名组末参)、split、内联修饰组;`.test`/`.exec` 对静态类型未知的接收者(如作为参数传入的正则)经 `__isRegExp` 运行时判别派发。❌:`\p{}`、`v` 标志、RegExp 子类化、`Symbol.match/replace/split`、`prototype.compile` |
+| RegExp 引擎(自研回溯 shim) | ⚠️ 大面完整 | 字面量/`new RegExp`、flags `gimsyd`、命名组+`\k`+`$<n>`、lookaround、反向引用、matchAll、`replace(re, fn)`(含命名组末参)、split、内联修饰组、`\p{...}` 属性转义(官方样本 generated property-escapes);`.test`/`.exec` 对静态类型未知的接收者(如作为参数传入的正则)经 `__isRegExp` 运行时判别派发。❌:`v` 标志、RegExp 子类化、`prototype.compile` |
 | TypedArray / ArrayBuffer / DataView | ✅ | 11 种视图、缓冲区多视图共享内存、`.buffer` 身份稳定、`.byteOffset`、Uint8Clamped 饱和、DataView 全宽度×端序;非原地 `toReversed`/`toSorted`/`with`(返回同类型副本,原数组不变;`with` 支持负索引);原地 `copyWithin(target,start?,end?)`(memmove 语义,重叠双向正确、负索引;此前 native 段错误);串化 `String(ta)`/`""+ta`/`` `${ta}` ``/`ta.toString()` → 逗号连接元素(对齐 node,此前为垃圾浮点);`console.log(ta)` → `Type(len) [ e0, e1 ]`(顶层/嵌套/多参一致,对齐 node,此前打 `[object Object]`)。偏差:sort 比较函数忽略、subarray 为拷贝、`toSpliced` 未实现 |
 | Math | ✅ | 全函数族(三角/双曲/对数/幂等)~1ulp;一元族可作一等值(`arr.map(Math.floor)`) |
 | Date | ✅ | 构造/历法 getter·setter/parse/ISO/toLocale* 系/装箱语义;getTimezoneOffset 恒 0 |
@@ -187,6 +188,5 @@
 - `--target wasm32-wasi` WebAssembly 目标([WASM_DESIGN.md](./WASM_DESIGN.md))。
 
 ## 16. 一句话结论
-1. `[] + x` 错值(ToPrimitive)
 
-经此前修复波,asm.js 的常用 ES 面(class 全家桶/async 全形态/迭代协议/属性描述符与枚举序/Proxy·Reflect/正则大面/typed arrays/JSON 全参)已与 node 对拍一致;自举链路覆盖的核心子集经逐字节确定性自举门(gen1==gen2==gen3)验证。剩余结构性缺口:字符串 UTF-16 码元语义、内建子类化与 `Symbol.species`、Iterator helpers、`\p{}`/`v` 正则、Intl(非目标)。
+经此前修复波,asm.js 的常用 ES 面(class 全家桶/async 全形态/迭代协议/属性描述符与枚举序/Proxy·Reflect/正则大面含 `\p{...}`/typed arrays/JSON 全参)已与 node 对拍一致;自举链路覆盖的核心子集经逐字节确定性自举门(gen1==gen2==gen3)验证。剩余结构性缺口:字符串 UTF-16 码元语义、内建子类化与 `Symbol.species`、Iterator helpers、RegExp `v` 标志、Intl(非目标)。口径数字见 [FACTS.md](./FACTS.md)。

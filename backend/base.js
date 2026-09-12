@@ -159,7 +159,7 @@ export class Backend {
         throw new Error("Backend.prologue must be implemented");
     }
 
-    epilogue(savedRegs) {
+    epilogue(savedRegs, stackSize, keep) {
         throw new Error("Backend.epilogue must be implemented");
     }
 

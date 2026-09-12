@@ -1,7 +1,7 @@
 # 28GB 初始堆规避项 —— `_heap_grow` 重定位 bug 根因研究
 
 > 状态:纯研究交付物,**不含任何代码修复**(修复明确延后至 S5 之后)。
-> 行号全部于 2026-07-22 对 `/Users/dmy/work/jsbin/runtime/core/allocator.js` 实地 Read 核实。
+> 行号全部于 2026-07-22 对 `runtime/core/allocator.js` 实地 Read 核实。
 > 引用文件均为仓库绝对路径;除本文件外未改动任何文件。
 
 ---
@@ -119,7 +119,7 @@ mmap(hint=current_end) 恰好返回 current_end → 线性延展
 
 ## 3. bug 精确定位
 
-全部行号指 `/Users/dmy/work/jsbin/runtime/core/allocator.js`(除另注)。
+全部行号指 `runtime/core/allocator.js`(除另注)。
 
 ### 3.1 链路一:弃旧段 → 范围漏洞 → 旧段活物失明 → 复用毁堆
 
@@ -293,7 +293,7 @@ mmap(hint=current_end) 恰好返回 current_end → 线性延展
 
 ## 附录 A:已核实行号索引(2026-07-22)
 
-文件 `/Users/dmy/work/jsbin/runtime/core/allocator.js`(除另注):
+文件 `runtime/core/allocator.js`(除另注):
 
 | 主题 | 行号 |
 |---|---|
@@ -330,14 +330,14 @@ mmap(hint=current_end) 恰好返回 current_end → 线性延展
 | `_gc_last_ptr` 数据标号(「上次 GC 后的 heap_ptr」);`_shadow_base`/`_shadow_miss` | :4315;:4317-4319 |
 
 其他文件:
-- `/Users/dmy/work/jsbin/BOOTSTRAP_RULES.md`:11(P0-1 行)、:38(不变量 #5)、
+- `BOOTSTRAP_RULES.md`:11(P0-1 行)、:38(不变量 #5)、
   :48(§1.5 疑似 P0-1)、:70(A 组分工)。
-- `/Users/dmy/work/jsbin/plan.md`:87(风险表行)。
-- `/Users/dmy/work/jsbin/docs/ROADMAP.md`:231-233(bitmap 精确化路线)、
+- `plan.md`:87(风险表行)。
+- `docs/ROADMAP.md`:231-233(bitmap 精确化路线)、
   :234-235(移动/压实非目标)。
-- `/Users/dmy/work/jsbin/docs/PERF_PLAN.md`:273-275(L5 复制式压实剩余项)。
-- `/Users/dmy/work/jsbin/self.sh`:2-4(定点链入口,无 GC_* env)。
-- `/Users/dmy/work/jsbin/README.md` / `README.zh-CN.md`:**当前无 32GB 声明**
+- `docs/PERF_PLAN.md`:273-275(L5 复制式压实剩余项)。
+- `self.sh`:2-4(定点链入口,无 GC_* env)。
+- `README.md` / `README.zh-CN.md`:**当前无 32GB 声明**
   (grep 无命中,§6 为建议新增措辞)。
 
 ## 附录 B:行号漂移说明(分诊值 → 核实值)

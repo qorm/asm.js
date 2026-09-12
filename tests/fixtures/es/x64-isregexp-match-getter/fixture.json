@@ -1,0 +1,10 @@
+{
+  "description": "IsRegExp must Get @@match before the regexp brand check so a throwing match getter surfaces, not a TypeError from __isRegExp.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "threw\nthrew",
+    "exitCode": 0
+  }
+}

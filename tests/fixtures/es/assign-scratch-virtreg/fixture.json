@@ -1,0 +1,10 @@
+{
+  "description": "Assignment/update temps use expr-scratch T* (LLVM virtreg) instead of push/pop.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "18,16,18\n1\n2\n6\n6\n7\n3\n10\n11\n0|1\n0\n2\n5\n3\n4\n5\n1",
+    "exitCode": 0
+  }
+}

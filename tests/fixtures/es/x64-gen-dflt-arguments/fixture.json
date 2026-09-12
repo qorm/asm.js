@@ -1,0 +1,10 @@
+{
+  "description": "Generator FDI stub must snapshot its own incoming args, not inherit the enclosing script _argRegSpill, so default parameters can read arguments[2].",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "third\nfourth\nthird",
+    "exitCode": 0
+  }
+}

@@ -969,9 +969,9 @@ export const MemberCompiler = {
     // 私有成员品牌检查:接收者(装箱)在 RET,检查后 RET 原样保留。
     // mode 0=读(缺私有名/无 getter 抛),1=写(缺私有名/私有方法/无 setter 抛)。
     emitPrivateBrandCheck(mangledName, mode, receiverIsThis) {
-        this.vm.push(VReg.RET);
+        const recvH = this._holdExpr(VReg.RET);
         this.emitBoxedStringKey(mangledName, VReg.A1);
-        this.vm.pop(VReg.A0);
+        this._loadHeldExpr(recvH, VReg.A0);
         // Pass the current method receiver to the runtime so repeated
         // evaluations of an instance class can be distinguished by their
         // prototype identity (the textual mangled key is shared by evals).
@@ -1005,10 +1005,10 @@ export const MemberCompiler = {
         } else {
             this.vm.movImm(VReg.A3, 0);
         }
-        this.vm.push(VReg.A0);
         this.vm.movImm(VReg.A2, mode);
         this.vm.call("_private_brand_check");
-        this.vm.pop(VReg.RET);
+        this._loadHeldExpr(recvH, VReg.RET);
+        this._releaseHeldExpr();
     },
 
     getMemberPropertyName(property) {
@@ -1025,17 +1025,14 @@ export const MemberCompiler = {
         // 仅字符串字面量算属性名；数字字面量是数组下标，必须走 subscript 路径
         if ((property.type === "Literal" || property.type === "StringLiteral") &&
             typeof property.value === "string") return String(property.value);
-        // well-known Symbol 计算键归一为静态字符串键 "Symbol.xxx"(存/读一致):
-        // 运行时创建的 async generator 把 Symbol.asyncIterator 存字符串键 "Symbol.asyncIterator",
-        // for await 的 RIGHT[Symbol.asyncIterator] 计算读需同键才命中(否则走动态 _js_prop_key
-        // 符号键 → 查不到 async-gen 的迭代器 → 空迭代)。iterator 行为不变。
-        // species 同协议:Map/Set/Promise/RegExp 构造器的 getter 块双键落位,
-        // X[Symbol.species] 读恒等于本构造器(此前动态符号键路径返残值)。
+        // well-known Symbol 计算键归一为静态字符串键名 "Symbol.xxx"，供编译期
+        // 选择真实 Symbol 键或兼容的双键协议；不能让这些键落入通用动态路径。
         if (property.type === "MemberExpression" &&
             property.object && property.object.type === "Identifier" && property.object.name === "Symbol" &&
             property.property && property.property.type === "Identifier" &&
-            (property.property.name === "iterator" || property.property.name === "asyncIterator" ||
-             property.property.name === "species")) {
+            ["iterator", "asyncIterator", "hasInstance", "isConcatSpreadable",
+                "match", "matchAll", "replace", "search", "species", "split",
+                "toPrimitive", "toStringTag", "unscopables"].includes(property.property.name)) {
             return "Symbol." + property.property.name;
         }
         return null;
@@ -1070,12 +1067,13 @@ export const MemberCompiler = {
         // NO_IC 在 compile() 入口缓存到 this._envNoIC——热路径勿每次读 process.env
         // (注释:编译产物内 env 恒空,但属性读仍贵)。
         if (this._envNoIC || this.engineNoIC) {
-            vm.push(VReg.RET);
+            const icH = this._holdExpr(VReg.RET);
             vm.mov(VReg.A0, VReg.RET);
             this.emitBoxedStringKey(propName, VReg.A1);
             vm.call("_object_get");
             vm.mov(VReg.A0, VReg.RET);
-            vm.pop(VReg.A1);
+            this._loadHeldExpr(icH, VReg.A1);
+            this._releaseHeldExpr();
             vm.call("_maybe_getter");
             return;
         }
@@ -3765,22 +3763,9 @@ export const MemberCompiler = {
     // (规范值,闭包属性侧表),再 _reSetProtoProp 落原型(attr 5)。helperLabel 是运行时
     // 标签或已解析的 shim 函数标签,vm.lea 链接期解析。
     emitDateProtoMethodEntry(protoSlot, name, helperLabel, length) {
-        const vm = this.vm;
-        this.emitBuiltinMethodRefClosure(helperLabel); // RET = 闭包
-        vm.mov(VReg.S0, VReg.RET);                     // 跨 call 暂存(closure_prop_set 毁 RET)
-        vm.mov(VReg.A0, VReg.S0);
-        this.emitBoxedStringKey("name", VReg.A1);
-        vm.lea(VReg.A2, this.asm.addString(name));
-        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
-        vm.or(VReg.A2, VReg.A2, VReg.V1);
-        vm.call("_closure_prop_set");
-        vm.mov(VReg.A0, VReg.S0);
-        this.emitBoxedStringKey("length", VReg.A1);
-        vm.movImm(VReg.A2, length);
-        vm.scvtf(0, VReg.A2);
-        vm.fmovToInt(VReg.A2, 0);
-        vm.call("_closure_prop_set");
-        vm.mov(VReg.RET, VReg.S0);                     // 恢复闭包供 _reSetProtoProp
+        // name/length 必须 _closure_prop_define:元数据 arity 回落为 0 时
+        // _closure_prop_set 会把已存在的不可写 name/length 忽略(gOPD 全空)。
+        this.emitBuiltinMethodRefClosureMeta(helperLabel, name, length);
         this._reSetProtoProp(protoSlot, name, BUILTIN_PROP_ATTR);
     },
 
@@ -3845,12 +3830,27 @@ export const MemberCompiler = {
             const helper = shimReady ? this.getFunctionLabel(m[1]) : "_date_toISOString";
             this.emitDateProtoMethodEntry(protoSlot, m[0], helper, m[2]);
         }
-        // [gOPD 补全] toTimeString:__date_shim 无此导出(index.js 注入 import 列表固定,
-        // 不进 DATE_PROTO_SHIM_METHODS,否则 dateShimReady 恒 false 拉垮真 shim 族)→
-        // 恒占位 _date_toISOString(输出格式记偏差,同 shim 未注入的 locale 族口径)。
-        // gOPD(Date.prototype,"toTimeString") 描述符/身份/name/length 均规范
-        // (15.2.3.3-4-156);值读经通用 _object_get 取同一 own prop。
-        this.emitDateProtoMethodEntry(protoSlot, "toTimeString", "_date_toISOString", 0);
+        // toTimeString is TimeString+TimeZoneString, not the full toString.
+        this.emitDateProtoMethodEntry(protoSlot, "toTimeString", "_date_toTimeString", 0);
+        // Date.prototype[@@toPrimitive]:{writable:false, enumerable:false, configurable:true}
+        this.emitBuiltinMethodRefClosureMeta("_date_toPrimitive", "[Symbol.toPrimitive]", 1);
+        vm.mov(VReg.S0, VReg.RET);
+        vm.lea(VReg.A0, "_symwk_toPrimitive");
+        vm.lea(VReg.A1, this.asm.addString("Symbol.toPrimitive"));
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A1, VReg.A1, VReg.V1);
+        vm.call("_symbol_wellknown");
+        vm.mov(VReg.S1, VReg.RET);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        vm.mov(VReg.A2, VReg.S0);
+        vm.call("_object_set");
+        vm.lea(VReg.V0, protoSlot);
+        vm.load(VReg.A0, VReg.V0, 0);
+        vm.mov(VReg.A1, VReg.S1);
+        vm.movImm(VReg.A2, 4); // writable:false, enumerable:false, configurable:true
+        vm.call("_object_set_prop_attr");
         // prototype.constructor = Date(从槽读,已就绪 → 不回调 emitDateCtorObject)
         vm.lea(VReg.V0, ctorSlot);
         vm.load(VReg.RET, VReg.V0, 0);
@@ -5288,11 +5288,12 @@ export const MemberCompiler = {
         // initializes fields. Once-flag: super() twice must not re-init.
         if (this.ctx._ctorFieldInitArgs && !this.ctx._ctorFieldsEmitted) {
             this.ctx._ctorFieldsEmitted = true;
-            vm.push(VReg.RET);
+            const superRetH = this._holdExpr(VReg.RET);
             const fi = this.ctx._ctorFieldInitArgs;
             this.emitCtorFieldInits(fi.instanceFields, fi.privateFields, fi.className,
                 fi.thisOffset, fi.cfkeysLabel, fi.privateMethods, fi.labelId);
-            vm.pop(VReg.RET);
+            this._loadHeldExpr(superRetH, VReg.RET);
+            this._releaseHeldExpr();
         }
         vm.load(VReg.RET, VReg.FP, retOff);
     },
@@ -5353,31 +5354,32 @@ export const MemberCompiler = {
         vm.mov(VReg.S0, VReg.RET);
         vm.load(VReg.A0, VReg.FP, fpSlot);
         vm.mov(VReg.A1, VReg.S0);
-        vm.push(VReg.A0); // thisArg 供 accessor
-        vm.call("_object_get");
-        vm.mov(VReg.A0, VReg.RET);
-        vm.pop(VReg.A1);
-        vm.call("_maybe_getter");
+        vm.call("_subscript_get"); // ToPropertyKey + Get + getter(同 _get_method_iterator)
+        // `_object_get` 对 well-known 符号键在 x64 上会 miss,即使 JS `obj[Symbol.unscopables]` 命中.
         // Type(unscopables) is Object:裸堆 / 0x7FFD / 0x7FFE / 0x7FFF;null/0 另排
-        vm.cmpImm(VReg.RET, 0);
+        // x64 V0≡RET:shrImm(V0,RET,48) 就地毁掉对象,随后 mov A0,RET 把标签当对象
+        // Get → with 不尊重 unscopables。值进 V6,标签进 V5。
+        vm.mov(VReg.V6, VReg.RET);
+        vm.cmpImm(VReg.V6, 0);
         vm.jeq(hitL); // 0.0 / null ptr — 非 Object
-        vm.shrImm(VReg.V0, VReg.RET, 48);
-        vm.cmpImm(VReg.V0, 0);
+        vm.shrImm(VReg.V5, VReg.V6, 48);
+        vm.cmpImm(VReg.V5, 0);
         vm.jeq(isObjL);
-        vm.cmpImm(VReg.V0, 0x7FFD);
+        vm.cmpImm(VReg.V5, 0x7FFD);
         vm.jeq(isObjL);
-        vm.cmpImm(VReg.V0, 0x7FFE);
+        vm.cmpImm(VReg.V5, 0x7FFE);
         vm.jeq(isObjL);
-        vm.cmpImm(VReg.V0, 0x7FFF);
+        vm.cmpImm(VReg.V5, 0x7FFF);
         vm.jeq(isObjL);
         vm.jmp(hitL); // 非 Object(含 null/undefined/原始)
         vm.label(isObjL);
-        vm.mov(VReg.A0, VReg.RET);
+        vm.mov(VReg.A0, VReg.V6);
+        const unscH = this._holdExpr(VReg.A0);
         this.emitBoxedStringKey(name, VReg.A1);
-        vm.push(VReg.A0);
         vm.call("_object_get");
         vm.mov(VReg.A0, VReg.RET);
-        vm.pop(VReg.A1);
+        this._loadHeldExpr(unscH, VReg.A1);
+        this._releaseHeldExpr();
         vm.call("_maybe_getter");
         vm.mov(VReg.A0, VReg.RET);
         vm.call("_to_boolean");
@@ -5405,11 +5407,12 @@ export const MemberCompiler = {
         // (delete-in-unscopables 会落到外层/0 而非 undefined)。
         this._emitObjectEnvHasProperty(slot, name, goneL);
         this.vm.load(VReg.A0, VReg.FP, slot);
-        this.vm.push(VReg.A0);
+        const withGetH = this._holdExpr(VReg.A0);
         this.emitBoxedStringKey(name, VReg.A1);
         this.vm.call("_object_get");
         this.vm.mov(VReg.A0, VReg.RET);
-        this.vm.pop(VReg.A1);
+        this._loadHeldExpr(withGetH, VReg.A1);
+        this._releaseHeldExpr();
         this.vm.call("_maybe_getter");
         this.vm.jmp(doneL);
         this.vm.label(goneL);
@@ -5547,13 +5550,8 @@ export const MemberCompiler = {
                     this.emitUninitializedBindingGuard(name, VReg.RET);
                 }
             } else {
-                // LSRA:非装箱局部优先 T*(录制期 mov);否则 FP load
-                const _lt = this.ctx.localTemps && this.ctx.localTemps.get(name);
-                if (_lt && !this.ctx.isRawIntVar(name)) {
-                    this.vm.mov(VReg.RET, _lt);
-                } else {
-                    this.vm.load(VReg.RET, VReg.FP, offset);
-                }
+                // LSRA:非装箱局部优先 T*(仅仍在录制时);否则 FP load
+                this._loadLocalTemp(name, offset, VReg.RET);
                 // [批次D TDZ] 仅 blockscope.js 标记的先读后声明点发守卫,正常读零税
                 if (expr._tdz) this.emitUninitializedBindingGuard(name, VReg.RET);
                 // [解箱①] 裸 int 驻留变量在通用 JSValue 上下文(console.log/return/传参/
@@ -6089,6 +6087,27 @@ export const MemberCompiler = {
         return Number(k) <= 4294967294;
     },
 
+    // Integer Literal / NumericLiteral (incl. 1_2_3_4_5_6_7_8).
+    _isIntegerIndexLiteral(prop) {
+        return !!(prop && (prop.type === "Literal" || prop.type === "NumericLiteral") &&
+            typeof prop.value === "number" &&
+            prop.value === prop.value &&
+            Math.trunc(prop.value) === prop.value);
+    },
+
+    // Naked integer keys with high16==0 and value >= ptrFloor alias the
+    // native image window. _js_prop_key then takes _jpk_asis (data-segment
+    // leftover) and _getStrContent dereferences the integer as a pointer.
+    // linux ptrFloor=0x400000 so o[12345678] SIGSEGV; macos/windows
+    // ptrFloor=2^32 so int32 keys were already safe. Box those as float64.
+    _isSafeNakedSubscriptIndex(idx) {
+        if (typeof idx !== "number" || idx !== idx) return false;
+        if (Math.trunc(idx) !== idx) return false;
+        if (idx < 0 || idx > 0x7fffffff) return false;
+        const floor = this.vm && this.vm.ptrFloor != null ? Number(this.vm.ptrFloor) : 0x400000;
+        return idx < floor;
+    },
+
     // OptionalChain continuation: `a?.b.c` / `o?.c.#f` / `a?.b.c(++x).d`.
     // Spec OptionalExpression short-circuits the *whole* chain when the
     // OptionalChain root is nullish. Parser only stamps `optional` on the
@@ -6376,7 +6395,7 @@ export const MemberCompiler = {
                 // 原型)**,接收者须跨物化保住(否则 IC 把原型当接收者读 → for-await
                 // 的 right[Symbol.asyncIterator] 恒 miss → 「obj is not iterable」回归)。
                 if (computedPropName.startsWith("Symbol.")) {
-                    this.vm.push(VReg.RET);
+                    const symRecvH = this._holdExpr(VReg.RET);
                     if (this.emitArrayProtoObject) this.emitArrayProtoObject();
                     // String primitive GET of @@iterator walks _nsobj_string_proto
                     // (0x7FFC named IC used to miss). Dual key "Symbol.iterator"
@@ -6386,7 +6405,8 @@ export const MemberCompiler = {
                         this.emitStringProtoObject) {
                         this.emitStringProtoObject();
                     }
-                    this.vm.pop(VReg.RET);
+                    this._loadHeldExpr(symRecvH, VReg.RET);
+                    this._releaseHeldExpr();
                 }
                 // Dual-key leftover: getMemberPropertyName maps Symbol.iterator
                 // to the string key "Symbol.iterator" (Array proto). defineProperty
@@ -6470,38 +6490,40 @@ export const MemberCompiler = {
                     // [求值序] 非纯按规范对象→键;皆纯保持原序。
                     if (this.isPureExpr(expr.object) && this.isPureExpr(expr.property)) {
                         this.compileExpression(expr.property);
-                        this.vm.push(VReg.RET);
+                        const keyH = this._holdExpr(VReg.RET);
                         this.compileExpression(expr.object);
                         this.vm.mov(VReg.A0, VReg.RET);
-                        this.vm.pop(VReg.A1);
+                        this._loadHeldExpr(keyH, VReg.A1);
+                        this._releaseHeldExpr();
                     } else {
                         this.compileExpression(expr.object);
-                        this.vm.push(VReg.RET);
+                        const objH = this._holdExpr(VReg.RET);
                         this.compileExpression(expr.property);
                         this.vm.mov(VReg.A1, VReg.RET);
-                        this.vm.pop(VReg.A0);
+                        this._loadHeldExpr(objH, VReg.A0);
+                        this._releaseHeldExpr();
                     }
                     this.vm.call("_subscript_get");
                 }
-            } else if (expr.property.type === "Literal" && typeof expr.property.value === "number" &&
-                       Math.trunc(expr.property.value) === expr.property.value) {
+            } else if (this._isIntegerIndexLiteral(expr.property)) {
                 // 静态索引：arr[0]（仅整数字面量;o[2.5] 若在此被 Math.trunc 截成 2
                 // 会与 o[2] 塌键 [#39],非整数字面量走下方动态路径按 float 位传运行时）
                 const idx = Math.trunc(expr.property.value);
                 this.compileExpression(expr.object);
                 // A0 保持装箱(勿提前 _js_unbox):_subscript_get 靠 A0 的 0x7FFC 标签分派。
-                // Signed-int32 literals are unambiguous bare indices. Larger
-                // int64 values can alias the native data-segment address window
-                // (macOS: 2^32+n), so pass their canonical float64 JS Number
-                // representation instead of raw integer bits.
-                if (idx >= -0x80000000 && idx <= 0x7fffffff) {
+                // Safe signed-int32 literals below ptrFloor are unambiguous
+                // bare indices. Values that alias the image window (linux
+                // ELF 0x400000 + 64MB; macOS 2^32+n) or sit outside int32
+                // must be the canonical float64 JS Number, not raw bits.
+                if (this._isSafeNakedSubscriptIndex(idx)) {
                     this.vm.mov(VReg.A0, VReg.RET);
                     this.vm.movImm(VReg.A1, idx);
                 } else {
-                    this.vm.push(VReg.RET);
+                    const objH = this._holdExpr(VReg.RET);
                     this.compileExpression(expr.property);
                     this.vm.mov(VReg.A1, VReg.RET);
-                    this.vm.pop(VReg.A0);
+                    this._loadHeldExpr(objH, VReg.A0);
+                    this._releaseHeldExpr();
                 }
                 this.vm.call("_subscript_get");
             } else if (expr.property.type === "Literal" && typeof expr.property.value === "string") {
@@ -6522,23 +6544,32 @@ export const MemberCompiler = {
                 // _subscript_get(每访问省一次全函数调用+动态分派)。未命中尾跳 helper;
                 // 越界返 undefined(0x7ffb,同 _subscript_get_arr_oob 语义)。非整数索引
                 // (obj["k"] 等字符串键语义不同)不入此路,走下方原通用分派。
-                const idxIsInt = this.isIntExpression(expr.property) ||
+                let idxIsInt = this.isIntExpression(expr.property) ||
                     (expr.property.type === "Identifier" && this.ctx.isRawIntVar(expr.property.name));
+                // Integer literals >= ptrFloor must not take the naked-int
+                // fast path: compileExpressionAsInt would reintroduce the
+                // image-window alias that the static-index path just boxed.
+                if (idxIsInt && this._isIntegerIndexLiteral(expr.property) &&
+                    !this._isSafeNakedSubscriptIndex(Math.trunc(expr.property.value))) {
+                    idxIsInt = false;
+                }
                 if (idxIsInt) {
                     const recvOff = this.ctx.allocLocal(`__subget_recv_${this.nextLabelId()}`);
                     // [求值序] 非纯操作数按规范序(对象→键);皆纯保持原序字节不变。
                     if (this.isPureExpr(expr.object) && this.isPureExpr(expr.property)) {
                         this.compileExpressionAsInt(expr.property); // RET = 裸 int 索引
-                        this.vm.push(VReg.RET);
+                        const idxH = this._holdExpr(VReg.RET);
                         this.compileExpression(expr.object);        // RET = boxed 对象
                         this.vm.mov(VReg.A0, VReg.RET);
-                        this.vm.pop(VReg.V1);                        // V1 = 裸 int 索引
+                        this._loadHeldExpr(idxH, VReg.V1);
+                        this._releaseHeldExpr();
                     } else {
                         this.compileExpression(expr.object);        // RET = boxed 对象
-                        this.vm.push(VReg.RET);
+                        const objH = this._holdExpr(VReg.RET);
                         this.compileExpressionAsInt(expr.property); // RET = 裸 int 索引
                         this.vm.mov(VReg.V1, VReg.RET);              // V1 = 裸 int 索引
-                        this.vm.pop(VReg.A0);                        // A0 = boxed 对象
+                        this._loadHeldExpr(objH, VReg.A0);
+                        this._releaseHeldExpr();
                     }
                     // RET/A0 会在读取 dense 槽时被元素值覆盖；hole/侧表/OOB 转慢路时
                     // 必须恢复原接收者，否则会把 0(hole) 当成 base 传给 _subscript_get。
@@ -6589,18 +6620,18 @@ export const MemberCompiler = {
                     // [求值序] 非纯操作数按规范序(对象→键);皆纯保持原序字节不变。
                     if (this.isPureExpr(expr.object) && this.isPureExpr(expr.property)) {
                         this.compileExpression(expr.property);
-                        this.vm.push(VReg.RET);
+                        const keyH = this._holdExpr(VReg.RET);
                         this.compileExpression(expr.object);
-                        this.vm.pop(VReg.V1);
-
                         this.vm.mov(VReg.A0, VReg.RET);
-                        this.vm.mov(VReg.A1, VReg.V1);
+                        this._loadHeldExpr(keyH, VReg.A1);
+                        this._releaseHeldExpr();
                     } else {
                         this.compileExpression(expr.object);
-                        this.vm.push(VReg.RET);
+                        const objH = this._holdExpr(VReg.RET);
                         this.compileExpression(expr.property);
                         this.vm.mov(VReg.A1, VReg.RET);
-                        this.vm.pop(VReg.A0);
+                        this._loadHeldExpr(objH, VReg.A0);
+                        this._releaseHeldExpr();
                     }
                     this.vm.call("_subscript_get");
                 }
@@ -7395,7 +7426,7 @@ export const MemberCompiler = {
                 const containerLbl = this.ctx.newLabel("size_container");
                 const sizeEndLbl = this.ctx.newLabel("size_end");
                 this.compileExpression(expr.object);
-                this.vm.push(VReg.RET);                        // 保存 boxed obj
+                const sizeH = this._holdExpr(VReg.RET);
                 this.vm.movImm64(VReg.V1, 0x0000FFFFFFFFFFFFn);
                 this.vm.and(VReg.V0, VReg.RET, VReg.V1);       // 裸指针
                 this.vm.loadByte(VReg.V2, VReg.V0, 0);         // 类型字节
@@ -7406,17 +7437,18 @@ export const MemberCompiler = {
                 // 非容器：普通属性读。**必须走 getter 感知路径**(emitObjectGetIC 融合
                 // _maybe_getter),否则用户类 `get size(){...}` 经裸 _object_get 返 getter
                 // 描述符对象 → 打印 "[object Object]"、`get size(){return 7}` 也返对象。
-                this.vm.pop(VReg.RET);          // boxed obj → RET(emitObjectGetIC 入参)
+                this._loadHeldExpr(sizeH, VReg.RET);
                 this.emitObjectGetIC("size");
                 this.vm.jmp(sizeEndLbl);
                 this.vm.label(containerLbl);
-                this.vm.pop(VReg.V0);                          // boxed obj
+                this._loadHeldExpr(sizeH, VReg.V0);
                 this.vm.movImm64(VReg.V1, 0x0000FFFFFFFFFFFFn);
                 this.vm.and(VReg.V0, VReg.V0, VReg.V1);        // 裸指针
                 this.vm.load(VReg.RET, VReg.V0, 8);            // size 计数（整数）
                 this.vm.scvtf(0, VReg.RET);
                 this.vm.fmovToInt(VReg.RET, 0);
                 this.vm.label(sizeEndLbl);
+                this._releaseHeldExpr();
             } else {
                 // 特殊处理 import.meta.url
                 if (expr.object.type === "MetaProperty" && propName === "url") {
@@ -7657,18 +7689,20 @@ export const MemberCompiler = {
                 if (this.inferObjectType && this.inferObjectType(expr.object) === "String" &&
                     (propName === "replace" || propName === "replaceAll") &&
                     this.emitStringProtoObject) {
-                    this.vm.push(VReg.RET);
+                    const strProtoH = this._holdExpr(VReg.RET);
                     this.emitStringProtoObject();
-                    this.vm.pop(VReg.RET);
+                    this._loadHeldExpr(strProtoH, VReg.RET);
+                    this._releaseHeldExpr();
                 }
                 // 子类化数组/未知接收者上的 Array.prototype 方法名:运行期走
                 // _nsobj_array_proto;槽空则 miss →「not a function」。物化幂等;
                 // 毁 RET,接收者须跨物化保住(同 W-29 Symbol.*)。
                 if (this.emitArrayProtoObject &&
                     Object.prototype.hasOwnProperty.call(ARRAY_PROTO_METHODS_REF, propName)) {
-                    this.vm.push(VReg.RET);
+                    const arrProtoH = this._holdExpr(VReg.RET);
                     this.emitArrayProtoObject();
-                    this.vm.pop(VReg.RET);
+                    this._loadHeldExpr(arrProtoH, VReg.RET);
+                    this._releaseHeldExpr();
                 }
                 this.emitObjectGetIC(propName); // [P2] 站点缓存(getter 已融合)
             }

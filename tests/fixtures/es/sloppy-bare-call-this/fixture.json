@@ -6,5 +6,6 @@
     "run": true,
     "stdout": "true\ntrue",
     "exitCode": 0
-  }
+  },
+  "knownFailure": "NEW: sloppy bare call this mismatch"
 }

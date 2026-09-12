@@ -1,0 +1,10 @@
+{
+  "description": "BigInt.prototype.valueOf.call(undefined/0) must TypeError, not unbox a non-object and _object_get SIGSEGV.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ok",
+    "exitCode": 0
+  }
+}

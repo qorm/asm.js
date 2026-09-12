@@ -1,0 +1,176 @@
+{
+  "generated": "2026-09-08T22:06:43.675Z",
+  "runnerSha": "7485e46bcc6534247078dd272145b36c6f7cb2b7",
+  "corpusPin": "9e61c12835c5e4a3bdba93850427e6742c4f64c4",
+  "runner": {
+    "mode": "docker",
+    "reason": "Docker linux/arm64"
+  },
+  "config": {
+    "corpus": ".test262-corpus",
+    "target": "linux-arm64",
+    "dirs": [
+      "language/expressions",
+      "language/statements",
+      "built-ins/Array",
+      "built-ins/Object",
+      "built-ins/String",
+      "built-ins/Number",
+      "built-ins/Math",
+      "built-ins/JSON",
+      "built-ins/Map",
+      "built-ins/Set",
+      "built-ins/TypedArray",
+      "built-ins/RegExp",
+      "built-ins/Promise",
+      "built-ins/Boolean",
+      "built-ins/Symbol"
+    ],
+    "stride": 5,
+    "max": 0,
+    "jobs": 8,
+    "canonical": false,
+    "full": false
+  },
+  "discovered": 33776,
+  "discoveredRaw": 33776,
+  "duplicateFiles": 0,
+  "excluded": {
+    "module": 83,
+    "feature": 2316,
+    "dir": 0
+  },
+  "excludedFeatureCounts": {
+    "cross-realm": 72,
+    "Array.fromAsync": 95,
+    "BigInt": 662,
+    "SharedArrayBuffer": 7,
+    "await-dictionary": 89,
+    "regexp-v-flag": 187,
+    "explicit-resource-management": 179,
+    "tail-call-optimization": 34,
+    "decorators": 24,
+    "dynamic-import": 688,
+    "source-phase-imports": 237,
+    "import-attributes": 42
+  },
+  "eligible": 31377,
+  "eligibleVariants": 61284,
+  "selectedVariants": 12274,
+  "variants": 61284,
+  "executed": 6276,
+  "notRun": 55008,
+  "run": 6276,
+  "totals": {
+    "PASS": 6276,
+    "FAIL": 0,
+    "COMPILE_FAIL": 0,
+    "CRASH": 0
+  },
+  "passRatePct": 10.24,
+  "executedPassRatePct": 100,
+  "timing": {
+    "compileMsSum": 7433723,
+    "runMsSum": 1228108,
+    "warm": 0,
+    "cold": 6276,
+    "unknown": 0,
+    "warmCompileMs": 0,
+    "coldCompileMs": 7433723,
+    "warmAvgMs": 0,
+    "coldAvgMs": 1184.4682919056725
+  },
+  "byArea": {
+    "built-ins/Array": {
+      "PASS": 594,
+      "FAIL": 0,
+      "COMPILE_FAIL": 0,
+      "CRASH": 0
+    },
+    "built-ins/Boolean": {
+      "PASS": 10,
+      "FAIL": 0,
+      "COMPILE_FAIL": 0,
+      "CRASH": 0
+    },
+    "built-ins/JSON": {
+      "PASS": 31,
+      "FAIL": 0,
+      "COMPILE_FAIL": 0,
+      "CRASH": 0
+    },
+    "built-ins/Map": {
+      "PASS": 41,
+      "FAIL": 0,
+      "COMPILE_FAIL": 0,
+      "CRASH": 0
+    },
+    "built-ins/Math": {
+      "PASS": 65,
+      "FAIL": 0,
+      "COMPILE_FAIL": 0,
+      "CRASH": 0
+    },
+    "built-ins/Number": {
+      "PASS": 67,
+      "FAIL": 0,
+      "COMPILE_FAIL": 0,
+      "CRASH": 0
+    },
+    "built-ins/Object": {
+      "PASS": 681,
+      "FAIL": 0,
+      "COMPILE_FAIL": 0,
+      "CRASH": 0
+    },
+    "built-ins/Promise": {
+      "PASS": 127,
+      "FAIL": 0,
+      "COMPILE_FAIL": 0,
+      "CRASH": 0
+    },
+    "built-ins/RegExp": {
+      "PASS": 338,
+      "FAIL": 0,
+      "COMPILE_FAIL": 0,
+      "CRASH": 0
+    },
+    "built-ins/Set": {
+      "PASS": 76,
+      "FAIL": 0,
+      "COMPILE_FAIL": 0,
+      "CRASH": 0
+    },
+    "built-ins/String": {
+      "PASS": 242,
+      "FAIL": 0,
+      "COMPILE_FAIL": 0,
+      "CRASH": 0
+    },
+    "built-ins/Symbol": {
+      "PASS": 15,
+      "FAIL": 0,
+      "COMPILE_FAIL": 0,
+      "CRASH": 0
+    },
+    "built-ins/TypedArray": {
+      "PASS": 192,
+      "FAIL": 0,
+      "COMPILE_FAIL": 0,
+      "CRASH": 0
+    },
+    "language/expressions": {
+      "PASS": 1975,
+      "FAIL": 0,
+      "COMPILE_FAIL": 0,
+      "CRASH": 0
+    },
+    "language/statements": {
+      "PASS": 1822,
+      "FAIL": 0,
+      "COMPILE_FAIL": 0,
+      "CRASH": 0
+    }
+  },
+  "topFailPatterns": []
+}

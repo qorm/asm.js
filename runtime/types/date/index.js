@@ -500,9 +500,111 @@ export class DateGenerator {
         // 生成 toISOString 相关辅助函数
         this.generateToISOString();
 
+        // 兼容别名：toJSON/toTimeString/@@toPrimitive 在自举与原型物化里被引用。
+        // 规范语义尚未单独实现时先接到已有 ISO/toString 路径（Invalid Date 行为
+        // 由底层 helper 自带检查）。
+        this.generateDateMethodAliases();
+
+        // Date.UTC / new Date(y,mo,…) 的 MakeDay 归一 + MakeDate 组装 + TimeClip。
+        this.generateDateMakeHelpers();
+
         // [Date 一等值] 物化 Date/Date.prototype 所需的运行时入口(无条件发射,
         // 与 _date_now 同,使 gen1/gen2/gen3 链接同一组标签)。
         this.generateDateValueHelpers();
+    }
+
+    generateDateMethodAliases() {
+        const vm = this.vm;
+        vm.label("_date_toJSON");
+        vm.jmp("_date_toISOString");
+        vm.label("_date_toTimeString");
+        vm.jmp("_date_toString");
+        vm.label("_date_toPrimitive");
+        // A0=this, A1=hint；先忽略 hint，统一走 toString（足够自举与描述符物化）。
+        vm.jmp("_date_toString");
+    }
+
+    // _date_norm_ym(A0=year, A1=month0, A2=&year, A3=&month)
+    // MakeDay 月溢出：year += floor(month0/12)，month0 → [0,11]，再存 1 基月到 [A3]
+    // （_date_civil_to_days 吃 1-12）。负月 floor 与 _date_set_part 同径。
+    generateDateMakeHelpers() {
+        const vm = this.vm;
+        vm.label("_date_norm_ym");
+        vm.prologue(0, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.mov(VReg.S0, VReg.A0); // year
+        vm.mov(VReg.S1, VReg.A1); // month0
+        vm.mov(VReg.S2, VReg.A2); // &year
+        vm.mov(VReg.S3, VReg.A3); // &month
+        vm.movImm(VReg.V5, 12);
+        vm.div(VReg.V3, VReg.S1, VReg.V5); // q
+        vm.mod(VReg.V4, VReg.S1, VReg.V5); // r
+        vm.cmpImm(VReg.V4, 0);
+        vm.jge("_dnym_ok");
+        vm.subImm(VReg.V3, VReg.V3, 1);
+        vm.addImm(VReg.V4, VReg.V4, 12);
+        vm.label("_dnym_ok");
+        vm.add(VReg.S0, VReg.S0, VReg.V3); // adjusted year
+        vm.addImm(VReg.V4, VReg.V4, 1);    // m1
+        vm.store(VReg.S2, 0, VReg.S0);
+        vm.store(VReg.S3, 0, VReg.V4);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+
+        // _date_compose_ms(A0=days(int), A1=h(f64 bits), A2=mi, A3=s, A4=ms)
+        // MakeTime 全程 IEEE：ms = (((days*24 + h)*60 + mi)*60 + s)*1000 + ms。
+        // 调用方对 h/mi/s/ms 不做 fcvtzs（milli 可超 int64）。TimeClip 用 fcmp。
+        vm.label("_date_compose_ms");
+        vm.prologue(64, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        vm.store(VReg.SP, 0, VReg.A0); // days (int)
+        vm.store(VReg.SP, 8, VReg.A1); // h
+        vm.store(VReg.SP, 16, VReg.A2); // mi
+        vm.store(VReg.SP, 24, VReg.A3); // s
+        vm.store(VReg.SP, 32, VReg.A4); // ms
+        // f0 = days * 24 + h
+        vm.load(VReg.V5, VReg.SP, 0);
+        vm.scvtf(0, VReg.V5); // f0 = (float)days
+        vm.movImm64(VReg.V1, 0x4038000000000000n); // 24.0
+        vm.fmovToFloat(1, VReg.V1);
+        vm.fmul(0, 0, 1);
+        vm.load(VReg.V5, VReg.SP, 8);
+        vm.fmovToFloat(1, VReg.V5);
+        vm.fadd(0, 0, 1);
+        // f0 = f0 * 60 + mi
+        vm.movImm64(VReg.V1, 0x404e000000000000n); // 60.0
+        vm.fmovToFloat(1, VReg.V1);
+        vm.fmul(0, 0, 1);
+        vm.load(VReg.V5, VReg.SP, 16);
+        vm.fmovToFloat(1, VReg.V5);
+        vm.fadd(0, 0, 1);
+        // f0 = (f0 * 60 + s) * 1000 + ms
+        vm.movImm64(VReg.V1, 0x404e000000000000n); // 60.0
+        vm.fmovToFloat(1, VReg.V1);
+        vm.fmul(0, 0, 1);
+        vm.load(VReg.V5, VReg.SP, 24);
+        vm.fmovToFloat(1, VReg.V5);
+        vm.fadd(0, 0, 1);
+        vm.movImm64(VReg.V1, 0x408f400000000000n); // 1000.0
+        vm.fmovToFloat(1, VReg.V1);
+        vm.fmul(0, 0, 1);
+        vm.load(VReg.V5, VReg.SP, 32);
+        vm.fmovToFloat(1, VReg.V5);
+        vm.fadd(0, 0, 1);
+        // TimeClip: |ms| > 8.64e15 → NaN
+        vm.fmovToInt(VReg.RET, 0);
+        vm.shrImm(VReg.V1, VReg.RET, 52);
+        vm.andImm(VReg.V1, VReg.V1, 0x7ff);
+        vm.cmpImm(VReg.V1, 0x7ff);
+        vm.jeq("_dcm_clipnan");
+        vm.movImm64(VReg.V1, 0x7fffffffffffffffn);
+        vm.and(VReg.V2, VReg.RET, VReg.V1);
+        vm.movImm64(VReg.V1, 0x433eb208c2dc0000n); // 8.64e15
+        vm.fmovToFloat(0, VReg.V2);
+        vm.fmovToFloat(1, VReg.V1);
+        vm.fcmp(0, 1);
+        vm.jfgt("_dcm_clipnan");
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 64);
+        vm.label("_dcm_clipnan");
+        vm.movImm64(VReg.RET, 0x7ff0000000000001n); // canonical NaN
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 64);
     }
 
     // [Date 一等值] 裸 `Date` 作值传递后调用(`const D=Date; D()`)与原型方法引用

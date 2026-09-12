@@ -1,0 +1,11 @@
+{
+  "description": "GeneratorValidate: next/return/throw while executing must TypeError and complete the generator, not resume the live coro (SIGSEGV).",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "ok",
+    "exitCode": 0
+  },
+  "knownFailure": "NEW: generator executing-state TypeError path crash"
+}

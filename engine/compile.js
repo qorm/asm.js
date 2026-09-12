@@ -53,6 +53,12 @@ export const HOST_DATA = {
     _agen_return_queued: 1, _agen_unwrap_pending: 1,
     _agen_unwrap_return_p: 1, _agen_unwrap_value: 1,
     _nsobj_promise: 1,
+    // x64 eval fragments emit `lea r64, _scheduler_current` as rip32.
+    // arm64 maps that name to an M-context offset, so it never hits this table.
+    _scheduler_current: 1,
+    // Same split: arm64 M-context offset, x64 data label used by generator
+    // stubs compiled inside eval/new Function.
+    _gen_last_coro: 1,
 };
 // well-known Symbol 槽同属宿主可变数据(单例身份须与宿主共享,内联副本会造出第二个
 // Symbol.iterator)。名字由 WELLKNOWN_SYMBOLS 派生,与 SYM_NAMES 末尾登记一一对应。
@@ -597,6 +603,30 @@ export function compileFragment(source, target, captureLayout) {
         }
         for (let i = 0; i < dataLabels.length; i++) dataLabelOff[dataLabels[i].name] = dataLabels[i].offset;
     }
+    // x64 AOT object keys can miss equal-but-distinct strings (same bug as
+    // the assembler label Map). Walk dataLabels by content so fragment-local
+    // slots such as `_superinfo_*` still resolve.
+    const lookupDataOff = (label) => {
+        if (typeof label === "string" && (label in dataLabelOff)) return dataLabelOff[label];
+        if (isX64) {
+            let off = 0;
+            for (let i = 0; i < dataLabels.length; i++) {
+                const it = dataLabels[i];
+                if (it.type === "label") {
+                    if (labelNameEq(it.name, label)) return off;
+                } else if (it.type === "byte") {
+                    off = off + 1;
+                } else if (it.type === "qword" || it.type === "float64") {
+                    off = off + 8;
+                }
+            }
+            return undefined;
+        }
+        for (let i = 0; i < dataLabels.length; i++) {
+            if (dataLabels[i] && labelNameEq(dataLabels[i].name, label)) return dataLabels[i].offset;
+        }
+        return undefined;
+    };
 
     const buf = code.slice();
     const relocs = [];
@@ -756,7 +786,7 @@ export function compileFragment(source, target, captureLayout) {
         // 宿主运行时符号取地址(闭包里存的 trampoline/内建函数体指针)同理:片段内无此
         // 代码体,只能运行时按 symId 取宿主地址填槽。片段自己发射的函数体(offset >= cs)
         // 走下方片段内 code-label 路径。
-        const hostSymAddr = !(fx.label in dataLabelOff) && (fx.label in SYM_IDS)
+        const hostSymAddr = lookupDataOff(fx.label) === undefined && (fx.label in SYM_IDS)
             && !(labelCodeOff(fx.label) !== undefined && labelCodeOff(fx.label) >= cs);
         if ((fx.label in HOST_DATA) || hostSymAddr) {
             const off = fx.offset - cs;
@@ -781,8 +811,9 @@ export function compileFragment(source, target, captureLayout) {
             continue;
         }
         let addr;
-        if (fx.label in dataLabelOff) {
-            addr = dataOff + dataLabelOff[fx.label];
+        const dataOffFound = lookupDataOff(fx.label);
+        if (dataOffFound !== undefined) {
+            addr = dataOff + dataOffFound;
         } else if (fx.label in SINGLETON) {
             // 宿主数据单例:内联 8 字节同位型(8 对齐,供 ldr 64 位)。
             if (!(fx.label in singletonBufOff)) {

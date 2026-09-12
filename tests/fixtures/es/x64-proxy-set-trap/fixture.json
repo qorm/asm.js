@@ -1,0 +1,10 @@
+{
+  "description": "Proxy [[Set]] trap: x64 must not keep the trap code pointer in V2 (aliases A2) or argc scratch in V1 (aliases A3). proxy.p=1 and with(proxy) p+=1 must invoke the trap, not SIGSEGV.",
+  "expect": {
+    "parse": true,
+    "compile": true,
+    "run": true,
+    "stdout": "1\n1\n2",
+    "exitCode": 0
+  }
+}

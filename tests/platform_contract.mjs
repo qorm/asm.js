@@ -6,6 +6,17 @@ import {
     resolveTarget,
 } from "../compiler/core/platform.js";
 import { Compiler } from "../compiler/index.js";
+import * as heapTypes from "../runtime/core/types.js";
+import {
+    TYPE_PROXY,
+    TYPE_REGEXP,
+    OBJECT_HEADER_SIZE,
+    OBJECT_SHAPE_OFFSET,
+    ARRAY_HEADER_SIZE,
+    ARRAY_DATA_PTR_OFFSET,
+} from "../runtime/core/types.js";
+import { VReg } from "../vm/registers.js";
+import { X64Backend, Reg } from "../backend/x64.js";
 import {
     existsSync,
     mkdtempSync,
@@ -116,6 +127,42 @@ try {
     assert.equal(existsSync(unknownOutput), false, "unknown target must not create an output");
 } finally {
     rmSync(scratchDir, { recursive: true, force: true });
+}
+
+// ---- 堆 type 字节 / 头布局契约 ----
+assert.equal(TYPE_PROXY, 17);
+assert.equal(TYPE_REGEXP, 8);
+assert.notEqual(TYPE_PROXY, TYPE_REGEXP);
+assert.equal(OBJECT_HEADER_SIZE, 56);
+assert.equal(OBJECT_SHAPE_OFFSET, 48);
+assert.equal(ARRAY_HEADER_SIZE, 32);
+assert.equal(ARRAY_DATA_PTR_OFFSET, 24);
+{
+    const seen = new Map();
+    for (const name of Object.keys(heapTypes)) {
+        if (!name.startsWith("TYPE_")) continue;
+        const value = heapTypes[name];
+        if (typeof value !== "number") continue;
+        const prev = seen.get(value);
+        assert.equal(prev, undefined, `type byte collision: ${prev} and ${name} both ${value}`);
+        seen.set(value, name);
+    }
+}
+
+// ---- x64 V/A 别名硬规（backend/x64.js regMap）----
+{
+    const x64 = new X64Backend({ code: [], addDataLabel() {}, addDataQword() {} }, "linux");
+    assert.equal(x64.regMap[VReg.V0], Reg.RAX);
+    assert.equal(x64.regMap[VReg.RET], Reg.RAX);
+    assert.equal(x64.regMap[VReg.LR], Reg.RAX);
+    assert.equal(x64.regMap[VReg.V1], x64.regMap[VReg.A3]);
+    assert.equal(x64.scratchReg(VReg.RET, VReg.V0), Reg.R11);
+    assert.equal(x64.scratchReg(VReg.V6), Reg.R10);
+    assert.notEqual(x64.scratchReg(VReg.RET), Reg.RAX);
+    assert.equal(x64.regMap[VReg.V2], x64.regMap[VReg.A2]);
+    assert.equal(x64.regMap[VReg.V3], x64.regMap[VReg.A4]);
+    assert.equal(x64.regMap[VReg.V4], x64.regMap[VReg.A5]);
+    assert.equal(x64.regMap[VReg.V7], x64.regMap[VReg.A1]);
 }
 
 console.log(`platform contract: ${listedTargets.length} targets, ${releaseTargets.length} release targets`);

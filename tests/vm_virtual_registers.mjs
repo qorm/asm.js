@@ -9,14 +9,20 @@ import {
     auditRecordedRegisters,
     getRegisterAliases,
     getRegisterContract,
+    registersAlias,
 } from "../vm/virtual-registers.js";
 import { VReg } from "../vm/registers.js";
+import { runUserFuncRegAlloc, RC } from "../vm/regalloc.js";
 
 function testContracts() {
     assert.deepEqual(getRegisterAliases("x64", VReg.V0), ["V0", "RET", "LR"]);
     assert.deepEqual(getRegisterAliases("x64", VReg.V1), ["V1", "A3"]);
+    assert.equal(registersAlias("x64", VReg.V0, VReg.RET), true);
+    assert.equal(registersAlias("x64", VReg.V5, VReg.RET), false);
+    assert.equal(registersAlias("x64", VReg.S5, VReg.RET), false);
     assert.deepEqual(getRegisterAliases("arm64", VReg.V0), ["V0"]);
     assert.deepEqual(getRegisterAliases("arm64", VReg.RET), ["A0", "RET"]);
+    assert.equal(registersAlias("arm64", VReg.V0, VReg.RET), false);
     assert.deepEqual(getRegisterAliases("wasm32", VReg.A0), ["A0", "RET"]);
     const x64 = getRegisterContract("x64");
     assert.equal(x64.map[VReg.S0], 3);
@@ -392,8 +398,26 @@ function testRecordedHomesDoNotLeak() {
     assert.equal(third.intervals[0].home, -80);
 }
 
+function testLsraMentionUnionCrossesCall() {
+    // store dest@-56, store src@-64, label, call, label, load src@-64.
+    // CFG 切块后若漏掉 load,mention∪CFG 仍让 src 跨 call → callee-saved S。
+    const cnt = 6;
+    const ops = [RC.STORE, RC.STORE, RC.LABEL, RC.CALL, RC.LABEL, RC.LOAD];
+    const a = [VReg.FP, VReg.FP, "mid", "_foo", "after", VReg.RET];
+    const b = [-56, -64, 0, 0, 0, VReg.FP];
+    const c = [VReg.A0, VReg.A1, 0, 0, 0, -64];
+    const out = runUserFuncRegAlloc({
+        ops, ra: a, rb: b, rc: c, cnt, arch: "arm64", tempHomes: null, pinnedOffs: [],
+    });
+    assert.equal(out.bail, false);
+    const srcIdx = out.promOffs.indexOf(-64);
+    assert.ok(srcIdx >= 0, "src slot is promoted (not pinned to FP)");
+    assert.ok(String(out.promRegs[srcIdx]).startsWith("S"), "src live across call uses S");
+}
+
 testContracts();
 testCallSafeAllocation();
+testLsraMentionUnionCrossesCall();
 testOverlapAndSpill();
 testControlFlowConservativeWidening();
 testOpcodeStringParity();

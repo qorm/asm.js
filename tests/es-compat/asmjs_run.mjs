@@ -1,7 +1,7 @@
 import { spawn } from "child_process";
 import fs from "fs";
 const man = JSON.parse(fs.readFileSync("es_tests/manifest.json"));
-const ASMJS = "/Users/dmy/work/jsbin/cli.js";
+const ASMJS = process.env.ASMJS_CLI || "cli.js";
 const CONC = 6;
 const res = {};
 let done = 0;
