@@ -97,17 +97,22 @@ export const AsyncCompiler = {
             if (!expr._noAwait) {
             // [async generator] AsyncGeneratorYield:先 Await(yield 值)再产出。
             // `yield Promise.reject(e)` 须使该次 next() Promise reject(e)(而非把 Promise
-            // 当值产出)。await 只对 Promise 施加(非 Promise 值原样返回)。reject → 异常
-            // 传播:体内有 try 走其 catch,无则完成协程(pending 保留)由 _async_generator_next
-            // reject 本次 next() 的 Promise。
+            // 当值产出)。`yield {then:…}` 同须 Await(thenable),否则 next() 收到原对象
+            // (es/async-generator-yield-thenable)。await 只对 Promise/thenable 施加
+            // (非 thenable 值原样返回)。reject → 异常传播:体内有 try 走其 catch,无则
+            // 完成协程(pending 保留)由 _async_generator_next reject 本次 next() 的 Promise。
             const yieldDone = this.ctx.newLabel("ayieldval_done");
             vm.mov(VReg.A0, VReg.RET);
             const yvH = this._holdExpr(VReg.RET);
-            vm.call("_is_promise");     // RET = 1 若为 Promise
+            vm.call("_is_promise_or_thenable");     // RET = 1 若为 Promise/thenable
             vm.cmpImm(VReg.RET, 0);
             this._loadHeldExpr(yvH, VReg.RET);
             this._releaseHeldExpr();
-            vm.jeq(yieldDone);          // 非 Promise → 值即产出值
+            vm.jeq(yieldDone);          // 非 thenable → 值即产出值
+            vm.mov(VReg.A0, VReg.RET);
+            // Ordinary await: non-Promise thenable goes through _Promise_resolve first
+            // so _promise_await_job always receives a Promise.
+            vm.call("_Promise_resolve");
             vm.mov(VReg.A0, VReg.RET);
             vm.call("_promise_await_job");
             const yieldExcLabel = this.ctx.newLabel("ayieldval_no_exc");

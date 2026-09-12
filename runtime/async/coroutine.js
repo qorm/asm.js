@@ -1046,6 +1046,39 @@ export class CoroutineGenerator {
         vm.movImm(VReg.A0, 0);
         vm.call("_promise_new");
         vm.mov(VReg.S3, VReg.RET);
+        // Busy (await pending / currently executing the first next):
+        // enqueue this throw instead of double-resuming the live coro.
+        // Node: throw-while-executing is queued; first next() still fulfills.
+        // Queue node: next@0, P@8, e@16, mode@24 (1=throw). Consumed by
+        // emitAsyncYieldValue's next-queue drain.
+        vm.load(VReg.V1, VReg.S1, 88);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jeq("_agt_go");
+        vm.movImm(VReg.A0, 32);
+        vm.call("_alloc");
+        vm.movImm(VReg.V1, 0);
+        vm.store(VReg.RET, 0, VReg.V1);
+        vm.store(VReg.RET, 8, VReg.S3);
+        vm.store(VReg.RET, 16, VReg.S2);
+        vm.movImm(VReg.V1, 1); // mode = throw
+        vm.store(VReg.RET, 24, VReg.V1);
+        vm.load(VReg.V1, VReg.S1, 264);
+        vm.cmpImm(VReg.V1, 0);
+        vm.jne("_agt_q_walk");
+        vm.store(VReg.S1, 264, VReg.RET);
+        vm.jmp("_agt_q_done");
+        vm.label("_agt_q_walk");
+        vm.load(VReg.V2, VReg.V1, 0);
+        vm.cmpImm(VReg.V2, 0);
+        vm.jeq("_agt_q_tail");
+        vm.mov(VReg.V1, VReg.V2);
+        vm.jmp("_agt_q_walk");
+        vm.label("_agt_q_tail");
+        vm.store(VReg.V1, 0, VReg.RET);
+        vm.label("_agt_q_done");
+        vm.mov(VReg.RET, VReg.S3);
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 0);
+        vm.label("_agt_go");
         vm.store(VReg.S1, 88, VReg.S3);
         vm.lea(VReg.V0, "_exception_value");
         vm.store(VReg.V0, 0, VReg.S2);

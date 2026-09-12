@@ -6,6 +6,5 @@
     "run": true,
     "stdout": "ok",
     "exitCode": 0
-  },
-  "knownFailure": "NEW: async-gen throw-while-executing not yet matching node (crash/exit null)"
+  }
 }

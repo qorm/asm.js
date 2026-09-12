@@ -2,6 +2,8 @@
 
 版本历史,最新在前。每条均经自举门 `gen2==gen3` 逐字节一致验证。
 
+## v0.4.10(**Async-generator yield thenable + throw-while-executing 入队 — gen2==gen3;fixtures 507 PASS / 15 XFAIL。** **(1) `yield {then:…}`** 现先 Await 解包 thenable(原先把原对象当值产出)。**(2) 协程执行中的 `iter.throw(e)`** 入队 mode=throw 请求,不再双 resume 活协程(node:首次 `next()` 仍 fulfill,throw 在当前 yield 之后投递)。解锁 `es/async-generator-yield-thenable` 与 `es/async-gen-throw-executing`。)
+
 ## v0.4.9(**Object.getOwnPropertySymbols 接受 classinfo(TYPE_FUNCTION=3) — gen2==gen3;fixtures 505 PASS / 17 XFAIL。** `_ogops_obj` 只扫 `TYPE_OBJECT`(2),对共用同一头/props 布局的 classinfo 返回 `[]`。`Object.getOwnPropertyNames` 早已特判 classinfo(`_object_gopn_classinfo_order`);symbols 现同。解锁 `es/class-static-symbol-field` 与 `es/class-computed-key-subscript`。)
 
 ## v0.4.8(**eval-direct-capture-writeback:为 forEach/thisArg 补片段 SYM_IDS — gen2==gen3;fixtures 503 PASS / 19 XFAIL。** `eval("[1,2,3].forEach(v => { s = s + v })")` 在捕获 `s` 的调用方内需要把 `_array_forEach_rt_t` 与 `_coll_cb_this` 追加进引擎 `SYM_NAMES`。解锁 `es/eval-direct-capture-writeback`。)

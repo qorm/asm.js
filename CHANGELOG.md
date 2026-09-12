@@ -2,6 +2,8 @@
 
 Version history. Newest first. Each entry is verified `gen2==gen3` byte-identical on the self-host gate.
 
+## v0.4.10 (**Async-generator yield thenable + throw-while-executing enqueue — gen2==gen3; fixtures 507 PASS / 15 XFAIL.** **(1) `yield {then:…}`** now Await-unwraps thenables (was yielding the raw object). **(2) `iter.throw(e)` while the async generator is executing** enqueues a mode=throw request on the next-queue (node: first `next()` still fulfills; the throw is delivered after the current yield). Unlocks `es/async-generator-yield-thenable` and `es/async-gen-throw-executing`.)
+
 ## v0.4.9 (**Object.getOwnPropertySymbols accepts classinfo (TYPE_FUNCTION=3) — gen2==gen3; fixtures 505 PASS / 17 XFAIL.** `_ogops_obj` only scanned `TYPE_OBJECT` (2) and returned `[]` for classinfo, which shares the same header/props layout. `Object.getOwnPropertyNames` already special-cased classinfo (`_object_gopn_classinfo_order`); symbols now do too. Unlocks `es/class-static-symbol-field` and `es/class-computed-key-subscript`.)
 
 ## v0.4.8 (**eval-direct-capture-writeback: fragment SYM_IDS for forEach/thisArg — gen2==gen3; fixtures 503 PASS / 19 XFAIL.** `eval("[1,2,3].forEach(v => { s = s + v })")` inside a caller that captures `s` needs `_array_forEach_rt_t` and `_coll_cb_this` in the append-only engine `SYM_NAMES` table. Unlocks `es/eval-direct-capture-writeback`.)
