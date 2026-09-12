@@ -437,6 +437,18 @@ export class CoroutineGenerator {
         vm.load(VReg.S1, VReg.S0, 16);   // S1 = coro(闭包捕获槽)
 
         // 仅挂起中的协程需要注入 resume(跑 finalizer);其余直接完成
+        // GeneratorValidate: 已在执行中的生成器上 return() → TypeError
+        vm.load(VReg.V1, VReg.S1, 8);
+        vm.cmpImm(VReg.V1, CORO_STATUS_RUNNING);
+        const genretNotRun = "_genret_notrunning";
+        vm.jne(genretNotRun);
+        vm.lea(VReg.A0, vm.asm.addString("Generator is already running"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+        vm.label(genretNotRun);
         vm.load(VReg.V1, VReg.S1, 8);
         vm.cmpImm(VReg.V1, CORO_STATUS_SUSPENDED);
         vm.jne("_genret_direct");
@@ -519,6 +531,18 @@ export class CoroutineGenerator {
         vm.load(VReg.S1, VReg.S0, 16);   // S1 = coro
 
         // 已完成的生成器:直接把 e 当未捕获异常向调用者传播
+        // GeneratorValidate: 已在执行中的生成器上 throw() → TypeError
+        vm.load(VReg.V1, VReg.S1, 8);
+        vm.cmpImm(VReg.V1, CORO_STATUS_RUNNING);
+        const genthrowNotRun = "_genthrow_notrunning";
+        vm.jne(genthrowNotRun);
+        vm.lea(VReg.A0, vm.asm.addString("Generator is already running"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+        vm.label(genthrowNotRun);
         vm.load(VReg.V1, VReg.S1, 8);
         vm.cmpImm(VReg.V1, CORO_STATUS_COMPLETED);
         vm.jeq("_genthrow_propagate");
@@ -1270,6 +1294,21 @@ export class CoroutineGenerator {
         vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3, VReg.S4, VReg.S5], 64);
 
         vm.label(notCompletedLabel);
+
+        // GeneratorValidate: resuming an already-executing generator is TypeError.
+        // Previously fell through to the same stack switch → SIGSEGV
+        // (es/generator-executing-state).
+        vm.load(VReg.V1, VReg.S0, 8);
+        vm.cmpImm(VReg.V1, CORO_STATUS_RUNNING);
+        const okResume = "_coro_resume_ok";
+        vm.jne(okResume);
+        vm.lea(VReg.A0, vm.asm.addString("Generator is already running"));
+        vm.movImm64(VReg.V1, 0x0000ffffffffffffn);
+        vm.and(VReg.A0, VReg.A0, VReg.V1);
+        vm.movImm64(VReg.V1, 0x7ffc000000000000n);
+        vm.or(VReg.A0, VReg.A0, VReg.V1);
+        vm.call("_throw_type_error");
+        vm.label(okResume);
 
         // 写入 resume value（yield 恢复后会读这里作为返回值）
         vm.store(VReg.S0, 72, VReg.A1);

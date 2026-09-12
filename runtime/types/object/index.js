@@ -15888,10 +15888,13 @@ export class ObjectGenerator {
             }
             vm.label(skipL);
         };
-        field("value", DP_HAS_VALUE, false, 0, 0);
-        field("writable", DP_HAS_WRITABLE, true, 0, 0);
+        // ToPropertyDescriptor 观察序(ES 6.2.4.6):enumerable → configurable →
+        // value → writable → get → set。与描述符对象的属性创建序无关
+        // (es/descriptor-explicit-undefined 用 getter 推 order 数组)。
         field("enumerable", DP_HAS_ENUMERABLE, true, 0, 1);
         field("configurable", DP_HAS_CONFIGURABLE, true, 0, 2);
+        field("value", DP_HAS_VALUE, false, 0, 0);
+        field("writable", DP_HAS_WRITABLE, true, 0, 0);
         field("get", DP_HAS_GET, false, 8, 0);
         field("set", DP_HAS_SET, false, 16, 0);
 

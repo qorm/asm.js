@@ -6089,8 +6089,12 @@ export const FunctionCompiler = {
                     const dpAttr = (wr ? 1 : 0) | (en ? 2 : 0) | (cf ? 4 : 0);
                     // 存在位:HAS_VALUE=1 HAS_WRITABLE=2 HAS_ENUMERABLE=4 HAS_CONFIGURABLE=8
                     // HAS_GET=16 HAS_SET=32;打包参 A5 = (mask<<8) | dpAttr。
-                    const dpMask = (hasValue ? 1 : 0) | (hasWr ? 2 : 0) | (hasEn ? 4 : 0) |
-                        (hasCf ? 8 : 0) | (hasGet ? 16 : 0) | (hasSet ? 32 : 0);
+                    // ToPropertyDescriptor 必须按规范顺序观察字段(与源对象
+                    // 属性创建序无关):enumerable, configurable, value,
+                    // writable, get, set — 见 es/descriptor-explicit-undefined.
+                    const dpMask = (hasEn ? 4 : 0) | (hasCf ? 8 : 0) |
+                        (hasValue ? 1 : 0) | (hasWr ? 2 : 0) |
+                        (hasGet ? 16 : 0) | (hasSet ? 32 : 0);
                     const dpPacked = (dpMask << 8) | dpAttr;
 
                     this.vm.load(VReg.A0, VReg.FP, dpObj);

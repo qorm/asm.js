@@ -6,6 +6,5 @@
     "run": true,
     "stdout": "ok",
     "exitCode": 0
-  },
-  "knownFailure": "NEW: generator executing-state TypeError path crash"
+  }
 }

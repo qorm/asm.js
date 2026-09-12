@@ -2,6 +2,8 @@
 
 版本历史,最新在前。每条均经自举门 `gen2==gen3` 逐字节一致验证。
 
+## v0.4.7(**GeneratorValidate + ToPropertyDescriptor 观察序 — gen2==gen3;fixtures 502 PASS / 20 XFAIL。** **(1) Generator executing-state:**对已在执行的生成器调用 `next`/`return`/`throw` 现抛 TypeError,不再重入同一栈(原 SIGSEGV)。解锁 `es/generator-executing-state`。**(2) ToPropertyDescriptor:**动态 `_object_define_property_dyn` 按 ES 顺序观察字段(`enumerable → configurable → value → writable → get → set`),不再跟源创建序。解锁 `es/descriptor-explicit-undefined`。)
+
 ## v0.4.6(**_main 帧 8 KiB → 32 KiB:落在 SP 之下的局部被被调函数冲掉 — gen2==gen3;fixtures 500 PASS / 22 XFAIL。** `_main` 发射 `prologue(8192)`。每个 `Date.UTC` 站点 `allocLocal` 7 槽(外加 shim `__reprop_*`),`stackOffset` 冲过 8 KiB;随后的 `for (let i=…)` 落在 `FP-8272`,**低于 SP**。任何被调函数的 prologue 都会冲掉 `i`(打印成 `32` / denormal)。解锁 `date-utc-string` 与 `date-to-locale-string`。帧与 `compileFunction` 对齐(32768);动态 high-water 仍待接线。)
 
 ## v0.4.5(**fp-bind-boundargs:ARM64 SP-as-XZR — gen2==gen3;fixtures 498 PASS / 24 XFAIL。** `Function.prototype.bind.call(f, …, "a")` 拷预绑定参时用了 `add(reg, SP, reg)`。ARM64 上 SP 的寄存器字段编码为 XZR,从地址 0 读 SIGSEGV。nBound≤4,改为立即数偏移展开(`load(reg, SP, imm)`)。解锁 `es/fp-bind-boundargs`。)

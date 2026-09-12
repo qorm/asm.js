@@ -6,6 +6,5 @@
     "run": true,
     "stdout": "true true false undefined undefined\ntrue 1\ntrue 1\nfalse false\ntrue false\ntrue false\n2\nenumerable,configurable,value,writable,get,set\ntrue",
     "exitCode": 0
-  },
-  "knownFailure": "Pre-existing issue - not caused by current changes"
+  }
 }
