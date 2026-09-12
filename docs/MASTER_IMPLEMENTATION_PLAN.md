@@ -518,7 +518,7 @@ B.3.3 var-environment 泄漏（`typeof e3 === "undefined"`）。直写路径已�
 
 ## 18. 分支状态（推送时）
 
-分支 `docs/llvm-implementation-plan`，相对 `main@7485e46`：
+分支 `docs/llvm-implementation-plan`，相对 `main@7485e46`，**tag `v0.4.2`**：
 
 | Commit | 内容 |
 |---|---|
@@ -527,6 +527,7 @@ B.3.3 var-environment 泄漏（`typeof e3 === "undefined"`）。直写路径已�
 | `4e8554bb3` | P2.b cjs-named-exports |
 | `33567ffb2` | P2.c module-graph |
 | `c053599df` | direct eval 外层函数绑定（annexB） |
+| `6b33027f0` | docs: 同步规划进度 |
 
 `compiler/index.js`：6365 → 4779 行。门禁：`gen2==gen3`、ABI、toolchain_no_regex、
 fixtures 426/5/7/5、官方 stride-5 抽样仍绿。
