@@ -2721,7 +2721,13 @@ export class Compiler {
         this._resetIcPropMaps();
         vm.label("_main");
         // _main 是整程序入口,体量远超 REC_CAP,录制必白冲;不 beginRecord。
-        vm.prologue(8192, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        // 帧必须覆盖最高水位局部:Date.UTC/shim/__reprop 每站 allocLocal 7+ 槽,
+        // 多站点后 stackOffset 可过 8 KiB(实测 i$blk 落在 FP-8272)。历史 8192
+        // 会把那些槽放到 SP 之下,被任何被调函数的 prologue 冲掉(for-let 归纳
+        // 变量变 denormal/垃圾 — date-utc-string 循环只跑一次的根因)。
+        // 与 compileFunction 的 32768 对齐;动态 high-water 尚未接线。
+        vm.prologue(32768, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        this.ctx._fnFrameSize = 32768;
         this.ctx.returnLabel = "_main_return";
 
         for (const moduleAst of this._moduleOrder) {
@@ -2835,7 +2841,8 @@ export class Compiler {
 
         vm.movImm(VReg.RET, 0);
         vm.label("_main_return");
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 8192);
+        // 与 _main prologue 的 32768 对齐(见上方注释)
+        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32768);
         this._phaseEnd("prog_main_body", sub);
 
         sub = this._phaseStart("prog_userfuncs");

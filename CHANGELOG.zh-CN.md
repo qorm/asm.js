@@ -2,6 +2,8 @@
 
 版本历史,最新在前。每条均经自举门 `gen2==gen3` 逐字节一致验证。
 
+## v0.4.6(**_main 帧 8 KiB → 32 KiB:落在 SP 之下的局部被被调函数冲掉 — gen2==gen3;fixtures 500 PASS / 22 XFAIL。** `_main` 发射 `prologue(8192)`。每个 `Date.UTC` 站点 `allocLocal` 7 槽(外加 shim `__reprop_*`),`stackOffset` 冲过 8 KiB;随后的 `for (let i=…)` 落在 `FP-8272`,**低于 SP**。任何被调函数的 prologue 都会冲掉 `i`(打印成 `32` / denormal)。解锁 `date-utc-string` 与 `date-to-locale-string`。帧与 `compileFunction` 对齐(32768);动态 high-water 仍待接线。)
+
 ## v0.4.5(**fp-bind-boundargs:ARM64 SP-as-XZR — gen2==gen3;fixtures 498 PASS / 24 XFAIL。** `Function.prototype.bind.call(f, …, "a")` 拷预绑定参时用了 `add(reg, SP, reg)`。ARM64 上 SP 的寄存器字段编码为 XZR,从地址 0 读 SIGSEGV。nBound≤4,改为立即数偏移展开(`load(reg, SP, imm)`)。解锁 `es/fp-bind-boundargs`。)
 
 ## v0.4.4(**XFAIL 债一波:Proxy IsCallable/construct、Weak* @@toStringTag、return-eval DirectEval — gen2==gen3;fixtures 497 PASS / 25 XFAIL / 0 FAIL / 0 XPASS。** **(1) Proxy:**`_validate_callable` 在合成 apply 蹦床前先查 IsCallable(target) 或 handler.apply(`new Proxy({},{})()` 现为 TypeError 而非 SIGBUS);嵌套 Proxy 的 `[[Construct]]` 递归转发,不再按 classinfo 布局解引(SIGSEGV)。**(2) WeakMap/WeakSet:**原型挂 `@@toStringTag`,物化后 `Object.prototype.toString` 品牌正确。**(3) `return eval(...)`:**仅在真正启用 TCO 时才把 tail eval 特判;TCO 关闭时按普通 DirectEval,`return eval("42")` / `eval("()=>this")` 值不丢(连带修好 sloppy-bare-call-this、eval-arrow-this 与四个 eval-capture XFAIL)。剩余 25 个 XFAIL 为 TCO/wasm/net/date-loop/bind 残差。)
