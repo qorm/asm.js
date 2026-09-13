@@ -735,7 +735,8 @@ export const FunctionCompiler = {
             this.emitOrdinaryCallBindThis(VReg.S1);
         }
         // 通过 S1 间接调用（不能用 V6 因为它映射到 X6 = A5+1）
-        if ((args && args._tco) && this._shouldTailCall()) {
+        // Method-call TCO only for non-toolchain (see _shouldTailCallMethod).
+        if ((args && args._tco) && this._shouldTailCallMethod()) {
             this.emitTailCallJump();
         } else {
             vm.callIndirect(VReg.S1);
@@ -817,7 +818,8 @@ export const FunctionCompiler = {
         vm.load(VReg.S1, VReg.SP, 40);
         vm.addImm(VReg.SP, VReg.SP, 48);
         vm.label(mDone);
-        if ((args && args._tco) && this._shouldTailCall()) {
+        // Method-call TCO only for non-toolchain (see _shouldTailCallMethod).
+        if ((args && args._tco) && this._shouldTailCallMethod()) {
             this.emitTailCallJump();
         } else {
             vm.callIndirect(VReg.S1);
@@ -826,19 +828,25 @@ export const FunctionCompiler = {
 
     // Strict-mode TCO only, and only in a user function with a known frame.
     // Async/generator bodies keep a coro frame on the caller stack.
-    // Toolchain sources (compiler/lang/asm/backend/vm/engine) stay non-TCO:
-    // PrepareForTailCall still breaks self-host (gen2 "not a function") even
-    // after the 32 KiB _main frame fix. User programs get full TCO.
+    // Method/closure-call TCO (S1 = runtime function pointer) breaks self-host
+    // (gen2 "not a function"): the target is not a static label, and the
+    // epilogueKeep + jmpIndirect sequence corrupts the import-resolution path
+    // in toolchain sources. Direct static-label calls TCO everywhere; toolchain
+    // sources only get direct-call TCO (method-call TCO is off for them).
+    // User programs get full TCO (direct + method).
     _shouldTailCall() {
         if (!this.ctx) return false;
-        if (this.ctx.toolchainSource) return false;
-        // Class field initializers: TCO would rewrite `eval(...)` tail sites
-        // (arguments-in-field-init SyntaxError path; es/eval-field-init-arguments).
         if (this.ctx.inFieldInit) return false;
         if (!this.ctx.inStrictFunction) return false;
         if (this.ctx.inCoroBody || this.ctx.inAsyncFunction || this.ctx.inAsyncGenerator) return false;
         if (!this.ctx._fnFrameSize) return false;
         return true;
+    },
+    // Method/closure-call TCO: only for non-toolchain user programs.
+    _shouldTailCallMethod() {
+        if (!this.ctx) return false;
+        if (this.ctx.toolchainSource) return false;
+        return this._shouldTailCall();
     },
 
     _tcoNeedsCleanup() {

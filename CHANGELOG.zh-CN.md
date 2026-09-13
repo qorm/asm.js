@@ -2,6 +2,8 @@
 
 版本历史,最新在前。每条均经自举门 `gen2==gen3` 逐字节一致验证。
 
+## v0.4.15(**TCO 根因定位:method-call TCO 弄挂自举;toolchain 现可 direct-call TCO — gen2==gen3;fixtures 515 PASS / 7 XFAIL。** method/closure-call TCO(`_shouldTailCallMethod`,S1 = 运行时函数指针)是自举破点:带 method-call TCO 的 `gen1` 编 `import` 时抛 `not a function`。direct 静态标签调用 TCO 在各处安全。拆分门禁:`_shouldTailCall()`(无 toolchain 限制)管 direct 调用;`_shouldTailCallMethod()`(禁 toolchain)管 method/closure 调用。toolchain 源现可 direct-call TCO;用户程序保持完整 TCO。)
+
 ## v0.4.14(**动态 high-water 帧 — prologue SUB SP 在函数体编译完后回填;gen2==gen3;fixtures 515 PASS / 7 XFAIL。** prologue 改为发射可回填的 `SUB SP` 对(arm64 hi12/lo12;x64 32-bit imm)。体编译完后按 `stackOffset` 高水位回填 prologue 立即数,最终 epilogue 用同一尺寸。下限保持历史保留值(用户函数 16 KiB、`_main`/模块级 32 KiB),使 TCO 中途 `epilogueKeep`(读 `_fnFrameSize`)仍正确——帧只增不减。这从策略层关掉了 v0.4.6 修过的 `_main` 8 KiB 溢出类,并接线了 FACTS.md / MASTER_PLAN 记为未来工作的动态 high-water。)
 
 ## v0.4.13(**Buffer.compare static、process.pid、私有名转义 parse 拒绝、fstat — gen2==gen3;fixtures 515 PASS / 7 XFAIL。** **(1)** `Buffer.compare(a,b)` 委托 `a.compare(b)`(内联循环在 LSRA 下返回 0)。**(2)** `process.pid` 经 getpid。**(3)** `.` 后转义 `#` 在 parse 期拒绝(ES 12.5.1.1)。**(4)** `fs.statSync` 真 fstat(macOS 189)+ 按 mode 的 isFile/isDirectory;`readdirSync` 仍返回 [](getdirentries EINVAL)。解锁 `node/builtin-buffer-methods` 与 `es/class-invalid-escaped-private-reference`。)
