@@ -1,6 +1,6 @@
 {
   "name": "asm.js",
-  "version": "0.4.13",
+  "version": "0.4.14",
   "scripts": {
     "bench:compile": "node scripts/bench-compile.mjs",
     "gate:compile-perf": "node scripts/compile-perf-gate.mjs",

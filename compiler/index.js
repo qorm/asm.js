@@ -2726,10 +2726,10 @@ export class Compiler {
         // _main 是整程序入口,体量远超 REC_CAP,录制必白冲;不 beginRecord。
         // 帧必须覆盖最高水位局部:Date.UTC/shim/__reprop 每站 allocLocal 7+ 槽,
         // 多站点后 stackOffset 可过 8 KiB(实测 i$blk 落在 FP-8272)。历史 8192
-        // 会把那些槽放到 SP 之下,被任何被调函数的 prologue 冲掉(for-let 归纳
-        // 变量变 denormal/垃圾 — date-utc-string 循环只跑一次的根因)。
-        // 与 compileFunction 的 32768 对齐;动态 high-water 尚未接线。
-        vm.prologue(32768, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        // 会把那些槽放到 SP 之下,被任何被调函数的 prologue 冲掉。
+        // 动态 high-water：prologue 先发占位 SUB SP,体编译完按 stackOffset 回填。
+        // 下限 32768(与 compileFunction 同量级);_main 无 TCO,可安全按高水位扩展。
+        const mainPrologueSpHandle = vm.prologue(32768, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
         this.ctx._fnFrameSize = 32768;
         this.ctx.returnLabel = "_main_return";
 
@@ -2844,8 +2844,17 @@ export class Compiler {
 
         vm.movImm(VReg.RET, 0);
         vm.label("_main_return");
-        // 与 _main prologue 的 32768 对齐(见上方注释)
-        vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32768);
+        // 动态 high-water：按真实 stackOffset 回填 prologue，再发同尺寸 epilogue。
+        // 下限 32768(与 prologue 占位一致)。
+        {
+            const hw = this.ctx.stackOffset > 0 ? this.ctx.stackOffset : 0;
+            const alignedHw = hw > 0 ? Math.ceil(hw / 16) * 16 : 0;
+            const realFrame = Math.max(32768, alignedHw);
+            if (vm.backend && vm.backend.patchPrologueStack) {
+                vm.backend.patchPrologueStack(mainPrologueSpHandle, realFrame);
+            }
+            vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], realFrame);
+        }
         this._phaseEnd("prog_main_body", sub);
 
         sub = this._phaseStart("prog_userfuncs");
@@ -3740,9 +3749,10 @@ export class Compiler {
         // example StaticLinker.getLinkedCode, whose local-home high-water is
         // ~31 KiB while self-hosting).  The historical 8 KiB frame lets those
         // FP slots overwrite the caller before any explicit error is raised.
+        // Dynamic high-water: patch prologue after body; floor 32768.
         // Keep the frame 16-byte aligned; `_main` retains its compact entry
         // frame above.
-        vm.prologue(32768, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
+        const declPrologueSpHandle = vm.prologue(32768, [VReg.S0, VReg.S1, VReg.S2, VReg.S3]);
         this.ctx._fnFrameSize = 32768;
         this.ctx._argRegSpill = null;
         this.ctx._pinnedFpOffs = [];
@@ -4063,7 +4073,14 @@ export class Compiler {
             vm.endRecord(this.ctx._pinnedFpOffs); // [P1] async 未开录,安全 no-op
         } else {
             // 普通/生成器/async-gen:epilogue(协程体经 _coroutine_entry → _coroutine_return)
-            vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], 32768);
+            // 动态 high-water：按真实 stackOffset 回填 prologue；下限 32768(与占位一致)。
+            const hwM = this.ctx.stackOffset > 0 ? this.ctx.stackOffset : 0;
+            const alignedM = hwM > 0 ? Math.ceil(hwM / 16) * 16 : 0;
+            const realM = Math.max(32768, alignedM);
+            if (vm.backend && vm.backend.patchPrologueStack) {
+                vm.backend.patchPrologueStack(declPrologueSpHandle, realM);
+            }
+            vm.epilogue([VReg.S0, VReg.S1, VReg.S2, VReg.S3], realM);
             vm.endRecord(this.ctx._pinnedFpOffs);
         }
         this.ctx.exceptionLabel = prevDeclExcLabel;

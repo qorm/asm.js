@@ -2,6 +2,8 @@
 
 版本历史,最新在前。每条均经自举门 `gen2==gen3` 逐字节一致验证。
 
+## v0.4.14(**动态 high-water 帧 — prologue SUB SP 在函数体编译完后回填;gen2==gen3;fixtures 515 PASS / 7 XFAIL。** prologue 改为发射可回填的 `SUB SP` 对(arm64 hi12/lo12;x64 32-bit imm)。体编译完后按 `stackOffset` 高水位回填 prologue 立即数,最终 epilogue 用同一尺寸。下限保持历史保留值(用户函数 16 KiB、`_main`/模块级 32 KiB),使 TCO 中途 `epilogueKeep`(读 `_fnFrameSize`)仍正确——帧只增不减。这从策略层关掉了 v0.4.6 修过的 `_main` 8 KiB 溢出类,并接线了 FACTS.md / MASTER_PLAN 记为未来工作的动态 high-water。)
+
 ## v0.4.13(**Buffer.compare static、process.pid、私有名转义 parse 拒绝、fstat — gen2==gen3;fixtures 515 PASS / 7 XFAIL。** **(1)** `Buffer.compare(a,b)` 委托 `a.compare(b)`(内联循环在 LSRA 下返回 0)。**(2)** `process.pid` 经 getpid。**(3)** `.` 后转义 `#` 在 parse 期拒绝(ES 12.5.1.1)。**(4)** `fs.statSync` 真 fstat(macOS 189)+ 按 mode 的 isFile/isDirectory;`readdirSync` 仍返回 [](getdirentries EINVAL)。解锁 `node/builtin-buffer-methods` 与 `es/class-invalid-escaped-private-reference`。)
 
 ## v0.4.12(**unknown bare import、assert.match、crypto.randomBytes、net ready 序 — gen2==gen3;fixtures 513 PASS / 9 XFAIL。** **(1)** 未知裸包 specifier 现在编译期失败(`Cannot find package '…'`),不再绑定 undefined。**(2)** 对 unknown 接收者不再把 `assert.match`/`replace` 劫持成 String 方法——普通方法调用到达 assert 函数。**(3)** 去掉遗留的 `crypto.randomBytes START` 调试日志。**(4)** net socket 先发 `ready` 再发 `connect`,使 connect 处理器能观察到 `ready=true`。解锁 `es/unknown-bare-import`、`node/builtin-assert-match-code`、`node/builtin-crypto-random`、`node/builtin-net-connect-options`。)

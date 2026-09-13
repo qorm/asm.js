@@ -524,6 +524,31 @@ export class X64Assembler {
         }
     }
 
+    // Always-32-bit SUB reg, imm — patchable (returns imm32 offset).
+    subImmPatchable(dst, imm) {
+        this.emit(this.rex(1, 0, 0, dst >= 8));
+        this.emit(129);
+        this.emit(this.modrm(3, 5, dst & 7));
+        const immOff = this.code.length;
+        this.emitImm32(imm);
+        return immOff;
+    }
+
+    patchImm32(offset, imm) {
+        this._codeWrite32(offset, imm >>> 0);
+    }
+
+    _codeWrite32(offset, word) {
+        if (this._byteCode) {
+            this.code.write32(offset, word);
+            return;
+        }
+        this.code[offset] = word & 255;
+        this.code[offset + 1] = (word >> 8) & 255;
+        this.code[offset + 2] = (word >> 16) & 255;
+        this.code[offset + 3] = (word >> 24) & 255;
+    }
+
     // AND reg, imm
     andImm(dst, imm) {
         let rexByte = this.rex(1, 0, 0, dst >= 8);

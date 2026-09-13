@@ -1481,7 +1481,7 @@ export const ClosureCompiler = {
         // more than the historical 8 KiB local area while self-hosting.  Keep
         // enough headroom for this experiment; the frame-size policy will be
         // centralized once the dynamic high-water mark is wired through.
-        vm.prologue(16384, savedRegs);
+        const prologueSpHandle = vm.prologue(16384, savedRegs);
         const prevFnFrameSize = this.ctx._fnFrameSize;
         this.ctx._fnFrameSize = 16384;
 
@@ -2000,7 +2000,16 @@ export const ClosureCompiler = {
         } else {
             // 普通函数 / 生成器 / async generator:epilogue 返回。
             // (生成器/async-gen 体经 _coroutine_entry 捕获返回 → _coroutine_return 置 COMPLETED。)
-            vm.epilogue(savedRegs, 16384);
+            // 动态 high-water：按真实 stackOffset 回填 prologue 的 SUB SP。
+            // 下限 = 保留帧(16384)：TCO 中途 epilogueKeep 用 _fnFrameSize，
+            // 必须与 prologue 的 SUB SP 一致；只增不减，避免中途 epilogue 尺寸错位。
+            const hw = this.ctx.stackOffset > 0 ? this.ctx.stackOffset : 0;
+            const alignedHw = hw > 0 ? Math.ceil(hw / 16) * 16 : 0;
+            const realFrame = Math.max(16384, alignedHw);
+            if (this.vm.backend && this.vm.backend.patchPrologueStack) {
+                this.vm.backend.patchPrologueStack(prologueSpHandle, realFrame);
+            }
+            vm.epilogue(savedRegs, realFrame);
         }
         vm.endRecord(this.ctx._pinnedFpOffs);
         if (_traceClass) console.log("CFB_EPILOGUE_DONE", expr && expr.type);

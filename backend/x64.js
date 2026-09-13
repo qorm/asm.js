@@ -1028,11 +1028,15 @@ export class X64Backend extends Backend {
         if (hasS5) {
             totalStack += 8; // S5 槽位
         }
+        this._prologueHasS5 = hasS5;
 
-        // 分配栈空间（16 字节对齐）
+        // 分配栈空间（16 字节对齐）。
+        // 动态 high-water：用固定 32-bit 立即数 SUB RSP，占位可事后回填。
         const aligned = totalStack > 0 ? Math.ceil(totalStack / 16) * 16 : 0;
-        if (aligned > 0) {
-            this.asm.subImm(Reg.RSP, aligned);
+        this._prologueSpOffsets = null;
+        {
+            const immOff = this.asm.subImmPatchable(Reg.RSP, aligned);
+            this._prologueSpOffsets = [immOff];
         }
 
         // S5 槽位在分配的栈空间的最高地址处（紧贴 pushed regs 下方）
@@ -1050,6 +1054,16 @@ export class X64Backend extends Backend {
             const savedRegBytes = regsWithoutS5.length * 8;
             this.s5StackOffset = -(savedRegBytes + 8);
         }
+    }
+
+    // 回填 prologue 的 SUB RSP 立即数（16 字节对齐）。
+    patchPrologueStack(alignedSize) {
+        if (!this._prologueSpOffsets) return;
+        // hasS5 时 prologue 额外 +8；回填时按同一规则加回。
+        let total = alignedSize;
+        if (this._prologueHasS5) total += 8;
+        const aligned = total > 0 ? Math.ceil(total / 16) * 16 : 0;
+        this.asm.patchImm32(this._prologueSpOffsets[0], aligned);
     }
 
     epilogue(savedRegs, stackSize, keep) {

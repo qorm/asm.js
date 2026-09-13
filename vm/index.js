@@ -810,10 +810,10 @@ export class VirtualMachine {
 
     // ========== 函数调用 ==========
 
-    // 函数序言
+    // 函数序言。返回 backend.prologue 的 patch 句柄（动态 high-water 用）。
     prologue(stackSize, savedRegs) {
         if (this._recN >= 0) { const k = this._recN; if (k < REC_CAP) { this._recOp[k] = RC_PROLOGUE; this._recA[k] = stackSize; this._recB[k] = savedRegs; this._recC[k] = 0; this._recN = k + 1; return; } this._flushRecordVerbatim(); }
-        this.backend.prologue(stackSize, savedRegs || []);
+        return this.backend.prologue(stackSize, savedRegs || []);
     }
 
     // 函数尾声。keep 非 0：弹出帧但不 ret（尾调用 PrepareForTailCall）。

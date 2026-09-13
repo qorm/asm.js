@@ -551,11 +551,35 @@ export class ARM64Backend extends Backend {
             this.asm.stpPre(r1, r2, Reg.SP, -16);
         }
 
-        // 分配栈空间（16 字节对齐，AAPCS64 要求 SP 在函数调用边界 16 字节对齐）
+        // 分配栈空间（16 字节对齐，AAPCS64 要求 SP 在函数调用边界 16 字节对齐）。
+        // 动态 high-water：始终发射两条 SUB SP（hi12 LSL#12 + lo12），占位立即数
+        // 可在函数体编译完后按真实 stackOffset 回填（patchPrologueStack）。
+        // 返回 patch 句柄（两条 SUB 的 code offset），供同函数 epilogue 前回填。
+        // 占位用传入 stackSize（历史硬编码值），回填后与 epilogue 的 size 一致。
         const aligned = stackSize > 0 ? Math.ceil(stackSize / 16) * 16 : 0;
-        if (aligned > 0) {
-            this.asm.subImm(Reg.SP, Reg.SP, aligned);
+        {
+            const lo12 = aligned & 4095;
+            const hi12 = (aligned >> 12) & 4095;
+            const offHi = this.asm.currentOffset();
+            this.asm.emit32(
+                3506438144 | (1 << 22) | (hi12 << 10) | (31 << 5) | 31);
+            const offLo = this.asm.currentOffset();
+            this.asm.emit32(
+                3506438144 | (0 << 22) | (lo12 << 10) | (31 << 5) | 31);
+            return [offHi, offLo];
         }
+    }
+
+    // 回填 prologue 里两条 SUB SP 的立即数（16 字节对齐）。函数体编译完、
+    // 真实 stackOffset 已知后调用；之后 epilogue 必须用同一 size。
+    patchPrologueStack(handle, alignedSize) {
+        if (!handle || handle.length < 2) return;
+        const lo12 = alignedSize & 4095;
+        const hi12 = (alignedSize >> 12) & 4095;
+        this.asm._codeWrite32(handle[0],
+            3506438144 | (1 << 22) | (hi12 << 10) | (31 << 5) | 31);
+        this.asm._codeWrite32(handle[1],
+            3506438144 | (0 << 22) | (lo12 << 10) | (31 << 5) | 31);
     }
 
     epilogue(savedRegs, stackSize, keep) {

@@ -13,7 +13,7 @@
 | 项 | 值 | 权威位置 |
 |---|---|---|
 | 产品名 | asm.js | `README.md`、`package.json` `name` |
-| 版本 | 0.4.13 | `cli.js` `VERSION`、`package.json` `version` |
+| 版本 | 0.4.14 | `cli.js` `VERSION`、`package.json` `version` |
 | 主页 | https://asm.js.cn | `README.md` |
 
 ## 门禁
