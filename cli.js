@@ -36,8 +36,8 @@ Options:
   --os <os>             Target OS: linux, macos, windows
   --arch <arch>         Target architecture: arm64, x64
   --target <target>     Target platform (e.g., macos-arm64, linux-x64)
-  --shared              Build shared library (.dylib/.so/.dll)
-  --static              Build static library (.a/.lib)
+  --shared              Build shared library (.dylib/.so/.dll) [EXPERIMENTAL]
+  --static              Build static library (.a/.lib) [EXPERIMENTAL]
   --no-jslib            Don't generate .jslib declaration file
   --no-cache            Disable the compilation action cache
   --cache-dir <dir>     Override the action cache directory
@@ -59,8 +59,8 @@ Examples:
   asm.js hello.js -o hello                     # Custom output name
   asm.js hello.js --os linux --arch x64        # Cross-compile to Linux x64
   asm.js hello.js --target macos-arm64         # Cross-compile to macOS ARM64
-  asm.js mylib.js --shared -o libmy.dylib      # Build shared library
-  asm.js mylib.js --static -o libmy.a          # Build static library
+  asm.js mylib.js --shared -o libmy.dylib      # EXPERIMENTAL shared library
+  asm.js mylib.js --static -o libmy.a          # EXPERIMENTAL static library
   asm.js app.js --lib mylib                    # ERROR: library linking not supported yet
   asm.js run app.js foo bar                    # Run app.js (compiles under the hood)
 `);
@@ -202,8 +202,10 @@ function parseArgs(args) {
             result.debug = true;
         } else if (arg === "--shared") {
             result.shared = true;
+            console.error("WARNING: --shared is EXPERIMENTAL. Dynamic-library export is incomplete (narrow pure-double only; see docs/C_INTEROP_DESIGN.md). Not for production linking.");
         } else if (arg === "--static") {
             result.static = true;
+            console.error("WARNING: --static is EXPERIMENTAL. Static libraries currently emit an empty symbol table and no relocations (see docs/C_INTEROP_DESIGN.md). Not for production linking.");
         } else if (arg === "--no-jslib") {
             result.noJslib = true;
         } else if (arg === "--no-cache") {

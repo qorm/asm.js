@@ -67,9 +67,9 @@ virtreg/`_holdExpr` 之后五目标均已复跑官方 stride-5 `--gate`：macos-
 |---|---|---|
 | 初始堆虚存预留 | 28 GiB（规避 `_heap_grow` 非连续放弃旧段；非容量设计） | `runtime/core/allocator.js` `INITIAL_HEAP_SIZE` |
 | 堆增长非连续 | 硬失败（不得覆写 `heap_base` 放弃旧段） | `runtime/core/allocator.js` `_heap_grow` |
-| 对象用户头 | 56 B，`shape_ptr@48` | `runtime/core/types.js` `OBJECT_*` |
-| 数组用户头 | 32 B，`data_ptr@24` | `runtime/core/types.js` `ARRAY_*` |
-| `TYPE_PROXY` | 17（不得与 `TYPE_REGEXP=8` 撞车） | `runtime/core/types.js` |
+| 对象用户头 | 56 B，`shape_ptr@48` | `runtime/core/types.js` `OBJECT_HEADER_SIZE` / `OBJECT_SHAPE_OFFSET` |
+| 数组用户头 | 32 B，`data_ptr@24` | `runtime/core/types.js` `ARRAY_HEADER_SIZE` / `ARRAY_DATA_PTR_OFFSET` |
+| `TYPE_PROXY` | **当前 8**（与 `TYPE_REGEXP=8` 撞车，已知 ABI 债）；目标 17 | `runtime/core/types.js` |
 | 调用 ABI | A0–A4 前五个实参，A5=`this`，溢出进 `_call_argv`（普通 cap 16） | `compiler/functions/functions.js` `compileCallArguments` |
 
 ## 文档角色

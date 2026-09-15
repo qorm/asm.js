@@ -16,7 +16,7 @@ A self-hosting, zero-dependency JavaScript→native AOT compiler supporting 5 ma
 
 - **Conformance**: Latest test262 conformance benchmark achieves **100%** of the executed official stride-5 sample (6,276/6,276; `tests/test262/last_report.md` on macOS-ARM64, 2026-09-08: FAIL 0, COMPILE_FAIL 0, CRASH 0). Not every eligible variant. Numbers and the five-target matrix: [docs/FACTS.md](./docs/FACTS.md).
 - **Self-Hosting**: Full bootstrap determinism (`gen1 == gen2 == gen3` byte-identical fixed point) verified on macOS-ARM64 and Linux-ARM64.
-- **Fixtures**: 522 repository fixtures green.
+- **Fixtures**: 522 manifests; gate requires FAIL=0 (current local run: PASS=515 XFAIL=7 FAIL=0).
 - **Version History**: For detailed release notes and change records, see **[CHANGELOG.md](./CHANGELOG.md)**.
 
 `asm.js` is **self-hosting on both ARM64 targets — macOS-ARM64 (native) and Linux-ARM64 (Docker)**: on each, the compiler compiles its own source into a native binary, and that binary compiles the compiler again to a **byte-identical** result — a stable self-reproducing fixed point (`gen1 == gen2 == gen3`). The x64 targets (macOS-x64, Linux-x64, Windows-x64) reached this fixed point as of v1.1.0 but currently do **not** hold it: a full self-compile of the CLI on x64 hits a layout-sensitive compilation blocker now under investigation (their cross-compiled outputs still build and run ordinary programs correctly — the five-target platform matrix is green). It supports a substantial ES subset and a limited Node core shim subset; full ECMAScript and full Node.js compatibility are still in progress.
@@ -58,7 +58,8 @@ An honest assessment of where this project stands. See [docs/ROADMAP.md](./docs/
 - **Performance is AOT-tier, workload-dependent.** Measured 2026-07 vs Node 24: ~2.7× slower on numeric loops (was ~14× before the 2026-07 optimization pass), ~13× on property-access-heavy code (down from ~32×), ~3× on string building, slightly faster on Map operations. For peak V8-JIT speed on polymorphic property-heavy hot loops this is still the wrong tool; for numeric/CLI/startup-bound workloads the gap has narrowed to small multiples (asm.js starts in ~2 ms vs Node's ~40 ms). Levers applied: interval linear-scan register allocation, property-site inline caches, inline ToNumber fast path, comparison-branch fusion; next: object shapes for the property gap.
 - **Memory model is conservative and non-moving.** Generational GC (sticky mark-bit minor + Go-style full pacing, 64 KB size-class spans with an O(1) page map) is the default; still conservative/non-moving with a large virtual reservation, so peak RSS during heavy workloads is higher than mature runtimes (compiler self-compile peaks ~1.4 GB, down from ~2 GB pre-generational).
 - **`eval` costs the closed world, no native addons.** Standalone binaries are closed-world by default; N-API/`.node` addons conflict with the single-binary model and are out of scope. Global-scope `eval`/`new Function` do work today via the embedded engine library (route B: programs that use them get the compiler compiled in — see `engine/README.md`); lexical-scope capture and runtime-specifier `import()` are still open (ROADMAP L2c).
-- **Pre-production.** No stability guarantees, no semver discipline yet, one primary developer. Test coverage is primarily fixture-based (522/522 — green); a test262 conformance harness is in place — current workspace baseline 6,276 / 6,276 = **100%** of the executed official stride-5 subset (`language/` + core `built-ins/`; FAIL 0, COMPILE_FAIL 0, CRASH 0; see `tests/test262/last_report.md`, 2026-09-08 macos-arm64). That is 100% of the *run* sample, not every eligible variant (31,377 files / 61,284 variants). Up from 97.29% at v0.3.66, 70.19% at v0.3.65, and 20.55% at v0.2.1. Five-target matrix and leftover-arg hunt log: [docs/FACTS.md](./docs/FACTS.md), `tests/test262/last_report_linux-x64.md` (underscore; not an official report).
+- **C library linking is experimental.** `--shared` / `--static` library emit is incomplete (narrow pure-double shared export only; static libs currently lack a usable symbol table). `--lib` / `--lib-path` fail loudly rather than silently ignoring. Do not treat these as a production FFI path — see [docs/C_INTEROP_DESIGN.md](./docs/C_INTEROP_DESIGN.md).
+- **Pre-production.** No stability guarantees, no semver discipline yet, one primary developer. Test coverage is primarily fixture-based (522 manifests; baseline PASS+XFAIL with FAIL=0 required by `bootstrap-gate.sh`); a test262 conformance harness is in place — current workspace baseline 6,276 / 6,276 = **100%** of the executed official stride-5 subset (`language/` + core `built-ins/`; FAIL 0, COMPILE_FAIL 0, CRASH 0; see `tests/test262/last_report.md`, 2026-09-08 macos-arm64). That is 100% of the *run* sample, not every eligible variant (31,377 files / 61,284 variants). Up from 97.29% at v0.3.66, 70.19% at v0.3.65, and 20.55% at v0.2.1. Five-target matrix and leftover-arg hunt log: [docs/FACTS.md](./docs/FACTS.md), `tests/test262/last_report_linux-x64.md` (underscore; not an official report).
 
 ### Where it fits (and where it doesn't)
 
@@ -192,9 +193,14 @@ node cli.js examples/helloworld.js
 # Compile and run directly (prints duration on exit)
 node cli.js run examples/helloworld.js
 
-# Run test fixtures
+# Fast default gate (toolchain regex + platform/ABI contracts)
+npm test
+
+# Full fixture suite
 npm run test:fixtures
-# or directly: node scripts/run-fixtures.mjs
+
+# Self-host fixed point + fixtures (the release choke point)
+npm run gate
 ```
 
 ## Project Structure
@@ -229,6 +235,7 @@ Not (yet) accurate:
 - "full Node support"
 - "drop-in Node replacement"
 - "production-ready"
+- "stable C ABI / drop-in library linking" (`--shared`/`--static`/`--lib` are experimental or unimplemented)
 
 ## Acknowledgements
 

@@ -1,12 +1,45 @@
 {
   "name": "asm.js",
   "version": "0.4.15",
+  "description": "Self-hosting JavaScript-to-native compiler with five-target cross-compilation (technical preview)",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "asm.js": "./cli.js",
+    "asmjs": "./cli.js"
+  },
+  "exports": {
+    ".": "./compiler/index.js",
+    "./compiler": "./compiler/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "cli.js",
+    "compiler/",
+    "runtime/",
+    "lang/",
+    "vm/",
+    "backend/",
+    "asm/",
+    "binary/",
+    "engine/",
+    "scripts/bootstrap-gate.sh",
+    "LICENSE",
+    "README.md",
+    "README.zh-CN.md"
+  ],
   "scripts": {
+    "test": "node tests/toolchain_no_regex.mjs && node tests/platform_contract.mjs && node tests/vm_abi_contract.mjs",
     "bench:compile": "node scripts/bench-compile.mjs",
     "gate:compile-perf": "node scripts/compile-perf-gate.mjs",
     "gate:gen1-compile-perf": "node scripts/gen1-compile-perf-gate.mjs",
     "test:cache": "node tests/action_cache.mjs",
     "test:fixtures": "node scripts/run-fixtures.mjs",
+    "test:fast": "npm test",
+    "test:selfhost": "bash scripts/bootstrap-gate.sh",
     "gate": "bash scripts/bootstrap-gate.sh",
     "gate:test262": "bash scripts/test262-gate.sh",
     "platform:contract": "node tests/platform_contract.mjs && node tests/elf_arm64_bytebuffer.mjs",

@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v0.1)"
+        description: "Release tag (e.g. v0.4.15)"
         required: true
 
 permissions:
@@ -19,13 +19,55 @@ jobs:
   build-and-release:
     runs-on: ubuntu-latest
     steps:
+      - name: Resolve release tag
+        id: tag
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag: ${TAG}"
+
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Manual dispatch must build the named tag, not the branch tip.
+          # Tag pushes already check out the tagged commit via GITHUB_REF.
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Verify tag matches checkout
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+          HEAD_SHA="$(git rev-parse HEAD)"
+          TAG_SHA="$(git rev-parse "refs/tags/${TAG}^{commit}" 2>/dev/null || true)"
+          echo "HEAD=${HEAD_SHA} tag=${TAG_SHA:-missing}"
+          if [ -z "${TAG_SHA}" ]; then
+            echo "ERROR: tag ${TAG} does not exist" >&2
+            exit 1
+          fi
+          if [ "${HEAD_SHA}" != "${TAG_SHA}" ]; then
+            echo "ERROR: checkout commit ${HEAD_SHA} != tag ${TAG} commit ${TAG_SHA}" >&2
+            exit 1
+          fi
+          echo "OK: building tag ${TAG} at ${HEAD_SHA}"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+
+      - name: Install dependencies
+        run: npm install --no-fund --no-audit
+
+      - name: Fast contracts (blocking)
+        run: npm test
+
+      - name: Platform ABI contracts (blocking)
+        run: npm run platform:contract
 
       - name: Cross-compile asm.js CLI for all 5 targets
         run: |
@@ -39,9 +81,9 @@ jobs:
           ls -la dist
 
       - name: Smoke test (linux-x64 runs natively on the x64 runner)
-        # 非阻塞:某些 runner 的严格 overcommit 会拒绝大初始堆的 mmap;
-        # 产物本身已在各目标运行时(native/Docker/Wine)验证过,不因此阻断发布。
-        continue-on-error: true
+        # Blocking: a broken linux-x64 product must not ship.
+        # If overcommit/mmap of the large initial heap is refused on this
+        # runner, fail loudly — do not release a binary that cannot run.
         run: |
           set -euo pipefail
           printf 'console.log("asm.js-ci-ok", 6*7);' > hello.js
@@ -50,20 +92,27 @@ jobs:
           echo "output: $out"
           test "$out" = "asm.js-ci-ok 42"
 
+      - name: Generate build metadata
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+          {
+            echo "tag=${TAG}"
+            echo "commit=$(git rev-parse HEAD)"
+            echo "node=$(node --version)"
+            echo "runner_os=${RUNNER_OS}"
+            echo "runner_arch=${RUNNER_ARCH}"
+            echo "targets=macos-arm64 macos-x64 linux-arm64 linux-x64 windows-x64"
+            echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > dist/BUILD_INFO.txt
+          cat dist/BUILD_INFO.txt
+
       - name: Generate checksums
         run: |
+          set -euo pipefail
           cd dist
-          sha256sum asm.js-* > SHA256SUMS.txt
+          sha256sum asm.js-* BUILD_INFO.txt > SHA256SUMS.txt
           cat SHA256SUMS.txt
-
-      - name: Resolve release tag
-        id: tag
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-          fi
 
       - name: Create GitHub Release
         env:
@@ -73,4 +122,4 @@ jobs:
           set -euo pipefail
           gh release create "$TAG" dist/* \
             --title "asm.js $TAG" \
-            --notes "Self-hosting asm.js CLI, cross-compiled from a single host for all five targets (macOS-ARM64, macOS-x64, Linux-ARM64, Linux-x64, Windows-x64). Each binary compiles \`cli.js\` into a native executable — no Node.js and no third-party dependencies at runtime. Verify integrity with \`SHA256SUMS.txt\`. See the README's Self-Hosting section for the \`gen2 == gen3\` fixed-point results."
+            --notes "Self-hosting asm.js CLI, cross-compiled from tag ${TAG} (commit $(git rev-parse --short HEAD)) for all five targets (macOS-ARM64, macOS-x64, Linux-ARM64, Linux-x64, Windows-x64). Each binary compiles \`cli.js\` into a native executable — no Node.js and no third-party dependencies at runtime. Verify integrity with \`SHA256SUMS.txt\`; see \`BUILD_INFO.txt\` for the exact commit and toolchain. Technical preview — not a stable toolchain. See the README's Self-Hosting section for the \`gen2 == gen3\` fixed-point results."

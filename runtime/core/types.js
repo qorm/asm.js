@@ -14,7 +14,12 @@ export const TYPE_SET = 5; // Set
 export const TYPE_STRING = 6; // 字符串
 export const TYPE_DATE = 7; // Date
 export const TYPE_REGEXP = 8; // RegExp
-export const TYPE_PROXY = 8; // Proxy（历史 type 字节=8，与 TYPE_REGEXP 同值）
+// ABI debt: TYPE_PROXY shares type byte 8 with TYPE_REGEXP. Proxy blocks
+// (target@8, handler@16) are layout-incompatible with RegExp (flags@8 etc.),
+// so cold-path dispatch must special-case REGEXP vs PROXY after the cmp==8.
+// Target ABI is TYPE_PROXY=17; migrating requires a coordinated bootstrap
+// (every cmpImm/alloc site + gen1 seed). Until then this value is authoritative.
+export const TYPE_PROXY = 8;
 export const TYPE_GENERATOR = 9; // Generator
 export const TYPE_COROUTINE = 10; // Coroutine
 export const TYPE_PROMISE = 11; // Promise
@@ -23,6 +28,12 @@ export const TYPE_NUMBER = 13; // Number (boxed, 默认 float64)
 export const TYPE_DATA_VIEW = 14; // DataView [type@0, data_ptr@8, byteOffset@16, byteLength@24, buffer@32]
 export const TYPE_SHAPE = 15; // [shape v2] 动态形状转移节点(见 docs/SHAPE_TRANSITIONS_DESIGN.md)
 export const TYPE_SHAPE_DESC = 16; // [shape v2 · T2a] 原型带键形状描述符 {@0 count|flags63, @8 keys_ptr}
+
+// 统一用户头布局契约（runtime/types/object|array 使用同一数字）
+export const OBJECT_HEADER_SIZE = 56; // type+count+proto+capacity+props_ptr+flags_ptr+shape_ptr
+export const OBJECT_SHAPE_OFFSET = 48;
+export const ARRAY_HEADER_SIZE = 32; // type+length+capacity+data_ptr
+export const ARRAY_DATA_PTR_OFFSET = 24;
 
 // TypedArray 类型 (直接作为 type 字段，无需额外 elemType)
 // 布局: [type:8 | length:8 | buffer...]

@@ -16,8 +16,8 @@
 
 import { VReg } from "../../../vm/registers.js";
 import { TYPE_STRING, HEADER_SIZE } from "../../core/allocator.js";
+import { ARRAY_HEADER_SIZE } from "../../core/types.js";
 
-const ARRAY_HEADER_SIZE = 32; // type + length + capacity + data_ptr
 const ARRAY_MIN_CAPACITY = 8;
 
 export class ArrayGenerator {

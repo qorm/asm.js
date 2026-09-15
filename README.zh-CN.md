@@ -16,7 +16,7 @@
 
 - **规范符合性**：最新 test262 符合性基线达 **100%**（6,276/6,276 已执行的官方 stride-5 子集；详见 `tests/test262/last_report.md`，macOS-ARM64，2026-09-08：FAIL 0、COMPILE_FAIL 0、CRASH 0）。这是已跑样本的 100%，不是全部 61,284 个合格变体。数字与五目标矩阵见 [docs/FACTS.md](./docs/FACTS.md)。
 - **自举确定性**：macOS-ARM64 与 Linux-ARM64 均已验证逐字节相同的自举固定点（`gen1 == gen2 == gen3`）。
-- **测试基线**：522 项仓库核心 fixtures 测试全绿通过。
+- **测试基线**：522 个 fixture manifest；门禁要求 FAIL=0（当前本地：PASS=515 XFAIL=7 FAIL=0）。
 - **版本历史与更新记录**：详细的发布日志与技术波次记录请参阅 **[CHANGELOG.zh-CN.md](./CHANGELOG.zh-CN.md)**。
 
 `asm.js` 已在**两个 ARM64 目标(macOS-ARM64 原生、Linux-ARM64 Docker)上实现自举**:在每个目标上,编译器把自身源码编译成原生二进制,该二进制再次编译编译器,产物**逐字节一致** —— 稳定的自我复现定点(`gen1 == gen2 == gen3`)。x64 三目标(macOS-x64、Linux-x64、Windows-x64)在 v1.1.0 曾达成此定点,当前**不保持**:x64 上完整自编译 CLI 命中一个布局敏感的编译阻塞,正在取证排查(其交叉编译产物仍能正确构建并运行普通程序——五目标平台矩阵绿)。当前支持较大的 ES 子集与有限的 Node 核心 shim 子集;完整 ECMAScript 与完整 Node.js 兼容仍在进行中。
@@ -58,7 +58,8 @@
 - **性能处于 AOT 档位,分负载差异大。** 2026-07 对 Node 24 实测:数值循环 ~2.7×(优化前 ~14×)、属性访问密集 ~13×(从 ~32× 收窄)、字符串构建 ~3×、Map 操作略快于 Node。要 V8-JIT 级多态属性热循环速度仍不是对的工具;数值/CLI/启动敏感负载差距已收窄到小倍数(asm.js ~2ms 启动 vs Node ~40ms)。已落地杠杆:区间线性扫描寄存器分配、属性站点缓存、ToNumber 内联快路、比较-分支融合;下一杠杆:对象 shape(属性差距)。
 - **内存模型为保守式非移动。** 分代 GC(sticky mark-bit minor + Go 式 full 步调,64KB 按类 span + O(1) 页映射)已是缺省;仍为保守/非移动 + 大虚拟地址预留,重负载峰值 RSS 高于成熟运行时(编译器自编译峰值 ~1.4 GB,分代前 ~2 GB)。
 - **`eval` 以封闭世界为代价、无 native addon。** 独立二进制默认封闭世界;N-API/`.node` 插件与单二进制模型冲突,不在范围内。全局作用域的 `eval`/`new Function` 现已可用(引擎库 route B:使用它们的程序会把编译器编入产物,见 `engine/README.md`);词法作用域捕获与运行时 specifier 的 `import()` 仍待做(ROADMAP L2c)。
-- **未达生产级。** 尚无稳定性承诺与 semver 纪律,主力开发者一人。测试覆盖以 fixtures 为主(522/522——全绿);test262 符合性 harness 已就位,当前工作区基线为已执行的官方 stride-5 子集(`language/` + 核心 `built-ins/`)6,276 / 6,276 = **100%**(见 `tests/test262/last_report.md`,2026-09-08 macos-arm64;FAIL 0、COMPILE_FAIL 0、CRASH 0)。这是已跑样本的 100%,不是全部合格变体(31,377 文件 / 61,284 variants)。较 v0.3.66 的 97.29%、v0.3.65 的 70.19% 与 v0.2.1 的 20.55% 已显著提升。五目标矩阵与 leftover-arg 猎日志见 [docs/FACTS.md](./docs/FACTS.md)、`tests/test262/last_report_linux-x64.md`(下划线;不是官方报告)。
+- **C 库链接为实验性。** `--shared` / `--static` 产出链路未完成(共享库仅极窄 pure-double 场景;静态库当前符号表不可用)。`--lib` / `--lib-path` 会显式报错而非静默忽略。不要把它们当作生产级 FFI 通路——见 [docs/C_INTEROP_DESIGN.md](./docs/C_INTEROP_DESIGN.md)。
+- **未达生产级。** 尚无稳定性承诺与 semver 纪律,主力开发者一人。测试覆盖以 fixtures 为主(522 个 manifest;`bootstrap-gate.sh` 要求 FAIL=0 且 PASS+XFAIL 覆盖全部);test262 符合性 harness 已就位,当前工作区基线为已执行的官方 stride-5 子集(`language/` + 核心 `built-ins/`)6,276 / 6,276 = **100%**(见 `tests/test262/last_report.md`,2026-09-08 macos-arm64;FAIL 0、COMPILE_FAIL 0、CRASH 0)。这是已跑样本的 100%,不是全部合格变体(31,377 文件 / 61,284 variants)。较 v0.3.66 的 97.29%、v0.3.65 的 70.19% 与 v0.2.1 的 20.55% 已显著提升。五目标矩阵与 leftover-arg 猎日志见 [docs/FACTS.md](./docs/FACTS.md)、`tests/test262/last_report_linux-x64.md`(下划线;不是官方报告)。
 
 ### 适合与不适合
 
@@ -155,9 +156,14 @@ node cli.js examples/helloworld.js
 # 直接执行(编译→运行→末行打印耗时)
 node cli.js run examples/helloworld.js
 
-# 跑测试 fixtures
+# 快速默认门禁(toolchain 正则约束 + 平台/ABI 契约)
+npm test
+
+# 完整 fixture 套件
 npm run test:fixtures
-# 或直接执行: node scripts/run-fixtures.mjs
+
+# 自举定点 + fixtures(发布阻塞门禁)
+npm run gate
 ```
 
 ## 项目结构
@@ -192,6 +198,7 @@ asm.js/
 - “完整 Node 支持”
 - “Node 的直接替代品”
 - “生产可用”
+- “稳定 C ABI / 即插即用库链接”(`--shared`/`--static`/`--lib` 仍为实验性或未实现)
 
 ## 致谢
 

@@ -3,6 +3,8 @@
 
 import { VReg } from "../../../vm/registers.js";
 import { JS_TAG_STRING_BASE, JS_PAYLOAD_MASK } from "../../core/jsvalue.js";
+// Single-line import: the self-host parser rejects multi-line import specs.
+import { TYPE_PROXY, OBJECT_HEADER_SIZE, OBJECT_SHAPE_OFFSET } from "../../core/types.js";
 
 // 对象内存布局（属性区独立分配，对象头指针稳定、可原地增长）:
 // +0:  type (8 bytes) = TYPE_OBJECT (2)
@@ -16,9 +18,7 @@ import { JS_TAG_STRING_BASE, JS_PAYLOAD_MASK } from "../../core/jsvalue.js";
 //      别名（装箱变量/闭包捕获等）保持有效。
 
 const TYPE_OBJECT = 2;
-const TYPE_PROXY = 8; // Proxy 对象块:type@0=8, target@8, handler@16(装箱 0x7FFD)。
-                      // 独立 type 字节使属性访问快路(cmp==TYPE_OBJECT)自动漏判 → 落
-                      // _object_get/_set 冷分支调 handler 陷阱;普通对象访问逐字节不变。
+// TYPE_PROXY / OBJECT_* 从 runtime/core/types.js 导入（ABI 唯一来源）。
 // 非属性容器堆块类型字节(布局与 [count@8, props_ptr@32] 不兼容,通用属性遍历必须绕开):
 const TYPE_MAP = 4; // Map:哈希/链表布局
 const TYPE_SET = 5; // Set:哈希/链表布局
@@ -36,11 +36,9 @@ const TYPE_SHAPE_DESC = 16; // [shape v2 · T2a] 原型带键形状描述符(堆
 // 属性 attrs 数组(capacity 字节,每属性 1 字节),flags_ptr=0 语义 = 全属性默认
 // attrs(writable+enumerable+configurable 全 1)。普通赋值/对象字面量/类字段/
 // 编译器自身对象全部 flags_ptr=0(不分配 flags 块),逐字节等价 P1 后状态。
-const OBJECT_HEADER_SIZE = 56; // type + count + __proto__ + capacity + props_ptr + flags_ptr + shape_ptr@48
 const OBJECT_CAP_OFFSET = 24; // capacity 字段偏移
 const OBJECT_PROPS_PTR_OFFSET = 32; // props 数组指针偏移
 const OBJECT_FLAGS_PTR_OFFSET = 40; // per-property attrs 数组指针偏移(0=全默认 attrs)
-const OBJECT_SHAPE_OFFSET = 48; // shape 描述符指针偏移(0=无形状,形状 IC 未启用)
 const PROP_SIZE = 16; // key + value
 
 // per-property attribute 位(flags[i] 对应 props_ptr+i*16)
