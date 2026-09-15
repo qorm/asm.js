@@ -25,14 +25,35 @@ python3 -m http.server 4173
 
 ## 部署
 
-本项目为纯静态构建，零编译步骤，直接部署 `website/` 目录即可。`CNAME` 已配置为 `asm.js.cn`，支持 GitHub Pages、Cloudflare Pages、Vercel 等静态托管平台。
+本项目为纯静态构建，零编译步骤。`CNAME` 为 `asm.js.cn`。
+
+**当前生产路径（与 qorm.com 同机）**：
+
+| 项 | 值 |
+| --- | --- |
+| 服务器 | `66.154.102.182`（hostname `qorm.com`） |
+| OpenResty | `/usr/local/openresty/nginx/sbin/nginx` |
+| docroot | `/var/www/asmjs`（勿用 `/var/www/qorm`） |
+| vhost | `server_name asm.js.cn www.asm.js.cn`（独立于 qorm 的 `default_server`） |
+| 前端 | Cloudflare 代理；源站仅监听 80，SSL 模式需为 Flexible（或等价：CF→源站 80） |
+
+发布步骤（在本机、使用 qorm 的 `web_server/deploy_key`）：
+
+```bash
+# 1. 同步静态资产
+rsync -az -e 'ssh -i ~/github/qorm/web_server/deploy_key -o UserKnownHostsFile=~/github/qorm/web_server/known_hosts' \
+  website/ root@66.154.102.182:/var/www/asmjs/
+
+# 2. 源站按 Host 验证（勿只测 IP，default_server 是 qorm）
+curl -sI -H 'Host: asm.js.cn' http://66.154.102.182/
+curl -s -H 'Host: asm.js.cn' http://66.154.102.182/ | head
+# 3. 确认 qorm 未被误伤
+curl -sI https://qorm.com
+```
 
 ### 与 qorm 同机部署时的 OpenResty 注意事项
 
-若官网与 `~/github/qorm`（或其它仓库的站点）部署在同一台服务器上，共享同一 OpenResty / Nginx 实例时必须：
-
-1. **按 `server_name` 严格分流**：`asm.js.cn` 与 qorm 的域名各写独立 `server` 块，禁止用一个 catch-all `server` 混路由；默认 `server` 应显式返回 444/404，避免误吞对方域名。
-2. **`root` 路径互不重叠**：官网 `root` 指向 `website/`（或其 rsync 目标），不要指向仓库根或 `~/github`；qorm 的 root 同理。禁止两个站点共用同一 `root` 再靠 `location` 拆。
-3. **改配置先 `nginx -t` / `openresty -t`，再 reload**；不要在未测配置时直接 reload，避免整机（含 qorm）站点中断。
-4. **证书与 ACME**：若用 Let's Encrypt webroot，两站共享同一 `/.well-known/acme-challenge` 别名路径时写成独立、显式的 `location`，不要靠默认继承。
-5. **本仓库不托管服务器配置**：OpenResty vhost 不要提交到 `website/`；服务器侧变更走运维配置库或独立 conf 目录，避免与静态资产部署互相覆盖。
+1. **按 `server_name` 严格分流**：`asm.js.cn` 必须有独立 `server` 块；qorm 保持 `default_server`。禁止把 asm.js 挂进 qorm 的 `root`。
+2. **改配置先 `nginx -t`，再 `nginx -s reload`**，避免整机（含 qorm/tapripe）中断。
+3. **本仓库不托管服务器配置**：OpenResty vhost 不要提交到 `website/`；服务器侧 conf 有备份在 `qorm/web_server/server-config/`（运维参考）。
+4. **HTTPS 521 排查顺序**：先 `curl -H 'Host: asm.js.cn' http://源站IP` 看源站内容是否正确，再查 Cloudflare SSL 模式是否为 Full/Full-strict（源站无 443 时必须 Flexible）。
